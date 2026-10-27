@@ -81,7 +81,12 @@ A replica adds a contribution only if all of these hold:
 6. A relation's `from` and `to` differ.
 7. A retract's target has the same `author`.
 8. A claim's `statement`, an artifact's `name` and an evidence's `method` are
-   not blank.
+   not blank. Blank means empty, or made only of the 25 characters with the
+   `White_Space` property in Unicode 17.0: U+0009 to U+000D, U+0020, U+0085,
+   U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F and
+   U+3000. Nothing else is blank, including characters that other languages'
+   trim functions remove: U+FEFF, U+200B, U+180E (White_Space before Unicode
+   6.3) and U+001C to U+001F.
 
 Every rule depends only on the contribution and its parents. Any two replicas
 that hold the parents therefore reach the same verdict, so validity converges
@@ -246,14 +251,28 @@ It pins:
   verify and pass the validity rules.
 - **Negative vectors.** Inputs a replica must reject, each with its specific
   error: non-canonical encodings (a non-shortest integer, map keys out of
-  order, an indefinite-length map, trailing bytes), protocol version 2, a
-  foreign Ground, a small-order key with a signature that plain RFC 8032
+  order, an indefinite-length map, trailing bytes), protocol versions 0 and 2,
+  a foreign Ground, a small-order key with a signature that plain RFC 8032
   verification accepts but strict verification rejects, parents out of order
-  or duplicated, and a body reference missing from `parents`. The size limit
-  is pinned at its boundary: exactly 16 MiB passes, one byte more fails both
-  decoding and the validity check.
-- **Bundle vector.** A two-contribution bundle's bytes: the magic, the Ground
-  id and the u32 big-endian length framing. It must read back.
+  or duplicated, a missing parent among several, a body reference missing from
+  `parents` (an evidence's or a retract's target, including a target the
+  replica doesn't hold, and either end of a relation), another author's
+  retraction of each kind of contribution, and a blank claim statement,
+  artifact name or evidence method, made of each White_Space character in
+  turn. On the other side, a field made of U+FEFF, U+200B, U+180E or U+001C to
+  U+001F is accepted, and a test checks that the toolchain's White_Space set
+  is exactly the 25 that rule 8 lists, so a Unicode upgrade that changes it
+  fails. The size limit is pinned at its boundary: exactly 16 MiB passes, one
+  byte more fails both decoding and the validity check.
+- **Causal order vector.** The pinned order of six contributions, some of
+  them concurrent, which pins the tie-break: the smallest id whose parents
+  are all listed comes next.
+- **Bundle vectors.** A two-contribution bundle's bytes: the magic, the Ground
+  id and the u32 big-endian length framing. It must read back, and a reader
+  must refuse another magic. The entry size limit is pinned at its boundary:
+  an entry of exactly 16 MiB reads, and a length prefix one byte over is
+  refused. A bundle cut inside a length prefix or inside an entry is refused,
+  not read as shorter.
 - **Sync vectors.** One message of every sync type, as pinned bytes that must
   decode back to the same message, then the id-list size (65 536), an empty
   `offer`'s bytes, a full id list fitting the smallest replica's message
@@ -262,21 +281,45 @@ It pins:
   `batch_bytes` in `hello`. New vectors are appended; pinned ones never change.
 - **Fixture Ground.** `crates/manyroot/tests/fixtures/ground-v1/` is a replica
   written by version 0.1.0 of `manyroot` (`ground.json`, `objects/`,
-  `agents/`; no private keys). The test opens it, verifies every
-  contribution, and checks pinned ids, agent names, the open contradiction,
-  and every validation status, including that retraction outranks a failure
-  and a failure outranks a pass. Cases appended for the supersession rule
-  pin that another author's supersession neither supersedes an accepted
-  claim nor silences a contradiction, and that an author's acceptance of
-  someone else's replacement does. The fixture holds a contribution of every
-  body kind, relation kind and verdict, and a test that fails to compile when
-  a variant is added keeps it that way.
+  `agents/`; no private keys). The test opens it, verifies every contribution,
+  and checks pinned ids, agent names, the exact list of open conflicts, and
+  every validation status, including that retraction outranks a failure and a
+  failure outranks a pass. Its statuses also pin which evidence and
+  retractions count: an author's pass on their own claim doesn't, a retracted
+  pass doesn't, retracting a retraction restores the original, and a retracted
+  `supersedes` or `contradicts` relation stops counting. Only an accepted
+  subject is reported superseded, and only by an accepted one: a rejected or
+  pending claim with an accepted successor keeps its status, and an accepted
+  claim with a pending successor stays accepted. Open conflicts are only
+  between current subjects that aren't retracted: the fixture's contradictions
+  between two pieces of evidence, against a superseded claim and from a
+  retracted claim are not reported. Cases appended for the supersession rule
+  pin that another author's supersession neither supersedes an accepted claim
+  nor silences a contradiction, and that an author's acceptance of someone
+  else's replacement does. The fixture holds a contribution of every body
+  kind, relation kind and verdict, and a test that fails to compile when a
+  variant is added keeps it that way.
 
-The guard has no vectors for the remaining validity rules (missing parents,
-self-relations, retraction by another author, blank fields) or for
-supersession and conflicts beyond the fixture's cases. Those are tested in
-`crates/manyroot/tests/protocol.rs`, except blank artifact names and evidence
-methods, which nothing tests yet.
+The guard does not pin these rules; `crates/manyroot/tests/protocol.rs`
+tests them:
+
+- **Validity:** a relation's `from` and `to` differ (rule 6).
+- **Acceptance:** `min_passes` above 1, distinct authors, and the
+  `validators` set. The fixture uses only the default policy.
+- **Conflicts:** divergence, and the accepted layer's conflicts. The fixture
+  has one open contradiction and no divergence.
+- **Replication:** merging two replicas by set union. Opening the fixture
+  does pin that a contribution is added once its parents are present.
+
+These lists say what each test was written to pin, not that a rule can't be
+loosened in a way no test notices. Gaps are found by mutation: changing one
+rule at a time in `crates/manyroot/src` and checking that `cargo test
+--workspace` fails. That sweep is a standing task (`7c6e5b8b4326` in this
+repository's Ground), and every surviving mutant it finds is either pinned
+by a new test or listed here. One check has no mutant that changes
+behaviour: evidence counts only for its own target, but the reader only
+looks at a subject's referrers, and evidence refers to nothing but its
+target.
 
 Changing a pinned value or the fixture is a protocol change: it needs
 independent review, the manager's go (logged as `owner-review`) and a migration note in

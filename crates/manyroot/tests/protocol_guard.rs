@@ -4,9 +4,9 @@
 //! If a test here fails, the change you made alters the protocol or the
 //! storage format, and every existing Ground (this repo's own `.bracken/`
 //! included) may no longer open. Don't update the pinned values to make the
-//! test pass. A protocol change needs independent review, the owner's go and
-//! a migration note in `docs/releases.md`; see "Protocol guard" in
-//! `docs/protocol.md`.
+//! test pass. A protocol change needs independent review, the manager's go
+//! (logged as `owner-review`) and a migration note in `docs/releases.md`; see
+//! "Protocol guard" in `docs/protocol.md`.
 
 use std::path::{Path, PathBuf};
 
@@ -211,11 +211,14 @@ fn other_protocol_versions_and_grounds_are_rejected() {
     let alice = identity(ALICE);
     let graph = Graph::new(GROUND);
 
-    let mut content = Contribution::create(GROUND, &alice, [], 1, claim("from the future", &[])).content().clone();
-    content.protocol = 2;
-    let future = Contribution::decode(&wire(&content, alice.sign(&content.id()))).unwrap();
-    assert!(future.signature_is_valid(), "validly signed, so only the version check can reject it");
-    assert_eq!(graph.check(&future), Err(RuleViolation::UnsupportedProtocol(2)));
+    // Versions on both sides of 1, so neither '>' nor '<' passes for '!='.
+    for version in [0, 2] {
+        let mut content = Contribution::create(GROUND, &alice, [], 1, claim("other version", &[])).content().clone();
+        content.protocol = version;
+        let other = Contribution::decode(&wire(&content, alice.sign(&content.id()))).unwrap();
+        assert!(other.signature_is_valid(), "validly signed, so only the version check can reject it");
+        assert_eq!(graph.check(&other), Err(RuleViolation::UnsupportedProtocol(version)));
+    }
 
     let elsewhere = Contribution::create(GroundId([0x68; 32]), &alice, [], 1, claim("elsewhere", &[]));
     assert!(matches!(graph.check(&elsewhere), Err(RuleViolation::WrongGround { .. })));
@@ -254,11 +257,74 @@ fn the_size_limit_is_exactly_16_mib() {
     assert_eq!(at_limit.encode().len(), LIMIT);
     assert_eq!(Graph::new(GROUND).check(&at_limit), Ok(()));
     assert!(Contribution::decode(&at_limit.encode()).is_ok());
+    let mut bytes = Vec::new();
+    bundle::write(&mut bytes, GROUND, [at_limit.clone()]).unwrap();
+    let (_, read) = bundle::read(bytes.as_slice()).expect("a bundle entry of exactly 16 MiB reads");
+    assert_eq!(read, [at_limit]);
 
     let over = sized(LIMIT - overhead + 1);
     assert_eq!(Graph::new(GROUND).check(&over), Err(RuleViolation::TooLarge(LIMIT + 1)));
     let result = Contribution::decode(&over.encode());
     assert!(matches!(result, Err(contribution::DecodeError::TooLarge(n)) if n == LIMIT + 1), "got {result:?}");
+}
+
+/// Unicode 17.0's White_Space characters: the only ones that make a field
+/// blank (docs/protocol.md, rule 8).
+const WHITE_SPACE: [char; 25] = [
+    '\u{9}', '\u{a}', '\u{b}', '\u{c}', '\u{d}', '\u{20}', '\u{85}', '\u{a0}', '\u{1680}', '\u{2000}', '\u{2001}',
+    '\u{2002}', '\u{2003}', '\u{2004}', '\u{2005}', '\u{2006}', '\u{2007}', '\u{2008}', '\u{2009}', '\u{200a}',
+    '\u{2028}', '\u{2029}', '\u{202f}', '\u{205f}', '\u{3000}',
+];
+
+/// Characters other languages' trims treat as space that are not blank here:
+/// U+FEFF (JavaScript), U+001C to U+001F (Python), U+200B, and U+180E (White_Space
+/// before Unicode 6.3).
+const NOT_BLANK: [char; 7] = ['\u{feff}', '\u{200b}', '\u{180e}', '\u{1c}', '\u{1d}', '\u{1e}', '\u{1f}'];
+
+/// The three fields rule 8 applies to, each filled with `text`, and the name
+/// `RuleViolation::Empty` reports for it.
+fn rule_8_fields(text: &str, target: ContributionId) -> [(Body, &'static str); 3] {
+    [
+        (claim(text, &[]), "claim statement"),
+        (Body::Artifact { name: text.into(), media_type: "text/plain".into(), content: vec![] }, "artifact name"),
+        (evidence(target, Verdict::Pass, text, ""), "evidence method"),
+    ]
+}
+
+#[test]
+fn blank_statements_names_and_methods_are_rejected() {
+    let alice = identity(ALICE);
+    let mut graph = Graph::new(GROUND);
+    let target = Contribution::create(GROUND, &alice, [], 1, claim("target", &[]));
+    let target_id = target.id();
+    graph.insert(target).unwrap();
+
+    let all: String = WHITE_SPACE.iter().collect();
+    let blanks = ["".to_string(), all].into_iter().chain(WHITE_SPACE.iter().map(char::to_string));
+    for blank in blanks {
+        for (body, field) in rule_8_fields(&blank, target_id) {
+            let c = Contribution::create(GROUND, &alice, [target_id], 2, body);
+            assert_eq!(graph.check(&c), Err(RuleViolation::Empty(field)), "{field} {blank:?}");
+        }
+    }
+    for not_blank in NOT_BLANK {
+        // Alone and surrounded by blanks: neither is blank.
+        for text in [not_blank.to_string(), format!(" \u{3000}{not_blank}\u{85}\n")] {
+            for (body, field) in rule_8_fields(&text, target_id) {
+                let c = Contribution::create(GROUND, &alice, [target_id], 2, body);
+                assert_eq!(graph.check(&c), Ok(()), "{field} {text:?} is not blank");
+            }
+        }
+    }
+}
+
+#[test]
+fn the_toolchain_agrees_on_white_space() {
+    // Rule 8 follows Rust's char::is_whitespace, which follows the toolchain's
+    // Unicode version. If a toolchain upgrade changes the set, validity changes
+    // with it: that is a protocol change, not an upgrade.
+    let found: Vec<char> = (0..=0x10ffff).filter_map(char::from_u32).filter(|c| c.is_whitespace()).collect();
+    assert_eq!(found, WHITE_SPACE, "Unicode {:?}", char::UNICODE_VERSION);
 }
 
 #[test]
@@ -289,6 +355,122 @@ fn parents_must_be_strictly_ascending_and_list_every_reference() {
     let about_a = Contribution::create(GROUND, &alice, [b], 3, evidence(a, Verdict::Pass, "review", ""));
     assert_eq!(graph.check(&about_a), Ok(()));
     assert_eq!(graph.check(&with_parents(&about_a, vec![b])), Err(RuleViolation::UnlistedReference(a)));
+
+    // A relation references both ends: each must be listed.
+    let link = Contribution::create(GROUND, &alice, [a, b], 3, relate(a, RelationKind::Supports, b, ""));
+    assert_eq!(graph.check(&link), Ok(()));
+    assert_eq!(graph.check(&with_parents(&link, vec![b])), Err(RuleViolation::UnlistedReference(a)));
+    assert_eq!(graph.check(&with_parents(&link, vec![a])), Err(RuleViolation::UnlistedReference(b)));
+
+    // So does a retract. Its target must be listed even when the replica holds
+    // it, and a target the replica lacks is refused the same way, not looked up.
+    let retract_a = Contribution::create(GROUND, &alice, [a, b], 3, Body::Retract { target: a, reason: "".into() });
+    assert_eq!(graph.check(&retract_a), Ok(()));
+    assert_eq!(graph.check(&with_parents(&retract_a, vec![b])), Err(RuleViolation::UnlistedReference(a)));
+    let absent = Contribution::create(GROUND, &alice, [], 9, claim("never added", &[])).id();
+    let retract_absent =
+        Contribution::create(GROUND, &alice, [b], 3, Body::Retract { target: absent, reason: "".into() });
+    assert_eq!(graph.check(&with_parents(&retract_absent, vec![b])), Err(RuleViolation::UnlistedReference(absent)));
+}
+
+#[test]
+fn every_parent_must_be_present() {
+    let alice = identity(ALICE);
+    let mut ids: Vec<Contribution> =
+        (1..=3).map(|t| Contribution::create(GROUND, &alice, [], t, claim(&format!("parent {t}"), &[]))).collect();
+    ids.sort_by_key(Contribution::id);
+    let [first, middle, last] = <[Contribution; 3]>::try_from(ids).unwrap();
+    let parents = [first.id(), middle.id(), last.id()];
+
+    // Only the first and last are present, so neither checking only the first
+    // parent nor only the last one finds the gap.
+    let mut graph = Graph::new(GROUND);
+    graph.insert(first).unwrap();
+    graph.insert(last).unwrap();
+    let child = Contribution::create(GROUND, &alice, parents, 4, claim("child", &[]));
+    assert_eq!(graph.check(&child), Err(RuleViolation::MissingParent(middle.id())));
+    graph.insert(middle).unwrap();
+    assert_eq!(graph.check(&child), Ok(()));
+}
+
+#[test]
+fn only_the_author_can_retract_any_kind() {
+    let (alice, bob) = (identity(ALICE), identity(BOB));
+    let mut graph = Graph::new(GROUND);
+    let add = |graph: &mut Graph, who: &Identity, body: Body| {
+        let heads: Vec<ContributionId> = graph.heads().collect();
+        let c = Contribution::create(GROUND, who, heads, 1, body);
+        let id = c.id();
+        graph.insert(c).unwrap();
+        id
+    };
+    let first = add(&mut graph, &alice, claim("first", &[]));
+    let second = add(&mut graph, &alice, claim("second", &[]));
+    // One of bob's contributions of every kind.
+    let bobs_claim = add(&mut graph, &bob, claim("bob's claim", &[]));
+    let bobs = [
+        bobs_claim,
+        add(
+            &mut graph,
+            &bob,
+            Body::Artifact { name: "bob.rs".into(), media_type: "text/x-rust".into(), content: vec![] },
+        ),
+        add(&mut graph, &bob, relate(first, RelationKind::Supports, second, "")),
+        add(&mut graph, &bob, evidence(first, Verdict::Fail, "review", "")),
+        add(&mut graph, &bob, Body::Retract { target: bobs_claim, reason: "no".into() }),
+    ];
+    let heads: Vec<ContributionId> = graph.heads().collect();
+    for target in bobs {
+        let by_alice =
+            Contribution::create(GROUND, &alice, heads.clone(), 2, Body::Retract { target, reason: "".into() });
+        assert_eq!(graph.check(&by_alice), Err(RuleViolation::RetractByOther(target)));
+        let by_bob = Contribution::create(GROUND, &bob, heads.clone(), 2, Body::Retract { target, reason: "".into() });
+        assert_eq!(graph.check(&by_bob), Ok(()));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Causal order: every replica holding the same set must list it the same way.
+// ---------------------------------------------------------------------------
+
+/// A root, three concurrent children, a grandchild under one of them, and a
+/// merge on top. The grandchild's id sorts below one of its parent's
+/// siblings, so the order differs from sorting by depth and then id.
+fn concurrent_graph() -> Graph {
+    let alice = identity(ALICE);
+    let mut graph = Graph::new(GROUND);
+    let add = |graph: &mut Graph, parents: Vec<ContributionId>, statement: &str| {
+        let c = Contribution::create(GROUND, &alice, parents, 1, claim(statement, &[]));
+        let id = c.id();
+        graph.insert(c).unwrap();
+        id
+    };
+    let root = add(&mut graph, vec![], "root");
+    let first = add(&mut graph, vec![root], "first");
+    add(&mut graph, vec![root], "second");
+    add(&mut graph, vec![root], "third");
+    add(&mut graph, vec![first], "builds on first");
+    let heads: Vec<ContributionId> = graph.heads().collect();
+    add(&mut graph, heads, "merge");
+    graph
+}
+
+/// `concurrent_graph`'s causal order: always the smallest id whose parents
+/// are all listed.
+const CAUSAL_ORDER: [&str; 6] = [
+    "3b7fb917d1debc949ed17b3a11eb152d6d153b073b60b3672bca63cdcd180189", // root
+    "2acdf47f087def5013aed5efa7863678b477cf859a36ca8318e6c46774878bb6", // third
+    "765d023515e7236d2eb0adfe1f34c18b04a1826df68ad86fa2eb2b96c035bcdc", // first
+    "10c60e00e284f05bf84c32e620b7badf114bca761b5a7f245448ee7692f35aaa", // builds on first
+    "8b3198d15c2057416048aad1eadc83e397331501a0041ee3bc130aec22a5ff6a", // second
+    "2baa1d6a46fe942b533a294c69d5325a7ee4f13a44007034fd91dcf4bbbd79fa", // merge
+];
+
+#[test]
+fn causal_order_breaks_ties_by_ascending_id() {
+    let graph = concurrent_graph();
+    let order: Vec<String> = graph.topo_order().iter().map(ContributionId::to_hex).collect();
+    assert_eq!(order, CAUSAL_ORDER);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,13 +497,40 @@ fn bundles_encode_to_pinned_bytes() {
     assert_eq!(ids, [VECTORS[0].id, VECTORS[1].id]);
 }
 
+#[test]
+fn bundles_with_another_magic_an_oversized_entry_or_a_cut_are_rejected() {
+    let mut bytes = hex::decode(pinned_bundle()).unwrap();
+    bytes[7] = b'2'; // "MRBUNDL2"
+    let result = bundle::read(bytes.as_slice());
+    assert!(matches!(result, Err(bundle::BundleError::BadMagic)), "got {result:?}");
+
+    // The length prefix alone is enough to refuse an entry over the limit.
+    let oversized = format!("4d5242554e444c31{}01000001", "67".repeat(32));
+    let result = bundle::read(hex::decode(oversized).unwrap().as_slice());
+    assert!(matches!(result, Err(bundle::BundleError::TooLarge(0x0100_0001))), "got {result:?}");
+
+    // A bundle must end exactly after an entry: cut inside a length prefix or
+    // inside an entry, it is refused rather than read as shorter.
+    let whole = hex::decode(pinned_bundle()).unwrap();
+    let in_prefix = [whole.as_slice(), &[0, 0]].concat();
+    let in_entry = &whole[..whole.len() - 1];
+    for (what, bytes) in [("inside a length prefix", in_prefix.as_slice()), ("inside an entry", in_entry)] {
+        let result = bundle::read(bytes);
+        assert!(
+            matches!(&result, Err(bundle::BundleError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "cut {what}: got {result:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixture Ground: a replica on disk, as version 0.1.0 wrote it.
 // ---------------------------------------------------------------------------
 
 /// Pinned ids of the fixture's subjects and their statuses under the default
-/// policy: every status, and the precedence between them.
-const FIXTURE_STATUSES: [(&str, Status); 11] = [
+/// policy: every status, the precedence between them, and which evidence and
+/// retractions count.
+const FIXTURE_STATUSES: [(&str, Status); 19] = [
     // "tokens expire after one hour"
     ("f844bc81e7bc741a5b952acd65cb0346c6c57324468fad777381b0b8121470c8", Status::Superseded),
     // auth.rs
@@ -336,6 +545,23 @@ const FIXTURE_STATUSES: [(&str, Status); 11] = [
     ("f34348d4d6c2c099688dd8b79194860dbfd44b5cdaca73e2c6659a1499b353ec", Status::Pending),
     // "rotate signing keys daily": retracted, with a counted fail
     ("98355b3ed012fa04b1559f12fe161d6a992ecf1c42babcc5d5ace0e4971f4fe2", Status::Retracted),
+    // "log every token refresh": only its author's own pass
+    ("ea0230e6bddf4ea7ede42560eb7c62ada33ca82c3114dd92edf7a4307174e90b", Status::Pending),
+    // "refresh tokens on every request": its only pass was retracted
+    ("a6b69433bb43db6ea5bd56890b713c87763782572d2e59552d606d82521ee22e", Status::Pending),
+    // "expire idle sessions after a day": its retraction was retracted
+    ("c96904fbfdd556a74959b71240c368c11404253b13090ff9c96c30c04fc2d054", Status::Accepted),
+    // "access tokens last five minutes": the supersedes relation from the
+    // accepted "one minute" was retracted
+    ("5b6e7106faa60967493e69a31d6c93f28b784848e6ee9fdf590ea56a8074fe4e", Status::Accepted),
+    // "access tokens last one minute"
+    ("b9e3e40a5435192c9100df854a60d946834abab7cf7d34d57caae2934be0b5ee", Status::Accepted),
+    // "tokens never expire": rejected, and an accepted claim supersedes it
+    ("6b16bcc6cbc040a4c21b2207781cc1417b12a3073aaab855a3003f59772b642c", Status::Rejected),
+    // "tokens expire at midnight": pending, and an accepted claim supersedes it
+    ("ff5c06fc616430d8ecea452ac1ab4cc16c9fcef0689da5fcc0e5afdd4a388159", Status::Pending),
+    // "refresh tokens last a week": accepted, and a pending claim supersedes it
+    ("49bf8b8a9418a4712ba827f6ebb95d288a8594925c35f5c8acd97016b80b1075", Status::Accepted),
     // Appended for the supersession rule (decision 4c55e65bc290).
     // "tokens expire after 90 minutes": bob's, claims to supersede alice's
     // "two hours", which stays accepted above because that doesn't count
@@ -398,40 +624,74 @@ fn fixture_covers_every_kind() {
 }
 
 /// Every contribution id in the fixture, sorted.
-const FIXTURE_IDS: [&str; 33] = [
+const FIXTURE_IDS: [&str; 67] = [
+    "089a140f7c9515bd3f6e9086a8b372ee87b22be916a1144217fdaf8d001fe888",
     "15b433921525a23fc72d03b75e948c93952ab5f7a6e8ea975546016b0094ac48",
     "178367f61edbdd30afc59a23f772edf3180876289327a18467640f8802fed1c6",
     "222245bf60eb1e6375b992b7a7cb5df7990be4182570f02da538bbc93b4b5c79",
+    "22e77a4d0c838d88c1b5ec22440560fbfa6567e494b1f936e7a037e2e40fe094",
+    "253e5ef940d5ff8118344a12113a1d4b7a5b0d749acdc23983e3fc042a971066",
+    "2fe19c16262e94617083e8af9d1243e260baab74519d74f493591df63051a82d",
     "34838f28015d42849a3ea06f0a5bb0381bf4920a75f3ffdf71620d22b1fd38a3",
+    "49bf8b8a9418a4712ba827f6ebb95d288a8594925c35f5c8acd97016b80b1075",
     "4db47ffb86e0fc48c535fd9939b2ab9c73e90992b1a95d148abadf240e4eb40e",
     "4eedeb02e6ef7a23c18352a3a70a22ac98dbe57e62887eb078b6a3bc9827901e",
     "51672e5f18a0ac576460395991392b0dce47c002049c916d25080b037d1f4d44",
+    "5307a3d5f3a84cb0e16ab3bc91ce618aafdaa4bea3d47d891d6d6ee4de8e8fe2",
+    "5a854eda070a7b8c6a3c651ad20f56efd5d337f11d4a3cdcf4d26809d8b1e871",
+    "5b6e7106faa60967493e69a31d6c93f28b784848e6ee9fdf590ea56a8074fe4e",
     "6172802e2bc6d3930339e877c47ef8bc89efebc327fa8a42d7d0f89d2c1bfe85",
+    "631ee6dfd00d8aafcbe4eab55bb8ba96b386824473027a4bd579dfbe8ca1d69c",
+    "641b3d010dc95a01b313cbcff92d929d88a9755d3cedbce579d479e61d21feb0",
+    "65fecf2d36e22532ccef3b4c6edabf186bba98fecca1dd0f4462d62a12af058f",
     "660d33f71236a66f412490ef71202e299d19afd0faecba64c8c19e503146715c",
     "6924e584cd3aa6a11702bf51be4404af6ac93ab76196b9adcb65b6d9ed74af5d",
+    "6b16bcc6cbc040a4c21b2207781cc1417b12a3073aaab855a3003f59772b642c",
     "6c51c956c53b61728e823de4dcddd7017aef5e1f38659b0f78f103f94565ded8",
+    "6ea3e6e109cb1cdea1a34394e550b2ed4663cf9f1c17a89145ebbb65a8c8afd0",
+    "700d800b50500467c00c44db5116066b92414c89bc09f1b057f1b8e5c6f5c7f4",
     "76178bfa7147234c4892fed630ae51dafc19b3a879f5a92f2e0a8852391168c3",
     "7639fc3e700c95c879504ce3667dfb72f2a2e7d99b743f68b2228dd22c05f048",
+    "7ccf1c7a19e53c0007b144866f80b0213abb00228fc208b02f3f9fa2e29cfb15",
     "7d94bd0888a748f8f4fd82afe64616a716c1fca03e8aff821f1127184986239c",
     "808d58df5d4f5570a40eece2e4c9c5f14ca550643ae508527d2ff410bd00ba6b",
+    "877da79d7f9d88398c6a832e7c5bceaf89d2b197e78523f3b42cf6f10c9794e5",
+    "9137e78fab67297a58c2e27f5537282534f5a60e04534ab00c2ddb0083e4351d",
     "964254b1499d51a3b3f09d2c7bb7b6d12456f394495837b8444737faebbbebba",
+    "96d51619a125c9e2d7d1296d55af5ced405cb6009cd0b6f7e4c471af53d5ad35",
     "98355b3ed012fa04b1559f12fe161d6a992ecf1c42babcc5d5ace0e4971f4fe2",
+    "a6b69433bb43db6ea5bd56890b713c87763782572d2e59552d606d82521ee22e",
     "a7a43fb2aba5b6eb830790052802f708780d08dbd02f268496ad2993fc76104f",
+    "ac2c42474ce976ae53ef51a17bbd0afc00a091408d440d625385d4677592cb39",
+    "ade0362958b76a99e486532449984db31f644ad5009229b5e2267e817d7da8ef",
+    "ae7ca352032bf0c1a538aaab455148843ba9f8b7df45a643afe6650bec16d488",
     "b94165ce6e141d541e770dbfab33de769ffca2cca43170e98e01ae38c9dc6314",
+    "b9e3e40a5435192c9100df854a60d946834abab7cf7d34d57caae2934be0b5ee",
+    "b9f098fa1c72a49d00756c03a58513750a0c23df5834f85f8aae65e896e88c38",
     "bac6e7a4abcb3cde1b9bc6b89ebe5ce8e35c03d4def68db239464ccce1afd2b1",
     "be7454450a144d7991ed5d4b1edf738e106cb0caeb6eb4eddbd681e5f6781452",
     "becb406c3f2ca5ec53aa8980062a363d301d644c1abfaff5020fd94e475fa7ee",
+    "bf2f0a2a922bce1e9d317947fa3923da1b393ab3b47c77089473f242332d3b15",
     "c2c0a2141cf90d3142a79d77f7ea606c7b9c443702488ae39c94740e2449aaf9",
     "c76ceda569128634a7967495f46756587d02f5d592ac5c18952e070483bb5f2e",
     "c8e94d5a68b5cadb611588c1064ef1198375e02d63de193e985c442cf8fecfb8",
+    "c96904fbfdd556a74959b71240c368c11404253b13090ff9c96c30c04fc2d054",
     "d7f4c3ac87730f5c5eb6c8dc040f4825134328fd47361bd38da342b41ab57108",
     "e37f81ed02ed8188b061058a223c74807b86953db7852509c9c06a636e9a816f",
     "e628ba51cba47bed175d752d922751649a9cfb651312f26a14ca516c79a5f443",
+    "e6f57c27bcc8fd0cc0c966f27e081f7a18902825f0730df23cef9a9add4c4c0f",
+    "ea0230e6bddf4ea7ede42560eb7c62ada33ca82c3114dd92edf7a4307174e90b",
+    "f114139d814ca8bf625936ad4ba5b71bd1272a981f3f88386f8f36b97b00b50a",
+    "f1dc00164e01012bb62de226e25fa22db8fdabdc9607144307125fc021c71461",
     "f2cf2005456cf8de1a13a4dfdeab069ad762f15b44943bcbff585aedca796114",
     "f34348d4d6c2c099688dd8b79194860dbfd44b5cdaca73e2c6659a1499b353ec",
     "f732a8371497252331f513156a478bc66aa87891d5f48ca25826c6fabcf7b6eb",
     "f844bc81e7bc741a5b952acd65cb0346c6c57324468fad777381b0b8121470c8",
     "f9a3bb0a9f2ef6f3bc0579c40756381be95f5657e6816d17f6b2c5aa3d0fc305",
+    "fa114eb6e5c49258ec3144806d5096a2216e658af76c2d37db886a1ff5f1416d",
+    "fcc2dcfb58615b1d8e480e2cfd052cf7b83dbb82e3560b57fd06f88637c962c2",
+    "fd584a18ebc810fb51c77b1396de10e7b7768ff6d7464fee709b8e9bc5af7b74",
+    "ff5c06fc616430d8ecea452ac1ab4cc16c9fcef0689da5fcc0e5afdd4a388159",
 ];
 
 #[test]
@@ -457,8 +717,19 @@ fn fixture_ground_opens_and_verifies() {
         let id: ContributionId = id.parse().unwrap();
         assert_eq!(policy.assess(graph, &id).map(|a| a.status), Some(status), "status of {id}");
     }
-    assert_eq!(open_conflicts(graph).len(), 1);
-    assert!(matches!(open_conflicts(graph)[0], Conflict::Contradiction { .. }));
+    // Only one contradiction. The others in the fixture are retracted, between
+    // evidence rather than subjects, against a superseded subject, or from a
+    // retracted subject.
+    let id = |hex: &str| hex.parse::<ContributionId>().unwrap();
+    assert_eq!(
+        open_conflicts(graph),
+        [Conflict::Contradiction {
+            relation: id("808d58df5d4f5570a40eece2e4c9c5f14ca550643ae508527d2ff410bd00ba6b"),
+            a: id("f34348d4d6c2c099688dd8b79194860dbfd44b5cdaca73e2c6659a1499b353ec"),
+            b: id("6c51c956c53b61728e823de4dcddd7017aef5e1f38659b0f78f103f94565ded8"),
+        }]
+    );
+
     // Only the target's author can supersede it, with a replacement anyone wrote.
     let redis: ContributionId = "f34348d4d6c2c099688dd8b79194860dbfd44b5cdaca73e2c6659a1499b353ec".parse().unwrap();
     let failed: ContributionId = "4eedeb02e6ef7a23c18352a3a70a22ac98dbe57e62887eb078b6a3bc9827901e".parse().unwrap();
@@ -514,7 +785,7 @@ fn fixture_holds_no_private_keys() {
 /// cargo test -p manyroot --test protocol_guard -- --ignored write_ground_v1_fixture
 /// ```
 #[test]
-#[ignore = "rewrites the checked-in fixture; run only with the owner's go"]
+#[ignore = "rewrites the checked-in fixture; a protocol change, see docs/protocol.md"]
 fn write_ground_v1_fixture() {
     let dir = fixture_dir();
     let mut store = Store::create(&dir, GroundInfo { ground: GROUND, name: "ground-v1".into() }).unwrap();
@@ -528,13 +799,17 @@ fn write_ground_v1_fixture() {
         std::fs::write(store.agents_dir().join(format!("{}.json", who.name())), json).unwrap();
     }
 
-    let mut t = 1_793_000_000_000;
-    let mut add = |store: &mut Store, who: &Identity, body: Body| {
-        t += 1000;
-        let heads: Vec<ContributionId> = store.graph().heads().collect();
-        let c = Contribution::create(GROUND, who, heads, t, body);
+    // Each contribution builds on the tip of its line of work, one second after
+    // the one before it. Until the fork below there is one line, so the tip is
+    // every causal head.
+    let tip: std::cell::RefCell<Vec<ContributionId>> = Default::default();
+    let clock = std::cell::Cell::new(1_793_000_000_000u64);
+    let add = |store: &mut Store, who: &Identity, body: Body| {
+        clock.set(clock.get() + 1000);
+        let c = Contribution::create(GROUND, who, tip.take(), clock.get(), body);
         let id = c.id();
         assert!(store.add(c).unwrap());
+        tip.replace(vec![id]);
         id
     };
 
@@ -572,6 +847,11 @@ fn write_ground_v1_fixture() {
     add(&mut store, &bob, evidence(rotate, Verdict::Fail, "review", "too often"));
     add(&mut store, &carol, Body::Retract { target: rotate, reason: "premature".into() });
 
+    // The fixture forks here into two concurrent lines of work, appended by two
+    // pull requests from this same point. Each keeps the parents and clock it
+    // had alone, so neither line's ids depend on the other.
+    let fork = (tip.borrow().clone(), clock.get());
+
     // Appended for the supersession rule (decision 4c55e65bc290): a supersedes
     // relation counts only when its author wrote the contribution it replaces.
     // Everything above is unchanged, so its ids are too.
@@ -590,6 +870,46 @@ fn write_ground_v1_fixture() {
     // 780f658d4b84): "keep sessions in redis" stays current.
     let postgres = add(&mut store, &bob, claim("keep sessions in postgres", &[]));
     add(&mut store, &bob, relate(postgres, RelationKind::Supersedes, redis, ""));
+
+    // The second line: protocol guard cases, from the fork point.
+    tip.replace(fork.0);
+    clock.set(fork.1);
+    let own = add(&mut store, &alice, claim("log every token refresh", &[]));
+    add(&mut store, &alice, evidence(own, Verdict::Pass, "self-review", ""));
+    let withdrawn = add(&mut store, &alice, claim("refresh tokens on every request", &[]));
+    let pass = add(&mut store, &bob, evidence(withdrawn, Verdict::Pass, "review", "looked fine"));
+    add(&mut store, &bob, Body::Retract { target: pass, reason: "reviewed the wrong commit".into() });
+    let restored = add(&mut store, &bob, claim("expire idle sessions after a day", &[]));
+    let retraction = add(&mut store, &bob, Body::Retract { target: restored, reason: "too long".into() });
+    add(&mut store, &bob, Body::Retract { target: retraction, reason: "a day is fine".into() });
+    add(&mut store, &carol, evidence(restored, Verdict::Pass, "review", ""));
+    let five = add(&mut store, &alice, claim("access tokens last five minutes", &[]));
+    add(&mut store, &carol, evidence(five, Verdict::Pass, "review", ""));
+    let one = add(&mut store, &alice, claim("access tokens last one minute", &[]));
+    add(&mut store, &carol, evidence(one, Verdict::Pass, "review", ""));
+    let replaces = add(&mut store, &alice, relate(one, RelationKind::Supersedes, five, ""));
+    add(&mut store, &alice, Body::Retract { target: replaces, reason: "one minute is too short".into() });
+    let clash = add(&mut store, &bob, relate(five, RelationKind::Contradicts, one, "pick one"));
+    add(&mut store, &bob, Body::Retract { target: clash, reason: "they answer different questions".into() });
+    // Only an accepted subject is reported superseded, and only by an accepted one.
+    let never = add(&mut store, &alice, claim("tokens never expire", &[]));
+    let unsafe_fail = add(&mut store, &bob, evidence(never, Verdict::Fail, "review", "unsafe"));
+    let midnight = add(&mut store, &alice, claim("tokens expire at midnight", &[]));
+    let idle = add(&mut store, &alice, claim("tokens expire after an hour idle", &[]));
+    let idle_pass = add(&mut store, &carol, evidence(idle, Verdict::Pass, "review", ""));
+    add(&mut store, &alice, relate(idle, RelationKind::Supersedes, never, ""));
+    add(&mut store, &alice, relate(idle, RelationKind::Supersedes, midnight, ""));
+    let week = add(&mut store, &alice, claim("refresh tokens last a week", &[]));
+    add(&mut store, &carol, evidence(week, Verdict::Pass, "review", ""));
+    let month = add(&mut store, &alice, claim("refresh tokens last a month", &[]));
+    add(&mut store, &alice, relate(month, RelationKind::Supersedes, week, ""));
+    // Open conflicts are only between current, unretracted subjects.
+    add(&mut store, &carol, relate(idle_pass, RelationKind::Contradicts, unsafe_fail, "evidence isn't a subject"));
+    let logout = add(&mut store, &bob, claim("tokens expire on logout", &[]));
+    add(&mut store, &bob, relate(logout, RelationKind::Contradicts, never, "never is already superseded"));
+    let restart = add(&mut store, &carol, claim("tokens expire on restart", &[]));
+    add(&mut store, &carol, relate(restart, RelationKind::Contradicts, idle, ""));
+    add(&mut store, &carol, Body::Retract { target: restart, reason: "restarts are rare".into() });
 }
 
 /// One sync message of every type, as pinned bytes (docs/protocol.md, "Sync"). Append new
