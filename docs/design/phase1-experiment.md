@@ -81,32 +81,44 @@ The demo's language, extended just enough to make a library:
 
 - A module is a text file of definitions, one per line:
   `def clamp3 3 : a b max2@ c min2@`. `#` starts a comment. Four modules
-  (`base`, `order`, `arith`, `shape`), about 8 functions each.
+  (`base`, `order`, `arith`, `shape`), 6 to 8 functions each. A module
+  with any line that doesn't parse contributes nothing, as a source file
+  with a syntax error doesn't compile, and a name defined more than once
+  counts as undefined. A module is at most 16 KiB, and errors quote at
+  most 40 characters of a bad word.
 - Functions take up to 3 inputs (`a`, `b`, `c`). `name@` calls another
   function in the library: it pops that function's arity in arguments and
   pushes its result. Calls are resolved by name across all modules, so a
   module depends on others the way source files do.
 - The interpreter stops a program after 10,000 steps or a call depth of 64
   and reports a failure, so no program can hang the grader. It runs inside
-  the harness, in Rust, on integers with wrapping arithmetic, like
-  `task::eval` today. Nothing an agent writes is ever executed any other
+  the harness, in Rust, on integers with wrapping arithmetic, like the
+  demo's `task::eval`. Nothing an agent writes is ever executed any other
   way.
-- About 30 specs in layers: layer 0 needs only the language (`abs`, `sign`,
-  `max2`), layer 1 calls layer 0 (`clamp3`, `dist`, `median3`), and so on up
-  to layer 3, so later functions are only as right as what they call.
-- **6 change requests**, released when the agents have used 40% of all their
-  turns in that mode (the same point in every mode). Each changes a shared
-  contract, for example "`clamp3` now takes `(x, lo, hi)`", so callers must
-  change too, or "`div` now rounds toward negative infinity". A change
-  request made by one agent and not followed by its callers' owners is the
-  experiment's source of semantic conflicts.
+- 30 specs in layers, one layer per module: layer 0 (`base`) needs only the
+  language (`abs`, `sign`, `max2`), layer 1 (`order`) calls layer 0
+  (`clamp3`, `dist`, `median3`), and so on up to layer 3 (`shape`), so later
+  functions are only as right as what they call. The list is `SPECS` in
+  `crates/experiment/src/task.rs`.
+- **6 change requests**, released together when the agents have used 40% of
+  all their turns in that mode (the same point in every mode). Each changes
+  a shared contract: `clamp3` takes `(lo, hi, x)` instead of `(x, lo, hi)`,
+  so its callers must change their code; `sign(0)` becomes 1; `nearer`
+  breaks ties the other way; `between` excludes its upper bound; `abs`
+  saturates instead of wrapping; `spread3` counts the integers spanned, so
+  `flat3`, whose own contract doesn't change, must change its code. A spec
+  defined in terms of a changed function follows it (`dist` follows `abs`),
+  so its code needn't change but its callee's must. A change made by one
+  agent and not followed by the callers' owners is the experiment's source
+  of semantic conflicts.
 
 Each spec has a reference implementation in Rust, at least two correct and
 two subtly wrong candidate programs (for the scripted agents and the tests,
 as in `task.rs` today), and two input sets:
 
-- **Public cases**: about 60 per function, drawn from −6 to 6 as now. The
-  agents' `check` tool runs these and nothing else.
+- **Public cases**: 60 per function, drawn from −6 to 6 as now (a function
+  of one input gets all 13). They are the same in every run. The agents'
+  `check` tool runs these and nothing else.
 - **Hidden cases**: the public ones plus 2,000 seeded draws from −1,000 to
   1,000 and the edge values (0, ±1, `i64::MIN`, `i64::MAX`). Only the grader
   runs them, and they never reach a model. A program that special-cases the
@@ -117,11 +129,19 @@ conflicts measurable:
 
 - **In library**: calls resolve to the library's own versions, as a user of
   the library would see it.
-- **Standalone**: calls resolve to the reference implementations, so only
-  the function's own code is judged.
+- **Standalone**: calls to other specs resolve to the reference
+  implementations, so only the function's own code is judged. That holds
+  only for specs of the function's own layer or a lower one whose contract
+  isn't defined in terms of it; the function itself, an agent's own helper
+  functions, higher layers and specs defined by it resolve in the library,
+  so a program can't score by handing its work back to an oracle of
+  itself.
 
 A function that passes standalone but fails in library is broken by what it
-calls, not by its own code.
+calls, not by its own code. The hidden cases' seed comes from the run's
+plan. In the code, everything an agent may see is in `task` (the language,
+specs, change requests, public cases and `check`), and the hidden cases and
+scores are in `grader`, which `task` never uses; a test checks both.
 
 ## 2. The three modes
 

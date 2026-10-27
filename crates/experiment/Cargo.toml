@@ -1,0 +1,11 @@
+[package]
+name = "bracken-experiment"
+description = "The Phase 1 experiment: three collaboration modes on one task, measured the same way"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+bracken-demo = { path = "../demo" }
