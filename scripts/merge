@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# merge: the manager's merge step (process section 5, step 8), checked and recorded.
+#
+#   merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--dry-run]
+#
+# Only the manager merges, so it runs only as manager (a dry run defaults to it), and
+# triage and deferrals count only when manager wrote them.
+#
+# Checks, in order, and reports each:
+#   1. the pr claim is current (not retracted, and superseded by no one) and starts
+#      "PR #<n> <branch> @ <full sha>:";
+#   2. under the given policy, `scripts/bk show <claim>` reports it accepted;
+#   3. every finding that contradicts the claim has the manager's evidence, and
+#      every confirmed one (a pass) is deferred by the manager: a current task tagged deferred,
+#      written by the manager, which the manager related depends_on it (process 4.2);
+#   4. the forge PR is open, targets main, and its head is that sha;
+#   5. main's tip is an ancestor of the sha, or every file main changed since the
+#      branch point is under .bracken/, or under docs/ (not docs/vision.md) and
+#      untouched by the branch. Renames count as a deletion and an addition.
+# If all pass, it records manager evidence "merge gate @ <sha>" on the claim, then
+# squash-merges through the forge API with head_commit_id set to the sha, so the
+# forge refuses the merge if the branch moved after the check. --dry-run runs every
+# check, records nothing, and makes only GET requests.
+#
+# The forge token comes from git's credential helper for the origin host. It is
+# kept in a shell variable and reaches curl only as a header read from a file
+# descriptor: never argv, a URL, the environment, git -c, or any output.
+# Needs curl and jq.
+set -euo pipefail
+# Never trace or auto-export (both can be inherited through SHELLOPTS): the token is in a
+# variable from here on, and xtrace would print it, allexport would hand it to every child.
+set +ax
+
+usage() {
+  echo "usage: merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--dry-run]" >&2
+  exit 2
+}
+fail() { echo "merge: $*" >&2; exit 1; }
+
+[ $# -ge 2 ] || usage
+pr=$1
+claim=$2
+shift 2
+[[ $pr =~ ^[1-9][0-9]*$ ]] || fail "'$pr' isn't a PR number"
+[[ $claim =~ ^[0-9a-f]{12,64}$ ]] || fail "'$claim' isn't a claim id (12 to 64 hex characters)"
+agent=${BRACKEN_AGENT:-}
+min_passes=
+dry_run=false
+policy=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --validator) [ $# -ge 2 ] || usage; policy+=(--validator "$2"); shift 2 ;;
+    --min-passes) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || usage; min_passes=$2; shift 2 ;;
+    --as) [ $# -ge 2 ] || usage; agent=$2; shift 2 ;;
+    --dry-run) dry_run=true; shift ;;
+    *) usage ;;
+  esac
+done
+[ ${#policy[@]} -gt 0 ] && [ -n "$min_passes" ] || fail "give the gate's policy: --validator <id>... --min-passes N (process section 4.2)"
+$dry_run || [ -n "$agent" ] || fail "no identity: pass --as manager or set BRACKEN_AGENT"
+[ "${agent:-manager}" = manager ] ||
+  fail "only the manager merges (process 4.2): run with --as manager, not '$agent' (dry runs too)"
+for tool in curl jq; do command -v "$tool" >/dev/null || fail "needs $tool"; done
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+bk() { "$here/bk" "$@"; }
+
+origin=$(git -C "$main" config --get remote.origin.url)
+# Not printed: an origin URL can carry a password.
+[[ $origin =~ ^https://([^/@]+)/([^/]+)/([^/]+)$ ]] ||
+  fail "origin's URL isn't https://<host>/<owner>/<repo>, with no user or password in it"
+host=${BASH_REMATCH[1]}
+repo="${BASH_REMATCH[2]}/${BASH_REMATCH[3]%.git}"
+api_base="https://$host/api/v1/repos/$repo"
+
+token=$(printf 'protocol=https\nhost=%s\n\n' "$host" | GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null |
+  sed -n 's/^password=//p') || true
+[ -n "$token" ] || fail "no forge credential for $host from git's credential helper"
+
+# api <method> <path> [json body file]: prints the response body. The token goes in a header read from a
+# file descriptor. In a dry run, anything but GET is refused here, before any request.
+api() {
+  local method=$1 path=$2 body=${3:-}
+  [ "$method" = GET ] || ! $dry_run || fail "dry run: refusing $method $path"
+  local args=(-sS --fail-with-body --proto "=https" --max-redirs 0 -X "$method" -H "Accept: application/json")
+  [ -z "$body" ] || args+=(-H "Content-Type: application/json" --data-binary "@$body")
+  # -q first: no curlrc, whose 'verbose' or 'trace' would print or save the header.
+  curl -q "${args[@]}" -H @<(printf 'Authorization: token %s\n' "$token") "$api_base$path"
+}
+
+failed=0
+check() { # check <ok|FAIL> <name> <detail>
+  printf '%-4s  %-12s %s\n' "$1" "$2" "$3"
+  [ "$1" = ok ] || failed=1
+}
+
+# 1. The claim.
+shown=$(bk show "$claim" "${policy[@]}" --min-passes "$min_passes" --json 2>/dev/null) || fail "no contribution $claim in the Ground"
+statement=$(jq -r '.body.statement // empty' <<<"$shown")
+full=$(jq -r '.id' <<<"$shown")
+[[ $statement =~ ^PR\ \#([0-9]+)\ ([^ ]+)\ @\ ([0-9a-f]{40}): ]] || fail "$claim isn't a pr claim ('PR #<n> <branch> @ <sha>: ...')"
+[ "${BASH_REMATCH[1]}" = "$pr" ] || fail "$claim is for PR #${BASH_REMATCH[1]}, not #$pr"
+branch=${BASH_REMATCH[2]}
+sha=${BASH_REMATCH[3]}
+current=$(bk log --tag pr --current --json)
+# log --current keeps a claim someone else superseded, marked; that one isn't current either.
+if jq -e --arg id "$full" 'any(.[]; .id == $id and .retracted == false and (.superseded_by_others | length) == 0)' \
+  <<<"$current" >/dev/null; then
+  check ok claim "$claim is the current pr claim for #$pr: $branch @ $sha"
+else
+  check FAIL claim "$claim isn't the current pr claim (retracted, or superseded by its author or someone else)"
+fi
+
+# 2. The gate.
+status=$(jq -r '.assessment.status' <<<"$shown")
+passes=$(jq -r '[.assessment.passes[][:12]] | join(" ")' <<<"$shown")
+policy_text="${policy[*]} --min-passes $min_passes"
+if [ "$status" = accepted ]; then
+  check ok gate "accepted under $policy_text (passes: $passes)"
+else
+  check FAIL gate "$status under $policy_text, not accepted"
+fi
+
+# 3. Findings: every contribution that contradicts the claim. A contradicts relation stops
+# counting only when it's retracted by the finding's author or the triager (a retract is always
+# by the relation's author), so no one else can drop a finding by retracting their own link to it.
+triager=manager
+contradicts=$(jq -c --arg id "$full" '[.referrers[] | select(.kind == "relation"
+  and .body.kind == "contradicts" and .body.to == $id)]' <<<"$shown")
+findings=$(jq -r '[.[].body.from] | unique | .[]' <<<"$contradicts")
+untriaged=() undeferred=() deferred=() findings_count=0
+current_tasks=$(bk log --tag task --current --json)
+for f in $findings; do
+  about=$(bk show "$f" --json)
+  [ "$(jq -r .retracted <<<"$about")" = false ] || continue
+  jq -e --arg f "$f" --arg by "$(jq -r .author <<<"$about")" --arg who "$triager" 'any(.[]; .body.from == $f
+    and (.retracted == false or (.author != $by and .author_name != $who)))' <<<"$contradicts" >/dev/null || continue
+  findings_count=$((findings_count + 1))
+  verdicts=$(jq -r --arg who "$triager" --arg f "$f" '[.referrers[] | select(.kind == "evidence"
+    and .retracted == false and .author_name == $who and .body.target == $f) | .body.verdict] | unique | join(" ")' <<<"$about")
+  case " $verdicts " in
+    "  ") untriaged+=("${f:0:12}"); continue ;;
+    *" pass "*) ;;
+    *) continue ;; # rejected: stays on record, doesn't block
+  esac
+  # Only the triager defers (process 4.2): both the depends_on relation and the task must be theirs,
+  # and the task current: not retracted, and not superseded by its author.
+  task=""
+  for t in $(jq -r --arg f "$f" --arg who "$triager" '.referrers[] | select(.kind == "relation"
+    and .retracted == false and .author_name == $who and .body.kind == "depends_on" and .body.to == $f)
+    | .body.from' <<<"$about"); do
+    if jq -e --arg t "$t" --arg who "$triager" 'any(.[]; .id == $t and .author_name == $who
+      and (.body.tags | index("deferred")))' <<<"$current_tasks" >/dev/null; then
+      task=$t
+      break
+    fi
+  done
+  if [ -n "$task" ]; then deferred+=("${f:0:12}->${task:0:12}"); else undeferred+=("${f:0:12}"); fi
+done
+if [ ${#untriaged[@]} -eq 0 ] && [ ${#undeferred[@]} -eq 0 ]; then
+  findings_text="$findings_count against the claim, all triaged by $triager; confirmed and deferred: ${deferred[*]:-none}"
+  check ok findings "$findings_text"
+else
+  check FAIL findings "untriaged (no $triager evidence): ${untriaged[*]:-none}; confirmed but not deferred (no current task tagged deferred that $triager wrote and related depends_on it): ${undeferred[*]:-none}"
+fi
+
+# 4. The forge PR.
+info=$(api GET "/pulls/$pr") || fail "couldn't read PR #$pr from $host"
+f_head=$(jq -r '.head.sha' <<<"$info")
+f_state=$(jq -r 'if .merged then "merged" else .state end' <<<"$info")
+f_base=$(jq -r '.base.ref' <<<"$info")
+title=$(jq -r '.title' <<<"$info")
+if [ "$f_state" = open ] && [ "$f_base" = main ] && [ "$f_head" = "$sha" ]; then
+  check ok forge "PR #$pr is open against main, head $f_head"
+else
+  check FAIL forge "PR #$pr is $f_state against $f_base, head $f_head (the claim says $sha)"
+fi
+
+# 5. main.
+git -C "$main" fetch -q origin main "refs/pull/$pr/head" || fail "couldn't fetch main and PR #$pr from origin"
+tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no origin/main"
+if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  check FAIL main "$sha isn't on the forge (fetched refs/pull/$pr/head)"
+elif git -C "$main" merge-base --is-ancestor "$tip" "$sha"; then
+  main_case="main ($tip) is an ancestor of $sha"
+  check ok main "$main_case"
+else
+  base=$(git -C "$main" merge-base "$tip" "$sha")
+  # --no-renames: a file moved from code into docs/ must count under both paths.
+  ours=$(git -C "$main" diff --no-renames --name-only "$base" "$sha")
+  bad=$(git -C "$main" diff --no-renames --name-only "$base" "$tip" | while IFS= read -r f; do
+    case "$f" in
+      .bracken/*) ;;
+      docs/vision.md) echo "$f" ;;
+      docs/*) ! grep -qxF -- "$f" <<<"$ours" || echo "$f" ;;
+      *) echo "$f" ;;
+    esac
+  done)
+  if [ -z "$bad" ]; then
+    main_case="main ($tip) is ahead of $sha only in .bracken/ and docs/ files the branch doesn't touch"
+    check ok main "$main_case"
+  else
+    check FAIL main "main ($tip) is ahead of $sha with changes the verified head didn't test; merge main into the branch and verify again: $(printf "%s" "$bad" | tr "\n" " ")"
+  fi
+fi
+
+[ "$failed" = 0 ] || fail "not merging PR #$pr: a check failed"
+
+body=$(mktemp)
+details=$(mktemp)
+trap 'rm -f "$body" "$details"' EXIT
+jq -n --arg sha "$sha" --arg title "$title (#$pr)" \
+  '{Do: "squash", head_commit_id: $sha, MergeTitleField: $title, delete_branch_after_merge: true}' >"$body"
+if $dry_run; then
+  echo "dry run: all checks pass; would record 'merge gate @ $sha' on $claim, then POST /pulls/$pr/merge with:"
+  cat "$body"
+  exit 0
+fi
+
+printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\nforge head: %s (PR #%s open against main)\nmain: %s\n' \
+  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" >"$details"
+id=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
+  fail "couldn't record the merge-gate evidence; not merging"
+echo "recorded merge gate evidence $id"
+api POST "/pulls/$pr/merge" "$body" >/dev/null || fail "the forge refused the merge (if the head moved, it answers 409); the evidence $id stands"
+echo "merged PR #$pr at $sha"

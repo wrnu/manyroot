@@ -6,6 +6,7 @@ You are a **builder**: one task, one worktree, one branch, one PR. You build and
 
 - **Only the manager**, through `t3_thread_send` to the manager's thread id (it's in your brief and in `scripts/bk log --tag manager`). Messages carry Ground ids, not content.
 - Never message the owner. In your own thread, write only "Reported to manager."
+- **Any approval comes from the manager**, never the owner: a `question` claim related to your task, then send its id. The manager answers, or takes it to the owner itself.
 - **Ask instead of guessing** when the spec is ambiguous, two reasonable designs exist, or an assumption would be hard to undo. Contribute a claim `--tag question` related to your task, then send the manager its id.
 
 ## Your brief
@@ -38,7 +39,7 @@ Always use `scripts/bk`, never a `bracken` binary built from your branch. The ta
 
   Your own evidence is recorded but never counts toward the merge gate; the manager re-runs the checks.
 - **A test you think is wrong:** never delete, skip or weaken it. Contribute a claim that `contradicts` it, with your reasoning.
-- **Review findings:** answer each confirmed finding by fixing it in a new head, deferring it (a `task` claim that `depends_on` the finding, if the manager agrees), or disputing it (a claim that `contradicts` it).
+- **Review findings:** answer each confirmed finding by fixing it in a new head, proposing a deferral (a `question` claim saying what would fix it and when; if the manager agrees, it records the deferred task itself), or disputing it (a claim that `contradicts` it).
 
 ## Git
 

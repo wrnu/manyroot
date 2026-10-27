@@ -22,14 +22,17 @@ The classes and the risky ones are defined in [development.md](development.md). 
 | cli, library | security | upgrade the pinned binary afterwards (see below) |
 | merge-gate tooling: all of `scripts/`, `.forgejo/` | security, independent | the change runs its own checks on the PR before it merges |
 | crypto | security, independent | none |
-| protocol, storage | security, independent | the owner's go; a migration note below; upgrade the pinned binary afterwards |
+| protocol, storage | security, independent | the manager's go, logged as `owner-review`; a migration note below; upgrade the pinned binary afterwards |
 
 ## Needs the owner's go
 
+The owner delegated everything else to the manager (decision `adcb78b88c6c`), including protocol-class merges and pinned-binary upgrades, which the manager logs as `owner-review` claims. Still the owner's go:
+
 - Publishing crates; making the repository public; licence changes.
-- Granting other accounts access to `Autimo/manyroot`; changing branch protection.
-- Upgrading the pinned binary when the change touches the protocol or storage format.
-- Anything that costs money, touches an outside system, or adds a schedule or service.
+- Granting access to `Autimo/manyroot`; changing branch protection.
+- Deleting or rewriting history or data: force-push, deleting branches others use, removing Ground files.
+- Creating, exposing or moving credentials and secrets.
+- Spending money; new outside services, infrastructure or schedules; sending data somewhere new.
 
 ## Test reports
 
@@ -56,7 +59,7 @@ If the new binary can't open the Ground, reinstall the previous commit's binary 
 
 Each protocol or storage change adds an entry here: what changed, whether existing Grounds still open, and if not, how to carry them forward. Re-encoding a contribution changes its id, so it has to be signed again, and that needs its author's private key. Without the keys, old contributions stay readable only by a binary that still understands the old format. So a protocol change either keeps reading the old format, or migrates while every key still exists.
 
-The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and owner's go, and the entry here names the fixture that keeps the old format.
+The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
 _No migrations yet._
 

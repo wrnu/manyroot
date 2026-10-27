@@ -373,8 +373,84 @@ fn evidence_details_file_refuses_keys_devices_and_oversized_input() {
 
     assert!(attach("/dev/zero").contains("isn't a regular file"));
 
+    // A FIFO with no writer is refused at once; opening it would block forever.
+    assert!(Command::new("mkfifo").arg(dir.join("fifo")).status().unwrap().success());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
+        .args(["evidence", &c, "pass", "--method", "t", "--details-file", "fifo", "--as", "val"])
+        .current_dir(dir)
+        .env_remove("BRACKEN_DIR")
+        .env_remove("BRACKEN_AGENT")
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(10) {
+            child.kill().unwrap();
+            panic!("--details-file on a FIFO blocked");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("isn't a regular file"));
+
     std::fs::write(dir.join("big.txt"), vec![b'y'; 16 * 1024 * 1024 + 1]).unwrap();
     assert!(attach("big.txt").contains("limit"));
 
     assert_eq!(ids(dir, &["log", "--json"]).len(), before, "nothing was recorded");
+}
+
+#[test]
+fn a_local_private_key_never_reaches_the_ground() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    let public = bracken(dir, &["id", "new", "val"]);
+    let c = bracken(dir, &["claim", "Works", "--as", "val"]);
+    let key_file = dir.join(".bracken/identities/val.json");
+    let identity: Value = serde_json::from_str(&std::fs::read_to_string(&key_file).unwrap()).unwrap();
+    let secret = identity["secret_key"].as_str().unwrap().to_owned();
+    let before = ids(dir, &["log", "--json"]).len();
+    let evidence = |extra: &[&str]| {
+        let mut args = vec!["evidence", &c, "pass", "--method", "t", "--as", "val"];
+        args.extend_from_slice(extra);
+        args.into_iter().map(String::from).collect::<Vec<_>>()
+    };
+    let refused = |args: Vec<String>| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let err = bracken_fails(dir, &args);
+        assert!(err.contains("private key"), "{args:?}: {err}");
+    };
+
+    refused(evidence(&["--details", &format!("log line: {secret}")]));
+    refused(evidence(&["--details", &secret.to_uppercase()]));
+    std::fs::hard_link(&key_file, dir.join("build.log")).unwrap();
+    refused(evidence(&["--details-file", "build.log"]));
+    refused(vec!["claim".into(), format!("the key is {secret}"), "--as".into(), "val".into()]);
+    refused(vec!["artifact".into(), ".bracken/identities/val.json".into(), "--as".into(), "val".into()]);
+    // The key as raw bytes, not hex.
+    let raw: Vec<u8> = (0..32).map(|i| u8::from_str_radix(&secret[2 * i..2 * i + 2], 16).unwrap()).collect();
+    std::fs::write(dir.join("key.bin"), raw).unwrap();
+    refused(vec!["artifact".into(), "key.bin".into(), "--as".into(), "val".into()]);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
+        .args(evidence(&["--details-file", "-"]))
+        .current_dir(dir)
+        .env_remove("BRACKEN_DIR")
+        .env_remove("BRACKEN_AGENT")
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), &std::fs::read(&key_file).unwrap()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("private key"));
+    assert_eq!(ids(dir, &["log", "--json"]).len(), before, "nothing was recorded");
+
+    // A public key, or talk about secret_key, is fine.
+    bracken(
+        dir,
+        &["evidence", &c, "pass", "--method", "t", "--details", &format!("signed by {public}"), "--as", "val"],
+    );
+    bracken(dir, &["claim", "Never commit a file with a secret_key field", "--as", "val"]);
 }

@@ -37,6 +37,10 @@ Agents act alone only on what can't reach users, can't cost money and doesn't to
 
 **Ask first:** merging anything that publishes or deploys (batch these so the owner approves several at once); releases and publishing; billed builds, manual deploys, access or permission changes; `<project-specific gated actions>`; **upgrading the pinned `bracken` binary when the change touches the protocol or storage format**; major process changes, or ones that touch an outside system, send data somewhere new, cost money, add tools, services or schedules, or change how agents work with the owner.
 
+**Delegation.** The owner may delegate their go to the manager for everything but a list of sensitive or destructive actions (the project's list is in `docs/development.md`). The manager then decides the "ask first" items itself and records each such decision as a claim tagged `owner-review` (what, why, how to undo), and reports them to the owner at the next check-in to agree or reverse. A check-in happens when the owner returns or asks: the manager lists `scripts/bk log --tag owner-review --current` and records each answer (section 4.1).
+
+**Builders and reviewers ask the manager** for any approval, never the owner: a `question` claim, then a message. The manager answers within the delegation, and raises an `owner-ask` only for the owner's list.
+
 **An approval covers the step it was given for, not later ones.** "Merge it" doesn't mean "and take it live". The manager records each approval as it's given (section 4.1), quoting the owner, and links it to exactly what it approves.
 
 ## 4. The Ground
@@ -51,6 +55,7 @@ Every agent follows these, so that `scripts/bk log --tag <tag>` answers the team
 | Decision | claim, tag `decision`: "Owner, 2026-10-27: <decision>. Why: <reason>" | manager (quoting the owner) or owner |
 | Owner approval | claim, tag `approval`: quote, date, scope; `relate <approval> supports <thing approved>` | manager or owner |
 | Owner ask | claim, tag `owner-ask`; retract it once it's answered and the answer is recorded | manager |
+| Owner review | claim, tag `owner-review`: a decision the manager took under the owner's delegation (section 3): what, why, how to undo. Once the owner has reviewed it, record their answer as a claim that `refines` it (a reversal also undoes it), then retract the `owner-review` claim | manager |
 | Task | claim, tag `task`: the full builder brief (section 6) | manager |
 | Design note, hypothesis, discovery | claim, tag `note`; relate it to the task or the code it concerns | anyone |
 | PR head | claim, tag `pr`: "PR #<n> <branch> @ <full sha>: <title>"; `relate <pr> implements <task>` | builder |
@@ -89,9 +94,9 @@ Any counted `fail` makes it `rejected`. The fix is a new commit and a new `pr` c
 
 CI is not part of the gate (section 10). Its result is a second opinion: when it disagrees with the Ground's evidence, the manager records why before merging.
 
-**Findings.** The complete list of findings against a head is the referrers of `scripts/bk show <pr>`: every `finding` that `contradicts` it, triaged or not. `scripts/bk conflicts` shows most of them too, but not a finding that someone else's claim supersedes (task 780f658d4b84), so don't rely on it here. Rejected findings stay listed until the head changes; that's expected, not a blocker. Before merging, every finding against the head must have manager evidence:
+**Findings.** The complete list of findings against a head is the referrers of `scripts/bk show <pr>`: every `finding` that `contradicts` it, triaged or not. Retracting a `contradicts` link drops the finding only when the finding's author or the manager wrote the link; `scripts/merge` keeps counting it otherwise. `scripts/bk conflicts` shows most of them too, but not a finding that someone else's claim supersedes (task 780f658d4b84), so don't rely on it here. Rejected findings stay listed until the head changes; that's expected, not a blocker. Before merging, every finding against the head must have manager evidence:
 
-- A **confirmed** finding (pass) blocks the merge until it's fixed in a new head, or **deferred**: a `task` claim (tags `task`, `deferred`) that `depends_on` the finding and says what will fix it and when. The manager defers only findings that don't make this PR unsafe to merge, such as a risk that only becomes real after a later change, and says so in its triage evidence.
+- A **confirmed** finding (pass) blocks the merge until it's fixed in a new head, or **deferred**: a `task` claim (tags `task`, `deferred`) that `depends_on` the finding and says what will fix it and when. Only the manager records a deferral, writing both the task and the relation; `scripts/merge` counts no other. The manager defers only findings that don't make this PR unsafe to merge, such as a risk that only becomes real after a later change, and says so in its triage evidence.
 - A **rejected** finding (fail) stays on record and doesn't block.
 
 A new head supersedes the old one, and that clears *all* of the old head's contradictions, fixed or not. So the next review round's brief lists every confirmed finding, and the reviewer must check each one against the new head. Anything still unfixed gets re-filed against the new head.
@@ -110,7 +115,7 @@ A new head supersedes the old one, and that clears *all* of the old head's contr
    - **Forge head:** the forge PR's head commit must be the current `pr` claim's full sha: the first entry of `fj --host <forge> pr view <n> commits`, or the API's `.head.sha`.
    - **Record** both as manager evidence on the `pr` claim: `--method "merge gate @ <sha>"`, `--details` with the forge head and which `main` case applied.
 
-   Then squash-merge at once: a push between the check and the merge isn't caught until merging by expected sha (Forgejo's `head_commit_id`) is verified. If it deploys, wait for the owner's go. If the PR touched the code of the pinned binary (for Bracken: `crates/bracken` or `crates/manyroot`), upgrade the pinned binary right after the merge (`docs/releases.md`), before sending any agent work that relies on the new docs.
+   Then squash-merge at once. `scripts/merge <n> <pr claim> --validator … --min-passes N --as manager` does all of this: it runs the checks (`--dry-run` stops there), records the evidence, and squash-merges through the forge API with `head_commit_id` set to the verified sha, so the forge refuses the merge if the branch moved after the check. Merging by hand, a push between the check and the merge isn't caught. If it deploys, wait for the owner's go. If the PR touched the code of the pinned binary (for Bracken: `crates/bracken` or `crates/manyroot`), upgrade the pinned binary right after the merge (`docs/releases.md`), before sending any agent work that relies on the new docs.
 9. **Each release stage** toward users needs the owner's go, recorded as an `approval`.
 10. **Watch it land.** Check triage and error reports for anything new from the release, and close out the task with a `note` saying what shipped.
 
@@ -124,7 +129,7 @@ Risky classes for this project: `<risky classes>`. Low-risk changes by a builder
 - Each finding is its own `finding` claim with file:line, a severity, **the requirement it breaks** (from the brief, the PR description or the project's rules) and **a concrete counterexample**, ideally a failing test. It's labelled **confirmed** (shown to fail) or **possible risk**. The round ends with a verdict as evidence on the `pr` claim.
 - AI reviewers often reject correct code and invent requirements, and asking for fixes makes this worse. So the manager **triages findings before passing them to the builder**. It rejects (fail evidence, with the reason) findings outside the task's scope or with no requirement behind them. It asks for a counterexample when one is missing. It checks confirmed findings by running the test, then records a pass.
 - **At most three rounds.** After that the manager decides on what's still open and records a `decision` saying why.
-- The builder answers every confirmed finding: fixed in a new head, deferred (a `task` claim that `depends_on` the finding), or disputed (a claim that `contradicts` it).
+- The builder answers every confirmed finding: fixed in a new head, a deferral proposed to the manager (a `question` claim saying what would fix it and when), or disputed (a claim that `contradicts` it). If the manager agrees, it records the deferral itself.
 
 ### 5.2 Security review (every proposal, every PR)
 
@@ -177,7 +182,7 @@ Report: <when, and anything beyond the standard final report>
 | Resource | Rule |
 |---|---|
 | Merges to `main` | One at a time, after merging `main` into the branch. Deploying merges need the owner's go. |
-| The pinned `bracken` binary | Only the manager upgrades it, and only from `main`, between merges. Before upgrading, commit a Ground checkpoint (9.3) and check that the new binary opens it (`scripts/bk log >/dev/null`). Protocol or storage changes need the owner's go and a migration note in `docs/releases.md`. |
+| The pinned `bracken` binary | Only the manager upgrades it, and only from `main`, between merges. Before upgrading, commit a Ground checkpoint (9.3) and check that the new binary opens it (`scripts/bk log >/dev/null`). Protocol or storage changes need the owner's go (or the manager's, where delegated: section 3) and a migration note in `docs/releases.md`. |
 | The Ground itself | Everyone contributes through `scripts/bk`; no one edits or deletes files under `.bracken/`. Only the manager runs `init`, `import`, `join` or `sync`, and only the manager commits `.bracken/` (9.3). Builders never stage it: their worktree's copy is a stale snapshot. |
 | Long-lived release branches | Only through PRs merged by the manager. Never make one a PR's head (merging deletes the head). |
 | Publishing, deploys, billed builds | The manager, with the owner's go. |
@@ -197,7 +202,7 @@ Report: <when, and anything beyond the standard final report>
   - new error-monitor issues and failed CI on `main`;
   - what shipped since yesterday;
   - `scripts/bk conflicts` (divergences and most untriaged findings; the referrers of each open `pr` are the complete list);
-  - `owner-ask` claims still open;
+  - `owner-ask` claims still open, and `owner-review` claims not yet reviewed;
   - `pr` claims pending for more than a day;
   - tasks with no recent contributions.
 
@@ -305,6 +310,7 @@ scripts/bk log --tag builder --current
 scripts/bk log --tag decision --current
 scripts/bk log --tag task --current
 scripts/bk log --tag owner-ask --current
+scripts/bk log --tag owner-review --current   # delegated decisions the owner hasn't reviewed yet
 scripts/bk conflicts
 fj --host forge.jx.rs pr search                # or the forge's equivalent
 ```
@@ -325,7 +331,7 @@ Then read the builder threads. The harness's own memory (in Claude Code, auto-me
 - **Token only in the checkout step:** fetch everything a later step needs (including `main` for the append-only check) in the step that has the token, so steps running the PR's code never see it.
 - **Tests, typecheck, lint** for every package, on every PR and on `main` (for Rust: `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`). A container without Node can't run JavaScript actions such as checkout: fetch with plain `git`, passing the token through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` environment variables, never argv or the remote URL. Pin images by digest.
 - **Lint warning cap:** zero warnings with `-D warnings`. If a project starts above zero, cap at today's count and lower it as warnings are fixed; never raise it.
-- **Protocol guard** (Bracken repo): a test that opens a checked-in fixture Ground written by an earlier release. A PR that breaks it is a protocol change and needs the migration note and the owner's go.
+- **Protocol guard** (Bracken repo): a test that opens a checked-in fixture Ground written by an earlier release. A PR that breaks it is a protocol change and needs the migration note and the owner's go (or the manager's, where delegated: section 3).
 - **Publish workflows:** a separate `concurrency` group per stage; tag every publish in git (e.g. `v<version>-<stage>`); only a tested pre-release whose commit is on `main` may be published.
 - **Deploy workflows** run on merge to `main`, filtered by path. Those filters decide which merges need the owner's go.
 

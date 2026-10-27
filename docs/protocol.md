@@ -185,7 +185,7 @@ supersession and conflicts beyond the fixture's cases. Those are tested in
 methods, which nothing tests yet.
 
 Changing a pinned value or the fixture is a protocol change: it needs
-independent review, the owner's go and a migration note in
+independent review, the manager's go (logged as `owner-review`) and a migration note in
 [releases.md](releases.md). A new protocol version should get a new fixture
 next to the old one, which stays to show what still opens. To rebuild a
 fixture deliberately, delete it and run its ignored generator:

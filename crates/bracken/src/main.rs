@@ -110,7 +110,8 @@ enum Command {
         method: String,
         #[arg(long, default_value = "")]
         details: String,
-        /// Read the details from a file ("-" for stdin), so they never appear on a command line.
+        /// Read the details from a regular file, or "-" for stdin, so they never appear on a command
+        /// line. Process substitution (`<(...)`) is a pipe, not a regular file: pipe into "-" instead.
         #[arg(long, value_name = "PATH", conflicts_with = "details")]
         details_file: Option<PathBuf>,
     },
@@ -247,12 +248,15 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let who = signer(&s, agent)?;
             let names = Names::load(&s)?;
             let old = supersedes.iter().map(|id| own_claim(&s, &names, &who, id)).collect::<Result<BTreeSet<_>>>()?;
-            let new = s.contribute(&who, Body::Claim { statement, tags })?;
+            let new = contribute(&mut s, &who, Body::Claim { statement, tags })?;
             let mut written = vec![new];
             for to in old {
                 let note = String::new();
-                written
-                    .push(s.contribute(&who, Body::Relation { from: new, kind: RelationKind::Supersedes, to, note })?);
+                written.push(contribute(
+                    &mut s,
+                    &who,
+                    Body::Relation { from: new, kind: RelationKind::Supersedes, to, note },
+                )?);
             }
             for id in written {
                 println!("{id}");
@@ -262,26 +266,26 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let who = signer(&s, agent)?;
             let content = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             let name = name.unwrap_or_else(|| file.display().to_string());
-            println!("{}", s.contribute(&who, Body::Artifact { name, media_type, content })?);
+            println!("{}", contribute(&mut s, &who, Body::Artifact { name, media_type, content })?);
         }
         Command::Relate { from, kind, to, note } => {
             let who = signer(&s, agent)?;
             let (from, to) = (resolve(&s, &from)?, resolve(&s, &to)?);
-            println!("{}", s.contribute(&who, Body::Relation { from, kind, to, note })?);
+            println!("{}", contribute(&mut s, &who, Body::Relation { from, kind, to, note })?);
         }
         Command::Evidence { target, verdict, method, details, details_file } => {
             let who = signer(&s, agent)?;
             let details = match details_file {
-                Some(path) => read_details(&s, &path)?,
+                Some(path) => read_details(&path)?,
                 None => details,
             };
             let target = resolve(&s, &target)?;
-            println!("{}", s.contribute(&who, Body::Evidence { target, verdict, method, details })?);
+            println!("{}", contribute(&mut s, &who, Body::Evidence { target, verdict, method, details })?);
         }
         Command::Retract { target, reason } => {
             let who = signer(&s, agent)?;
             let target = resolve(&s, &target)?;
-            println!("{}", s.contribute(&who, Body::Retract { target, reason })?);
+            println!("{}", contribute(&mut s, &who, Body::Retract { target, reason })?);
         }
         Command::Log { kind, tag, author, current, out } => {
             let names = Names::load(&s)?;
@@ -464,29 +468,83 @@ fn read_bundle(path: &Path) -> Result<(GroundId, Vec<Contribution>)> {
     })
 }
 
-/// Evidence details from a regular file, or stdin for "-". Refuses the replica's own private
-/// keys, which must never reach the Ground, and stops reading past the size limit.
-fn read_details(s: &Store, path: &Path) -> Result<String> {
+/// Evidence details from a regular file, or stdin for "-". The type is checked on the opened
+/// file, and reading stops past the size limit.
+fn read_details(path: &Path) -> Result<String> {
     let limit = contribution::MAX_CONTRIBUTION_BYTES as u64;
     let mut bytes = Vec::new();
     if path.as_os_str() == "-" {
         io::stdin().take(limit + 1).read_to_end(&mut bytes).context("reading stdin")?;
     } else {
-        let real = std::fs::canonicalize(path).with_context(|| format!("reading {}", path.display()))?;
-        if std::fs::canonicalize(s.identities_dir()).is_ok_and(|keys| real.starts_with(keys)) {
-            bail!("{} is a private key in this replica; it can't go into the Ground", path.display());
+        let not_regular =
+            || anyhow::anyhow!("{} isn't a regular file (for a pipe, use --details-file -)", path.display());
+        // Checked before opening too, because opening a FIFO blocks until something writes to it.
+        if !std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?.is_file() {
+            return Err(not_regular());
         }
-        if !real.is_file() {
-            bail!("{} isn't a regular file", path.display());
+        let f = File::open(path).with_context(|| format!("reading {}", path.display()))?;
+        if !f.metadata().with_context(|| format!("reading {}", path.display()))?.is_file() {
+            return Err(not_regular());
         }
-        File::open(&real)
-            .and_then(|f| f.take(limit + 1).read_to_end(&mut bytes))
-            .with_context(|| format!("reading {}", path.display()))?;
+        f.take(limit + 1).read_to_end(&mut bytes).with_context(|| format!("reading {}", path.display()))?;
     }
     if bytes.len() as u64 > limit {
         bail!("{} is over the {limit}-byte contribution limit", path.display());
     }
     String::from_utf8(bytes).with_context(|| format!("{} isn't UTF-8 text", path.display()))
+}
+
+/// Signs and adds a contribution, unless it holds the private key of an identity in this replica.
+/// The Ground is permanent and goes into git, so this catches the likely accidents: a key file
+/// attached as details or as an artifact, or a key pasted into text. A key re-encoded (base64)
+/// gets through.
+fn contribute(s: &mut Store, who: &Identity, body: Body) -> Result<ContributionId> {
+    let fields: Vec<&[u8]> = match &body {
+        Body::Claim { statement, tags } => {
+            std::iter::once(statement.as_bytes()).chain(tags.iter().map(|t| t.as_bytes())).collect()
+        }
+        Body::Artifact { name, media_type, content } => vec![name.as_bytes(), media_type.as_bytes(), content],
+        Body::Relation { note, .. } => vec![note.as_bytes()],
+        Body::Evidence { method, details, .. } => vec![method.as_bytes(), details.as_bytes()],
+        Body::Retract { reason, .. } => vec![reason.as_bytes()],
+    };
+    for (name, hex, raw) in local_secret_keys(s)? {
+        let found = fields.iter().any(|f| contains(&f.to_ascii_lowercase(), hex.as_bytes()) || contains(f, &raw));
+        if found {
+            bail!("this contribution contains the private key of identity {name:?}; it can't go into the Ground");
+        }
+    }
+    Ok(s.contribute(who, body)?)
+}
+
+/// Each local identity's name and secret key, as lowercase hex and as bytes. Read from the
+/// identity files themselves, like scripts/ground-checkpoint does.
+fn local_secret_keys(s: &Store) -> Result<Vec<(String, String, Vec<u8>)>> {
+    let dir = s.identities_dir();
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    let mut keys = Vec::new();
+    for entry in entries {
+        let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
+        if path.extension().is_none_or(|e| e != "json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let file: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let Some(hex) = file["secret_key"].as_str() else { continue };
+        let hex = hex.to_ascii_lowercase();
+        let raw = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()).collect();
+        let name = path.file_stem().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+        keys.push((name, hex, raw));
+    }
+    Ok(keys)
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn resolve(s: &Store, prefix: &str) -> Result<ContributionId> {
