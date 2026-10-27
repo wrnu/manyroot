@@ -258,3 +258,123 @@ fn a_reader_that_stops_early_is_not_an_error() {
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0]["body"]["statement"], "Plan: v2");
 }
+
+/// Runs bracken with stdout already closed, as under `| head -0`. Returns its status and stderr.
+fn with_closed_stdout(dir: &Path, args: &[&str]) -> (std::process::ExitStatus, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
+        .args(args)
+        .current_dir(dir)
+        .env_remove("BRACKEN_DIR")
+        .env_remove("BRACKEN_AGENT")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    (out.status, String::from_utf8(out.stderr).unwrap())
+}
+
+#[test]
+fn join_and_import_keep_a_failure_when_the_reader_stops_early() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (origin, joined, replica) = (tmp.path().join("origin"), tmp.path().join("joined"), tmp.path().join("replica"));
+    for d in [&origin, &joined, &replica] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    bracken(&origin, &["init"]);
+    bracken(&origin, &["id", "new", "alice"]);
+    bracken(&origin, &["claim", "First", "--as", "alice"]);
+    let good = tmp.path().join("good.mrb");
+    bracken(&origin, &["export", good.to_str().unwrap()]);
+    bracken(&origin, &["claim", "Second", "--as", "alice"]);
+    // A bundle whose last contribution has a broken signature: it decodes, then is rejected.
+    let bad = tmp.path().join("bad.mrb");
+    bracken(&origin, &["export", bad.to_str().unwrap()]);
+    let mut bytes = std::fs::read(&bad).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    std::fs::write(&bad, bytes).unwrap();
+
+    let (status, stderr) = with_closed_stdout(&joined, &["join", bad.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(1), "join: {stderr}");
+    assert!(stderr.contains("rejected"), "join: {stderr}");
+
+    bracken(&replica, &["join", good.to_str().unwrap()]);
+    let (status, stderr) = with_closed_stdout(&replica, &["import", bad.to_str().unwrap()]);
+    assert_eq!(status.code(), Some(1), "import: {stderr}");
+    assert!(stderr.contains("rejected"), "import: {stderr}");
+
+    // A clean import with a closed stdout still succeeds.
+    let (status, stderr) = with_closed_stdout(&replica, &["import", good.to_str().unwrap()]);
+    assert!(status.success(), "clean import: {stderr}");
+}
+
+#[test]
+fn evidence_details_come_from_a_file_or_stdin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "alice"]);
+    bracken(dir, &["id", "new", "val"]);
+    let c = bracken(dir, &["claim", "Works", "--as", "alice"]);
+    let details = |id: &str| json(dir, &["show", id, "--json"])["body"]["details"].as_str().unwrap().to_owned();
+
+    std::fs::write(dir.join("out.txt"), "exit 0\nall 7 tests passed\n").unwrap();
+    let from_file =
+        bracken(dir, &["evidence", &c, "pass", "--method", "t", "--details-file", "out.txt", "--as", "val"]);
+    assert_eq!(details(&from_file), "exit 0\nall 7 tests passed\n");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
+        .args(["evidence", &c, "fail", "--method", "t", "--details-file", "-", "--as", "val"])
+        .current_dir(dir)
+        .env_remove("BRACKEN_DIR")
+        .env_remove("BRACKEN_AGENT")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"exit 2\nfrom stdin\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let from_stdin = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(details(from_stdin.trim()), "exit 2\nfrom stdin\n");
+
+    let before = ids(dir, &["log", "--json"]).len();
+    let err = bracken_fails(
+        dir,
+        &["evidence", &c, "pass", "--method", "t", "--details", "x", "--details-file", "out.txt", "--as", "val"],
+    );
+    assert!(err.contains("cannot be used with"), "{err}");
+    assert!(
+        bracken_fails(dir, &["evidence", &c, "pass", "--method", "t", "--details-file", "missing.txt", "--as", "val"])
+            .contains("missing.txt")
+    );
+    assert_eq!(ids(dir, &["log", "--json"]).len(), before, "a refused evidence writes nothing");
+}
+
+#[test]
+fn evidence_details_file_refuses_keys_devices_and_oversized_input() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "val"]);
+    let c = bracken(dir, &["claim", "Works", "--as", "val"]);
+    let attach = |path: &str| {
+        bracken_fails(dir, &["evidence", &c, "pass", "--method", "t", "--details-file", path, "--as", "val"])
+    };
+    let before = ids(dir, &["log", "--json"]).len();
+
+    let key = dir.join(".bracken/identities/val.json");
+    assert!(key.is_file(), "the identity lives where the test expects");
+    assert!(attach(".bracken/identities/val.json").contains("private key"));
+    let link = dir.join("innocent.log");
+    std::os::unix::fs::symlink(&key, &link).unwrap();
+    assert!(attach("innocent.log").contains("private key"), "a symlink to a key is a key");
+
+    assert!(attach("/dev/zero").contains("isn't a regular file"));
+
+    std::fs::write(dir.join("big.txt"), vec![b'y'; 16 * 1024 * 1024 + 1]).unwrap();
+    assert!(attach("big.txt").contains("limit"));
+
+    assert_eq!(ids(dir, &["log", "--json"]).len(), before, "nothing was recorded");
+}

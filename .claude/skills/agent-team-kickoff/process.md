@@ -75,7 +75,7 @@ Rules:
 
 ### 4.2 Merge gate
 
-Merge readiness is the acceptance status of the **current `pr` claim** under the class's policy. An author's evidence about their own contribution never counts: the library ignores it. So the gate depends on who wrote the `pr` claim.
+Merge readiness is the acceptance status of the **current `pr` claim** under the class's policy. An author's evidence about their own contribution never counts: the library ignores it. So the gate depends on who wrote the `pr` claim. It also requires the forge PR's head to be the `pr` claim's full sha, checked and recorded right before the squash-merge (step 8).
 
 | Who wrote the `pr` claim | Class | Gate: `scripts/bk show <pr> …` reports `accepted` |
 |---|---|---|
@@ -105,7 +105,12 @@ A new head supersedes the old one, and that clears *all* of the old head's contr
 5. **Verify.** The manager re-runs the done-when checks in a **fresh worktree at the exact head commit**, never in a checkout that might hold uncommitted files: `git worktree add --detach "$TMPDIR/verify-<sha>" <sha>`, run the checks there, then remove the worktree. It records the result as counted `manager` evidence with the sha in `--method`, running the main checkout's copy from inside the verify worktree: `"$main/scripts/bk-evidence" <pr> --as manager -- <command>`, where `main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")`. Verifying runs the PR's code on the host, where it can read the Ground's keys and the forge credential, so first read the PR's changes to build scripts and dependencies (`build.rs`, `Cargo.lock`, `package.json` and the like), and call the **main checkout's** `scripts/bk` and `scripts/bk-evidence` by absolute path, never the PR worktree's copies: a PR can change them, and its copy would then sign counted evidence on its own PR. CI runs too (section 10); if CI and the manager's evidence disagree, the manager contributes a claim tagged `ci-disagreement` saying which was right and why.
 6. **Reviews** (independent for risky classes; security for all) record findings and verdicts in the Ground. **Finish every review round before manual testing**, so the tested build is the one that merges.
 7. **Manual test**, if the change can be seen or felt: test the real thing, and record the result as manager evidence with a short report in `--details`.
-8. **Merge:** once the gate passes (section 4.2), merge `main` into the branch, then squash-merge. If the merge changed the head, the gate applies to the new head. If it deploys, wait for the owner's go. If the PR touched the code of the pinned binary (for Bracken: `crates/bracken` or `crates/manyroot`), upgrade the pinned binary right after the merge (`docs/releases.md`), before sending any agent work that relies on the new docs.
+8. **Merge:** once the gate passes (section 4.2), and right before the squash-merge:
+   - **`main`:** its tip must be an ancestor of the verified head, or every commit on `main` that the branch lacks touches only `.bracken/`, or `docs/` files other than `docs/vision.md` that the branch doesn't touch. Otherwise merge `main` into the branch: that's a new head, and the gate applies to it.
+   - **Forge head:** the forge PR's head commit must be the current `pr` claim's full sha: the first entry of `fj --host <forge> pr view <n> commits`, or the API's `.head.sha`.
+   - **Record** both as manager evidence on the `pr` claim: `--method "merge gate @ <sha>"`, `--details` with the forge head and which `main` case applied.
+
+   Then squash-merge at once: a push between the check and the merge isn't caught until merging by expected sha (Forgejo's `head_commit_id`) is verified. If it deploys, wait for the owner's go. If the PR touched the code of the pinned binary (for Bracken: `crates/bracken` or `crates/manyroot`), upgrade the pinned binary right after the merge (`docs/releases.md`), before sending any agent work that relies on the new docs.
 9. **Each release stage** toward users needs the owner's go, recorded as an `approval`.
 10. **Watch it land.** Check triage and error reports for anything new from the release, and close out the task with a `note` saying what shipped.
 
@@ -316,6 +321,7 @@ Then read the builder threads. The harness's own memory (in Claude Code, auto-me
 - **Ground is append-only:** fails if a tracked Ground file was deleted or edited: on a PR, relative to the merge base with `main`; on a push to `main`, relative to what `main` was before the push, so every pushed commit is covered. If there's nothing to compare with (no merge base within the fetch depth, a pre-push `main` beyond the fetch depth, the first push to `main`), it fails rather than passing unchecked. Deleting a finding or a failing piece of evidence would change what the gate concludes.
 - **Ground opens:** builds the PR's `bracken` and opens the committed Ground with it, which verifies every contribution's encoding, hash, signature and parents.
 - **Vision document matches the Ground:** the latest artifact named `<vision doc>` has exactly the file's contents (section 1).
+- **No repo or org Actions secrets** while CI runs PR code: anything a workflow can read, a PR can read.
 - **Token only in the checkout step:** fetch everything a later step needs (including `main` for the append-only check) in the step that has the token, so steps running the PR's code never see it.
 - **Tests, typecheck, lint** for every package, on every PR and on `main` (for Rust: `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check`). A container without Node can't run JavaScript actions such as checkout: fetch with plain `git`, passing the token through `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` environment variables, never argv or the remote URL. Pin images by digest.
 - **Lint warning cap:** zero warnings with `-D warnings`. If a project starts above zero, cap at today's count and lower it as warnings are fixed; never raise it.

@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -109,6 +110,9 @@ enum Command {
         method: String,
         #[arg(long, default_value = "")]
         details: String,
+        /// Read the details from a file ("-" for stdin), so they never appear on a command line.
+        #[arg(long, value_name = "PATH", conflicts_with = "details")]
+        details_file: Option<PathBuf>,
     },
     /// Withdraw one of your own contributions.
     Retract {
@@ -206,9 +210,10 @@ fn run(cli: Cli) -> Result<ExitCode> {
             let (ground, contributions) = read_bundle(&path)?;
             let mut s = Store::create(&dir, GroundInfo { ground, name: default_name(&dir) })?;
             let report = s.import(contributions)?;
+            let code = decide(report.is_clean());
             print_report(&report);
             println!("joined ground {ground} in {}", dir.display());
-            return Ok(exit_for(&report));
+            return Ok(code);
         }
         command => return run_in_store(open_store(cli.dir.as_deref())?, cli.agent.as_deref(), command),
     }
@@ -264,8 +269,12 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let (from, to) = (resolve(&s, &from)?, resolve(&s, &to)?);
             println!("{}", s.contribute(&who, Body::Relation { from, kind, to, note })?);
         }
-        Command::Evidence { target, verdict, method, details } => {
+        Command::Evidence { target, verdict, method, details, details_file } => {
             let who = signer(&s, agent)?;
+            let details = match details_file {
+                Some(path) => read_details(&s, &path)?,
+                None => details,
+            };
             let target = resolve(&s, &target)?;
             println!("{}", s.contribute(&who, Body::Evidence { target, verdict, method, details })?);
         }
@@ -393,10 +402,11 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let other_dir = if other.join(DIR_NAME).is_dir() { other.join(DIR_NAME) } else { other };
             let mut o = Store::open(&other_dir)?;
             let (here, there) = store::sync(&mut s, &mut o)?;
-            println!("received {}, sent {}", here.added.len(), there.added.len());
+            let code = decide(here.is_clean() && there.is_clean());
             print_report(&here);
             print_report(&there);
-            return Ok(if here.is_clean() && there.is_clean() { ExitCode::SUCCESS } else { ExitCode::FAILURE });
+            println!("received {}, sent {}", here.added.len(), there.added.len());
+            return Ok(code);
         }
         Command::Export { file } => {
             let all = s.graph().missing_from(&Graph::new(s.info().ground));
@@ -414,9 +424,10 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 bail!("bundle is for ground {ground}, this replica is {}", s.info().ground);
             }
             let report = s.import(contributions)?;
-            println!("imported {}, already had {}", report.added.len(), report.already_present);
+            let code = decide(report.is_clean());
             print_report(&report);
-            return Ok(exit_for(&report));
+            println!("imported {}, already had {}", report.added.len(), report.already_present);
+            return Ok(code);
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -451,6 +462,31 @@ fn read_bundle(path: &Path) -> Result<(GroundId, Vec<Contribution>)> {
         let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         bundle::read(BufReader::new(f))?
     })
+}
+
+/// Evidence details from a regular file, or stdin for "-". Refuses the replica's own private
+/// keys, which must never reach the Ground, and stops reading past the size limit.
+fn read_details(s: &Store, path: &Path) -> Result<String> {
+    let limit = contribution::MAX_CONTRIBUTION_BYTES as u64;
+    let mut bytes = Vec::new();
+    if path.as_os_str() == "-" {
+        io::stdin().take(limit + 1).read_to_end(&mut bytes).context("reading stdin")?;
+    } else {
+        let real = std::fs::canonicalize(path).with_context(|| format!("reading {}", path.display()))?;
+        if std::fs::canonicalize(s.identities_dir()).is_ok_and(|keys| real.starts_with(keys)) {
+            bail!("{} is a private key in this replica; it can't go into the Ground", path.display());
+        }
+        if !real.is_file() {
+            bail!("{} isn't a regular file", path.display());
+        }
+        File::open(&real)
+            .and_then(|f| f.take(limit + 1).read_to_end(&mut bytes))
+            .with_context(|| format!("reading {}", path.display()))?;
+    }
+    if bytes.len() as u64 > limit {
+        bail!("{} is over the {limit}-byte contribution limit", path.display());
+    }
+    String::from_utf8(bytes).with_context(|| format!("{} isn't UTF-8 text", path.display()))
 }
 
 fn resolve(s: &Store, prefix: &str) -> Result<ContributionId> {
@@ -528,8 +564,18 @@ fn print_report(report: &ImportReport) {
     }
 }
 
-fn exit_for(report: &ImportReport) -> ExitCode {
-    if report.is_clean() { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+/// The exit status [`write_stdout`] uses if stdout's reader goes away: 0 unless the command has
+/// already decided to fail.
+static BROKEN_PIPE_STATUS: AtomicI32 = AtomicI32::new(0);
+
+/// Decides a command's exit status before it prints, so a reader that stops early can't turn a
+/// failure into success.
+fn decide(clean: bool) -> ExitCode {
+    if clean {
+        return ExitCode::SUCCESS;
+    }
+    BROKEN_PIPE_STATUS.store(1, Ordering::Relaxed);
+    ExitCode::FAILURE
 }
 
 impl PolicyArgs {
@@ -701,13 +747,14 @@ fn print_conflicts(g: &Graph, names: &Names, conflicts: &[Conflict], as_json: bo
     }
 }
 
-/// Writes to stdout. A reader that stops early (`| head -1`) ends the program quietly and
-/// successfully, where `println!` would panic. Commands finish writing to the Ground before
-/// they print, so stopping here never leaves a write half-done.
+/// Writes to stdout. A reader that stops early (`| head -1`) ends the program quietly, where
+/// `println!` would panic, with the status the command already decided ([`decide`]), or 0.
+/// Commands finish writing to the Ground before they print, so stopping here never leaves a
+/// write half-done.
 fn write_stdout(bytes: &[u8]) {
     if let Err(e) = io::stdout().write_all(bytes) {
         if e.kind() == io::ErrorKind::BrokenPipe {
-            std::process::exit(0);
+            std::process::exit(BROKEN_PIPE_STATUS.load(Ordering::Relaxed));
         }
         eprintln!("bracken: writing to stdout: {e}");
         std::process::exit(1);
