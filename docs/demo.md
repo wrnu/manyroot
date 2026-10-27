@@ -44,23 +44,28 @@ demo writes a `.gitignore` that ignores everything at the top of the run's
 directory. It also refuses to run in a directory inside a git checkout (asking
 `git rev-parse`, and looking for a `.git` itself in case git isn't installed),
 or with `GIT_DIR` or `GIT_WORK_TREE` set, unless you pass `--allow-in-repo`, so
-agents never work with a repository's files, or its Ground, in reach. Every
-path the demo hands to bracken is absolute, so a relative `--keep` stays where
-you asked. A `--keep` path with `..` after a directory that doesn't exist yet
-is refused, because creating it would follow the `..` to a place the checks
-never looked at. The demo resolves the part of the path that exists once,
-checks the directory beneath that real path, and makes each new directory
-there without resolving the path as typed again. If a check refuses, or a
-directory it made was swapped for something else meanwhile, it removes the
-directories it made, but only those that are still the very ones it made.
+agents never work with a repository's files, or its Ground, in reach.
 
-These checks refuse paths in or through a checkout as they stand when the demo
-looks, but they can't protect against someone who can swap directories in the
-path while the demo runs: the run's files, keys included, are written by path,
-so a well-timed swap can send them, or a cleanup, somewhere else. So `--keep`
-must not point into a directory that other users or processes can write to.
-A fix, creating and writing the run through directory handles instead of
-paths, is tracked as task `efc537ca8e65`.
+Every run happens in a private temporary directory that only you can write
+to. `--keep` copies the finished run out of it, so a relative `--keep` stays
+where you asked, and a `--keep` path with `..` after a directory that doesn't
+exist yet is refused, because creating it would follow the `..` somewhere the
+checks never looked. On unix the copy goes through directory handles: the
+existing part of the path is opened once, the check runs on where that really
+is, and every directory and file is made relative to its parent's handle,
+without following symlinks. Renaming or swapping directories on the path while
+the demo runs can't redirect what it writes, keys included, or what it
+removes: on any failure it removes only entries that are still the very ones it
+made. It prints where the run was kept.
+
+Two things the handles can't do. A swap can still move the kept directory
+itself somewhere else afterwards, into a checkout too, as any later rename
+could. And between making a new directory and opening it, someone could swap in
+another empty directory, which the demo would then fill and could later remove.
+So no directory on the `--keep` path should let anyone else rename its entries:
+it should be owned by you and not writable by others, or sticky, like `/tmp`.
+Without unix the copy goes by path and has no such protection.
+
 `compare` runs each seed in the system's temporary directory (`TMPDIR`), with
 the same refusal; it takes `--work-rounds` 0 to 10 and `--jobs` 1 to 64.
 

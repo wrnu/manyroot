@@ -10,7 +10,7 @@ use serde_json::json;
 use bracken_demo::bracken::Bracken;
 use bracken_demo::harness::{self, Behaviour, Config, Schedule, StaleRule, Topology};
 use bracken_demo::rng::Rng;
-use bracken_demo::safety::{DEMO, create_checked, refuse_git_checkout, refuse_parent_in_new_part};
+use bracken_demo::safety::{DEMO, keep_run, refuse_git_checkout, refuse_parent_in_new_part};
 use bracken_demo::{compare, task};
 
 #[derive(Parser)]
@@ -208,32 +208,37 @@ fn demo(args: RunArgs) -> Result<ExitCode> {
         },
     };
 
-    // Every path from here on is absolute: bracken runs in each agent's work
-    // directory, where a relative path would point somewhere else.
-    let _temp;
-    let root = match args.keep {
+    // A bad --keep fails before the run, not after it.
+    let keep = match &args.keep {
         Some(dir) => {
-            let dir = std::path::absolute(&dir).with_context(|| format!("resolving {}", dir.display()))?;
+            let dir = std::path::absolute(dir).with_context(|| format!("resolving {}", dir.display()))?;
             if dir.exists() {
                 bail!("{} already exists; --keep needs a new directory", dir.display());
             }
             refuse_parent_in_new_part(&dir)?;
             refuse_git_checkout(&dir, args.allow_in_repo, &DEMO)?;
-            // Check again where the directory really is, once it exists.
-            create_checked(&dir, |real| refuse_git_checkout(real, args.allow_in_repo, &DEMO))?
+            Some(dir)
         }
-        None => {
-            _temp = tempfile::tempdir().context("creating a temporary directory")?;
-            let dir = std::path::absolute(_temp.path()).context("resolving the temporary directory")?;
-            refuse_git_checkout(&dir, args.allow_in_repo, &DEMO)?;
-            dir
-        }
+        None => None,
     };
+
+    // The run always happens in a private temporary directory, where nobody else can
+    // rename anything; --keep copies it out at the end, through directory handles.
+    // Every path is absolute: bracken runs in each agent's work directory, where a
+    // relative path would point somewhere else.
+    let temp = tempfile::tempdir().context("creating a temporary directory")?;
+    let root = std::path::absolute(temp.path()).context("resolving the temporary directory")?;
+    refuse_git_checkout(&root, args.allow_in_repo, &DEMO)?;
     // The replicas hold unencrypted private keys: keep them out of any repository.
     let ignore = root.join(".gitignore");
     std::fs::write(&ignore, "*\n").with_context(|| format!("writing {}", ignore.display()))?;
 
-    let report = harness::run_scripted(&bracken, &root, &cfg)?;
+    let report = harness::run_scripted(&bracken, &root, &cfg);
+    if let Some(dest) = keep {
+        let kept = keep_run(&root, &dest, |real| refuse_git_checkout(real, args.allow_in_repo, &DEMO))?;
+        eprintln!("kept the run in {}", kept.display());
+    }
+    let report = report?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report).expect("reports serialize"));
     } else {
