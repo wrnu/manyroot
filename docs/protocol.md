@@ -148,6 +148,56 @@ Conflicts are resolved by contributing, never by deleting. For example, a new
 subject can supersede all the competing ones, or the authors can retract
 their positions.
 
+## Protocol guard
+
+`crates/manyroot/tests/protocol_guard.rs` pins this version to bytes, so an
+accidental change fails a test instead of making existing Grounds unreadable.
+It pins:
+
+- **Golden vectors.** One contribution of every body kind, built from fixed
+  keys, timestamps and bodies, with its encoding, id and signature hard-coded
+  as hex. This pins the CBOR field names and order, BLAKE3 ids, Ed25519 key
+  derivation and the signing context. The pinned bytes must still decode,
+  verify and pass the validity rules.
+- **Negative vectors.** Inputs a replica must reject, each with its specific
+  error: non-canonical encodings (a non-shortest integer, map keys out of
+  order, an indefinite-length map, trailing bytes), protocol version 2, a
+  foreign Ground, a small-order key with a signature that plain RFC 8032
+  verification accepts but strict verification rejects, parents out of order
+  or duplicated, and a body reference missing from `parents`. The size limit
+  is pinned at its boundary: exactly 16 MiB passes, one byte more fails both
+  decoding and the validity check.
+- **Bundle vector.** A two-contribution bundle's bytes: the magic, the Ground
+  id and the u32 big-endian length framing. It must read back.
+- **Fixture Ground.** `crates/manyroot/tests/fixtures/ground-v1/` is a replica
+  written by version 0.1.0 of `manyroot` (`ground.json`, `objects/`,
+  `agents/`; no private keys). The test opens it, verifies every
+  contribution, and checks pinned ids, agent names, the open contradiction,
+  and every validation status, including that retraction outranks a failure
+  and a failure outranks a pass. The fixture holds a contribution of every
+  body kind, relation kind and verdict, and a test that fails to compile when
+  a variant is added keeps it that way.
+
+The guard has no vectors for the remaining validity rules (missing parents,
+self-relations, retraction by another author, blank fields) or for
+supersession and conflicts beyond the fixture's cases. Those are tested in
+`crates/manyroot/tests/protocol.rs`, except blank artifact names and evidence
+methods, which nothing tests yet.
+
+Changing a pinned value or the fixture is a protocol change: it needs
+independent review, the owner's go and a migration note in
+[releases.md](releases.md). A new protocol version should get a new fixture
+next to the old one, which stays to show what still opens. To rebuild a
+fixture deliberately, delete it and run its ignored generator:
+
+```sh
+rm -r crates/manyroot/tests/fixtures/ground-v1
+cargo test -p manyroot --test protocol_guard -- --ignored write_ground_v1_fixture
+```
+
+The generator is deterministic: on an unchanged protocol it rewrites the
+fixture byte for byte.
+
 ## Not yet specified
 
 - Ground membership, permissions and governance (Stewards).
