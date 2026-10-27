@@ -49,7 +49,7 @@ cargo install --locked --path crates/bracken --root .bracken-bin --force
 scripts/bk log > /dev/null && echo "new binary opens the Ground"
 ```
 
-If the new binary can't open the Ground, reinstall the previous commit's binary (`git worktree add /tmp/prev <old sha>`, then `cargo install --path /tmp/prev/crates/bracken --root .bracken-bin --force`), and treat the merge as a protocol break.
+If the new binary can't open the Ground, reinstall the previous commit's binary (`prev="$TMPDIR/prev-<old sha>"; git worktree add --detach "$prev" <old sha>`, then `cargo install --locked --path "$prev/crates/bracken" --root .bracken-bin --force` and `git worktree remove "$prev"`), and treat the merge as a protocol break.
 
 **Upgrade after merging task c3d2a3297a71** (`log --current`, `claim --supersedes`, `--as` accepted everywhere). The docs and skill use these as soon as it merges, but `scripts/bk` runs the pinned binary, so upgrade it right after the merge. Until then the old recipes still apply: to find the current entry, read `scripts/bk log --tag <tag>`, drop the lines marked `(retracted)` and take the last one; to supersede, contribute the claim, then `relate <new> supersedes <old>`; and leave `--as` off read commands.
 

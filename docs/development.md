@@ -49,6 +49,11 @@ the same PR (process section 8, "Keeping the skill current").
 | **watch-pr** | `watch_pull_request` (T3 recognizes this Forgejo repo). Fallback: `fj --host forge.jx.rs pr view <n>` |
 | **schedule** | `schedule_task`. None set up yet; ask the owner first |
 
+## Harness
+
+- **Where worktrees live:** builders' in `~/.t3/worktrees/bracken/<branch>`; delegated children's in `~/.t3/worktrees/bracken/t3-<id>`, on a `t3/<name>` branch or detached. T3 doesn't remove either, so the manager does (process section 6, Worktrees). Threads the owner opens on this repo also get `t3-<id>` worktrees, so match each one to a finished child or builder through `t3_worktree_list` and the thread's status before removing it. Scratch worktrees go under `$TMPDIR`.
+- **No file deletion in Bash.** Claude Code asks a human to approve an `rm` it can't prove safe, even in full-access mode, and overnight that blocks the agent until the owner wakes. The owner's user-level hook `~/.claude/hooks/bracken-no-rm.py` refuses any Bash command running `rm` in this repo's checkouts and worktrees, with advice, so the agent carries on at once. Use `git worktree remove`, `git rm` or `trash <path>`, and leave `mktemp -d` directories in place. The hook is outside the repo: a new machine needs it installed in `~/.claude/settings.json` under `PreToolUse`, matcher `Bash|Monitor`.
+
 ## Forge commands
 
 Forge isn't GitHub: wherever `process.md` says `gh`, use these instead.

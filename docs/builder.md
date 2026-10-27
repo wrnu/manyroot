@@ -46,6 +46,7 @@ Always use `scripts/bk`, never a `bracken` binary built from your branch. The ta
 - Right before each push, `git fetch origin && git merge origin/main`, so the head you claim is tested against today's `main`.
 - Merge `main` into your branch; never rebase or force-push someone else's. Force-push only your own branch, with `--force-with-lease`.
 - `git stash` is shared across worktrees; use a WIP commit.
+- Your own worktree is the manager's to remove, after your PR merges. Any extra worktree you add (a clean copy, a scratch check) is yours: remove it before you report, with the checks in process section 6, Worktrees (`git worktree remove <path>`, without `--force` unless you've looked and the files are disposable). The `rm` command is refused in Bash here (development.md, Harness), only to avoid approval prompts; it is no guard against deletion. Use `git rm` or `trash <path>`.
 - Never stage `.bracken/`. Your worktree's copy is a stale snapshot.
 - Open the PR with `fj --host forge.jx.rs pr create --base main --head <branch> --body "…" "<title>"`. The body has the change class, what wasn't tested, the release steps (usually "none"), and the task id. It doesn't carry the `pr` claim id (the claim needs the PR number first); reviewers find it with `scripts/bk log --tag pr --current`.
 
