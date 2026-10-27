@@ -106,6 +106,18 @@ exchanges only what each side lacks.
   `result` bounds (1 024 rejected, 256-byte reasons) and the 44-byte minimum
   `batch_bytes`.
 
+### 2026-10-27: store writes refuse symlinked shards
+
+Task `26a5c735230d`, in sync step 2 (task `57072a4ea13f`). A write refuses
+an `objects/` directory or shard that is a symlink or not a directory,
+creates its temporary file new, and replaces rather than follows a symlink at
+the object's path.
+
+- **Existing Grounds open unchanged.** Reading is unchanged; only a replica
+  whose `objects/` or a shard is a symlink stops accepting writes, with an
+  error naming the path. Replace the symlink with a real directory.
+- **No migration.** Upgrade the pinned binary after the merge.
+
 ## Rollback
 
 - A bad merge: revert it on `main` through a PR. Ground contributions it caused stay: they're history. If they're wrong, contribute corrections or retractions.

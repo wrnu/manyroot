@@ -183,7 +183,13 @@ A peer can still keep a session open by sending new contributions under the
 shortcut, by sending a `heads` or `offer` list that never ends (full messages
 forever), or by not answering. Id lists have no total bound, and the receiver
 keeps every id it's sent, so memory grows with them too. Bounding a session's
-time, bytes and memory is the transport's concern (step 2 of network sync).
+time, bytes and memory is the transport's concern, not the protocol's. The
+`bracken` transports (network-sync.md, "As built in step 2") end a session at
+a wall-clock deadline, and once the peer has sent more than a byte budget
+(counted per frame before the frame is read), of which id lists may take only
+a smaller share. Which contributions a replica stores (an allowlist, quotas)
+is local policy too: a refused contribution is listed in `rejected`, like one
+that breaks a validity rule.
 
 ## Derived state
 

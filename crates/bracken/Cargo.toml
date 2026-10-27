@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+blake3.workspace = true
+getrandom.workspace = true
+httparse.workspace = true
 manyroot.workspace = true
 clap.workspace = true
 serde.workspace = true

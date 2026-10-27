@@ -5,6 +5,8 @@
 > amended; both are recorded below. The supersession rule (decision 4) is
 > in [protocol.md](../protocol.md). The sync protocol itself enters
 > protocol.md only with its own `protocol`-class PR. Task `9fa2c890ae5a`.
+> Steps 1 and 2 are built; [As built in step 2](#as-built-in-step-2) says
+> what the transports do (task `57072a4ea13f`).
 
 Today replicas exchange whole bundles by file, or `bracken sync` merges two
 local directories, and the team shares one Ground in the main checkout,
@@ -118,10 +120,11 @@ one extra round trip and 32 bytes per candidate id.
   shortcut never ends its own session. An `offer` or `need` listing an id
   twice ends it too, as does an empty batch that isn't `last` (findings
   `a38cae31c621`, `ab5965f73636`). A session deadline and a byte budget are the
-  transport's, in step 2 (task `d04580486e94`), and so is a bound on id
-  lists, which have no total limit (finding `b8b70206f0f8`).
-- There's no error message in step 1: a refusal ends the session locally, and
-  step 2's transport reports it.
+  transport's, and so is a bound on id lists, which have no total limit
+  (finding `b8b70206f0f8`); step 2 built all three (task `d04580486e94`).
+- There's no error message in the protocol: a violation ends the session
+  locally, and the transport reports it (an HTTP status and a one-line
+  reason, or stderr and a closed stream).
 
 **Alternatives:** git-style have/ack negotiation pays off only for huge,
 mostly shared histories (a later optimization). Range-based set
@@ -145,15 +148,18 @@ The protocol is the message sequence above. A transport only has to carry it.
   `u32 big-endian length || CBOR message`, the bundle's framing.
   `bracken serve --stdio` makes SSH work like git's: `ssh host bracken serve
   --stdio <path>`, with SSH doing authentication.
-- **HTTP**, stateless. Each step is one request:
+- **HTTP** carries the same session, in rounds. `POST /v1/<ground>/sessions`
+  opens one: the body is the client's messages, framed as on a stream, and
+  the response holds the server's, with the session id in an
+  `X-Bracken-Session` header. Each later round is `POST
+  /v1/<ground>/sessions/<id>`, until both sides are done.
 
-  | Request | Body | Response |
-  |---|---|---|
-  | `GET /v1/<ground>/heads?wait=<s>` | | `Heads` |
-  | `POST /v1/<ground>/offer` | client's `Heads` | `Offer` (or a bundle directly, when the server holds all the client's heads) |
-  | `POST /v1/<ground>/fetch` | `Need` | bundle |
-  | `POST /v1/<ground>/need` | client's `Offer` | `Need` |
-  | `POST /v1/<ground>/push` | bundle | `Result` |
+  This replaces the stateless mapping first proposed here (`heads`, `offer`,
+  `fetch`, `need` and `push` as separate requests; manager's answer
+  `7db500f36577`): that would have been a second protocol beside the one in
+  protocol.md, with its own rules to specify, test and keep in step. With
+  rounds, HTTP is only framing, and every rule the session enforces holds
+  over HTTP unchanged. Long-polling heads (`heads?wait`) waits for step 3.
 
 **Recommendation: HTTP first**: other machines reach HTTPS without SSH host
 keys (gotcha `463398c097a2`). Stdio comes almost free and tests both ends in
@@ -162,6 +168,98 @@ signed, so any peer can serve any contribution and the receiver checks it.
 Integrity never depends on who serves the data; availability does. The
 protocol stays transport-independent because the library exposes a session
 state machine (messages in, messages out) with no I/O.
+
+### As built in step 2
+
+`bracken serve` serves one replica; `bracken sync` is the client. Task
+`57072a4ea13f`, with the manager's answers in `7db500f36577`.
+
+| Command | What it does |
+|---|---|
+| `bracken serve --tokens <file> [--port <n>]` | HTTP on 127.0.0.1 only (no TLS, and no flag to bind elsewhere); prints `listening on http://127.0.0.1:<port>` |
+| `bracken serve --stdio` | One session on stdin and stdout, for `ssh host bracken --dir <path> serve --stdio`; the credential is SSH's, logged as `stdio` |
+| `bracken sync http://127.0.0.1:<port>` | The token from `$BRACKEN_TOKEN` or `--token-file`, never the command line; loopback URLs only |
+| `bracken sync --exec <program> [args...]` | Runs the program without a shell, and without `BRACKEN_TOKEN` or `BRACKEN_DIR` in its environment, and syncs over its stdin and stdout. The program is killed at the deadline, or 2 seconds after the session ends if it hasn't exited |
+
+**Server files**, all outside the Ground directory, and refused if a
+symlink, not a regular file, or writable by anyone:
+
+- `--allow`: author keys whose contributions the server stores, one hex key
+  per line, optionally followed by a name, `#` for comments. Without it the
+  server stores nothing: clients can pull but not push.
+- `--tokens`: lines of `<credential name> <blake3 hex of the token>`, so the
+  file holds no secret. Required for HTTP; there is no unauthenticated mode.
+  Hashes are compared in constant time. An HTTP session is bound to the
+  credential that opened it: a request with another credential gets `404`,
+  as an unknown id does. Session ids are 128 bits from the OS's random
+  source, and appear in no log or error message.
+- `--first-seen`: required with `--allow`. An append-only log, one JSON line
+  per contribution the server stores for the first time: `{id,
+  first_seen_ms, credential, author, bytes}`, synced to disk after each
+  batch. An id is logged once, across sessions and restarts. If the log
+  can't be written, or a write to the replica fails partway through a batch
+  (a full disk), what was stored before the failure is still logged and
+  counted, and the server stores nothing more until it restarts.
+
+**Refused at intake**, listed in the `result`'s `rejected`, so the client
+exits non-zero and nothing refused is stored: an author not on the
+allowlist; over a quota, per author key and per credential, of 10 000
+contributions or 256 MiB in a rolling 24 hours (replayed from the first-seen
+log at startup, so a restart doesn't reset them); and over the 4 GiB storage
+cap. A contribution the server already holds is never refused. A refusal is
+local policy, not a protocol violation, so the session goes on; descendants
+of a refused contribution come back `unresolved`.
+
+**Each session's bounds**, on server and client alike: a deadline 10 minutes
+from its start, and a budget of 1 GiB received from the peer, of which id
+lists (`heads`, `offer`, `need`) may take 64 MiB, about 1.9 million ids. A
+session's memory grows to roughly 8x the id lists it receives, so the id
+budget holds it near 512 MiB. The budget is counted per frame, from the
+length prefix, before the frame is read, and an HTTP body over what's left
+is refused from its `Content-Length`. Past either bound the session ends with
+an error, and the replica stays valid, because each contribution is written
+whole by atomic rename. An import under way finishes, and the session ends
+right after it. Over HTTP a session also ends after 5 minutes without a
+request; at most 16 are open, counting opens under way (a slot is reserved
+before the first body is read), and 64 connections are served at once.
+
+**What a side sends** is bounded too: a batch never exceeds the smaller of
+the peer's `batch_bytes` and the sender's own (64 MiB, `--batch-bytes`), so a
+peer can't ask for one batch of everything, and an HTTP response carries at
+most one batch. A client following the protocol answers each batch with one
+`result` and receives at most one batch per response, so it never sends two
+in a round; a request whose results would release a second batch is refused.
+A response therefore holds at most a batch and an id list, and with 16
+sessions the server's session memory stays within about 16 times that plus
+the id budget. All of these bounds are flags.
+
+**HTTP framing.** One request per connection (`Connection: close`; a
+pipelined second request is read and dropped). Heads of at most 16 KiB and
+32 headers; bodies by `Content-Length` only (`Transfer-Encoding` gets `501`).
+Every wait has an absolute end, however slowly a peer trickles bytes: a
+request head must arrive within 10 seconds in all (before authentication, so
+this bounds what any local process can hold), a body before the session's
+deadline (and at most 30 seconds between its bytes), a response must be
+written within 30 seconds, and the client's whole round ends at its
+deadline. The client connects to 127.0.0.1 or ::1 itself, never to what
+`localhost` resolves to. Parsing is `httparse`, the only HTTP dependency.
+
+**Store writes stay inside the Ground** (task `26a5c735230d`): `objects/` and
+each shard must be real directories, not symlinks; the temporary file is
+created new; and the rename replaces whatever is at the object's path, a
+symlink included, rather than writing through it.
+
+**Limits of step 2:** the server reads its replica once, at startup, so it
+must be the replica's only writer while it runs (step 3 decides how
+`scripts/bk` and the server share the team's Ground). A stdio peer that stops
+reading holds the session's process until the deadline. Sixteen sessions at
+the full id budget could hold several GiB, which is acceptable only behind
+credentials on one machine. A local process can still keep all 64
+connection slots busy by reconnecting every 10 seconds; that's denial of
+service from inside the machine, which step 2 accepts. One credential can
+hold all 16 sessions (no per-credential limit yet). Tokens must be long and
+random: the file holds unsalted blake3 hashes. Withholding (section 4) is
+unchanged.
 
 ## 3. Authentication and who may push
 
@@ -370,7 +468,7 @@ Same outcome; the recommendation needs one relation.
 |---|---|---|---|
 | 0 | Supersession rule and its tests (independent of sync; task `e8a78fc1b51a`) | protocol | Yes (decision 4) |
 | 1 | Sync messages and session state machine in `manyroot`, with no I/O; `bracken sync` between two local directories uses it. (The iterative `is_retracted` is already PR #8.) | protocol (wire format in protocol.md), library | Yes (wire format) |
-| 2 | `bracken serve` (HTTP and `--stdio`), allowlist, quotas, first-seen log; `bracken sync <url>`. Tested on localhost against throwaway Grounds | cli, storage | No |
+| 2 | `bracken serve` (HTTP and `--stdio`), allowlist, quotas, first-seen log; `bracken sync <url>`. Tested on localhost against throwaway Grounds. **Built**: [As built in step 2](#as-built-in-step-2) | cli, storage | No |
 | 3 | Every reader's pinned binary includes PR #8 (done); then run the team server and its off-host backup; `scripts/bk` confirms pushes and the gate fails closed; per-machine keys; checkpoints continue | merge-gate tooling, process | Yes (decision 2, still open; 3) |
 | 4 | Once the off-host backup exists, retire manual checkpoints; update the skill | process, merge-gate tooling | Yes (decision 6) |
 | 5 | Agent-key session auth; membership as contributions (Stewards) | protocol, crypto | Yes |

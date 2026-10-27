@@ -396,12 +396,20 @@ impl Session {
 
     /// The outcome of importing the contributions from the last batch. Returns the Result to send.
     pub fn imported(&mut self, report: &ImportReport) -> Vec<Message> {
+        self.imported_refusing(report, &[])
+    }
+
+    /// Like [`Session::imported`], for a receiver that refused some of the batch's contributions
+    /// before importing the rest, by local policy (an allowlist, a quota). The refusals are listed
+    /// first in `rejected`.
+    pub fn imported_refusing(&mut self, report: &ImportReport, refused: &[Rejected]) -> Vec<Message> {
         self.awaiting_import = false;
-        let rejected = report
-            .rejected
+        let rejected = refused
             .iter()
+            .map(|r| (r.id, r.reason.clone()))
+            .chain(report.rejected.iter().map(|(id, why)| (*id, why.to_string())))
             .take(MAX_REJECTED)
-            .map(|(id, why)| Rejected { id: *id, reason: truncate(why.to_string(), MAX_REASON_BYTES) })
+            .map(|(id, why)| Rejected { id, reason: truncate(why, MAX_REASON_BYTES) })
             .collect();
         vec![Message::Result {
             added: report.added.len() as u64,
@@ -426,9 +434,11 @@ impl Session {
         Ok(Step { send: split(&candidates, MAX_IDS, |ids| Message::Offer { ids }), import: None })
     }
 
-    /// The next batch from the queue, as large as the peer's limit allows. The last one says so.
+    /// The next batch from the queue, as large as both sides' limits allow, so a peer can't make
+    /// this side build a batch larger than it would accept itself. The last one says so.
     fn next_batch(&mut self, graph: &Graph) -> Result<Step, SyncError> {
-        let limit = self.peer_limits.expect("hello comes before anything is sent").batch_bytes;
+        let peer = self.peer_limits.expect("hello comes before anything is sent").batch_bytes;
+        let limit = peer.min(self.limits.batch_bytes);
         let mut size = BUNDLE_HEADER as u64;
         let mut batch = Vec::new();
         while let Some(id) = self.queue.front() {

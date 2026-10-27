@@ -342,11 +342,33 @@ fn object_path(dir: &Path, id: &ContributionId) -> PathBuf {
     dir.join("objects").join(&hex[..2]).join(&hex[2..])
 }
 
+/// Writes one object without following a symlink out of the Ground: `objects/` and the shard
+/// must be real directories (created here if missing), and the temporary file is created new, so
+/// an existing file or symlink in its place fails the write. The rename replaces whatever is at
+/// the object's path, a symlink included, rather than writing through it.
 fn write_object(dir: &Path, c: &Contribution) -> Result<(), StoreError> {
     let path = object_path(dir, &c.id());
     let shard = path.parent().expect("object path has a shard dir");
-    fs::create_dir_all(shard).map_err(io(shard))?;
+    for d in [&dir.join("objects"), shard] {
+        real_dir(d)?;
+    }
     let tmp = shard.join(format!(".tmp-{}-{}", std::process::id(), c.id().short()));
-    fs::write(&tmp, c.encode()).map_err(io(&tmp))?;
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(io(&tmp))?;
+    std::io::Write::write_all(&mut file, &c.encode()).map_err(io(&tmp))?;
+    drop(file);
     fs::rename(&tmp, &path).map_err(io(&path))
+}
+
+/// Creates `d` if it doesn't exist, and refuses it if it is anything but a directory, a symlink
+/// to one included.
+fn real_dir(d: &Path) -> Result<(), StoreError> {
+    match fs::symlink_metadata(d) {
+        Ok(m) if m.is_dir() => Ok(()),
+        Ok(_) => Err(StoreError::Corrupt { path: d.to_owned(), reason: "not a directory (or a symlink)".into() }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(d) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => real_dir(d),
+            other => other.map_err(io(d)),
+        },
+        Err(e) => Err(io(d)(e)),
+    }
 }

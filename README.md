@@ -56,6 +56,9 @@ Moving contributions between replicas:
 
 ```sh
 bracken sync ../other-checkout       # exchange with another replica on disk
+bracken serve --tokens T --allow A --first-seen L   # serve this replica on 127.0.0.1
+BRACKEN_TOKEN=... bracken sync http://127.0.0.1:<port>
+bracken sync --exec ssh host bracken --dir <path> serve --stdio
 bracken export ground.mrb            # or carry a bundle over any transport
 bracken join ground.mrb              # create a new replica from a bundle
 bracken import ground.mrb            # add a bundle to an existing replica
@@ -104,8 +107,9 @@ Manyroot subsystems map onto modules as they come into being:
 v0. The core graph, the validation model, local replicas and the CLI work and
 are tested. These are not done yet:
 
-- **Network sync.** Replicas exchange contributions through shared
-  filesystems or bundle files.
+- **Network sync.** `bracken serve` and `bracken sync <url>` work on one
+  machine (HTTP on 127.0.0.1, no TLS) and over a program's stdio (SSH). No
+  team server runs yet (docs/design/network-sync.md, step 3).
 - **Key protection.** Identity keys are stored unencrypted under
   `.bracken/identities/`. Keep that folder out of git. The rest of
   `.bracken/` (contributions, `ground.json`, the public `agents/` directory)

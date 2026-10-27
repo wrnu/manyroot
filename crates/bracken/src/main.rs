@@ -17,6 +17,10 @@ use manyroot::validation::{open_conflicts, open_supersessors};
 use manyroot::*;
 use serde_json::{Value, json};
 
+mod remote;
+mod serve;
+mod wire;
+
 /// `println!`, through [`write_stdout`]. Shadows the standard macro in this file.
 macro_rules! println {
     () => {
@@ -165,15 +169,87 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
-    /// Exchange contributions with another replica of the same Ground.
+    /// Exchange contributions with another replica of the same Ground: a local directory, a server
+    /// at an http:// URL on this machine, or a server reached through a program (--exec).
     Sync {
-        /// A directory containing .bracken, or a replica directory itself.
-        other: PathBuf,
+        /// A directory containing .bracken, a replica directory itself, or http://127.0.0.1:<port>.
+        #[arg(required_unless_present = "exec", conflicts_with = "exec")]
+        other: Option<String>,
+        /// Run this program (no shell) and sync over its stdin and stdout, e.g. `--exec ssh host
+        /// bracken --dir <path> serve --stdio`. Takes the rest of the command line.
+        #[arg(long, num_args = 1.., allow_hyphen_values = true, value_name = "PROGRAM")]
+        exec: Option<Vec<String>>,
+        /// For an http:// server: read the bearer token from this file. Defaults to $BRACKEN_TOKEN.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<PathBuf>,
+        #[command(flatten)]
+        bounds: BoundsArgs,
+    },
+    /// Serve this replica to sync sessions: over HTTP on 127.0.0.1, or one session over stdio.
+    Serve {
+        /// Serve one session on stdin and stdout (for SSH), instead of HTTP.
+        #[arg(long)]
+        stdio: bool,
+        /// HTTP port on 127.0.0.1; 0 picks a free one. The URL is printed on stdout.
+        #[arg(long, default_value_t = 0, conflicts_with = "stdio")]
+        port: u16,
+        /// Author keys whose contributions this server stores, one hex key per line. Without it, the
+        /// server stores nothing (pull only).
+        #[arg(long, value_name = "PATH", requires = "first_seen")]
+        allow: Option<PathBuf>,
+        /// HTTP credentials: lines of `<name> <blake3 hex of the token>`. Required for HTTP.
+        #[arg(long, value_name = "PATH", conflicts_with = "stdio")]
+        tokens: Option<PathBuf>,
+        /// Append-only log of each contribution stored for the first time, as JSON lines.
+        #[arg(long, value_name = "PATH")]
+        first_seen: Option<PathBuf>,
+        /// Contributions each author key, and each credential, may add in 24 hours.
+        #[arg(long, default_value_t = 10_000)]
+        quota_contributions: u64,
+        /// Bytes each author key, and each credential, may add in 24 hours.
+        #[arg(long, default_value_t = 256 << 20)]
+        quota_bytes: u64,
+        /// The most bytes of contributions the replica may hold.
+        #[arg(long, default_value_t = 4 << 30)]
+        store_cap: u64,
+        /// Over HTTP, the longest wait between a session's requests, in seconds.
+        #[arg(long, default_value_t = 300)]
+        idle: u64,
+        /// Sessions open at once, over HTTP.
+        #[arg(long, default_value_t = 16)]
+        max_sessions: usize,
+        #[command(flatten)]
+        bounds: BoundsArgs,
     },
     /// Write every contribution to a bundle file ("-" for stdout).
     Export { file: PathBuf },
     /// Import contributions from a bundle file ("-" for stdin).
     Import { file: PathBuf },
+}
+
+/// What one sync session may take from its peer.
+#[derive(Args)]
+struct BoundsArgs {
+    /// Seconds from the session's start until it ends with an error.
+    #[arg(long, default_value_t = 600)]
+    deadline: u64,
+    /// Bytes the peer may send in one session, framing and id lists included.
+    #[arg(long, default_value_t = 1 << 30)]
+    budget: u64,
+    /// Bytes of those that may be id lists (heads, offer, need).
+    #[arg(long, default_value_t = 64 << 20)]
+    id_budget: u64,
+    /// The largest batch this side accepts, and sends. Under 16 MiB, the largest contributions
+    /// can't be exchanged.
+    #[arg(long, default_value_t = 64 << 20, value_parser = clap::value_parser!(u64).range(44..))]
+    batch_bytes: u64,
+}
+
+impl BoundsArgs {
+    fn bounds(&self) -> wire::Bounds {
+        let deadline = std::time::Duration::from_secs(self.deadline);
+        wire::Bounds { deadline, budget: self.budget, id_budget: self.id_budget, batch_bytes: self.batch_bytes }
+    }
 }
 
 #[derive(Subcommand)]
@@ -399,7 +475,18 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 }
             }
         }
-        Command::Sync { other } => {
+        Command::Sync { exec: Some(program), bounds, .. } => {
+            return sync_remote(remote::sync_exec(&mut s, &program, bounds.bounds())?);
+        }
+        Command::Sync { other: Some(url), token_file, bounds, .. } if url.contains("://") => {
+            let token = match token_file {
+                Some(path) => std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?,
+                None => std::env::var("BRACKEN_TOKEN").context("set BRACKEN_TOKEN or pass --token-file")?,
+            };
+            return sync_remote(remote::sync_http(&mut s, &url, token.trim(), bounds.bounds())?);
+        }
+        Command::Sync { other, .. } => {
+            let other = PathBuf::from(other.expect("clap requires a target without --exec"));
             let other_dir = if other.join(DIR_NAME).is_dir() { other.join(DIR_NAME) } else { other };
             let mut o = Store::open(&other_dir)?;
             let (here, there) = store::sync(&mut s, &mut o)?;
@@ -408,6 +495,39 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             print_report(&there);
             println!("received {}, sent {}", here.added.len(), there.added.len());
             return Ok(code);
+        }
+        Command::Serve {
+            stdio,
+            port,
+            allow,
+            tokens,
+            first_seen,
+            quota_contributions,
+            quota_bytes,
+            store_cap,
+            idle,
+            max_sessions,
+            bounds,
+        } => {
+            let tokens = match (&tokens, stdio) {
+                (Some(path), false) => Some(serve::Tokens::read(path)?),
+                (None, false) => bail!("serving over HTTP needs --tokens"),
+                (_, true) => None,
+            };
+            let policy = serve::Policy {
+                allow: allow.as_deref().map(serve::read_allowlist).transpose()?,
+                quota_contributions,
+                quota_bytes,
+                store_cap,
+                bounds: bounds.bounds(),
+                idle: std::time::Duration::from_secs(idle),
+                max_sessions,
+            };
+            let intake = serve::Intake::new(s, policy, first_seen.as_deref())?;
+            match tokens {
+                Some(tokens) => serve::serve_http(intake, tokens, port)?,
+                None => serve::serve_stdio(intake)?,
+            }
         }
         Command::Export { file } => {
             let all = s.graph().missing_from(&Graph::new(s.info().ground));
@@ -617,6 +737,22 @@ impl CurrentView {
     fn by_others(&self, id: &ContributionId) -> &[(ContributionId, AgentId)] {
         self.others.get(id).map_or(&[], Vec::as_slice)
     }
+}
+
+/// Reports a session with a server: what each side refused, and what each received. Fails if
+/// either side refused anything or was left with contributions missing ancestors.
+fn sync_remote(side: wire::Side) -> Result<ExitCode> {
+    let peer = &side.peer;
+    let code = decide(side.report.is_clean() && peer.rejected.is_empty() && peer.unresolved == 0);
+    print_report(&side.report);
+    for r in &peer.rejected {
+        eprintln!("the server refused {}: {}", r.id.short(), r.reason);
+    }
+    if peer.unresolved > 0 {
+        eprintln!("the server is missing ancestors of {} contributions", peer.unresolved);
+    }
+    println!("received {}, sent {}", side.report.added.len(), peer.added);
+    Ok(code)
 }
 
 fn print_report(report: &ImportReport) {
