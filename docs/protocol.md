@@ -114,9 +114,17 @@ Every replica holding the same set produces the same order.
 that is not itself retracted. Retracted contributions stay in the graph.
 
 **Supersession.** `S` supersedes `T` if there is a non-retracted
-`relation { from: S, kind: supersedes, to: T }` whose author is also `S`'s
-author. Agents can replace their own contributions or anyone else's, but
-only by contributing something new themselves.
+`relation { from: S, kind: supersedes, to: T }` whose author is also `T`'s
+author. Only a contribution's own author can retire it, but the replacement
+`S` may be anyone's: an author can accept someone else's contribution in
+place of their own. A `supersedes` relation by anyone else stays in the
+graph as a visible statement, and counts for nothing. A supersession only
+holds while its replacement is live: if `S` is retracted, or in a policy's
+accepted layer isn't accepted (a counted failure, say), `T` is current again,
+with everything about it. So accepting someone else's replacement lets its
+author, or a validator, revive `T` without any action by `T`'s author. (Before 2026-10-27 the
+rule required the relation's author to have written `S` instead; see
+[releases.md](releases.md).)
 
 ## Acceptance
 
@@ -174,7 +182,10 @@ It pins:
   `agents/`; no private keys). The test opens it, verifies every
   contribution, and checks pinned ids, agent names, the open contradiction,
   and every validation status, including that retraction outranks a failure
-  and a failure outranks a pass. The fixture holds a contribution of every
+  and a failure outranks a pass. Cases appended for the supersession rule
+  pin that another author's supersession neither supersedes an accepted
+  claim nor silences a contradiction, and that an author's acceptance of
+  someone else's replacement does. The fixture holds a contribution of every
   body kind, relation kind and verdict, and a test that fails to compile when
   a variant is added keeps it that way.
 

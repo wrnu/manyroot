@@ -105,6 +105,11 @@ an agent runs. Without `--sample` it checks every input.
 
 The shipped agent is scripted and deterministic given the seed. Each round it:
 
+- first accepts other agents' fixes of its own implementations, by relating
+  each fix as superseding its implementation itself. A `supersedes` relation
+  only counts when the replaced contribution's author writes it (protocol.md,
+  "Supersession"), so until then another agent's fix is a proposal and the
+  old implementation stays current;
 - fixes its own failing implementation if it has one (a new artifact that
   `supersedes` it), sometimes fixes someone else's instead, or else implements
   a spec it sees no live, unfailed implementation of. Sometimes it implements
@@ -133,7 +138,9 @@ it has a 10% chance of dropping the work instead. With `--wip`, it also:
 - doesn't start a spec that another agent's open wip claim covers, unless that
   claim is stale: `--stale-after` rounds have passed since the round it
   states. Every agent reaches the same verdict. A start that takes over stale
-  claims `supersedes` them.
+  claims `refines` them, saying so: only a claim's own author can supersede
+  it, so a stale claim stops blocking by age alone, and the takeover records
+  who picked the work up.
 
 The default stale window is one round after the latest the work could be due:
 W + 1, or W + 2 under `jitter`. A claim is never stale while its work is on
@@ -160,18 +167,30 @@ setter's are left out.
 | Line | Meaning |
 |---|---|
 | Contributions | Agents' contributions, by kind and by agent |
-| Work | Implementations (artifacts that `implement` a spec, by the artifact's author); fixes (implementations that `supersede` another); checks (evidence) and their verdicts; findings (claims tagged `finding`) |
-| Duplicated work | New implementations (not fixes) of a spec that another agent had already implemented anywhere in the Ground. **Blind**: the earlier one hadn't reached this agent's replica yet, so only better sync or visible work in progress would have avoided it. **Visible**: the agent's replica already held it. Competing fixes aren't counted here; they show up as divergences |
+| Work | Implementations (artifacts that `implement` a spec, by the artifact's author); fixes (implementations their author relates as superseding another, whether or not the replaced one's author has accepted it yet); checks (evidence) and their verdicts; findings (claims tagged `finding`) |
+| Duplicated work | New implementations (not fixes) of a spec that another agent had already implemented anywhere in the Ground. **Blind**: the earlier one hadn't reached this agent's replica yet, so only better sync or visible work in progress would have avoided it. **Visible**: the agent's replica already held it. Competing fixes aren't counted here; they show up as divergences once the replaced implementation's author has accepted more than one |
 | Concurrent work | Implementations started while another agent's implementation of the same spec was started and not yet delivered: the duplication that announcing work could prevent. The start round comes from the `implements` relation's note (`started in round N`). A pair started in the same round counts once, as **same round**: no sync could have shown either agent the other's start. **Later** means the other work started in an earlier round. Dropped work leaves no artifact, so it isn't counted |
-| Wip claims | Shown with `--wip`: claims made, retracted on delivery, retracted on abandonment, taken over when stale, and **ignored while fresh**: claims made while the author's replica held another agent's open, fresh wip claim on the same spec. The scripted agent never does that, so it's always 0 |
+| Wip claims | Shown with `--wip`: claims made, retracted on delivery, retracted on abandonment, taken over when stale (refined by another agent's wip claim), and **ignored while fresh**: claims made while the author's replica held another agent's open, fresh wip claim on the same spec. The scripted agent never does that, so it's always 0 |
 | Availability | For each contribution and each other agent, the number of sync rounds until that agent's replica held it: 1 means the sync right after the round it was made. The final all-to-all sync counts as round `rounds + 1`, and the line says how many pairs only arrived then |
-| Conflicts | What `bracken conflicts` reports at the end: divergences (one implementation superseded by two current ones) and contradictions (a current finding contradicting a current implementation). Fixing an implementation resolves the contradictions against it. The relation counts show how many of each kind agents made |
+| Conflicts | What `bracken conflicts` reports at the end: divergences (one implementation superseded by two current ones) and contradictions (a current finding contradicting a current implementation). A fix resolves the contradictions against an implementation once it counts: when the implementation's author wrote the fix, or accepted it. Until then, someone else's fix leaves them open. The relation counts show how many of each kind agents made; the supersedes count includes acceptances |
 | Ground truth | The harness checks every implementation on every input. "Caught" means a wrong one got at least one failing check from another agent |
 | Policy table | `bracken accepted --min-passes N` for N = 1, 2, 3, with any agent as a validator. **accepted** counts subjects meeting the policy, including **superseded** ones; **impls**, **correct** and **wrong** are the accepted implementations by ground truth; **specs solved** counts specs with an accepted, not superseded, correct implementation; **conflicts** are those in the accepted layer |
 | Replicas | Whether every replica ended with the same contributions |
 | Timing | Wall time and bracken calls. The only part that changes between runs with the same seed |
 
-A sample, from `--agents 4 --rounds 5 --seed 1`:
+Results computed before 2026-10-27, including PR #4's runs and the first
+version of the compare table below (PR #10), used the old supersession rule,
+under which any agent's fix retired an implementation at once and a takeover
+superseded a stale wip claim. They count more divergences: seeds 1 to 3 over
+10 rounds had 3, 4 and 3 then, and 0, 0 and 0 now. Those divergences were
+races: another agent fixed a failing implementation while its author fixed
+it too. Now the author's own fix counts and the other stays a proposal on a
+retired implementation. Of the 14 fixes of someone else's work in those
+three runs, the author's own fix won 11, one was accepted, and two arrived
+after their target was already retired or the run had ended.
+
+A sample, from `--agents 4 --rounds 5 --seed 1` (it has no fixes, so it's the
+same under both rules):
 
 ```
 Bracken demo: 4 agents, 5 rounds, seed 1, ring sync, checks on 6 sampled inputs, 6 specs
@@ -211,60 +230,63 @@ target/release/bracken-demo compare            # seeds 1..10, ring and gossip, W
 
 Every row is the mean over seeds 1 to 10, with 4 agents and 12 rounds: enough
 rounds for jittered work to drift apart. "Accepted" is under min passes 2.
-All 240 runs converged, and no agent ever ignored a fresh wip claim.
+All 240 runs converged, and no agent ever ignored a fresh wip claim. The table
+was re-run on 2026-10-27 under the current supersession rule; the first
+version (PR #10) differed by at most 0.5 in any mean and 3 in contributions
+or bracken calls, and the findings below hold under both.
 
 | Topology | W | Schedule | Wip | Concurrent starts (same round) | Duplicates (blind/visible) | Accepted (correct) | Specs solved | Contributions | Bracken calls | Wip claims (taken over) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| ring | 1 | lockstep | off | 6.2 (5.7) | 7.9 (4.5/3.4) | 12.3 (11.5) | 5.9 | 112 | 405 |  |
-| ring | 1 | lockstep | on | 6.1 (5.7) | 8.0 (4.5/3.5) | 12.2 (11.5) | 5.9 | 180 | 473 | 22.1 (3.7) |
-| ring | 1 | stagger | off | 7.1 (1.3) | 8.2 (1.6/6.6) | 11.9 (11.1) | 5.4 | 113 | 406 |  |
-| ring | 1 | stagger | on | 3.7 (1.0) | 7.7 (2.0/5.7) | 10.6 (9.9) | 5.8 | 182 | 475 | 22.2 (8.0) |
-| ring | 1 | jitter | off | 5.5 (1.7) | 5.8 (2.1/3.7) | 7.9 (7.7) | 4.8 | 82 | 374 |  |
-| ring | 1 | jitter | on | 3.6 (1.6) | 5.2 (1.8/3.4) | 8.3 (7.5) | 5.3 | 131 | 424 | 17.7 (3.3) |
+| ring | 1 | lockstep | off | 6.0 (5.4) | 8.1 (4.5/3.6) | 12.3 (11.6) | 5.8 | 113 | 407 |  |
+| ring | 1 | lockstep | on | 5.8 (5.4) | 8.1 (4.5/3.6) | 12.1 (11.5) | 5.8 | 182 | 476 | 22.4 (4.2) |
+| ring | 1 | stagger | off | 7.1 (1.3) | 8.1 (1.6/6.5) | 11.8 (11.1) | 5.3 | 114 | 408 |  |
+| ring | 1 | stagger | on | 3.8 (1.0) | 7.5 (1.8/5.7) | 10.5 (9.8) | 5.6 | 184 | 478 | 22.1 (7.9) |
+| ring | 1 | jitter | off | 5.8 (1.8) | 5.7 (2.1/3.6) | 7.9 (7.7) | 4.7 | 82 | 376 |  |
+| ring | 1 | jitter | on | 3.5 (1.7) | 5.2 (1.7/3.5) | 8.2 (7.4) | 5.2 | 131 | 424 | 17.6 (3.2) |
 | ring | 2 | lockstep | off | 3.7 (2.4) | 4.5 (2.4/2.1) | 6.9 (6.7) | 4.1 | 69 | 362 |  |
-| ring | 2 | lockstep | on | 3.2 (2.6) | 4.3 (2.3/2.0) | 6.7 (6.5) | 4.1 | 122 | 415 | 16.9 (4.2) |
-| ring | 2 | stagger | off | 4.8 (0.6) | 5.0 (1.9/3.1) | 6.8 (6.4) | 3.8 | 64 | 358 |  |
-| ring | 2 | stagger | on | 2.5 (0.8) | 3.8 (2.1/1.7) | 6.4 (5.9) | 4.7 | 106 | 400 | 15.3 (2.3) |
+| ring | 2 | lockstep | on | 3.1 (2.5) | 4.3 (2.3/2.0) | 6.7 (6.5) | 4.1 | 123 | 416 | 16.9 (4.6) |
+| ring | 2 | stagger | off | 4.8 (0.6) | 5.0 (1.9/3.1) | 6.8 (6.4) | 3.8 | 65 | 358 |  |
+| ring | 2 | stagger | on | 2.5 (0.8) | 3.8 (2.1/1.7) | 6.4 (5.9) | 4.7 | 107 | 400 | 15.3 (2.3) |
 | ring | 2 | jitter | off | 3.5 (0.5) | 3.7 (1.4/2.3) | 4.6 (4.0) | 3.1 | 54 | 347 |  |
-| ring | 2 | jitter | on | 1.7 (0.7) | 2.8 (0.9/1.9) | 3.9 (3.6) | 3.2 | 98 | 390 | 14.8 (2.2) |
-| gossip | 1 | lockstep | off | 6.8 (6.2) | 6.7 (3.5/3.2) | 12.2 (11.3) | 5.8 | 112 | 405 |  |
-| gossip | 1 | lockstep | on | 6.6 (6.3) | 6.8 (3.5/3.3) | 12.2 (11.3) | 5.8 | 180 | 473 | 21.4 (4.6) |
-| gossip | 1 | stagger | off | 7.8 (1.5) | 7.5 (2.5/5.0) | 11.2 (10.9) | 5.7 | 116 | 409 |  |
-| gossip | 1 | stagger | on | 5.5 (2.3) | 6.8 (2.5/4.3) | 11.0 (10.4) | 5.6 | 169 | 462 | 21.5 (4.1) |
-| gossip | 1 | jitter | off | 5.4 (1.8) | 6.1 (2.3/3.8) | 8.1 (7.9) | 5.0 | 88 | 381 |  |
-| gossip | 1 | jitter | on | 3.1 (1.5) | 4.4 (1.5/2.9) | 7.6 (7.0) | 5.3 | 131 | 424 | 17.2 (2.7) |
+| ring | 2 | jitter | on | 1.7 (0.7) | 2.8 (0.9/1.9) | 3.9 (3.6) | 3.2 | 98 | 391 | 14.8 (2.1) |
+| gossip | 1 | lockstep | off | 6.4 (5.9) | 6.7 (3.3/3.4) | 12.3 (11.4) | 5.9 | 113 | 406 |  |
+| gossip | 1 | lockstep | on | 6.3 (6.0) | 6.7 (3.3/3.4) | 12.3 (11.4) | 5.9 | 182 | 475 | 21.8 (4.8) |
+| gossip | 1 | stagger | off | 7.8 (1.4) | 7.5 (2.5/5.0) | 11.3 (11.0) | 5.7 | 116 | 409 |  |
+| gossip | 1 | stagger | on | 5.6 (2.5) | 6.8 (2.4/4.4) | 10.9 (10.4) | 5.6 | 171 | 464 | 21.4 (4.2) |
+| gossip | 1 | jitter | off | 5.4 (1.8) | 6.1 (2.3/3.8) | 8.1 (7.9) | 5.0 | 88 | 382 |  |
+| gossip | 1 | jitter | on | 3.3 (1.7) | 4.4 (1.5/2.9) | 7.6 (7.0) | 5.4 | 133 | 426 | 17.3 (2.8) |
 | gossip | 2 | lockstep | off | 3.9 (2.4) | 4.4 (2.0/2.4) | 6.6 (6.3) | 3.9 | 69 | 362 |  |
 | gossip | 2 | lockstep | on | 3.5 (2.5) | 4.9 (2.2/2.7) | 6.9 (6.5) | 4.0 | 118 | 411 | 17.0 (4.1) |
-| gossip | 2 | stagger | off | 4.2 (0.8) | 4.5 (1.9/2.6) | 6.8 (6.6) | 3.7 | 62 | 355 |  |
-| gossip | 2 | stagger | on | 2.9 (1.3) | 4.6 (1.5/3.1) | 6.5 (6.1) | 4.6 | 112 | 406 | 15.7 (3.3) |
+| gossip | 2 | stagger | off | 4.6 (0.8) | 4.4 (1.9/2.5) | 6.8 (6.6) | 3.7 | 63 | 356 |  |
+| gossip | 2 | stagger | on | 2.9 (1.2) | 4.5 (1.5/3.0) | 6.5 (6.1) | 4.6 | 114 | 407 | 15.9 (3.4) |
 | gossip | 2 | jitter | off | 3.2 (0.6) | 3.8 (1.1/2.7) | 4.7 (4.6) | 3.1 | 54 | 347 |  |
-| gossip | 2 | jitter | on | 2.3 (1.1) | 3.3 (0.7/2.6) | 4.6 (4.5) | 3.6 | 94 | 386 | 14.4 (2.4) |
+| gossip | 2 | jitter | on | 2.3 (1.1) | 3.3 (0.7/2.6) | 4.6 (4.5) | 3.6 | 94 | 387 | 14.4 (2.5) |
 
 **What changes between rows matters more than wip.**
 
 - **The schedule decides whether wip can help at all.** In lockstep every agent
   chooses in the same rounds, so almost every concurrent start is a same-round
-  start (5.7 of 6.2 on ring at W = 1). Wip can't help agents who all choose in
-  the same round, and it doesn't: 6.2 becomes 6.1. Staggered and jittered
+  start (5.4 of 6.0 on ring at W = 1). Wip can't help agents who all choose in
+  the same round, and it doesn't: 6.0 becomes 5.8. Staggered and jittered
   schedules turn most concurrent starts into later-round ones (1.3 of 7.1 are
   same-round under stagger), and those are the ones a claim can prevent.
 - **With the agents out of step, wip roughly halves concurrent starts:** on
-  ring, from 7.1 to 3.7 (stagger) and 5.5 to 3.6 (jitter) at W = 1, and 4.8 to
+  ring, from 7.1 to 3.8 (stagger) and 5.8 to 3.5 (jitter) at W = 1, and 4.8 to
   2.5 and 3.5 to 1.7 at W = 2. Gossip spreads claims more slowly and unevenly,
-  so the gain is smaller (7.8 to 5.5 for stagger, W = 1).
+  so the gain is smaller (7.8 to 5.6 for stagger, W = 1).
 - **Same-round starts stay blind in both modes.** Wip leaves them as they were,
-  or adds a few (gossip, stagger, W = 1: 1.5 to 2.3), because steering agents
+  or adds a few (gossip, stagger, W = 1: 1.4 to 2.5), because steering agents
   away from claimed specs crowds them onto the few still free.
 - **Longer work (W = 2) means less of everything** in 12 rounds: fewer
   implementations, fewer accepted, fewer specs solved. Comparing across W
   compares different amounts of work.
 
-**PR #4's duplicate count barely moves** (ring, stagger, W = 1: 8.2 to 7.7),
+**PR #4's duplicate count barely moves** (ring, stagger, W = 1: 8.1 to 7.5),
 because most of it is visible: re-implementing a spec whose earlier
 implementation failed its checks, or deliberately repeating a covered one.
 Wip doesn't target either. Concurrent starts is the number it targets.
 
-**Overhead.** Wip adds 45 to 80% more contributions (claims, `refines`
+**Overhead.** Wip adds 47 to 81% more contributions (claims, `refines`
 relations, retractions) and 12 to 17% more bracken calls. Availability is
 unchanged at about 2 sync rounds: claims don't make sync any faster.
 

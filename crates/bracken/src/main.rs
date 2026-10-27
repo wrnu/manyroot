@@ -130,9 +130,9 @@ enum Command {
         /// Local name or public key.
         #[arg(long)]
         author: Option<String>,
-        /// Only what is current: omit retracted contributions, claims and artifacts their author superseded,
-        /// and relations, evidence and retractions about anything omitted. Another author's supersession is
-        /// shown as a marker instead.
+        /// Only what is current: omit retracted contributions, claims and artifacts their author superseded
+        /// (with a replacement anyone may have written), and relations, evidence and retractions about anything
+        /// omitted. Another author's supersession doesn't count, and is shown as a marker instead.
         #[arg(long)]
         current: bool,
         #[command(flatten)]
@@ -312,10 +312,7 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                             v["superseded_by_others"] = view
                                 .by_others(&c.id())
                                 .iter()
-                                .map(|s| {
-                                    let a = g.get(s).expect("supersessors exist").author();
-                                    json!({"id": s, "author": a, "author_name": names.0.get(&a)})
-                                })
+                                .map(|(s, a)| json!({"id": s, "author": a, "author_name": names.0.get(a)}))
                                 .collect();
                         }
                         v
@@ -325,8 +322,8 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             } else {
                 for c in rows {
                     let mut text = line(g, &names, c);
-                    for by in view.as_ref().map_or(&[][..], |v| v.by_others(&c.id())) {
-                        let author = names.display(&g.get(by).expect("supersessors exist").author());
+                    for (by, author) in view.as_ref().map_or(&[][..], |v| v.by_others(&c.id())) {
+                        let author = names.display(author);
                         text.push_str(&format!("  (superseded by {author} {})", by.short()));
                     }
                     println!("{text}");
@@ -577,13 +574,14 @@ fn own_claim(s: &Store, names: &Names, who: &Identity, prefix: &str) -> Result<C
 
 /// What `log --current` shows.
 struct CurrentView {
-    /// Omitted: retracted contributions; claims and artifacts their own author superseded with
-    /// another of their own (a supersession that counts under docs/protocol.md, whose newer side
-    /// is live); and anything that refers to an omitted contribution.
+    /// Omitted: retracted contributions; claims and artifacts with a supersession that counts under
+    /// docs/protocol.md (written by their own author, with a live newer side, whoever wrote it); and
+    /// anything that refers to an omitted contribution.
     hidden: HashSet<ContributionId>,
-    /// Shown but marked: live subjects that only other authors superseded. Someone else can't
-    /// hide your claim, or the relations and evidence about it.
-    others: HashMap<ContributionId, Vec<ContributionId>>,
+    /// Shown but marked: live subjects that other authors claim to supersede. Those supersessions
+    /// don't count, so someone else can't hide your claim, or the relations and evidence about it.
+    /// Each entry is the claimed successor and the author of the supersedes relation.
+    others: HashMap<ContributionId, Vec<(ContributionId, AgentId)>>,
 }
 
 impl CurrentView {
@@ -592,23 +590,31 @@ impl CurrentView {
         let mut view = CurrentView { hidden: HashSet::new(), others: HashMap::new() };
         for id in order {
             let c = g.get(id).expect("ordered ids exist");
-            let (own, others): (Vec<_>, Vec<_>) = if c.body().is_subject() {
-                open_supersessors(g, id)
-                    .into_iter()
-                    .partition(|s| g.get(s).expect("supersessors exist").author() == c.author())
-            } else {
-                Default::default()
-            };
-            if g.is_retracted(id) || !own.is_empty() || c.body().references().iter().any(|r| view.hidden.contains(r)) {
+            let superseded = c.body().is_subject() && !open_supersessors(g, id).is_empty();
+            if g.is_retracted(id) || superseded || c.body().references().iter().any(|r| view.hidden.contains(r)) {
                 view.hidden.insert(*id);
-            } else if !others.is_empty() {
+                continue;
+            }
+            let others: Vec<(ContributionId, AgentId)> = g
+                .referrers(id)
+                .filter(|r| r.author() != c.author() && !g.is_retracted(&r.id()))
+                .filter_map(|r| match r.body() {
+                    Body::Relation { from, kind: RelationKind::Supersedes, to, .. }
+                        if to == id && g.get(from).is_some_and(|f| f.body().is_subject()) && !g.is_retracted(from) =>
+                    {
+                        Some((*from, r.author()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !others.is_empty() {
                 view.others.insert(*id, others);
             }
         }
         view
     }
 
-    fn by_others(&self, id: &ContributionId) -> &[ContributionId] {
+    fn by_others(&self, id: &ContributionId) -> &[(ContributionId, AgentId)] {
         self.others.get(id).map_or(&[], Vec::as_slice)
     }
 }

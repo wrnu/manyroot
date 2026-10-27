@@ -130,6 +130,45 @@ fn a_small_demo_converges_and_its_report_adds_up() {
 }
 
 #[test]
+fn another_agents_fix_counts_once_the_implementations_author_accepts_it() {
+    // Seed 1 over 10 rounds has a fix of another agent's implementation.
+    let tmp = tempfile::tempdir().unwrap();
+    let kept = tmp.path().join("run");
+    let args = ["--agents", "4", "--rounds", "10", "--seed", "1"];
+    report(&[&args[..], &["--keep", kept.to_str().unwrap()]].concat());
+    let replica = kept.join("agent-0/.bracken");
+    let log = bracken_json(&replica, &["log", "--json"]);
+    let log = log.as_array().unwrap();
+    let author: HashMap<&str, &str> =
+        log.iter().map(|c| (c["id"].as_str().unwrap(), c["author"].as_str().unwrap())).collect();
+    let supersedes: Vec<&Value> =
+        log.iter().filter(|c| c["kind"] == "relation" && c["body"]["kind"] == "supersedes").collect();
+    let pair =
+        |c: &Value| (c["body"]["from"].as_str().unwrap().to_owned(), c["body"]["to"].as_str().unwrap().to_owned());
+
+    // Proposals: a fixer relates its fix to someone else's implementation.
+    let proposals: BTreeSet<(String, String)> = supersedes
+        .iter()
+        .filter(|c| author[c["body"]["to"].as_str().unwrap()] != c["author"].as_str().unwrap())
+        .map(|c| pair(c))
+        .collect();
+    // Acceptances: the replaced implementation's author relates someone else's fix.
+    let acceptances: Vec<(String, String)> = supersedes
+        .iter()
+        .filter(|c| author[c["body"]["to"].as_str().unwrap()] == c["author"].as_str().unwrap())
+        .filter(|c| author[c["body"]["from"].as_str().unwrap()] != c["author"].as_str().unwrap())
+        .map(|c| pair(c))
+        .collect();
+    assert!(!acceptances.is_empty(), "the run should include an accepted fix");
+    for (fix, old) in &acceptances {
+        assert!(proposals.contains(&(fix.clone(), old.clone())), "{old} accepts {fix}, which nobody proposed");
+        let shown = bracken_json(&replica, &["show", old, "--json"]);
+        let current = bracken_json(&replica, &["log", "--current", "--json"]);
+        assert!(current.as_array().unwrap().iter().all(|c| c["id"] != old.as_str()), "{old} is still current: {shown}");
+    }
+}
+
+#[test]
 fn the_same_seed_gives_the_same_report() {
     let args = ["--agents", "3", "--rounds", "2", "--seed", "11", "--topology", "gossip"];
     let first = without_timing(report(&args));
@@ -324,7 +363,8 @@ fn wip_claims_are_honoured_while_fresh_and_taken_over_when_stale() {
         })
         .collect();
     let wip = |id: &str| claims.iter().find(|w| w.id == id);
-    // The round each claim was closed in: retracted by its author, or superseded by a takeover.
+    // The round each claim was closed in: retracted by its author, or taken over (a wip claim that
+    // `refines` it: only its author could supersede it).
     let mut closed: HashMap<&str, u64> = HashMap::new();
     let mut takeovers = 0;
     for c in log {
@@ -333,7 +373,7 @@ fn wip_claims_are_honoured_while_fresh_and_taken_over_when_stale() {
             closed.insert(body["target"].as_str().unwrap(), round_in(body["reason"].as_str().unwrap()));
         }
         if c["kind"] == "relation"
-            && body["kind"] == "supersedes"
+            && body["kind"] == "refines"
             && let (Some(new), Some(old)) = (wip(body["from"].as_str().unwrap()), wip(body["to"].as_str().unwrap()))
         {
             assert!(new.round >= old.round + stale_after, "{} took over a fresh claim", new.id);

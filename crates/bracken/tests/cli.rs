@@ -64,6 +64,10 @@ fn two_replicas_preserve_and_resolve_a_disagreement() {
     assert_eq!(ids(&laptop).len(), 7);
     assert_eq!(ids(&laptop), ids(&server), "same graph, same causal order");
 
+    // Bob's supersession of Alice's requirement doesn't count: only its author can retire it.
+    assert_eq!(json(&laptop, &["conflicts", "--json"]), Value::Array(vec![]));
+    // Alice accepts Bob's replacement too, so the requirement has two current successors.
+    bracken(&laptop, &["relate", &long, "supersedes", &req, "--as", "alice"]);
     let conflicts = json(&laptop, &["conflicts", "--json"]);
     assert_eq!(conflicts[0]["type"], "divergence");
     assert_eq!(conflicts[0]["target"], req.as_str());
@@ -192,7 +196,8 @@ fn log_current_keeps_what_another_author_superseded() {
     let contradicts = bracken(dir, &["relate", &finding, "contradicts", &pr, "--as", "security"]);
     let fail = bracken(dir, &["evidence", &pr, "fail", "--method", "review", "--as", "security"]);
 
-    // The builder supersedes the finding with a claim of their own: a counted supersession, by another author.
+    // The builder supersedes the finding with a claim of their own. It's another author's supersession, so it
+    // doesn't count, and the finding stays, marked.
     let addressed = bracken(dir, &["claim", "Addressed", "--as", "builder"]);
     let by_builder = bracken(dir, &["relate", &addressed, "supersedes", &finding, "--as", "builder"]);
 
@@ -206,6 +211,11 @@ fn log_current_keeps_what_another_author_superseded() {
     assert_eq!(row[0]["superseded_by_others"][0]["author_name"], "builder");
     let text = bracken(dir, &["log", "--tag", "finding", "--current"]);
     assert!(text.contains(&format!("(superseded by builder {})", &addressed[..12])), "{text}");
+    // Nor does it silence the finding in `conflicts` (task 780f658d4b84).
+    let conflicts = json(dir, &["conflicts", "--json"]);
+    assert_eq!(conflicts.as_array().unwrap().len(), 1, "{conflicts}");
+    assert_eq!(conflicts[0]["type"], "contradiction");
+    assert_eq!(conflicts[0]["relation"], contradicts.as_str());
 
     // The finding's own author superseding it still hides it, and everything about it.
     let revised = bracken(
@@ -217,6 +227,33 @@ fn log_current_keeps_what_another_author_superseded() {
     let current = ids(dir, &["log", "--current", "--json"]);
     assert!(!current.contains(&contradicts) && !current.contains(&by_builder));
     assert!(current.contains(&fail), "evidence about the pr is not about the finding");
+}
+
+#[test]
+fn log_current_hides_what_its_author_replaced_with_someone_elses() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "builder"]);
+    bracken(dir, &["id", "new", "security"]);
+
+    let pr = bracken(dir, &["claim", "PR #1 head", "--tag", "pr", "--as", "builder"]);
+    let finding = bracken(dir, &["claim", "main.rs:1 leaks a key", "--tag", "finding", "--as", "security"]);
+    let contradicts = bracken(dir, &["relate", &finding, "contradicts", &pr, "--as", "security"]);
+    let addressed = bracken(dir, &["claim", "Addressed: the key is read from a file", "--as", "builder"]);
+    let by_builder = bracken(dir, &["relate", &addressed, "supersedes", &finding, "--as", "builder"]);
+    assert_eq!(ids(dir, &["log", "--tag", "finding", "--current", "--json"]), std::slice::from_ref(&finding));
+
+    // The finding's author accepts the builder's claim in its place: that supersession counts.
+    let accepts = bracken(dir, &["relate", &addressed, "supersedes", &finding, "--as", "security"]);
+    assert!(ids(dir, &["log", "--tag", "finding", "--current", "--json"]).is_empty());
+    let current = ids(dir, &["log", "--current", "--json"]);
+    for gone in [&finding, &contradicts, &by_builder, &accepts] {
+        assert!(!current.contains(gone), "{gone} should leave log --current with the finding");
+    }
+    assert!(current.contains(&addressed) && current.contains(&pr));
+    assert_eq!(json(dir, &["show", &finding, "--json"])["assessment"]["status"], "pending");
+    assert!(json(dir, &["conflicts", "--json"]).as_array().unwrap().is_empty());
 }
 
 #[test]

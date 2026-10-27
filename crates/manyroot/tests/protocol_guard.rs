@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use manyroot::validation::{Conflict, Policy, Status, open_conflicts};
+use manyroot::validation::{Conflict, Policy, Status, open_conflicts, open_supersessors};
 use manyroot::*;
 
 /// The fixture Ground, checked in. Only `write_ground_v1_fixture` writes it.
@@ -321,7 +321,7 @@ fn bundles_encode_to_pinned_bytes() {
 
 /// Pinned ids of the fixture's subjects and their statuses under the default
 /// policy: every status, and the precedence between them.
-const FIXTURE_STATUSES: [(&str, Status); 7] = [
+const FIXTURE_STATUSES: [(&str, Status); 11] = [
     // "tokens expire after one hour"
     ("f844bc81e7bc741a5b952acd65cb0346c6c57324468fad777381b0b8121470c8", Status::Superseded),
     // auth.rs
@@ -336,6 +336,17 @@ const FIXTURE_STATUSES: [(&str, Status); 7] = [
     ("f34348d4d6c2c099688dd8b79194860dbfd44b5cdaca73e2c6659a1499b353ec", Status::Pending),
     // "rotate signing keys daily": retracted, with a counted fail
     ("98355b3ed012fa04b1559f12fe161d6a992ecf1c42babcc5d5ace0e4971f4fe2", Status::Retracted),
+    // Appended for the supersession rule (decision 4c55e65bc290).
+    // "tokens expire after 90 minutes": bob's, claims to supersede alice's
+    // "two hours", which stays accepted above because that doesn't count
+    ("f732a8371497252331f513156a478bc66aa87891d5f48ca25826c6fabcf7b6eb", Status::Accepted),
+    // "log failed logins": alice accepted carol's replacement, which counts
+    ("4eedeb02e6ef7a23c18352a3a70a22ac98dbe57e62887eb078b6a3bc9827901e", Status::Superseded),
+    // "log failed and successful logins"
+    ("c76ceda569128634a7967495f46756587d02f5d592ac5c18952e070483bb5f2e", Status::Accepted),
+    // "keep sessions in postgres": bob's, claims to supersede carol's "redis",
+    // whose contradiction therefore stays open below
+    ("660d33f71236a66f412490ef71202e299d19afd0faecba64c8c19e503146715c", Status::Pending),
 ];
 
 // The fixture's contribution of each body kind, relation kind and verdict, so
@@ -387,28 +398,38 @@ fn fixture_covers_every_kind() {
 }
 
 /// Every contribution id in the fixture, sorted.
-const FIXTURE_IDS: [&str; 23] = [
+const FIXTURE_IDS: [&str; 33] = [
     "15b433921525a23fc72d03b75e948c93952ab5f7a6e8ea975546016b0094ac48",
     "178367f61edbdd30afc59a23f772edf3180876289327a18467640f8802fed1c6",
     "222245bf60eb1e6375b992b7a7cb5df7990be4182570f02da538bbc93b4b5c79",
+    "34838f28015d42849a3ea06f0a5bb0381bf4920a75f3ffdf71620d22b1fd38a3",
     "4db47ffb86e0fc48c535fd9939b2ab9c73e90992b1a95d148abadf240e4eb40e",
+    "4eedeb02e6ef7a23c18352a3a70a22ac98dbe57e62887eb078b6a3bc9827901e",
     "51672e5f18a0ac576460395991392b0dce47c002049c916d25080b037d1f4d44",
     "6172802e2bc6d3930339e877c47ef8bc89efebc327fa8a42d7d0f89d2c1bfe85",
+    "660d33f71236a66f412490ef71202e299d19afd0faecba64c8c19e503146715c",
     "6924e584cd3aa6a11702bf51be4404af6ac93ab76196b9adcb65b6d9ed74af5d",
     "6c51c956c53b61728e823de4dcddd7017aef5e1f38659b0f78f103f94565ded8",
     "76178bfa7147234c4892fed630ae51dafc19b3a879f5a92f2e0a8852391168c3",
+    "7639fc3e700c95c879504ce3667dfb72f2a2e7d99b743f68b2228dd22c05f048",
     "7d94bd0888a748f8f4fd82afe64616a716c1fca03e8aff821f1127184986239c",
     "808d58df5d4f5570a40eece2e4c9c5f14ca550643ae508527d2ff410bd00ba6b",
+    "964254b1499d51a3b3f09d2c7bb7b6d12456f394495837b8444737faebbbebba",
     "98355b3ed012fa04b1559f12fe161d6a992ecf1c42babcc5d5ace0e4971f4fe2",
     "a7a43fb2aba5b6eb830790052802f708780d08dbd02f268496ad2993fc76104f",
     "b94165ce6e141d541e770dbfab33de769ffca2cca43170e98e01ae38c9dc6314",
+    "bac6e7a4abcb3cde1b9bc6b89ebe5ce8e35c03d4def68db239464ccce1afd2b1",
     "be7454450a144d7991ed5d4b1edf738e106cb0caeb6eb4eddbd681e5f6781452",
     "becb406c3f2ca5ec53aa8980062a363d301d644c1abfaff5020fd94e475fa7ee",
+    "c2c0a2141cf90d3142a79d77f7ea606c7b9c443702488ae39c94740e2449aaf9",
+    "c76ceda569128634a7967495f46756587d02f5d592ac5c18952e070483bb5f2e",
+    "c8e94d5a68b5cadb611588c1064ef1198375e02d63de193e985c442cf8fecfb8",
     "d7f4c3ac87730f5c5eb6c8dc040f4825134328fd47361bd38da342b41ab57108",
     "e37f81ed02ed8188b061058a223c74807b86953db7852509c9c06a636e9a816f",
     "e628ba51cba47bed175d752d922751649a9cfb651312f26a14ca516c79a5f443",
     "f2cf2005456cf8de1a13a4dfdeab069ad762f15b44943bcbff585aedca796114",
     "f34348d4d6c2c099688dd8b79194860dbfd44b5cdaca73e2c6659a1499b353ec",
+    "f732a8371497252331f513156a478bc66aa87891d5f48ca25826c6fabcf7b6eb",
     "f844bc81e7bc741a5b952acd65cb0346c6c57324468fad777381b0b8121470c8",
     "f9a3bb0a9f2ef6f3bc0579c40756381be95f5657e6816d17f6b2c5aa3d0fc305",
 ];
@@ -438,6 +459,12 @@ fn fixture_ground_opens_and_verifies() {
     }
     assert_eq!(open_conflicts(graph).len(), 1);
     assert!(matches!(open_conflicts(graph)[0], Conflict::Contradiction { .. }));
+    // Only the target's author can supersede it, with a replacement anyone wrote.
+    let redis: ContributionId = "f34348d4d6c2c099688dd8b79194860dbfd44b5cdaca73e2c6659a1499b353ec".parse().unwrap();
+    let failed: ContributionId = "4eedeb02e6ef7a23c18352a3a70a22ac98dbe57e62887eb078b6a3bc9827901e".parse().unwrap();
+    let all: ContributionId = "c76ceda569128634a7967495f46756587d02f5d592ac5c18952e070483bb5f2e".parse().unwrap();
+    assert!(open_supersessors(graph, &redis).is_empty());
+    assert_eq!(open_supersessors(graph, &failed), vec![all]);
 
     let agents: Vec<(String, String)> =
         store.agents().unwrap().into_iter().map(|e| (e.name, e.agent.to_hex())).collect();
@@ -544,4 +571,23 @@ fn write_ground_v1_fixture() {
     let rotate = add(&mut store, &carol, claim("rotate signing keys daily", &[]));
     add(&mut store, &bob, evidence(rotate, Verdict::Fail, "review", "too often"));
     add(&mut store, &carol, Body::Retract { target: rotate, reason: "premature".into() });
+
+    // Appended for the supersession rule (decision 4c55e65bc290): a supersedes
+    // relation counts only when its author wrote the contribution it replaces.
+    // Everything above is unchanged, so its ids are too.
+
+    // Another author's supersession doesn't count: "two hours" stays accepted.
+    let ninety = add(&mut store, &bob, claim("tokens expire after 90 minutes", &["decision"]));
+    add(&mut store, &bob, relate(ninety, RelationKind::Supersedes, two_hours, "a compromise"));
+    add(&mut store, &carol, evidence(ninety, Verdict::Pass, "review", ""));
+    // The replaced claim's author accepting someone else's replacement does count.
+    let failed = add(&mut store, &alice, claim("log failed logins", &[]));
+    add(&mut store, &bob, evidence(failed, Verdict::Pass, "review", ""));
+    let all = add(&mut store, &carol, claim("log failed and successful logins", &[]));
+    add(&mut store, &bob, evidence(all, Verdict::Pass, "review", ""));
+    add(&mut store, &alice, relate(all, RelationKind::Supersedes, failed, "I accept yours"));
+    // Another author's supersession doesn't silence a contradiction (task
+    // 780f658d4b84): "keep sessions in redis" stays current.
+    let postgres = add(&mut store, &bob, claim("keep sessions in postgres", &[]));
+    add(&mut store, &bob, relate(postgres, RelationKind::Supersedes, redis, ""));
 }

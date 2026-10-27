@@ -1,4 +1,4 @@
-use manyroot::validation::open_conflicts;
+use manyroot::validation::{open_conflicts, open_supersessors};
 use manyroot::*;
 
 fn ground() -> GroundId {
@@ -246,12 +246,19 @@ fn concurrent_supersessions_are_preserved_as_divergence() {
     let contract = add(&mut g, &alice, claim("tokens last 30 minutes"));
     add(&mut g, &val, evidence(contract, Verdict::Pass));
 
-    // Bob and Carol each replace the contract without seeing the other.
+    // Bob and Carol each propose a replacement without seeing the other.
+    // Their own supersessions don't count: only the contract's author can
+    // retire it.
     let short = add_detached(&mut g, &bob, claim("tokens last 15 minutes"));
     let long = add_detached(&mut g, &carol, claim("tokens last 60 minutes"));
     add_detached(&mut g, &bob, relate(short, RelationKind::Supersedes, contract));
     add_detached(&mut g, &carol, relate(long, RelationKind::Supersedes, contract));
     assert!(!g.is_ancestor(&short, &long) && !g.is_ancestor(&long, &short));
+    assert!(open_conflicts(&g).is_empty());
+
+    // Alice accepts each, on replicas that haven't seen the other acceptance.
+    add_detached(&mut g, &alice, relate(short, RelationKind::Supersedes, contract));
+    add_detached(&mut g, &alice, relate(long, RelationKind::Supersedes, contract));
 
     // Before validation: open conflicts see the fork, accepted view does not.
     let policy = Policy::default();
@@ -268,28 +275,67 @@ fn concurrent_supersessions_are_preserved_as_divergence() {
     add(&mut g, &val, evidence(long, Verdict::Pass));
     let e = policy.evaluate(&g);
     assert_eq!(policy.assess(&g, &contract).unwrap().status, Status::Superseded);
-    assert_eq!(e.conflicts, vec![divergence]);
+    assert_eq!(e.conflicts, vec![divergence.clone()]);
 
-    // A later decision that supersedes both resolves it.
+    // A later decision that supersedes both resolves it, once each
+    // replacement's author accepts it.
     let decision = add(&mut g, &alice, claim("tokens last 15 minutes; refresh tokens last 60"));
     add(&mut g, &alice, relate(decision, RelationKind::Supersedes, short));
     add(&mut g, &alice, relate(decision, RelationKind::Supersedes, long));
     add(&mut g, &val, evidence(decision, Verdict::Pass));
+    assert_eq!(policy.evaluate(&g).conflicts, vec![divergence], "Alice can't retire Bob's and Carol's claims");
+    add(&mut g, &bob, relate(decision, RelationKind::Supersedes, short));
+    add(&mut g, &carol, relate(decision, RelationKind::Supersedes, long));
     let e = policy.evaluate(&g);
     assert_eq!(ids(&e), vec![decision]);
     assert!(e.conflicts.is_empty());
 }
 
 #[test]
-fn only_the_successors_author_can_supersede() {
+fn only_the_targets_author_can_supersede() {
     let (alice, mallory, val) = (agent("alice"), agent("mallory"), agent("validator"));
     let mut g = Graph::new(ground());
+    let policy = Policy::default();
     let a = add(&mut g, &alice, claim("a"));
     let b = add(&mut g, &alice, claim("b"));
-    add(&mut g, &val, evidence(a, Verdict::Pass));
-    add(&mut g, &val, evidence(b, Verdict::Pass));
+    let m = add(&mut g, &mallory, claim("m"));
+    for x in [a, b, m] {
+        add(&mut g, &val, evidence(x, Verdict::Pass));
+    }
+
+    // Mallory can't retire Alice's claim, with Alice's replacement or her own.
     add(&mut g, &mallory, relate(b, RelationKind::Supersedes, a));
-    assert_eq!(Policy::default().assess(&g, &a).unwrap().status, Status::Accepted);
+    add(&mut g, &mallory, relate(m, RelationKind::Supersedes, a));
+    assert_eq!(policy.assess(&g, &a).unwrap().status, Status::Accepted);
+    assert!(open_supersessors(&g, &a).is_empty());
+
+    // Alice can, with a replacement anyone wrote.
+    add(&mut g, &alice, relate(m, RelationKind::Supersedes, a));
+    let assessment = policy.assess(&g, &a).unwrap();
+    assert_eq!(assessment.status, Status::Superseded);
+    assert_eq!(assessment.superseded_by, vec![m]);
+    assert_eq!(open_supersessors(&g, &a), vec![m]);
+}
+
+#[test]
+fn another_authors_supersession_does_not_silence_a_contradiction() {
+    // Deferred task 780f658d4b84: a builder "supersedes" the finding against
+    // their PR with a claim of their own. The contradiction stays open.
+    let (builder, security) = (agent("builder"), agent("security"));
+    let mut g = Graph::new(ground());
+    let pr = add(&mut g, &builder, claim("PR #1 head"));
+    let finding = add(&mut g, &security, claim("main.rs:1 leaks a key"));
+    let rel = add(&mut g, &security, relate(finding, RelationKind::Contradicts, pr));
+    let contradiction = Conflict::Contradiction { relation: rel, a: finding, b: pr };
+    assert_eq!(open_conflicts(&g), vec![contradiction.clone()]);
+
+    let addressed = add(&mut g, &builder, claim("Addressed"));
+    add(&mut g, &builder, relate(addressed, RelationKind::Supersedes, finding));
+    assert_eq!(open_conflicts(&g), vec![contradiction]);
+
+    // The finding's author withdrawing it in favour of the fix does close it.
+    add(&mut g, &security, relate(addressed, RelationKind::Supersedes, finding));
+    assert!(open_conflicts(&g).is_empty());
 }
 
 #[test]

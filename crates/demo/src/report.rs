@@ -60,7 +60,7 @@ pub struct WipReport {
     pub delivered: usize,
     /// Retracted by their author on dropping the work.
     pub abandoned: usize,
-    /// Superseded by another agent's wip claim, as stale.
+    /// Taken over by another agent's wip claim, as stale: a `refines` relation between wip claims.
     pub taken_over: usize,
     /// Wip claims made while the author's replica held another agent's open, fresh wip claim
     /// on the same spec. Agents that honour wip claims make none.
@@ -79,7 +79,7 @@ pub struct Contributions {
 pub struct Work {
     /// Artifacts that implement a spec.
     pub implementations: usize,
-    /// Implementations that supersede another one.
+    /// Implementations their author relates as superseding another one: fixes, counted or only proposed.
     pub fixes: usize,
     pub checks: usize,
     pub passes: usize,
@@ -390,8 +390,9 @@ fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &E
         .iter()
         .filter(|e| match e.kind.as_str() {
             "retract" => true,
+            // Only the wip claim's own author can close it by superseding it.
             "relation" => {
-                e.text("kind") == "supersedes" && by_id.get(e.text("from")).is_some_and(|f| f.author == e.author)
+                e.text("kind") == "supersedes" && by_id.get(e.text("to")).is_some_and(|t| t.author == e.author)
             }
             _ => false,
         })
@@ -399,7 +400,7 @@ fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &E
         .collect();
     let taken_over = mine
         .iter()
-        .filter(|e| e.kind == "relation" && e.text("kind") == "supersedes")
+        .filter(|e| e.kind == "relation" && e.text("kind") == "refines")
         .filter(|e| is_wip(e.text("from")) && is_wip(e.text("to")))
         .count();
 

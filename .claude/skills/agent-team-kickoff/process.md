@@ -94,7 +94,7 @@ Any counted `fail` makes it `rejected`. The fix is a new commit and a new `pr` c
 
 CI is not part of the gate (section 10). Its result is a second opinion: when it disagrees with the Ground's evidence, the manager records why before merging.
 
-**Findings.** The complete list of findings against a head is the referrers of `scripts/bk show <pr>`: every `finding` that `contradicts` it, triaged or not. Retracting a `contradicts` link drops the finding only when the finding's author or the manager wrote the link; `scripts/merge` keeps counting it otherwise. `scripts/bk conflicts` shows most of them too, but not a finding that someone else's claim supersedes (task 780f658d4b84), so don't rely on it here. Rejected findings stay listed until the head changes; that's expected, not a blocker. Before merging, every finding against the head must have manager evidence:
+**Findings.** The complete list of findings against a head is the referrers of `scripts/bk show <pr>`: every `finding` that `contradicts` it, triaged or not. Retracting a `contradicts` link drops the finding only when the finding's author or the manager wrote the link; `scripts/merge` keeps counting it otherwise. `scripts/bk conflicts` lists them too, except one its own author has retracted or superseded; someone else's supersession can't silence a finding. Rejected findings stay listed until the head changes; that's expected, not a blocker. Before merging, every finding against the head must have manager evidence:
 
 - A **confirmed** finding (pass) blocks the merge until it's fixed in a new head, or **deferred**: a `task` claim (tags `task`, `deferred`) that `depends_on` the finding and says what will fix it and when. Only the manager records a deferral, writing both the task and the relation; `scripts/merge` counts no other. The manager defers only findings that don't make this PR unsafe to merge, such as a risk that only becomes real after a later change, and says so in its triage evidence.
 - A **rejected** finding (fail) stays on record and doesn't block.
@@ -192,7 +192,7 @@ Report: <when, and anything beyond the standard final report>
 - Split work so builders touch different files; otherwise run tasks in sequence or stack them. Note overlaps in the task claims with `depends_on` relations.
 - Never rewrite another agent's branch. Merge `main` into your own; force-push only your own, with `--force-with-lease`.
 - **`git stash` is shared across worktrees.** Use a WIP commit instead.
-- Concurrent contributions never conflict in the Ground. Two builders contributing at the same moment just produce two causal heads. If two agents **supersede the same claim** differently, `scripts/bk conflicts` shows a divergence. That's a real disagreement for the manager to settle, not an error to clear.
+- Concurrent contributions never conflict in the Ground. Two builders contributing at the same moment just produce two causal heads. Only a claim's author can supersede it (another agent's `supersedes` relation stays visible but doesn't count), so if the author accepts **two different replacements** for one claim, `scripts/bk conflicts` shows a divergence. That's a real disagreement for the manager to settle, not an error to clear.
 
 ## 7. Monitoring and triage
 
@@ -201,7 +201,7 @@ Report: <when, and anything beyond the standard final report>
 - **Daily triage** (**schedule**, fixed time, fresh thread, identity `triage`; read-only for code, writes only to the Ground) covers:
   - new error-monitor issues and failed CI on `main`;
   - what shipped since yesterday;
-  - `scripts/bk conflicts` (divergences and most untriaged findings; the referrers of each open `pr` are the complete list);
+  - `scripts/bk conflicts` (divergences, and findings against current heads; the referrers of each open `pr` are the complete list);
   - `owner-ask` claims still open, and `owner-review` claims not yet reviewed;
   - `pr` claims pending for more than a day;
   - tasks with no recent contributions.
@@ -257,7 +257,7 @@ Besides decisions and tasks, three tags carry what a future agent would otherwis
 | `preference` | How the owner wants agents to work, quoted and dated | "Owner, 2026-10-27: no AI attribution in commits" |
 | `reference` | Where something lives outside the repo | "Forge docs: `~/Code/autimo/wiki/forge/`" |
 
-- **At the start of a task**, read `scripts/bk log --tag decision --current`, `--tag gotcha --current` and `--tag preference --current`, and `--tag reference --current` when it's relevant. `--current` leaves out retracted entries, entries their author superseded with another of their own, and anything about those. An entry that someone else superseded stays, marked `(superseded by <author> <id>)`: nobody can hide another author's entry. Before relying on one, run `scripts/bk show <id>` to see whether something contradicts it.
+- **At the start of a task**, read `scripts/bk log --tag decision --current`, `--tag gotcha --current` and `--tag preference --current`, and `--tag reference --current` when it's relevant. `--current` leaves out retracted entries, entries their author superseded (the replacement can be anyone's), and anything about those. An entry that someone else superseded stays, marked `(superseded by <author> <id>)`: nobody can hide another author's entry. Before relying on one, run `scripts/bk show <id>` to see whether something contradicts it.
 - **Verify before acting:** if an entry names a file, function or flag, confirm it still exists.
 - **Don't contribute:** what the code, `git log` or docs already say (update those instead); secrets or personal data (contributions are permanent); anything only the current conversation needs.
 - **Keep it current, never delete.** When an entry changes, its author contributes the new version with `claim … --supersedes <old>`, which also records the `supersedes` relation. `claim --supersedes` refuses another author's claim: contradict or refine it instead. When it's wrong, anyone contributes a correction that `contradicts` it, and its author can retract it.

@@ -61,7 +61,37 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
-_No migrations yet._
+### 2026-10-27: supersession counts only when the relation's author wrote the target
+
+Decision `4c55e65bc290` (point 4), answering `3d381dfdb8a9`. A
+`supersedes` relation used to count when its author wrote the new
+contribution (`from`), so anyone could retire anyone's claim by writing a
+replacement. It now counts only when its author wrote the old one (`to`);
+the replacement may be anyone's. As before, a supersession holds only while
+the replacement is live: if the accepted replacement is retracted, or fails
+validation under a policy, the replaced claim is current again. When the
+replacement is someone else's, that's now in their hands (or a validator's),
+not the replaced claim's author's.
+
+- **Existing Grounds open unchanged.** No validity rule, encoding or id
+  changed: only derived state (supersession, `superseded` status, divergence,
+  contradictions between current subjects, `log --current`).
+- **What changes:** derived state only where a `supersedes` relation's author
+  didn't write its target, or wrote its target but not its replacement. On
+  this repo's Ground (947 contributions, 60 supersedes relations, every one
+  written by the author of both ends), every subject's status, `log
+  --current`, `conflicts` and `accepted` are identical before and after.
+- **Fixture:** `ground-v1` gained ten contributions appended after the
+  original 23, whose ids and bytes are unchanged. A binary from before this
+  change opens the extended fixture, but derives different statuses for the
+  appended cases.
+- **The demo** (`crates/demo`) follows the rule: an agent accepts other
+  agents' fixes of its own implementations, and a wip takeover `refines` the
+  stale claim instead of superseding it. Demo results from before this
+  change, including PR #4's and PR #10's first compare table, count more
+  divergences (docs/demo.md).
+- **No re-signing or data migration.** Upgrade the pinned binary with the
+  owner's go.
 
 ## Rollback
 

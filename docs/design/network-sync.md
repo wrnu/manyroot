@@ -1,42 +1,48 @@
 # Network sync between Ground replicas
 
-> **Proposal: not decided.** Nothing here is part of the protocol until the
-> owner decides it and [protocol.md](../protocol.md) is changed in its own
-> `protocol`-class PR. Task `9fa2c890ae5a`.
+> **Decided in part, 2026-10-27.** The owner accepted the recommendations
+> (decision `4c55e65bc290`), with decision 2 deferred and decision 6
+> amended; both are recorded below. The supersession rule (decision 4) is
+> in [protocol.md](../protocol.md). The sync protocol itself enters
+> protocol.md only with its own `protocol`-class PR. Task `9fa2c890ae5a`.
 
 Today replicas exchange whole bundles by file, or `bracken sync` merges two
 local directories, and the team shares one Ground in the main checkout,
 committed to git. This proposes sync over a network.
 
-## Decisions for the owner
+## Decisions
 
-1. **Approve the exchange and transports** (sections 1 and 2): heads
-   exchange, then an exact offer/need step, carried over HTTP first and stdio
-   or SSH second. Peer-to-peer later.
-2. **Where the team's sync server runs**, who can reach it, and its
-   off-host backup (sections 4 and 5). The backup holds the objects, the
-   first-seen log and the server's configuration, and can't be rewritten
-   from the server (append-only or with retention). This is new
-   infrastructure and access, so it's your call. *Assumed:* a single small
-   server on Autimo infrastructure, HTTPS only.
-3. **v1 authentication** (section 3): credentials stay in the transport, and
-   the server keeps an allowlist of author keys. Each machine generates its
-   own identities, and only public keys leave it. No authentication in the
-   protocol until membership (Stewards). Until each agent holds only its own
-   key, author-based rules are conventions inside the team.
-4. **The supersession rule** (section 6, question `3d381dfdb8a9`): a
-   `supersedes` relation counts only when its author wrote the contribution
-   it replaces. It's a protocol change, though it changes nothing in this
-   repo's Ground today (note `4f72b184f324`).
-5. **CI stays an observer in v1** (section 5), as decision `8b2454e4cf81`
-   has it. CI as a validator moves to [Later](#later-ci-as-a-validator),
-   because a CI pass on a PR's tree can't be independent of that tree. While
-   CI runs PR code, no repository or organization Actions secrets exist.
-6. **Replacing checkpoint commits** (section 5). *Assumed:* after two weeks
-   of running both with no divergence, the manual checkpoints stop. A daily
-   automated export of new objects to git continues as the independent
-   timeline until the off-host backup in decision 2 exists. This changes
-   decision `34dd510c2457`.
+The owner's answers, 2026-10-27 (decision `4c55e65bc290`: "Accept your
+recommendations").
+
+1. **Accepted: the exchange and transports** (sections 1 and 2): heads
+   exchange, then an exact offer/need step, with bundles as batches, carried
+   over HTTP first and SSH second. Peer-to-peer later.
+2. **Deferred: where the team's sync server runs**, who can reach it, and
+   its off-host backup (sections 4 and 5), until there's something to
+   deploy. The backup must be one the server can't rewrite, and holds the
+   objects, the first-seen log and the server's configuration.
+3. **Accepted: v1 authentication** (section 3): credentials stay in the
+   transport, and the server keeps an allowlist of author keys. Each machine
+   generates its own identities, and only public keys leave it. No
+   authentication in the protocol until membership (Stewards). Until each
+   agent holds only its own key, author-based rules are conventions inside
+   the team.
+4. **Accepted: the supersession rule** (section 6, answering
+   `3d381dfdb8a9`): a `supersedes` relation counts only when its author wrote
+   the contribution it replaces. Now in protocol.md, with a migration note
+   in [releases.md](../releases.md); it changes nothing in this repo's
+   Ground.
+5. **Accepted: CI stays an observer in v1** (section 5), as decision
+   `8b2454e4cf81` has it. CI as a validator is under
+   [Later](#later-ci-as-a-validator), because a CI pass on a PR's tree can't
+   be independent of that tree. While CI runs PR code, no repository or
+   organization Actions secrets exist.
+6. **Amended: the manual Ground checkpoints stay** (`scripts/ground-checkpoint`
+   from the main checkout) until the off-host backup in decision 2 exists.
+   There's no automated export, because one would have to hold a credential
+   that can push to the code repository (finding `99c8fcc0702f`). Decision
+   `34dd510c2457` stands.
 
 ## 1. What's exchanged
 
@@ -195,7 +201,8 @@ pushes needs more:
   different sets. Comparing heads among replicas that sync only through that
   server can't detect this. **It's a stated limit of v1, with one server.**
   Detection needs a copy that doesn't come through the server, such as the
-  git export (decision 6) or a direct sync between two replicas.
+  Ground checkpoints in git (decision 6) or a direct sync between two
+  replicas.
 - **Backdating:** `timestamp_ms` is advisory, so a leaked key can backdate
   forgeries (process 9.3). The server should keep a first-seen log
   (contribution id, time, credential), unreplicated but backed up off-host
@@ -231,8 +238,14 @@ process already requires (process step 5). Two standing rules go with this:
   head is exactly the current `pr` claim's full sha, and merges by that sha:
   the merge API's expected-head field (`head_commit_id` in Forgejo's merge
   options; to be verified before use, since `fj pr merge` has no such
-  option), so a head that moved fails the merge. This belongs in process
-  step 8 and section 4.2, and applies with or without network sync.
+  option), so a head that moved fails the merge. That binds the PR's side
+  only: a squash merge lands the verified head combined with main's tip at
+  merge time (finding `1b203aeab09b`). So the manager also checks that
+  main's current tip is an ancestor of the verified sha (`git merge-base
+  --is-ancestor origin/main <sha>`); if it isn't, main is merged into the
+  branch again and the gate applies to the new head. This belongs in
+  process step 8 and section 4.2, and applies with or without network
+  sync.
 
 **Agent names.** `.bracken/agents/` isn't a contribution, so network sync
 won't carry it (note `8d64aea0f186`). *Assumed:* each identity contributes a
@@ -245,44 +258,47 @@ prefixes. Policies resolve names from local configuration (section 3).
 | Retired | Replaced by |
 |---|---|
 | `scripts/bk`'s main-checkout-only Ground and `BRACKEN_DIR` trick | Each worktree or machine uses a replica synced with the server |
-| Manual checkpoints (9.3), `scripts/ground-checkpoint`, gotcha `a407d726a0ee` | An automated daily export to git, then the off-host backup (decision 2) |
-| The main checkout as the only live Ground | Server and full replicas; the export keeps the independent timeline |
+| Manual checkpoints (9.3), `scripts/ground-checkpoint`, gotcha `a407d726a0ee` | The off-host backup (decision 2), once it exists; until then, checkpoints continue (decision 6) |
+| The main checkout as the only live Ground | Server and full replicas; the checkpoints keep the independent timeline |
 | Restore by clone (9.3) | Pull from the server or any replica |
 
-CI keeps checking `docs/vision.md` against the Ground in git, now the
-export. It doesn't pull from the server, which would need a credential
-(the no-secrets rule above).
+CI keeps checking `docs/vision.md` against the Ground committed in git. It
+doesn't pull from the server, which would need a credential (the no-secrets
+rule above).
 
 **Not retired:** CI as an observer (process section 10, and the first row
 of process section 11, stay as they are in v1); CI's Ground-shape and
-append-only checks, which guard the git export; one key per agent (needs
+append-only checks, which guard the checkpoints; one key per agent (needs
 Stewards); and branches and PRs for code (need Weave).
 
-**Transition.** Run both for two weeks, comparing the server's heads with
-the committed Ground daily. Then replace the manual checkpoints with the
-export, with your go (decision 6).
+**Transition.** Checkpoints continue alongside the server, and the
+manager compares the server's heads with the committed Ground at each
+checkpoint. Retiring them waits for the off-host backup, and needs your go
+(decision 6).
 
 ## 6. Cross-author supersession
 
-Today a `supersedes` relation counts when its author wrote the *new*
-contribution, whoever wrote the old one. So anyone can mark anyone's claim
+Until 2026-10-27 a `supersedes` relation counted when its author wrote the
+*new* contribution, whoever wrote the old one. So anyone can mark anyone's claim
 superseded by writing a claim and a relation. Finding `8d90a9a5d109` showed
 this hides others' entries from reading views, and task `780f658d4b84` that
 it silences contradictions in `conflicts`. With replicas run by different
 people, it lets one organization quietly retire another's claims in every
 reader's open layer.
 
-**Recommendation:** a `supersedes` relation counts only when **its author
-wrote the target** (`to`). The new contribution may be anyone's: an author
+**Decided** (decision 4): a `supersedes` relation counts only when **its
+author wrote the target** (`to`). The new contribution may be anyone's: an author
 can declare their own claim replaced by someone else's ("I accept yours").
-Anything else stays a plain relation, visible and marked as proposed, the way
-`log --current` already shows it.
+Anything else stays a plain relation, visible: `log --current` keeps the
+target and marks it `(superseded by <relation's author> <id>)`.
 
-**Policies can trust more.** A policy may name `supersession_authorities`
-(empty by default, so the default policy trusts no one extra): in that
-policy's accepted layer, their cross-author supersessions count too. That
-keeps a reader's right to decide (vision principle 4) without letting any
-writer decide for everyone.
+**Later, policy only: trusting more.** A policy could name
+`supersession_authorities` (empty by default, so the default policy trusts
+no one extra): in that policy's accepted layer, their cross-author
+supersessions would count too. That keeps a reader's right to decide (vision
+principle 4) without letting any writer decide for everyone. It changes no
+replicated data, so it can come whenever a reader needs it; it isn't part of
+the protocol change.
 
 **Effects:**
 
@@ -293,8 +309,9 @@ writer decide for everyone.
   manager's claim stands alongside, marked, which is what happens today.
 - No validity rule changes, so every existing Ground still opens. Derived
   state changes only where cross-author supersessions exist, and this repo's
-  Ground has none (note `4f72b184f324`). It's still a `protocol`-class change
-  with a migration note.
+  Ground has none (note `4f72b184f324`; every status was compared before and
+  after). It's still a `protocol`-class change, with a migration note in
+  releases.md.
 
 **Caveat:** inside the team, the rule binds only as far as keys do. Any
 agent can still sign the relation with the target author's key, as with
@@ -307,15 +324,15 @@ Same outcome; the recommendation needs one relation.
 
 | Step | What | Class | Needs your go |
 |---|---|---|---|
-| 0 | Decide this proposal; supersession rule and its tests (independent of sync) | protocol | Yes (decision 4) |
+| 0 | Supersession rule and its tests (independent of sync; task `e8a78fc1b51a`) | protocol | Yes (decision 4) |
 | 1 | Sync messages and session state machine in `manyroot`, with no I/O; `bracken sync` between two local directories uses it. (The iterative `is_retracted` is already PR #8.) | protocol (wire format in protocol.md), library | Yes (wire format) |
 | 2 | `bracken serve` (HTTP and `--stdio`), allowlist, quotas, first-seen log; `bracken sync <url>`. Tested on localhost against throwaway Grounds | cli, storage | No |
-| 3 | Upgrade every reader's pinned binary to include PR #8; then run the team server and its off-host backup; `scripts/bk` confirms pushes and the gate fails closed; per-machine keys; checkpoints continue | merge-gate tooling, process | Yes (decisions 2, 3) |
-| 4 | Replace manual checkpoints with the daily export; update the skill | process, merge-gate tooling | Yes (decision 6) |
+| 3 | Every reader's pinned binary includes PR #8 (done); then run the team server and its off-host backup; `scripts/bk` confirms pushes and the gate fails closed; per-machine keys; checkpoints continue | merge-gate tooling, process | Yes (decision 2, still open; 3) |
+| 4 | Once the off-host backup exists, retire manual checkpoints; update the skill | process, merge-gate tooling | Yes (decision 6) |
 | 5 | Agent-key session auth; membership as contributions (Stewards) | protocol, crypto | Yes |
 | 6 | Peer-to-peer discovery; range reconciliation with selective replication (Canopy) | protocol | Yes |
 
-The merge-sha check (section 5) and the no-secrets rule need no sync, so
+The merge checks (section 5) and the no-secrets rule need no sync, so
 they can land now as a `process` change.
 
 **The smallest useful step is 1**: it makes the exchange exact and testable
@@ -340,11 +357,21 @@ signer would need at least:
   limits. Only the outcome goes back to the signer.
 - **Dependencies** fetched in a separate step, from the PR's `Cargo.lock` but
   with cargo configuration the signer supplies, into a read-only vendor
-  directory. The build ignores the repository's `.cargo/` and toolchain file
-  and uses a fixed toolchain image.
+  directory. The fetch needs network, so it also runs on the disposable
+  side, never on the key's host. Cargo reads `.cargo/config.toml` from every
+  directory above where it runs, and the repository's can name a registry
+  credential provider (an executable), source replacement or path
+  overrides. So the fetch runs outside the checkout tree, or with the
+  repository's `.cargo/` removed, with a signer-set `CARGO_HOME` (finding
+  `53325c072be5`). The build ignores the repository's `.cargo/` and
+  toolchain file and uses a fixed toolchain image.
 - **A policy for build-configuration changes:** a PR that touches `.cargo/`,
-  `rust-toolchain*`, `build.rs`, harness settings, or deletes tests gets no
-  `ci` pass, only a flag for reviewers.
+  `rust-toolchain*`, `build.rs`, harness settings, or dependencies
+  (`Cargo.toml` or `Cargo.lock` adding crates brings their `build.rs` and
+  proc-macros), or deletes tests, gets no `ci` pass, only a flag for
+  reviewers. A test can also end its process early (`std::process::exit(0)`
+  makes the whole test binary exit 0), which is one more reason a ci pass is
+  never independent.
 - **Binding** (finding `f68a026f861f`): it runs only for a full 40-hex sha
   that is the Forge PR's current head, records the PR number, and the merge
   uses the expected-head check in section 5.

@@ -60,11 +60,20 @@ impl Roster {
 /// others' implementations on a sample of inputs, reports what fails, fixes
 /// failing implementations, and sometimes duplicates work it can see.
 ///
+/// A fix `supersedes` the implementation it replaces, but under the protocol
+/// that only counts when the replaced implementation's author writes the
+/// relation. So an agent that finds others' fixes of its own work accepts
+/// them on its next turn, by relating each fix as superseding its
+/// implementation itself.
+///
 /// With [`Behaviour::work_rounds`] above 0, an implementation is delivered
 /// that many rounds after the agent starts it, and the agent sometimes drops
 /// work it started. With [`Behaviour::wip`], it announces each start with a
 /// `wip` claim, retracts the claim when it delivers or abandons the work, and
-/// doesn't start a spec that another agent's open, fresh wip claim covers.
+/// doesn't start a spec that another agent's open, fresh wip claim covers. A
+/// stale wip claim by another agent stops counting by age alone; an agent
+/// that starts the same spec records that it takes the work over with a
+/// `refines` relation, since only the claim's author could supersede it.
 pub struct ScriptedAgent {
     name: String,
     rng: Rng,
@@ -91,7 +100,7 @@ struct Start {
     spec: &'static Spec,
     /// The failing implementation this replaces: its id and name.
     replaces: Option<(String, String)>,
-    /// Stale wip claims by others on the same spec, which this start takes over.
+    /// Stale wip claims by others on the same spec, which this start takes over (`refines`).
     takes_over: Vec<String>,
 }
 
@@ -153,7 +162,7 @@ impl ScriptedAgent {
             let claim = turn.replica.claim(&statement, &["wip", start.spec.name])?;
             turn.replica.relate(&claim, "refines", &view.specs[start.spec.name], "")?;
             for stale in &start.takes_over {
-                turn.replica.relate(&claim, "supersedes", stale, "takes over stale work")?;
+                turn.replica.relate(&claim, "refines", stale, "takes over stale work")?;
             }
             wip = Some(claim);
         }
@@ -258,7 +267,19 @@ impl ScriptedAgent {
 
 impl Agent for ScriptedAgent {
     fn act(&mut self, turn: &Turn) -> Result<()> {
-        let view = View::read(turn)?;
+        let mut view = View::read(turn)?;
+
+        // 0. Accept others' fixes of my live implementations: only my relation retires mine.
+        let mut accepted = false;
+        for mine in view.impls.values().filter(|i| i.live() && i.author == self.name) {
+            for (fix_name, fix_id) in &mine.proposed_fixes {
+                turn.replica.relate(fix_id, "supersedes", &mine.id, &format!("accepts {fix_name}"))?;
+                accepted = true;
+            }
+        }
+        if accepted {
+            view = View::read(turn)?;
+        }
 
         // 1. Carry on with started work, or start something.
         if let Some(p) = self.pending.take() {
@@ -289,7 +310,7 @@ impl Agent for ScriptedAgent {
     }
 }
 
-/// An open wip claim (not retracted, not superseded), as one replica sees it.
+/// An open wip claim (not retracted, superseded by its author, or taken over), as one replica sees it.
 struct Wip {
     id: String,
     author: String,
@@ -312,7 +333,11 @@ struct Impl {
     spec: String,
     program: String,
     retracted: bool,
+    /// A supersession that counts: written by this implementation's author.
     superseded: bool,
+    /// Live fixes by other agents that claim to supersede it, which its author
+    /// hasn't accepted: fix name to fix id.
+    proposed_fixes: BTreeMap<String, String>,
     checked_by: BTreeSet<String>,
     fails: BTreeSet<String>,
 }
@@ -369,6 +394,7 @@ impl View {
                 program: artifact.text("text").to_owned(),
                 retracted: artifact.retracted,
                 superseded: false,
+                proposed_fixes: BTreeMap::new(),
                 checked_by: BTreeSet::new(),
                 fails: BTreeSet::new(),
             });
@@ -385,23 +411,35 @@ impl View {
                     }
                     i.checked_by.insert(who);
                 }
-                // Supersession counts only when the relation's author wrote the replacement.
+                // Supersession counts only when the relation's author wrote the replaced
+                // implementation. Another agent's fix is only a proposal until then.
                 "relation" if e.text("kind") == "supersedes" => {
-                    let from_author = by_id.get(e.text("from")).map(|f| f.author.as_str());
-                    if from_author == Some(e.author.as_str())
-                        && let Some(target) = name_of.get(e.text("to"))
+                    let Some(target) = name_of.get(e.text("to")) else { continue };
+                    let target_author = by_id[e.text("to")].author.as_str();
+                    let i = impls.get_mut(target).expect("named impls exist");
+                    if e.author == target_author {
+                        i.superseded = true;
+                    } else if let Some(fix) = name_of.get(e.text("from"))
+                        && by_id[e.text("from")].author == e.author
+                        && !by_id[e.text("from")].retracted
                     {
-                        impls.get_mut(target).expect("named impls exist").superseded = true;
+                        i.proposed_fixes.insert(fix.clone(), e.text("from").to_owned());
                     }
                 }
                 _ => {}
             }
         }
-        // Open wip claims: not retracted, and not superseded by their superseder's own relation.
+        // Open wip claims: not retracted, not superseded by their own author, and not taken
+        // over (refined by another wip claim) as stale.
+        let is_wip = |id: &str| by_id.get(id).is_some_and(|c| c.kind == "claim" && c.tags().first() == Some(&"wip"));
         let superseded: BTreeSet<&str> = log
             .iter()
-            .filter(|e| e.kind == "relation" && !e.retracted && e.text("kind") == "supersedes")
-            .filter(|e| by_id.get(e.text("from")).is_some_and(|f| f.author == e.author))
+            .filter(|e| e.kind == "relation" && !e.retracted)
+            .filter(|e| match e.text("kind") {
+                "supersedes" => by_id.get(e.text("to")).is_some_and(|t| t.author == e.author),
+                "refines" => is_wip(e.text("from")) && is_wip(e.text("to")),
+                _ => false,
+            })
             .map(|e| e.text("to"))
             .collect();
         let mut wips: Vec<Wip> = log

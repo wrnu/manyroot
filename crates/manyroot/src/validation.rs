@@ -158,17 +158,16 @@ fn open(graph: &Graph, id: &ContributionId) -> bool {
 }
 
 /// Contributions in `live` that supersede `target`. A supersedes relation
-/// only counts when its author also wrote the superseding contribution, and
-/// it has not been retracted.
+/// only counts when its author also wrote `target`, so only a contribution's
+/// own author can retire it, whoever wrote the replacement; and only while
+/// the relation is not retracted.
 fn supersessors(graph: &Graph, target: &ContributionId, live: impl Fn(&ContributionId) -> bool) -> Vec<ContributionId> {
+    let Some(target_author) = graph.get(target).map(|t| t.author()) else { return Vec::new() };
     let mut out: Vec<ContributionId> = graph
         .referrers(target)
         .filter_map(|r| match r.body() {
             Body::Relation { from, kind: RelationKind::Supersedes, to, .. }
-                if to == target
-                    && graph.get(from).is_some_and(|f| f.author() == r.author())
-                    && !graph.is_retracted(&r.id())
-                    && live(from) =>
+                if to == target && r.author() == target_author && !graph.is_retracted(&r.id()) && live(from) =>
             {
                 Some(*from)
             }
