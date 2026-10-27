@@ -47,7 +47,21 @@ agents never work with a repository's files, or its Ground, in reach. Every
 path the demo hands to bracken is absolute, so a relative `--keep` stays where
 you asked. A `--keep` path with `..` after a directory that doesn't exist yet
 is refused, because creating it would follow the `..` to a place the checks
-never looked at.
+never looked at. The demo resolves the part of the path that exists once,
+checks the directory beneath that real path, and makes each new directory
+there without resolving the path as typed again. If a check refuses, or a
+directory it made was swapped for something else meanwhile, it removes the
+directories it made, but only those that are still the very ones it made.
+
+These checks refuse paths in or through a checkout as they stand when the demo
+looks, but they can't protect against someone who can swap directories in the
+path while the demo runs: the run's files, keys included, are written by path,
+so a well-timed swap can send them, or a cleanup, somewhere else. So `--keep`
+must not point into a directory that other users or processes can write to.
+A fix, creating and writing the run through directory handles instead of
+paths, is tracked as task `efc537ca8e65`.
+`compare` runs each seed in the system's temporary directory (`TMPDIR`), with
+the same refusal; it takes `--work-rounds` 0 to 10 and `--jobs` 1 to 64.
 
 To look around a run's Ground afterwards, keep it outside any repository and
 point bracken at a replica:

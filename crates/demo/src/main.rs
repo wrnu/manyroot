@@ -10,7 +10,7 @@ use serde_json::json;
 use bracken_demo::bracken::Bracken;
 use bracken_demo::harness::{self, Behaviour, Config, Schedule, Topology};
 use bracken_demo::rng::Rng;
-use bracken_demo::safety::{refuse_git_checkout, refuse_parent_in_new_part};
+use bracken_demo::safety::{DEMO, create_checked, refuse_git_checkout, refuse_parent_in_new_part};
 use bracken_demo::{compare, task};
 
 #[derive(Parser)]
@@ -100,7 +100,8 @@ struct CompareArgs {
     seeds: Seeds,
     #[arg(long, value_enum, value_delimiter = ',', default_value = "ring,gossip")]
     topologies: Vec<Topology>,
-    #[arg(long, value_delimiter = ',', default_value = "1,2")]
+    /// Rounds each piece of work takes, 0 to 10 each.
+    #[arg(long, value_delimiter = ',', default_value = "1,2", value_parser = clap::value_parser!(u32).range(0..=10))]
     work_rounds: Vec<u32>,
     #[arg(long, value_enum, value_delimiter = ',', default_value = "lockstep,stagger,jitter")]
     schedules: Vec<Schedule>,
@@ -111,9 +112,9 @@ struct CompareArgs {
     rounds: u32,
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u16).range(1..=169))]
     sample: u16,
-    /// Runs at once. Defaults to the number of CPUs.
-    #[arg(long)]
-    jobs: Option<usize>,
+    /// Runs at once, 1 to 64. Defaults to the number of CPUs.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=64))]
+    jobs: Option<u8>,
     #[arg(long, value_name = "PATH")]
     bracken: Option<PathBuf>,
     #[arg(long)]
@@ -207,20 +208,14 @@ fn demo(args: RunArgs) -> Result<ExitCode> {
                 bail!("{} already exists; --keep needs a new directory", dir.display());
             }
             refuse_parent_in_new_part(&dir)?;
-            refuse_git_checkout(&dir, args.allow_in_repo)?;
-            std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            // Check again where the directory really is, now that it exists.
-            let real = std::fs::canonicalize(&dir).with_context(|| format!("resolving {}", dir.display()))?;
-            if let Err(e) = refuse_git_checkout(&real, args.allow_in_repo) {
-                let _ = std::fs::remove_dir(&dir);
-                return Err(e);
-            }
-            real
+            refuse_git_checkout(&dir, args.allow_in_repo, &DEMO)?;
+            // Check again where the directory really is, once it exists.
+            create_checked(&dir, |real| refuse_git_checkout(real, args.allow_in_repo, &DEMO))?
         }
         None => {
             _temp = tempfile::tempdir().context("creating a temporary directory")?;
             let dir = std::path::absolute(_temp.path()).context("resolving the temporary directory")?;
-            refuse_git_checkout(&dir, args.allow_in_repo)?;
+            refuse_git_checkout(&dir, args.allow_in_repo, &DEMO)?;
             dir
         }
     };
@@ -256,7 +251,9 @@ fn compare(args: CompareArgs) -> Result<ExitCode> {
         topologies: args.topologies,
         work_rounds: args.work_rounds,
         schedules: args.schedules,
-        jobs: args.jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())),
+        jobs: args
+            .jobs
+            .map_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(64), usize::from),
     };
     let rows = compare::run(&bin, &plan)?;
     if args.json {

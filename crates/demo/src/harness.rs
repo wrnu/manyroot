@@ -71,15 +71,18 @@ impl Behaviour {
     /// round after the latest the work could be due.
     pub fn new(work_rounds: u32, wip: bool, schedule: Schedule) -> Behaviour {
         let drop_rate = if work_rounds == 0 { 0.0 } else { 0.1 };
-        let longest = work_rounds + u32::from(schedule == Schedule::Jitter);
-        Behaviour { work_rounds, wip, stale_after: longest + 1, drop_rate, schedule }
+        let longest = work_rounds.saturating_add(u32::from(schedule == Schedule::Jitter));
+        Behaviour { work_rounds, wip, stale_after: longest.saturating_add(1), drop_rate, schedule }
     }
 
     /// The round in which agent `index` may first start work.
     pub fn first_round(&self, index: u64) -> u32 {
         match self.schedule {
             Schedule::Lockstep => 1,
-            Schedule::Stagger | Schedule::Jitter => 1 + (index % u64::from(self.work_rounds + 1)) as u32,
+            Schedule::Stagger | Schedule::Jitter => {
+                let offset = index % (u64::from(self.work_rounds) + 1);
+                u32::try_from(offset).map_or(u32::MAX, |o| o.saturating_add(1))
+            }
         }
     }
 }
@@ -255,4 +258,19 @@ fn sync(
         held[i] = now;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extreme_work_rounds_saturate_instead_of_overflowing() {
+        for schedule in [Schedule::Lockstep, Schedule::Stagger, Schedule::Jitter] {
+            let b = Behaviour::new(u32::MAX, true, schedule);
+            assert_eq!(b.stale_after, u32::MAX);
+            assert!(b.first_round(3) >= 1);
+        }
+        assert_eq!(Behaviour::new(2, true, Schedule::Stagger).first_round(4), 2, "1 + (4 mod 3)");
+    }
 }

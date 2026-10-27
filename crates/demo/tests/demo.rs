@@ -370,3 +370,29 @@ fn compare_is_deterministic_per_seed() {
     assert_eq!(first[1]["wip_ignored_fresh"], 0);
     assert_eq!(first, run());
 }
+
+#[test]
+fn compare_bounds_work_rounds_and_jobs() {
+    let base = ["compare", "--seeds", "1", "--topologies", "ring", "--schedules", "stagger"];
+    for bad in [&["--work-rounds", "4294967295"][..], &["--work-rounds", "11"], &["--jobs", "0"], &["--jobs", "100000"]]
+    {
+        let out = demo(&[&base[..], bad].concat());
+        assert_eq!(out.status.code(), Some(2), "{bad:?} must be refused by argument parsing, not panic");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(bad[1]), "{bad:?}");
+    }
+}
+
+#[test]
+fn compare_refuses_a_temporary_directory_in_a_checkout_with_compare_advice() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(".git")).unwrap();
+    let args = ["compare", "--seeds", "1", "--topologies", "ring", "--work-rounds", "1", "--schedules", "stagger"];
+    let out = demo_command(&[&args[..], &["--rounds", "1", "--agents", "2"]].concat())
+        .env("TMPDIR", tmp.path())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("set TMPDIR to a directory outside any repository"), "{stderr}");
+    assert!(!stderr.contains("--allow-in-repo"), "compare has no --allow-in-repo: {stderr}");
+}

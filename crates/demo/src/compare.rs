@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::bracken::Bracken;
 use crate::harness::{self, Behaviour, Config, Schedule, Topology};
 use crate::report::{PolicyReport, Report};
-use crate::safety::refuse_git_checkout;
+use crate::safety::{COMPARE, refuse_git_checkout};
 
 /// What to vary, and what stays fixed.
 pub struct Plan {
@@ -65,7 +65,7 @@ pub fn run(bin: &Path, plan: &Plan) -> Result<Vec<Row>> {
     let results: Mutex<Vec<Option<Result<Report>>>> = Mutex::new((0..jobs.len()).map(|_| None).collect());
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
-        for _ in 0..plan.jobs.max(1) {
+        for _ in 0..plan.jobs.clamp(1, jobs.len().max(1)) {
             scope.spawn(|| {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
@@ -126,7 +126,7 @@ fn one(bin: &Path, cfg: &Config) -> Result<Report> {
     let bracken = Bracken::new(bin)?;
     let temp = tempfile::tempdir().context("creating a temporary directory")?;
     let root = std::path::absolute(temp.path()).context("resolving the temporary directory")?;
-    refuse_git_checkout(&root, false)?;
+    refuse_git_checkout(&root, false, &COMPARE)?;
     std::fs::write(root.join(".gitignore"), "*\n").context("writing .gitignore")?;
     harness::run_scripted(&bracken, &root, cfg)
 }
