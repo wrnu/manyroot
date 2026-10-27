@@ -106,7 +106,9 @@ are tested. These are not done yet:
 - **Network sync.** Replicas exchange contributions through shared
   filesystems or bundle files.
 - **Key protection.** Identity keys are stored unencrypted under
-  `.bracken/identities/`.
+  `.bracken/identities/`. Keep that folder out of git. The rest of
+  `.bracken/` (contributions, `ground.json`, the public `agents/` directory)
+  is safe to commit, and git merges it without conflicts.
 - **Ground governance.** Any key can contribute to any Ground it can reach.
 - **Scale.** Each replica loads its whole graph into memory on open.
 

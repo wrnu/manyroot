@@ -36,10 +36,9 @@ Build the **project profile**:
 | Release stages | From internal to users | local → tagged pre-release → crates.io |
 | What deploys on merge | Workflows triggered by `push` to `main`, and their path filters | none yet |
 | Gated actions | Actions that need the owner's go, beyond the defaults | publishing crates, creating the public repo, licence changes |
-| Shared resources | Things only one agent may use at a time | **the pinned `bracken` binary**, the Ground's backups |
+| Shared resources | Things only one agent may use at a time | **the pinned `bracken` binary**, Ground checkpoint commits |
 | Things that break production | Footguns | "a change to encoding or validity rules can make every existing Ground unreadable" |
 | Remote | Where PRs and CI live | GitHub `owner/repo`, or `TODO(owner)`: no remote yet |
-| Ground backup | Where checkpoint bundles go | `~/Backups/bracken-grounds/`, or `TODO(owner)` |
 | Agent harness | How threads, child tasks, messages and schedules work here (see Tool mapping) | T3 Code + Claude Code |
 | Models | Default model, a different-model reviewer, a strong security model, and which quota is largest | default A; reviewer B; security A at high effort |
 | Monitoring | Error monitor, crash reporting, where logs live | none yet |
@@ -77,7 +76,7 @@ Do these steps from the **main checkout**, not a worktree:
 
 1. **Pin the binary.** In the Bracken repo itself, run `cargo install --locked --path crates/bracken --root .bracken-bin`. Elsewhere, install a released `bracken` and record its version. Agents never coordinate through a binary built from their own branch: a builder breaking the CLI must not break the team. Upgrading the pinned binary is a shared-resource action (section 6).
 2. **Install the wrapper.** Copy `templates/bk` from this skill to `scripts/bk` and `chmod +x` it. It resolves the main checkout from any worktree and points `BRACKEN_DIR` at its `.bracken/`. **Agents always run `scripts/bk`, never `bracken` directly.**
-3. **Ignore the Ground.** Add `.bracken/` and `.bracken-bin/` to `.gitignore`. The Ground holds private keys and isn't committed. Durability comes from checkpoints (section 9.3).
+3. **Commit the Ground, never the keys.** `.gitignore` must exclude `.bracken/identities/` (private keys), `.bracken/objects/**/.tmp-*` (writes in progress) and `.bracken-bin/`. Everything else under `.bracken/` is committed: `ground.json`, `objects/` and the public agent directory `agents/`. Contribution files are immutable and named by their hash, so git merges them without conflicts, and git is the Ground's durable record (section 9.3).
 4. **Create the Ground and identities:**
 
    ```sh
@@ -182,7 +181,7 @@ Rules:
 - **Contribute as you learn, not at the end.** A builder that finds out something another agent would need (a gotcha, an interface decision, a dead end) contributes a `note` right away and relates it. That's what lets parallel work build on itself.
 - **Never act on a claim alone.** Use `scripts/bk show <id>` to check its status, evidence and referrers. A `note` is a lead, not a fact.
 - **Ids in messages, content in the Ground.** Quote the short id (12 hex characters) everywhere: messages, PR descriptions, commits.
-- **No secrets or personal data in the Ground.** Contributions are immutable: a retracted contribution still exists and is copied into every checkpoint.
+- **No secrets or personal data in the Ground.** Contributions are immutable: a retracted contribution still exists, and it's in git history for good.
 - **Disagreement is data.** If you think a decision, a finding or a test is wrong, contribute a claim that `contradicts` it with your reasoning. Don't argue in messages, and don't quietly work around it.
 
 ### 4.2 Merge gate
@@ -237,7 +236,7 @@ A child on a strong model, running as `security`, checks:
 - **Access control and permissions:** data rules, endpoint auth, admin paths, CI service accounts, workflow triggers. PR code must never reach a credential.
 - **Input handling, supply chain** (new crates, packages and actions), **logging and telemetry** (no secrets, personal data or user content).
 - **Protocol integrity** (Bracken repo): changes to encoding, ids, signatures or validity rules must keep the guarantees in `docs/protocol.md`. Above all: validity depends only on a contribution and its parents, there's exactly one encoding per contribution, and signatures are verified strictly.
-- **Agents and the Ground:** secrets never appear in agent output, PRs, comments, memory or **any contribution**, which is immutable and copied into every checkpoint. No production user data or secrets go into any brief or task claim, since briefs may reach other model providers.
+- **Agents and the Ground:** secrets never appear in agent output, PRs, comments, memory or **any contribution**, which is immutable and committed to git history. No production user data or secrets go into any brief or task claim, since briefs may reach other model providers.
 
 Its verdict is evidence on the `pr` claim with the head commit in `--method`: `pass` (clear), or `fail` (blocked), with findings as `finding` claims. "Clear with conditions" is a `pass` whose `--details` lists the conditions; the manager checks them before merging. A new commit means a new head and a new review of what changed.
 
@@ -279,8 +278,8 @@ Report: <when, and anything beyond the standard final report>
 | Resource | Rule |
 |---|---|
 | Merges to `main` | One at a time, after merging `main` into the branch. Deploying merges need the owner's go. |
-| The pinned `bracken` binary | Only the manager upgrades it, and only from `main`, between merges. Before upgrading, checkpoint the Ground (9.3) and check that the new binary opens it (`scripts/bk log >/dev/null`). Protocol or storage changes need the owner's go and a migration note in `docs/releases.md`. |
-| The Ground itself | Everyone contributes; no one edits or deletes files under `.bracken/`. Only the manager runs `init`, `import`, `join` or `sync`. |
+| The pinned `bracken` binary | Only the manager upgrades it, and only from `main`, between merges. Before upgrading, commit a Ground checkpoint (9.3) and check that the new binary opens it (`scripts/bk log >/dev/null`). Protocol or storage changes need the owner's go and a migration note in `docs/releases.md`. |
+| The Ground itself | Everyone contributes through `scripts/bk`; no one edits or deletes files under `.bracken/`. Only the manager runs `init`, `import`, `join` or `sync`, and only the manager commits `.bracken/` (9.3). Builders never stage it: their worktree's copy is a stale snapshot. |
 | Long-lived release branches | Only through PRs merged by the manager. Never make one a PR's head (merging deletes the head). |
 | Publishing, deploys, billed builds | The manager, with the owner's go. |
 
@@ -450,13 +449,20 @@ exit 0
 
 ### 9.3 Ground checkpoints
 
-The Ground isn't in git, so it needs its own backups. The manager writes a checkpoint at least daily, and always before upgrading the pinned binary:
+The live Ground is the main checkout's `.bracken/`, and git is its durable record. Agents add new files there continuously, and the manager commits them at least daily, and always before upgrading the pinned binary:
 
 ```sh
-scripts/bk export "<backup dir>/<project>-$(date +%Y%m%dT%H%M).mrb"
+# from the main checkout, on main
+git add .bracken
+git diff --cached --name-only | grep -v '^\.bracken/' && echo "stop: other files staged"
+git commit -m "ground: checkpoint $(date +%Y-%m-%d)"
 ```
 
-To restore into a fresh main checkout: `scripts/bk join <bundle>`, then recreate the identities. Old keys are gone unless their files were backed up separately, which must happen **outside** the repo and never in a bundle or brief.
+A checkpoint commit only adds `.bracken/` files and deploys nothing, so it merges like any other no-deploy change. Use a PR where branch protection requires one. Commit before pulling or merging into the main checkout: git refuses a pull that would overwrite untracked files.
+
+**Never commit `.bracken/identities/`.** If `git status` ever shows a file there as staged or tracked, stop and tell the owner: that key must be treated as leaked and replaced.
+
+To restore, clone the repo. Contributions, causal history and agent names all come back; private keys don't. Create new identities under new names (`manager-2`); the directory refuses names that are already taken. Recorded signatures stay verifiable, because each contribution carries its author's public key.
 
 ### 9.4 The manager's state
 
@@ -467,7 +473,7 @@ Most of what the original process kept in a state file is now derivable from the
   "updated": "YYYY-MM-DDTHH:MM",
   "manager": { "thread": "<id>", "worktree": "<path>" },
   "builders": [ { "thread": "<id>", "identity": "builder-<branch>", "task": "<task claim id>" } ],
-  "lastCheckpoint": "<bundle path>",
+  "lastCheckpoint": "<commit sha>",
   "nextSteps": [ "<in order>" ]
 }
 ```
@@ -518,7 +524,7 @@ Tick these off in the setup PR description:
 - [ ] Pinned `bracken` binary installed; `scripts/bk` installed; `.bracken/` and `.bracken-bin/` ignored
 - [ ] Ground created; identities `owner`, `manager`, `reviewer`, `security`, `triage` created
 - [ ] Goal and profile decisions contributed as claims
-- [ ] First checkpoint written to the backup location
+- [ ] First Ground checkpoint committed (and `git ls-files .bracken/identities` prints nothing)
 - [ ] `AGENTS.md` (breaks-production list, conventions, test table, releases summary, The Ground, Memory, Working with other agents)
 - [ ] `docs/development.md`, `docs/releases.md`, `docs/README.md`, `docs/builder.md`
 - [ ] `AGENTS.md` trimmed and approved by the owner

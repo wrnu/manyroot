@@ -170,7 +170,7 @@ enum Command {
 enum IdCommand {
     /// Create a new identity.
     New { name: String },
-    /// List local identities.
+    /// List known agents, marking those this replica can sign as.
     List {
         #[command(flatten)]
         out: Output,
@@ -218,13 +218,18 @@ fn run_in_store(mut s: Store, command: Command) -> Result<ExitCode> {
             println!("{}", id.agent_id());
         }
         Command::Id(IdCommand::List { out }) => {
-            let ids = s.identities()?;
+            let local: BTreeSet<AgentId> = s.identities()?.iter().map(|i| i.agent_id()).collect();
+            let agents = s.agents()?;
             if out.json {
-                let rows: Vec<Value> = ids.iter().map(|i| json!({"name": i.name(), "agent": i.agent_id()})).collect();
+                let rows: Vec<Value> = agents
+                    .iter()
+                    .map(|a| json!({"name": a.name, "agent": a.agent, "can_sign": local.contains(&a.agent)}))
+                    .collect();
                 print_json(&rows);
             } else {
-                for i in ids {
-                    println!("{}  {}", i.agent_id(), i.name());
+                for a in agents {
+                    let key = if local.contains(&a.agent) { "" } else { "  (no local key)" };
+                    println!("{}  {}{key}", a.agent, a.name);
                 }
             }
         }
@@ -441,7 +446,7 @@ struct Names(HashMap<AgentId, String>);
 
 impl Names {
     fn load(s: &Store) -> Result<Names> {
-        Ok(Names(s.identities()?.into_iter().map(|i| (i.agent_id(), i.name().to_owned())).collect()))
+        Ok(Names(s.agents()?.into_iter().map(|a| (a.agent, a.name)).collect()))
     }
 
     fn display(&self, agent: &AgentId) -> String {

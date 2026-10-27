@@ -311,3 +311,49 @@ fn sorted<const N: usize>(mut ids: [ContributionId; N]) -> Vec<ContributionId> {
     ids.sort();
     ids.to_vec()
 }
+
+#[test]
+fn a_git_clone_of_a_ground_opens_without_keys_or_empty_dirs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (origin, clone) = (tmp.path().join("origin"), tmp.path().join("clone"));
+    let mut s = Store::init(&origin, "g").unwrap();
+
+    // What git would carry for a brand-new Ground: the manifest only.
+    std::fs::create_dir_all(&clone).unwrap();
+    std::fs::copy(origin.join("ground.json"), clone.join("ground.json")).unwrap();
+    let empty = Store::open(&clone).unwrap();
+    assert!(empty.graph().is_empty());
+    assert!(empty.identities().unwrap().is_empty());
+
+    // After contributions: everything except the private keys.
+    let alice = s.create_identity("alice").unwrap();
+    let id = s.contribute(&alice, claim("kept in git")).unwrap();
+    copy_dir(&origin.join("objects"), &clone.join("objects"));
+    copy_dir(&origin.join("agents"), &clone.join("agents"));
+    let cloned = Store::open(&clone).unwrap();
+    assert!(cloned.graph().contains(&id));
+    assert!(matches!(cloned.identity("alice"), Err(StoreError::UnknownIdentity(_))));
+    let directory = cloned.agents().unwrap();
+    assert_eq!(
+        directory,
+        vec![AgentEntry { name: "alice".into(), agent: alice.agent_id() }],
+        "names survive the clone"
+    );
+    assert!(matches!(cloned.create_identity("alice"), Err(StoreError::NameTaken(_))));
+
+    // The clone can mint its own identity and keep contributing.
+    let mut cloned = cloned;
+    let bob = cloned.create_identity("bob").unwrap();
+    cloned.contribute(&bob, claim("from the clone")).unwrap();
+    assert_eq!(cloned.graph().len(), 2);
+    assert_eq!(cloned.agents().unwrap().len(), 2);
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let path = entry.unwrap().path();
+        let dest = to.join(path.file_name().unwrap());
+        if path.is_dir() { copy_dir(&path, &dest) } else { std::fs::copy(&path, &dest).map(|_| ()).unwrap() }
+    }
+}

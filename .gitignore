@@ -1,5 +1,10 @@
 /target
 
-# Bracken Ground replicas (hold private keys) and the pinned team binary
-.bracken/
+# Private agent keys never leave the machine. The rest of .bracken/ is the
+# Ground itself and is committed: contribution files are immutable and named
+# by their hash, so git merges them without conflicts.
+.bracken/identities/
+.bracken/objects/**/.tmp-*
+
+# The pinned team binary (a build artifact)
 .bracken-bin/

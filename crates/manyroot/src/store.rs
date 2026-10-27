@@ -3,8 +3,17 @@
 //! ```text
 //! <dir>/ground.json          ground id and local name
 //! <dir>/objects/ab/cdef...   one file per contribution, named by id
-//! <dir>/identities/<name>    local agent keys (unencrypted in v0)
+//! <dir>/agents/<name>.json   public directory: local names for agent keys
+//! <dir>/identities/<name>    private agent keys (unencrypted in v0)
 //! ```
+//!
+//! Everything except `identities/` is safe to commit to git. Objects are
+//! immutable and named by their hash, so merging branches is a union of files
+//! and never conflicts. The agent directory lets a clone show names instead
+//! of bare keys. `identities/` holds private keys and must never be
+//! committed, so a fresh clone has none. A Ground with no contributions also
+//! has no `objects/`, because git drops empty directories. Both are treated
+//! as empty.
 //!
 //! Contribution files are content-addressed and written by atomic rename, so
 //! any number of agent processes can write to one replica without locking:
@@ -18,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::contribution::{Body, Contribution, DecodeError};
 use crate::graph::{Graph, ImportReport, RuleViolation};
-use crate::id::{ContributionId, GroundId};
+use crate::id::{AgentId, ContributionId, GroundId};
 use crate::identity::{self, Identity, IdentityError};
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +48,8 @@ pub enum StoreError {
     Identity(#[from] IdentityError),
     #[error("no identity named {0:?}")]
     UnknownIdentity(String),
+    #[error("the name {0:?} is already taken")]
+    NameTaken(String),
     #[error("cannot sync ground {0} with ground {1}")]
     DifferentGrounds(GroundId, GroundId),
 }
@@ -52,6 +63,13 @@ pub struct GroundInfo {
     pub ground: GroundId,
     /// Local label only; not part of the protocol.
     pub name: String,
+}
+
+/// A public directory entry, naming an agent's key. Safe to commit and share.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentEntry {
+    pub name: String,
+    pub agent: AgentId,
 }
 
 pub struct Store {
@@ -96,7 +114,12 @@ impl Store {
 
         let mut batch = Vec::new();
         let objects = dir.join("objects");
-        for shard in fs::read_dir(&objects).map_err(io(&objects))? {
+        let shards = match fs::read_dir(&objects) {
+            Ok(shards) => shards.collect::<Vec<_>>(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(io(&objects)(e)),
+        };
+        for shard in shards {
             let shard = shard.map_err(io(&objects))?.path();
             if !shard.is_dir() {
                 continue;
@@ -173,9 +196,26 @@ impl Store {
         self.dir.join("identities")
     }
 
+    pub fn agents_dir(&self) -> PathBuf {
+        self.dir.join("agents")
+    }
+
+    /// Creates a private key and its public directory entry. Refuses a name
+    /// that is already taken, here or in a directory entry from elsewhere.
     pub fn create_identity(&self, name: &str) -> Result<Identity, StoreError> {
         let identity = Identity::generate(name)?;
-        identity.save(&self.identities_dir().join(format!("{name}.json")))?;
+        let key_path = self.identities_dir().join(format!("{name}.json"));
+        let entry_path = self.agents_dir().join(format!("{name}.json"));
+        if key_path.exists() || entry_path.exists() {
+            return Err(StoreError::NameTaken(name.to_owned()));
+        }
+        for dir in [self.identities_dir(), self.agents_dir()] {
+            fs::create_dir_all(&dir).map_err(io(&dir))?;
+        }
+        identity.save(&key_path)?;
+        let entry = AgentEntry { name: name.to_owned(), agent: identity.agent_id() };
+        let json = serde_json::to_string_pretty(&entry).expect("agent entry serializes") + "\n";
+        fs::write(&entry_path, json).map_err(io(&entry_path))?;
         Ok(identity)
     }
 
@@ -192,7 +232,12 @@ impl Store {
     pub fn identities(&self) -> Result<Vec<Identity>, StoreError> {
         let dir = self.identities_dir();
         let mut out = Vec::new();
-        for entry in fs::read_dir(&dir).map_err(io(&dir))? {
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(io(&dir)(e)),
+        };
+        for entry in entries {
             let path = entry.map_err(io(&dir))?.path();
             if path.extension().is_some_and(|e| e == "json") {
                 out.push(Identity::load(&path)?);
@@ -200,6 +245,45 @@ impl Store {
         }
         out.sort_by(|a, b| a.name().cmp(b.name()));
         Ok(out)
+    }
+
+    /// Every agent with a known name: the public directory plus local
+    /// identities, sorted by name.
+    pub fn agents(&self) -> Result<Vec<AgentEntry>, StoreError> {
+        let mut by_name = std::collections::BTreeMap::new();
+        let dir = self.agents_dir();
+        match fs::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    let path = entry.map_err(io(&dir))?.path();
+                    if path.extension().is_none_or(|e| e != "json") {
+                        continue;
+                    }
+                    let text = fs::read_to_string(&path).map_err(io(&path))?;
+                    let entry: AgentEntry = serde_json::from_str(&text)
+                        .map_err(|e| StoreError::Corrupt { path: path.clone(), reason: e.to_string() })?;
+                    by_name.insert(entry.name.clone(), entry);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(io(&dir)(e)),
+        }
+        for identity in self.identities()? {
+            let local = AgentEntry { name: identity.name().to_owned(), agent: identity.agent_id() };
+            match by_name.get(&local.name) {
+                Some(listed) if listed.agent != local.agent => {
+                    return Err(StoreError::Corrupt {
+                        path: self.agents_dir().join(format!("{}.json", local.name)),
+                        reason: format!("lists a different key than local identity {:?}", local.name),
+                    });
+                }
+                Some(_) => {}
+                None => {
+                    by_name.insert(local.name.clone(), local);
+                }
+            }
+        }
+        Ok(by_name.into_values().collect())
     }
 }
 

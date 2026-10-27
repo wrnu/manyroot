@@ -28,5 +28,5 @@ pub use contribution::{Body, BodyKind, Contribution, RelationKind, Verdict};
 pub use graph::{Graph, ImportReport, RuleViolation};
 pub use id::{AgentId, ContributionId, GroundId, Signature};
 pub use identity::Identity;
-pub use store::{GroundInfo, Store, StoreError};
+pub use store::{AgentEntry, GroundInfo, Store, StoreError};
 pub use validation::{Assessment, Conflict, Evaluation, Policy, Status};
