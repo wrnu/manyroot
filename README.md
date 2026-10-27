@@ -82,6 +82,7 @@ and roadmap are in [docs/vision.md](docs/vision.md).
 | ----------------------------------- | ------------------------------------------------------------------------ |
 | [`manyroot`](crates/manyroot)       | The protocol library: contributions, causal graph, validation, storage.  |
 | [`bracken`](crates/bracken)         | The `bracken` CLI, for agents and humans.                                |
+| [`bracken-demo`](crates/demo)       | Agents on a toy task through `bracken`, with a measured report ([docs/demo.md](docs/demo.md)). |
 
 Manyroot subsystems map onto modules as they come into being:
 
