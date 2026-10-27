@@ -7,7 +7,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 fn demo(args: &[&str]) -> Output {
     demo_command(args).output().unwrap()
@@ -406,8 +406,14 @@ fn compare_is_deterministic_per_seed() {
         serde_json::from_slice::<Value>(&out.stdout).unwrap()
     };
     let first = run();
-    assert_eq!(first.as_array().unwrap().len(), 2, "one row without wip, one with");
-    assert_eq!(first[1]["wip_ignored_fresh"], 0);
+    let rows = first.as_array().unwrap();
+    let rules: Vec<&Value> = rows.iter().map(|r| &r["behaviour"]["stale_rule"]).collect();
+    assert_eq!(rows.len(), 3, "one row without wip, one per staleness rule");
+    assert_eq!(
+        (rows[0]["behaviour"]["wip"].as_bool(), rules[1], rules[2]),
+        (Some(false), &json!("claim_round"), &json!("liveness"))
+    );
+    assert!(rows.iter().all(|r| r["wip_ignored_fresh"] == 0));
     assert_eq!(first, run());
 }
 
@@ -435,4 +441,78 @@ fn compare_refuses_a_temporary_directory_in_a_checkout_with_compare_advice() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("set TMPDIR to a directory outside any repository"), "{stderr}");
     assert!(!stderr.contains("--allow-in-repo"), "compare has no --allow-in-repo: {stderr}");
+}
+
+#[test]
+fn under_liveness_no_claim_is_taken_over_while_its_news_is_fresh() {
+    // Full sync: what an agent makes in round r reaches everyone in round r + 1, so a taker in
+    // round t has seen exactly the claim's news (the claim, its heartbeats) made before round t.
+    let tmp = tempfile::tempdir().unwrap();
+    let kept = tmp.path().join("run");
+    let args = ["--agents", "4", "--rounds", "12", "--seed", "7", "--topology", "full", "--work-rounds", "2"];
+    let wip = ["--schedule", "stagger", "--wip", "--stale-rule", "liveness", "--keep", kept.to_str().unwrap()];
+    let r = report(&[&args[..], &wip[..]].concat());
+    let k = r["config"]["behaviour"]["stale_after"].as_u64().unwrap();
+    assert_eq!((r["config"]["behaviour"]["stale_rule"].as_str(), k), (Some("liveness"), 2));
+    assert_eq!(r["wip"]["ignored_fresh"], 0);
+    assert!(r["wip"]["heartbeats"].as_u64().unwrap() > 0);
+
+    let log = bracken_json(&kept.join("agent-0/.bracken"), &["log", "--json"]);
+    let log = log.as_array().unwrap();
+    let claims: Vec<WipClaim> = log
+        .iter()
+        .filter(|c| c["kind"] == "claim" && c["body"]["tags"][0] == "wip")
+        .map(|c| WipClaim {
+            id: c["id"].as_str().unwrap(),
+            author: c["author"].as_str().unwrap(),
+            spec: c["body"]["tags"][1].as_str().unwrap(),
+            round: round_in(c["body"]["statement"].as_str().unwrap()),
+        })
+        .collect();
+    let wip = |id: &str| claims.iter().find(|w| w.id == id);
+    // Rounds of news about each claim: the claim itself, and each heartbeat its author recorded.
+    let news = |w: &WipClaim| -> Vec<u64> {
+        let beats = log.iter().filter(|c| c["kind"] == "evidence" && c["body"]["method"] == "heartbeat");
+        let beats = beats.filter(|c| c["body"]["target"] == w.id && c["author"] == w.author);
+        beats.map(|c| round_in(c["body"]["details"].as_str().unwrap())).chain([w.round]).collect()
+    };
+    let mut closed: HashMap<&str, u64> = HashMap::new();
+    for c in log.iter().filter(|c| c["kind"] == "retract") {
+        if let Some(w) = wip(c["body"]["target"].as_str().unwrap()) {
+            closed.insert(w.id, round_in(c["body"]["reason"].as_str().unwrap()));
+        }
+    }
+
+    let mut takeovers = 0;
+    for w2 in &claims {
+        for w1 in claims.iter().filter(|w1| w1.spec == w2.spec && w1.author != w2.author && w1.round < w2.round) {
+            if closed.get(w1.id).is_some_and(|&r| r < w2.round) {
+                continue; // Its retraction had reached w2's author.
+            }
+            let latest = news(w1).into_iter().filter(|&h| h < w2.round).max().unwrap();
+            let fresh = w2.round < latest + 1 + k;
+            let taken_over = log.iter().any(|c| {
+                c["kind"] == "relation"
+                    && c["body"]["kind"] == "refines"
+                    && c["body"]["from"] == w2.id
+                    && c["body"]["to"] == w1.id
+            });
+            if taken_over {
+                assert!(!fresh, "{} took over {} with news from round {latest}", w2.id, w1.id);
+                takeovers += 1;
+            } else {
+                // A start over another open claim is only allowed once that claim is stale, or
+                // after someone else took it over in an earlier round.
+                let taken = log.iter().any(|c| {
+                    c["kind"] == "relation"
+                        && c["body"]["kind"] == "refines"
+                        && c["body"]["to"] == w1.id
+                        && wip(c["body"]["from"].as_str().unwrap()).is_some_and(|t| t.round < w2.round)
+                });
+                assert!(!fresh || taken, "{} started {} over fresh claim {}", w2.author, w2.spec, w1.id);
+            }
+        }
+    }
+    assert!(takeovers > 0, "this seed takes over stale claims");
+    assert_eq!(r["wip"]["taken_over"], takeovers);
 }

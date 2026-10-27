@@ -9,7 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use anyhow::{Context, Result};
 
 use crate::bracken::{Entry, Replica};
-use crate::harness::{Behaviour, Schedule};
+use crate::harness::{Behaviour, Schedule, StaleRule};
 use crate::rng::Rng;
 use crate::task::{self, Spec};
 
@@ -40,6 +40,13 @@ pub struct Turn<'a, 'b> {
 /// harness already refuses to run inside a git checkout.
 pub trait Agent {
     fn act(&mut self, turn: &Turn) -> Result<()>;
+
+    /// Ground truth the Ground can't hold: the wip claims whose work this agent dropped
+    /// without saying so, and the round it dropped each. Only a scripted agent can know
+    /// this; the harness uses it to judge takeovers, as it judges correctness on every input.
+    fn silent_drops(&self) -> Vec<(String, u32)> {
+        Vec::new()
+    }
 }
 
 #[derive(Default)]
@@ -93,6 +100,9 @@ pub struct ScriptedAgent {
     pending: Option<Pending>,
     /// The first round in which this agent starts work.
     first_round: u32,
+    /// For other agents' wip claims: the heartbeats I've seen, and the round I first saw that many.
+    news: HashMap<String, (usize, u32)>,
+    silent_drops: Vec<(String, u32)>,
 }
 
 /// What an agent decided to work on.
@@ -127,6 +137,8 @@ impl ScriptedAgent {
             written: 0,
             pending: None,
             first_round: behaviour.first_round(index),
+            news: HashMap::new(),
+            silent_drops: Vec::new(),
             rng,
         }
     }
@@ -177,8 +189,12 @@ impl ScriptedAgent {
         if self.rng.chance(self.behaviour.drop_rate) {
             // Half the time the agent says so; otherwise its claim goes stale.
             let says_so = self.rng.chance(0.5);
-            if let (Some(wip), true) = (&p.wip, says_so) {
-                turn.replica.retract(wip, &format!("abandoned in round {}", turn.round))?;
+            match (&p.wip, says_so) {
+                (Some(wip), true) => {
+                    turn.replica.retract(wip, &format!("abandoned in round {}", turn.round))?;
+                }
+                (Some(wip), false) => self.silent_drops.push((wip.clone(), turn.round)),
+                (None, _) => {}
             }
         } else if turn.round >= p.due {
             self.implement(turn, view, &p.start, p.started)?;
@@ -186,6 +202,10 @@ impl ScriptedAgent {
                 turn.replica.retract(wip, &format!("delivered in round {}", turn.round))?;
             }
         } else {
+            if let (Some(wip), StaleRule::Liveness) = (&p.wip, self.behaviour.stale_rule) {
+                let round = format!("round {}", turn.round);
+                turn.replica.evidence(wip, true, HEARTBEAT, &round)?;
+            }
             self.pending = Some(p);
         }
         Ok(())
@@ -242,9 +262,23 @@ impl ScriptedAgent {
         Some(Start { spec, replaces, takes_over })
     }
 
-    /// An open wip claim is stale once `stale_after` rounds have passed since the round it states.
+    /// Whether an open wip claim is stale, by the behaviour's rule.
     fn is_stale(&self, w: &Wip, round: u32) -> bool {
-        round >= w.round + self.behaviour.stale_after
+        let since = match self.behaviour.stale_rule {
+            StaleRule::ClaimRound => w.round,
+            StaleRule::Liveness => self.news.get(&w.id).map_or(round, |&(_, seen)| seen),
+        };
+        round >= since + self.behaviour.stale_after
+    }
+
+    /// Notes, for each open wip claim, the round its latest heartbeat first reached me.
+    fn observe(&mut self, view: &View, round: u32) {
+        for w in &view.wips {
+            let news = self.news.entry(w.id.clone()).or_insert((w.heartbeats, round));
+            if news.0 != w.heartbeats {
+                *news = (w.heartbeats, round);
+            }
+        }
     }
 
     fn check(&mut self, turn: &Turn, target: &Impl) -> Result<()> {
@@ -280,6 +314,7 @@ impl Agent for ScriptedAgent {
         if accepted {
             view = View::read(turn)?;
         }
+        self.observe(&view, turn.round);
 
         // 1. Carry on with started work, or start something.
         if let Some(p) = self.pending.take() {
@@ -308,7 +343,14 @@ impl Agent for ScriptedAgent {
         }
         Ok(())
     }
+
+    fn silent_drops(&self) -> Vec<(String, u32)> {
+        self.silent_drops.clone()
+    }
 }
+
+/// The evidence method of a heartbeat on a wip claim.
+pub const HEARTBEAT: &str = "heartbeat";
 
 /// An open wip claim (not retracted, superseded by its author, or taken over), as one replica sees it.
 struct Wip {
@@ -317,6 +359,8 @@ struct Wip {
     spec: String,
     /// The round the claim states it was made in.
     round: u32,
+    /// Heartbeats its author has recorded on it.
+    heartbeats: usize,
 }
 
 /// The round a wip claim states, from its trailing `(round N)`.
@@ -442,12 +486,20 @@ impl View {
             })
             .map(|e| e.text("to"))
             .collect();
+        // Heartbeats by their target, counting only those the claim's own author recorded.
+        let mut heartbeats: HashMap<&str, usize> = HashMap::new();
+        for h in log.iter().filter(|h| h.kind == "evidence" && !h.retracted && h.text("method") == HEARTBEAT) {
+            if by_id.get(h.text("target")).is_some_and(|t| t.author == h.author) {
+                *heartbeats.entry(h.text("target")).or_default() += 1;
+            }
+        }
         let mut wips: Vec<Wip> = log
             .iter()
             .filter(|e| e.kind == "claim" && !e.retracted && !superseded.contains(e.id.as_str()))
             .filter_map(|e| match (&e.tags()[..], wip_round(e.text("statement"))) {
                 (&["wip", spec], Some(round)) if task::spec(spec).is_some() => {
-                    Some(Wip { id: e.id.clone(), author: name(&e.author), spec: spec.to_owned(), round })
+                    let heartbeats = heartbeats.get(e.id.as_str()).copied().unwrap_or(0);
+                    Some(Wip { id: e.id.clone(), author: name(&e.author), spec: spec.to_owned(), round, heartbeats })
                 }
                 _ => None,
             })

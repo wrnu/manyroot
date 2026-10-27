@@ -29,7 +29,8 @@ one.
 | `--work-rounds N` | 0 | Rounds between starting an implementation and delivering it |
 | `--schedule lockstep\|stagger\|jitter` | lockstep | When agents start work relative to each other (see [Work in progress](#work-in-progress)) |
 | `--wip` | | Announce work with a `wip` claim before doing it, and skip specs others have announced |
-| `--stale-after N` | see below | Rounds after its own round at which an open wip claim is stale |
+| `--stale-rule claim-round\|liveness` | claim-round | How an agent decides another agent's wip claim is stale (see below) |
+| `--stale-after N` | see below | The stale window, counted as `--stale-rule` says |
 | `--keep DIR` | | Keep the replicas in `DIR` (must not exist), instead of a temporary directory |
 | `--allow-in-repo` | | Allow the run's directory inside a git checkout (refused by default) |
 | `--json` | | Print the report as JSON |
@@ -142,9 +143,21 @@ it has a 10% chance of dropping the work instead. With `--wip`, it also:
   it, so a stale claim stops blocking by age alone, and the takeover records
   who picked the work up.
 
-The default stale window is one round after the latest the work could be due:
-W + 1, or W + 2 under `jitter`. A claim is never stale while its work is on
-time.
+`--stale-rule` decides what "stale" means:
+
+- **claim-round** (the default): `--stale-after` rounds after the round the
+  claim states, the same verdict for every agent. The default window is one
+  round after the latest the work could be due: W + 1, or W + 2 under `jitter`.
+  A claim is never stale while its work is on time, but if the claim's
+  retraction is slow to arrive, delivered work looks stale too.
+- **liveness**: an agent still working records a heartbeat each round: evidence
+  on its own wip claim with method `heartbeat` and details `round N`. Each
+  agent notes the round in which the latest news about a claim (the claim, or
+  a new heartbeat) first reached it. It treats the claim as stale once
+  `--stale-after` of its own rounds (default 2) pass with no new news, so slow
+  but steady sync doesn't make live work look dead. An author's evidence on
+  its own contribution never counts toward acceptance, so heartbeats can't
+  change what any policy accepts.
 
 `--schedule` sets when agents start, in both modes alike:
 
@@ -170,7 +183,9 @@ setter's are left out.
 | Work | Implementations (artifacts that `implement` a spec, by the artifact's author); fixes (implementations their author relates as superseding another, whether or not the replaced one's author has accepted it yet); checks (evidence) and their verdicts; findings (claims tagged `finding`) |
 | Duplicated work | New implementations (not fixes) of a spec that another agent had already implemented anywhere in the Ground. **Blind**: the earlier one hadn't reached this agent's replica yet, so only better sync or visible work in progress would have avoided it. **Visible**: the agent's replica already held it. Competing fixes aren't counted here; they show up as divergences once the replaced implementation's author has accepted more than one |
 | Concurrent work | Implementations started while another agent's implementation of the same spec was started and not yet delivered: the duplication that announcing work could prevent. The start round comes from the `implements` relation's note (`started in round N`). A pair started in the same round counts once, as **same round**: no sync could have shown either agent the other's start. **Later** means the other work started in an earlier round. Dropped work leaves no artifact, so it isn't counted |
-| Wip claims | Shown with `--wip`: claims made, retracted on delivery, retracted on abandonment, taken over when stale (refined by another agent's wip claim), and **ignored while fresh**: claims made while the author's replica held another agent's open, fresh wip claim on the same spec. The scripted agent never does that, so it's always 0 |
+| Takeovers | Shown with `--wip`. Each takeover, by the state of the claimant's work at the takeover's turn: **already delivered** (the retraction hadn't reached the taker), **in progress and delivered later**, **in progress and never delivered** (dropped later, or unfinished at the end), or **already dropped**. **Wrongful** is the first three: the work was alive when it was taken over. Counting only the first two is the other reasonable reading, and it can be read off the same numbers |
+| Silent drops | Shown with `--wip`: work dropped without retracting its claim, how many were taken over and how many rounds after the drop on average, how many never were, and the heartbeats recorded. The Ground can't show when a silent drop happened, so the scripted agent reports its own drops (`Agent::silent_drops`), as ground truth only a scripted agent can give, like the check on every input |
+| Wip claims | Shown with `--wip`: claims made, retracted on delivery, retracted on abandonment, taken over when stale (refined by another agent's wip claim), and **ignored while fresh**: claims made while the author's replica held another agent's open, fresh wip claim on the same spec, fresh by the run's stale rule (under liveness, from the round each piece of news reached the author). The scripted agent never does that, so it's always 0 |
 | Availability | For each contribution and each other agent, the number of sync rounds until that agent's replica held it: 1 means the sync right after the round it was made. The final all-to-all sync counts as round `rounds + 1`, and the line says how many pairs only arrived then |
 | Conflicts | What `bracken conflicts` reports at the end: divergences (one implementation superseded by two current ones) and contradictions (a current finding contradicting a current implementation). A fix resolves the contradictions against an implementation once it counts: when the implementation's author wrote the fix, or accepted it. Until then, someone else's fix leaves them open. The relation counts show how many of each kind agents made; the supersedes count includes acceptances |
 | Ground truth | The harness checks every implementation on every input. "Caught" means a wrong one got at least one failing check from another agent |
@@ -225,7 +240,7 @@ experiment adds them (`--wip`) and compares runs with and without:
 
 ```sh
 cargo build --release -p bracken -p bracken-demo
-target/release/bracken-demo compare            # seeds 1..10, ring and gossip, W = 1 and 2, all schedules
+target/release/bracken-demo compare --stale-rules claim-round   # seeds 1..10, ring and gossip, W = 1 and 2, all schedules
 ```
 
 Every row is the mean over seeds 1 to 10, with 4 agents and 12 rounds: enough
@@ -310,6 +325,80 @@ claim, pick a different spec for its own reasons, or announce more than it
 does. The result is about the mechanism: announced work helps only when the
 announcement reaches others before they choose, and nothing helps agents who
 choose at the same moment.
+
+### Can heartbeats tell slow sync from stalled work?
+
+The wip result's weak point was staleness: a claim went stale a fixed number
+of rounds after it was made, so on ring and gossip, work that had already been
+delivered looked dead whenever its retraction was slow to arrive. This
+experiment compares that rule (`--stale-rule claim-round`) with
+`--stale-rule liveness`, where working agents record a heartbeat each round and
+each agent counts the stale window from when news last reached it:
+
+```sh
+target/release/bracken-demo compare            # now also over --stale-rules claim-round,liveness
+```
+
+Same seeds and settings as above: means over seeds 1 to 10, 4 agents, 12
+rounds. Every pair is "claim-round / liveness"; ± is the largest standard error
+of the mean over seeds among the values. Liveness uses K = 2; claim-round uses
+its default (W + 1, or W + 2 under jitter). All 360 runs converged, and no
+agent ever ignored a claim that was fresh by its rule. The table was re-run on
+2026-10-27 under the current supersession rule, where a takeover is a `refines`
+relation between wip claims; the first version differed by at most 0.4 in any
+mean and 4 in contributions or bracken calls.
+
+| Topology | W | Schedule | Concurrent starts: off / claim-round / liveness | Wrongful takeovers: claim-round / liveness | Takeovers of dropped work | Silent drops taken over, delay in rounds (missed) | Contributions | Bracken calls | Heartbeats |
+|---|---|---|---|---|---|---|---|---|---|
+| ring | 1 | lockstep | 6.0 / 5.8 / 5.3 (±0.6) | 3.2 ±0.6 / 0.0 ±0.0 | 1.0 / 0.7 | 0.6 of 0.8, 1.6 (0.2) / 0.5 of 0.8, 3.8 (0.3) | 182 / 165 | 476 / 459 | 0.0 |
+| ring | 1 | stagger | 7.1 / 3.8 / 4.5 (±0.5) | 6.8 ±0.5 / 0.0 ±0.0 | 1.1 / 0.6 | 0.7 of 0.9, 2.6 (0.2) / 0.4 of 0.7, 2.8 (0.3) | 184 / 154 | 478 / 448 | 0.0 |
+| ring | 1 | jitter | 5.8 / 3.5 / 3.9 (±0.6) | 2.2 ±0.3 / 0.0 ±0.0 | 1.0 / 0.9 | 0.7 of 1.2, 3.1 (0.5) / 0.6 of 1.5, 3.9 (0.9) | 131 / 130 | 424 / 424 | 8.1 |
+| ring | 2 | lockstep | 3.7 / 3.1 / 4.7 (±0.6) | 3.2 ±0.4 / 0.0 ±0.0 | 1.4 / 0.4 | 1.0 of 1.9, 2.4 (0.9) / 0.4 of 1.5, 5.2 (1.1) | 123 / 130 | 416 / 424 | 14.2 |
+| ring | 2 | stagger | 4.8 / 2.5 / 2.9 (±0.5) | 1.5 ±0.3 / 0.0 ±0.0 | 0.8 / 0.5 | 0.5 of 1.0, 2.8 (0.5) / 0.4 of 0.9, 4.0 (0.5) | 107 / 116 | 400 / 409 | 12.9 |
+| ring | 2 | jitter | 3.5 / 1.7 / 2.0 (±0.4) | 1.4 ±0.3 / 0.0 ±0.0 | 0.7 / 0.6 | 0.7 of 1.6, 3.9 (0.9) / 0.5 of 1.4, 3.8 (0.9) | 98 / 112 | 391 / 405 | 17.7 |
+| gossip | 1 | lockstep | 6.4 / 6.3 / 6.1 (±0.7) | 3.9 ±0.9 / 0.1 ±0.1 | 0.9 / 0.4 | 0.4 of 0.7, 3.0 (0.3) / 0.2 of 0.8, 3.0 (0.6) | 182 / 171 | 475 / 464 | 0.0 |
+| gossip | 1 | stagger | 7.8 / 5.6 / 5.6 (±0.8) | 3.4 ±0.4 / 0.6 ±0.2 | 0.8 / 0.4 | 0.5 of 1.0, 1.0 (0.5) / 0.3 of 0.9, 3.5 (0.6) | 171 / 167 | 464 / 460 | 0.0 |
+| gossip | 1 | jitter | 5.4 / 3.3 / 2.9 (±0.5) | 1.7 ±0.4 / 0.8 ±0.2 | 1.1 / 0.6 | 0.3 of 0.9, 2.3 (0.6) / 0.3 of 1.0, 4.8 (0.7) | 133 / 137 | 426 / 430 | 8.9 |
+| gossip | 2 | lockstep | 3.9 / 3.5 / 4.3 (±0.6) | 2.5 ±0.6 / 0.6 ±0.2 | 1.6 / 1.3 | 1.1 of 1.9, 2.6 (0.8) / 1.0 of 1.4, 4.7 (0.4) | 118 / 135 | 411 / 428 | 14.0 |
+| gossip | 2 | stagger | 4.6 / 2.9 / 2.7 (±0.6) | 2.2 ±0.4 / 1.3 ±0.4 | 1.2 / 1.0 | 0.8 of 1.2, 3.6 (0.4) / 0.7 of 1.2, 4.1 (0.5) | 114 / 124 | 407 / 418 | 13.5 |
+| gossip | 2 | jitter | 3.2 / 2.3 / 2.0 (±0.6) | 1.7 ±0.4 / 1.1 ±0.4 | 0.8 / 0.9 | 0.5 of 1.1, 4.6 (0.6) / 0.7 of 1.4, 4.1 (0.7) | 94 / 110 | 387 / 403 | 18.2 |
+
+**Liveness all but removes wrongful takeovers.** On ring it takes them to 0 in
+every row, from 1.4 to 6.8 a run. On gossip it leaves 0.1 to 1.3, because a
+random peer can hold news back for longer than K rounds. Under both rules
+every wrongful takeover was of work **already delivered** whose retraction
+hadn't arrived: neither rule ever took over work in progress, so the two
+readings of "wrongful" (alive at the takeover, or delivered in the end) give
+the same numbers here.
+
+**The cost is slower recovery from real drops.** Silent drops are taken over
+later under liveness (ring, W = 2, lockstep: 2.4 rounds after the drop, against
+5.2), and about as many are never taken over. Counting from the latest news
+waits for news to stop, and on a slow topology that takes a while.
+
+**Heartbeats only exist when work spans rounds.** At W = 1 without jitter
+there's no round between starting and delivering, so liveness records no
+heartbeats and comes down to "K rounds since I first saw the claim". That
+alone removes the wrongful takeovers, because the window starts when the news
+arrives, not when the claim was made. At W = 2 heartbeats cost 13 to 18
+contributions a run. Against claim-round, liveness costs between 30 fewer and
+17 more contributions a run, because fewer takeovers also mean fewer takeover
+claims.
+
+**Concurrent starts barely change between the rules.** All differences but one
+(ring, W = 2, lockstep: 2.0) are within about 1.5 standard errors of the
+difference, and they point both ways.
+One row looks worse than no wip at all (ring, W = 2, lockstep: 4.7 against
+3.7, about 1.5 standard errors of the difference). I haven't found a mechanism
+for it: no extra start in it comes from taking over live work. So wrongful
+takeovers were mostly a waste of a takeover claim on work that was already
+done, not a source of duplicated work.
+
+**Reading.** Measuring staleness from the observer's own news is the change
+that matters, and heartbeats keep long work alive under that rule. Neither
+rule fixes same-round blindness, and liveness trades fewer false alarms for
+later recovery. A window tuned to the topology's sync lag would trade the
+other way.
 
 ## Against the Phase 1 list
 

@@ -8,9 +8,9 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::agent::wip_round;
+use crate::agent::{HEARTBEAT, wip_round};
 use crate::bracken::Entry;
-use crate::harness::{Behaviour, Config, Run, Topology};
+use crate::harness::{Behaviour, Config, Run, StaleRule, Topology};
 use crate::task;
 
 #[derive(Debug, Serialize)]
@@ -52,6 +52,33 @@ pub struct ConcurrentStarts {
     pub later_round: usize,
 }
 
+/// The claimant's work when its claim was taken over. The harness knows silent drops
+/// from the agents themselves ([`crate::agent::Agent::silent_drops`]).
+#[derive(Debug, Default, Serialize)]
+pub struct Takeovers {
+    /// The work was alive at the takeover: the sum of the next three.
+    pub wrongful: usize,
+    /// Already delivered, but the news hadn't reached the taker.
+    pub already_delivered: usize,
+    /// In progress, and delivered later.
+    pub in_progress_delivered: usize,
+    /// In progress, and dropped later or unfinished at the end.
+    pub in_progress_not_delivered: usize,
+    /// Already dropped: the takeovers staleness is for.
+    pub already_dropped: usize,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct SilentDrops {
+    pub total: usize,
+    /// Of those, taken over by another agent.
+    pub taken_over: usize,
+    /// Mean rounds from the drop to the takeover.
+    pub mean_delay_rounds: f64,
+    /// Of those, never taken over.
+    pub missed: usize,
+}
+
 #[derive(Debug, Serialize)]
 pub struct WipReport {
     /// Claims tagged `wip`.
@@ -62,6 +89,12 @@ pub struct WipReport {
     pub abandoned: usize,
     /// Taken over by another agent's wip claim, as stale: a `refines` relation between wip claims.
     pub taken_over: usize,
+    /// Takeovers by the state of the claimant's work at the takeover's turn.
+    pub takeovers: Takeovers,
+    /// Wip claims whose work was dropped without saying so.
+    pub silent_drops: SilentDrops,
+    /// Heartbeats recorded on wip claims.
+    pub heartbeats: usize,
     /// Wip claims made while the author's replica held another agent's open, fresh wip claim
     /// on the same spec. Agents that honour wip claims make none.
     pub ignored_fresh: usize,
@@ -390,37 +423,105 @@ fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &E
         .iter()
         .filter(|e| match e.kind.as_str() {
             "retract" => true,
-            // Only the wip claim's own author can close it by superseding it.
-            "relation" => {
-                e.text("kind") == "supersedes" && by_id.get(e.text("to")).is_some_and(|t| t.author == e.author)
-            }
+            // Only the wip claim's own author can close it by superseding it; another
+            // agent's takeover (a refines between wip claims) closes it for everyone's view.
+            "relation" => match e.text("kind") {
+                "supersedes" => by_id.get(e.text("to")).is_some_and(|t| t.author == e.author),
+                "refines" => is_wip(e.text("from")) && is_wip(e.text("to")),
+                _ => false,
+            },
             _ => false,
         })
         .map(|e| (e.text(if e.kind == "retract" { "target" } else { "to" }), e.id.as_str()))
         .collect();
-    let taken_over = mine
+    let takeover_relations: Vec<&Entry> = mine
         .iter()
+        .copied()
         .filter(|e| e.kind == "relation" && e.text("kind") == "refines")
         .filter(|e| is_wip(e.text("from")) && is_wip(e.text("to")))
-        .count();
+        .collect();
+    let heartbeats: Vec<&Entry> = mine
+        .iter()
+        .copied()
+        .filter(|e| e.kind == "evidence" && e.text("method") == HEARTBEAT)
+        .filter(|e| by_id.get(e.text("target")).is_some_and(|t| t.author == e.author))
+        .collect();
 
+    // The round agent `b` first saw `id`: the round after the sync that brought it.
+    let seen_by = |id: &str, b: usize| run.arrival.get(&(id.to_owned(), b)).map(|phase| phase + 1);
+    let rule = cfg.behaviour.stale_rule;
+    let k = cfg.behaviour.stale_after;
     let mut ignored_fresh = 0;
     for (w2, spec, r2) in &claims {
         let held = &run.held_before[&w2.id];
+        let b = run.origin[&w2.id].agent;
         let ignored = claims.iter().any(|(w1, s1, r1)| {
+            let since = match rule {
+                StaleRule::ClaimRound => Some(*r1),
+                // The latest news about w1 that had reached b: the claim or a heartbeat on it.
+                StaleRule::Liveness => heartbeats
+                    .iter()
+                    .filter(|h| h.text("target") == w1.id)
+                    .map(|h| h.id.as_str())
+                    .chain([w1.id.as_str()])
+                    .filter(|id| held.contains(*id))
+                    .filter_map(|id| seen_by(id, b))
+                    .max(),
+            };
             s1 == spec
                 && w1.author != w2.author
                 && held.contains(&w1.id)
-                && r2 < &(r1 + cfg.behaviour.stale_after)
+                && since.is_some_and(|since| *r2 < since + k)
                 && !closers.iter().any(|(target, closer)| *target == w1.id && held.contains(*closer))
         });
         ignored_fresh += usize::from(ignored);
     }
+
+    // When each claim's work ended, by turn: delivered or dropped.
+    let ended = |claim: &str, reason: &str| {
+        mine.iter()
+            .find(|e| e.kind == "retract" && e.text("target") == claim && e.text("reason").starts_with(reason))
+            .map(|e| run.origin[&e.id].turn)
+    };
+    let mut takeovers = Takeovers::default();
+    let mut first_takeover: HashMap<&str, usize> = HashMap::new();
+    for r in &takeover_relations {
+        let (old, at) = (r.text("to"), run.origin[&r.id].turn);
+        let entry = first_takeover.entry(old).or_insert(at);
+        *entry = (*entry).min(at);
+        let delivered = ended(old, "delivered");
+        let dropped = ended(old, "abandoned").or_else(|| run.silent_drops.get(old).copied());
+        match (delivered, dropped) {
+            (Some(d), _) if d < at => takeovers.already_delivered += 1,
+            (_, Some(d)) if d < at => takeovers.already_dropped += 1,
+            (Some(_), _) => takeovers.in_progress_delivered += 1,
+            _ => takeovers.in_progress_not_delivered += 1,
+        }
+    }
+    takeovers.wrongful =
+        takeovers.already_delivered + takeovers.in_progress_delivered + takeovers.in_progress_not_delivered;
+
+    let mut silent_drops = SilentDrops { total: run.silent_drops.len(), ..SilentDrops::default() };
+    let mut delays = Vec::new();
+    for (claim, &dropped) in &run.silent_drops {
+        match first_takeover.get(claim.as_str()) {
+            Some(&at) => delays.push((at / cfg.agents) as f64 - (dropped / cfg.agents) as f64),
+            None => silent_drops.missed += 1,
+        }
+    }
+    silent_drops.taken_over = delays.len();
+    if !delays.is_empty() {
+        silent_drops.mean_delay_rounds = delays.iter().sum::<f64>() / delays.len() as f64;
+    }
+
     WipReport {
         claims: claims.len(),
         delivered: retracts("delivered"),
         abandoned: retracts("abandoned"),
-        taken_over,
+        taken_over: takeover_relations.len(),
+        takeovers,
+        silent_drops,
+        heartbeats: heartbeats.len(),
         ignored_fresh,
     }
 }
@@ -471,6 +572,23 @@ impl fmt::Display for Report {
                 f,
                 "Wip claims       {}: {} delivered, {} abandoned, {} taken over when stale, {} ignored while fresh",
                 w.claims, w.delivered, w.abandoned, w.taken_over, w.ignored_fresh
+            )?;
+            let t = &w.takeovers;
+            let s = &w.silent_drops;
+            writeln!(
+                f,
+                "Takeovers        {} wrongful ({} already delivered, {} in progress and delivered later, \
+                 {} in progress and never delivered), {} of work already dropped",
+                t.wrongful,
+                t.already_delivered,
+                t.in_progress_delivered,
+                t.in_progress_not_delivered,
+                t.already_dropped
+            )?;
+            writeln!(
+                f,
+                "Silent drops     {}: {} taken over, {:.2} rounds after the drop on average; {} never; {} heartbeats",
+                s.total, s.taken_over, s.mean_delay_rounds, s.missed, w.heartbeats
             )?;
         }
         let a = &self.availability;
@@ -544,6 +662,11 @@ fn describe(b: &Behaviour) -> String {
         return String::new();
     }
     let schedule = serde_json::to_value(b.schedule).expect("schedules serialize");
-    let wip = if b.wip { format!(", wip claims (stale after {} rounds)", b.stale_after) } else { String::new() };
+    let rule = serde_json::to_value(b.stale_rule).expect("rules serialize");
+    let wip = if b.wip {
+        format!(", wip claims (stale by {} after {} rounds)", rule.as_str().unwrap_or("?"), b.stale_after)
+    } else {
+        String::new()
+    };
     format!("\nwork takes {} rounds, {} schedule{wip}", b.work_rounds, schedule.as_str().unwrap_or("?"))
 }

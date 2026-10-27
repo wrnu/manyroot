@@ -47,11 +47,24 @@ pub struct Behaviour {
     pub work_rounds: u32,
     /// Announce work with a `wip` claim before doing it, and skip specs others have announced.
     pub wip: bool,
-    /// Rounds after its own round at which an open wip claim is stale and may be taken over.
+    /// How agents decide that another agent's wip claim is stale.
+    pub stale_rule: StaleRule,
+    /// Rounds that make an open wip claim stale, counted as `stale_rule` says.
     pub stale_after: u32,
     /// Chance, each round, that an agent drops the work it started.
     pub drop_rate: f64,
     pub schedule: Schedule,
+}
+
+/// How an agent decides that another agent's open wip claim is stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleRule {
+    /// `stale_after` rounds after the round the claim states, the same for every agent.
+    ClaimRound,
+    /// Working agents record a heartbeat on their claim each round. A claim is stale for an
+    /// observer once `stale_after` of its own rounds pass with no new heartbeat reaching it.
+    Liveness,
 }
 
 /// When agents start work, relative to each other.
@@ -72,7 +85,24 @@ impl Behaviour {
     pub fn new(work_rounds: u32, wip: bool, schedule: Schedule) -> Behaviour {
         let drop_rate = if work_rounds == 0 { 0.0 } else { 0.1 };
         let longest = work_rounds.saturating_add(u32::from(schedule == Schedule::Jitter));
-        Behaviour { work_rounds, wip, stale_after: longest.saturating_add(1), drop_rate, schedule }
+        Behaviour {
+            work_rounds,
+            wip,
+            stale_rule: StaleRule::ClaimRound,
+            stale_after: longest.saturating_add(1),
+            drop_rate,
+            schedule,
+        }
+    }
+
+    /// The same, with `rule` and its default window: one round after the latest the work
+    /// could be due for `claim-round`, 2 rounds without news for `liveness`.
+    pub fn with_rule(self, rule: StaleRule) -> Behaviour {
+        let stale_after = match rule {
+            StaleRule::ClaimRound => self.stale_after,
+            StaleRule::Liveness => 2,
+        };
+        Behaviour { stale_rule: rule, stale_after, ..self }
     }
 
     /// The round in which agent `index` may first start work.
@@ -121,6 +151,9 @@ pub struct Run {
     pub conflicts: Value,
     /// `bracken accepted --min-passes <n> --json`, for each policy.
     pub accepted: Vec<(usize, Value)>,
+    /// Wip claims whose work was dropped silently, with the turn it was dropped in.
+    /// Ground truth from the agents ([`Agent::silent_drops`]).
+    pub silent_drops: HashMap<String, usize>,
 }
 
 /// Policies the report evaluates the final Ground under.
@@ -181,6 +214,7 @@ pub fn run(
         log: Vec::new(),
         conflicts: Value::Null,
         accepted: Vec::new(),
+        silent_drops: HashMap::new(),
     };
     let mut held: Vec<HashSet<String>> = replicas.iter().map(|r| r.log().map(|l| ids(&l))).collect::<Result<_>>()?;
     let mut rng = Rng::derive(cfg.seed, 0);
@@ -198,6 +232,7 @@ pub fn run(
                 run.held_before.insert(id.clone(), before.clone());
             }
             held[i] = now;
+            debug_assert_eq!(turn, turn_index(round, i, cfg.agents));
             turn += 1;
         }
         let n = cfg.agents;
@@ -214,6 +249,11 @@ pub fn run(
     let everyone: Vec<Vec<usize>> = (0..cfg.agents).map(|i| (0..cfg.agents).filter(|&j| j != i).collect()).collect();
     sync(&replicas, &bundles, cfg.rounds + 1, &everyone, &mut held, &mut run.arrival)?;
 
+    for (i, agent) in agents.iter().enumerate() {
+        for (claim, round) in agent.silent_drops() {
+            run.silent_drops.insert(claim, turn_index(round, i, cfg.agents));
+        }
+    }
     run.replica_sizes = held.iter().map(HashSet::len).collect();
     run.converged = held.windows(2).all(|w| w[0] == w[1]);
     run.log = replicas[0].log()?;
@@ -222,6 +262,11 @@ pub fn run(
         run.accepted.push((k, replicas[0].accepted(k)?));
     }
     Ok(run)
+}
+
+/// The position of agent `i`'s turn in round `round`: agents act in order, round by round.
+pub fn turn_index(round: u32, i: usize, agents: usize) -> usize {
+    (round as usize - 1) * agents + i
 }
 
 /// Runs the scripted agents in `root` and builds the report.

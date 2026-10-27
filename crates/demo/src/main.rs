@@ -8,7 +8,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
 use bracken_demo::bracken::Bracken;
-use bracken_demo::harness::{self, Behaviour, Config, Schedule, Topology};
+use bracken_demo::harness::{self, Behaviour, Config, Schedule, StaleRule, Topology};
 use bracken_demo::rng::Rng;
 use bracken_demo::safety::{DEMO, create_checked, refuse_git_checkout, refuse_parent_in_new_part};
 use bracken_demo::{compare, task};
@@ -46,6 +46,10 @@ struct RunArgs {
     /// Announce work with a wip claim before doing it, and skip specs others have announced.
     #[arg(long)]
     wip: bool,
+    /// How agents decide another agent's wip claim is stale: by the round it states, or by
+    /// heartbeats that stop reaching them.
+    #[arg(long, value_enum, default_value_t = StaleRule::ClaimRound)]
+    stale_rule: StaleRule,
     /// When agents start work relative to each other.
     #[arg(long, value_enum, default_value_t = Schedule::Lockstep)]
     schedule: Schedule,
@@ -105,6 +109,12 @@ struct CompareArgs {
     work_rounds: Vec<u32>,
     #[arg(long, value_enum, value_delimiter = ',', default_value = "lockstep,stagger,jitter")]
     schedules: Vec<Schedule>,
+    /// Staleness rules for the wip rows.
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "claim-round,liveness")]
+    stale_rules: Vec<StaleRule>,
+    /// Stale window for every wip row, instead of each rule's default.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=20))]
+    stale_after: Option<u32>,
     #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(2..=16))]
     agents: u16,
     /// Enough for jittered work to drift apart.
@@ -191,10 +201,10 @@ fn demo(args: RunArgs) -> Result<ExitCode> {
         topology: args.topology,
         sample: usize::from(args.sample),
         behaviour: Behaviour {
-            stale_after: args
-                .stale_after
-                .unwrap_or_else(|| Behaviour::new(args.work_rounds, args.wip, args.schedule).stale_after),
-            ..Behaviour::new(args.work_rounds, args.wip, args.schedule)
+            stale_after: args.stale_after.unwrap_or_else(|| {
+                Behaviour::new(args.work_rounds, args.wip, args.schedule).with_rule(args.stale_rule).stale_after
+            }),
+            ..Behaviour::new(args.work_rounds, args.wip, args.schedule).with_rule(args.stale_rule)
         },
     };
 
@@ -251,6 +261,8 @@ fn compare(args: CompareArgs) -> Result<ExitCode> {
         topologies: args.topologies,
         work_rounds: args.work_rounds,
         schedules: args.schedules,
+        stale_rules: args.stale_rules,
+        stale_after: args.stale_after,
         jobs: args
             .jobs
             .map_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get()).min(64), usize::from),
