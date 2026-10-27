@@ -161,17 +161,48 @@ fn a_long_chain_of_retractions_does_not_overflow_the_stack() {
     let alice = agent("alice");
     let mut g = Graph::new(ground());
     let a = add(&mut g, &alice, claim("a"));
-    let mut last = a;
+    let mut chain = vec![a];
     for _ in 0..CHAIN {
-        last = add(&mut g, &alice, Body::Retract { target: last, reason: String::new() });
+        let last = *chain.last().unwrap();
+        chain.push(add(&mut g, &alice, Body::Retract { target: last, reason: String::new() }));
     }
     // A small stack, so the test fails the same way in debug and release
-    // builds if the walk ever recurses per link again.
+    // builds if the walk ever recurses per link again. Every link is asked
+    // about, as `log` does: link i stands when the chain after it is even.
     let walk = std::thread::Builder::new()
         .stack_size(128 * 1024)
-        .spawn(move || (g.is_retracted(&a), g.is_retracted(&last)))
+        .spawn(move || chain.iter().map(|id| g.is_retracted(id)).collect::<Vec<_>>())
         .unwrap();
-    assert_eq!(walk.join().unwrap(), (CHAIN % 2 == 1, false));
+    let statuses = walk.join().unwrap();
+    for (i, retracted) in statuses.iter().enumerate() {
+        assert_eq!(*retracted, (CHAIN - i) % 2 == 1, "link {i}");
+    }
+}
+
+/// The cost finding 613f0e33fced measured: asking about every link of a
+/// 100,000-link chain of self-retractions. Walking each link's retractions
+/// costs the square of the chain's length (about 15-20 minutes here); one
+/// pass costs its length. Run in release:
+/// `cargo test --release -p manyroot --test protocol -- --ignored --nocapture every_link`.
+#[test]
+#[ignore = "builds 100,000 signed contributions; a timing check, run in release"]
+fn every_link_of_a_100k_chain_is_decided_in_linear_time() {
+    const CHAIN: usize = 100_000;
+    let alice = agent("alice");
+    let mut g = Graph::new(ground());
+    let mut chain = vec![add(&mut g, &alice, claim("a"))];
+    let build = std::time::Instant::now();
+    for _ in 0..CHAIN {
+        let last = *chain.last().unwrap();
+        chain.push(add(&mut g, &alice, Body::Retract { target: last, reason: String::new() }));
+    }
+    println!("built {CHAIN} links in {:.2?}", build.elapsed());
+    let read = std::time::Instant::now();
+    let retracted = chain.iter().filter(|id| g.is_retracted(id)).count();
+    let elapsed = read.elapsed();
+    println!("decided every link in {elapsed:.2?}: {retracted} retracted");
+    assert_eq!(retracted, CHAIN / 2);
+    assert!(elapsed < std::time::Duration::from_secs(10), "took {elapsed:.2?}");
 }
 
 /// The definition, written as directly as possible: retracted if any

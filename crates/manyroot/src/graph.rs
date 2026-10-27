@@ -7,6 +7,7 @@
 //! parents, which must already be present before it can be added.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use crate::contribution::{Body, Contribution, MAX_CONTRIBUTION_BYTES, PROTOCOL_VERSION};
 use crate::id::{ContributionId, GroundId};
@@ -82,6 +83,9 @@ pub struct Graph {
     /// Relations, evidence and retractions that reference a contribution.
     referrers: HashMap<ContributionId, Vec<ContributionId>>,
     heads: BTreeSet<ContributionId>,
+    /// Every retracted contribution, computed in one pass on first use and
+    /// cleared by every insertion. See [`Graph::is_retracted`].
+    retracted: OnceLock<HashSet<ContributionId>>,
 }
 
 impl Graph {
@@ -92,6 +96,7 @@ impl Graph {
             children: HashMap::new(),
             referrers: HashMap::new(),
             heads: BTreeSet::new(),
+            retracted: OnceLock::new(),
         }
     }
 
@@ -197,6 +202,7 @@ impl Graph {
         }
         self.heads.insert(id);
         self.contributions.insert(id, c);
+        self.retracted = OnceLock::new();
     }
 
     /// Imports contributions in any order, adding each once its parents are
@@ -302,43 +308,30 @@ impl Graph {
     /// restores the original.
     ///
     /// A contribution is retracted if any retraction of it is not itself
-    /// retracted. Retractions of retractions can chain to any depth, so this
-    /// walks the tree of retractions under `id` with an explicit stack rather
-    /// than recursion: one author's long chain must not overflow the stack.
+    /// retracted. Retractions of retractions can chain to any depth, and
+    /// readers ask about many contributions, so walking each one's tree of
+    /// retractions would cost the square of a chain's length over a read. The
+    /// first call after a change instead decides every contribution in one
+    /// pass (see `all_retracted`), and later calls look the answer up.
     pub fn is_retracted(&self, id: &ContributionId) -> bool {
-        // Each frame holds a contribution's retractions and the next one to visit.
-        let mut stack = vec![(self.retractions(id), 0)];
-        // The answer for the frame just popped, to be applied to its parent.
-        let mut finished: Option<bool> = None;
-        while let Some((retractions, next)) = stack.last_mut() {
-            if finished.take() == Some(false) {
-                // A retraction that stands: this frame's contribution is retracted.
-                stack.pop();
-                finished = Some(true);
-                continue;
-            }
-            match retractions.get(*next) {
-                Some(r) => {
-                    *next += 1;
-                    let child = self.retractions(r);
-                    stack.push((child, 0));
-                }
-                None => {
-                    // No standing retraction: not retracted.
-                    stack.pop();
-                    finished = Some(false);
-                }
-            }
-        }
-        finished.expect("the root frame always finishes")
+        self.retracted.get_or_init(|| self.all_retracted()).contains(id)
     }
 
-    /// Retractions that target `id`.
-    fn retractions(&self, id: &ContributionId) -> Vec<ContributionId> {
-        self.referrers(id)
-            .filter(|r| matches!(r.body(), Body::Retract { target, .. } if target == id))
-            .map(|r| r.id())
-            .collect()
+    /// Every retracted contribution, in time linear in the graph. A retraction
+    /// lists its target as a parent, so it comes after its target in causal
+    /// order. Walking that order backwards decides each retraction before the
+    /// contribution it retracts, without recursion.
+    fn all_retracted(&self) -> HashSet<ContributionId> {
+        let mut retracted = HashSet::new();
+        for id in self.topo_order().iter().rev() {
+            let stands = |r: &&Contribution| {
+                matches!(r.body(), Body::Retract { target, .. } if target == id) && !retracted.contains(&r.id())
+            };
+            if self.referrers(id).any(|r| stands(&r)) {
+                retracted.insert(*id);
+            }
+        }
+        retracted
     }
 
     /// Contributions this graph has that `other` lacks, parents first.
