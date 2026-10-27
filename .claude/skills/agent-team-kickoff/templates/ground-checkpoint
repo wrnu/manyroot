@@ -78,8 +78,12 @@ fi
 
 printf '%s\n' "$new" | git add --pathspec-from-file=-
 staged=$(git diff --cached --name-status)
-if printf '%s\n' "$staged" | grep -E -v "^A	" | grep -q . ||
-   printf '%s\n' "$staged" | cut -f2 | grep -E -v "$allowed" | grep -q .; then
+# Filtered into a variable, not piped to grep -q: under pipefail, grep -q exiting early kills a writer
+# with more than a pipe's worth of output (SIGPIPE), the pipeline fails, and the check would pass.
+# grep exits 1 when nothing is left over; anything else is an error, not a pass.
+not_added=$(printf '%s\n' "$staged" | grep -E -v "^A	") || [ $? -eq 1 ] || not_added="grep failed"
+outside=$(printf '%s\n' "$staged" | cut -f2 | grep -E -v "$allowed") || [ $? -eq 1 ] || outside="grep failed"
+if [ -n "$not_added$outside" ]; then
   git reset -q
   stop "staging didn't match what was checked; nothing was committed:
 $staged"

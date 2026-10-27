@@ -29,7 +29,9 @@
 set -euo pipefail
 # Never trace or auto-export (both can be inherited through SHELLOPTS): the token is in a
 # variable from here on, and xtrace would print it, allexport would hand it to every child.
+# A token exported by the caller would keep its export attribute when assigned, so drop it first.
 set +ax
+unset token
 
 usage() {
   echo "usage: merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--dry-run]" >&2
