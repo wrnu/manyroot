@@ -591,3 +591,122 @@ fn write_ground_v1_fixture() {
     let postgres = add(&mut store, &bob, claim("keep sessions in postgres", &[]));
     add(&mut store, &bob, relate(postgres, RelationKind::Supersedes, redis, ""));
 }
+
+/// One sync message of every type, as pinned bytes (docs/protocol.md, "Sync"). Append new
+/// vectors; never edit these.
+const SYNC_VECTORS: [(&str, &str); 6] = [
+    (
+        "hello",
+        "a564747970656568656c6c6f6870726f746f636f6c016667726f756e6458206767676767676767676767676767676767676767676767676767676767676767666c696d697473a16b62617463685f62797465731a0400000068666561747572657380",
+    ),
+    (
+        "heads",
+        "a26474797065656865616473656865616473825820111111111111111111111111111111111111111111111111111111111111111158202222222222222222222222222222222222222222222222222222222222222222",
+    ),
+    ("offer", "a26474797065656f66666572636964738158203333333333333333333333333333333333333333333333333333333333333333"),
+    ("need", "a26474797065646e656564636964738158203333333333333333333333333333333333333333333333333333333333333333"),
+    (
+        "batch",
+        "a364747970656562617463686662756e646c6558284d5242554e444c316767676767676767676767676767676767676767676767676767676767676767646c617374f5",
+    ),
+    (
+        "result",
+        "a5647479706566726573756c74656164646564026f616c72656164795f70726573656e74006872656a656374656481a26269645820444444444444444444444444444444444444444444444444444444444444444466726561736f6e6d626164207369676e61747572656a756e7265736f6c76656401",
+    ),
+];
+
+fn sync_messages() -> [sync::Message; 6] {
+    use sync::{Limits, Message, Rejected};
+    let id = |b: u8| ContributionId([b; 32]);
+    let mut empty_bundle = Vec::new();
+    bundle::write(&mut empty_bundle, GROUND, Vec::<Contribution>::new()).unwrap();
+    [
+        Message::Hello {
+            protocol: 1,
+            ground: GROUND,
+            limits: Limits { batch_bytes: 64 * 1024 * 1024 },
+            features: vec![],
+        },
+        Message::Heads { heads: vec![id(0x11), id(0x22)] },
+        Message::Offer { ids: vec![id(0x33)] },
+        Message::Need { ids: vec![id(0x33)] },
+        Message::Batch { bundle: empty_bundle, last: true },
+        Message::Result {
+            added: 2,
+            already_present: 0,
+            rejected: vec![Rejected { id: id(0x44), reason: "bad signature".into() }],
+            unresolved: 1,
+        },
+    ]
+}
+
+#[test]
+fn sync_messages_encode_to_pinned_bytes() {
+    for ((name, pinned), message) in SYNC_VECTORS.iter().zip(sync_messages()) {
+        assert_eq!(hex::encode(message.encode()), *pinned, "{name} encoding changed");
+        let bytes = hex::decode(pinned).unwrap();
+        assert_eq!(sync::Message::decode(&bytes, bytes.len()).unwrap(), message, "{name} no longer decodes");
+    }
+    let sync::Message::Batch { bundle: pinned_batch, .. } = &sync_messages()[4] else { unreachable!() };
+    assert_eq!(bundle::read(pinned_batch.as_slice()).unwrap().0, GROUND, "a batch carries a bundle");
+}
+
+/// Id lists are split across messages of at most this many ids; a short message ends the list.
+const SYNC_MAX_IDS: usize = 65_536;
+/// An empty offer: how a list that fills its earlier messages exactly ends.
+const SYNC_EMPTY_OFFER: &str = "a26474797065656f666665726369647380";
+
+#[test]
+fn sync_id_lists_are_split_at_a_pinned_size() {
+    assert_eq!(sync::MAX_IDS, SYNC_MAX_IDS, "the id-list size is part of the sync protocol");
+    let empty = sync::Message::Offer { ids: vec![] };
+    assert_eq!(hex::encode(empty.encode()), SYNC_EMPTY_OFFER, "an empty offer's encoding changed");
+    // A full list fits the message limit of any replica, whatever its batch_bytes.
+    let full = sync::Message::Need { ids: vec![ContributionId([1; 32]); SYNC_MAX_IDS] }.encode();
+    let smallest = sync::Limits { batch_bytes: 44 };
+    assert_eq!(
+        sync::Message::decode(&full, smallest.max_message_bytes()).unwrap(),
+        sync::Message::Need { ids: vec![ContributionId([1; 32]); SYNC_MAX_IDS] }
+    );
+}
+
+/// A result lists at most this many rejected contributions, with reasons of at most this many bytes.
+const SYNC_MAX_REJECTED: usize = 1024;
+const SYNC_MAX_REASON_BYTES: usize = 256;
+
+#[test]
+fn sync_results_are_bounded_at_a_pinned_size() {
+    assert_eq!(sync::MAX_REJECTED, SYNC_MAX_REJECTED, "the rejected-list bound is part of the sync protocol");
+    assert_eq!(sync::MAX_REASON_BYTES, SYNC_MAX_REASON_BYTES, "the reason bound is part of the sync protocol");
+    // The largest result fits the smallest replica's message limit.
+    let rejected = sync::Rejected { id: ContributionId([1; 32]), reason: "r".repeat(SYNC_MAX_REASON_BYTES) };
+    let largest = sync::Message::Result {
+        added: u64::MAX,
+        already_present: u64::MAX,
+        rejected: vec![rejected; SYNC_MAX_REJECTED],
+        unresolved: u64::MAX,
+    };
+    let bytes = largest.encode();
+    assert_eq!(sync::Message::decode(&bytes, sync::Limits { batch_bytes: 44 }.max_message_bytes()).unwrap(), largest);
+}
+
+/// The smallest batch_bytes a hello may carry: an empty bundle (magic and Ground id) plus one length prefix.
+const SYNC_MIN_BATCH_BYTES: u64 = 44;
+
+#[test]
+fn sync_hello_batch_bytes_has_a_pinned_minimum() {
+    let graph = Graph::new(GROUND);
+    let hello = |batch_bytes| sync::Message::Hello {
+        protocol: 1,
+        ground: GROUND,
+        limits: sync::Limits { batch_bytes },
+        features: vec![],
+    };
+    let mut session = sync::Session::new(GROUND, sync::Limits::default());
+    assert_eq!(
+        session.receive(&graph, hello(SYNC_MIN_BATCH_BYTES - 1)).unwrap_err(),
+        sync::SyncError::LimitTooSmall(SYNC_MIN_BATCH_BYTES - 1)
+    );
+    let mut session = sync::Session::new(GROUND, sync::Limits::default());
+    assert!(session.receive(&graph, hello(SYNC_MIN_BATCH_BYTES)).is_ok());
+}

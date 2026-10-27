@@ -58,6 +58,7 @@ fn two_replicas_preserve_and_resolve_a_disagreement() {
     let artifact = bracken(&server, &["artifact", "ttl.rs", "--name", "src/ttl.rs", "--as", "bob"]);
 
     assert_eq!(bracken(&server, &["sync", "../laptop"]).lines().next(), Some("received 2, sent 3"));
+    assert_eq!(bracken(&server, &["sync", "../laptop"]), "received 0, sent 0", "a session sends only what's missing");
     let ids = |dir: &Path| -> Vec<Value> {
         json(dir, &["log", "--json"]).as_array().unwrap().iter().map(|c| c["id"].clone()).collect()
     };

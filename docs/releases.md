@@ -93,6 +93,19 @@ not the replaced claim's author's.
 - **No re-signing or data migration.** Upgrade the pinned binary with the
   owner's go.
 
+### 2026-10-27: sync wire format, version 1
+
+Task `7a85f54c214d`. Adds the sync messages and session (protocol.md,
+"Sync"). `bracken sync` between two local directories now runs a session and
+exchanges only what each side lacks.
+
+- **Existing Grounds open unchanged.** Contributions, bundles and storage are
+  unchanged, so no migration is needed.
+- **Pinned in the guard:** one message of every type, then (appended) the
+  id-list size of 65 536 ids per `heads`, `offer` or `need` message, the
+  `result` bounds (1 024 rejected, 256-byte reasons) and the 44-byte minimum
+  `batch_bytes`.
+
 ## Rollback
 
 - A bad merge: revert it on `main` through a PR. Ground contributions it caused stay: they're history. If they're wrong, contribute corrections or retractions.

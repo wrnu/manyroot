@@ -103,6 +103,83 @@ Bundles carry contributions over any transport:
 "MRBUNDL1"  GroundId  ( u32 big-endian length  ||  encoded contribution )*
 ```
 
+## Sync
+
+A sync session exchanges exactly the contributions each replica lacks.
+Because a replica only holds a contribution once it holds its parents, its
+set is closed under ancestry, and its causal heads describe it.
+
+**Messages.** Each message is one CBOR map, encoded like a contribution:
+canonical, text keys in the order listed, `type` first. A receiver decodes a
+message, re-encodes it and rejects it if the bytes differ. Ids are 32-byte
+strings. How messages are framed on a connection is the transport's concern.
+
+| `type`   | Fields, in order                                                                  |
+| -------- | --------------------------------------------------------------------------------- |
+| `hello`  | `protocol: 1`, `ground: GroundId`, `limits: {batch_bytes: uint}`, `features: [text]` |
+| `heads`  | `heads: [ContributionId]`, the sender's causal heads, sorted by id                |
+| `offer`  | `ids: [ContributionId]`, what the sender holds and the receiver may lack, in causal order |
+| `need`   | `ids: [ContributionId]`, the offered ids the sender lacks                         |
+| `batch`  | `bundle: bytes`, a bundle (above) for this Ground; `last: bool`                   |
+| `result` | `added: uint`, `already_present: uint`, `rejected: [{id, reason: text}]`, `unresolved: uint` |
+
+**Id lists.** `heads`, `offer` and `need` each send one list, split across
+messages of that type: every message holds at most 65 536 ids, every one but
+the last holds exactly 65 536, and the last holds fewer, possibly none, which
+ends the list. So a list of up to 65 535 ids is one message, and a list of
+exactly 65 536 is a full message followed by an empty one. A replica decodes
+any message up to its `batch_bytes` or 65 536 × 34 bytes (a full id list),
+whichever is larger, plus 64 bytes. A full id list therefore always fits,
+however small the peer's `batch_bytes` is.
+
+**Session.** Both sides run the same steps:
+
+1. Send `hello`, then the `heads` list. On the peer's `hello`, end the
+   session if its `protocol` isn't 1, its `ground` isn't this replica's, or
+   its `batch_bytes` is under 44 (an empty bundle plus one length prefix),
+   before reading anything else. Unknown `features` are ignored.
+2. On the peer's `heads`, let *known* be the peer's heads this side holds,
+   and their ancestors. The candidates are this side's contributions outside
+   *known*, in causal order.
+   - If this side holds every one of the peer's heads, the candidates are
+     exactly what the peer lacks: send them as batches.
+   - Otherwise send the `offer` list of candidates. Once the whole list has
+     arrived, the peer answers with the `need` list of the ones it lacks, and
+     this side sends those as batches, in the order needed.
+3. Batches go one at a time: send the next only after the peer's `result` for
+   the last. Each bundle fits the peer's `batch_bytes`; a contribution too
+   large for it ends the session. The final batch has `last: true` and may be
+   empty, so every side sends at least one batch. Only the final batch may be
+   empty.
+4. On a batch, import its contributions and answer `result` with the import
+   report. `reason` is advisory text. `rejected` lists at most the first 1 024
+   rejected contributions, each `reason` cut to at most 256 bytes (at a
+   character boundary), so a `result` always fits the peer's message limit,
+   whatever either side's `batch_bytes`.
+5. The session ends when both sides have sent their last batch and received
+   its `result`.
+
+A side ends the session at once if the peer breaks these rules: a message out
+of order, a message over the size limit above or a `heads`, `offer` or `need`
+with more than 65 536 ids, a bundle over its own `batch_bytes` (checked before
+decoding) or for another Ground, an empty batch without `last`, an `offer` or
+`need` list that holds an id twice, a `need` for an id it didn't `offer`, a
+`last` batch while ids this side listed in its `need` haven't all arrived, or
+over-sending. A contribution is over-sent if the receiver neither asked for it
+with `need` nor could have been sent it under the subset shortcut, or if it
+was sent before: after a `need`, anything not listed or already received;
+after the shortcut, anything the receiver held when it sent its `heads`, or
+already received this session. (It may hold more by the time the batch
+arrives, from elsewhere; those count as `already_present`.) The exchange
+never sends a contribution twice, or one the receiver holds; it costs at most
+one extra round trip and 34 bytes per candidate.
+
+A peer can still keep a session open by sending new contributions under the
+shortcut, by sending a `heads` or `offer` list that never ends (full messages
+forever), or by not answering. Id lists have no total bound, and the receiver
+keeps every id it's sent, so memory grows with them too. Bounding a session's
+time, bytes and memory is the transport's concern (step 2 of network sync).
+
 ## Derived state
 
 These are computed from the graph and are never replicated.
@@ -177,6 +254,12 @@ It pins:
   decoding and the validity check.
 - **Bundle vector.** A two-contribution bundle's bytes: the magic, the Ground
   id and the u32 big-endian length framing. It must read back.
+- **Sync vectors.** One message of every sync type, as pinned bytes that must
+  decode back to the same message, then the id-list size (65 536), an empty
+  `offer`'s bytes, a full id list fitting the smallest replica's message
+  limit, and the `result` bounds (1 024 rejected, 256-byte reasons) with the
+  largest `result` fitting that limit too, and the 44-byte minimum
+  `batch_bytes` in `hello`. New vectors are appended; pinned ones never change.
 - **Fixture Ground.** `crates/manyroot/tests/fixtures/ground-v1/` is a replica
   written by version 0.1.0 of `manyroot` (`ground.json`, `objects/`,
   `agents/`; no private keys). The test opens it, verifies every
@@ -214,5 +297,5 @@ fixture byte for byte.
 - Ground membership, permissions and governance (Stewards).
 - References across Grounds and selective replication (Canopy).
 - Checkpoints and releases (Rings).
-- A network sync protocol beyond bundles.
+- Transports for sync sessions, and who may push (Stewards).
 - Identities with readable names that other replicas can see.

@@ -19,6 +19,7 @@
 //! any number of agent processes can write to one replica without locking:
 //! two processes writing concurrently just produce concurrent contributions.
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +30,7 @@ use crate::contribution::{Body, Contribution, DecodeError};
 use crate::graph::{Graph, ImportReport, RuleViolation};
 use crate::id::{AgentId, ContributionId, GroundId};
 use crate::identity::{self, Identity, IdentityError};
+use crate::sync::{Limits, Message, Session, SyncError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -52,6 +54,8 @@ pub enum StoreError {
     NameTaken(String),
     #[error("cannot sync ground {0} with ground {1}")]
     DifferentGrounds(GroundId, GroundId),
+    #[error("sync: {0}")]
+    Sync(#[from] SyncError),
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + '_ {
@@ -287,15 +291,50 @@ impl Store {
     }
 }
 
-/// Exchanges contributions so both replicas end up holding the union.
-/// Returns the reports for `a` and `b` respectively.
+/// Exchanges contributions so both replicas end up holding the union, through
+/// a sync session on each side (see [`crate::sync`]), so each receives only
+/// what it lacked. Every message goes through its wire encoding. Returns what
+/// `a` and `b` imported, respectively.
 pub fn sync(a: &mut Store, b: &mut Store) -> Result<(ImportReport, ImportReport), StoreError> {
     if a.info.ground != b.info.ground {
         return Err(StoreError::DifferentGrounds(a.info.ground, b.info.ground));
     }
-    let for_a = b.graph.missing_from(&a.graph);
-    let for_b = a.graph.missing_from(&b.graph);
-    Ok((a.import(for_a)?, b.import(for_b)?))
+    let limits = Limits::default();
+    let mut sides = [
+        (Session::new(a.info.ground, limits), ImportReport::default()),
+        (Session::new(b.info.ground, limits), ImportReport::default()),
+    ];
+    let stores = [a, b];
+    // inbox[i] holds encoded messages for side i.
+    let mut inbox: [VecDeque<Vec<u8>>; 2] = Default::default();
+    for i in 0..2 {
+        inbox[1 - i].extend(sides[i].0.start(stores[i].graph()).iter().map(Message::encode));
+    }
+    while let Some(i) = (0..2).find(|&i| !inbox[i].is_empty()) {
+        let bytes = inbox[i].pop_front().expect("inbox isn't empty");
+        let (session, report) = &mut sides[i];
+        let message = Message::decode(&bytes, limits.max_message_bytes())?;
+        let step = session.receive(stores[i].graph(), message)?;
+        let mut replies = step.send;
+        if let Some(batch) = step.import {
+            let imported = stores[i].import(batch)?;
+            replies.extend(session.imported(&imported));
+            merge(report, imported);
+        }
+        inbox[1 - i].extend(replies.iter().map(Message::encode));
+    }
+    if !sides.iter().all(|(s, _)| s.is_done()) {
+        return Err(StoreError::Sync(SyncError::Unexpected("end of messages before the session finished")));
+    }
+    let [(_, for_a), (_, for_b)] = sides;
+    Ok((for_a, for_b))
+}
+
+fn merge(into: &mut ImportReport, from: ImportReport) {
+    into.added.extend(from.added);
+    into.already_present += from.already_present;
+    into.rejected.extend(from.rejected);
+    into.unresolved.extend(from.unresolved);
 }
 
 fn object_path(dir: &Path, id: &ContributionId) -> PathBuf {

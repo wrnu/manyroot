@@ -14,6 +14,7 @@
 //! | [`validation`]   | Proof     | Policies, acceptance, conflicts                 |
 //! | [`store`]        | Ground    | A replica on disk, local identities, sync       |
 //! | [`bundle`]       | Weave     | Portable contribution streams between replicas  |
+//! | [`sync`]         | Weave     | Sessions that exchange only what's missing      |
 //! | [`identity`]     | Stewards  | Agent keys and signatures                       |
 
 pub mod bundle;
@@ -22,6 +23,7 @@ pub mod graph;
 pub mod id;
 pub mod identity;
 pub mod store;
+pub mod sync;
 pub mod validation;
 
 pub use contribution::{Body, BodyKind, Contribution, RelationKind, Verdict};

@@ -71,13 +71,57 @@ One session between replicas A and B:
    today's format (`MRBUNDL1`, ground id, length-prefixed contributions). One
    session may send several batches, each under the receiver's byte limit.
 6. **Result.** The receiver imports and replies
-   `{added, already_present, rejected: [{id, rule}], unresolved}`. That's
+   `{added, already_present, rejected: [{id, reason}], unresolved}`. That's
    `ImportReport`, which exists already.
 
 Pull and push are the two halves; the server's permissions decide which a
 client may run. Messages are CBOR maps with a `type` field. The exchange is
 exact: it never sends a contribution the receiver holds, at a cost of at most
 one extra round trip and 32 bytes per candidate id.
+
+**Wire format, as built in step 1** (answer `22cdcf597acf`; normative text in
+[protocol.md](../protocol.md), "Sync"):
+
+- Each message is one canonical CBOR map, `type` first, re-encoded on receipt
+  and rejected if the bytes differ. Framing between messages is the
+  transport's.
+- `hello {protocol: 1, ground, limits: {batch_bytes}, features: [text]}`;
+  unknown features are ignored. A `batch_bytes` under 44, too small for one
+  contribution, ends the session (finding `4922d8de4c62`).
+- `heads {heads}` carries the sender's causal heads, sorted by id;
+  `offer {ids}` the candidates, in causal order; `need {ids}` the offered ids
+  the receiver lacks, in offer order. Ids are 32-byte strings (finding
+  `f29c3b7292ea`). Each is one list split across messages of
+  at most 65 536 ids (a protocol constant, not tied to `batch_bytes`); a short
+  message, possibly empty, ends the list. The message size limit is the larger
+  of a batch and a full id list, so a replica with a small `batch_bytes` still
+  takes a large offer (finding `0372553b36ac`).
+- `batch {bundle: bytes, last: bool}`: the bundle is today's `MRBUNDL1` bytes.
+  `last` tells the receiver the sender is done, which it can't otherwise know
+  under the shortcut. Every side's sending ends with exactly one `last` batch,
+  possibly empty.
+- Batches go one at a time; the next waits for the peer's `result`.
+- `result {added, already_present, rejected: [{id, reason}], unresolved}`;
+  `reason` is advisory text. `rejected` holds at most 1 024 entries with
+  reasons of at most 256 bytes, so a `result` fits the peer's message limit
+  under asymmetric `batch_bytes` (finding `f29c3b7292ea`).
+- After a `need`, a `last` batch before every needed id has arrived ends the
+  session (finding `309a0d9671f2`). Arriving isn't being added: a peer that
+  sends a child before its parent leaves the child unresolved, and the
+  session still completes. The `result`'s `unresolved` count reports it, and
+  `bracken sync` then exits non-zero (finding `5c4022219fea`).
+- A receiver refuses a batch over its own `batch_bytes` before decoding it. A
+  sender stops if one contribution can't fit the peer's limit.
+- Over-sending ends the session: a contribution the receiver neither asked
+  for with `need` nor could have been sent under the subset shortcut (one it
+  held when it sent its `heads`), or one sent before in this session. So the
+  shortcut never ends its own session. An `offer` or `need` listing an id
+  twice ends it too, as does an empty batch that isn't `last` (findings
+  `a38cae31c621`, `ab5965f73636`). A session deadline and a byte budget are the
+  transport's, in step 2 (task `d04580486e94`), and so is a bound on id
+  lists, which have no total limit (finding `b8b70206f0f8`).
+- There's no error message in step 1: a refusal ends the session locally, and
+  step 2's transport reports it.
 
 **Alternatives:** git-style have/ack negotiation pays off only for huge,
 mostly shared histories (a later optimization). Range-based set
