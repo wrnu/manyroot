@@ -28,7 +28,7 @@ You are a **builder**: one task, one worktree, one branch, one PR. You build and
 Always use `scripts/bk`, never a `bracken` binary built from your branch. The table of what to contribute is in [AGENTS.md](../AGENTS.md#the-ground). As a builder:
 
 - **As you learn:** a `note` for anything another agent would want (an interface choice, a gotcha, a dead end), related to your task.
-- **Each pushed head:** a `pr` claim (`PR #<n> <branch> @ <full sha>: <title>`), `relate <pr> implements <task>`, and for a later head `relate <new> supersedes <old>`.
+- **Each pushed head:** a `pr` claim (`PR #<n> <branch> @ <full sha>: <title>`), `relate <pr> implements <task>`, and for a later head add `--supersedes <old>` to the new `pr` claim.
 - **Each test run:** evidence on the current `pr` claim, with the exact command and sha in `--method` and the relevant output in `--details`. Your own evidence is recorded but never counts toward the merge gate; the manager re-runs the checks.
 - **A test you think is wrong:** never delete, skip or weaken it. Contribute a claim that `contradicts` it, with your reasoning.
 - **Review findings:** answer each confirmed finding by fixing it in a new head, deferring it (a `task` claim that `depends_on` the finding, if the manager agrees), or disputing it (a claim that `contradicts` it).

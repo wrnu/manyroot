@@ -14,13 +14,13 @@ the same PR (process section 8, "Keeping the skill current").
 
 | Field | Value |
 |---|---|
-| Goal | The vision in [vision.md](vision.md), plus how the team works (process section 1). In the Ground: the latest `goal` claim (`scripts/bk log --tag goal \| grep -v '(retracted)' \| tail -1`), which depends on the `docs/vision.md` artifact |
+| Goal | The vision in [vision.md](vision.md), plus how the team works (process section 1). In the Ground: the current `goal` claim (`scripts/bk log --tag goal --current`), which depends on the `docs/vision.md` artifact |
 | Stack and packages | Rust 2024 workspace: `crates/manyroot` (protocol library), `crates/bracken` (CLI). Commands are in AGENTS.md |
 | Change classes | docs, process, cli, library, merge-gate tooling, crypto, protocol, storage. Release path per class: [releases.md](releases.md) |
 | Release stages | None yet; nothing is published. See [releases.md](releases.md) |
 | What deploys on merge | Nothing. `.forgejo/workflows/ci.yml` only runs checks |
 | Shared resources | The pinned `bracken` in `.bracken-bin/`; Ground checkpoint commits; merges to `main` |
-| Remote | Private `Autimo/manyroot` on forge.jx.rs (Forgejo). Agents push as `warren` for now; bot access is an open owner question in the Ground |
+| Remote | Private `Autimo/manyroot` on forge.jx.rs (Forgejo). Agents push as `warren` for now; a bot account is backlog (decision 247eb4d1240c, task 284f93c1fd6b) |
 | CI role | Observer: runs on every PR, not required by protection (decision `8b2454e4cf81`) |
 | Branch protection | `main`: blocks force-push and deletion, applies to admins, allows direct pushes, no required checks. Tested on a scratch branch 2026-10-27 |
 | Agent harness | T3 Code with Claude Code |

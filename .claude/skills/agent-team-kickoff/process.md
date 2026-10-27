@@ -10,7 +10,7 @@ The goal says what the work is **for**, not only how it's done. `<vision doc>` i
 
 The goal is in the Ground as well as the repo:
 - The vision document is an **artifact** in the Ground, named by its repo path. Every change to the document adds a new artifact that supersedes the previous one, **in the same PR**. CI checks that the latest one matches the file (section 10).
-- The goal is the latest non-retracted claim tagged `goal`, and it `depends_on` the vision artifact it was written against. A new goal supersedes the old one.
+- The goal is the current claim tagged `goal` (`scripts/bk log --tag goal --current`), and it `depends_on` the vision artifact it was written against. A new goal supersedes the old one (`claim … --supersedes <old>`).
 
 Every decision, task and process change is judged against the goal, the vision first. A task that ships safely but doesn't move the vision forward needs a reason. The manager may propose new wording; only the owner changes it.
 
@@ -54,7 +54,7 @@ Every agent follows these, so that `scripts/bk log --tag <tag>` answers the team
 | Task | claim, tag `task`: the full builder brief (section 6) | manager |
 | Design note, hypothesis, discovery | claim, tag `note`; relate it to the task or the code it concerns | anyone |
 | PR head | claim, tag `pr`: "PR #<n> <branch> @ <full sha>: <title>"; `relate <pr> implements <task>` | builder |
-| New commit on a PR | new `pr` claim, then `relate <new> supersedes <old>`. Evidence on the old head no longer counts, so every head is verified on its own | builder |
+| New commit on a PR | new `pr` claim with `--supersedes <old>`. Evidence on the old head no longer counts, so every head is verified on its own | builder |
 | Test run | evidence on the `pr` claim: `--method "<command> @ <sha>"`, `--details "<relevant output>"` | builder (recorded, never counted), manager (counted) |
 | Review verdict | evidence on the `pr` claim: `pass` or `fail`, `--method "independent review (<model>) @ <sha>"` | reviewer, security |
 | Review finding | claim, tag `finding`, with file:line, severity, the requirement broken and a counterexample; `relate <finding> contradicts <pr>` | reviewer, security |
@@ -70,7 +70,7 @@ Rules:
 - **Never act on a claim alone.** Use `scripts/bk show <id>` to check its status, evidence and referrers. A `note` is a lead, not a fact.
 - **Ids in messages, content in the Ground.** Quote the short id (12 hex characters) everywhere: messages, PR descriptions, commits.
 - **No secrets or personal data in the Ground.** Contributions are immutable: a retracted contribution still exists, and it's in git history for good.
-- **Tags are queries.** Readers take the latest claim with a tag such as `goal`, `manager-state`, `pr` or `manager`, so tag a claim with one of those only if it is one. A decision about the goal is tagged `decision`, not `goal`. Put topics in the statement.
+- **Tags are queries.** Readers take the current claim with a tag such as `goal`, `manager-state`, `pr` or `manager` (`scripts/bk log --tag <tag> --current`), so tag a claim with one of those only if it is one. A decision about the goal is tagged `decision`, not `goal`. Put topics in the statement.
 - **Disagreement is data.** If you think a decision, a finding or a test is wrong, contribute a claim that `contradicts` it with your reasoning. Don't argue in messages, and don't quietly work around it.
 
 ### 4.2 Merge gate
@@ -247,10 +247,10 @@ Besides decisions and tasks, three tags carry what a future agent would otherwis
 | `preference` | How the owner wants agents to work, quoted and dated | "Owner, 2026-10-27: no AI attribution in commits" |
 | `reference` | Where something lives outside the repo | "Forge docs: `~/Code/autimo/wiki/forge/`" |
 
-- **At the start of a task**, read `scripts/bk log --tag decision`, `--tag gotcha` and `--tag preference`, and `--tag reference` when it's relevant. Skip entries marked `(retracted)`. Before relying on one, run `scripts/bk show <id>` to see whether something replaced or contradicts it.
+- **At the start of a task**, read `scripts/bk log --tag decision --current`, `--tag gotcha --current` and `--tag preference --current`, and `--tag reference --current` when it's relevant. `--current` leaves out retracted entries, entries their author superseded with another of their own, and anything about those. An entry that someone else superseded stays, marked `(superseded by <author> <id>)`: nobody can hide another author's entry. Before relying on one, run `scripts/bk show <id>` to see whether something contradicts it.
 - **Verify before acting:** if an entry names a file, function or flag, confirm it still exists.
 - **Don't contribute:** what the code, `git log` or docs already say (update those instead); secrets or personal data (contributions are permanent); anything only the current conversation needs.
-- **Keep it current, never delete.** When an entry changes, its author contributes the new version and relates it `supersedes` the old one. When it's wrong, anyone contributes a correction that `contradicts` it, and its author can retract it.
+- **Keep it current, never delete.** When an entry changes, its author contributes the new version with `claim … --supersedes <old>`, which also records the `supersedes` relation. `claim --supersedes` refuses another author's claim: contradict or refine it instead. When it's wrong, anyone contributes a correction that `contradicts` it, and its author can retract it.
 - **Ids are the links.** Refer to entries by short id in docs, PRs and other claims.
 
 ### 9.2 No compaction hook
@@ -271,7 +271,12 @@ A checkpoint commit only adds `.bracken/` files and deploys nothing, so it merge
 
 **Never commit `.bracken/identities/`.** If `git status` ever shows a file there as staged or tracked, stop and tell the owner: that key must be treated as leaked and replaced.
 
-**A key inside a contribution.** If the checkpoint stops because a new file contains a key, that contribution can't be removed, and retracting it doesn't help: it still holds the key, so every later checkpoint stops too. Treat the key as exposed and tell the owner. Recovery, with the owner's go: create a replacement identity under a new name, record a `decision` saying which key is compromised and from when, and use the new name in merge gates from then on. Then the owner moves the old identity file out of `.bracken/identities/` (to somewhere outside the repo, or deletes it). With that key no longer local, the checkpoint commits again, and the key it commits is revoked.
+**A key inside a contribution.** If the checkpoint stops because a new file contains a key, that contribution can't be removed, and retracting it doesn't help: it still holds the key, so every later checkpoint stops too. Treat the key as exposed and tell the owner. Recovery, with the owner's go: create a replacement identity under a new name, and record a `decision` saying which key is compromised. Then the owner moves the old identity file out of `.bracken/identities/` (to somewhere outside the repo, or deletes it). With that key no longer local, the checkpoint commits again.
+
+The old key is distrusted only by that decision, not by the protocol or the CLI. Its name still resolves (`.bracken/agents/<name>.json` stays), so `--validator <old name>` would still count evidence that anyone holding the leaked key signs. So:
+
+- Replace the old name with the new one in section 4.2's gate commands, in the role briefs (sections 5.1 and 5.2) and in `docs/development.md`, and never pass the old name to `--validator` again.
+- Treat everything the old key signed as suspect, not only what came after the leak: `timestamp_ms` is advisory, so a forgery can be backdated. Re-check any open `pr` whose gate counted that key, and have the new identity re-record any evidence or decision still needed.
 
 To restore, clone the repo. Contributions, causal history and agent names all come back; private keys don't. Create new identities under new names (`manager-2`); the directory refuses names that are already taken. Recorded signatures stay verifiable, because each contribution carries its author's public key.
 
@@ -281,20 +286,20 @@ The manager's state is in the Ground too:
 
 | What | How |
 |---|---|
-| Manager thread | Claim `--tag manager`: thread id and worktree. A new manager contributes its own claim, which supersedes the last. |
+| Manager thread | Claim `--tag manager`: thread id and worktree. A new manager contributes its own claim, which supersedes the last (`claim … --supersedes <old>` under the same identity; under a new one, `relate <new> supersedes <old>` signed by the new one). |
 | Builder threads | Claim `--tag builder`: "Thread <id> builds task <task id> as builder-<branch>", then `relate <claim> refines <task>`. Retract it when the builder is done. |
-| Plan | Claim `--tag manager-state`: the next steps in order, and what's waiting on whom. Each update is a new claim that supersedes the previous one, so the latest claim is the plan and the chain is its history. |
+| Plan | Claim `--tag manager-state`: the next steps in order, and what's waiting on whom. Each update is a new claim with `--supersedes <previous>`, so the current claim is the plan and the chain is its history. After a handover to a new manager identity, the old manager's last `manager` and `manager-state` claims stay in `--current`, marked as superseded by the new one, until the old identity retracts them, or for good if its key is gone. |
 
 Update the plan whenever it changes, not at the end of a session.
 
 **After a compaction, before anything else**, rebuild the picture:
 
 ```sh
-scripts/bk log --tag manager-state | grep -v '(retracted)' | tail -1   # the current plan; scripts/bk show <id> for all of it
-scripts/bk log --tag builder
-scripts/bk log --tag decision
-scripts/bk log --tag task
-scripts/bk log --tag owner-ask
+scripts/bk log --tag manager-state --current   # the current plan; scripts/bk show <id> for all of it
+scripts/bk log --tag builder --current
+scripts/bk log --tag decision --current
+scripts/bk log --tag task --current
+scripts/bk log --tag owner-ask --current
 scripts/bk conflicts
 fj --host forge.jx.rs pr search                # or the forge's equivalent
 ```
@@ -308,7 +313,7 @@ Then read the builder threads. The harness's own memory (in Claude Code, auto-me
 **Branch protection blocks force-push and deletion on `main`, applying to admins.** The Ground's history lives in git, so rewriting `main` would erase contributions. Direct pushes stay allowed, so the manager can commit Ground checkpoints (9.3). Changing protection needs the owner's go. Test a new rule on a scratch branch with the same settings, not on `main`.
 
 - **Only Ground files under `.bracken/`:** fails if any tracked file there isn't one of the three Ground shapes (9.3), or if an agent entry holds a private key. It's the backstop for keys and backup copies if `.gitignore` ever loses its line.
-- **Ground is append-only:** fails if a tracked Ground file was deleted or edited: on a PR, relative to the merge base with `main`; on a push to `main`, relative to what `main` was before the push, so every pushed commit is covered. If there's nothing to compare with (no merge base within the fetch depth, the first push to `main`), it fails rather than passing unchecked. Deleting a finding or a failing piece of evidence would change what the gate concludes.
+- **Ground is append-only:** fails if a tracked Ground file was deleted or edited: on a PR, relative to the merge base with `main`; on a push to `main`, relative to what `main` was before the push, so every pushed commit is covered. If there's nothing to compare with (no merge base within the fetch depth, a pre-push `main` beyond the fetch depth, the first push to `main`), it fails rather than passing unchecked. Deleting a finding or a failing piece of evidence would change what the gate concludes.
 - **Ground opens:** builds the PR's `bracken` and opens the committed Ground with it, which verifies every contribution's encoding, hash, signature and parents.
 - **Vision document matches the Ground:** the latest artifact named `<vision doc>` has exactly the file's contents (section 1).
 - **Token only in the checkout step:** fetch everything a later step needs (including `main` for the append-only check) in the step that has the token, so steps running the PR's code never see it.
@@ -325,7 +330,6 @@ This process is a bridge. As Bracken gains capabilities, the manager proposes re
 | When Bracken has… | Retire… |
 |---|---|
 | Network sync, so CI can contribute to the Ground | CI as a separate system: it becomes a `ci` validator whose evidence policies can count (section 10) |
-| A current-only view (no retracted or superseded claims) | The `grep -v '(retracted)' \| tail -1` reading rules in sections 1, 9.1 and 9.4, and the tag discipline in 4.1 |
 | Network sync between replicas | `scripts/bk`'s shared-directory trick; agents on other machines join the Ground |
 | Notifications or subscriptions (Signal) | Most **send** wake-ups and the triage queries |
 | Ground membership and per-key permissions (Stewards) | The shared identities folder and the "never use another role's identity" honour rule |

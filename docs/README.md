@@ -8,4 +8,4 @@
 | [builder.md](builder.md) | One-page role card for builders |
 | [releases.md](releases.md) | Release stages, the owner's-go list, pinned-binary upgrades, migrations, rollback |
 
-Stale docs move to `archive/`. Knowledge that isn't documentation (decisions, gotchas, tasks, the plan, weekly metrics) lives in the Ground: `scripts/bk log --tag <tag>`.
+Stale docs move to `archive/`. Knowledge that isn't documentation (decisions, gotchas, tasks, the plan, weekly metrics) lives in the Ground: `scripts/bk log --tag <tag> --current`.

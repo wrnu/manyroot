@@ -3,7 +3,7 @@
 //! Every command that reads the graph accepts `--json` so agents can consume
 //! it directly. Writes print the new contribution's full id on stdout.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
@@ -12,9 +12,19 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use manyroot::store::{self, GroundInfo};
-use manyroot::validation::open_conflicts;
+use manyroot::validation::{open_conflicts, open_supersessors};
 use manyroot::*;
 use serde_json::{Value, json};
+
+/// `println!`, through [`write_stdout`]. Shadows the standard macro in this file.
+macro_rules! println {
+    () => {
+        write_stdout(b"\n")
+    };
+    ($($arg:tt)*) => {
+        write_stdout(format!("{}\n", format_args!($($arg)*)).as_bytes())
+    };
+}
 
 /// Directory holding a Bracken workspace's Ground replica.
 const DIR_NAME: &str = ".bracken";
@@ -26,15 +36,12 @@ struct Cli {
     #[arg(long, global = true, env = "BRACKEN_DIR")]
     dir: Option<PathBuf>,
 
+    /// Local identity to sign with. Commands that only read ignore it.
+    #[arg(long = "as", global = true, env = "BRACKEN_AGENT", value_name = "NAME")]
+    agent: Option<String>,
+
     #[command(subcommand)]
     command: Command,
-}
-
-#[derive(Args)]
-struct Author {
-    /// Local identity to sign with.
-    #[arg(long = "as", env = "BRACKEN_AGENT", value_name = "NAME")]
-    agent: String,
 }
 
 #[derive(Args)]
@@ -72,8 +79,9 @@ enum Command {
         statement: String,
         #[arg(long = "tag")]
         tags: Vec<String>,
-        #[command(flatten)]
-        author: Author,
+        /// One of your own claims that this one replaces; records the supersedes relation too. Repeatable.
+        #[arg(long, value_name = "ID")]
+        supersedes: Vec<String>,
     },
     /// Contribute an artifact from a file.
     Artifact {
@@ -83,8 +91,6 @@ enum Command {
         name: Option<String>,
         #[arg(long, default_value = "application/octet-stream")]
         media_type: String,
-        #[command(flatten)]
-        author: Author,
     },
     /// Relate two contributions, e.g. `bracken relate <a> supersedes <b>`.
     Relate {
@@ -93,8 +99,6 @@ enum Command {
         to: String,
         #[arg(long, default_value = "")]
         note: String,
-        #[command(flatten)]
-        author: Author,
     },
     /// Record the outcome of checking a contribution.
     Evidence {
@@ -105,16 +109,12 @@ enum Command {
         method: String,
         #[arg(long, default_value = "")]
         details: String,
-        #[command(flatten)]
-        author: Author,
     },
     /// Withdraw one of your own contributions.
     Retract {
         target: String,
         #[arg(long, default_value = "")]
         reason: String,
-        #[command(flatten)]
-        author: Author,
     },
     /// List contributions in causal order.
     Log {
@@ -125,6 +125,11 @@ enum Command {
         /// Local name or public key.
         #[arg(long)]
         author: Option<String>,
+        /// Only what is current: omit retracted contributions, claims and artifacts their author superseded,
+        /// and relations, evidence and retractions about anything omitted. Another author's supersession is
+        /// shown as a marker instead.
+        #[arg(long)]
+        current: bool,
         #[command(flatten)]
         out: Output,
     },
@@ -205,12 +210,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("joined ground {ground} in {}", dir.display());
             return Ok(exit_for(&report));
         }
-        command => return run_in_store(open_store(cli.dir.as_deref())?, command),
+        command => return run_in_store(open_store(cli.dir.as_deref())?, cli.agent.as_deref(), command),
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_in_store(mut s: Store, command: Command) -> Result<ExitCode> {
+fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<ExitCode> {
     match command {
         Command::Init { .. } | Command::Join { .. } => unreachable!("handled before opening a store"),
         Command::Id(IdCommand::New { name }) => {
@@ -233,38 +238,51 @@ fn run_in_store(mut s: Store, command: Command) -> Result<ExitCode> {
                 }
             }
         }
-        Command::Claim { statement, tags, author } => {
-            let who = s.identity(&author.agent)?;
-            println!("{}", s.contribute(&who, Body::Claim { statement, tags })?);
+        Command::Claim { statement, tags, supersedes } => {
+            let who = signer(&s, agent)?;
+            let names = Names::load(&s)?;
+            let old = supersedes.iter().map(|id| own_claim(&s, &names, &who, id)).collect::<Result<BTreeSet<_>>>()?;
+            let new = s.contribute(&who, Body::Claim { statement, tags })?;
+            let mut written = vec![new];
+            for to in old {
+                let note = String::new();
+                written
+                    .push(s.contribute(&who, Body::Relation { from: new, kind: RelationKind::Supersedes, to, note })?);
+            }
+            for id in written {
+                println!("{id}");
+            }
         }
-        Command::Artifact { file, name, media_type, author } => {
-            let who = s.identity(&author.agent)?;
+        Command::Artifact { file, name, media_type } => {
+            let who = signer(&s, agent)?;
             let content = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             let name = name.unwrap_or_else(|| file.display().to_string());
             println!("{}", s.contribute(&who, Body::Artifact { name, media_type, content })?);
         }
-        Command::Relate { from, kind, to, note, author } => {
-            let who = s.identity(&author.agent)?;
+        Command::Relate { from, kind, to, note } => {
+            let who = signer(&s, agent)?;
             let (from, to) = (resolve(&s, &from)?, resolve(&s, &to)?);
             println!("{}", s.contribute(&who, Body::Relation { from, kind, to, note })?);
         }
-        Command::Evidence { target, verdict, method, details, author } => {
-            let who = s.identity(&author.agent)?;
+        Command::Evidence { target, verdict, method, details } => {
+            let who = signer(&s, agent)?;
             let target = resolve(&s, &target)?;
             println!("{}", s.contribute(&who, Body::Evidence { target, verdict, method, details })?);
         }
-        Command::Retract { target, reason, author } => {
-            let who = s.identity(&author.agent)?;
+        Command::Retract { target, reason } => {
+            let who = signer(&s, agent)?;
             let target = resolve(&s, &target)?;
             println!("{}", s.contribute(&who, Body::Retract { target, reason })?);
         }
-        Command::Log { kind, tag, author, out } => {
+        Command::Log { kind, tag, author, current, out } => {
             let names = Names::load(&s)?;
             let author = author.map(|a| names.resolve(&a)).transpose()?;
             let g = s.graph();
-            let rows: Vec<&Contribution> = g
-                .topo_order()
+            let order = g.topo_order();
+            let view = current.then(|| CurrentView::new(g, &order));
+            let rows: Vec<&Contribution> = order
                 .iter()
+                .filter(|id| view.as_ref().is_none_or(|v| !v.hidden.contains(id)))
                 .map(|id| g.get(id).expect("ordered ids exist"))
                 .filter(|c| kind.is_none_or(|k| c.body().kind() == k))
                 .filter(|c| author.is_none_or(|a| c.author() == a))
@@ -273,10 +291,32 @@ fn run_in_store(mut s: Store, command: Command) -> Result<ExitCode> {
                 })
                 .collect();
             if out.json {
-                print_json(&rows.iter().map(|c| contribution_json(g, &names, c)).collect::<Vec<_>>());
+                let rows: Vec<Value> = rows
+                    .iter()
+                    .map(|c| {
+                        let mut v = contribution_json(g, &names, c);
+                        if let Some(view) = &view {
+                            v["superseded_by_others"] = view
+                                .by_others(&c.id())
+                                .iter()
+                                .map(|s| {
+                                    let a = g.get(s).expect("supersessors exist").author();
+                                    json!({"id": s, "author": a, "author_name": names.0.get(&a)})
+                                })
+                                .collect();
+                        }
+                        v
+                    })
+                    .collect();
+                print_json(&rows);
             } else {
                 for c in rows {
-                    println!("{}", line(g, &names, c));
+                    let mut text = line(g, &names, c);
+                    for by in view.as_ref().map_or(&[][..], |v| v.by_others(&c.id())) {
+                        let author = names.display(&g.get(by).expect("supersessors exist").author());
+                        text.push_str(&format!("  (superseded by {author} {})", by.short()));
+                    }
+                    println!("{text}");
                 }
             }
         }
@@ -301,7 +341,7 @@ fn run_in_store(mut s: Store, command: Command) -> Result<ExitCode> {
             let Body::Artifact { content, .. } = s.graph().get(&id).expect("resolved ids exist").body() else {
                 bail!("{id} is not an artifact");
             };
-            io::stdout().write_all(content)?;
+            write_stdout(content);
         }
         Command::Heads { out } => {
             let names = Names::load(&s)?;
@@ -415,6 +455,68 @@ fn read_bundle(path: &Path) -> Result<(GroundId, Vec<Contribution>)> {
 
 fn resolve(s: &Store, prefix: &str) -> Result<ContributionId> {
     Ok(s.graph().resolve_prefix(prefix)?)
+}
+
+fn signer(s: &Store, agent: Option<&str>) -> Result<Identity> {
+    let name = agent.context("this command signs a contribution: pass --as <NAME> or set BRACKEN_AGENT")?;
+    Ok(s.identity(name)?)
+}
+
+/// Resolves a `--supersedes` target, which must be a claim `who` wrote. Superseding someone
+/// else's claim is refused: they may not see it as replaced, and the old claim's evidence and
+/// relations don't carry over.
+fn own_claim(s: &Store, names: &Names, who: &Identity, prefix: &str) -> Result<ContributionId> {
+    let id = resolve(s, prefix)?;
+    let c = s.graph().get(&id).expect("resolved ids exist");
+    if !matches!(c.body(), Body::Claim { .. }) {
+        bail!("--supersedes {}: it is a {}, not a claim", id.short(), c.body().kind());
+    }
+    if c.author() != who.agent_id() {
+        bail!(
+            "--supersedes {}: it is {}'s claim; you can only supersede your own (contradict or refine it instead)",
+            id.short(),
+            names.display(&c.author())
+        );
+    }
+    Ok(id)
+}
+
+/// What `log --current` shows.
+struct CurrentView {
+    /// Omitted: retracted contributions; claims and artifacts their own author superseded with
+    /// another of their own (a supersession that counts under docs/protocol.md, whose newer side
+    /// is live); and anything that refers to an omitted contribution.
+    hidden: HashSet<ContributionId>,
+    /// Shown but marked: live subjects that only other authors superseded. Someone else can't
+    /// hide your claim, or the relations and evidence about it.
+    others: HashMap<ContributionId, Vec<ContributionId>>,
+}
+
+impl CurrentView {
+    /// `order` is causal, so references are decided before their referrers.
+    fn new(g: &Graph, order: &[ContributionId]) -> CurrentView {
+        let mut view = CurrentView { hidden: HashSet::new(), others: HashMap::new() };
+        for id in order {
+            let c = g.get(id).expect("ordered ids exist");
+            let (own, others): (Vec<_>, Vec<_>) = if c.body().is_subject() {
+                open_supersessors(g, id)
+                    .into_iter()
+                    .partition(|s| g.get(s).expect("supersessors exist").author() == c.author())
+            } else {
+                Default::default()
+            };
+            if g.is_retracted(id) || !own.is_empty() || c.body().references().iter().any(|r| view.hidden.contains(r)) {
+                view.hidden.insert(*id);
+            } else if !others.is_empty() {
+                view.others.insert(*id, others);
+            }
+        }
+        view
+    }
+
+    fn by_others(&self, id: &ContributionId) -> &[ContributionId] {
+        self.others.get(id).map_or(&[], Vec::as_slice)
+    }
 }
 
 fn print_report(report: &ImportReport) {
@@ -596,6 +698,19 @@ fn print_conflicts(g: &Graph, names: &Names, conflicts: &[Conflict], as_json: bo
                 println!("  x {}", describe(b));
             }
         }
+    }
+}
+
+/// Writes to stdout. A reader that stops early (`| head -1`) ends the program quietly and
+/// successfully, where `println!` would panic. Commands finish writing to the Ground before
+/// they print, so stopping here never leaves a write half-done.
+fn write_stdout(bytes: &[u8]) {
+    if let Err(e) = io::stdout().write_all(bytes) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+        eprintln!("bracken: writing to stdout: {e}");
+        std::process::exit(1);
     }
 }
 

@@ -31,7 +31,7 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 ## The Ground
 
 - Always run `scripts/bk … --as <your identity>`.
-- At the start of every task, read `scripts/bk log --tag decision` and `scripts/bk show <task id>`.
+- At the start of every task, read `scripts/bk log --tag decision --current` and `scripts/bk show <task id>`. `--current` leaves out retracted entries and those their own author superseded; one someone else superseded stays, marked.
 - Check a claim with `scripts/bk show <id>` before acting on it. A `note` is a lead, not a fact.
 - Contribute what others would need **as you learn it**, not at the end.
 - Messages carry ids; the content goes in the Ground. No secrets or personal data: contributions are permanent.
@@ -43,7 +43,7 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 | Note, discovery, dead end | claim `--tag note`, related to the task |
 | Question to the manager | claim `--tag question`, related to the task; the answer `refines` it |
 | PR head | claim `--tag pr`: `PR #<n> <branch> @ <full sha>: <title>`, then `relate <pr> implements <task>` |
-| New commit | a new `pr` claim, then `relate <new> supersedes <old>` |
+| New commit | a new `pr` claim with `--supersedes <old>` |
 | Test run | `evidence <pr> pass\|fail --method "<command> @ <sha>" --details "<output>"` |
 | Review finding | claim `--tag finding` (file:line, severity, requirement broken, counterexample), then `relate <finding> contradicts <pr>` |
 | Final report | claim `--tag report`, then `relate <report> implements <task>` |
@@ -55,9 +55,9 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 
 There's no memory folder: what a future agent needs is in the Ground (process section 9.1).
 
-- At task start, read `scripts/bk log --tag gotcha` and `--tag preference` (plus `--tag reference` when relevant). Skip `(retracted)` entries. `scripts/bk show <id>` tells you whether one was superseded or contradicted.
+- At task start, read `scripts/bk log --tag gotcha --current` and `--tag preference --current` (plus `--tag reference --current` when relevant). `scripts/bk show <id>` tells you whether one is contradicted.
 - Contribute a `gotcha` (the trap and the fix), a `preference` (the owner, quoted and dated) or a `reference` (where something outside the repo lives) the moment you learn it.
-- Don't contribute what the code, git log or docs already say, or secrets. To change an entry, contribute a new one that `supersedes` it.
+- Don't contribute what the code, git log or docs already say, or secrets. To change your own entry, contribute the new one with `claim … --supersedes <old>`.
 
 ## Working with other agents
 

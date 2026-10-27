@@ -143,7 +143,18 @@ impl Policy {
 
 /// The exploration layer's conflicts: everything not retracted is in play.
 pub fn open_conflicts(graph: &Graph) -> Vec<Conflict> {
-    conflicts(graph, |id| graph.get(id).is_some_and(|c| c.body().is_subject()) && !graph.is_retracted(id))
+    conflicts(graph, |id| open(graph, id))
+}
+
+/// Live subjects in the exploration layer that supersede `target`. A subject
+/// is current there when it is live and this is empty.
+pub fn open_supersessors(graph: &Graph, target: &ContributionId) -> Vec<ContributionId> {
+    supersessors(graph, target, |id| open(graph, id))
+}
+
+/// Whether `id` is live in the exploration layer: a subject not retracted.
+fn open(graph: &Graph, id: &ContributionId) -> bool {
+    graph.get(id).is_some_and(|c| c.body().is_subject()) && !graph.is_retracted(id)
 }
 
 /// Contributions in `live` that supersede `target`. A supersedes relation

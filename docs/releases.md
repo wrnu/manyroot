@@ -48,6 +48,8 @@ scripts/bk log > /dev/null && echo "new binary opens the Ground"
 
 If the new binary can't open the Ground, reinstall the previous commit's binary (`git worktree add /tmp/prev <old sha>`, then `cargo install --path /tmp/prev/crates/bracken --root .bracken-bin --force`), and treat the merge as a protocol break.
 
+**Upgrade after merging task c3d2a3297a71** (`log --current`, `claim --supersedes`, `--as` accepted everywhere). The docs and skill use these as soon as it merges, but `scripts/bk` runs the pinned binary, so upgrade it right after the merge. Until then the old recipes still apply: to find the current entry, read `scripts/bk log --tag <tag>`, drop the lines marked `(retracted)` and take the last one; to supersede, contribute the claim, then `relate <new> supersedes <old>`; and leave `--as` off read commands.
+
 ## Protocol and storage migrations
 
 Each protocol or storage change adds an entry here: what changed, whether existing Grounds still open, and if not, how to carry them forward. Re-encoding a contribution changes its id, so it has to be signed again, and that needs its author's private key. Without the keys, old contributions stay readable only by a binary that still understands the old format. So a protocol change either keeps reading the old format, or migrates while every key still exists.
