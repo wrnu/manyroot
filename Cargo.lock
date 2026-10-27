@@ -128,7 +128,13 @@ dependencies = [
 name = "bracken-experiment"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bracken-demo",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

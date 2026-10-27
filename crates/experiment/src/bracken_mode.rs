@@ -1,0 +1,728 @@
+//! Mode 3, Bracken semantic contributions (design section 2).
+//!
+//! Each agent's copy and the hub are Bracken replicas of one Ground. Tools run
+//! the real `bracken` binary; every value an agent chooses passes the rules in
+//! [`crate::args`], lands after `--` or inside one `--option=value` argument,
+//! and free text that bracken can read from standard input goes there. An
+//! implementation is an artifact holding the function's definition (and any
+//! helpers named after it) that `implements` the function's spec claim. Only
+//! the setter's claims state the task, its specs and its change requests.
+
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+
+use serde_json::{Value, json};
+
+use crate::args::Args;
+use crate::lang::{Library, parse_module};
+use crate::mode::{Mode, Store, StoreConfig, ToolSpec, is_within};
+use crate::task::{CHANGES, Change, MODULES, SPECS, Version, check, spec_named, task_text};
+
+/// The media type of an implementation artifact.
+pub const MEDIA_TYPE: &str = "text/x-stacklib";
+/// Kinds a `log` may filter on.
+const KINDS: [&str; 5] = ["claim", "artifact", "relation", "evidence", "retraction"];
+/// Relation kinds an agent may record.
+const RELATIONS: [&str; 7] = ["supports", "contradicts", "depends_on", "refines", "supersedes", "implements", "tests"];
+const VERDICTS: [&str; 2] = ["pass", "fail"];
+/// The largest implementation artifact: a module of the most specs any module has, each this size, still fits.
+pub const MAX_ARTIFACT_BYTES: usize = 2000;
+/// How long one sync session may take, in seconds, on either side.
+const SYNC_DEADLINE: u32 = 60;
+/// Bytes one side of a sync session may receive from the other.
+const SYNC_BUDGET: u64 = 32 * 1024 * 1024;
+
+/// The tag the setter puts on a change request's claim.
+pub fn change_tag(change: Change) -> &'static str {
+    match change {
+        Change::ClampOrder => "clamp-order",
+        Change::SignOfZero => "sign-of-zero",
+        Change::NearerTies => "nearer-ties",
+        Change::BetweenExclusive => "between-exclusive",
+        Change::AbsSaturates => "abs-saturates",
+        Change::SpreadCounts => "spread-counts",
+    }
+}
+
+pub struct BrackenMode;
+
+fn tool(name: &'static str, description: &'static str, properties: Value, required: &[&str]) -> ToolSpec {
+    ToolSpec {
+        name,
+        description,
+        input_schema: json!({"type": "object", "properties": properties, "required": required, "additionalProperties": false}),
+    }
+}
+
+impl Mode for BrackenMode {
+    fn name(&self) -> &'static str {
+        "bracken"
+    }
+
+    fn tools(&self) -> Vec<ToolSpec> {
+        let id = json!({"type": "string", "description": "A contribution id: 12 to 64 hex digits"});
+        let text = json!({"type": "string"});
+        vec![
+            tool(
+                "log",
+                "Contributions in your replica, in causal order, as JSON",
+                json!({"kind": {"type": "string", "enum": KINDS}, "tag": text, "current": {"type": "boolean"}}),
+                &[],
+            ),
+            tool("show", "One contribution with its assessment and referrers", json!({"id": id}), &["id"]),
+            tool("heads", "The causal heads of your replica", json!({}), &[]),
+            tool("conflicts", "Open divergences and contradictions", json!({}), &[]),
+            tool(
+                "accepted",
+                "The accepted layer: contributions with enough independent passes",
+                json!({"min_passes": {"type": "integer", "minimum": 1, "maximum": 5}}),
+                &[],
+            ),
+            tool("cat", "An artifact's content", json!({"id": id}), &["id"]),
+            tool(
+                "claim",
+                "Contribute a claim",
+                json!({"statement": text, "tags": {"type": "array", "items": text}, "supersedes": {"type": "array", "items": id}}),
+                &["statement"],
+            ),
+            tool(
+                "artifact",
+                "Contribute an implementation: the definition of one task function, as stacklib text of at most 2000 bytes. It may define helpers, each named starting with the function's name (e.g. `median3lo`), but no other task function. Relate it with `implements` to its spec claim",
+                json!({"function": text, "content": text}),
+                &["function", "content"],
+            ),
+            tool(
+                "relate",
+                "Relate two contributions",
+                json!({"from": id, "kind": {"type": "string", "enum": RELATIONS}, "to": id, "note": text}),
+                &["from", "kind", "to"],
+            ),
+            tool(
+                "evidence",
+                "Record a pass or fail on a contribution",
+                json!({"target": id, "verdict": {"type": "string", "enum": VERDICTS}, "method": text, "details": text}),
+                &["target", "verdict", "method"],
+            ),
+            tool("retract", "Retract one of your contributions", json!({"target": id, "reason": text}), &["target"]),
+            tool(
+                "check",
+                "Run an implementation artifact on the public cases, with calls resolved in your replica's working library",
+                json!({"id": id}),
+                &["id"],
+            ),
+        ]
+    }
+
+    fn open(&self, config: StoreConfig) -> Box<dyn Store> {
+        Box::new(BrackenStore { config, runs: 0, files: 0 })
+    }
+}
+
+/// A command to run: `bracken --dir <replica> <argv>`, with `stdin` if any.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub argv: Vec<String>,
+    pub stdin: Option<Vec<u8>>,
+    /// Free text the store writes to a file of its own before running; the file's path ends `argv`.
+    pub file: Option<String>,
+    /// Whether the output is JSON.
+    pub json: bool,
+}
+
+fn opt(name: &str, value: impl std::fmt::Display) -> String {
+    format!("--{name}={value}")
+}
+
+/// The command for tool `name`, signing as `identity`. Every value from `args`
+/// is checked by its rule (unless the test-only unchecked args are given), and
+/// lands after `--` or inside one `--option=value` argument, never anywhere it
+/// could be read as an option.
+pub fn plan(name: &str, args: &Args, identity: &str) -> Result<Plan, String> {
+    let read = |argv: Vec<String>| Plan { argv, stdin: None, file: None, json: true };
+    let write = |mut head: Vec<String>, tail: Vec<String>| {
+        head.insert(1, opt("as", identity));
+        head.push("--".into());
+        head.extend(tail);
+        Plan { argv: head, stdin: None, file: None, json: false }
+    };
+    let s = |v: &str| v.to_string();
+    Ok(match name {
+        "log" => {
+            let mut argv = vec![s("log"), s("--json")];
+            if let Some(k) = args.choice_opt("kind", &KINDS)? {
+                argv.push(opt("kind", k));
+            }
+            if let Some(t) = args.tag_opt("tag")? {
+                argv.push(opt("tag", t));
+            }
+            if args.bool_opt("current")? {
+                argv.push(s("--current"));
+            }
+            read(argv)
+        }
+        "show" => read(vec![s("show"), s("--json"), s("--"), s(args.id("id")?)]),
+        "heads" => read(vec![s("heads"), s("--json")]),
+        "conflicts" => read(vec![s("conflicts"), s("--json")]),
+        "accepted" => {
+            let n = args.int_opt("min_passes", 1..=5)?.unwrap_or(1);
+            read(vec![s("accepted"), s("--json"), opt("min-passes", n)])
+        }
+        "cat" => Plan { json: false, ..read(vec![s("cat"), s("--"), s(args.id("id")?)]) },
+        "claim" => {
+            let mut head = vec![s("claim")];
+            head.extend(args.tags("tags")?.into_iter().map(|t| opt("tag", t)));
+            head.extend(args.ids("supersedes")?.into_iter().map(|i| opt("supersedes", i)));
+            write(head, vec![s(args.text("statement")?)])
+        }
+        "artifact" => {
+            let function = args.spec_name("function")?;
+            let content = args.text("content")?;
+            let head = vec![s("artifact"), opt("name", function), opt("media-type", MEDIA_TYPE)];
+            Plan { file: Some(s(content)), ..write(head, vec![]) }
+        }
+        "relate" => {
+            let head = vec![s("relate"), opt("note", args.text_opt("note")?)];
+            write(head, vec![s(args.id("from")?), s(args.choice("kind", &RELATIONS)?), s(args.id("to")?)])
+        }
+        "evidence" => {
+            let head = vec![s("evidence"), opt("method", args.text("method")?), s("--details-file=-")];
+            let details = args.text_opt("details")?.as_bytes().to_vec();
+            let plan = write(head, vec![s(args.id("target")?), s(args.choice("verdict", &VERDICTS)?)]);
+            Plan { stdin: Some(details), ..plan }
+        }
+        "retract" => write(vec![s("retract"), opt("reason", args.text_opt("reason")?)], vec![s(args.id("target")?)]),
+        other => return Err(format!("no tool {}", crate::args::short(other))),
+    })
+}
+
+/// The arguments each tool accepts.
+fn allowed(name: &str) -> &'static [&'static str] {
+    match name {
+        "log" => &["kind", "tag", "current"],
+        "show" | "cat" | "check" => &["id"],
+        "accepted" => &["min_passes"],
+        "claim" => &["statement", "tags", "supersedes"],
+        "artifact" => &["function", "content"],
+        "relate" => &["from", "kind", "to", "note"],
+        "evidence" => &["target", "verdict", "method", "details"],
+        "retract" => &["target", "reason"],
+        _ => &[],
+    }
+}
+
+pub struct BrackenStore {
+    config: StoreConfig,
+    /// bracken processes started, for tests that show a refused call starts none.
+    pub runs: u64,
+    files: u64,
+}
+
+impl BrackenStore {
+    fn replica(&self) -> PathBuf {
+        self.config.dir.join(".bracken")
+    }
+
+    /// Runs `bracken --dir <own replica> <argv>` in the store's own directory, with an empty environment.
+    fn run(&mut self, argv: &[String], stdin: Option<&[u8]>) -> Result<Vec<u8>, String> {
+        self.runs += 1;
+        let mut child = Command::new(&self.config.bracken)
+            .arg("--dir")
+            .arg(self.replica())
+            .args(argv)
+            .env_clear()
+            .current_dir(&self.config.dir)
+            .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("starting bracken: {e}"))?;
+        if let (Some(bytes), Some(mut pipe)) = (stdin, child.stdin.take()) {
+            pipe.write_all(bytes).map_err(|e| format!("writing to bracken: {e}"))?;
+        }
+        let out = child.wait_with_output().map_err(|e| format!("running bracken: {e}"))?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            Err(format!("bracken {}: {}", argv.first().map_or("", String::as_str), crate::args::short(err.trim())))
+        }
+    }
+
+    fn json(&mut self, argv: &[&str]) -> Result<Value, String> {
+        let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
+        let out = self.run(&argv, None)?;
+        serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))
+    }
+
+    fn write(&mut self, argv: Vec<String>) -> Result<String, String> {
+        let out = self.run(&argv, None)?;
+        Ok(String::from_utf8_lossy(&out).lines().next().unwrap_or_default().trim().to_string())
+    }
+
+    /// A file of the store's own for `content`, under `files/`.
+    fn own_file(&mut self, content: &str) -> Result<PathBuf, String> {
+        let dir = self.config.dir.join("files");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        self.files += 1;
+        let path = dir.join(format!("{}.stk", self.files));
+        if !is_within(&path, &self.config.dir) {
+            return Err("refusing a file outside the store".into());
+        }
+        std::fs::write(&path, content).map_err(|e| format!("writing {}: {e}", path.display()))?;
+        Ok(path)
+    }
+
+    fn state(&mut self) -> Result<Snapshot, String> {
+        let current = self.json(&["log", "--json", "--current"])?;
+        Snapshot::new(&current, &self.saved("setter.txt")?)
+    }
+
+    /// A key this store saved at setup.
+    fn saved(&self, file: &str) -> Result<String, String> {
+        std::fs::read_to_string(self.config.dir.join(file))
+            .map(|k| k.trim().to_string())
+            .map_err(|e| format!("no {file}: {e}"))
+    }
+
+    fn save(&self, file: &str, key: &str) -> Result<(), String> {
+        std::fs::write(self.config.dir.join(file), key).map_err(|e| format!("writing {file}: {e}"))
+    }
+
+    /// A new identity for this store; its public key, saved as `key.txt`.
+    fn new_identity(&mut self) -> Result<String, String> {
+        let key = self.run(&["id".into(), "new".into(), "--".into(), self.config.identity.clone()], None)?;
+        let key = String::from_utf8_lossy(&key).trim().to_string();
+        self.save("key.txt", &key)?;
+        Ok(key)
+    }
+
+    /// The setter states the task: a task claim, and one spec claim per function refining it.
+    fn setup_hub(&mut self) -> Result<Value, String> {
+        self.run(&["init".into(), "--name=hub".into()], None)?;
+        let key = self.new_identity()?;
+        self.save("setter.txt", &key)?;
+        let me = self.config.identity.clone();
+        let task = self.write(vec![
+            "claim".into(),
+            opt("as", &me),
+            "--tag=task".into(),
+            "--".into(),
+            task_text(Version::ORIGINAL),
+        ])?;
+        for s in SPECS {
+            let statement = format!("Implement {}.", s.description);
+            let spec = self.write(vec![
+                "claim".into(),
+                opt("as", &me),
+                "--tag=spec".into(),
+                opt("tag", s.name),
+                "--".into(),
+                statement,
+            ])?;
+            self.write(vec![
+                "relate".into(),
+                opt("as", &me),
+                "--note=".into(),
+                "--".into(),
+                spec,
+                "refines".into(),
+                task.clone(),
+            ])?;
+        }
+        Ok(json!({ "task": task }))
+    }
+}
+
+impl Store for BrackenStore {
+    fn setup(&mut self, hub_export: Option<&[u8]>) -> Result<Value, String> {
+        let Some(bundle) = hub_export else { return self.setup_hub() };
+        let path = self.config.dir.join("join.mrb");
+        std::fs::write(&path, bundle).map_err(|e| format!("writing the bundle: {e}"))?;
+        self.run(&["join".into(), "--".into(), path.to_string_lossy().into_owned()], None)?;
+        // Before any agent has written, the hub's export holds only the setter's work: its task claim names the setter.
+        let log = self.json(&["log", "--json", "--tag=task"])?;
+        let setter = match log.as_array().map(Vec::as_slice) {
+            Some([task]) => task["author"].as_str().unwrap_or_default().to_string(),
+            _ => return Err("the hub's export must hold exactly one task claim".into()),
+        };
+        self.save("setter.txt", &setter)?;
+        let key = self.new_identity()?;
+        Ok(json!({ "key": key }))
+    }
+
+    fn export(&mut self) -> Result<Vec<u8>, String> {
+        self.run(&["export".into(), "-".into()], None)
+    }
+
+    fn import(&mut self, bytes: &[u8]) -> Result<Value, String> {
+        let out = self.run(&["import".into(), "-".into()], Some(bytes))?;
+        Ok(json!({ "imported": String::from_utf8_lossy(&out).trim() }))
+    }
+
+    fn tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        if name == "check" {
+            let id = Args::new(args, allowed("check"))?.id("id")?.to_string();
+            return self.check(&id);
+        }
+        if !self.tools_known(name) {
+            return Err(format!("no tool {}", crate::args::short(name)));
+        }
+        let args = Args::new(args, allowed(name))?;
+        if name == "artifact"
+            && let Some(problem) = artifact_problem(args.spec_name("function")?, args.text("content")?)
+        {
+            return Err(problem);
+        }
+        let plan = plan(name, &args, &self.config.identity)?;
+        self.execute(plan)
+    }
+
+    fn sync_client(&mut self, socket: &Path, relay: &Path) -> Result<Value, String> {
+        let mut argv = vec!["sync".into(), opt("deadline", SYNC_DEADLINE), opt("budget", SYNC_BUDGET), "--exec".into()];
+        argv.extend([relay.to_string_lossy().into_owned(), "shim".into(), "--socket".into()]);
+        argv.push(socket.to_string_lossy().into_owned());
+        let out = self.run(&argv, None)?;
+        Ok(json!({ "synced": crate::args::short(String::from_utf8_lossy(&out).trim()) }))
+    }
+
+    fn sync_server(&mut self, socket: &Path, peers: &[String]) -> Result<Value, String> {
+        let allow = self.config.dir.join("allow.txt");
+        std::fs::write(&allow, peers.join("\n") + "\n").map_err(|e| format!("writing the allow list: {e}"))?;
+        let stream = std::os::unix::net::UnixStream::connect(socket)
+            .map_err(|e| format!("connecting to {}: {e}", socket.display()))?;
+        self.runs += 1;
+        let mut child = Command::new(&self.config.bracken)
+            .arg("--dir")
+            .arg(self.replica())
+            .args(["serve", "--stdio"])
+            .arg(format!("--allow={}", allow.display()))
+            .arg(format!("--first-seen={}", self.config.dir.join("first-seen.jsonl").display()))
+            .args([opt("deadline", SYNC_DEADLINE), opt("budget", SYNC_BUDGET)])
+            .env_clear()
+            .current_dir(&self.config.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("starting bracken: {e}"))?;
+        let (mut to_bracken, mut from_bracken) =
+            (child.stdin.take().ok_or("no bracken stdin")?, child.stdout.take().ok_or("no bracken stdout")?);
+        let mut up = stream.try_clone().map_err(|e| e.to_string())?;
+        let mut down = stream;
+        let relayed = std::thread::scope(|scope| {
+            let incoming = scope.spawn(move || crate::shim::relay(&mut up, &mut to_bracken));
+            let outgoing = crate::shim::relay(&mut from_bracken, &mut down);
+            let _ = down.shutdown(std::net::Shutdown::Both);
+            let incoming = incoming.join().unwrap_or_else(|_| Err("the relay panicked".into()));
+            outgoing.and(incoming)
+        });
+        let out = child.wait_with_output().map_err(|e| format!("running bracken: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(format!("bracken serve: {}", crate::args::short(err.trim())));
+        }
+        relayed?;
+        Ok(json!({ "served": true }))
+    }
+
+    fn release_changes(&mut self) -> Result<Value, String> {
+        let state = self.state()?;
+        let me = self.config.identity.clone();
+        let task = state.tagged("task").first().map(|e| e.id.clone()).ok_or("no task claim")?;
+        let mut released = Vec::new();
+        for c in CHANGES {
+            let old = state.spec_claim(c.target).ok_or_else(|| format!("no spec claim for {}", c.target))?;
+            self.write(vec![
+                "claim".into(),
+                opt("as", &me),
+                "--tag=change".into(),
+                opt("tag", change_tag(c.change)),
+                "--".into(),
+                format!("Change request: {}", c.text),
+            ])?;
+            let spec = self.write(vec![
+                "claim".into(),
+                opt("as", &me),
+                "--tag=spec".into(),
+                opt("tag", c.target),
+                opt("supersedes", &old),
+                "--".into(),
+                format!("Implement {}.", c.description),
+            ])?;
+            self.write(vec![
+                "relate".into(),
+                opt("as", &me),
+                "--note=".into(),
+                "--".into(),
+                spec,
+                "refines".into(),
+                task.clone(),
+            ])?;
+            released.push(change_tag(c.change));
+        }
+        Ok(json!({ "released": released }))
+    }
+
+    fn integrated(&mut self) -> Result<Vec<(String, String)>, String> {
+        let state = self.state()?;
+        Ok(modules_of(&state.integrated()))
+    }
+}
+
+impl BrackenStore {
+    fn tools_known(&self, name: &str) -> bool {
+        BrackenMode.tools().iter().any(|t| t.name == name)
+    }
+
+    fn execute(&mut self, mut plan: Plan) -> Result<Value, String> {
+        if let Some(content) = plan.file.take() {
+            let path = self.own_file(&content)?;
+            plan.argv.push(path.to_string_lossy().into_owned());
+        }
+        let out = self.run(&plan.argv, plan.stdin.as_deref())?;
+        if plan.json {
+            serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))
+        } else {
+            let text = String::from_utf8_lossy(&out).into_owned();
+            Ok(json!({ "output": text }))
+        }
+    }
+
+    /// The public check of artifact `id`, against the working library of this replica.
+    fn check(&mut self, id: &str) -> Result<Value, String> {
+        let state = self.state()?;
+        let artifact = state.find(id).ok_or("no such artifact in your replica")?;
+        if artifact.kind != "artifact" {
+            return Err("check takes an artifact".into());
+        }
+        let function = artifact.body["name"].as_str().unwrap_or_default().to_string();
+        let spec = spec_named(&function).ok_or("the artifact doesn't name a task function")?;
+        let text = artifact.body["text"].as_str().unwrap_or_default().to_string();
+        if let Some(problem) = artifact_problem(spec.name, &text) {
+            return Ok(json!({ "function": spec.name, "ok": false, "details": problem }));
+        }
+        let me = self.saved("key.txt")?;
+        let mut programs = state.working(&me);
+        programs.insert(spec.name, text);
+        let modules = modules_of(&programs);
+        let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
+        let result = check(&library, spec.name, state.version())?;
+        Ok(json!({ "function": spec.name, "ok": result.ok(), "details": result.details() }))
+    }
+}
+
+/// Programs by function, as artifact texts.
+pub type Programs = BTreeMap<&'static str, String>;
+
+/// Module texts for `programs`: each artifact's text in its function's module.
+pub fn modules_of(programs: &Programs) -> Vec<(String, String)> {
+    MODULES
+        .iter()
+        .map(|&m| {
+            let text: String = SPECS
+                .iter()
+                .filter(|s| s.module == m)
+                .filter_map(|s| programs.get(s.name))
+                .map(|t| if t.ends_with('\n') { t.clone() } else { format!("{t}\n") })
+                .collect();
+            (m.to_string(), text)
+        })
+        .collect()
+}
+
+/// Why `text` can't implement `function`, if it can't: it must parse alone,
+/// fit [`MAX_ARTIFACT_BYTES`], define `function` once, and name every helper
+/// starting with `function` (no spec name starts another, so a helper is never
+/// a task function and never collides with another function's helpers).
+pub fn artifact_problem(function: &str, text: &str) -> Option<String> {
+    if text.len() > MAX_ARTIFACT_BYTES {
+        return Some(format!("an implementation holds at most {MAX_ARTIFACT_BYTES} bytes, not {}", text.len()));
+    }
+    let defs = match parse_module("artifact", text) {
+        Ok(defs) => defs,
+        Err(e) => return Some(format!("it doesn't parse: {e}")),
+    };
+    let mut names = std::collections::BTreeSet::new();
+    for d in &defs {
+        if !names.insert(d.name.as_str()) {
+            return Some(format!("`{}` is defined more than once", d.name));
+        }
+        if d.name != function && (spec_named(&d.name).is_some() || !d.name.starts_with(function)) {
+            return Some(format!(
+                "helper `{}` must be named starting with `{function}`, and not be a task function",
+                d.name
+            ));
+        }
+    }
+    (!names.contains(function)).then(|| format!("it doesn't define `{function}`"))
+}
+
+/// One row of `bracken log --json`.
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub id: String,
+    pub kind: String,
+    /// The author's public key.
+    pub author: String,
+    pub body: Value,
+    /// Position in causal order.
+    pub index: usize,
+}
+
+impl Entry {
+    fn tags(&self) -> Vec<&str> {
+        self.body["tags"].as_array().map(|t| t.iter().filter_map(Value::as_str).collect()).unwrap_or_default()
+    }
+}
+
+/// What a replica holds that the materializer and the check need.
+pub struct Snapshot {
+    /// `log --current`, in causal order: nothing retracted, nothing its own author superseded.
+    current: Vec<Entry>,
+    /// The setter's public key: only its claims state the task, the specs and the change requests.
+    setter: String,
+    /// For each target id, each validator's latest current verdict.
+    verdicts: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+/// One implementation of a current spec.
+struct Implementation<'a> {
+    spec: &'static str,
+    entry: &'a Entry,
+}
+
+impl Snapshot {
+    pub fn new(current: &Value, setter: &str) -> Result<Snapshot, String> {
+        let rows = current.as_array().ok_or("log --json is not a list")?;
+        let current: Vec<Entry> = rows
+            .iter()
+            .enumerate()
+            .map(|(index, r)| Entry {
+                id: r["id"].as_str().unwrap_or_default().to_string(),
+                kind: r["kind"].as_str().unwrap_or_default().to_string(),
+                author: r["author"].as_str().unwrap_or_default().to_string(),
+                body: r["body"].clone(),
+                index,
+            })
+            .collect();
+        let mut verdicts: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for e in current.iter().filter(|e| e.kind == "evidence") {
+            let (Some(target), Some(verdict)) = (e.body["target"].as_str(), e.body["verdict"].as_str()) else {
+                continue;
+            };
+            // Causal order: a later verdict by the same validator replaces its earlier one.
+            verdicts.entry(target.to_string()).or_default().insert(e.author.clone(), verdict.to_string());
+        }
+        Ok(Snapshot { current, setter: setter.to_string(), verdicts })
+    }
+
+    /// The setter's current claims tagged `tag`.
+    fn tagged(&self, tag: &str) -> Vec<&Entry> {
+        self.current
+            .iter()
+            .filter(|e| e.kind == "claim" && e.author == self.setter && e.tags().contains(&tag))
+            .collect()
+    }
+
+    /// The current spec claim for `function`.
+    fn spec_claim(&self, function: &str) -> Option<String> {
+        self.tagged("spec").into_iter().rev().find(|e| e.tags().contains(&function)).map(|e| e.id.clone())
+    }
+
+    fn find(&self, id: &str) -> Option<&Entry> {
+        let mut matches = self.current.iter().filter(|e| e.id.starts_with(id));
+        let first = matches.next()?;
+        if matches.next().is_some() { None } else { Some(first) }
+    }
+
+    /// The change requests this replica has seen.
+    pub fn version(&self) -> Version {
+        let tags: Vec<&str> = self.tagged("change").iter().flat_map(|e| e.tags()).collect();
+        CHANGES.iter().filter(|c| tags.contains(&change_tag(c.change))).fold(Version::ORIGINAL, |v, c| v.with(c.change))
+    }
+
+    /// Current artifacts that implement a current spec, related by their own
+    /// author, and hold that function's definition by the artifact rules.
+    fn implementations(&self) -> Vec<Implementation<'_>> {
+        let specs: BTreeMap<String, &'static str> =
+            SPECS.iter().filter_map(|s| self.spec_claim(s.name).map(|id| (id, s.name))).collect();
+        let by_id: BTreeMap<&str, &Entry> = self.current.iter().map(|e| (e.id.as_str(), e)).collect();
+        let mut out = Vec::new();
+        for r in self.current.iter().filter(|e| e.kind == "relation" && e.body["kind"] == "implements") {
+            let (Some(from), Some(to)) = (r.body["from"].as_str(), r.body["to"].as_str()) else { continue };
+            let (Some(artifact), Some(&spec)) = (by_id.get(from), specs.get(to)) else { continue };
+            if artifact.kind == "artifact"
+                && artifact.author == r.author
+                && artifact.body["name"] == spec
+                && artifact_problem(spec, artifact.body["text"].as_str().unwrap_or_default()).is_none()
+                && !out.iter().any(|i: &Implementation| i.entry.id == artifact.id)
+            {
+                out.push(Implementation { spec, entry: artifact });
+            }
+        }
+        out
+    }
+
+    /// Decision `5e8df6996a2e`: the independent passes on `entry`, counting
+    /// each validator once (its latest current verdict) and never the author;
+    /// none when there is no pass or a counted fail.
+    fn passes(&self, entry: &Entry) -> Option<usize> {
+        let verdicts = self.verdicts.get(&entry.id)?;
+        let counted = || verdicts.iter().filter(|(validator, _)| **validator != entry.author).map(|(_, v)| v.as_str());
+        if counted().any(|v| v != "pass") {
+            return None;
+        }
+        Some(counted().count()).filter(|&n| n > 0)
+    }
+
+    /// The fixed rule (decision `b29d5db02da8` point 7, counted per
+    /// `5e8df6996a2e`): for each current spec, the current implementations
+    /// with at least one independent pass and no counted fail; the one with
+    /// the most passes, then the earliest in causal order. None: missing.
+    fn pick(&self) -> BTreeMap<&'static str, &Entry> {
+        let mut best: BTreeMap<&'static str, (usize, usize, &Entry)> = BTreeMap::new();
+        for i in self.implementations() {
+            let Some(passes) = self.passes(i.entry) else { continue };
+            let better = match best.get(i.spec) {
+                None => true,
+                Some(&(p, index, _)) => passes > p || (passes == p && i.entry.index < index),
+            };
+            if better {
+                best.insert(i.spec, (passes, i.entry.index, i.entry));
+            }
+        }
+        best.into_iter().map(|(s, (_, _, e))| (s, e)).collect()
+    }
+
+    /// The integrated library: the fixed rule's pick, and nothing else.
+    pub fn integrated(&self) -> Programs {
+        self.pick().into_iter().map(|(s, e)| (s, e.body["text"].as_str().unwrap_or_default().to_string())).collect()
+    }
+
+    /// The working library `check` resolves calls in (answer `88ae128c5fcd`):
+    /// for each spec, the fixed rule's pick; else the latest current
+    /// implementation by `me` (a public key); else the latest current one by anyone.
+    pub fn working(&self, me: &str) -> Programs {
+        let picked = self.pick();
+        let implementations = self.implementations();
+        let mut out = Programs::new();
+        for s in SPECS {
+            let latest = |mine: bool| {
+                implementations
+                    .iter()
+                    .filter(|i| i.spec == s.name && (!mine || i.entry.author == me))
+                    .max_by_key(|i| i.entry.index)
+                    .map(|i| i.entry)
+            };
+            if let Some(e) = picked.get(s.name).copied().or_else(|| latest(true)).or_else(|| latest(false)) {
+                out.insert(s.name, e.body["text"].as_str().unwrap_or_default().to_string());
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests;

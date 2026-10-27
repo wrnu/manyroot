@@ -7,5 +7,17 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[[bin]]
+name = "bracken-experiment"
+path = "src/main.rs"
+
 [dependencies]
 bracken-demo = { path = "../demo" }
+blake3.workspace = true
+clap.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

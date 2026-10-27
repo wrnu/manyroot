@@ -205,22 +205,56 @@ CRDT mode is in the first run (decision 3, section 8).
 ### Mode 3: Bracken semantic contributions
 
 - **Hub:** a Bracken replica held by the harness. Each agent has its own
-  replica and identity, as in the demo; sync carries bundles both ways
-  (`bracken export -` on one side, `bracken import -` on the other, as the
-  demo does with bundle files), serialized by the harness.
+  replica and identity, as in the demo. The hub's first export seeds each
+  replica; after that, each sync is one Bracken sync session between the
+  agent's replica and the hub, relayed through the driver, so only what each
+  side is missing moves (section 3). The harness serializes syncs.
 - **Tools:** the read commands (`log`, `show`, `heads`, `conflicts`,
   `accepted`, `cat`), `claim`, `artifact`, `relate`, `evidence`, `retract`,
   each run through the real `bracken` binary with `--json`, plus `check` on
-  an artifact. An implementation is an artifact holding one definition that
-  `implements` its spec, as in the demo.
+  an artifact. An implementation is an artifact named for its function,
+  which its own author relates as `implements` the function's current spec
+  claim. Its text must parse on its own, define the function once, and fit
+  2000 bytes, so a module with every function at that size still fits the
+  language's 16 KiB module limit and no artifact can break the others in its
+  module (finding `bc4a1eb3bdcd`). It may define helpers, each named
+  starting with the function's name (`median3lo`), and no other task
+  function. No spec name starts another, so a helper never stands in for a
+  task function and never collides with another function's helpers (finding
+  `624fb21cfacd`). The `artifact` tool refuses text that breaks these rules,
+  and the materializer ignores it.
+- **Only the task setter states the task.** The task claim, the spec claims
+  and the change-request claims count only when the setter's key signed
+  them. Each replica learns that key from the hub's first export, which
+  holds only the setter's work. A claim tagged `spec` or `change` by an agent
+  is just a claim (finding `29c4dbee556d`).
+- **`check` on an artifact** resolves calls in the agent's working library
+  (answer `88ae128c5fcd`, part of the pre-registered plan): the artifact
+  under check for its own function; for every other function, the fixed
+  rule's pick below if there is one, else the agent's own latest current
+  implementation, else the latest current one by anyone. So, as in the other
+  modes, an agent checks against what its copy holds, accepted or not.
 - **Change requests** are new spec claims by the task setter that supersede
-  the old ones (the setter wrote them, so the supersession counts).
+  the old ones (the setter wrote them, so the supersession counts), each with
+  a claim tagged `change` and the request's own tag stating it. An
+  implementation of a superseded spec no longer counts; a copy learns of a
+  change when it syncs, and checks against the changed contracts from then
+  on.
 - **Integrated state:** the accepted layer at the hub, materialized into the
   four module files by a fixed rule: for each current spec, the current
-  (not superseded) implementations that pass `bracken accepted --min-passes
-  1` (an author's evidence never counts); if there are several, the one with
+  (not retracted or superseded) implementations with at least one
+  independent pass and no counted fail; if there are several, the one with
   the most passes, then the earliest in causal order. If none, the function
-  is missing (decision 7, section 8).
+  is missing (decision 7, section 8). Verdicts count as decision
+  `5e8df6996a2e` says: each validator counts at most once per
+  implementation, by its latest current verdict, and the implementation's
+  author never counts. Passes are counted by validator, not by evidence
+  contribution, so one validator recording the same pass again gains
+  nothing (finding `40f448eb0951`). So one agent's fail keeps an
+  implementation out, as in Bracken. That is Bracken's real semantics, and
+  it is what the experiment tests. How often it blocks correct code is
+  measured: a counted fail on an implementation the hidden grader scores
+  correct is a **semantic-conflict event** (section 4).
 
 Bracken mode doesn't use the demo's ring or gossip topologies. Git and CRDT
 editors both sync through a central server in practice, and giving Bracken a
@@ -249,14 +283,15 @@ part, and each gets only what its job needs:
 | **Driver** (`experiment run`) | The owner, unsandboxed | Its plan; the routing entries of the owner's `~/.claude/settings.json`; the bytes the workers send it (sync data, the integrated files to grade) | The run directory, the event log, transcripts, the report | Only the LLM proxy, through its own local forwarding proxy | Yes, in memory only |
 | **Claude Code**, one per agent turn | The owner, under the **agent** profile | The Claude Code installation and system libraries; its own config directory; its read-only turn configuration | Its own config directory (`HOME`, `CLAUDE_CONFIG_DIR`, `TMPDIR`) | The driver's local proxy port, and the shim's socket | Yes: it needs it to make requests |
 | **MCP shim**, started by Claude Code | The owner, under the agent profile (inherited), with an empty environment | Its own binary | Nothing | The driver's socket for this agent | No |
-| **Tool worker**, one per agent | The owner, under the **tools** profile, started by the driver | Its agent's working copy; the `git` and `bracken` binaries | Its agent's working copy | The driver's socket for this agent | No |
-| **Hub worker**, one per mode | The owner, under the **hub** profile, started by the driver | The mode's hub; the `git` and `bracken` binaries | The mode's hub | The driver's socket | No |
+| **Tool worker**, one per agent | The owner, under the **tools** profile, started by the driver | Its agent's working copy; the `git` and `bracken` binaries | Its agent's working copy | Only its pipes to the driver | No |
+| **Hub worker**, one per mode | The owner, under the **hub** profile, started by the driver | The mode's hub; the `git` and `bracken` binaries | The mode's hub | Only its pipes to the driver | No |
 
 How a tool call travels: the model asks Claude Code for a tool; Claude Code
 sends it to the MCP shim over stdio; the shim, which does nothing else,
-forwards the bytes to the driver over a Unix socket; the driver logs the
-request, passes it to that agent's tool worker, logs the reply and returns
-it. Sync goes through the driver too, one hub at a time (Moving data,
+forwards the bytes to the driver over a Unix socket (one per agent, mode
+0600, open only during that agent's turn); the driver logs the request,
+passes it to that agent's tool worker over the worker's standard input (one
+JSON line each way, bytes hex-encoded), logs the reply and returns it. Sync goes through the driver too, one hub at a time (Moving data,
 below). So:
 
 - **Only the driver writes the event log**, and it records what actually
@@ -283,11 +318,10 @@ below). So:
 
 ### Moving data between copies and hubs
 
-No worker ever opens another's store. Data moves as bytes over the driver's
-sockets: one side writes a bundle or a message to its standard output, the
-driver logs its size and hash and hands it on, and the other side reads it
-from its standard input (or from a file it writes in its own store) and
-applies it. So each worker writes only its own store, and none needs a
+No worker ever opens another's store. Data moves as bytes through the
+driver: one side writes a bundle or a message, the driver logs its size and
+hash and hands it on, and the other side reads it from its standard input,
+a socket, or a file it writes in its own store, and applies it. So each worker writes only its own store, and none needs a
 shell: git's local transport, which starts `git-upload-pack` through
 `/bin/sh` and then `/bin/bash` on macOS (finding `6e3f4df3e7ce`), is never
 used.
@@ -296,12 +330,16 @@ used.
 |---|---|---|
 | Git | The tool worker runs `git bundle create - <validated branches>` in its copy; the hub worker writes the bytes to a file in the hub and runs `git fetch` from it into that agent's namespace (`refs/agents/<agent>/<branch>`); a PR merge is then a merge inside the hub | The hub worker runs `git bundle create - main <PR branches>` in the hub; the tool worker writes the bytes to a file in its copy and runs `git fetch` from it into `refs/remotes/hub/*` |
 | CRDT | The tool worker produces an Automerge sync message from its document's sync state; the hub worker applies it | The reverse, repeated until neither side has anything to send |
-| Bracken | `bracken export -` in the agent's replica; `bracken import -` in the hub | `bracken export -` in the hub; `bracken import -` in the agent's replica |
+| Bracken | One session, both halves: the tool worker runs `bracken sync --exec <bracken-experiment> shim --socket <driver socket>` in its replica, and the hub worker runs `bracken serve --stdio --allow <the agents' keys>` in the hub, relaying its standard input and output to its own driver socket. The driver relays between the two sockets, counting and hashing each direction. Heads and offers go first, so only what each side is missing moves. Both sides cap the session's time and bytes (60 s, 32 MiB) | (same session) |
 
 Every import validates what it receives as it does any bundle (Bracken
 checks signatures and parents; git checks objects), and a bundle that fails
 is refused and logged, never retried as a different command. The demo's
-`bracken sync <dir>`, which writes both replicas, isn't used.
+`bracken sync <dir>`, which writes both replicas, isn't used. A sync that
+fails, like any failure of one agent's (a dropped connection, an MCP
+message over 256 KiB, its backend's error), is logged as that agent's
+`turn_error`, with its size and digest only, and ends only that turn. The
+run goes on (finding `2b37d97ab9c6`).
 
 ### Starting Claude Code
 
@@ -376,7 +414,7 @@ it doesn't match:
 | Relation kinds, choices | From a fixed list |
 | Tags | `^[a-z][a-z0-9-]{0,31}$`, at most 8 |
 | Agent names | From the roster |
-| Free text (file contents, statements, notes, comments, commit messages, PR titles and bodies, evidence details, retraction reasons) | At most 16 KiB, valid UTF-8, no NUL. Never in a place where it could be read as an option: on standard input or in a file the worker writes in its own copy (`git commit -F -`, `bracken evidence --details-file -`, `bracken artifact <the worker's file>`); where a command takes it only as an argument (a Bracken claim's statement, a relation's note), as the one argument after `--` |
+| Free text (file contents, statements, notes, comments, commit messages, PR titles and bodies, evidence details, retraction reasons) | At most 16 KiB, valid UTF-8, no NUL. Never in a place where it could be read as an option: on standard input or in a file the worker writes in its own copy (`git commit -F -`, `bracken evidence --details-file -`, `bracken artifact <the worker's file>`); where a command takes it only as an argument (a Bracken claim's statement), as the one argument after `--`, and where only as an option's value (a relation's note, evidence's method, a retraction's reason), inside one `--option=value` argument, which can't be split or read as another option |
 
 And for every command the workers run:
 
@@ -548,9 +586,9 @@ agent can write to:
 |---|---|---|
 | Validated improvements per million tokens | An **improvement** is a change to the integrated state after which a function passes the hidden grader in library that didn't before (net: a change that makes one fail counts −1). Divided by the mode's total tokens (input, cache reads, cache writes and output) in millions. Also reported per million output tokens | Snapshots, token accounting |
 | Duplicated work | A **delivery** is a write of a function's definition that differs from the then-integrated one. A delivery is **duplicated** if, when the agent made it, another agent's correct (by the grader) version of that function had already reached the hub (**visible**), or another agent delivered one after this agent last read that function's state (**blind**), as in the demo. Reported as counts and as the share of output tokens spent in the turns that made them | Event log, snapshots |
-| Integration and validation overhead | The share of tokens and of wall time spent on calls whose tools integrate (sync, fetch, merge, rebase, conflict editing, PR operations, Bracken export and import) or validate (`check`, reviews, evidence), and the count of failed integrations (merge conflicts, PRs closed unmerged, failed CI) | Token accounting, event log |
+| Integration and validation overhead | The share of tokens and of wall time spent on calls whose tools integrate (sync, fetch, merge, rebase, conflict editing, PR operations, Bracken sync sessions) or validate (`check`, reviews, evidence), and the count of failed integrations (merge conflicts, PRs closed unmerged, failed CI) | Token accounting, event log |
 | Time until a useful discovery is available to others | A **useful discovery** is a delivery that passes the grader standalone, or a bug report naming an input that really fails (section below). **Available**: seconds and other agents' turns from its making until it reached the hub where others could read it (pushed branch, synced edit, synced contribution). **Integrated**: until it was in the integrated state. **Taken up**: until another agent first read it | Event log |
-| Semantically incompatible contributions | Changes to the integrated state after which a function the change didn't touch still passes standalone but no longer passes in library: each change was fine alone, together they're wrong. Also counted: changes after which a module no longer parses (mostly interleaved CRDT edits) | Snapshots |
+| Semantically incompatible contributions | Changes to the integrated state after which a function the change didn't touch still passes standalone but no longer passes in library: each change was fine alone, together they're wrong. Also counted: changes after which a module no longer parses (mostly interleaved CRDT edits), and in Bracken mode the semantic-conflict events, counted fails on implementations the hidden grader scores correct (decision `5e8df6996a2e`) | Snapshots, the Ground |
 | Quality of the final artifact | The final integrated library: functions correct in library under the latest specs (all change requests applied), out of about 30, and the number that are present but wrong | Final snapshot |
 
 Bug reports are found in what agents write (PR comments, CRDT notes,
@@ -577,7 +615,12 @@ gains nothing.
   only integrated, correct functions are.
 - **The analysis is fixed before the run.** Each run starts by writing a
   plan: the harness commit, the metric code's hash, the prompts' hashes, the
-  model and effort, the caps, the materialization rule and the seeds. It is
+  model and effort, the caps, the materialization rule with how Bracken
+  mode counts verdicts (decision `5e8df6996a2e`: one per validator, its
+  latest; never the author; at least one pass and no counted fail; fails on
+  implementations the grader scores correct counted as semantic-conflict
+  events), Bracken mode's working-library rule for `check` (answer
+  `88ae128c5fcd`) and the seeds. It is
   contributed to the team's Ground as an artifact before the first model
   call, and the report quotes its id. Changing the analysis afterwards means
   a new plan and saying why.
