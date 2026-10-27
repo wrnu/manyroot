@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# bk-evidence: run a check and record its real result as evidence on a pr claim.
+#
+#   bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] -- <command> [args...]
+#
+# Runs the command in the current checkout, streaming its output, and records
+# evidence on <claim> through scripts/bk: `pass` if it exits 0, otherwise `fail`,
+# with --method "<command, shell-quoted> @ <HEAD sha>" and --details holding the
+# exit code and the last N lines (default 40, at most 8000 bytes) of its combined
+# output, with control characters and invalid UTF-8 removed. Then exits with the
+# command's exit code.
+#
+# It refuses, recording nothing, when:
+#   - it isn't run inside a git checkout;
+#   - the checkout has uncommitted changes or untracked files outside .bracken/,
+#     before or after the command (the sha would be a lie), or the command moved HEAD;
+#   - <claim> isn't a hex id (12 to 64 characters) of a claim whose statement names
+#     HEAD as its own head, "... @ <full sha>: ...", as a pr claim does. For evidence
+#     on a claim that isn't a pr claim (a finding, a task), pass --any-head; it
+#     refuses claims tagged pr, whose head must always match;
+#   - the identity (--as or BRACKEN_AGENT) is missing or can't sign here;
+#   - the command isn't an executable file (exit 127). A shell builtin, keyword or
+#     function is refused too: pass the program's path (`type -P true` gives
+#     /usr/bin/true), or wrap it in `bash -c '...'`.
+#
+# The command's exit code is what's recorded: for a pipeline, use
+# `bash -o pipefail -c '...'`, or only the last stage's code counts. The output
+# tail reaches bracken on its command line, so don't use this for commands whose
+# output can hold secrets.
+#
+# Verifying someone else's branch, run the main checkout's copy by absolute path,
+# never the branch's own: "$main/scripts/bk-evidence".
+set -euo pipefail
+
+usage() {
+  echo "usage: bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] -- <command> [args...]" >&2
+  exit 2
+}
+fail() { echo "bk-evidence: $*" >&2; exit 1; }
+
+[ $# -ge 1 ] || usage
+claim=$1
+shift
+agent=${BRACKEN_AGENT:-}
+lines=40
+any_head=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --as) [ $# -ge 2 ] || usage; agent=$2; shift 2 ;;
+    --lines) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || usage; lines=$2; shift 2 ;;
+    --any-head) any_head=true; shift ;;
+    --) shift; break ;;
+    *) usage ;;
+  esac
+done
+[ $# -ge 1 ] || usage
+[[ $claim =~ ^[0-9a-f]{12,64}$ ]] || fail "'$claim' isn't a claim id (12 to 64 hex characters)"
+[ -n "$agent" ] || fail "no identity: pass --as <identity> or set BRACKEN_AGENT"
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+top=$(git rev-parse --show-toplevel 2>/dev/null) || fail "$PWD is not inside a git checkout"
+changes() { git -C "$top" status --porcelain | grep -E -v '^\?\? \.bracken/' || true; }
+sha=$(git -C "$top" rev-parse HEAD)
+dirty=$(changes)
+[ -z "$dirty" ] || fail "the checkout has uncommitted changes, so '@ $sha' would be wrong; commit first:
+$dirty"
+kind=$(type -t "$1" || true)
+case "$kind" in
+  file) ;;
+  "") echo "bk-evidence: command not found: $1 (nothing recorded)" >&2; exit 127 ;;
+  *)
+    path=$(type -P "$1" || true)
+    echo "bk-evidence: '$1' is a shell $kind, and bk-evidence runs only executable files; pass ${path:-the program path}, or wrap it in bash -c '...' (nothing recorded)" >&2
+    exit 127
+    ;;
+esac
+"$here/bk" id list | awk -v n="$agent" '$2 == n && NF == 2 { found = 1 } END { exit !found }' ||
+  fail "this replica can't sign as '$agent' (see scripts/bk id list)"
+shown=$("$here/bk" show "$claim" --json)
+statement=$(printf '%s\n' "$shown" | grep -m1 '"statement":' || true)
+[ -n "$statement" ] || fail "$claim isn't a claim in the Ground"
+# The claim's own tags: the first "tags" list in the JSON, which is the claim's body.
+is_pr=$(printf '%s\n' "$shown" | awk '
+  !seen && /"tags": \[/ { seen = 1; open = !/\]/; if (/"pr"/) pr = 1; next }
+  open { if (/\]/) open = 0; else if (/^ *"pr",?$/) pr = 1 }
+  END { print pr ? "yes" : "no" }')
+if $any_head; then
+  [ "$is_pr" = no ] || fail "--any-head is for claims that aren't pr claims; $claim is tagged pr, so its head must be HEAD ($sha)"
+else
+  [[ $statement == *" @ $sha:"* ]] ||
+    fail "claim $claim doesn't name HEAD as its head (' @ $sha:'); record on the current pr claim, or pass --any-head for a claim that isn't a pr claim"
+fi
+
+out=$(mktemp)
+trap 'rm -f "$out" "$out.tail"' EXIT
+set +e
+"$@" 2>&1 | tee "$out"
+code=${PIPESTATUS[0]}
+set -e
+
+after=$(git -C "$top" rev-parse HEAD)
+[ "$after" = "$sha" ] || fail "the command moved HEAD from $sha to $after; nothing recorded (exit $code)"
+dirty=$(changes)
+[ -z "$dirty" ] || fail "the command changed the checkout, so the run didn't test $sha; nothing recorded (exit $code):
+$dirty"
+
+verdict=pass
+[ "$code" -eq 0 ] || verdict=fail
+tail -n "$lines" "$out" >"$out.tail"
+if [ "$(wc -c <"$out.tail")" -gt 8000 ]; then
+  tail -c 8000 "$out.tail" >"$out"
+  # The cut can start mid-line: drop that partial line, unless it's the only one.
+  if [ "$(wc -l <"$out")" -ge 2 ]; then tail -n +2 "$out" >"$out.tail"; else cp "$out" "$out.tail"; fi
+fi
+# The output is untrusted: drop invalid UTF-8, C0 controls except tab and newline, DEL and C1 controls,
+# so the evidence always records and never drives the terminal of whoever reads it.
+details=$(
+  printf 'exit %s\n' "$code"
+  iconv -c -f UTF-8 -t UTF-8 <"$out.tail" 2>/dev/null | LC_ALL=C tr -d '\000-\010\013-\037\177' |
+    LC_ALL=C sed $'s/\xc2[\x80-\x9f]//g' || true
+)
+method="$(printf '%q ' "$@")@ $sha"
+if id=$("$here/bk" evidence "$claim" "$verdict" --method "$method" --details "$details" --as "$agent"); then
+  echo "bk-evidence: recorded $verdict $id (exit $code)" >&2
+  exit "$code"
+fi
+echo "bk-evidence: the command exited $code, but recording the evidence failed" >&2
+exit $((code != 0 ? code : 1))

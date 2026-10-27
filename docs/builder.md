@@ -29,16 +29,17 @@ Always use `scripts/bk`, never a `bracken` binary built from your branch. The ta
 
 - **As you learn:** a `note` for anything another agent would want (an interface choice, a gotcha, a dead end), related to your task.
 - **Each pushed head:** a `pr` claim (`PR #<n> <branch> @ <full sha>: <title>`), `relate <pr> implements <task>`, and for a later head add `--supersedes <old>` to the new `pr` claim.
-- **Each test run:** evidence on the current `pr` claim, with the exact command and sha in `--method` and the relevant output in `--details`. Your own evidence is recorded but never counts toward the merge gate; the manager re-runs the checks.
+- **Each test run:** `"$main/scripts/bk-evidence" <pr> --as builder-<branch> -- <command>` from your committed worktree, where `main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")`: the main checkout's copy, never your branch's (it may differ, and it signs with the team's Ground). It runs the command and records `pass` or `fail` on the `pr` claim with the command and HEAD sha in `--method` and the real exit code and output tail in `--details`, then exits with the command's code. It records nothing if the `pr` claim's head (`@ <sha>:`) isn't HEAD, the checkout isn't clean before and after, the command moved HEAD, or the command isn't an executable file. A shell builtin such as `true` or `echo` counts as not executable: pass its path (`/usr/bin/true`) or wrap it in `bash -c '…'`. `--any-head` is only for evidence on a claim that isn't a `pr` claim; it refuses `pr` claims. For a pipeline, use `bash -o pipefail -c '…'`, or only the last stage's exit code counts. Don't hand-build `--details`; don't use it for commands whose output can hold secrets. Your own evidence is recorded but never counts toward the merge gate; the manager re-runs the checks.
 - **A test you think is wrong:** never delete, skip or weaken it. Contribute a claim that `contradicts` it, with your reasoning.
 - **Review findings:** answer each confirmed finding by fixing it in a new head, deferring it (a `task` claim that `depends_on` the finding, if the manager agrees), or disputing it (a claim that `contradicts` it).
 
 ## Git
 
+- Right before each push, `git fetch origin && git merge origin/main`, so the head you claim is tested against today's `main`.
 - Merge `main` into your branch; never rebase or force-push someone else's. Force-push only your own branch, with `--force-with-lease`.
 - `git stash` is shared across worktrees; use a WIP commit.
 - Never stage `.bracken/`. Your worktree's copy is a stale snapshot.
-- Open the PR with `fj --host forge.jx.rs pr create --base main --head <branch> --body "…" "<title>"`. The body has the change class, what wasn't tested, the release steps (usually "none"), and the task and `pr` claim ids.
+- Open the PR with `fj --host forge.jx.rs pr create --base main --head <branch> --body "…" "<title>"`. The body has the change class, what wasn't tested, the release steps (usually "none"), and the task id. It doesn't carry the `pr` claim id (the claim needs the PR number first); reviewers find it with `scripts/bk log --tag pr --current`.
 
 ## Final report
 

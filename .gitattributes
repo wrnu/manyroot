@@ -1,0 +1,2 @@
+# The Ground is binary. Git must never convert its line endings.
+.bracken/** -text

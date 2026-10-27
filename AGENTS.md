@@ -44,7 +44,7 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 | Question to the manager | claim `--tag question`, related to the task; the answer `refines` it |
 | PR head | claim `--tag pr`: `PR #<n> <branch> @ <full sha>: <title>`, then `relate <pr> implements <task>` |
 | New commit | a new `pr` claim with `--supersedes <old>` |
-| Test run | `evidence <pr> pass\|fail --method "<command> @ <sha>" --details "<output>"` |
+| Test run | `"$main/scripts/bk-evidence" <pr> --as <you> -- <command>`, the main checkout's copy (`main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")`): records the real exit code and output tail, `@ <HEAD sha>` |
 | Review finding | claim `--tag finding` (file:line, severity, requirement broken, counterexample), then `relate <finding> contradicts <pr>` |
 | Final report | claim `--tag report`, then `relate <report> implements <task>` |
 | Gotcha, preference, reference | claim `--tag gotcha` / `preference` / `reference` |

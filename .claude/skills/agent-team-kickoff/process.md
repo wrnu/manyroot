@@ -55,7 +55,7 @@ Every agent follows these, so that `scripts/bk log --tag <tag>` answers the team
 | Design note, hypothesis, discovery | claim, tag `note`; relate it to the task or the code it concerns | anyone |
 | PR head | claim, tag `pr`: "PR #<n> <branch> @ <full sha>: <title>"; `relate <pr> implements <task>` | builder |
 | New commit on a PR | new `pr` claim with `--supersedes <old>`. Evidence on the old head no longer counts, so every head is verified on its own | builder |
-| Test run | evidence on the `pr` claim: `--method "<command> @ <sha>"`, `--details "<relevant output>"` | builder (recorded, never counted), manager (counted) |
+| Test run | evidence on the `pr` claim, recorded with `"$main/scripts/bk-evidence" <pr> --as <you> -- <command>` (the main checkout's copy, step 5): `--method "<command> @ <sha>"`, `--details` with the exit code and output tail | builder (recorded, never counted), manager (counted) |
 | Review verdict | evidence on the `pr` claim: `pass` or `fail`, `--method "independent review (<model>) @ <sha>"` | reviewer, security |
 | Review finding | claim, tag `finding`, with file:line, severity, the requirement broken and a counterexample; `relate <finding> contradicts <pr>` | reviewer, security |
 | Finding triage | evidence on the `finding`: `pass` = confirmed (say how), `fail` = rejected (say why) | manager |
@@ -89,7 +89,7 @@ Any counted `fail` makes it `rejected`. The fix is a new commit and a new `pr` c
 
 CI is not part of the gate (section 10). Its result is a second opinion: when it disagrees with the Ground's evidence, the manager records why before merging.
 
-**Findings.** `scripts/bk conflicts` lists every finding that contradicts a current head, whether triaged or not. Rejected ones stay listed until the head changes; that's expected, not a blocker. Before merging, every finding against the head must have manager evidence (see the referrers in `scripts/bk show <pr>`):
+**Findings.** The complete list of findings against a head is the referrers of `scripts/bk show <pr>`: every `finding` that `contradicts` it, triaged or not. `scripts/bk conflicts` shows most of them too, but not a finding that someone else's claim supersedes (task 780f658d4b84), so don't rely on it here. Rejected findings stay listed until the head changes; that's expected, not a blocker. Before merging, every finding against the head must have manager evidence:
 
 - A **confirmed** finding (pass) blocks the merge until it's fixed in a new head, or **deferred**: a `task` claim (tags `task`, `deferred`) that `depends_on` the finding and says what will fix it and when. The manager defers only findings that don't make this PR unsafe to merge, such as a risk that only becomes real after a later change, and says so in its triage evidence.
 - A **rejected** finding (fail) stays on record and doesn't block.
@@ -101,11 +101,11 @@ A new head supersedes the old one, and that clears *all* of the old head's contr
 1. **Task:** the manager contributes a `task` claim holding the brief, then launches the builder with that id. One task, one worktree, one branch, one PR.
 2. **Branch:** short kebab-case, no prefix.
 3. **Build and test locally:** every command in the `AGENTS.md` test table for the touched packages, plus the brief's definition-of-done checks. **Never delete, skip or weaken a test to get a green run**; if a test seems wrong, contribute a claim that `contradicts` it and let the manager decide.
-4. **PR head:** commit, then contribute a `pr` claim (or a superseding one) and evidence for each test run. The PR description has the change **class**, what wasn't tested, the release steps, and the task and `pr` claim ids.
-5. **Verify.** The manager re-runs the done-when checks in a **fresh worktree at the exact head commit**, never in a checkout that might hold uncommitted files: `git worktree add --detach "$TMPDIR/verify-<sha>" <sha>`, run the checks there, then remove the worktree. It records the result as counted `manager` evidence with the sha in `--method`. Verifying runs the PR's code on the host, where it can read the Ground's keys and the forge credential, so first read the PR's changes to build scripts and dependencies (`build.rs`, `Cargo.lock`, `package.json` and the like), and call the **main checkout's** `scripts/bk` by absolute path, never the PR worktree's copy. CI runs too (section 10); if CI and the manager's evidence disagree, the manager contributes a claim tagged `ci-disagreement` saying which was right and why.
+4. **PR head:** commit, then contribute a `pr` claim (or a superseding one) and evidence for each test run, recorded with the main checkout's `"$main/scripts/bk-evidence" <pr> --as builder-<branch> -- <command>` (step 5) so the exit code and output are the real ones. For a pipeline, use `bash -o pipefail -c '…'`, or only the last stage's exit code is recorded. The PR description has the change **class**, what wasn't tested, the release steps, and the task id. It can't hold the `pr` claim id, which needs the PR number first: the current `pr` claim is found with `scripts/bk log --tag pr --current`.
+5. **Verify.** The manager re-runs the done-when checks in a **fresh worktree at the exact head commit**, never in a checkout that might hold uncommitted files: `git worktree add --detach "$TMPDIR/verify-<sha>" <sha>`, run the checks there, then remove the worktree. It records the result as counted `manager` evidence with the sha in `--method`, running the main checkout's copy from inside the verify worktree: `"$main/scripts/bk-evidence" <pr> --as manager -- <command>`, where `main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")`. Verifying runs the PR's code on the host, where it can read the Ground's keys and the forge credential, so first read the PR's changes to build scripts and dependencies (`build.rs`, `Cargo.lock`, `package.json` and the like), and call the **main checkout's** `scripts/bk` and `scripts/bk-evidence` by absolute path, never the PR worktree's copies: a PR can change them, and its copy would then sign counted evidence on its own PR. CI runs too (section 10); if CI and the manager's evidence disagree, the manager contributes a claim tagged `ci-disagreement` saying which was right and why.
 6. **Reviews** (independent for risky classes; security for all) record findings and verdicts in the Ground. **Finish every review round before manual testing**, so the tested build is the one that merges.
 7. **Manual test**, if the change can be seen or felt: test the real thing, and record the result as manager evidence with a short report in `--details`.
-8. **Merge:** once the gate passes (section 4.2), merge `main` into the branch, then squash-merge. If the merge changed the head, the gate applies to the new head. If it deploys, wait for the owner's go.
+8. **Merge:** once the gate passes (section 4.2), merge `main` into the branch, then squash-merge. If the merge changed the head, the gate applies to the new head. If it deploys, wait for the owner's go. If the PR touched the code of the pinned binary (for Bracken: `crates/bracken` or `crates/manyroot`), upgrade the pinned binary right after the merge (`docs/releases.md`), before sending any agent work that relies on the new docs.
 9. **Each release stage** toward users needs the owner's go, recorded as an `approval`.
 10. **Watch it land.** Check triage and error reports for anything new from the release, and close out the task with a `note` saying what shipped.
 
@@ -191,7 +191,7 @@ Report: <when, and anything beyond the standard final report>
 - **Daily triage** (**schedule**, fixed time, fresh thread, identity `triage`; read-only for code, writes only to the Ground) covers:
   - new error-monitor issues and failed CI on `main`;
   - what shipped since yesterday;
-  - `scripts/bk conflicts` (divergences and untriaged findings);
+  - `scripts/bk conflicts` (divergences and most untriaged findings; the referrers of each open `pr` are the complete list);
   - `owner-ask` claims still open;
   - `pr` claims pending for more than a day;
   - tasks with no recent contributions.
