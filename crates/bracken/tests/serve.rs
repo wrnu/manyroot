@@ -840,3 +840,50 @@ fn sync_exec_kills_a_program_that_outlives_the_session_and_hides_the_token() {
     assert!(!out.status.success());
     assert_eq!(std::fs::read_to_string(&seen).unwrap(), "none|none");
 }
+
+#[test]
+fn sync_exec_ends_at_the_deadline_whatever_the_programs_descendants_do() {
+    let g = grounds();
+    let has = |program: &str| Command::new(program).arg("-v").output().is_ok_and(|o| o.status.success());
+    // Each leaves a descendant holding the program's stdout after the program itself is killed:
+    // a forked child, a background job in its own process group, and one in a new session.
+    let mut scripts = vec!["sleep 20; true", "sleep 20 & exec sleep 25", "set -m; sleep 20 & wait"];
+    if has("perl") {
+        scripts.push("perl -MPOSIX -e 'POSIX::setsid() or die; sleep 20'; true");
+    } else {
+        eprintln!("perl isn't installed: skipping the setsid case");
+    }
+    for script in scripts {
+        let start = Instant::now();
+        // Through pipes, as a caller capturing bracken's output reads it: a descendant left alive
+        // must hold neither of them.
+        let out = cmd(&g.a).args(["sync", "--deadline", "3", "--exec", "sh", "-c", script]).output().unwrap();
+        assert!(stderr(&out).contains("deadline"), "{script}: {}", stderr(&out));
+        assert!(start.elapsed() < Duration::from_secs(6), "{script}: took {:?}", start.elapsed());
+    }
+}
+
+#[test]
+fn sync_exec_relays_the_programs_stderr() {
+    let g = grounds();
+    let out = cmd(&g.a).args(["sync", "--exec", "sh", "-c", "echo from-the-program >&2"]).output().unwrap();
+    assert!(stderr(&out).contains("from-the-program"), "{}", stderr(&out));
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_exec_keeps_the_program_in_brackens_process_group_so_it_can_use_the_terminal() {
+    // A program outside the terminal's foreground group is stopped when it reads /dev/tty (ssh's
+    // password and host-key prompts). This test has no terminal, so it checks the condition
+    // instead: the program shares bracken's process group, which is the foreground one whenever
+    // bracken runs at a terminal.
+    let g = grounds();
+    let seen = g.tmp.join("pgids");
+    let script = format!("ps -o pgid= -p $$ > {0}; ps -o pgid= -p $PPID >> {0}", seen.display());
+    let out = cmd(&g.a).args(["sync", "--exec", "sh", "-c", &script]).output().unwrap();
+    assert!(!out.status.success(), "the program speaks no protocol");
+    let text = std::fs::read_to_string(&seen).unwrap();
+    let pgids: Vec<&str> = text.split_whitespace().collect();
+    assert_eq!(pgids.len(), 2, "{text:?}");
+    assert_eq!(pgids[0], pgids[1], "the program is in bracken's process group");
+}

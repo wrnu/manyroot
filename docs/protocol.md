@@ -153,7 +153,11 @@ however small the peer's `batch_bytes` is.
      this side sends those as batches, in the order needed.
 3. Batches go one at a time: send the next only after the peer's `result` for
    the last. Each bundle fits the peer's `batch_bytes`; a contribution too
-   large for it ends the session. The final batch has `last: true` and may be
+   large for it ends the session. A sender may also keep its batches within
+   its own `batch_bytes`, as `manyroot` does (the smaller of the two limits),
+   so a peer can't make it build a batch larger than it would accept; a
+   contribution too large for that ends the session too. The receiver checks
+   only its own limit either way. The final batch has `last: true` and may be
    empty, so every side sends at least one batch. Only the final batch may be
    empty.
 4. On a batch, import its contributions and answer `result` with the import

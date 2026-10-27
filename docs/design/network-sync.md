@@ -179,7 +179,7 @@ state machine (messages in, messages out) with no I/O.
 | `bracken serve --tokens <file> [--port <n>]` | HTTP on 127.0.0.1 only (no TLS, and no flag to bind elsewhere); prints `listening on http://127.0.0.1:<port>` |
 | `bracken serve --stdio` | One session on stdin and stdout, for `ssh host bracken --dir <path> serve --stdio`; the credential is SSH's, logged as `stdio` |
 | `bracken sync http://127.0.0.1:<port>` | The token from `$BRACKEN_TOKEN` or `--token-file`, never the command line; loopback URLs only |
-| `bracken sync --exec <program> [args...]` | Runs the program without a shell, and without `BRACKEN_TOKEN` or `BRACKEN_DIR` in its environment, and syncs over its stdin and stdout. The program is killed at the deadline, or 2 seconds after the session ends if it hasn't exited |
+| `bracken sync --exec <program> [args...]` | Runs the program without a shell, and without `BRACKEN_TOKEN` or `BRACKEN_DIR` in its environment, and syncs over its stdin and stdout. The program stays in bracken's process group, so it can prompt on the terminal (ssh's password and host-key questions). The client's reads and writes end at the deadline whatever holds the pipes, so neither the program nor a descendant (forked, in another group or session) can keep it waiting. The program's stderr is relayed through a pipe of bracken's, so a descendant left alive doesn't hold the caller's stderr either. The program is killed at the deadline, or 2 seconds after the session ends if it hasn't exited; its descendants aren't killed and may outlive the client |
 
 **Server files**, all outside the Ground directory, and refused if a
 symlink, not a regular file, or writable by anyone:
@@ -232,6 +232,22 @@ in a round; a request whose results would release a second batch is refused.
 A response therefore holds at most a batch and an id list, and with 16
 sessions the server's session memory stays within about 16 times that plus
 the id budget. All of these bounds are flags.
+
+**Memory, for choosing step 3's limits** (task `c2d2bc516624`). A busy
+session holds about three copies of the batch it is sending (the
+contributions, the bundle, the response body), so 3 x `--batch-bytes`, plus
+the id lists it has received, up to about 8 x `--id-budget`. The defaults
+(64 MiB batches, a 64 MiB id budget, 16 sessions) put the worst case near 16 x
+(192 MiB + 512 MiB), about 11 GiB, and a typical busy session near 200 MiB.
+The team's Ground on 2026-10-27 is 2 328 contributions in 9.2 MB, and the
+owner's machine has 64 GiB. Recommended for the team server in step 3:
+`--batch-bytes 17825792` (17 MiB, which still carries a 16 MiB contribution),
+`--id-budget 8388608` (8 MiB, about 240 000 ids, a hundred times today's
+Ground) and `--max-sessions 16`, for a worst case near 16 x (51 MiB + 64 MiB),
+under 2 GiB. Revisit the id budget once the Ground nears 100 000
+contributions: a session between replicas that each hold work the other
+lacks offers every contribution outside what they share, so a replica that
+was offline for long can offer many.
 
 **HTTP framing.** One request per connection (`Connection: close`; a
 pipelined second request is read and dropped). Heads of at most 16 KiB and

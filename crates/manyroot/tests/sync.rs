@@ -564,6 +564,40 @@ fn a_sender_fills_a_batch_to_exactly_the_peer_limit() {
 }
 
 #[test]
+fn a_sender_caps_its_batches_at_its_own_limit_when_that_is_smaller() {
+    let all = random_history(&mut Rng(47), 10);
+    let g = closure(&all, &(0..all.len()).collect::<Vec<_>>());
+    let order: Vec<Contribution> = g.topo_order().iter().map(|id| g.get(id).unwrap().clone()).collect();
+    // The peer accepts anything and holds nothing; the sender's own limit is the smaller one.
+    let first_batch = |own_batch_bytes: usize| -> Result<Vec<u8>, SyncError> {
+        let mut s = Session::new(GROUND, Limits { batch_bytes: own_batch_bytes as u64 });
+        s.start(&g);
+        let peer = Limits { batch_bytes: u64::MAX };
+        s.receive(&g, Message::Hello { protocol: 1, ground: GROUND, limits: peer, features: vec![] }).unwrap();
+        match &s.receive(&g, Message::Heads { heads: vec![] })?.send[..] {
+            [Message::Batch { bundle, .. }] => Ok(bundle.clone()),
+            other => panic!("expected one batch: {other:?}"),
+        }
+    };
+    for k in [1, 3, 6] {
+        let exact = bundle_len(&order[..k]);
+        assert_eq!(first_batch(exact).unwrap().len(), exact, "an own limit of exactly {k} contributions takes {k}");
+        match first_batch(exact - 1) {
+            Ok(bundle) => assert_eq!(bundle.len(), bundle_len(&order[..k - 1]), "one byte less takes {}", k - 1),
+            Err(e) => assert_eq!((k, e), (1, SyncError::TooLargeForOwnLimit(order[0].id()))),
+        }
+    }
+
+    // Two replicas still converge, the capped side sending many small batches.
+    let small = Limits { batch_bytes: bundle_len(&order[..2]) as u64 };
+    let mut empty = Graph::new(GROUND);
+    let mut full = g.clone();
+    let out = run([&mut full, &mut empty], [small, Limits::default()]).unwrap();
+    assert_eq!(ids(&empty), ids(&g));
+    assert!(out.received[1].batches >= 5, "{:?}", out.received[1]);
+}
+
+#[test]
 fn a_hello_needs_batch_bytes_of_at_least_44() {
     let g = Graph::new(GROUND);
     let with =

@@ -118,6 +118,8 @@ pub enum SyncError {
     BatchTooLarge(usize, u64),
     #[error("contribution {0} is too large for the peer's batch limit")]
     TooLargeForPeer(ContributionId),
+    #[error("contribution {0} is too large for this replica's own batch limit, which caps what it sends")]
+    TooLargeForOwnLimit(ContributionId),
     #[error("bad batch: {0}")]
     BadBatch(String),
     #[error("peer sent {0}, which this replica didn't need")]
@@ -445,6 +447,9 @@ impl Session {
             let c = graph.get(id).expect("offered and planned contributions are in the graph");
             let entry = (BUNDLE_ENTRY + c.encode().len()) as u64;
             if size + entry > limit {
+                if batch.is_empty() && self.limits.batch_bytes < peer {
+                    return Err(SyncError::TooLargeForOwnLimit(*id));
+                }
                 if batch.is_empty() {
                     return Err(SyncError::TooLargeForPeer(*id));
                 }

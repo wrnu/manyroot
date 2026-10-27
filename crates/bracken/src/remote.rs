@@ -7,7 +7,6 @@ use std::io::{self, Cursor, Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -139,7 +138,13 @@ fn read_response_head(stream: &mut impl Read) -> Result<(u16, Option<String>, u6
 
 /// Syncs with a server reached through a program's stdin and stdout (`ssh host bracken serve
 /// --stdio`), run without a shell and without this side's token or replica in its environment.
-/// The program is killed at the deadline, or soon after the session ends if it doesn't exit.
+/// The program stays in this process's group, so it can still prompt on the terminal (ssh's
+/// password and host-key questions). Every read and write of the session ends at the deadline,
+/// whatever holds the pipes: they run on threads this side stops waiting for, so a descendant
+/// that keeps a pipe open can't keep the client waiting. At the deadline, or soon after the
+/// session ends if the program doesn't exit, the program itself is killed; its descendants
+/// aren't, and may outlive the client. The program's stderr is relayed through a pipe, so a
+/// descendant left alive doesn't hold the caller's stderr either.
 pub fn sync_exec(store: &mut Store, program: &[String], bounds: Bounds) -> Result<Side> {
     let (name, args) = program.split_first().context("--exec needs a program")?;
     let mut child = Command::new(name)
@@ -148,47 +153,36 @@ pub fn sync_exec(store: &mut Store, program: &[String], bounds: Bounds) -> Resul
         .env_remove("BRACKEN_DIR")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("running {name}"))?;
-    let mut input = child.stdin.take().expect("stdin is piped");
-    let mut output = io::BufReader::new(child.stdout.take().expect("stdout is piped"));
-    let child = Arc::new(Mutex::new(child));
     let mut side = side(store, bounds);
     let deadline = side.deadline();
-    // Kills the program at the deadline, which unblocks a read or write stuck on it.
-    let (done, finished) = mpsc::channel::<()>();
-    let watchdog = {
-        let child = Arc::clone(&child);
-        std::thread::spawn(move || {
-            let timed_out = finished.recv_timeout(deadline.saturating_duration_since(Instant::now())).is_err();
-            if timed_out {
-                let _ = child.lock().map(|mut c| c.kill());
-            }
-            timed_out
-        })
-    };
+    let relayed = relay_stderr(child.stderr.take().expect("stderr is piped"));
+    let mut input = Piped::writer(child.stdin.take().expect("stdin is piped"));
+    let mut output = Piped::reader(child.stdout.take().expect("stdout is piped"), deadline);
     let opening = side.session.start(store.graph());
     let result =
         run_stream(&mut side, opening, &mut output, &mut input, |side, frame| side.handle(&mut Local(store), frame));
+    // The writer thread closes the program's stdin once the queued writes have gone.
     drop(input);
     // The session is over either way: give the program a moment to exit, within the deadline.
     let until = deadline.min(Instant::now() + EXIT_GRACE);
     let status = loop {
-        let mut c = child.lock().map_err(|_| anyhow::anyhow!("the child's lock is poisoned"))?;
-        if let Some(status) = c.try_wait()? {
+        if let Some(status) = child.try_wait()? {
             break Some(status);
         }
         if Instant::now() >= until {
-            let _ = c.kill();
-            c.wait()?;
+            let _ = child.kill();
+            child.wait()?;
             break None;
         }
-        drop(c);
         std::thread::sleep(Duration::from_millis(20));
     };
-    let _ = done.send(());
-    let timed_out = watchdog.join().unwrap_or(false) || Instant::now() >= deadline;
+    // Let the last of the program's messages through, but don't wait for a descendant that
+    // still holds its stderr.
+    let _ = relayed.recv_timeout(deadline.saturating_duration_since(Instant::now()).min(STDERR_GRACE));
+    let timed_out = Instant::now() >= deadline;
     match (result, status) {
         (Err(_), _) | (Ok(()), None) if timed_out => Err(Refused::deadline().into()),
         (Err(e), _) => Err(e),
@@ -197,6 +191,93 @@ pub fn sync_exec(store: &mut Store, program: &[String], bounds: Bounds) -> Resul
         (Ok(()), Some(_)) => Ok(side),
     }
 }
+
+/// One end of a pipe to `--exec`'s program, through a thread, so this side never blocks on the
+/// pipe itself: reads wait on a channel with the time left to the deadline, and writes are queued.
+/// The thread may stay blocked on the pipe after this side gives up; it ends with the process.
+enum Piped {
+    Reader { chunks: mpsc::Receiver<io::Result<Vec<u8>>>, buffer: Cursor<Vec<u8>>, deadline: Instant },
+    Writer { chunks: mpsc::Sender<Vec<u8>> },
+}
+
+impl Piped {
+    fn reader(mut pipe: impl Read + Send + 'static, deadline: Instant) -> Piped {
+        let (send, chunks) = mpsc::sync_channel(4);
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let chunk = match pipe.read(&mut buf) {
+                    Ok(n) => Ok(buf[..n].to_vec()),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => Err(e),
+                };
+                let end = !matches!(&chunk, Ok(c) if !c.is_empty());
+                if send.send(chunk).is_err() || end {
+                    return;
+                }
+            }
+        });
+        Piped::Reader { chunks, buffer: Cursor::new(Vec::new()), deadline }
+    }
+
+    fn writer(mut pipe: impl Write + Send + 'static) -> Piped {
+        let (chunks, receive) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            for chunk in receive {
+                if pipe.write_all(&chunk).and_then(|()| pipe.flush()).is_err() {
+                    return;
+                }
+            }
+        });
+        Piped::Writer { chunks }
+    }
+}
+
+impl Read for Piped {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        let Piped::Reader { chunks, buffer, deadline } = self else {
+            return Err(io::Error::other("not a reader"));
+        };
+        if buffer.position() as usize == buffer.get_ref().len() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match chunks.recv_timeout(left) {
+                Ok(chunk) => *buffer = Cursor::new(chunk?),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(io::ErrorKind::TimedOut.into()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(0),
+            }
+        }
+        buffer.read(out)
+    }
+}
+
+impl Write for Piped {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let Piped::Writer { chunks } = self else {
+            return Err(io::Error::other("not a writer"));
+        };
+        chunks.send(data.to_vec()).map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Copies the program's stderr to this process's on a thread, so the program and its descendants
+/// hold a pipe of this process's rather than its caller's stderr: a descendant left alive can't
+/// keep a caller that reads this process's stderr waiting. The channel says when the copy is done.
+fn relay_stderr(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<()> {
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = io::copy(&mut pipe, &mut io::stderr());
+        let _ = done.send(());
+    });
+    finished
+}
+
+/// How long to wait for the program's last messages on stderr once it has exited.
+const STDERR_GRACE: Duration = Duration::from_millis(200);
 
 /// How long `--exec`'s program may take to exit once the session is over.
 const EXIT_GRACE: Duration = Duration::from_secs(2);
