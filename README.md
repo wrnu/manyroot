@@ -115,3 +115,7 @@ are tested. These are not done yet:
 Next up is the Phase 1 experiment: comparing Git branches and PRs, shared
 CRDT text editing, and Bracken's semantic contributions with 10 to 100 agents
 on the same tasks and budgets.
+
+## Licence
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Contributions are accepted under the same terms.

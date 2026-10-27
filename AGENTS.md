@@ -1,0 +1,64 @@
+# Agent guide
+
+## Things that break production
+
+- **Protocol changes can make every existing Ground unreadable**, this repo's own `.bracken/` included. That covers encoding, ids, the signing context and validity rules (`crates/manyroot/src/{contribution,graph,id,identity}.rs`, `docs/protocol.md`). They're the `protocol` class: independent review, the owner's go, and a migration note in `docs/releases.md`.
+- **Never commit `.bracken/identities/`.** It holds unencrypted private keys. If git ever shows a file there as staged or tracked, stop and tell the manager.
+- **Never edit or delete files under `.bracken/` by hand.** Write only through `scripts/bk`. Only the manager commits `.bracken/`, and only with `scripts/ground-checkpoint`.
+- **Coordinate only through `scripts/bk`.** It runs the pinned binary against the main checkout's Ground. When you test your own branch's binary, give it a throwaway Ground: `BRACKEN_DIR=$(mktemp -d)/g target/debug/bracken init`. Without `BRACKEN_DIR`, a binary run in a worktree finds that worktree's stale copy of `.bracken/`. `scripts/bk` always ignores `BRACKEN_DIR`.
+
+## Conventions
+
+- Rust 2024. Formatting follows `rustfmt.toml` (width 120). Use `thiserror` errors in `manyroot` and `anyhow` in the CLI. Outside tests, use `expect("why it can't fail")`, never a bare `unwrap()`.
+- Public APIs use plain names (`contribution`, `causal heads`, `evidence`). The subsystem names (Seed, Roots, Proof…) appear only in docs and module comments.
+- Nothing in `manyroot` may assume a contribution is code.
+- Every read command in the CLI keeps a `--json` form; agents depend on it.
+- Commit messages and PRs carry no AI attribution.
+- Forge, not GitHub: `fj --host forge.jx.rs …` for PRs, `fj-ex` for Actions. Commands are in `docs/development.md`, under Forge commands.
+
+## Tests
+
+Run all three before every `pr` claim. CI runs the same.
+
+| Package | Test | Lint | Format |
+|---|---|---|---|
+| workspace | `cargo test --workspace` | `cargo clippy --all-targets -- -D warnings` | `cargo fmt --check` |
+
+## Releases
+
+Nothing is published, and no workflow deploys on merge. Publishing crates, making the repo public, licence changes and access or protection changes need the owner's go. See [docs/releases.md](docs/releases.md).
+
+## The Ground
+
+- Always run `scripts/bk … --as <your identity>`.
+- At the start of every task, read `scripts/bk log --tag decision` and `scripts/bk show <task id>`.
+- Check a claim with `scripts/bk show <id>` before acting on it. A `note` is a lead, not a fact.
+- Contribute what others would need **as you learn it**, not at the end.
+- Messages carry ids; the content goes in the Ground. No secrets or personal data: contributions are permanent.
+
+| What | How |
+|---|---|
+| Decision | claim `--tag decision`, quoting the owner with the date |
+| Task | claim `--tag task` holding the brief (manager) |
+| Note, discovery, dead end | claim `--tag note`, related to the task |
+| Question to the manager | claim `--tag question`, related to the task; the answer `refines` it |
+| PR head | claim `--tag pr`: `PR #<n> <branch> @ <full sha>: <title>`, then `relate <pr> implements <task>` |
+| New commit | a new `pr` claim, then `relate <new> supersedes <old>` |
+| Test run | `evidence <pr> pass\|fail --method "<command> @ <sha>" --details "<output>"` |
+| Review finding | claim `--tag finding` (file:line, severity, requirement broken, counterexample), then `relate <finding> contradicts <pr>` |
+| Final report | claim `--tag report`, then `relate <report> implements <task>` |
+| Gotcha, preference, reference | claim `--tag gotcha` / `preference` / `reference` |
+| Process idea | claim `--tag process` |
+| Disagreement | a claim that `contradicts` the thing you disagree with, with your reasoning |
+
+## Shared knowledge
+
+There's no memory folder: what a future agent needs is in the Ground (process section 9.1).
+
+- At task start, read `scripts/bk log --tag gotcha` and `--tag preference` (plus `--tag reference` when relevant). Skip `(retracted)` entries. `scripts/bk show <id>` tells you whether one was superseded or contradicted.
+- Contribute a `gotcha` (the trap and the fix), a `preference` (the owner, quoted and dated) or a `reference` (where something outside the repo lives) the moment you learn it.
+- Don't contribute what the code, git log or docs already say, or secrets. To change an entry, contribute a new one that `supersedes` it.
+
+## Working with other agents
+
+Roles, the merge gate and everything else about how the team works are in the process, [process.md](.claude/skills/agent-team-kickoff/process.md). This repo's values for it (models, risky classes, Forge commands) are in [docs/development.md](docs/development.md). Builders start with [docs/builder.md](docs/builder.md). "Process section N" means a section of `process.md`.

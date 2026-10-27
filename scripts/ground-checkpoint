@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# ground-checkpoint: commit the Ground's new files from the main checkout.
+#
+# The Ground is append-only, and its committed files have exactly three shapes:
+# ground.json, agents/<name>.json and objects/<2 hex>/<62 hex>. This commits only
+# new files of those shapes. It stops, committing nothing, if a tracked Ground file
+# was changed or deleted, if anything under .bracken/ has another shape (a key, a
+# backup copy of the keys, a stray file), if anything else is staged, or if the
+# Ground doesn't open. Pushing is a separate step.
+#
+# Normally it runs on main. During the kickoff, `--setup` runs it on the setup
+# branch instead, with every other check, to commit the Ground's first files into
+# the setup PR.
+set -euo pipefail
+
+setup=false
+case "$*" in
+  --setup) setup=true ;;
+  "") ;;
+  *) echo "usage: ground-checkpoint [--setup]" >&2; exit 2 ;;
+esac
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)
+main=$(dirname "$common")
+cd "$main"
+
+allowed='^\.bracken/(ground\.json|agents/[a-z0-9_-]{1,64}\.json|objects/[0-9a-f]{2}/[0-9a-f]{62})$'
+stop() { echo "ground-checkpoint: STOP: $*" >&2; exit 1; }
+
+branch=$(git rev-parse --abbrev-ref HEAD)
+if $setup; then
+  [ "$branch" != main ] || stop "--setup is for the kickoff's setup branch; on main, run it without --setup"
+  [ "$branch" != HEAD ] || stop "--setup needs the setup branch checked out, not a detached HEAD"
+else
+  [ "$branch" = main ] || stop "the main checkout isn't on main (during the kickoff, use --setup)"
+fi
+git diff --cached --quiet || stop "something is already staged; commit or unstage it first"
+
+tracked_bad=$(git ls-files -- .bracken | grep -E -v "$allowed" || true)
+[ -z "$tracked_bad" ] || stop "tracked files under .bracken/ that aren't Ground files (if any is a key, treat it as leaked and tell the owner):
+$tracked_bad"
+
+edited=$(git diff --name-status -- .bracken)
+[ -z "$edited" ] || stop "tracked Ground files were changed or deleted; the Ground is append-only:
+$edited"
+
+new=$(git ls-files --others --exclude-standard -- .bracken)
+[ -n "$new" ] || { echo "ground-checkpoint: nothing new"; exit 0; }
+bad=$(printf '%s\n' "$new" | grep -E -v "$allowed" || true)
+[ -z "$bad" ] || stop "files under .bracken/ that aren't Ground files; nothing was committed:
+$bad"
+for f in $(printf '%s\n' "$new" | grep -E '^\.bracken/agents/' || true); do
+  ! grep -q secret_key "$f" || stop "$f holds a private key; nothing was committed"
+done
+# A contribution can carry a key too (`bk artifact .bracken/identities/x.json`, or a claim quoting one), and the
+# word secret_key can't be searched for: findings mention it. So look for the local keys' values written as hex,
+# in any case, in every new file. That catches the likely accidents; a key re-encoded (base64, raw bytes) or one
+# that isn't local gets through. The keys go to a private temporary file and are never printed.
+keys=$(mktemp)
+trap 'rm -f "$keys"' EXIT
+cat .bracken/identities/*.json 2>/dev/null | grep -oE '"secret_key" *: *"[0-9a-fA-F]+"' | grep -oE '[0-9a-fA-F]{64}' >"$keys" || true
+if [ -s "$keys" ]; then
+  leaked=$(printf '%s\n' "$new" | while IFS= read -r f; do ! grep -qiF -f "$keys" "$f" || echo "$f"; done)
+  [ -z "$leaked" ] || stop "new Ground files contain a local private key; don't commit them, and treat the key as exposed (tell the owner):
+$leaked"
+fi
+
+"$here/bk" log >/dev/null || stop "the Ground doesn't open; don't commit a broken replica"
+
+printf '%s\n' "$new" | git add --pathspec-from-file=-
+staged=$(git diff --cached --name-status)
+if printf '%s\n' "$staged" | grep -E -v "^A	" | grep -q . ||
+   printf '%s\n' "$staged" | cut -f2 | grep -E -v "$allowed" | grep -q .; then
+  git reset -q
+  stop "staging didn't match what was checked; nothing was committed:
+$staged"
+fi
+
+git commit -q -m "ground: checkpoint $(date -u +%Y-%m-%dT%H:%MZ)"
+echo "ground-checkpoint: committed $(git rev-parse HEAD) ($(printf '%s\n' "$new" | wc -l | tr -d ' ') files); push it with: git push origin $branch"

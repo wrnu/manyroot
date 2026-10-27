@@ -1,0 +1,100 @@
+# Tests, lint and formatting for every pull request into main and every push to main. It deploys nothing.
+# CI is an observer, not a merge gate: the Ground's evidence decides merges, and branch protection requires no
+# checks (owner decision 8b2454e4cf81; process section 10). When CI disagrees with the Ground, the manager
+# records a ci-disagreement claim.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: docker
+    container:
+      image: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    steps:
+      # The image has no Node, so no JavaScript checkout action. The token reaches git through environment
+      # config, never argv or a remote URL.
+      - name: Check out
+        env:
+          GIT_CONFIG_COUNT: "1"
+          GIT_CONFIG_KEY_0: http.extraHeader
+          GIT_CONFIG_VALUE_0: "Authorization: token ${{ secrets.GITHUB_TOKEN }}"
+        run: |
+          git init -q .
+          git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
+          # Fetch the ref, then check out the run's own commit: if the branch moved on while the run was
+          # queued, fail instead of testing a newer commit and reporting it against this one.
+          git fetch -q --depth=100 origin "${{ github.ref }}"
+          git checkout -q --detach "${{ github.sha }}" || {
+            echo "${{ github.sha }} is no longer on ${{ github.ref }}; a newer run covers the new commit"
+            exit 1
+          }
+          echo "checked out $(git rev-parse HEAD) from ${{ github.ref }}"
+          # main, for the append-only check below. Fetched here so no later step needs the token.
+          git fetch -q --depth=100 origin +refs/heads/main:refs/remotes/origin/main
+      # The committed Ground has exactly three file shapes. Anything else under .bracken/ (a key, a backup
+      # copy of the keys, a stray file) fails, and must be treated as leaked if it holds a key.
+      - name: Only Ground files under .bracken
+        run: |
+          bad=$(git ls-files -- .bracken | grep -E -v '^\.bracken/(ground\.json|agents/[a-z0-9_-]{1,64}\.json|objects/[0-9a-f]{2}/[0-9a-f]{62})$' || true)
+          keyed=$(git ls-files -- .bracken/agents | xargs -r grep -l secret_key || true)
+          if [ -n "$bad$keyed" ]; then
+            echo "files under .bracken/ that aren't Ground files, or agent entries holding a private key:"
+            printf '%s\n' $bad $keyed
+            exit 1
+          fi
+      # The Ground is append-only: deleting or editing a contribution (a finding, a failing piece of evidence)
+      # would change what the merge gate concludes. A PR is compared with its merge base; a push, with what main
+      # was before the push (all its commits, not just the last). When there's no base to compare with, this
+      # fails: an observer that can't check must say so, not pass.
+      - name: Ground is append-only
+        run: |
+          if [ "${{ github.event_name }}" = pull_request ]; then
+            base=$(git merge-base HEAD origin/main) || { echo "no merge base within 100 commits; can't check"; exit 1; }
+          else
+            before="${{ github.event.before }}"
+            if [ -z "$(printf %s "$before" | tr -d 0)" ]; then echo "no previous commit on main to compare with; can't check"; exit 1; fi
+            base=$(git rev-parse -q --verify "$before^{commit}") ||
+              { echo "main's previous commit $before isn't in the fetched history; can't check"; exit 1; }
+          fi
+          changed=$(git diff --diff-filter=DMRT --name-status "$base" HEAD -- .bracken)
+          if [ -n "$changed" ]; then
+            echo "Ground files were deleted or changed since $base:"
+            echo "$changed"
+            exit 1
+          fi
+      - name: Toolchain
+        run: |
+          rustup component add clippy rustfmt
+          cargo --version
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --workspace
+      # Opening a replica verifies every contribution: canonical encoding, hash, signature and causal parents.
+      - name: Ground opens
+        run: |
+          if [ -f .bracken/ground.json ]; then
+            cargo run -q --locked -p bracken -- --dir .bracken log | wc -l | xargs echo "contributions:"
+          fi
+      # The goal includes the vision document, which lives in the Ground as an artifact (process section 1).
+      # Each change to the file must add a new artifact in the same PR.
+      - name: Vision document matches the Ground
+        run: |
+          doc=docs/vision.md
+          [ -f .bracken/ground.json ] && [ -f "$doc" ] || exit 0
+          # log prints "<id>  artifact  <author>  <name> (<n> bytes)" in causal order; the last match is the latest.
+          id=$(cargo run -q --locked -p bracken -- --dir .bracken log --kind artifact \
+            | grep -v '(retracted)' | awk -v d="$doc" '$4 == d { id = $1 } END { print id }')
+          [ -n "$id" ] || { echo "$doc isn't in the Ground; add it with scripts/bk artifact"; exit 1; }
+          cargo run -q --locked -p bracken -- --dir .bracken cat "$id" | cmp -s - "$doc" || {
+            echo "$doc differs from its latest artifact in the Ground ($id); add the new version and supersede it"
+            exit 1
+          }
+          echo "$doc matches artifact $id"

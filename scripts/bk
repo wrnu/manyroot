@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# bk: run the team's pinned bracken against the team's shared Ground, from any worktree.
+#
+# Every agent, in every worktree, must read and write the same Ground: the main
+# checkout's .bracken/. This script finds the main checkout from its own location
+# (not the caller's directory), so running it from elsewhere can't select another
+# repo's Ground. For the same reason it ignores an inherited BRACKEN_DIR (left over
+# from testing a throwaway Ground). It runs only the pinned binary in
+# <main>/.bracken-bin, never whatever `bracken` is on PATH: a broken or stray build
+# must not touch the team's Ground. Set BRACKEN_BIN to override deliberately.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+  echo "bk: $here is not inside a git repository" >&2
+  exit 1
+}
+main=$(dirname "$common")
+export BRACKEN_DIR="$main/.bracken"
+
+bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
+if [ ! -x "$bin" ]; then
+  echo "bk: no pinned bracken at $bin" >&2
+  echo "bk: the manager installs it (agent-team-kickoff skill, SKILL.md section 2.1)" >&2
+  exit 1
+fi
+exec "$bin" "$@"
