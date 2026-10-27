@@ -1,0 +1,383 @@
+# Network sync between Ground replicas
+
+> **Proposal: not decided.** Nothing here is part of the protocol until the
+> owner decides it and [protocol.md](../protocol.md) is changed in its own
+> `protocol`-class PR. Task `9fa2c890ae5a`.
+
+Today replicas exchange whole bundles by file, or `bracken sync` merges two
+local directories, and the team shares one Ground in the main checkout,
+committed to git. This proposes sync over a network.
+
+## Decisions for the owner
+
+1. **Approve the exchange and transports** (sections 1 and 2): heads
+   exchange, then an exact offer/need step, carried over HTTP first and stdio
+   or SSH second. Peer-to-peer later.
+2. **Where the team's sync server runs**, who can reach it, and its
+   off-host backup (sections 4 and 5). The backup holds the objects, the
+   first-seen log and the server's configuration, and can't be rewritten
+   from the server (append-only or with retention). This is new
+   infrastructure and access, so it's your call. *Assumed:* a single small
+   server on Autimo infrastructure, HTTPS only.
+3. **v1 authentication** (section 3): credentials stay in the transport, and
+   the server keeps an allowlist of author keys. Each machine generates its
+   own identities, and only public keys leave it. No authentication in the
+   protocol until membership (Stewards). Until each agent holds only its own
+   key, author-based rules are conventions inside the team.
+4. **The supersession rule** (section 6, question `3d381dfdb8a9`): a
+   `supersedes` relation counts only when its author wrote the contribution
+   it replaces. It's a protocol change, though it changes nothing in this
+   repo's Ground today (note `4f72b184f324`).
+5. **CI stays an observer in v1** (section 5), as decision `8b2454e4cf81`
+   has it. CI as a validator moves to [Later](#later-ci-as-a-validator),
+   because a CI pass on a PR's tree can't be independent of that tree. While
+   CI runs PR code, no repository or organization Actions secrets exist.
+6. **Replacing checkpoint commits** (section 5). *Assumed:* after two weeks
+   of running both with no divergence, the manual checkpoints stop. A daily
+   automated export of new objects to git continues as the independent
+   timeline until the off-host backup in decision 2 exists. This changes
+   decision `34dd510c2457`.
+
+## 1. What's exchanged
+
+### The key property
+
+A replica only adds a contribution once its parents are present (validity
+rule 4), so every replica's set is **closed under ancestry**: its causal
+heads describe it exactly.
+
+### Recommendation: heads, then offer and need
+
+One session between replicas A and B:
+
+1. **Hello.** Both send `{protocol: 1, ground, limits, features}`. If the
+   Grounds differ, they stop.
+2. **Heads.** Both send their causal heads.
+3. **Candidates.** Each side computes what it may need to send: its own set
+   minus the peer's heads that it holds and their ancestors.
+   - If it holds *all* the peer's heads, the peer's set is a subset of its
+     own, and the candidates are exactly what the peer lacks. Skip to step 5.
+   - Otherwise the peer has concurrent work this side hasn't seen, and some
+     candidates may already be there. Go to step 4.
+4. **Offer and need.** Send `Offer {ids}` (32 bytes each). The peer answers
+   `Need {ids}` with the ones it lacks.
+5. **Batch.** Send the needed contributions, parents first, as a bundle in
+   today's format (`MRBUNDL1`, ground id, length-prefixed contributions). One
+   session may send several batches, each under the receiver's byte limit.
+6. **Result.** The receiver imports and replies
+   `{added, already_present, rejected: [{id, rule}], unresolved}`. That's
+   `ImportReport`, which exists already.
+
+Pull and push are the two halves; the server's permissions decide which a
+client may run. Messages are CBOR maps with a `type` field. The exchange is
+exact: it never sends a contribution the receiver holds, at a cost of at most
+one extra round trip and 32 bytes per candidate id.
+
+**Alternatives:** git-style have/ack negotiation pays off only for huge,
+mostly shared histories (a later optimization). Range-based set
+reconciliation (Negentropy) doesn't need ancestry-closed sets, so it belongs
+with selective replication (Canopy). Bloom filters (Automerge) are compact,
+but false positives cost rounds.
+
+### Availability
+
+The demo found most duplicated work is blind (`bd7882c5dcae`): agents can't
+see what hasn't reached them. So clients push **right after every write**, and
+readers long-poll heads (`heads?wait=30`), which returns as soon as they
+change. That narrows the window without closing it; agents starting together
+still need work-in-progress claims (`bd5c57651365`).
+
+## 2. Transports
+
+The protocol is the message sequence above. A transport only has to carry it.
+
+- **Streams** (stdio, SSH, TCP, later QUIC). Each message is
+  `u32 big-endian length || CBOR message`, the bundle's framing.
+  `bracken serve --stdio` makes SSH work like git's: `ssh host bracken serve
+  --stdio <path>`, with SSH doing authentication.
+- **HTTP**, stateless. Each step is one request:
+
+  | Request | Body | Response |
+  |---|---|---|
+  | `GET /v1/<ground>/heads?wait=<s>` | | `Heads` |
+  | `POST /v1/<ground>/offer` | client's `Heads` | `Offer` (or a bundle directly, when the server holds all the client's heads) |
+  | `POST /v1/<ground>/fetch` | `Need` | bundle |
+  | `POST /v1/<ground>/need` | client's `Offer` | `Need` |
+  | `POST /v1/<ground>/push` | bundle | `Result` |
+
+**Recommendation: HTTP first**: other machines reach HTTPS without SSH host
+keys (gotcha `463398c097a2`). Stdio comes almost free and tests both ends in
+one process. **Peer-to-peer later**: ids are hashes and contributions are
+signed, so any peer can serve any contribution and the receiver checks it.
+Integrity never depends on who serves the data; availability does. The
+protocol stays transport-independent because the library exposes a session
+state machine (messages in, messages out) with no I/O.
+
+## 3. Authentication and who may push
+
+Signatures already say who wrote each contribution. What a server still
+decides is **who may read**, and **whose contributions it will store**.
+
+**Recommended for v1:**
+
+- **Reading:** the transport authenticates (an HTTPS bearer token or SSH
+  key). Anyone authenticated reads the whole Ground. Partial reads are
+  Canopy's job.
+- **Pushing:** the server stores only contributions whose `author` is on its
+  allowlist of agent keys. That doesn't depend on who pushes, so relaying
+  others' work is safe. The allowlist is server configuration (a local
+  policy), not protocol.
+- **Session authentication by agent key** (signing a server challenge) needs
+  a new signing context, a protocol change, and would prove little while the
+  team's keys share one folder. Later.
+
+**Trade-off.** An allowlist can split replicas: if a key is removed, a
+member's later contribution that builds on that key's work can't be stored
+(its parent is missing), so the server reports it `unresolved` and the
+member's replica holds more than the server. v1 keeps the allowlist add-only
+in practice, and treats removal as a key-compromise event (process 9.3).
+Membership as contributions (Stewards) would make "who may contribute"
+converge with the graph. That's the proper fix, and it's out of v1.
+
+**Within the team, keys are conventions.** Today every key sits in the
+shared `.bracken/identities/` folder, so any agent can sign as any other
+(`--as`). Until each agent holds only its own key, the allowlist, retraction,
+evidence independence and the supersession rule in section 6 all hold inside
+the team only by the honour rule (process 2). A compromised machine yields
+every key on it.
+
+**Keys on other machines.** Each machine generates its own identities
+locally, and only their public keys go to the server's allowlist. No one
+copies the identities folder between machines. A machine then holds only its
+own agents' keys, which is the first real step toward one key per agent.
+
+**Names in policies.** `--validator <name>` resolves names through local
+configuration only (the `.bracken/agents/` directory, kept in step with the
+allowlist, which names each key), never through identity claims in the graph
+(section 5), and refuses a name that maps to more than one key. Otherwise any allowlisted key could
+claim to be `ci` or `manager`.
+
+**v1 leaves out:** membership in the graph, per-key permissions, read
+permissions finer than the whole Ground, key revocation in the protocol, and
+encryption at rest.
+
+## 4. Abuse
+
+Validity rules already reject wrong Grounds, bad signatures, non-canonical
+encodings, missing parents and over-16-MiB contributions. A server accepting
+pushes needs more:
+
+- **Size:** cap the request before decoding (e.g. 64 MiB per batch), and
+  check each entry's length prefix before allocating, as `bundle::read` does.
+  A server may set a lower limit for artifacts than the protocol's 16 MiB.
+- **Flooding:** every contribution is permanent, and deleting one would break
+  set equality with every other replica. So refuse at the door: per-key and
+  per-credential rate and byte quotas, and a total storage cap. An allowlisted
+  key that floods gets its credential and key removed, which is the
+  compromise path in section 3.
+- **Unknown parents:** a push must be closed under ancestry against what the
+  server holds. Whatever stays `unresolved` at the end of a request is
+  dropped, not buffered across requests, so orphans can't fill memory.
+- **Invalid signatures:** check length, decoding and ground before the
+  signature.
+- **Foreign Grounds:** `Hello` names the Ground and the path carries it; a
+  mismatch ends the session before any contribution is read.
+- **Pathological graphs:** storing a contribution never derives state, so a
+  server stores a long chain of self-retractions without trouble. Every
+  *reader* that derives state (`log`, `status`, `conflicts`, the merge gate)
+  overflowed its stack in `Graph::is_retracted` on such a chain (note
+  `38642d5cfb86`). A chain can't be removed once it's replicated, so the fix
+  (task `ae0ffeace5b8`, PR #8) must be in every reader's pinned binary
+  before any replica pulls from a server. A depth cap at intake would be a
+  local rejection that splits replicas, as the allowlist can.
+- **Withholding:** a server can't forge contributions, but it can hide some,
+  such as a failing finding against a PR, or show different replicas
+  different sets. Comparing heads among replicas that sync only through that
+  server can't detect this. **It's a stated limit of v1, with one server.**
+  Detection needs a copy that doesn't come through the server, such as the
+  git export (decision 6) or a direct sync between two replicas.
+- **Backdating:** `timestamp_ms` is advisory, so a leaked key can backdate
+  forgeries (process 9.3). The server should keep a first-seen log
+  (contribution id, time, credential), unreplicated but backed up off-host
+  (decision 2). It bounds when a contribution really appeared, at no
+  protocol cost.
+
+## 5. The team's own use
+
+**Shape.** One sync server holds the team's Ground. The main checkout's
+`.bracken/` stays a full replica, and agents on other machines get their own.
+
+- **Writes confirm.** `scripts/bk` pushes after every write, then checks
+  that the server's heads cover the new contribution. If they don't, it
+  fails, and the writer must not report the work done.
+- **Ordinary reads** pull first, with a short timeout, and fall back to the
+  local replica if the server is down.
+- **The merge gate fails closed.** Its reads must pull successfully, with no
+  offline fallback. A replica that can't confirm it's current with the
+  server refuses to decide.
+
+**CI stays an observer.** Sync doesn't change what CI can prove: whatever
+runs the tests, the PR's own tree decides what they do. The team's
+independence comes from reviewers reading build and test changes, which the
+process already requires (process step 5). Two standing rules go with this:
+
+- **No Actions secrets.** A same-repo PR's run uses the PR's own workflow
+  files, so it can read any repository or organization secret (note
+  `404c66f318ce`). While CI runs PR code, none may exist. The job token is
+  the remaining exposure, finding `b7f6724d61bb`.
+- **The merged commit is the verified commit.** The gate certifies the sha
+  in the current `pr` claim, but the Forge PR's head can move, and a `pr`
+  claim is free text. Before merging, the manager checks that the Forge PR's
+  head is exactly the current `pr` claim's full sha, and merges by that sha:
+  the merge API's expected-head field (`head_commit_id` in Forgejo's merge
+  options; to be verified before use, since `fj pr merge` has no such
+  option), so a head that moved fails the merge. This belongs in process
+  step 8 and section 4.2, and applies with or without network sync.
+
+**Agent names.** `.bracken/agents/` isn't a contribution, so network sync
+won't carry it (note `8d64aea0f186`). *Assumed:* each identity contributes a
+self-signed claim tagged `identity` with its name, and the CLI shows names
+from those, for display only. Two keys claiming one name show with key
+prefixes. Policies resolve names from local configuration (section 3).
+
+**What it retires** (process section 11 and nearby):
+
+| Retired | Replaced by |
+|---|---|
+| `scripts/bk`'s main-checkout-only Ground and `BRACKEN_DIR` trick | Each worktree or machine uses a replica synced with the server |
+| Manual checkpoints (9.3), `scripts/ground-checkpoint`, gotcha `a407d726a0ee` | An automated daily export to git, then the off-host backup (decision 2) |
+| The main checkout as the only live Ground | Server and full replicas; the export keeps the independent timeline |
+| Restore by clone (9.3) | Pull from the server or any replica |
+
+CI keeps checking `docs/vision.md` against the Ground in git, now the
+export. It doesn't pull from the server, which would need a credential
+(the no-secrets rule above).
+
+**Not retired:** CI as an observer (process section 10, and the first row
+of process section 11, stay as they are in v1); CI's Ground-shape and
+append-only checks, which guard the git export; one key per agent (needs
+Stewards); and branches and PRs for code (need Weave).
+
+**Transition.** Run both for two weeks, comparing the server's heads with
+the committed Ground daily. Then replace the manual checkpoints with the
+export, with your go (decision 6).
+
+## 6. Cross-author supersession
+
+Today a `supersedes` relation counts when its author wrote the *new*
+contribution, whoever wrote the old one. So anyone can mark anyone's claim
+superseded by writing a claim and a relation. Finding `8d90a9a5d109` showed
+this hides others' entries from reading views, and task `780f658d4b84` that
+it silences contradictions in `conflicts`. With replicas run by different
+people, it lets one organization quietly retire another's claims in every
+reader's open layer.
+
+**Recommendation:** a `supersedes` relation counts only when **its author
+wrote the target** (`to`). The new contribution may be anyone's: an author
+can declare their own claim replaced by someone else's ("I accept yours").
+Anything else stays a plain relation, visible and marked as proposed, the way
+`log --current` already shows it.
+
+**Policies can trust more.** A policy may name `supersession_authorities`
+(empty by default, so the default policy trusts no one extra): in that
+policy's accepted layer, their cross-author supersessions count too. That
+keeps a reader's right to decide (vision principle 4) without letting any
+writer decide for everyone.
+
+**Effects:**
+
+- `780f658d4b84` is fixed by the rule: `open_conflicts` uses the open layer,
+  where cross-author supersession no longer counts.
+- The manager handover (process 9.4) under a new identity needs the old
+  identity to write the relation while its key exists. Otherwise the new
+  manager's claim stands alongside, marked, which is what happens today.
+- No validity rule changes, so every existing Ground still opens. Derived
+  state changes only where cross-author supersessions exist, and this repo's
+  Ground has none (note `4f72b184f324`). It's still a `protocol`-class change
+  with a migration note.
+
+**Caveat:** inside the team, the rule binds only as far as keys do. Any
+agent can still sign the relation with the target author's key, as with
+everything in section 3.
+
+**Alternative:** a proposal the old author accepts with a second relation.
+Same outcome; the recommendation needs one relation.
+
+## 7. Staged plan
+
+| Step | What | Class | Needs your go |
+|---|---|---|---|
+| 0 | Decide this proposal; supersession rule and its tests (independent of sync) | protocol | Yes (decision 4) |
+| 1 | Sync messages and session state machine in `manyroot`, with no I/O; `bracken sync` between two local directories uses it. (The iterative `is_retracted` is already PR #8.) | protocol (wire format in protocol.md), library | Yes (wire format) |
+| 2 | `bracken serve` (HTTP and `--stdio`), allowlist, quotas, first-seen log; `bracken sync <url>`. Tested on localhost against throwaway Grounds | cli, storage | No |
+| 3 | Upgrade every reader's pinned binary to include PR #8; then run the team server and its off-host backup; `scripts/bk` confirms pushes and the gate fails closed; per-machine keys; checkpoints continue | merge-gate tooling, process | Yes (decisions 2, 3) |
+| 4 | Replace manual checkpoints with the daily export; update the skill | process, merge-gate tooling | Yes (decision 6) |
+| 5 | Agent-key session auth; membership as contributions (Stewards) | protocol, crypto | Yes |
+| 6 | Peer-to-peer discovery; range reconciliation with selective replication (Canopy) | protocol | Yes |
+
+The merge-sha check (section 5) and the no-secrets rule need no sync, so
+they can land now as a `process` change.
+
+**The smallest useful step is 1**: it makes the exchange exact and testable
+before any network code, and replaces whole-set copying in today's local
+`sync`. Step 3 is the first one the team feels: agents on other machines,
+and contributions visible in seconds.
+
+## Later: CI as a validator
+
+Not in v1. A `ci` key whose evidence policies count (`--validator ci`) would
+let CI join the Ground, but its pass can only ever mean "the PR's own tests
+pass in a clean environment", never an independent check. The PR's tree
+decides what `cargo test` does: `.cargo/config.toml` (a test runner of
+`true`, a `rustc-wrapper`), `rust-toolchain.toml`, test harness settings in
+`Cargo.toml`, deleted tests, `build.rs` and proc-macros (finding
+`06241d722a91`). So a reviewer's evidence stays required alongside it. A
+signer would need at least:
+
+- **Isolation** (finding `4612a2e0930f`): builds run on a separate,
+  disposable VM, not on the host holding the key or the sync server, with no
+  network, no host mounts or container socket, unprivileged, with resource
+  limits. Only the outcome goes back to the signer.
+- **Dependencies** fetched in a separate step, from the PR's `Cargo.lock` but
+  with cargo configuration the signer supplies, into a read-only vendor
+  directory. The build ignores the repository's `.cargo/` and toolchain file
+  and uses a fixed toolchain image.
+- **A policy for build-configuration changes:** a PR that touches `.cargo/`,
+  `rust-toolchain*`, `build.rs`, harness settings, or deletes tests gets no
+  `ci` pass, only a flag for reviewers.
+- **Binding** (finding `f68a026f861f`): it runs only for a full 40-hex sha
+  that is the Forge PR's current head, records the PR number, and the merge
+  uses the expected-head check in section 5.
+- **The key:** readable only by the signer's service user. A leaked key lets
+  its holder sign passing evidence on any claim, permanently and backdated,
+  until rotated as in process 9.3: a new key under a new name, a `decision`
+  naming the compromised one, the old key removed from the allowlist and
+  every `--validator`, and everything it signed re-checked.
+- **Prerequisite:** finding `b7f6724d61bb` closed, so no PR run can push to
+  main.
+
+## Comparison with existing systems
+
+**Git's smart protocol.** The server advertises refs; the client sends `want`
+and `have` lines until both agree on common commits; the server sends a
+packfile. Authentication is the transport's, and v2 runs statelessly over
+HTTP. We borrow transport authentication,
+the stateless HTTP mapping and `serve --stdio` over SSH. We need less: git's
+refs are mutable, so pushes can conflict and need locking; a Ground's heads are
+derived, and every push is a set union that can't conflict.
+
+**Automerge sync.** Peers exchange their heads and a Bloom filter of the
+changes since the heads they last had in common, then send what the filter
+says is missing, repeating until both sides' heads match. It has no
+authentication: that's the application's job. We borrow the heads-first
+exchange, and replace the Bloom filter
+with offer/need, which is exact, because our ids are cheap to list.
+
+**Hypercore.** Each feed is a single-writer append-only log, with a Merkle
+tree signed by its writer; peers replicate ranges, tracked with bitfields,
+and find each other through a DHT (Hyperswarm). Multi-writer needs a layer on
+top (Autobase). Our graph is multi-writer, with no per-author
+sequence numbers, so per-author range sync would need a protocol change. What
+carries over is the peer-to-peer part: DHT discovery, and fetching verifiable
+data from untrusted peers, as IPFS's Bitswap does with want-lists of content
+ids, like `Need`.
