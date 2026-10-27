@@ -1,0 +1,5 @@
+/target
+
+# Bracken Ground replicas (hold private keys) and the pinned team binary
+.bracken/
+.bracken-bin/

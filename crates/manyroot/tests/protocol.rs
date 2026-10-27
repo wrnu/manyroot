@@ -1,0 +1,313 @@
+use manyroot::validation::open_conflicts;
+use manyroot::*;
+
+fn ground() -> GroundId {
+    GroundId([7; 32])
+}
+
+fn agent(name: &str) -> Identity {
+    Identity::generate(name).unwrap()
+}
+
+fn claim(text: &str) -> Body {
+    Body::Claim { statement: text.into(), tags: vec![] }
+}
+
+fn relate(from: ContributionId, kind: RelationKind, to: ContributionId) -> Body {
+    Body::Relation { from, kind, to, note: String::new() }
+}
+
+fn evidence(target: ContributionId, verdict: Verdict) -> Body {
+    Body::Evidence { target, verdict, method: "test".into(), details: String::new() }
+}
+
+/// Adds a contribution on top of all current heads.
+fn add(g: &mut Graph, who: &Identity, body: Body) -> ContributionId {
+    let heads: Vec<_> = g.heads().collect();
+    let c = Contribution::create(g.ground(), who, heads, 0, body);
+    let id = c.id();
+    assert!(g.insert(c).unwrap());
+    id
+}
+
+/// Adds a contribution that only depends on what its body references.
+fn add_detached(g: &mut Graph, who: &Identity, body: Body) -> ContributionId {
+    let c = Contribution::create(g.ground(), who, [], 0, body);
+    let id = c.id();
+    g.insert(c).unwrap();
+    id
+}
+
+#[test]
+fn encoding_round_trips_and_ids_are_content_addresses() {
+    let alice = agent("alice");
+    let c = Contribution::create(ground(), &alice, [], 42, claim("tokens expire"));
+    let decoded = Contribution::decode(&c.encode()).unwrap();
+    assert_eq!(decoded, c);
+    assert!(decoded.signature_is_valid());
+
+    let mut trailing = c.encode();
+    trailing.push(0);
+    assert!(matches!(Contribution::decode(&trailing), Err(manyroot::contribution::DecodeError::NotCanonical)));
+
+    let other = Contribution::create(ground(), &alice, [], 43, claim("tokens expire"));
+    assert_ne!(other.id(), c.id(), "any change to content changes the id");
+}
+
+#[test]
+fn tampered_content_fails_signature_check() {
+    let alice = agent("alice");
+    let c = Contribution::create(ground(), &alice, [], 0, claim("original statement"));
+    let mut bytes = c.encode();
+    let pos = bytes.windows(8).position(|w| w == b"original").unwrap();
+    bytes[pos..pos + 8].copy_from_slice(b"modified");
+    let forged = Contribution::decode(&bytes).unwrap();
+    assert_ne!(forged.id(), c.id());
+    assert!(!forged.signature_is_valid());
+    assert_eq!(Graph::new(ground()).check(&forged), Err(RuleViolation::BadSignature));
+}
+
+#[test]
+fn rules_reject_invalid_contributions() {
+    let (alice, bob) = (agent("alice"), agent("bob"));
+    let mut g = Graph::new(ground());
+    let a = add(&mut g, &alice, claim("a"));
+
+    let elsewhere = Contribution::create(GroundId([9; 32]), &alice, [], 0, claim("x"));
+    assert!(matches!(g.check(&elsewhere), Err(RuleViolation::WrongGround { .. })));
+
+    let unknown = Contribution::create(ground(), &alice, [], 0, claim("unknown"));
+    let dangling = Contribution::create(ground(), &alice, [], 0, evidence(unknown.id(), Verdict::Pass));
+    assert_eq!(g.check(&dangling), Err(RuleViolation::MissingParent(unknown.id())));
+
+    let retract = Contribution::create(ground(), &bob, [], 0, Body::Retract { target: a, reason: String::new() });
+    assert_eq!(g.check(&retract), Err(RuleViolation::RetractByOther(a)));
+
+    let selfrel = Contribution::create(ground(), &alice, [], 0, relate(a, RelationKind::Refines, a));
+    assert_eq!(g.check(&selfrel), Err(RuleViolation::SelfRelation));
+
+    let empty = Contribution::create(ground(), &alice, [], 0, claim("  "));
+    assert_eq!(g.check(&empty), Err(RuleViolation::Empty("claim statement")));
+}
+
+#[test]
+fn replicas_converge_regardless_of_order() {
+    let (alice, bob, carol) = (agent("alice"), agent("bob"), agent("carol"));
+    let mut base = Graph::new(ground());
+    let root = add(&mut base, &alice, claim("we need auth"));
+
+    // Three replicas diverge from the same starting point.
+    let (mut r1, mut r2, mut r3) = (base.clone(), base.clone(), base);
+    add(&mut r1, &alice, claim("token validation"));
+    add(&mut r1, &alice, claim("token refresh"));
+    add(&mut r2, &bob, claim("rate limiting"));
+    let t = add(&mut r3, &carol, claim("security tests"));
+    add(&mut r3, &carol, relate(t, RelationKind::Tests, root));
+
+    // r1 <- r2 <- r3 in one order; r3 <- r1 <- r2 with reversed batches.
+    let mut x = r1.clone();
+    x.import(r2.missing_from(&x));
+    x.import(r3.missing_from(&x));
+
+    let mut y = r3.clone();
+    let mut batch = r2.missing_from(&y);
+    batch.extend(r1.missing_from(&y));
+    batch.reverse();
+    let report = y.import(batch);
+    assert!(report.is_clean());
+
+    assert_eq!(x.len(), 6);
+    assert_eq!(x.topo_order(), y.topo_order(), "same set gives the same causal order");
+    assert_eq!(x.heads().collect::<Vec<_>>(), y.heads().collect::<Vec<_>>());
+    assert_eq!(x.heads().count(), 3, "three concurrent lines of work");
+
+    // A new contribution on top of all heads merges them.
+    add(&mut x, &alice, claim("integrated"));
+    assert_eq!(x.heads().count(), 1);
+    assert!(x.is_ancestor(&root, &x.heads().next().unwrap()));
+}
+
+#[test]
+fn import_reports_unresolvable_contributions() {
+    let alice = agent("alice");
+    let mut source = Graph::new(ground());
+    let a = add(&mut source, &alice, claim("a"));
+    let b = add(&mut source, &alice, claim("b"));
+
+    let mut target = Graph::new(ground());
+    let only_child = source.missing_from(&target).into_iter().filter(|c| c.id() == b);
+    let report = target.import(only_child);
+    assert!(report.added.is_empty());
+    assert_eq!(report.unresolved, vec![b]);
+    assert!(!target.contains(&a));
+}
+
+#[test]
+fn retraction_and_retracting_a_retraction() {
+    let alice = agent("alice");
+    let mut g = Graph::new(ground());
+    let a = add(&mut g, &alice, claim("a"));
+    let r = add(&mut g, &alice, Body::Retract { target: a, reason: "wrong".into() });
+    assert!(g.is_retracted(&a));
+    add(&mut g, &alice, Body::Retract { target: r, reason: "it was right".into() });
+    assert!(!g.is_retracted(&a));
+}
+
+#[test]
+fn acceptance_requires_independent_evidence() {
+    let (alice, bob, carol) = (agent("alice"), agent("bob"), agent("carol"));
+    let mut g = Graph::new(ground());
+    let work = add(&mut g, &alice, claim("tokens expire after 15 minutes"));
+    let policy = Policy::default();
+    let status = |g: &Graph, p: &Policy| p.assess(g, &work).unwrap().status;
+
+    add(&mut g, &alice, evidence(work, Verdict::Pass));
+    assert_eq!(status(&g, &policy), Status::Pending, "self-validation does not count");
+
+    add(&mut g, &bob, evidence(work, Verdict::Pass));
+    assert_eq!(status(&g, &policy), Status::Accepted);
+
+    let strict = Policy { min_passes: 2, ..Policy::default() };
+    assert_eq!(status(&g, &strict), Status::Pending);
+    add(&mut g, &bob, evidence(work, Verdict::Pass));
+    assert_eq!(status(&g, &strict), Status::Pending, "validators count once each");
+
+    let fail = add(&mut g, &carol, evidence(work, Verdict::Fail));
+    assert_eq!(status(&g, &policy), Status::Rejected);
+
+    let only_bob = Policy { min_passes: 1, validators: Some([bob.agent_id()].into()) };
+    assert_eq!(status(&g, &only_bob), Status::Accepted, "carol's evidence is not counted under this policy");
+
+    add(&mut g, &carol, Body::Retract { target: fail, reason: "flaky runner".into() });
+    assert_eq!(status(&g, &policy), Status::Accepted);
+
+    assert!(policy.assess(&g, &fail).is_none(), "evidence is not itself assessed");
+}
+
+#[test]
+fn concurrent_supersessions_are_preserved_as_divergence() {
+    let (alice, bob, carol, val) = (agent("alice"), agent("bob"), agent("carol"), agent("validator"));
+    let mut g = Graph::new(ground());
+    let contract = add(&mut g, &alice, claim("tokens last 30 minutes"));
+    add(&mut g, &val, evidence(contract, Verdict::Pass));
+
+    // Bob and Carol each replace the contract without seeing the other.
+    let short = add_detached(&mut g, &bob, claim("tokens last 15 minutes"));
+    let long = add_detached(&mut g, &carol, claim("tokens last 60 minutes"));
+    add_detached(&mut g, &bob, relate(short, RelationKind::Supersedes, contract));
+    add_detached(&mut g, &carol, relate(long, RelationKind::Supersedes, contract));
+    assert!(!g.is_ancestor(&short, &long) && !g.is_ancestor(&long, &short));
+
+    // Before validation: open conflicts see the fork, accepted view does not.
+    let policy = Policy::default();
+    let divergence = Conflict::Divergence { target: contract, successors: sorted([short, long]) };
+    assert_eq!(open_conflicts(&g), vec![divergence.clone()]);
+    assert!(policy.evaluate(&g).conflicts.is_empty());
+    assert_eq!(ids(&policy.evaluate(&g)), vec![contract]);
+
+    add(&mut g, &val, evidence(short, Verdict::Pass));
+    let e = policy.evaluate(&g);
+    assert_eq!(ids(&e), vec![short], "accepted successor replaces the original");
+    assert!(e.conflicts.is_empty());
+
+    add(&mut g, &val, evidence(long, Verdict::Pass));
+    let e = policy.evaluate(&g);
+    assert_eq!(policy.assess(&g, &contract).unwrap().status, Status::Superseded);
+    assert_eq!(e.conflicts, vec![divergence]);
+
+    // A later decision that supersedes both resolves it.
+    let decision = add(&mut g, &alice, claim("tokens last 15 minutes; refresh tokens last 60"));
+    add(&mut g, &alice, relate(decision, RelationKind::Supersedes, short));
+    add(&mut g, &alice, relate(decision, RelationKind::Supersedes, long));
+    add(&mut g, &val, evidence(decision, Verdict::Pass));
+    let e = policy.evaluate(&g);
+    assert_eq!(ids(&e), vec![decision]);
+    assert!(e.conflicts.is_empty());
+}
+
+#[test]
+fn only_the_successors_author_can_supersede() {
+    let (alice, mallory, val) = (agent("alice"), agent("mallory"), agent("validator"));
+    let mut g = Graph::new(ground());
+    let a = add(&mut g, &alice, claim("a"));
+    let b = add(&mut g, &alice, claim("b"));
+    add(&mut g, &val, evidence(a, Verdict::Pass));
+    add(&mut g, &val, evidence(b, Verdict::Pass));
+    add(&mut g, &mallory, relate(b, RelationKind::Supersedes, a));
+    assert_eq!(Policy::default().assess(&g, &a).unwrap().status, Status::Accepted);
+}
+
+#[test]
+fn contradictions_between_current_contributions_are_reported() {
+    let (alice, bob) = (agent("alice"), agent("bob"));
+    let mut g = Graph::new(ground());
+    let a = add(&mut g, &alice, claim("clients cache tokens for 60 minutes"));
+    let b = add(&mut g, &bob, claim("tokens expire after 15 minutes"));
+    let rel = add(&mut g, &bob, relate(b, RelationKind::Contradicts, a));
+    assert_eq!(open_conflicts(&g), vec![Conflict::Contradiction { relation: rel, a: b, b: a }]);
+
+    add(&mut g, &alice, Body::Retract { target: a, reason: "fixed client".into() });
+    assert!(open_conflicts(&g).is_empty());
+}
+
+#[test]
+fn store_persists_syncs_and_bundles() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = Store::init(&tmp.path().join("a"), "auth").unwrap();
+    let mut b = Store::create(&tmp.path().join("b"), a.info().clone()).unwrap();
+    let alice = a.create_identity("alice").unwrap();
+    let bob = b.create_identity("bob").unwrap();
+    assert!(a.create_identity("alice").is_err(), "identities are never overwritten");
+
+    let x = a.contribute(&alice, claim("token validation")).unwrap();
+    b.contribute(&bob, claim("rate limiting")).unwrap();
+    let artifact =
+        Body::Artifact { name: "auth.rs".into(), media_type: "text/x-rust".into(), content: b"fn main() {}".to_vec() };
+    b.contribute(&bob, artifact).unwrap();
+
+    let (ra, rb) = store::sync(&mut a, &mut b).unwrap();
+    assert_eq!((ra.added.len(), rb.added.len()), (2, 1));
+    assert_eq!(a.graph().topo_order(), b.graph().topo_order());
+
+    let reopened = Store::open(&tmp.path().join("a")).unwrap();
+    assert_eq!(reopened.graph().topo_order(), a.graph().topo_order());
+    assert_eq!(reopened.identity("alice").unwrap().agent_id(), alice.agent_id());
+
+    let mut buf = Vec::new();
+    let all = a.graph().missing_from(&Graph::new(a.info().ground));
+    bundle::write(&mut buf, a.info().ground, all).unwrap();
+    let (gid, contributions) = bundle::read(buf.as_slice()).unwrap();
+    assert_eq!(gid, a.info().ground);
+    let mut c = Store::create(&tmp.path().join("c"), a.info().clone()).unwrap();
+    assert_eq!(c.import(contributions).unwrap().added.len(), 3);
+    assert!(c.graph().contains(&x));
+
+    let other = Store::init(&tmp.path().join("other"), "elsewhere").unwrap();
+    let mut other = other;
+    assert!(matches!(store::sync(&mut a, &mut other), Err(StoreError::DifferentGrounds(..))));
+}
+
+#[test]
+fn store_detects_tampered_objects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("g");
+    let mut s = Store::init(&dir, "g").unwrap();
+    let alice = s.create_identity("alice").unwrap();
+    let id = s.contribute(&alice, claim("original statement")).unwrap();
+    let hex = id.to_hex();
+    let path = dir.join("objects").join(&hex[..2]).join(&hex[2..]);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let pos = bytes.windows(8).position(|w| w == b"original").unwrap();
+    bytes[pos] = b'O';
+    std::fs::write(&path, bytes).unwrap();
+    assert!(matches!(Store::open(&dir), Err(StoreError::Corrupt { .. })));
+}
+
+fn ids(e: &Evaluation) -> Vec<ContributionId> {
+    e.accepted.iter().map(|a| a.id).collect()
+}
+
+fn sorted<const N: usize>(mut ids: [ContributionId; N]) -> Vec<ContributionId> {
+    ids.sort();
+    ids.to_vec()
+}

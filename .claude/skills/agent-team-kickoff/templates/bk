@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# bk: run bracken against the team's shared Ground from any worktree.
+#
+# Every agent, in every worktree, must read and write the same Ground, so this
+# resolves the main checkout through git and points BRACKEN_DIR at its
+# .bracken/. It prefers a pinned binary in <main>/.bracken-bin so that a broken
+# build on someone's branch can't break coordination for everyone.
+set -euo pipefail
+
+common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+  echo "bk: not inside a git repository" >&2
+  exit 1
+}
+main=$(dirname "$common")
+export BRACKEN_DIR="${BRACKEN_DIR:-$main/.bracken}"
+
+bin="${BRACKEN_BIN:-}"
+if [ -z "$bin" ]; then
+  if [ -x "$main/.bracken-bin/bin/bracken" ]; then
+    bin="$main/.bracken-bin/bin/bracken"
+  elif command -v bracken >/dev/null 2>&1; then
+    bin=$(command -v bracken)
+  else
+    echo "bk: no bracken binary; the manager installs one (see docs/development.md, 'The Ground')" >&2
+    exit 1
+  fi
+fi
+exec "$bin" "$@"

@@ -1,0 +1,21 @@
+[package]
+name = "bracken"
+description = "Bracken: agent-native collaborative software development on Manyroot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bracken"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+manyroot.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

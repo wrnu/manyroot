@@ -1,0 +1,229 @@
+//! A Ground replica on the local filesystem.
+//!
+//! ```text
+//! <dir>/ground.json          ground id and local name
+//! <dir>/objects/ab/cdef...   one file per contribution, named by id
+//! <dir>/identities/<name>    local agent keys (unencrypted in v0)
+//! ```
+//!
+//! Contribution files are content-addressed and written by atomic rename, so
+//! any number of agent processes can write to one replica without locking:
+//! two processes writing concurrently just produce concurrent contributions.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+
+use crate::contribution::{Body, Contribution, DecodeError};
+use crate::graph::{Graph, ImportReport, RuleViolation};
+use crate::id::{ContributionId, GroundId};
+use crate::identity::{self, Identity, IdentityError};
+
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("{path}")]
+    Io { path: PathBuf, source: std::io::Error },
+    #[error("no ground at {0}")]
+    NotAGround(PathBuf),
+    #[error("a ground already exists at {0}")]
+    AlreadyExists(PathBuf),
+    #[error("{path}: {reason}")]
+    Corrupt { path: PathBuf, reason: String },
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    #[error("contribution rejected")]
+    Rejected(#[from] RuleViolation),
+    #[error(transparent)]
+    Identity(#[from] IdentityError),
+    #[error("no identity named {0:?}")]
+    UnknownIdentity(String),
+    #[error("cannot sync ground {0} with ground {1}")]
+    DifferentGrounds(GroundId, GroundId),
+}
+
+fn io(path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + '_ {
+    move |source| StoreError::Io { path: path.to_owned(), source }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroundInfo {
+    pub ground: GroundId,
+    /// Local label only; not part of the protocol.
+    pub name: String,
+}
+
+pub struct Store {
+    dir: PathBuf,
+    info: GroundInfo,
+    graph: Graph,
+}
+
+impl Store {
+    /// Creates a new Ground with a fresh random id.
+    pub fn init(dir: &Path, name: &str) -> Result<Store, StoreError> {
+        let mut bytes = [0u8; 32];
+        getrandom::fill(&mut bytes).map_err(IdentityError::Random)?;
+        Self::create(dir, GroundInfo { ground: GroundId(bytes), name: name.to_owned() })
+    }
+
+    /// Creates an empty replica of an existing Ground, e.g. before syncing.
+    pub fn create(dir: &Path, info: GroundInfo) -> Result<Store, StoreError> {
+        let manifest = dir.join("ground.json");
+        if manifest.exists() {
+            return Err(StoreError::AlreadyExists(dir.to_owned()));
+        }
+        for sub in ["objects", "identities"] {
+            let p = dir.join(sub);
+            fs::create_dir_all(&p).map_err(io(&p))?;
+        }
+        let json = serde_json::to_string_pretty(&info).expect("ground info serializes") + "\n";
+        fs::write(&manifest, json).map_err(io(&manifest))?;
+        Ok(Store { dir: dir.to_owned(), graph: Graph::new(info.ground), info })
+    }
+
+    /// Opens a replica and verifies every contribution in it.
+    pub fn open(dir: &Path) -> Result<Store, StoreError> {
+        let manifest = dir.join("ground.json");
+        let text = match fs::read_to_string(&manifest) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(StoreError::NotAGround(dir.to_owned())),
+            Err(e) => return Err(io(&manifest)(e)),
+        };
+        let info: GroundInfo = serde_json::from_str(&text)
+            .map_err(|e| StoreError::Corrupt { path: manifest.clone(), reason: e.to_string() })?;
+
+        let mut batch = Vec::new();
+        let objects = dir.join("objects");
+        for shard in fs::read_dir(&objects).map_err(io(&objects))? {
+            let shard = shard.map_err(io(&objects))?.path();
+            if !shard.is_dir() {
+                continue;
+            }
+            for entry in fs::read_dir(&shard).map_err(io(&shard))? {
+                let path = entry.map_err(io(&shard))?.path();
+                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+                if file_name.starts_with('.') {
+                    continue; // in-flight write from another process
+                }
+                let bytes = fs::read(&path).map_err(io(&path))?;
+                let c = Contribution::decode(&bytes)
+                    .map_err(|e| StoreError::Corrupt { path: path.clone(), reason: e.to_string() })?;
+                if path != object_path(dir, &c.id()) {
+                    return Err(StoreError::Corrupt { path, reason: format!("content hashes to {}", c.id()) });
+                }
+                batch.push(c);
+            }
+        }
+
+        let mut graph = Graph::new(info.ground);
+        let report = graph.import(batch);
+        if let Some((id, why)) = report.rejected.first() {
+            return Err(StoreError::Corrupt { path: object_path(dir, id), reason: why.to_string() });
+        }
+        if let Some(id) = report.unresolved.first() {
+            return Err(StoreError::Corrupt {
+                path: object_path(dir, id),
+                reason: "an ancestor is missing from the replica".into(),
+            });
+        }
+        Ok(Store { dir: dir.to_owned(), info, graph })
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn info(&self) -> &GroundInfo {
+        &self.info
+    }
+
+    pub fn graph(&self) -> &Graph {
+        &self.graph
+    }
+
+    /// Writes a new contribution that builds on every current causal head.
+    pub fn contribute(&mut self, identity: &Identity, body: Body) -> Result<ContributionId, StoreError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let heads: Vec<ContributionId> = self.graph.heads().collect();
+        let c = Contribution::create(self.info.ground, identity, heads, now, body);
+        let id = c.id();
+        self.add(c)?;
+        Ok(id)
+    }
+
+    /// Adds one contribution whose parents are already present.
+    pub fn add(&mut self, c: Contribution) -> Result<bool, StoreError> {
+        if self.graph.contains(&c.id()) {
+            return Ok(false);
+        }
+        self.graph.check(&c)?;
+        let report = self.import([c])?;
+        Ok(!report.added.is_empty())
+    }
+
+    /// Imports contributions in any order, persisting each one as it is added.
+    pub fn import(&mut self, batch: impl IntoIterator<Item = Contribution>) -> Result<ImportReport, StoreError> {
+        let dir = self.dir.clone();
+        self.graph.import_with(batch, |c| write_object(&dir, c))
+    }
+
+    pub fn identities_dir(&self) -> PathBuf {
+        self.dir.join("identities")
+    }
+
+    pub fn create_identity(&self, name: &str) -> Result<Identity, StoreError> {
+        let identity = Identity::generate(name)?;
+        identity.save(&self.identities_dir().join(format!("{name}.json")))?;
+        Ok(identity)
+    }
+
+    pub fn identity(&self, name: &str) -> Result<Identity, StoreError> {
+        identity::validate_name(name)?;
+        let path = self.identities_dir().join(format!("{name}.json"));
+        if !path.exists() {
+            return Err(StoreError::UnknownIdentity(name.to_owned()));
+        }
+        Ok(Identity::load(&path)?)
+    }
+
+    /// Local identities, sorted by name.
+    pub fn identities(&self) -> Result<Vec<Identity>, StoreError> {
+        let dir = self.identities_dir();
+        let mut out = Vec::new();
+        for entry in fs::read_dir(&dir).map_err(io(&dir))? {
+            let path = entry.map_err(io(&dir))?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                out.push(Identity::load(&path)?);
+            }
+        }
+        out.sort_by(|a, b| a.name().cmp(b.name()));
+        Ok(out)
+    }
+}
+
+/// Exchanges contributions so both replicas end up holding the union.
+/// Returns the reports for `a` and `b` respectively.
+pub fn sync(a: &mut Store, b: &mut Store) -> Result<(ImportReport, ImportReport), StoreError> {
+    if a.info.ground != b.info.ground {
+        return Err(StoreError::DifferentGrounds(a.info.ground, b.info.ground));
+    }
+    let for_a = b.graph.missing_from(&a.graph);
+    let for_b = a.graph.missing_from(&b.graph);
+    Ok((a.import(for_a)?, b.import(for_b)?))
+}
+
+fn object_path(dir: &Path, id: &ContributionId) -> PathBuf {
+    let hex = id.to_hex();
+    dir.join("objects").join(&hex[..2]).join(&hex[2..])
+}
+
+fn write_object(dir: &Path, c: &Contribution) -> Result<(), StoreError> {
+    let path = object_path(dir, &c.id());
+    let shard = path.parent().expect("object path has a shard dir");
+    fs::create_dir_all(shard).map_err(io(shard))?;
+    let tmp = shard.join(format!(".tmp-{}-{}", std::process::id(), c.id().short()));
+    fs::write(&tmp, c.encode()).map_err(io(&tmp))?;
+    fs::rename(&tmp, &path).map_err(io(&path))
+}
