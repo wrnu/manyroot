@@ -300,9 +300,45 @@ impl Graph {
 
     /// Whether `id` has been withdrawn by its author. Retracting a retraction
     /// restores the original.
+    ///
+    /// A contribution is retracted if any retraction of it is not itself
+    /// retracted. Retractions of retractions can chain to any depth, so this
+    /// walks the tree of retractions under `id` with an explicit stack rather
+    /// than recursion: one author's long chain must not overflow the stack.
     pub fn is_retracted(&self, id: &ContributionId) -> bool {
+        // Each frame holds a contribution's retractions and the next one to visit.
+        let mut stack = vec![(self.retractions(id), 0)];
+        // The answer for the frame just popped, to be applied to its parent.
+        let mut finished: Option<bool> = None;
+        while let Some((retractions, next)) = stack.last_mut() {
+            if finished.take() == Some(false) {
+                // A retraction that stands: this frame's contribution is retracted.
+                stack.pop();
+                finished = Some(true);
+                continue;
+            }
+            match retractions.get(*next) {
+                Some(r) => {
+                    *next += 1;
+                    let child = self.retractions(r);
+                    stack.push((child, 0));
+                }
+                None => {
+                    // No standing retraction: not retracted.
+                    stack.pop();
+                    finished = Some(false);
+                }
+            }
+        }
+        finished.expect("the root frame always finishes")
+    }
+
+    /// Retractions that target `id`.
+    fn retractions(&self, id: &ContributionId) -> Vec<ContributionId> {
         self.referrers(id)
-            .any(|r| matches!(r.body(), Body::Retract { target, .. } if target == id) && !self.is_retracted(&r.id()))
+            .filter(|r| matches!(r.body(), Body::Retract { target, .. } if target == id))
+            .map(|r| r.id())
+            .collect()
     }
 
     /// Contributions this graph has that `other` lacks, parents first.

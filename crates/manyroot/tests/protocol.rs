@@ -154,6 +154,61 @@ fn retraction_and_retracting_a_retraction() {
 }
 
 #[test]
+fn a_long_chain_of_retractions_does_not_overflow_the_stack() {
+    // Each retraction retracts the one before it. The last one stands, so
+    // the claim stands when the chain's length is even.
+    const CHAIN: usize = 10_000;
+    let alice = agent("alice");
+    let mut g = Graph::new(ground());
+    let a = add(&mut g, &alice, claim("a"));
+    let mut last = a;
+    for _ in 0..CHAIN {
+        last = add(&mut g, &alice, Body::Retract { target: last, reason: String::new() });
+    }
+    // A small stack, so the test fails the same way in debug and release
+    // builds if the walk ever recurses per link again.
+    let walk = std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(move || (g.is_retracted(&a), g.is_retracted(&last)))
+        .unwrap();
+    assert_eq!(walk.join().unwrap(), (CHAIN % 2 == 1, false));
+}
+
+/// The definition, written as directly as possible: retracted if any
+/// retraction of it is not itself retracted.
+fn retracted_by_definition(g: &Graph, id: &ContributionId) -> bool {
+    g.referrers(id).any(|r| {
+        matches!(r.body(), Body::Retract { target, .. } if target == id) && !retracted_by_definition(g, &r.id())
+    })
+}
+
+#[test]
+fn retraction_matches_its_definition_on_branching_retractions() {
+    let alice = agent("alice");
+    // A fixed xorshift sequence, so a failure reproduces.
+    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+    let mut next = |n: usize| {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        (state % n as u64) as usize
+    };
+    for _ in 0..20 {
+        let mut g = Graph::new(ground());
+        let mut ids = vec![add(&mut g, &alice, claim("a")), add(&mut g, &alice, claim("b"))];
+        // Retractions of random earlier contributions: several retractions of
+        // one target, retractions of retractions, and retractions of those.
+        for i in 0..40 {
+            let target = ids[next(ids.len())];
+            ids.push(add_detached(&mut g, &alice, Body::Retract { target, reason: i.to_string() }));
+        }
+        for id in &ids {
+            assert_eq!(g.is_retracted(id), retracted_by_definition(&g, id));
+        }
+    }
+}
+
+#[test]
 fn acceptance_requires_independent_evidence() {
     let (alice, bob, carol) = (agent("alice"), agent("bob"), agent("carol"));
     let mut g = Graph::new(ground());
