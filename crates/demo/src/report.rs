@@ -8,8 +8,9 @@ use std::time::Duration;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::agent::wip_round;
 use crate::bracken::Entry;
-use crate::harness::{Config, Run, Topology};
+use crate::harness::{Behaviour, Config, Run, Topology};
 use crate::task;
 
 #[derive(Debug, Serialize)]
@@ -18,6 +19,8 @@ pub struct Report {
     pub contributions: Contributions,
     pub work: Work,
     pub duplication: Duplication,
+    pub concurrent_starts: ConcurrentStarts,
+    pub wip: WipReport,
     pub availability: Availability,
     pub conflicts: Conflicts,
     pub ground_truth: GroundTruth,
@@ -35,6 +38,33 @@ pub struct ConfigReport {
     pub topology: Topology,
     pub sample: usize,
     pub specs: usize,
+    pub behaviour: Behaviour,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConcurrentStarts {
+    /// Implementations started while another agent's implementation of the same spec was
+    /// started and not yet delivered. Pairs started in the same round count once.
+    pub total: usize,
+    /// Of those, where the other work started in the same round: nothing could have shown it.
+    pub same_round: usize,
+    /// Of those, where the other work started in an earlier round.
+    pub later_round: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WipReport {
+    /// Claims tagged `wip`.
+    pub claims: usize,
+    /// Retracted by their author on delivering the work.
+    pub delivered: usize,
+    /// Retracted by their author on dropping the work.
+    pub abandoned: usize,
+    /// Superseded by another agent's wip claim, as stale.
+    pub taken_over: usize,
+    /// Wip claims made while the author's replica held another agent's open, fresh wip claim
+    /// on the same spec. Agents that honour wip claims make none.
+    pub ignored_fresh: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -138,6 +168,9 @@ struct Impl<'a> {
     spec: &'a str,
     correct: bool,
     fix: bool,
+    /// The round its work started, from its `implements` note, else the round it was delivered.
+    started: u32,
+    delivered: u32,
 }
 
 pub fn build(cfg: &Config, run: &Run, wall: Duration, calls: u64, bracken: Duration) -> Report {
@@ -171,11 +204,15 @@ pub fn build(cfg: &Config, run: &Run, wall: Duration, calls: u64, bracken: Durat
     for r in relations("implements") {
         let (Some(a), Some(spec)) = (by_id.get(r.text("from")), spec_of_claim.get(r.text("to"))) else { continue };
         let Some(s) = task::spec(spec).filter(|_| a.kind == "artifact" && a.author == r.author) else { continue };
+        let delivered = run.origin[&a.id].round;
+        let started = r.text("note").strip_prefix("started in round ").and_then(|n| n.parse().ok());
         impls.entry(a.id.as_str()).or_insert(Impl {
             entry: a,
             spec,
             correct: s.is_correct(a.text("text")),
             fix: fixes.contains(a.id.as_str()),
+            started: started.unwrap_or(delivered).min(delivered),
+            delivered,
         });
     }
 
@@ -206,6 +243,29 @@ pub fn build(cfg: &Config, run: &Run, wall: Duration, calls: u64, bracken: Durat
             duplication.blind += 1;
         }
     }
+
+    let name = |e: &Entry| &run.names[run.origin[&e.id].agent];
+    let mut concurrent_starts = ConcurrentStarts { total: 0, same_round: 0, later_round: 0 };
+    for i in impls.values() {
+        let overlapping: Vec<&Impl> = impls
+            .values()
+            .filter(|j| j.spec == i.spec && j.entry.author != i.entry.author)
+            .filter(|j| j.started <= i.started && i.started <= j.delivered)
+            // In a same-round pair, count only the agent later in name order.
+            .filter(|j| j.started < i.started || name(j.entry) < name(i.entry))
+            .collect();
+        if overlapping.is_empty() {
+            continue;
+        }
+        concurrent_starts.total += 1;
+        if overlapping.iter().any(|j| j.started < i.started) {
+            concurrent_starts.later_round += 1;
+        } else {
+            concurrent_starts.same_round += 1;
+        }
+    }
+
+    let wip = wip_report(cfg, run, &mine, &by_id);
 
     let final_phase = cfg.rounds + 1;
     let mut latencies = Vec::new();
@@ -283,6 +343,7 @@ pub fn build(cfg: &Config, run: &Run, wall: Duration, calls: u64, bracken: Durat
             topology: cfg.topology,
             sample: cfg.sample,
             specs: task::SPECS.len(),
+            behaviour: cfg.behaviour,
         },
         contributions: Contributions { total: mine.len(), by_kind, by_agent },
         work: Work {
@@ -294,6 +355,8 @@ pub fn build(cfg: &Config, run: &Run, wall: Duration, calls: u64, bracken: Durat
             findings: mine.iter().filter(|e| e.kind == "claim" && e.tags().first() == Some(&"finding")).count(),
         },
         duplication,
+        concurrent_starts,
+        wip,
         availability,
         conflicts,
         ground_truth: GroundTruth {
@@ -307,19 +370,74 @@ pub fn build(cfg: &Config, run: &Run, wall: Duration, calls: u64, bracken: Durat
     }
 }
 
+fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &Entry>) -> WipReport {
+    let claims: Vec<(&Entry, &str, u32)> = mine
+        .iter()
+        .filter(|e| e.kind == "claim")
+        .filter_map(|e| match (&e.tags()[..], wip_round(e.text("statement"))) {
+            (&["wip", spec], Some(round)) => Some((*e, spec, round)),
+            _ => None,
+        })
+        .collect();
+    let is_wip = |id: &str| claims.iter().any(|(c, ..)| c.id == id);
+    let retracts = |prefix: &str| {
+        mine.iter()
+            .filter(|e| e.kind == "retract" && is_wip(e.text("target")) && e.text("reason").starts_with(prefix))
+            .count()
+    };
+    // Relations and retractions that close a wip claim, by the claim they close.
+    let closers: Vec<(&str, &str)> = mine
+        .iter()
+        .filter(|e| match e.kind.as_str() {
+            "retract" => true,
+            "relation" => {
+                e.text("kind") == "supersedes" && by_id.get(e.text("from")).is_some_and(|f| f.author == e.author)
+            }
+            _ => false,
+        })
+        .map(|e| (e.text(if e.kind == "retract" { "target" } else { "to" }), e.id.as_str()))
+        .collect();
+    let taken_over = mine
+        .iter()
+        .filter(|e| e.kind == "relation" && e.text("kind") == "supersedes")
+        .filter(|e| is_wip(e.text("from")) && is_wip(e.text("to")))
+        .count();
+
+    let mut ignored_fresh = 0;
+    for (w2, spec, r2) in &claims {
+        let held = &run.held_before[&w2.id];
+        let ignored = claims.iter().any(|(w1, s1, r1)| {
+            s1 == spec
+                && w1.author != w2.author
+                && held.contains(&w1.id)
+                && r2 < &(r1 + cfg.behaviour.stale_after)
+                && !closers.iter().any(|(target, closer)| *target == w1.id && held.contains(*closer))
+        });
+        ignored_fresh += usize::from(ignored);
+    }
+    WipReport {
+        claims: claims.len(),
+        delivered: retracts("delivered"),
+        abandoned: retracts("abandoned"),
+        taken_over,
+        ignored_fresh,
+    }
+}
+
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let c = &self.config;
         let topology = serde_json::to_value(c.topology).expect("topologies serialize");
         writeln!(
             f,
-            "Bracken demo: {} agents, {} rounds, seed {}, {} sync, checks on {} sampled inputs, {} specs\n",
+            "Bracken demo: {} agents, {} rounds, seed {}, {} sync, checks on {} sampled inputs, {} specs{}\n",
             c.agents,
             c.rounds,
             c.seed,
             topology.as_str().unwrap_or("?"),
             c.sample,
-            c.specs
+            c.specs,
+            describe(&c.behaviour)
         )?;
 
         let kinds: Vec<String> = self.contributions.by_kind.iter().map(|(k, n)| format!("{k} {n}")).collect();
@@ -339,6 +457,21 @@ impl fmt::Display for Report {
             "Duplicated work  {} of {} new implementations repeat another agent's spec ({} blind, {} visible)",
             d.duplicates, d.new_implementations, d.blind, d.visible
         )?;
+        let cs = &self.concurrent_starts;
+        writeln!(
+            f,
+            "Concurrent work  {} implementations started while another agent's was under way \
+             ({} started the same round, {} later)",
+            cs.total, cs.same_round, cs.later_round
+        )?;
+        let w = &self.wip;
+        if c.behaviour.wip {
+            writeln!(
+                f,
+                "Wip claims       {}: {} delivered, {} abandoned, {} taken over when stale, {} ignored while fresh",
+                w.claims, w.delivered, w.abandoned, w.taken_over, w.ignored_fresh
+            )?;
+        }
         let a = &self.availability;
         let hist: Vec<String> = a.histogram.iter().map(|(r, n)| format!("{r}: {n}")).collect();
         writeln!(
@@ -402,4 +535,14 @@ impl fmt::Display for Report {
             t.bracken_ms as f64 / 1000.0
         )
     }
+}
+
+/// The behaviour, for the report's first line. Empty for the plain demo.
+fn describe(b: &Behaviour) -> String {
+    if *b == Behaviour::default() {
+        return String::new();
+    }
+    let schedule = serde_json::to_value(b.schedule).expect("schedules serialize");
+    let wip = if b.wip { format!(", wip claims (stale after {} rounds)", b.stale_after) } else { String::new() };
+    format!("\nwork takes {} rounds, {} schedule{wip}", b.work_rounds, schedule.as_str().unwrap_or("?"))
 }

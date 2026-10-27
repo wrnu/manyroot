@@ -202,6 +202,11 @@ impl<'b> Replica<'b> {
         self.write(&args)
     }
 
+    pub fn retract(&self, target: &str, reason: &str) -> Result<String> {
+        let args: [&OsStr; 4] = ["retract".as_ref(), target.as_ref(), "--reason".as_ref(), reason.as_ref()];
+        self.write(&args)
+    }
+
     pub fn evidence(&self, target: &str, pass: bool, method: &str, details: &str) -> Result<String> {
         let verdict = if pass { "pass" } else { "fail" };
         let args: [&OsStr; 7] = [

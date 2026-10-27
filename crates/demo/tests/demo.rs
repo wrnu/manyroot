@@ -260,3 +260,113 @@ fn runs_refuse_a_directory_inside_a_real_git_repository() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("inside the git checkout"));
 }
+
+#[test]
+fn keep_refuses_dot_dot_after_a_missing_directory() {
+    // Repro of finding ce255fae2fa8: the checks saw T/safe, but creating the path lands in T/repo.
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("repo/.git")).unwrap();
+    let safe = tmp.path().join("safe");
+    std::fs::create_dir_all(&safe).unwrap();
+    let out = demo_command(&["--agents", "2", "--rounds", "1", "--keep", "nope/../../repo/run2"])
+        .current_dir(&safe)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the run must be refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("'..' after a directory that doesn't exist yet"));
+    assert!(!tmp.path().join("repo/run2").exists());
+    assert!(!safe.join("nope").exists(), "nothing is created when refused");
+
+    // '..' through directories that exist is still fine.
+    let out =
+        demo_command(&["--agents", "2", "--rounds", "1", "--keep", "../safe/run"]).current_dir(&safe).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(safe.join("run/.gitignore").is_file());
+}
+
+/// A wip claim's spec, the round it states, and its author.
+struct WipClaim<'a> {
+    id: &'a str,
+    author: &'a str,
+    spec: &'a str,
+    round: u64,
+}
+
+/// The round in a trailing "(round N)" or "... in round N".
+fn round_in(text: &str) -> u64 {
+    let digits: String = text.trim_end_matches(')').chars().rev().take_while(char::is_ascii_digit).collect();
+    digits.chars().rev().collect::<String>().parse().unwrap()
+}
+
+#[test]
+fn wip_claims_are_honoured_while_fresh_and_taken_over_when_stale() {
+    // With full sync, a contribution made in round r is visible to every agent from round r + 1,
+    // so the rules can be checked from the Ground alone.
+    let tmp = tempfile::tempdir().unwrap();
+    let kept = tmp.path().join("run");
+    let args = ["--agents", "4", "--rounds", "10", "--seed", "6", "--topology", "full"];
+    let wip = ["--work-rounds", "1", "--schedule", "stagger", "--wip", "--keep", kept.to_str().unwrap()];
+    let r = report(&[&args[..], &wip[..]].concat());
+    let stale_after = r["config"]["behaviour"]["stale_after"].as_u64().unwrap();
+    assert_eq!(stale_after, 2);
+    assert_eq!(r["wip"]["ignored_fresh"], 0);
+
+    let log = bracken_json(&kept.join("agent-0/.bracken"), &["log", "--json"]);
+    let log = log.as_array().unwrap();
+    let claims: Vec<WipClaim> = log
+        .iter()
+        .filter(|c| c["kind"] == "claim" && c["body"]["tags"][0] == "wip")
+        .map(|c| WipClaim {
+            id: c["id"].as_str().unwrap(),
+            author: c["author"].as_str().unwrap(),
+            spec: c["body"]["tags"][1].as_str().unwrap(),
+            round: round_in(c["body"]["statement"].as_str().unwrap()),
+        })
+        .collect();
+    let wip = |id: &str| claims.iter().find(|w| w.id == id);
+    // The round each claim was closed in: retracted by its author, or superseded by a takeover.
+    let mut closed: HashMap<&str, u64> = HashMap::new();
+    let mut takeovers = 0;
+    for c in log {
+        let body = &c["body"];
+        if c["kind"] == "retract" && wip(body["target"].as_str().unwrap()).is_some() {
+            closed.insert(body["target"].as_str().unwrap(), round_in(body["reason"].as_str().unwrap()));
+        }
+        if c["kind"] == "relation"
+            && body["kind"] == "supersedes"
+            && let (Some(new), Some(old)) = (wip(body["from"].as_str().unwrap()), wip(body["to"].as_str().unwrap()))
+        {
+            assert!(new.round >= old.round + stale_after, "{} took over a fresh claim", new.id);
+            assert!(closed.get(old.id).is_none_or(|&r| r >= new.round), "took over a claim already closed");
+            closed.entry(old.id).or_insert(new.round);
+            takeovers += 1;
+        }
+    }
+    assert!(takeovers > 0, "this seed has stale claims that get taken over");
+    assert_eq!(r["wip"]["taken_over"], takeovers);
+
+    // No agent starts a spec that another agent announced in an earlier round, while that claim is
+    // open and fresh. Starts in the same round can't see each other, so they are allowed.
+    for w2 in &claims {
+        for w1 in claims.iter().filter(|w1| w1.spec == w2.spec && w1.author != w2.author && w1.round < w2.round) {
+            let open = closed.get(w1.id).is_none_or(|&r| r >= w2.round);
+            let fresh = w2.round < w1.round + stale_after;
+            assert!(!(open && fresh), "{} started {} over a fresh claim {}", w2.author, w2.spec, w1.id);
+        }
+    }
+}
+
+#[test]
+fn compare_is_deterministic_per_seed() {
+    let args = ["compare", "--seeds", "1,2", "--topologies", "ring", "--work-rounds", "1"];
+    let small = ["--schedules", "stagger", "--rounds", "6", "--agents", "3", "--json"];
+    let run = || {
+        let out = demo(&[&args[..], &small[..]].concat());
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice::<Value>(&out.stdout).unwrap()
+    };
+    let first = run();
+    assert_eq!(first.as_array().unwrap().len(), 2, "one row without wip, one with");
+    assert_eq!(first[1]["wip_ignored_fresh"], 0);
+    assert_eq!(first, run());
+}

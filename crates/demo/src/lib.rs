@@ -6,7 +6,9 @@
 
 pub mod agent;
 pub mod bracken;
+pub mod compare;
 pub mod harness;
 pub mod report;
 pub mod rng;
+pub mod safety;
 pub mod task;

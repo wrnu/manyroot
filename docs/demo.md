@@ -26,6 +26,10 @@ one.
 | `--seed N` | 1 | Seeds the agents and the gossip topology |
 | `--topology full\|ring\|gossip` | ring | Who imports whose bundle after a round: everyone's; the previous agent's; one random agent's |
 | `--sample N` | 6 | Inputs an agent checks per implementation |
+| `--work-rounds N` | 0 | Rounds between starting an implementation and delivering it |
+| `--schedule lockstep\|stagger\|jitter` | lockstep | When agents start work relative to each other (see [Work in progress](#work-in-progress)) |
+| `--wip` | | Announce work with a `wip` claim before doing it, and skip specs others have announced |
+| `--stale-after N` | see below | Rounds after its own round at which an open wip claim is stale |
 | `--keep DIR` | | Keep the replicas in `DIR` (must not exist), instead of a temporary directory |
 | `--allow-in-repo` | | Allow the run's directory inside a git checkout (refused by default) |
 | `--json` | | Print the report as JSON |
@@ -41,7 +45,9 @@ directory. It also refuses to run in a directory inside a git checkout (asking
 or with `GIT_DIR` or `GIT_WORK_TREE` set, unless you pass `--allow-in-repo`, so
 agents never work with a repository's files, or its Ground, in reach. Every
 path the demo hands to bracken is absolute, so a relative `--keep` stays where
-you asked.
+you asked. A `--keep` path with `..` after a directory that doesn't exist yet
+is refused, because creating it would follow the `..` to a place the checks
+never looked at.
 
 To look around a run's Ground afterwards, keep it outside any repository and
 point bracken at a replica:
@@ -98,6 +104,39 @@ Each agent draws its own skill and habits from the seed. It only knows what its
 replica holds, and nothing tells agents what others are working on, so agents
 working at the same time often pick the same spec.
 
+### Work in progress
+
+By default an agent delivers an implementation in the turn it decides to write
+it. With `--work-rounds W`, it delivers W rounds after starting, and each round
+it has a 10% chance of dropping the work instead. With `--wip`, it also:
+
+- contributes a claim tagged `wip` and the spec's name when it starts
+  (`Work in progress: agent-1 is implementing max2 (round 3)`), refining the
+  spec;
+- retracts that claim when it delivers (`delivered in round 4`). When it drops
+  the work, half the time it retracts the claim (`abandoned in round 4`) and
+  half the time it goes silent, so the claim goes stale;
+- doesn't start a spec that another agent's open wip claim covers, unless that
+  claim is stale: `--stale-after` rounds have passed since the round it
+  states. Every agent reaches the same verdict. A start that takes over stale
+  claims `supersedes` them.
+
+The default stale window is one round after the latest the work could be due:
+W + 1, or W + 2 under `jitter`. A claim is never stale while its work is on
+time.
+
+`--schedule` sets when agents start, in both modes alike:
+
+- **lockstep**: everyone starts in round 1, and all work takes exactly W
+  rounds, so all agents choose in the same rounds;
+- **stagger**: agent i first starts in round 1 + (i mod (W + 1)), as if the
+  agents had joined at different times;
+- **jitter**: staggered first starts, and each piece of work takes W or W + 1
+  rounds at random, so agents drift apart over time.
+
+The plain demo is `--work-rounds 0 --schedule lockstep` without wip: the same
+agents and the same numbers as before these options existed.
+
 ## What the numbers mean
 
 The harness computes everything from the replicas, through bracken's JSON,
@@ -109,6 +148,8 @@ setter's are left out.
 | Contributions | Agents' contributions, by kind and by agent |
 | Work | Implementations (artifacts that `implement` a spec, by the artifact's author); fixes (implementations that `supersede` another); checks (evidence) and their verdicts; findings (claims tagged `finding`) |
 | Duplicated work | New implementations (not fixes) of a spec that another agent had already implemented anywhere in the Ground. **Blind**: the earlier one hadn't reached this agent's replica yet, so only better sync or visible work in progress would have avoided it. **Visible**: the agent's replica already held it. Competing fixes aren't counted here; they show up as divergences |
+| Concurrent work | Implementations started while another agent's implementation of the same spec was started and not yet delivered: the duplication that announcing work could prevent. The start round comes from the `implements` relation's note (`started in round N`). A pair started in the same round counts once, as **same round**: no sync could have shown either agent the other's start. **Later** means the other work started in an earlier round. Dropped work leaves no artifact, so it isn't counted |
+| Wip claims | Shown with `--wip`: claims made, retracted on delivery, retracted on abandonment, taken over when stale, and **ignored while fresh**: claims made while the author's replica held another agent's open, fresh wip claim on the same spec. The scripted agent never does that, so it's always 0 |
 | Availability | For each contribution and each other agent, the number of sync rounds until that agent's replica held it: 1 means the sync right after the round it was made. The final all-to-all sync counts as round `rounds + 1`, and the line says how many pairs only arrived then |
 | Conflicts | What `bracken conflicts` reports at the end: divergences (one implementation superseded by two current ones) and contradictions (a current finding contradicting a current implementation). Fixing an implementation resolves the contradictions against it. The relation counts show how many of each kind agents made |
 | Ground truth | The harness checks every implementation on every input. "Caught" means a wrong one got at least one failing check from another agent |
@@ -125,6 +166,7 @@ Contributions    75 by agents: artifact 16, claim 5, evidence 28, relation 26
                  agent-0 21, agent-1 18, agent-2 18, agent-3 18
 Work             16 implementations (0 fixes), 28 checks (20 pass, 8 fail), 5 findings
 Duplicated work  10 of 16 new implementations repeat another agent's spec (8 blind, 2 visible)
+Concurrent work  6 implementations started while another agent's was under way (6 started the same round, 0 later)
 Availability     1.90 sync rounds on average until another agent holds a contribution (median 2, max 3; 61 of 225 only in the final sync)
                  by rounds: 1: 75, 2: 97, 3: 53
 Conflicts        0 divergences, 5 contradictions open at the end (from 0 supersedes and 5 contradicts relations)
@@ -136,8 +178,102 @@ min passes 2         9           0      9        9      0         5 of 6        
 min passes 3         1           0      1        1      0         1 of 6          0
 
 Replicas         converged: all 4 hold the same 88 contributions
-Timing           5.0 s wall, 228 bracken calls (4.9 s)
+Timing           5.5 s wall, 228 bracken calls (5.5 s)
 ```
+
+## Experiments
+
+### Does announcing work cut duplication?
+
+The first result (Ground note `bd7882c5dcae`) was that most
+duplicated work is blind: agents repeat a spec before the earlier work reaches
+them. The vision's answer is visible claims of work in progress, so this
+experiment adds them (`--wip`) and compares runs with and without:
+
+```sh
+cargo build --release -p bracken -p bracken-demo
+target/release/bracken-demo compare            # seeds 1..10, ring and gossip, W = 1 and 2, all schedules
+```
+
+Every row is the mean over seeds 1 to 10, with 4 agents and 12 rounds: enough
+rounds for jittered work to drift apart. "Accepted" is under min passes 2.
+All 240 runs converged, and no agent ever ignored a fresh wip claim.
+
+| Topology | W | Schedule | Wip | Concurrent starts (same round) | Duplicates (blind/visible) | Accepted (correct) | Specs solved | Contributions | Bracken calls | Wip claims (taken over) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ring | 1 | lockstep | off | 6.2 (5.7) | 7.9 (4.5/3.4) | 12.3 (11.5) | 5.9 | 112 | 405 |  |
+| ring | 1 | lockstep | on | 6.1 (5.7) | 8.0 (4.5/3.5) | 12.2 (11.5) | 5.9 | 180 | 473 | 22.1 (3.7) |
+| ring | 1 | stagger | off | 7.1 (1.3) | 8.2 (1.6/6.6) | 11.9 (11.1) | 5.4 | 113 | 406 |  |
+| ring | 1 | stagger | on | 3.7 (1.0) | 7.7 (2.0/5.7) | 10.6 (9.9) | 5.8 | 182 | 475 | 22.2 (8.0) |
+| ring | 1 | jitter | off | 5.5 (1.7) | 5.8 (2.1/3.7) | 7.9 (7.7) | 4.8 | 82 | 374 |  |
+| ring | 1 | jitter | on | 3.6 (1.6) | 5.2 (1.8/3.4) | 8.3 (7.5) | 5.3 | 131 | 424 | 17.7 (3.3) |
+| ring | 2 | lockstep | off | 3.7 (2.4) | 4.5 (2.4/2.1) | 6.9 (6.7) | 4.1 | 69 | 362 |  |
+| ring | 2 | lockstep | on | 3.2 (2.6) | 4.3 (2.3/2.0) | 6.7 (6.5) | 4.1 | 122 | 415 | 16.9 (4.2) |
+| ring | 2 | stagger | off | 4.8 (0.6) | 5.0 (1.9/3.1) | 6.8 (6.4) | 3.8 | 64 | 358 |  |
+| ring | 2 | stagger | on | 2.5 (0.8) | 3.8 (2.1/1.7) | 6.4 (5.9) | 4.7 | 106 | 400 | 15.3 (2.3) |
+| ring | 2 | jitter | off | 3.5 (0.5) | 3.7 (1.4/2.3) | 4.6 (4.0) | 3.1 | 54 | 347 |  |
+| ring | 2 | jitter | on | 1.7 (0.7) | 2.8 (0.9/1.9) | 3.9 (3.6) | 3.2 | 98 | 390 | 14.8 (2.2) |
+| gossip | 1 | lockstep | off | 6.8 (6.2) | 6.7 (3.5/3.2) | 12.2 (11.3) | 5.8 | 112 | 405 |  |
+| gossip | 1 | lockstep | on | 6.6 (6.3) | 6.8 (3.5/3.3) | 12.2 (11.3) | 5.8 | 180 | 473 | 21.4 (4.6) |
+| gossip | 1 | stagger | off | 7.8 (1.5) | 7.5 (2.5/5.0) | 11.2 (10.9) | 5.7 | 116 | 409 |  |
+| gossip | 1 | stagger | on | 5.5 (2.3) | 6.8 (2.5/4.3) | 11.0 (10.4) | 5.6 | 169 | 462 | 21.5 (4.1) |
+| gossip | 1 | jitter | off | 5.4 (1.8) | 6.1 (2.3/3.8) | 8.1 (7.9) | 5.0 | 88 | 381 |  |
+| gossip | 1 | jitter | on | 3.1 (1.5) | 4.4 (1.5/2.9) | 7.6 (7.0) | 5.3 | 131 | 424 | 17.2 (2.7) |
+| gossip | 2 | lockstep | off | 3.9 (2.4) | 4.4 (2.0/2.4) | 6.6 (6.3) | 3.9 | 69 | 362 |  |
+| gossip | 2 | lockstep | on | 3.5 (2.5) | 4.9 (2.2/2.7) | 6.9 (6.5) | 4.0 | 118 | 411 | 17.0 (4.1) |
+| gossip | 2 | stagger | off | 4.2 (0.8) | 4.5 (1.9/2.6) | 6.8 (6.6) | 3.7 | 62 | 355 |  |
+| gossip | 2 | stagger | on | 2.9 (1.3) | 4.6 (1.5/3.1) | 6.5 (6.1) | 4.6 | 112 | 406 | 15.7 (3.3) |
+| gossip | 2 | jitter | off | 3.2 (0.6) | 3.8 (1.1/2.7) | 4.7 (4.6) | 3.1 | 54 | 347 |  |
+| gossip | 2 | jitter | on | 2.3 (1.1) | 3.3 (0.7/2.6) | 4.6 (4.5) | 3.6 | 94 | 386 | 14.4 (2.4) |
+
+**What changes between rows matters more than wip.**
+
+- **The schedule decides whether wip can help at all.** In lockstep every agent
+  chooses in the same rounds, so almost every concurrent start is a same-round
+  start (5.7 of 6.2 on ring at W = 1). Wip can't help agents who all choose in
+  the same round, and it doesn't: 6.2 becomes 6.1. Staggered and jittered
+  schedules turn most concurrent starts into later-round ones (1.3 of 7.1 are
+  same-round under stagger), and those are the ones a claim can prevent.
+- **With the agents out of step, wip roughly halves concurrent starts:** on
+  ring, from 7.1 to 3.7 (stagger) and 5.5 to 3.6 (jitter) at W = 1, and 4.8 to
+  2.5 and 3.5 to 1.7 at W = 2. Gossip spreads claims more slowly and unevenly,
+  so the gain is smaller (7.8 to 5.5 for stagger, W = 1).
+- **Same-round starts stay blind in both modes.** Wip leaves them as they were,
+  or adds a few (gossip, stagger, W = 1: 1.5 to 2.3), because steering agents
+  away from claimed specs crowds them onto the few still free.
+- **Longer work (W = 2) means less of everything** in 12 rounds: fewer
+  implementations, fewer accepted, fewer specs solved. Comparing across W
+  compares different amounts of work.
+
+**PR #4's duplicate count barely moves** (ring, stagger, W = 1: 8.2 to 7.7),
+because most of it is visible: re-implementing a spec whose earlier
+implementation failed its checks, or deliberately repeating a covered one.
+Wip doesn't target either. Concurrent starts is the number it targets.
+
+**Overhead.** Wip adds 45 to 80% more contributions (claims, `refines`
+relations, retractions) and 12 to 17% more bracken calls. Availability is
+unchanged at about 2 sync rounds: claims don't make sync any faster.
+
+**Quality is unchanged.** Accepted correct implementations and solved specs
+stay within about 1.3 of the no-wip numbers, sometimes higher (specs solved
+3.8 to 4.7 on ring, stagger, W = 2) and sometimes lower, since fewer duplicates
+also mean fewer implementations to accept.
+
+**Staleness can't tell slow sync from stalled work.** Takeovers (2 to 8 per
+run) outnumber silently dropped claims, which at a 10% drop rate should be
+about 1 or 2 per run. On ring and
+gossip a delivery's retraction can take longer than the stale window to arrive,
+so an agent takes over work that was already done. Those takeovers account for
+some of the remaining later-round concurrent starts. A window based on sync
+lag, or a liveness signal (a claim refreshed each round), would separate the
+two. That's the next thing to try.
+
+**What this doesn't show.** The agents are scripted, every run uses the same
+six specs, and "work" is a delay, not effort. A real agent might ignore a
+claim, pick a different spec for its own reasons, or announce more than it
+does. The result is about the mechanism: announced work helps only when the
+announcement reaches others before they choose, and nothing helps agents who
+choose at the same moment.
 
 ## Against the Phase 1 list
 

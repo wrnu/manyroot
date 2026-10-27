@@ -1,18 +1,17 @@
 //! `bracken-demo`: run the demo, or check a program against a spec.
 
-use std::path::{Path, PathBuf};
-use std::process::{self, ExitCode, Stdio};
-use std::time::Instant;
+use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use serde_json::json;
 
-use bracken_demo::agent::{Agent, ScriptedAgent};
 use bracken_demo::bracken::Bracken;
-use bracken_demo::harness::{self, Config, Topology};
+use bracken_demo::harness::{self, Behaviour, Config, Schedule, Topology};
 use bracken_demo::rng::Rng;
-use bracken_demo::{report, task};
+use bracken_demo::safety::{refuse_git_checkout, refuse_parent_in_new_part};
+use bracken_demo::{compare, task};
 
 #[derive(Parser)]
 #[command(name = "bracken-demo", about = "Agents on a toy task through bracken, with a measured report.")]
@@ -41,6 +40,19 @@ struct RunArgs {
     /// Inputs per check. Smaller samples miss more edge-case bugs.
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u16).range(1..=169))]
     sample: u16,
+    /// Rounds between starting an implementation and delivering it.
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u32).range(0..=10))]
+    work_rounds: u32,
+    /// Announce work with a wip claim before doing it, and skip specs others have announced.
+    #[arg(long)]
+    wip: bool,
+    /// When agents start work relative to each other.
+    #[arg(long, value_enum, default_value_t = Schedule::Lockstep)]
+    schedule: Schedule,
+    /// Rounds after its own round at which an open wip claim is stale. Defaults to one round
+    /// after the latest the work could be due.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=20))]
+    stale_after: Option<u32>,
     /// Put the replicas in this new directory and keep them, instead of a temporary one.
     /// It holds each agent's private key, unencrypted, so it gets a `.gitignore` that ignores everything.
     #[arg(long, value_name = "DIR")]
@@ -76,6 +88,52 @@ enum Command {
     },
     /// Print the language and the specs.
     Task,
+    /// Run the same seeds with and without wip claims, for each topology, work length and
+    /// schedule, and print the means side by side.
+    Compare(CompareArgs),
+}
+
+#[derive(Args)]
+struct CompareArgs {
+    /// Seeds: a range like 1..10 (inclusive) or a list like 1,4,7.
+    #[arg(long, default_value = "1..10", value_parser = parse_seeds)]
+    seeds: Seeds,
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "ring,gossip")]
+    topologies: Vec<Topology>,
+    #[arg(long, value_delimiter = ',', default_value = "1,2")]
+    work_rounds: Vec<u32>,
+    #[arg(long, value_enum, value_delimiter = ',', default_value = "lockstep,stagger,jitter")]
+    schedules: Vec<Schedule>,
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u16).range(2..=16))]
+    agents: u16,
+    /// Enough for jittered work to drift apart.
+    #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u32).range(1..=100))]
+    rounds: u32,
+    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u16).range(1..=169))]
+    sample: u16,
+    /// Runs at once. Defaults to the number of CPUs.
+    #[arg(long)]
+    jobs: Option<usize>,
+    #[arg(long, value_name = "PATH")]
+    bracken: Option<PathBuf>,
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Clone)]
+struct Seeds(Vec<u64>);
+
+/// `a..b` (inclusive) or `a,b,c`.
+fn parse_seeds(s: &str) -> Result<Seeds, String> {
+    let bad = |_| format!("{s:?} is not a seed range like 1..10 or a list like 1,2,3");
+    let seeds: Vec<u64> = match s.split_once("..") {
+        Some((a, b)) => (a.parse().map_err(bad)?..=b.parse().map_err(bad)?).collect(),
+        None => s.split(',').map(|n| n.trim().parse().map_err(bad)).collect::<Result<_, _>>()?,
+    };
+    if seeds.is_empty() || seeds.len() > 1000 {
+        return Err(format!("{s:?} gives {} seeds; give 1 to 1000", seeds.len()));
+    }
+    Ok(Seeds(seeds))
 }
 
 fn main() -> ExitCode {
@@ -114,6 +172,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             }
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Compare(args)) => compare(args),
         None => demo(cli.run),
     }
 }
@@ -130,6 +189,12 @@ fn demo(args: RunArgs) -> Result<ExitCode> {
         seed: args.seed,
         topology: args.topology,
         sample: usize::from(args.sample),
+        behaviour: Behaviour {
+            stale_after: args
+                .stale_after
+                .unwrap_or_else(|| Behaviour::new(args.work_rounds, args.wip, args.schedule).stale_after),
+            ..Behaviour::new(args.work_rounds, args.wip, args.schedule)
+        },
     };
 
     // Every path from here on is absolute: bracken runs in each agent's work
@@ -141,9 +206,16 @@ fn demo(args: RunArgs) -> Result<ExitCode> {
             if dir.exists() {
                 bail!("{} already exists; --keep needs a new directory", dir.display());
             }
+            refuse_parent_in_new_part(&dir)?;
             refuse_git_checkout(&dir, args.allow_in_repo)?;
             std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-            dir
+            // Check again where the directory really is, now that it exists.
+            let real = std::fs::canonicalize(&dir).with_context(|| format!("resolving {}", dir.display()))?;
+            if let Err(e) = refuse_git_checkout(&real, args.allow_in_repo) {
+                let _ = std::fs::remove_dir(&dir);
+                return Err(e);
+            }
+            real
         }
         None => {
             _temp = tempfile::tempdir().context("creating a temporary directory")?;
@@ -156,17 +228,50 @@ fn demo(args: RunArgs) -> Result<ExitCode> {
     let ignore = root.join(".gitignore");
     std::fs::write(&ignore, "*\n").with_context(|| format!("writing {}", ignore.display()))?;
 
-    let start = Instant::now();
-    let run = harness::run(&bracken, &root, &cfg, |i, name| -> Box<dyn Agent> {
-        Box::new(ScriptedAgent::new(name, cfg.seed, i as u64, cfg.sample))
-    })?;
-    let report = report::build(&cfg, &run, start.elapsed(), bracken.calls(), bracken.elapsed());
+    let report = harness::run_scripted(&bracken, &root, &cfg)?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report).expect("reports serialize"));
     } else {
         println!("{report}");
     }
     Ok(if report.replicas.converged { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+fn compare(args: CompareArgs) -> Result<ExitCode> {
+    let bin = match args.bracken {
+        Some(b) => b,
+        None => default_bracken()?,
+    };
+    let bin = Bracken::new(&bin)?.bin().to_owned();
+    let plan = compare::Plan {
+        base: Config {
+            agents: usize::from(args.agents),
+            rounds: args.rounds,
+            seed: 0,
+            topology: Topology::Ring,
+            sample: usize::from(args.sample),
+            behaviour: Behaviour::default(),
+        },
+        seeds: args.seeds.0,
+        topologies: args.topologies,
+        work_rounds: args.work_rounds,
+        schedules: args.schedules,
+        jobs: args.jobs.unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get())),
+    };
+    let rows = compare::run(&bin, &plan)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&rows).expect("rows serialize"));
+    } else {
+        let seeds = &plan.seeds;
+        println!(
+            "Means over seeds {}: {} agents, {} rounds; accepted means under min passes 2\n",
+            if seeds.len() > 2 { format!("{}..{}", seeds[0], seeds[seeds.len() - 1]) } else { format!("{seeds:?}") },
+            plan.base.agents,
+            plan.base.rounds
+        );
+        print!("{}", compare::table(&rows));
+    }
+    Ok(if rows.iter().all(|r| r.converged) { ExitCode::SUCCESS } else { ExitCode::FAILURE })
 }
 
 /// `bracken` next to this executable: cargo puts both in `target/<profile>/`
@@ -177,51 +282,4 @@ fn default_bracken() -> Result<PathBuf> {
     let dir = exe.parent().context("this executable has no directory")?;
     let candidates = [dir.join(&name), dir.parent().map(|p| p.join(&name)).unwrap_or_default()];
     Ok(candidates.iter().find(|c| c.is_file()).unwrap_or(&candidates[0]).clone())
-}
-
-/// Fails if `path`, which need not exist yet, is inside a git checkout, or if the
-/// environment points git at one, unless `allowed`.
-fn refuse_git_checkout(path: &Path, allowed: bool) -> Result<()> {
-    if allowed {
-        return Ok(());
-    }
-    for var in ["GIT_DIR", "GIT_WORK_TREE"] {
-        if std::env::var_os(var).is_some() {
-            bail!(
-                "{var} is set, so git may treat {} as part of a checkout; unset it, or pass --allow-in-repo",
-                path.display()
-            );
-        }
-    }
-    let abs = std::path::absolute(path).with_context(|| format!("resolving {}", path.display()))?;
-    let existing = abs.ancestors().find(|p| p.exists()).context("no part of the path exists")?;
-    let real = std::fs::canonicalize(existing).with_context(|| format!("resolving {}", existing.display()))?;
-    let refuse = |checkout: &Path| {
-        bail!(
-            "{} is inside the git checkout {}; run the demo outside any repository, or pass --allow-in-repo",
-            path.display(),
-            checkout.display()
-        )
-    };
-    // Ask git, which also knows work trees whose git directory is elsewhere.
-    let git = process::Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree", "--show-toplevel"])
-        .current_dir(&real)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_CEILING_DIRECTORIES")
-        .stderr(Stdio::null())
-        .output();
-    if let Ok(out) = git
-        && out.status.success()
-        && out.stdout.starts_with(b"true")
-    {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        return refuse(Path::new(stdout.lines().nth(1).unwrap_or("?")));
-    }
-    // And look for a .git ourselves, in case git isn't installed.
-    if let Some(checkout) = real.ancestors().find(|p| p.join(".git").exists()) {
-        return refuse(checkout);
-    }
-    Ok(())
 }

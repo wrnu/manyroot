@@ -4,13 +4,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::agent::{Agent, MEDIA_TYPE, Roster, Turn};
+use crate::agent::{Agent, MEDIA_TYPE, Roster, ScriptedAgent, Turn};
 use crate::bracken::{Bracken, Entry, Replica};
+use crate::report::{self, Report};
 use crate::rng::Rng;
 use crate::task::{LANGUAGE, SPECS};
 
@@ -34,6 +36,58 @@ pub struct Config {
     pub topology: Topology,
     /// Inputs per check.
     pub sample: usize,
+    pub behaviour: Behaviour,
+}
+
+/// How the scripted agents work. The plain demo uses the default: work is
+/// delivered in the turn it starts, and nobody announces it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct Behaviour {
+    /// Rounds between starting an implementation and delivering it.
+    pub work_rounds: u32,
+    /// Announce work with a `wip` claim before doing it, and skip specs others have announced.
+    pub wip: bool,
+    /// Rounds after its own round at which an open wip claim is stale and may be taken over.
+    pub stale_after: u32,
+    /// Chance, each round, that an agent drops the work it started.
+    pub drop_rate: f64,
+    pub schedule: Schedule,
+}
+
+/// When agents start work, relative to each other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum Schedule {
+    /// Everyone starts in round 1, and all work takes exactly `work_rounds`.
+    Lockstep,
+    /// Agent i makes its first start in round 1 + (i mod (work_rounds + 1)).
+    Stagger,
+    /// Staggered first starts, and each piece of work takes `work_rounds` or one more, at random.
+    Jitter,
+}
+
+impl Behaviour {
+    /// Work that takes `work_rounds` on `schedule`, with wip claims stale one
+    /// round after the latest the work could be due.
+    pub fn new(work_rounds: u32, wip: bool, schedule: Schedule) -> Behaviour {
+        let drop_rate = if work_rounds == 0 { 0.0 } else { 0.1 };
+        let longest = work_rounds + u32::from(schedule == Schedule::Jitter);
+        Behaviour { work_rounds, wip, stale_after: longest + 1, drop_rate, schedule }
+    }
+
+    /// The round in which agent `index` may first start work.
+    pub fn first_round(&self, index: u64) -> u32 {
+        match self.schedule {
+            Schedule::Lockstep => 1,
+            Schedule::Stagger | Schedule::Jitter => 1 + (index % u64::from(self.work_rounds + 1)) as u32,
+        }
+    }
+}
+
+impl Default for Behaviour {
+    fn default() -> Behaviour {
+        Behaviour::new(0, false, Schedule::Lockstep)
+    }
 }
 
 /// Where and when a contribution was made.
@@ -165,6 +219,15 @@ pub fn run(
         run.accepted.push((k, replicas[0].accepted(k)?));
     }
     Ok(run)
+}
+
+/// Runs the scripted agents in `root` and builds the report.
+pub fn run_scripted(bracken: &Bracken, root: &Path, cfg: &Config) -> Result<Report> {
+    let start = Instant::now();
+    let run = run(bracken, root, cfg, |i, name| -> Box<dyn Agent> {
+        Box::new(ScriptedAgent::new(name, cfg.seed, i as u64, cfg.sample, cfg.behaviour))
+    })?;
+    Ok(report::build(cfg, &run, start.elapsed(), bracken.calls(), bracken.elapsed()))
 }
 
 /// One sync phase: every replica exports a bundle, then imports from its sources.
