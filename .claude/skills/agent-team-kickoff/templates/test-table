@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# test-table: the whole test table, as the manager counts it, in one command.
+#
+#   test-table
+#
+# Runs, from the top of the checkout it lives in, stopping at the first that fails:
+#   cargo fmt --check
+#   cargo clippy --locked --all-targets -- -D warnings
+#   cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+#   timeout 900 cargo test --locked --workspace
+#   scripts/ground-guards origin/main HEAD
+# That's AGENTS.md's table plus the checks the manager adds (the Linux-target lint, since nothing
+# runs on Linux now, and the Ground guards). scripts/merge accepts main ahead of a head in code only
+# on a manager pass of exactly this command, run with bk-evidence --on, so a partial re-run after
+# main moves can't count. Another project replaces the commands with its own table.
+#
+# Needs the x86_64-unknown-linux-gnu target (rustup target add x86_64-unknown-linux-gnu), and
+# timeout (gtimeout on macOS, from coreutils).
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$(git -C "$here" rev-parse --show-toplevel)"
+fail() { echo "test-table: $*" >&2; exit 1; }
+timeout=$(command -v timeout || command -v gtimeout) || fail "needs timeout (on macOS, gtimeout from coreutils)"
+
+step() {
+  echo "test-table: $*"
+  "$@" || fail "failed: $*"
+}
+step cargo fmt --check
+step cargo clippy --locked --all-targets -- -D warnings
+step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+step "$timeout" 900 cargo test --locked --workspace
+step scripts/ground-guards origin/main HEAD
+echo "test-table: all passed at $(git rev-parse HEAD)"

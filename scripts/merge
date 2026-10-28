@@ -19,9 +19,10 @@
 #      under docs/ (not docs/vision.md) or a .md file under .claude/skills/ outside
 #      any templates/ directory: none of these can change what builds, tests or
 #      runs. Renames count as a deletion and an addition. Otherwise, main may be
-#      ahead in any path if a manager pass on the claim tested the merge
-#      ('<command> @ <sha> on <main sha>', from bk-evidence --on) with a main sha
-#      that main's tip has moved past only in those same paths;
+#      ahead in any path if a manager pass on the claim ran the whole test table on
+#      the merge ('scripts/test-table @ <sha> on <main sha>', from bk-evidence --on)
+#      with a main sha that main's tip has moved past only in those same paths. A pass
+#      of any other command with --on doesn't count: part of the table proves too little;
 #   6. scripts/ground-guards passes on the sha against main's tip: no keys or stray
 #      files under .bracken/, the Ground append-only, the Ground opens, and
 #      docs/vision.md matches it.
@@ -222,10 +223,11 @@ else
     done
   }
   bad=$(untested "$base")
-  # The main shas the manager's passes tested this head merged with ('<command> @ <sha> on <main sha>').
+  # The main shas the manager's whole-table passes tested this head merged with
+  # ('scripts/test-table @ <sha> on <main sha>'). Any other command's --on pass is part of the table at most.
   verified=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
     and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
-    | .body.method | capture(" @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40})$")? | select(.h == $sha) | .m]
+    | .body.method | capture("^scripts/test-table @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40})$")? | select(.h == $sha) | .m]
     | unique | .[]' <<<"$shown")
   on=""
   # m must hold the branch point, or the tested merge added nothing and m..tip can hide a change
@@ -241,13 +243,13 @@ else
     main_case="main ($tip) is ahead of $sha only in .bracken/, and docs/ or skill .md files the branch doesn't touch"
     check ok main "$main_case"
   elif [ -n "$on" ]; then
-    main_case="main ($tip) is ahead of $sha in code, and the manager's pass tested $sha merged with main $on"
+    main_case="main ($tip) is ahead of $sha in code, and the manager's test-table pass tested $sha merged with main $on"
     [ "$on" = "$tip" ] || main_case="$main_case, which main has moved past only in .bracken/ and docs"
     check ok main "$main_case"
   elif [ -n "$verified" ]; then
-    check FAIL main "main ($tip) has moved in code since the main the manager's passes tested $sha on ($(tr "\n" " " <<<"$verified" | sed 's/ $//')); verify again with bk-evidence --on origin/main: $(printf "%s" "$bad" | tr "\n" " ")"
+    check FAIL main "main ($tip) has moved in code since the main the manager's passes tested $sha on ($(tr "\n" " " <<<"$verified" | sed 's/ $//')); verify again with bk-evidence --on origin/main -- scripts/test-table: $(printf "%s" "$bad" | tr "\n" " ")"
   else
-    check FAIL main "main ($tip) is ahead of $sha with changes the verified head didn't test; verify the merge with bk-evidence --on origin/main, or merge main into the branch and verify again: $(printf "%s" "$bad" | tr "\n" " ")"
+    check FAIL main "main ($tip) is ahead of $sha with changes the verified head didn't test; verify the merge with bk-evidence --on origin/main -- scripts/test-table, or merge main into the branch and verify again: $(printf "%s" "$bad" | tr "\n" " ")"
   fi
 fi
 
