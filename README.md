@@ -54,8 +54,9 @@ bracken log --since "$C" --limit 50  # only the most recent 50 of what is new; t
 With `--since` or `--limit`, `log --json` prints an object, `{"contributions": [...], "cursor": "...",
 "omitted": N}`, instead of the bare array. A cursor means the same only under the same filters: new work
 that `--tag`, `--kind`, `--author` or `--current` hid is past it all the same, so keep one cursor per set of
-filters. Log lines print control characters from contributions (CR, ESC, newlines and the like) as escapes
-such as `\u{1b}`, so no contribution can forge or hide a line; `--json` escapes them as JSON does.
+filters. Every read command prints control characters from contributions (CR, ESC, newlines and the
+like) as escapes such as `\u{1b}`, so no contribution can forge or hide a line; `show` keeps a statement's
+or evidence's line breaks, with each of its lines starting `| `. `--json` escapes them as JSON does.
 
 ```sh
 bracken accepted                     # what the default policy accepts

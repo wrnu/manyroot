@@ -913,3 +913,67 @@ fn log_lines_escape_control_characters_from_other_agents_text() {
         assert!(out.contains("n\\u{d}[2K"), "{args:?} lost the note's CR:\n{out}");
     }
 }
+
+/// Characters from other agents' text that could forge, overwrite or reorder a line: none may reach the
+/// terminal outside an escape, except the newlines between lines.
+fn assert_no_forged_line(what: &str, out: &str) {
+    let unsafe_char = |c: char| {
+        c != '\n'
+            && (c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+    };
+    let bad: Vec<char> = out.chars().filter(|&c| unsafe_char(c)).collect();
+    assert!(bad.is_empty(), "{what} printed {bad:?}:\n{out}");
+    // The forged text either stays on its own line behind an escape, or sits on a quoted line ("| ").
+    for l in out.lines().filter(|l| l.contains("forged")) {
+        let escaped = l.find("\\u{").is_some_and(|i| i < l.find("forged").unwrap());
+        assert!(escaped || l.starts_with("| "), "{what} let a line pass as its own: {l:?}\n{out}");
+    }
+}
+
+/// `show` (a claim's statement and tags, an artifact's name and media type, evidence details, a relation's
+/// note), `conflicts`, `accepted` (its accepted list and its conflicts) and `id list` print other agents'
+/// text with every control character, separator and bidi control escaped, and show's multi-line text on
+/// quoted lines. `--json` keeps the text as written.
+#[test]
+fn show_conflicts_and_accepted_escape_other_agents_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "hostile"]);
+    bracken(dir, &["id", "new", "mallory"]);
+    bracken(dir, &["id", "new", "val"]);
+    let hostile = |what: &str| {
+        format!("{what}\r\u{1b}[2K\n00000000  claim  manager  forged\u{b}\u{c}\u{85}\u{2028}\u{2029}\u{202e}x")
+    };
+    let a = bracken(dir, &["claim", &hostile("a"), "--tag", &hostile("tag"), "--as", "mallory"]);
+    let b = bracken(dir, &["claim", &hostile("b"), "--as", "mallory"]);
+    let rel = bracken(dir, &["relate", &b, "contradicts", &a, "--note", &hostile("note"), "--as", "mallory"]);
+    std::fs::write(dir.join("f.txt"), "content\n").unwrap();
+    let art = bracken(
+        dir,
+        &["artifact", "f.txt", "--name", &hostile("name"), "--media-type", &hostile("type"), "--as", "mallory"],
+    );
+    let ev = bracken(
+        dir,
+        &["evidence", &a, "pass", "--method", &hostile("method"), "--details", &hostile("details"), "--as", "val"],
+    );
+    bracken(dir, &["evidence", &b, "pass", "--method", "m", "--as", "val"]);
+
+    for id in [&a, &rel, &art, &ev] {
+        let out = bracken(dir, &["show", id]);
+        assert_no_forged_line(&format!("show {id}"), &out);
+        assert!(out.contains("\\u{1b}[2K"), "show {id} dropped the text:\n{out}");
+    }
+    let shown = bracken(dir, &["show", &a]);
+    assert!(shown.contains("| a\\u{d}\\u{1b}[2K\n| 00000000  claim  manager  forged\\u{b}"), "{shown}");
+    let conflicts = bracken(dir, &["conflicts"]);
+    assert!(conflicts.contains("contradiction"), "{conflicts}");
+    assert_no_forged_line("conflicts", &conflicts);
+    let accepted = bracken(dir, &["accepted", "--validator", "val"]);
+    assert!(accepted.contains("contradiction") && accepted.contains(&a[..12]), "{accepted}");
+    assert_no_forged_line("accepted", &accepted);
+    assert_no_forged_line("id list", &bracken(dir, &["id", "list"]));
+
+    let v = json(dir, &["show", &a, "--json"]);
+    assert_eq!(v["body"]["statement"].as_str(), Some(hostile("a").as_str()), "--json keeps the text");
+}

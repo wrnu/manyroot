@@ -355,7 +355,7 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             } else {
                 for a in agents {
                     let key = if local.contains(&a.agent) { "" } else { "  (no local key)" };
-                    println!("{}  {}{key}", a.agent, a.name);
+                    println!("{}  {}{key}", a.agent, terminal::printable(&a.name));
                 }
             }
         }
@@ -1135,7 +1135,7 @@ fn print_show(
 ) {
     println!("id        {}", c.id());
     println!("kind      {}", c.body().kind());
-    println!("author    {} ({})", names.display(&c.author()), c.author());
+    println!("author    {} ({})", terminal::printable(&names.display(&c.author())), c.author());
     let parents: Vec<String> = c.parents().iter().map(|p| p.short()).collect();
     println!("parents   {}", if parents.is_empty() { "(root)".into() } else { parents.join(" ") });
     if g.is_retracted(&c.id()) {
@@ -1155,19 +1155,30 @@ fn print_show(
         }
     }
     println!();
+    // Text other agents wrote: each of its lines starts "| ", so none can pass for a line of this listing,
+    // and anything else that could move the cursor or reorder the line prints as an escape.
+    let quoted = |text: &str| {
+        for l in text.split('\n') {
+            println!("| {}", terminal::printable(l));
+        }
+    };
     match c.body() {
         Body::Claim { statement, tags } => {
-            println!("{statement}");
+            quoted(statement);
             if !tags.is_empty() {
-                println!("\ntags: {}", tags.join(", "));
+                println!("\ntags: {}", terminal::printable(&tags.join(", ")));
             }
         }
         Body::Artifact { name, media_type, content } => {
+            let (name, media_type) = (terminal::printable(name), terminal::printable(media_type));
             println!("{name}  {media_type}  {} bytes", content.len());
             println!("(use `bracken cat {}` for the content)", c.id().short());
         }
-        Body::Evidence { details, .. } if !details.is_empty() => println!("{}\n\n{details}", summary(g, c)),
-        _ => println!("{}", summary(g, c)),
+        Body::Evidence { details, .. } if !details.is_empty() => {
+            println!("{}\n", terminal::printable(&summary(g, c)));
+            quoted(details);
+        }
+        _ => println!("{}", terminal::printable(&summary(g, c))),
     }
     if !referrers.is_empty() {
         println!("\nreferenced by:");
@@ -1185,7 +1196,7 @@ fn print_conflicts(g: &Graph, names: &Names, conflicts: &[Conflict], as_json: bo
     let describe = |id: &ContributionId| {
         g.get(id).map_or_else(
             || id.short(),
-            |c| format!("{}  {}  {}", id.short(), names.display(&c.author()), summary(g, c)),
+            |c| terminal::printable(&format!("{}  {}  {}", id.short(), names.display(&c.author()), summary(g, c))),
         )
     };
     for conflict in conflicts {
