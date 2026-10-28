@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use crate::args::Args;
 use crate::lang::{Library, parse_module};
 use crate::mode::{Mode, Session, Store, StoreConfig, ToolSpec, is_within};
-use crate::task::{CHANGES, Change, MODULES, SPECS, Version, check, spec_named, task_text};
+use crate::task::{CHANGES, MODULES, SPECS, Version, change_tag, check, spec_named, task_text};
 
 /// The media type of an implementation artifact.
 pub const MEDIA_TYPE: &str = "text/x-stacklib";
@@ -32,18 +32,6 @@ pub const MAX_ARTIFACT_BYTES: usize = 2000;
 const SYNC_DEADLINE: u32 = 60;
 /// Bytes one side of a sync session may receive from the other.
 const SYNC_BUDGET: u64 = 32 * 1024 * 1024;
-
-/// The tag the setter puts on a change request's claim.
-pub fn change_tag(change: Change) -> &'static str {
-    match change {
-        Change::ClampOrder => "clamp-order",
-        Change::SignOfZero => "sign-of-zero",
-        Change::NearerTies => "nearer-ties",
-        Change::BetweenExclusive => "between-exclusive",
-        Change::AbsSaturates => "abs-saturates",
-        Change::SpreadCounts => "spread-counts",
-    }
-}
 
 pub struct BrackenMode;
 

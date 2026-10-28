@@ -146,6 +146,7 @@ pub trait Mode: Sync {
 pub fn mode_named(name: &str) -> Option<&'static dyn Mode> {
     match name {
         "bracken" => Some(&crate::bracken_mode::BrackenMode),
+        "crdt" => Some(&crate::crdt_mode::CrdtMode),
         "git" => Some(&crate::git_mode::GitMode),
         _ => None,
     }

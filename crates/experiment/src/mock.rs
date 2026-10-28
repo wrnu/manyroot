@@ -7,7 +7,8 @@
 //! by others and records the result (Bracken evidence, Git reviews), and keeps
 //! what it has done in its private notes. In Git mode it works on a branch per
 //! function, opens a PR, merges what is approved and passes CI, and brings its
-//! own PRs up to date when they conflict with `main`.
+//! own PRs up to date when they conflict with `main`. In CRDT mode it writes the
+//! definition into its module file, checks it, and adds a line to the shared notes.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -18,11 +19,9 @@ use bracken_demo::rng::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::bracken_mode::change_tag;
 use crate::candidates::{candidates, correct_programs};
 use crate::driver::Backend;
-use crate::git_mode::version_of;
-use crate::task::{CHANGES, SPECS, Version};
+use crate::task::{CHANGES, SPECS, Version, change_tag, version_of};
 
 pub struct MockBackend {
     pub seed: u64,
@@ -134,6 +133,13 @@ impl Backend for MockBackend {
         let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
+        if has("replace") && !has("pr_open") {
+            self.crdt_turn(&mut c, agent, name, turn, &mut rng, &mut memory)?;
+            let text = serde_json::to_string(&memory).map_err(|e| e.to_string())?;
+            c.tool("notes_write", json!({"text": text}))?;
+            c.tool("sync", json!({}))?;
+            return Ok(());
+        }
         if has("pr_open") {
             self.git_turn(&mut c, agent, &mut rng, &mut memory)?;
             let text = serde_json::to_string(&memory).map_err(|e| e.to_string())?;
@@ -226,6 +232,49 @@ fn file_text(read: &Value) -> String {
 }
 
 impl MockBackend {
+    /// One CRDT-mode turn: write one function's definition into its module file (replacing an
+    /// earlier definition of it), check it, and say so in the shared notes.
+    fn crdt_turn(
+        &self,
+        c: &mut Client,
+        agent: usize,
+        name: &str,
+        turn: u32,
+        rng: &mut Rng,
+        memory: &mut Memory,
+    ) -> Result<(), String> {
+        use crate::crdt_mode::{MODULE_FILES, NOTES, TASKS};
+        let version = version_of(&file_text(&c.tool("read", json!({"file": TASKS}))?));
+        let todo: Vec<_> = SPECS.iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
+        let Some(spec) = todo.get(agent % 3).or(todo.first()).copied() else { return Ok(()) };
+        let program = if rng.chance(self.wrong_rate) {
+            candidates(spec.name).wrong[0].to_string()
+        } else {
+            correct_programs(version)[spec.name].to_string()
+        };
+        let line = format!("def {} {} : {program}", spec.name, spec.arity);
+        let index = crate::task::MODULES.iter().position(|m| *m == spec.module).ok_or("a spec in no module")?;
+        let file = MODULE_FILES[index];
+        let text = file_text(&c.tool("read", json!({"file": file}))?);
+        let prefix = format!("def {} ", spec.name);
+        match text.lines().find(|l| l.starts_with(&prefix)) {
+            Some(old) => c.tool("replace", json!({"file": file, "old": old, "new": line}))?,
+            None => {
+                let n = text.lines().count() as i64;
+                c.tool("edit", json!({"file": file, "start": n + 1, "end": n, "text": line}))?
+            }
+        };
+        let checked = c.tool("check", json!({"function": spec.name}))?;
+        let notes = file_text(&c.tool("read", json!({"file": NOTES}))?);
+        let n = notes.lines().count() as i64;
+        let ok = checked["ok"].as_bool().unwrap_or(false);
+        let note =
+            format!("{name}, turn {turn}: wrote {} (public check {})", spec.name, if ok { "passes" } else { "fails" });
+        c.tool("edit", json!({"file": NOTES, "start": n + 1, "end": n, "text": note}))?;
+        memory.implemented.push(spec.name.to_string());
+        Ok(())
+    }
+
     fn git_turn(&self, c: &mut Client, agent: usize, rng: &mut Rng, memory: &mut Memory) -> Result<(), String> {
         let version = version_of(&file_text(&c.tool("read", json!({"file": "TASKS.md"}))?));
         let program = |spec: &crate::task::Spec, rng: &mut Rng| {

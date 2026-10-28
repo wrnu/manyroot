@@ -367,3 +367,31 @@ pub fn task_text(version: Version) -> String {
     }
     text
 }
+
+/// A change request's tag: on the setter's claim in Bracken mode, and on `TASKS.md`'s released line.
+pub fn change_tag(change: Change) -> &'static str {
+    match change {
+        Change::ClampOrder => "clamp-order",
+        Change::SignOfZero => "sign-of-zero",
+        Change::NearerTies => "nearer-ties",
+        Change::BetweenExclusive => "between-exclusive",
+        Change::AbsSaturates => "abs-saturates",
+        Change::SpreadCounts => "spread-counts",
+    }
+}
+
+/// The line of `TASKS.md` that lists the change requests released so far.
+pub const RELEASED: &str = "Change requests released:";
+
+/// The version a `TASKS.md` states on its released line.
+pub fn version_of(tasks: &str) -> Version {
+    let released: Vec<&str> =
+        tasks.lines().filter_map(|l| l.strip_prefix(RELEASED)).flat_map(|l| l.split(',').map(str::trim)).collect();
+    CHANGES.iter().filter(|c| released.contains(&change_tag(c.change))).fold(Version::ORIGINAL, |v, c| v.with(c.change))
+}
+
+/// `TASKS.md` at `version`: the task text, and the released line.
+pub fn tasks_md(version: Version) -> String {
+    let tags: Vec<&str> = CHANGES.iter().filter(|c| version.has(c.change)).map(|c| change_tag(c.change)).collect();
+    format!("{}\n\n{RELEASED} {}\n", task_text(version), tags.join(", "))
+}

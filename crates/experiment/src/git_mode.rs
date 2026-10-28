@@ -20,10 +20,10 @@ use std::process::{Command, Stdio};
 use serde_json::{Value, json};
 
 use crate::args::{Args, is_branch, is_commit};
-use crate::bracken_mode::{Programs, change_tag};
+use crate::bracken_mode::Programs;
 use crate::lang::Library;
 use crate::mode::{Mode, Session, Store, StoreConfig, SyncKind, ToolSpec, Transfer, is_within};
-use crate::task::{CHANGES, MODULES, Version, check, task_text};
+use crate::task::{CHANGES, MODULES, Version, change_tag, check, tasks_md, version_of};
 
 pub mod prs;
 
@@ -31,8 +31,6 @@ pub mod prs;
 pub const MODULE_FILES: [&str; 4] = ["base.stk", "order.stk", "arith.stk", "shape.stk"];
 /// The task, written only by the setter.
 pub const TASKS: &str = "TASKS.md";
-/// The line of `TASKS.md` that lists the change requests released so far.
-const RELEASED: &str = "Change requests released:";
 /// The largest module file an edit may leave.
 const MAX_FILE: usize = 64 * 1024;
 /// The most commits one push may bring that the hub doesn't have (finding `4bcfe41f2818`).
@@ -871,19 +869,6 @@ impl GitStore {
         )?;
         Ok(json!({ "branch": branch, "from": start.trim_start_matches("refs/remotes/hub/") }))
     }
-}
-
-/// The version a `TASKS.md` states on its released line.
-pub fn version_of(tasks: &str) -> Version {
-    let released: Vec<&str> =
-        tasks.lines().filter_map(|l| l.strip_prefix(RELEASED)).flat_map(|l| l.split(',').map(str::trim)).collect();
-    CHANGES.iter().filter(|c| released.contains(&change_tag(c.change))).fold(Version::ORIGINAL, |v, c| v.with(c.change))
-}
-
-/// `TASKS.md` at `version`: the task text, and the released line.
-pub fn tasks_md(version: Version) -> String {
-    let tags: Vec<&str> = CHANGES.iter().filter(|c| version.has(c.change)).map(|c| change_tag(c.change)).collect();
-    format!("{}\n\n{RELEASED} {}\n", task_text(version), tags.join(", "))
 }
 
 /// The readable file an argument names, from the fixed list: never a path.

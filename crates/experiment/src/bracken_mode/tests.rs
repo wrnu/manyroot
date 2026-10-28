@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use super::*;
+use crate::task::Change;
 
 /// Values an agent might try to smuggle into a command line.
 fn hostile(canary: &str) -> Vec<String> {

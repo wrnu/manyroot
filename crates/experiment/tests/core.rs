@@ -309,6 +309,44 @@ fn one_agents_failure_stays_in_its_own_turn() {
 }
 
 #[test]
+fn a_crdt_mode_mock_run_goes_end_to_end_through_the_shim() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = RunConfig {
+        root: dir.path().join("run"),
+        mode: "crdt",
+        agents: 3,
+        turns: 3,
+        worker_bin: bin(),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        trace: false,
+        calls_per_turn: CALLS_PER_TURN,
+        turn_limit: TURN_LIMIT,
+    };
+    let outcome = run(&cfg, &MockBackend { seed: 5, wrong_rate: 0.0, shim: Some(bin()) }).expect("the run");
+    assert_eq!(outcome.released_after, Some(4));
+    let log = events(&outcome.events);
+    assert!(!log.iter().any(|e| e["event"] == "turn_error"), "no turn failed: {log:?}");
+    for agent in ["agent-0", "agent-1", "agent-2"] {
+        assert_eq!(log.iter().filter(|e| e["agent"] == agent && e["event"] == "turn_end").count(), 3);
+        // A sync at the start and end of every turn, and the mock's own.
+        assert_eq!(log.iter().filter(|e| e["agent"] == agent && e["event"] == "sync").count(), 9, "{agent}");
+    }
+    // Every agent's edits reached the hub. Agents overlap on functions, and a later definition
+    // replaces an earlier one, so there's one line per function written.
+    let defs: Vec<&str> =
+        outcome.modules.iter().flat_map(|(_, text)| text.lines()).filter(|l| l.starts_with("def ")).collect();
+    let names: std::collections::BTreeSet<&str> = defs.iter().filter_map(|l| l.split_whitespace().nth(1)).collect();
+    assert!(names.len() >= 4 && names.len() == defs.len(), "{defs:?}");
+    // The hub's copy of the document is the only store any other store's data came from.
+    let hub = dir.path().join("run/hub/doc.automerge");
+    assert!(hub.exists());
+    let library = Library::parse(outcome.modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
+    let grades = grade(&library, Version::all(), &HiddenCases::new(1));
+    assert_eq!(grades.len(), SPECS.len());
+}
+
+#[test]
 fn one_agent_spending_its_hub_quota_leaves_anothers_sync_alone() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let config = |name: &str, identity: &str| StoreConfig {

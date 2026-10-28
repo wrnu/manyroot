@@ -236,6 +236,86 @@ only, and needs the supply-chain part of security review. Writing a text
 CRDT ourselves would be cheaper to vet and much easier to get subtly wrong.
 CRDT mode is in the first run (decision 3, section 8).
 
+**As built** (task `aaa30dca350b`, decisions `89568ebb896f`, `285ce6a0cad9`
+and `7f454b0343ff`; points 1 to 4 are part of the pre-registered plan):
+
+1. **Check and integrated state.** The document holds `base.stk`,
+   `order.stk`, `arith.stk`, `shape.stk`, `TASKS.md` and `NOTES.md`, named as
+   in Git mode. `check <function>` runs the public cases with every call
+   resolved in the agent's own document, at the version its copy's
+   `TASKS.md` states. The integrated state is the hub's four module texts as
+   they are. There's no resolution rule beyond what the text holds, so a
+   function defined twice fails to parse, as a module would in Git mode.
+   `TASKS.md` is the setter's only: the edit tools refuse it, and every
+   store refuses a received change to it by anyone else. `edit` and
+   `replace` take Git mode's arguments, and each becomes the smallest text
+   splice from the old text to the new.
+2. **Identity.** The harness gives each agent an Automerge actor of 32 bytes
+   derived from its name. The hub takes a change it lacks only from the
+   actor of the agent it is syncing with, so every change the hub holds is
+   by the setter or by the agent that brought it. A copy, which gets
+   changes only from the hub, takes the setter's edits to `TASKS.md` and any
+   other actor's to the module files and `NOTES.md`.
+3. **Bounds on what a peer sends.** Agents are honest Claude Code
+   sessions that reach the hub only through the harness's own code
+   (decision `7f454b0343ff`), so these bounds keep a normal run from
+   hanging or running out of memory, not crafted messages out. Automerge's
+   own receive path inflates compressed changes and V2 messages' documents
+   without a bound, sizes a bloom filter's probe list from the wire, and
+   divides by a wire-chosen length (note `7f9a154018f5`). So each message
+   is parsed first, and accepted only as a V1 message with at most 1 024
+   hashes per list and 4 `have` entries, a bloom filter with Automerge's own
+   constants and exact length, and at most 10 000 changes, each an
+   uncompressed change chunk of at most 2 MiB. A message holds at most
+   250 000 ops and 17 MiB. Automerge sends a peer everything it lacks in
+   one message, so this is also about how far a copy can fall behind and
+   still catch up. A document holds at most 20 000 changes and 16 MiB. Each
+   new change must be by an allowed actor and hold only single-character
+   inserts and deletes on that actor's text objects. A message that fails
+   any of this is refused whole, before any of it is applied, and the
+   session ends with an error. A session gets 60 s, 32 MiB and 200
+   messages. Both sides clear the peer's advertised capabilities after
+   every message, so neither ever sends V2.
+
+   Every Automerge call on the document runs under `catch_unwind`. After a
+   caught panic or any error, the in-memory document is thrown away, never
+   saved, and reloaded from its last save. A document is saved only if it
+   loads back with the same heads, since Automerge can apply a change and
+   then save a document that doesn't load (finding `0357e515ecaa`). Ops
+   aren't checked against the elements they name (findings `f28fcc5b25ac`,
+   `70cba757d87f`, `0357e515ecaa` and `a9c642a058cf`, accepted risk under
+   `7f454b0343ff`); a session that trips Automerge just fails, and the hub
+   keeps its last save.
+4. **Changes whose deps are missing** (a departure from `89568ebb896f`,
+   which refused them on arrival; accepted by decision `285ce6a0cad9`).
+   They are refused at the end of the session, not the moment they arrive.
+   Automerge's bloom filter has false positives (about 1%), so an honest
+   sender sometimes leaves out a change the receiver lacks, sends its
+   children, and sends the change itself only when asked. With a fresh
+   sync state each session the same false positive recurs every time, so
+   refusing at once would leave that copy unable to sync. So within a
+   session Automerge may hold such a change and ask for its deps, under
+   four conditions:
+   1. A held change is never saved, sent to another peer, used in the
+      integrated state, or used by `check` or the grader. Saves drop held
+      changes, and a session's document is used only by that session.
+   2. A session is kept only if it ends normally with every dep held, and
+      its document saves and loads back. Any other end (an error, the
+      deadline, the budget, the frame cap, the peer gone, a caught panic)
+      drops everything the session brought, held changes included, by
+      reloading the document's last save.
+   3. Held changes count against the session's 32 MiB and 200 messages,
+      and the document's caps, like any others. Nothing held carries over
+      to the next session.
+   4. A change whose own deps are held but themselves dropped is dropped
+      with them: the drop is a reload of the last save, which never held
+      either.
+
+**Sync on the wire.** Over the driver's two sockets, each side sends in
+turn one frame, a u32 big-endian length and then a V1 sync message (length
+0 for nothing to send), until both have sent 0 in a row. Each session
+starts from a fresh sync state.
+
 ### Mode 3: Bracken semantic contributions
 
 - **Hub:** a Bracken replica held by the harness. Each agent has its own
