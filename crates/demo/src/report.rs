@@ -249,7 +249,10 @@ pub fn build(cfg: &Config, run: &Run, wall: Duration, calls: u64, bracken: Durat
         });
     }
 
-    let evidence: Vec<&&Entry> = mine.iter().filter(|e| e.kind == "evidence").collect();
+    // Checks: evidence other than heartbeats, which are an author's evidence on its own wip claim.
+    let is_heartbeat =
+        |e: &Entry| e.text("method") == HEARTBEAT && by_id.get(e.text("target")).is_some_and(|t| t.author == e.author);
+    let evidence: Vec<&&Entry> = mine.iter().filter(|e| e.kind == "evidence" && !is_heartbeat(e)).collect();
     let failed: BTreeSet<&str> = evidence
         .iter()
         .filter(|e| e.text("verdict") == "fail" && by_id.get(e.text("target")).is_some_and(|t| t.author != e.author))
@@ -404,11 +407,12 @@ pub fn build(cfg: &Config, run: &Run, wall: Duration, calls: u64, bracken: Durat
 }
 
 fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &Entry>) -> WipReport {
-    let claims: Vec<(&Entry, &str, u32)> = mine
+    // Wip claims, with the round each states, if any: its author's word.
+    let claims: Vec<(&Entry, &str, Option<u32>)> = mine
         .iter()
         .filter(|e| e.kind == "claim")
-        .filter_map(|e| match (&e.tags()[..], wip_round(e.text("statement"))) {
-            (&["wip", spec], Some(round)) => Some((*e, spec, round)),
+        .filter_map(|e| match &e.tags()[..] {
+            &["wip", spec] => Some((*e, spec, wip_round(e.text("statement")))),
             _ => None,
         })
         .collect();
@@ -423,13 +427,12 @@ fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &E
         .iter()
         .filter(|e| match e.kind.as_str() {
             "retract" => true,
-            // Only the wip claim's own author can close it by superseding it; another
-            // agent's takeover (a refines between wip claims) closes it for everyone's view.
-            "relation" => match e.text("kind") {
-                "supersedes" => by_id.get(e.text("to")).is_some_and(|t| t.author == e.author),
-                "refines" => is_wip(e.text("from")) && is_wip(e.text("to")),
-                _ => false,
-            },
+            // Only the wip claim's own author can close it, by superseding it. Another
+            // agent's takeover (a refines between wip claims) doesn't close it: whether it's
+            // stale is each agent's own judgement.
+            "relation" => {
+                e.text("kind") == "supersedes" && by_id.get(e.text("to")).is_some_and(|t| t.author == e.author)
+            }
             _ => false,
         })
         .map(|e| (e.text(if e.kind == "retract" { "target" } else { "to" }), e.id.as_str()))
@@ -452,12 +455,13 @@ fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &E
     let rule = cfg.behaviour.stale_rule;
     let k = cfg.behaviour.stale_after;
     let mut ignored_fresh = 0;
-    for (w2, spec, r2) in &claims {
+    for (w2, spec, _) in &claims {
         let held = &run.held_before[&w2.id];
-        let b = run.origin[&w2.id].agent;
+        let (b, r2) = (run.origin[&w2.id].agent, run.origin[&w2.id].round);
         let ignored = claims.iter().any(|(w1, s1, r1)| {
             let since = match rule {
-                StaleRule::ClaimRound => Some(*r1),
+                // The round w1 states, unless it's later than the round w1 reached b.
+                StaleRule::ClaimRound => seen_by(&w1.id, b).map(|seen| r1.map_or(seen, |r1| r1.min(seen))),
                 // The latest news about w1 that had reached b: the claim or a heartbeat on it.
                 StaleRule::Liveness => heartbeats
                     .iter()
@@ -471,7 +475,7 @@ fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &E
             s1 == spec
                 && w1.author != w2.author
                 && held.contains(&w1.id)
-                && since.is_some_and(|since| *r2 < since + k)
+                && since.is_some_and(|since| r2 < since.saturating_add(k))
                 && !closers.iter().any(|(target, closer)| *target == w1.id && held.contains(*closer))
         });
         ignored_fresh += usize::from(ignored);
@@ -484,11 +488,10 @@ fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &E
             .map(|e| run.origin[&e.id].turn)
     };
     let mut takeovers = Takeovers::default();
-    let mut first_takeover: HashMap<&str, usize> = HashMap::new();
+    let mut takeover_turns: HashMap<&str, Vec<usize>> = HashMap::new();
     for r in &takeover_relations {
         let (old, at) = (r.text("to"), run.origin[&r.id].turn);
-        let entry = first_takeover.entry(old).or_insert(at);
-        *entry = (*entry).min(at);
+        takeover_turns.entry(old).or_default().push(at);
         let delivered = ended(old, "delivered");
         let dropped = ended(old, "abandoned").or_else(|| run.silent_drops.get(old).copied());
         match (delivered, dropped) {
@@ -504,7 +507,9 @@ fn wip_report(cfg: &Config, run: &Run, mine: &[&Entry], by_id: &HashMap<&str, &E
     let mut silent_drops = SilentDrops { total: run.silent_drops.len(), ..SilentDrops::default() };
     let mut delays = Vec::new();
     for (claim, &dropped) in &run.silent_drops {
-        match first_takeover.get(claim.as_str()) {
+        // The first takeover after the drop: one before it took over live work.
+        let after = takeover_turns.get(claim.as_str()).and_then(|t| t.iter().filter(|&&at| at > dropped).min());
+        match after {
             Some(&at) => delays.push((at / cfg.agents) as f64 - (dropped / cfg.agents) as f64),
             None => silent_drops.missed += 1,
         }

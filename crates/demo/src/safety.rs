@@ -75,6 +75,129 @@ pub fn refuse_git_checkout(path: &Path, allowed: bool, advice: &Advice) -> Resul
     Ok(())
 }
 
+/// Makes the private directory a run happens in, under the system's temporary
+/// directory once [`refuse_shared`] has passed it, and refuses it inside a git
+/// checkout unless `allowed`. Returns the directory and its real, absolute path.
+pub fn run_dir(allowed: bool, advice: &Advice) -> Result<(tempfile::TempDir, PathBuf)> {
+    let base = std::env::temp_dir();
+    let base = std::fs::canonicalize(&base).with_context(|| format!("resolving {}", base.display()))?;
+    refuse_shared(&base)?;
+    let temp = tempfile::Builder::new().tempdir_in(&base).context("creating a temporary directory")?;
+    let root = temp.path().to_owned();
+    refuse_git_checkout(&root, allowed, advice)?;
+    Ok((temp, root))
+}
+
+/// Fails unless nobody else can rename entries in `dir`, a real path, or in any
+/// directory above it: each must be owned by this user or root, and either not
+/// writable by group or others, or sticky. On macOS each must also have no ACL entry
+/// that allows adding, deleting or renaming entries, or changing its permissions or
+/// owner, whoever it names (on Linux, ACLs show in the group bits). bracken writes a
+/// run's files, keys included, by path, so a rename there could send them into a
+/// checkout.
+#[cfg(unix)]
+pub fn refuse_shared(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let me = rustix::process::getuid().as_raw();
+    for d in dir.ancestors() {
+        let m = std::fs::metadata(d).with_context(|| format!("reading {}", d.display()))?;
+        let owned = m.uid() == me || m.uid() == 0;
+        let closed = m.mode() & 0o022 == 0 || m.mode() & 0o1000 != 0;
+        #[cfg(target_os = "macos")]
+        let acl = acl::grants_change(d).with_context(|| format!("reading the ACL of {}", d.display()))?;
+        #[cfg(not(target_os = "macos"))]
+        let acl: Option<&str> = None;
+        if !owned || !closed || acl.is_some() {
+            let why = match acl {
+                _ if !owned => "belongs to another user".to_owned(),
+                _ if !closed => "is writable by others and not sticky".to_owned(),
+                Some(perm) => format!("has an ACL entry allowing {perm}"),
+                None => unreachable!("one of the checks failed"),
+            };
+            bail!(
+                "the temporary directory {} isn't private: {} {why}, so others could swap the run's files \
+                 into a repository; set TMPDIR to a directory only you can write to",
+                dir.display(),
+                d.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Reading a directory's ACL on macOS, which has no binding in rustix.
+#[cfg(target_os = "macos")]
+mod acl {
+    use std::ffi::{CString, c_char, c_int, c_void};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    // <sys/acl.h>
+    unsafe extern "C" {
+        fn acl_get_link_np(path: *const c_char, kind: c_int) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
+        fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
+        fn acl_get_permset(entry: *mut c_void, permset: *mut *mut c_void) -> c_int;
+        fn acl_get_perm_np(permset: *mut c_void, perm: c_int) -> c_int;
+        fn acl_free(obj: *mut c_void) -> c_int;
+    }
+    const ACL_TYPE_EXTENDED: c_int = 0x100;
+    const ACL_FIRST_ENTRY: c_int = 0;
+    const ACL_NEXT_ENTRY: c_int = -1;
+    const ACL_EXTENDED_ALLOW: c_int = 1;
+    /// Permissions that let someone add, remove or rename entries, or grant themselves that.
+    const CHANGES: [(c_int, &str); 6] = [
+        (1 << 2, "add_file"),
+        (1 << 4, "delete"),
+        (1 << 5, "add_subdirectory"),
+        (1 << 6, "delete_child"),
+        (1 << 12, "writesecurity"),
+        (1 << 13, "chown"),
+    ];
+    const ENOENT: i32 = 2;
+    const ENOTSUP: i32 = 45;
+    const EOPNOTSUPP: i32 = 102;
+
+    /// The first of [`CHANGES`] that an allow entry in `path`'s ACL grants, if any.
+    pub fn grants_change(path: &Path) -> std::io::Result<Option<&'static str>> {
+        let c = CString::new(path.as_os_str().as_bytes())?;
+        // SAFETY: `c` is a NUL-terminated path. A non-null ACL is freed below.
+        let acl = unsafe { acl_get_link_np(c.as_ptr(), ACL_TYPE_EXTENDED) };
+        if acl.is_null() {
+            // No ACL, or a file system without them.
+            let err = std::io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(ENOENT | ENOTSUP | EOPNOTSUPP) => Ok(None),
+                _ => Err(err),
+            };
+        }
+        let mut found = None;
+        // SAFETY: `acl` is valid until `acl_free`, and every entry and permission set read
+        // here points into it; each call's result is checked before its output is used.
+        unsafe {
+            let (mut id, mut entry) = (ACL_FIRST_ENTRY, std::ptr::null_mut());
+            while found.is_none() && acl_get_entry(acl, id, &mut entry) == 0 {
+                id = ACL_NEXT_ENTRY;
+                let (mut tag, mut perms) = (0, std::ptr::null_mut());
+                if acl_get_tag_type(entry, &mut tag) == 0
+                    && tag == ACL_EXTENDED_ALLOW
+                    && acl_get_permset(entry, &mut perms) == 0
+                {
+                    found = CHANGES.iter().find(|&&(perm, _)| acl_get_perm_np(perms, perm) == 1).map(|&(_, n)| n);
+                }
+            }
+            acl_free(acl);
+        }
+        Ok(found)
+    }
+}
+
+/// Without unix there are no owners and modes to check.
+#[cfg(not(unix))]
+pub fn refuse_shared(_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
 /// Copies the finished run in `from`, a private directory, to `dest`, which must
 /// not exist yet, and returns where `dest` really is.
 ///
@@ -443,6 +566,56 @@ mod tests {
         let left: Vec<_> = std::fs::read_dir(&away).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(left, ["theirs"], "everything made is gone from where it went, and nothing else");
         assert!(!root.join("safe/kept").exists());
+    }
+
+    #[test]
+    fn a_temporary_directory_others_can_rename_entries_in_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = real(&tmp);
+        let dir = root.join("t");
+        std::fs::create_dir(&dir).unwrap();
+        let mode = |path: &Path, mode| std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+
+        refuse_shared(&dir).unwrap();
+        for open in [0o777, 0o770, 0o722] {
+            mode(&dir, open);
+            let refused = refuse_shared(&dir).unwrap_err().to_string();
+            assert!(refused.contains("writable by others and not sticky"), "{open:o}: {refused}");
+        }
+        mode(&dir, 0o1777);
+        refuse_shared(&dir).unwrap();
+
+        // A private directory under a shared one isn't private: its parent's entries can move.
+        mode(&dir, 0o777);
+        let below = dir.join("mine");
+        std::fs::create_dir(&below).unwrap();
+        mode(&below, 0o700);
+        let refused = refuse_shared(&below).unwrap_err().to_string();
+        assert!(refused.contains(&format!("{} is writable", dir.display())), "{refused}");
+        mode(&dir, 0o700);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_temporary_directory_whose_acl_lets_others_rename_entries_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = real(&tmp).join("t");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let chmod =
+            |args: &[&str]| assert!(Command::new("/bin/chmod").args(args).arg(&dir).status().unwrap().success());
+
+        refuse_shared(&dir).unwrap();
+        chmod(&["+a", "everyone deny delete_child"]);
+        refuse_shared(&dir).unwrap();
+        for perm in ["add_file", "add_subdirectory", "delete_child", "writesecurity"] {
+            chmod(&["-N"]);
+            chmod(&["+a", &format!("everyone allow list,{perm}")]);
+            let refused = refuse_shared(&dir).unwrap_err().to_string();
+            assert!(refused.contains(&format!("has an ACL entry allowing {perm}")), "{perm}: {refused}");
+        }
+        chmod(&["-N"]);
+        refuse_shared(&dir).unwrap();
     }
 
     /// Replaces directory `name` in `parent` with a symlink to `to`, keeping it as `<name>.moved`.

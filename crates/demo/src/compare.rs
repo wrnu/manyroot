@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::bracken::Bracken;
 use crate::harness::{self, Behaviour, Config, Schedule, StaleRule, Topology};
 use crate::report::{PolicyReport, Report};
-use crate::safety::{COMPARE, refuse_git_checkout};
+use crate::safety::{COMPARE, run_dir};
 
 /// What to vary, and what stays fixed.
 pub struct Plan {
@@ -172,9 +172,7 @@ fn policy2(r: &Report) -> &PolicyReport {
 /// One run in its own temporary directory.
 fn one(bin: &Path, cfg: &Config) -> Result<Report> {
     let bracken = Bracken::new(bin)?;
-    let temp = tempfile::tempdir().context("creating a temporary directory")?;
-    let root = std::path::absolute(temp.path()).context("resolving the temporary directory")?;
-    refuse_git_checkout(&root, false, &COMPARE)?;
+    let (_temp, root) = run_dir(false, &COMPARE)?;
     std::fs::write(root.join(".gitignore"), "*\n").context("writing .gitignore")?;
     harness::run_scripted(&bracken, &root, cfg)
 }

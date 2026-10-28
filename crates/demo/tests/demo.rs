@@ -131,10 +131,10 @@ fn a_small_demo_converges_and_its_report_adds_up() {
 
 #[test]
 fn another_agents_fix_counts_once_the_implementations_author_accepts_it() {
-    // Seed 1 over 10 rounds has a fix of another agent's implementation.
+    // Seed 4 over 10 rounds has fixes of other agents' implementations that their authors accept.
     let tmp = tempfile::tempdir().unwrap();
     let kept = tmp.path().join("run");
-    let args = ["--agents", "4", "--rounds", "10", "--seed", "1"];
+    let args = ["--agents", "4", "--rounds", "10", "--seed", "4"];
     report(&[&args[..], &["--keep", kept.to_str().unwrap()]].concat());
     let replica = kept.join("agent-0/.bracken");
     let log = bracken_json(&replica, &["log", "--json"]);
@@ -515,4 +515,65 @@ fn under_liveness_no_claim_is_taken_over_while_its_news_is_fresh() {
     }
     assert!(takeovers > 0, "this seed takes over stale claims");
     assert_eq!(r["wip"]["taken_over"], takeovers);
+}
+
+#[cfg(unix)]
+#[test]
+fn runs_refuse_a_shared_temporary_directory_that_isnt_sticky() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    for args in [&["--agents", "2", "--rounds", "1"][..], &["compare", "--seeds", "1", "--topologies", "full"][..]] {
+        let out = demo_command(args).env("TMPDIR", &shared).output().unwrap();
+        assert!(!out.status.success(), "{args:?} ran in a shared TMPDIR");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("writable by others and not sticky"), "{args:?}: {stderr}");
+        assert!(stderr.contains("set TMPDIR to a directory only you can write to"), "{args:?}: {stderr}");
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0, "{args:?} made something in it");
+    }
+    // Sticky, like /tmp, it's fine.
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let out = demo_command(&["--agents", "2", "--rounds", "1"]).env("TMPDIR", &shared).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn runs_refuse_a_temporary_directory_shared_through_an_acl() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("acl");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let grant = Command::new("/bin/chmod")
+        .args(["+a", "everyone allow add_file,add_subdirectory,delete_child"])
+        .arg(&shared)
+        .status()
+        .unwrap();
+    assert!(grant.success());
+    let out = demo_command(&["--agents", "2", "--rounds", "1"]).env("TMPDIR", &shared).output().unwrap();
+    assert!(!out.status.success(), "ran in a TMPDIR others can rename entries in");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("has an ACL entry allowing add_file"), "{stderr}");
+    assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+}
+
+#[test]
+fn checks_leave_out_heartbeats() {
+    let tmp = tempfile::tempdir().unwrap();
+    let kept = tmp.path().join("run");
+    let args = ["--agents", "4", "--rounds", "12", "--seed", "3", "--topology", "ring", "--work-rounds", "2"];
+    let wip = ["--wip", "--stale-rule", "liveness", "--keep", kept.to_str().unwrap()];
+    let r = report(&[&args[..], &wip[..]].concat());
+    assert!(r["wip"]["heartbeats"].as_u64().unwrap() > 0);
+    let log = bracken_json(&kept.join("agent-0/.bracken"), &["log", "--json"]);
+    // Only agents record evidence; the task setter never does.
+    let evidence = log.as_array().unwrap().iter().filter(|c| c["kind"] == "evidence");
+    let checks: Vec<&Value> = evidence.filter(|c| c["body"]["method"] != "heartbeat").collect();
+    let passes = checks.iter().filter(|c| c["body"]["verdict"] == "pass").count();
+    assert_eq!(r["work"]["checks"], checks.len());
+    assert_eq!(r["work"]["passes"], passes);
+    assert_eq!(r["work"]["checks"], r["work"]["passes"].as_u64().unwrap() + r["work"]["fails"].as_u64().unwrap());
 }

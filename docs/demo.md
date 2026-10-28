@@ -47,13 +47,22 @@ or with `GIT_DIR` or `GIT_WORK_TREE` set, unless you pass `--allow-in-repo`, so
 agents never work with a repository's files, or its Ground, in reach.
 
 Every run happens in a private temporary directory that only you can write
-to. `--keep` copies the finished run out of it, so a relative `--keep` stays
-where you asked, and a `--keep` path with `..` after a directory that doesn't
-exist yet is refused, because creating it would follow the `..` somewhere the
-checks never looked. On unix the copy goes through directory handles: the
-existing part of the path is opened once, the check runs on where that really
-is, and every directory and file is made relative to its parent's handle,
-without following symlinks. Renaming or swapping directories on the path while
+to, made in the system's temporary directory (`TMPDIR`). bracken writes the
+run's files, keys included, by path, so the demo first checks that nobody else
+can rename entries in that directory or any directory above it: each must be
+owned by you or root, and either not writable by group or others, or sticky,
+like `/tmp`. On macOS each must also have no ACL entry allowing anyone to add,
+delete or rename entries, or to change its permissions or owner (on Linux, ACLs
+show in the group bits, so the mode check covers them). Otherwise it refuses to run and asks for a `TMPDIR` only you can
+write to.
+
+`--keep` copies the finished run out of the temporary directory, so a relative
+`--keep` stays where you asked, and a `--keep` path with `..` after a directory
+that doesn't exist yet is refused, because creating it would follow the `..`
+somewhere the checks never looked. On unix the copy goes through directory
+handles: the existing part of the path is opened once, the check runs on where
+that really is, and every directory and file is made relative to its parent's
+handle, without following symlinks. Renaming or swapping directories on the path while
 the demo runs can't redirect what it writes, keys included, or what it
 removes: on any failure it removes only entries that are still the very ones it
 made. It prints where the run was kept.
@@ -66,8 +75,8 @@ So no directory on the `--keep` path should let anyone else rename its entries:
 it should be owned by you and not writable by others, or sticky, like `/tmp`.
 Without unix the copy goes by path and has no such protection.
 
-`compare` runs each seed in the system's temporary directory (`TMPDIR`), with
-the same refusal; it takes `--work-rounds` 0 to 10 and `--jobs` 1 to 64.
+`compare` runs each seed in the system's temporary directory, with the same
+checks; it takes `--work-rounds` 0 to 10 and `--jobs` 1 to 64.
 
 To look around a run's Ground afterwards, keep it outside any repository and
 point bracken at a replica:
@@ -115,7 +124,13 @@ The shipped agent is scripted and deterministic given the seed. Each round it:
   each fix as superseding its implementation itself. A `supersedes` relation
   only counts when the replaced contribution's author writes it (protocol.md,
   "Supersession"), so until then another agent's fix is a proposal and the
-  old implementation stays current;
+  old implementation stays current. It accepts a fix only if the fix
+  implements the same spec with a different program, another agent's check
+  has failed the implementation it replaces, the agent's own check of that
+  implementation fails too (anyone can record a fail), and the fix passes the
+  agent's own check. These checks use a sample and aren't recorded as
+  evidence. A program that fails the check once stays rejected, however often
+  it's proposed; any other proposal stays a proposal;
 - fixes its own failing implementation if it has one (a new artifact that
   `supersedes` it), sometimes fixes someone else's instead, or else implements
   a spec it sees no live, unfailed implementation of. Sometimes it implements
@@ -142,11 +157,15 @@ it has a 10% chance of dropping the work instead. With `--wip`, it also:
   the work, half the time it retracts the claim (`abandoned in round 4`) and
   half the time it goes silent, so the claim goes stale;
 - doesn't start a spec that another agent's open wip claim covers, unless that
-  claim is stale: `--stale-after` rounds have passed since the round it
-  states. Every agent reaches the same verdict. A start that takes over stale
-  claims `refines` them, saying so: only a claim's own author can supersede
-  it, so a stale claim stops blocking by age alone, and the takeover records
-  who picked the work up.
+  claim is stale by `--stale-rule`. A start that takes over stale claims
+  `refines` them, saying so: only a claim's own author can supersede it, so a
+  stale claim stops blocking by age alone, and the takeover records who picked
+  the work up. A takeover doesn't end the claim for anyone else: each agent
+  judges for itself whether a claim is stale, so another agent's `refines`
+  can't hide a fresh claim. It only stops a second takeover of the same claim:
+  an agent that starts the spec of a claim someone has already taken over
+  doesn't record a takeover of its own, so another agent's `refines` can move
+  the report's takeover counts, but not what anyone starts.
 
 `--stale-rule` decides what "stale" means:
 
@@ -154,7 +173,11 @@ it has a 10% chance of dropping the work instead. With `--wip`, it also:
   claim states, the same verdict for every agent. The default window is one
   round after the latest the work could be due: W + 1, or W + 2 under `jitter`.
   A claim is never stale while its work is on time, but if the claim's
-  retraction is slow to arrive, delivered work looks stale too.
+  retraction is slow to arrive, delivered work looks stale too. The stated
+  round is its author's word, so it counts only if it isn't later than the
+  round the claim reached the agent; otherwise, or if the claim states no
+  round, the agent counts from that round. A claim can't stay fresh longer
+  by stating a later round.
 - **liveness**: an agent still working records a heartbeat each round: evidence
   on its own wip claim with method `heartbeat` and details `round N`. Each
   agent notes the round in which the latest news about a claim (the claim, or
@@ -185,12 +208,12 @@ setter's are left out.
 | Line | Meaning |
 |---|---|
 | Contributions | Agents' contributions, by kind and by agent |
-| Work | Implementations (artifacts that `implement` a spec, by the artifact's author); fixes (implementations their author relates as superseding another, whether or not the replaced one's author has accepted it yet); checks (evidence) and their verdicts; findings (claims tagged `finding`) |
+| Work | Implementations (artifacts that `implement` a spec, by the artifact's author); fixes (implementations their author relates as superseding another, whether or not the replaced one's author has accepted it yet); checks (evidence, not counting heartbeats) and their verdicts; findings (claims tagged `finding`) |
 | Duplicated work | New implementations (not fixes) of a spec that another agent had already implemented anywhere in the Ground. **Blind**: the earlier one hadn't reached this agent's replica yet, so only better sync or visible work in progress would have avoided it. **Visible**: the agent's replica already held it. Competing fixes aren't counted here; they show up as divergences once the replaced implementation's author has accepted more than one |
 | Concurrent work | Implementations started while another agent's implementation of the same spec was started and not yet delivered: the duplication that announcing work could prevent. The start round comes from the `implements` relation's note (`started in round N`). A pair started in the same round counts once, as **same round**: no sync could have shown either agent the other's start. **Later** means the other work started in an earlier round. Dropped work leaves no artifact, so it isn't counted |
 | Takeovers | Shown with `--wip`. Each takeover, by the state of the claimant's work at the takeover's turn: **already delivered** (the retraction hadn't reached the taker), **in progress and delivered later**, **in progress and never delivered** (dropped later, or unfinished at the end), or **already dropped**. **Wrongful** is the first three: the work was alive when it was taken over. Counting only the first two is the other reasonable reading, and it can be read off the same numbers |
-| Silent drops | Shown with `--wip`: work dropped without retracting its claim, how many were taken over and how many rounds after the drop on average, how many never were, and the heartbeats recorded. The Ground can't show when a silent drop happened, so the scripted agent reports its own drops (`Agent::silent_drops`), as ground truth only a scripted agent can give, like the check on every input |
-| Wip claims | Shown with `--wip`: claims made, retracted on delivery, retracted on abandonment, taken over when stale (refined by another agent's wip claim), and **ignored while fresh**: claims made while the author's replica held another agent's open, fresh wip claim on the same spec, fresh by the run's stale rule (under liveness, from the round each piece of news reached the author). The scripted agent never does that, so it's always 0 |
+| Silent drops | Shown with `--wip`: work dropped without retracting its claim, how many were taken over after the drop and how many rounds after it on average, how many never were (a takeover before the drop took over live work, so it doesn't count here), and the heartbeats recorded. The Ground can't show when a silent drop happened, so the scripted agent reports its own drops (`Agent::silent_drops`), as ground truth only a scripted agent can give, like the check on every input |
+| Wip claims | Shown with `--wip`: claims made, retracted on delivery, retracted on abandonment, taken over when stale (refined by another agent's wip claim), and **ignored while fresh**: claims made while the author's replica held another agent's open, fresh wip claim on the same spec, fresh by the run's stale rule (under claim-round, from the round the claim states unless it reached the author earlier; under liveness, from the round each piece of news reached the author). A takeover by a third agent doesn't make a claim stale. The scripted agent never does that, so it's always 0 |
 | Availability | For each contribution and each other agent, the number of sync rounds until that agent's replica held it: 1 means the sync right after the round it was made. The final all-to-all sync counts as round `rounds + 1`, and the line says how many pairs only arrived then |
 | Conflicts | What `bracken conflicts` reports at the end: divergences (one implementation superseded by two current ones) and contradictions (a current finding contradicting a current implementation). A fix resolves the contradictions against an implementation once it counts: when the implementation's author wrote the fix, or accepted it. Until then, someone else's fix leaves them open. The relation counts show how many of each kind agents made; the supersedes count includes acceptances |
 | Ground truth | The harness checks every implementation on every input. "Caught" means a wrong one got at least one failing check from another agent |
@@ -206,8 +229,10 @@ superseded a stale wip claim. They count more divergences: seeds 1 to 3 over
 races: another agent fixed a failing implementation while its author fixed
 it too. Now the author's own fix counts and the other stays a proposal on a
 retired implementation. Of the 14 fixes of someone else's work in those
-three runs, the author's own fix won 11, one was accepted, and two arrived
-after their target was already retired or the run had ended.
+three runs, the author's own fix won 13, and the other wasn't accepted: an
+author now accepts another agent's fix only when its own check fails its
+implementation too. Before that rule, 11 won, one was accepted, and two
+arrived after their target was retired or the run had ended.
 
 A sample, from `--agents 4 --rounds 5 --seed 1` (it has no fixes, so it's the
 same under both rules):
@@ -253,20 +278,26 @@ rounds for jittered work to drift apart. "Accepted" is under min passes 2.
 All 240 runs converged, and no agent ever ignored a fresh wip claim. The table
 was re-run on 2026-10-27 under the current supersession rule; the first
 version (PR #10) differed by at most 0.5 in any mean and 3 in contributions
-or bracken calls, and the findings below hold under both.
+or bracken calls, and the findings below hold under both. Both tables were
+re-run again with the agents hardened against an adversary (they now accept
+another agent's fix only when their own checks fail their implementation and
+pass the fix): every mean moved by at most 0.2, and contributions and bracken
+calls by about 1, except one row's mean silent-drop delay (gossip, W = 1,
+jitter, liveness: 4.8 to 3.5 rounds), which averages over about 0.3 drops a
+run.
 
 | Topology | W | Schedule | Wip | Concurrent starts (same round) | Duplicates (blind/visible) | Accepted (correct) | Specs solved | Contributions | Bracken calls | Wip claims (taken over) |
 |---|---|---|---|---|---|---|---|---|---|---|
-| ring | 1 | lockstep | off | 6.0 (5.4) | 8.1 (4.5/3.6) | 12.3 (11.6) | 5.8 | 113 | 407 |  |
-| ring | 1 | lockstep | on | 5.8 (5.4) | 8.1 (4.5/3.6) | 12.1 (11.5) | 5.8 | 182 | 476 | 22.4 (4.2) |
-| ring | 1 | stagger | off | 7.1 (1.3) | 8.1 (1.6/6.5) | 11.8 (11.1) | 5.3 | 114 | 408 |  |
-| ring | 1 | stagger | on | 3.8 (1.0) | 7.5 (1.8/5.7) | 10.5 (9.8) | 5.6 | 184 | 478 | 22.1 (7.9) |
-| ring | 1 | jitter | off | 5.8 (1.8) | 5.7 (2.1/3.6) | 7.9 (7.7) | 4.7 | 82 | 376 |  |
+| ring | 1 | lockstep | off | 6.0 (5.4) | 8.1 (4.5/3.6) | 12.3 (11.6) | 5.8 | 113 | 406 |  |
+| ring | 1 | lockstep | on | 5.8 (5.4) | 8.1 (4.5/3.6) | 12.1 (11.5) | 5.8 | 183 | 477 | 22.5 (4.4) |
+| ring | 1 | stagger | off | 7.2 (1.3) | 8.1 (1.6/6.5) | 11.8 (11.1) | 5.3 | 114 | 408 |  |
+| ring | 1 | stagger | on | 4.0 (1.1) | 7.5 (1.8/5.7) | 10.4 (9.8) | 5.6 | 184 | 479 | 22.1 (7.9) |
+| ring | 1 | jitter | off | 5.8 (1.8) | 5.7 (2.1/3.6) | 7.9 (7.7) | 4.7 | 82 | 375 |  |
 | ring | 1 | jitter | on | 3.5 (1.7) | 5.2 (1.7/3.5) | 8.2 (7.4) | 5.2 | 131 | 424 | 17.6 (3.2) |
 | ring | 2 | lockstep | off | 3.7 (2.4) | 4.5 (2.4/2.1) | 6.9 (6.7) | 4.1 | 69 | 362 |  |
 | ring | 2 | lockstep | on | 3.1 (2.5) | 4.3 (2.3/2.0) | 6.7 (6.5) | 4.1 | 123 | 416 | 16.9 (4.6) |
 | ring | 2 | stagger | off | 4.8 (0.6) | 5.0 (1.9/3.1) | 6.8 (6.4) | 3.8 | 65 | 358 |  |
-| ring | 2 | stagger | on | 2.5 (0.8) | 3.8 (2.1/1.7) | 6.4 (5.9) | 4.7 | 107 | 400 | 15.3 (2.3) |
+| ring | 2 | stagger | on | 2.5 (0.8) | 3.8 (2.1/1.7) | 6.4 (5.9) | 4.7 | 106 | 400 | 15.3 (2.3) |
 | ring | 2 | jitter | off | 3.5 (0.5) | 3.7 (1.4/2.3) | 4.6 (4.0) | 3.1 | 54 | 347 |  |
 | ring | 2 | jitter | on | 1.7 (0.7) | 2.8 (0.9/1.9) | 3.9 (3.6) | 3.2 | 98 | 391 | 14.8 (2.1) |
 | gossip | 1 | lockstep | off | 6.4 (5.9) | 6.7 (3.3/3.4) | 12.3 (11.4) | 5.9 | 113 | 406 |  |
@@ -274,11 +305,11 @@ or bracken calls, and the findings below hold under both.
 | gossip | 1 | stagger | off | 7.8 (1.4) | 7.5 (2.5/5.0) | 11.3 (11.0) | 5.7 | 116 | 409 |  |
 | gossip | 1 | stagger | on | 5.6 (2.5) | 6.8 (2.4/4.4) | 10.9 (10.4) | 5.6 | 171 | 464 | 21.4 (4.2) |
 | gossip | 1 | jitter | off | 5.4 (1.8) | 6.1 (2.3/3.8) | 8.1 (7.9) | 5.0 | 88 | 382 |  |
-| gossip | 1 | jitter | on | 3.3 (1.7) | 4.4 (1.5/2.9) | 7.6 (7.0) | 5.4 | 133 | 426 | 17.3 (2.8) |
+| gossip | 1 | jitter | on | 3.3 (1.7) | 4.4 (1.5/2.9) | 7.6 (7.0) | 5.4 | 134 | 427 | 17.4 (2.9) |
 | gossip | 2 | lockstep | off | 3.9 (2.4) | 4.4 (2.0/2.4) | 6.6 (6.3) | 3.9 | 69 | 362 |  |
 | gossip | 2 | lockstep | on | 3.5 (2.5) | 4.9 (2.2/2.7) | 6.9 (6.5) | 4.0 | 118 | 411 | 17.0 (4.1) |
 | gossip | 2 | stagger | off | 4.6 (0.8) | 4.4 (1.9/2.5) | 6.8 (6.6) | 3.7 | 63 | 356 |  |
-| gossip | 2 | stagger | on | 2.9 (1.2) | 4.5 (1.5/3.0) | 6.5 (6.1) | 4.6 | 114 | 407 | 15.9 (3.4) |
+| gossip | 2 | stagger | on | 2.9 (1.2) | 4.5 (1.5/3.0) | 6.5 (6.1) | 4.6 | 114 | 408 | 15.9 (3.4) |
 | gossip | 2 | jitter | off | 3.2 (0.6) | 3.8 (1.1/2.7) | 4.7 (4.6) | 3.1 | 54 | 347 |  |
 | gossip | 2 | jitter | on | 2.3 (1.1) | 3.3 (0.7/2.6) | 4.6 (4.5) | 3.6 | 94 | 387 | 14.4 (2.5) |
 
@@ -288,10 +319,10 @@ or bracken calls, and the findings below hold under both.
   chooses in the same rounds, so almost every concurrent start is a same-round
   start (5.4 of 6.0 on ring at W = 1). Wip can't help agents who all choose in
   the same round, and it doesn't: 6.0 becomes 5.8. Staggered and jittered
-  schedules turn most concurrent starts into later-round ones (1.3 of 7.1 are
+  schedules turn most concurrent starts into later-round ones (1.3 of 7.2 are
   same-round under stagger), and those are the ones a claim can prevent.
 - **With the agents out of step, wip roughly halves concurrent starts:** on
-  ring, from 7.1 to 3.8 (stagger) and 5.8 to 3.5 (jitter) at W = 1, and 4.8 to
+  ring, from 7.2 to 4.0 (stagger) and 5.8 to 3.5 (jitter) at W = 1, and 4.8 to
   2.5 and 3.5 to 1.7 at W = 2. Gossip spreads claims more slowly and unevenly,
   so the gain is smaller (7.8 to 5.6 for stagger, W = 1).
 - **Same-round starts stay blind in both modes.** Wip leaves them as they were,
@@ -306,7 +337,7 @@ because most of it is visible: re-implementing a spec whose earlier
 implementation failed its checks, or deliberately repeating a covered one.
 Wip doesn't target either. Concurrent starts is the number it targets.
 
-**Overhead.** Wip adds 47 to 81% more contributions (claims, `refines`
+**Overhead.** Wip adds 47 to 82% more contributions (claims, `refines`
 relations, retractions) and 12 to 17% more bracken calls. Availability is
 unchanged at about 2 sync rounds: claims don't make sync any faster.
 
@@ -355,18 +386,18 @@ mean and 4 in contributions or bracken calls.
 
 | Topology | W | Schedule | Concurrent starts: off / claim-round / liveness | Wrongful takeovers: claim-round / liveness | Takeovers of dropped work | Silent drops taken over, delay in rounds (missed) | Contributions | Bracken calls | Heartbeats |
 |---|---|---|---|---|---|---|---|---|---|
-| ring | 1 | lockstep | 6.0 / 5.8 / 5.3 (±0.6) | 3.2 ±0.6 / 0.0 ±0.0 | 1.0 / 0.7 | 0.6 of 0.8, 1.6 (0.2) / 0.5 of 0.8, 3.8 (0.3) | 182 / 165 | 476 / 459 | 0.0 |
-| ring | 1 | stagger | 7.1 / 3.8 / 4.5 (±0.5) | 6.8 ±0.5 / 0.0 ±0.0 | 1.1 / 0.6 | 0.7 of 0.9, 2.6 (0.2) / 0.4 of 0.7, 2.8 (0.3) | 184 / 154 | 478 / 448 | 0.0 |
+| ring | 1 | lockstep | 6.0 / 5.8 / 5.4 (±0.6) | 3.4 ±0.6 / 0.0 ±0.0 | 1.0 / 0.7 | 0.6 of 0.8, 1.6 (0.2) / 0.5 of 0.8, 3.8 (0.3) | 183 / 166 | 477 / 459 | 0.0 |
+| ring | 1 | stagger | 7.2 / 4.0 / 4.5 (±0.5) | 6.8 ±0.5 / 0.0 ±0.0 | 1.1 / 0.6 | 0.7 of 0.9, 2.6 (0.2) / 0.4 of 0.7, 2.8 (0.3) | 184 / 153 | 479 / 447 | 0.0 |
 | ring | 1 | jitter | 5.8 / 3.5 / 3.9 (±0.6) | 2.2 ±0.3 / 0.0 ±0.0 | 1.0 / 0.9 | 0.7 of 1.2, 3.1 (0.5) / 0.6 of 1.5, 3.9 (0.9) | 131 / 130 | 424 / 424 | 8.1 |
 | ring | 2 | lockstep | 3.7 / 3.1 / 4.7 (±0.6) | 3.2 ±0.4 / 0.0 ±0.0 | 1.4 / 0.4 | 1.0 of 1.9, 2.4 (0.9) / 0.4 of 1.5, 5.2 (1.1) | 123 / 130 | 416 / 424 | 14.2 |
-| ring | 2 | stagger | 4.8 / 2.5 / 2.9 (±0.5) | 1.5 ±0.3 / 0.0 ±0.0 | 0.8 / 0.5 | 0.5 of 1.0, 2.8 (0.5) / 0.4 of 0.9, 4.0 (0.5) | 107 / 116 | 400 / 409 | 12.9 |
+| ring | 2 | stagger | 4.8 / 2.5 / 2.9 (±0.5) | 1.5 ±0.3 / 0.0 ±0.0 | 0.8 / 0.5 | 0.5 of 1.0, 2.8 (0.5) / 0.4 of 0.9, 4.0 (0.5) | 106 / 116 | 400 / 409 | 12.9 |
 | ring | 2 | jitter | 3.5 / 1.7 / 2.0 (±0.4) | 1.4 ±0.3 / 0.0 ±0.0 | 0.7 / 0.6 | 0.7 of 1.6, 3.9 (0.9) / 0.5 of 1.4, 3.8 (0.9) | 98 / 112 | 391 / 405 | 17.7 |
 | gossip | 1 | lockstep | 6.4 / 6.3 / 6.1 (±0.7) | 3.9 ±0.9 / 0.1 ±0.1 | 0.9 / 0.4 | 0.4 of 0.7, 3.0 (0.3) / 0.2 of 0.8, 3.0 (0.6) | 182 / 171 | 475 / 464 | 0.0 |
 | gossip | 1 | stagger | 7.8 / 5.6 / 5.6 (±0.8) | 3.4 ±0.4 / 0.6 ±0.2 | 0.8 / 0.4 | 0.5 of 1.0, 1.0 (0.5) / 0.3 of 0.9, 3.5 (0.6) | 171 / 167 | 464 / 460 | 0.0 |
-| gossip | 1 | jitter | 5.4 / 3.3 / 2.9 (±0.5) | 1.7 ±0.4 / 0.8 ±0.2 | 1.1 / 0.6 | 0.3 of 0.9, 2.3 (0.6) / 0.3 of 1.0, 4.8 (0.7) | 133 / 137 | 426 / 430 | 8.9 |
+| gossip | 1 | jitter | 5.4 / 3.3 / 2.9 (±0.5) | 1.8 ±0.4 / 0.9 ±0.2 | 1.1 / 0.5 | 0.3 of 0.9, 2.3 (0.6) / 0.2 of 1.0, 3.5 (0.8) | 134 / 137 | 427 / 430 | 9.0 |
 | gossip | 2 | lockstep | 3.9 / 3.5 / 4.3 (±0.6) | 2.5 ±0.6 / 0.6 ±0.2 | 1.6 / 1.3 | 1.1 of 1.9, 2.6 (0.8) / 1.0 of 1.4, 4.7 (0.4) | 118 / 135 | 411 / 428 | 14.0 |
-| gossip | 2 | stagger | 4.6 / 2.9 / 2.7 (±0.6) | 2.2 ±0.4 / 1.3 ±0.4 | 1.2 / 1.0 | 0.8 of 1.2, 3.6 (0.4) / 0.7 of 1.2, 4.1 (0.5) | 114 / 124 | 407 / 418 | 13.5 |
-| gossip | 2 | jitter | 3.2 / 2.3 / 2.0 (±0.6) | 1.7 ±0.4 / 1.1 ±0.4 | 0.8 / 0.9 | 0.5 of 1.1, 4.6 (0.6) / 0.7 of 1.4, 4.1 (0.7) | 94 / 110 | 387 / 403 | 18.2 |
+| gossip | 2 | stagger | 4.6 / 2.9 / 2.7 (±0.6) | 2.2 ±0.4 / 1.3 ±0.4 | 1.2 / 1.0 | 0.8 of 1.2, 3.6 (0.4) / 0.7 of 1.2, 4.1 (0.5) | 114 / 124 | 408 / 418 | 13.5 |
+| gossip | 2 | jitter | 3.2 / 2.3 / 2.0 (±0.6) | 1.7 ±0.4 / 1.1 ±0.4 | 0.8 / 0.9 | 0.5 of 1.1, 4.6 (0.6) / 0.7 of 1.4, 4.1 (0.7) | 94 / 110 | 387 / 402 | 18.2 |
 
 **Liveness all but removes wrongful takeovers.** On ring it takes them to 0 in
 every row, from 1.4 to 6.8 a run. On gossip it leaves 0.1 to 1.3, because a
@@ -386,7 +417,7 @@ there's no round between starting and delivering, so liveness records no
 heartbeats and comes down to "K rounds since I first saw the claim". That
 alone removes the wrongful takeovers, because the window starts when the news
 arrives, not when the claim was made. At W = 2 heartbeats cost 13 to 18
-contributions a run. Against claim-round, liveness costs between 30 fewer and
+contributions a run. Against claim-round, liveness costs between 31 fewer and
 17 more contributions a run, because fewer takeovers also mean fewer takeover
 claims.
 
@@ -447,3 +478,13 @@ model process:
   never works inside a repository. The harness also refuses to run when
   `GIT_DIR` or `GIT_WORK_TREE` is set, since either can make git treat the
   run's directory as part of a checkout.
+
+The scripted agents treat what other agents write as untrusted, since a model
+could write anything a scripted agent can: they accept a proposed fix only on
+the conditions above, checking their own work rather than trusting a recorded
+fail, judge staleness themselves rather than from another
+agent's takeover, never let the round a claim states keep it fresh, and tell
+two implementations with the same name apart by id. `tests/adversary.rs` runs
+them against an agent that tries each. A model can still hold a spec under
+liveness by recording heartbeats on its own claim without working, as any
+agent can announce more than it does.

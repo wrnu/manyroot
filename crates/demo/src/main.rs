@@ -10,7 +10,7 @@ use serde_json::json;
 use bracken_demo::bracken::Bracken;
 use bracken_demo::harness::{self, Behaviour, Config, Schedule, StaleRule, Topology};
 use bracken_demo::rng::Rng;
-use bracken_demo::safety::{DEMO, keep_run, refuse_git_checkout, refuse_parent_in_new_part};
+use bracken_demo::safety::{DEMO, keep_run, refuse_git_checkout, refuse_parent_in_new_part, run_dir};
 use bracken_demo::{compare, task};
 
 #[derive(Parser)]
@@ -226,9 +226,7 @@ fn demo(args: RunArgs) -> Result<ExitCode> {
     // rename anything; --keep copies it out at the end, through directory handles.
     // Every path is absolute: bracken runs in each agent's work directory, where a
     // relative path would point somewhere else.
-    let temp = tempfile::tempdir().context("creating a temporary directory")?;
-    let root = std::path::absolute(temp.path()).context("resolving the temporary directory")?;
-    refuse_git_checkout(&root, args.allow_in_repo, &DEMO)?;
+    let (_temp, root) = run_dir(args.allow_in_repo, &DEMO)?;
     // The replicas hold unencrypted private keys: keep them out of any repository.
     let ignore = root.join(".gitignore");
     std::fs::write(&ignore, "*\n").with_context(|| format!("writing {}", ignore.display()))?;

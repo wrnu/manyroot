@@ -4,7 +4,7 @@
 //! commands. The harness measures everything from the replicas afterwards,
 //! never from what an agent says it did, so any kind of agent can be swapped in.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 
@@ -71,7 +71,9 @@ impl Roster {
 /// that only counts when the replaced implementation's author writes the
 /// relation. So an agent that finds others' fixes of its own work accepts
 /// them on its next turn, by relating each fix as superseding its
-/// implementation itself.
+/// implementation itself, but only a fix that implements the same spec, of an
+/// implementation another agent's check has failed, and that passes the
+/// author's own check. Any other proposal stays a proposal.
 ///
 /// With [`Behaviour::work_rounds`] above 0, an implementation is delivered
 /// that many rounds after the agent starts it, and the agent sometimes drops
@@ -81,6 +83,9 @@ impl Roster {
 /// stale wip claim by another agent stops counting by age alone; an agent
 /// that starts the same spec records that it takes the work over with a
 /// `refines` relation, since only the claim's author could supersede it.
+/// Whether a claim is fresh is each agent's own judgement, from when the claim
+/// reached it: another agent's takeover doesn't end a claim, and the round a
+/// claim states counts only if it isn't later than that.
 pub struct ScriptedAgent {
     name: String,
     rng: Rng,
@@ -102,6 +107,15 @@ pub struct ScriptedAgent {
     first_round: u32,
     /// For other agents' wip claims: the heartbeats I've seen, and the round I first saw that many.
     news: HashMap<String, (usize, u32)>,
+    /// For other agents' wip claims: the round I first saw each.
+    first_seen: HashMap<String, u32>,
+    /// For checking others' proposed fixes of my work, apart from `rng` so that
+    /// proposals don't change the rest of the script.
+    review_rng: Rng,
+    /// Programs proposed as fixes of my work that failed my check, with their spec: each
+    /// is checked once, so a wrong fix can't pass by being re-sampled, under the same id
+    /// or as a new artifact.
+    rejected: HashSet<(String, String)>,
     silent_drops: Vec<(String, u32)>,
 }
 
@@ -138,7 +152,10 @@ impl ScriptedAgent {
             pending: None,
             first_round: behaviour.first_round(index),
             news: HashMap::new(),
+            first_seen: HashMap::new(),
             silent_drops: Vec::new(),
+            review_rng: Rng::derive(seed, (index + 1) | 1 << 32),
+            rejected: HashSet::new(),
             rng,
         }
     }
@@ -256,29 +273,62 @@ impl ScriptedAgent {
         let takes_over = view
             .wips
             .iter()
-            .filter(|w| w.author != me && w.spec == spec.name && self.is_stale(w, round))
+            .filter(|w| w.author != me && w.spec == spec.name && !w.taken_over && self.is_stale(w, round))
             .map(|w| w.id.clone())
             .collect();
         Some(Start { spec, replaces, takes_over })
     }
 
-    /// Whether an open wip claim is stale, by the behaviour's rule.
+    /// Whether an open wip claim is stale, by the behaviour's rule. Under claim-round,
+    /// the round the claim states counts only if it isn't later than the round the claim
+    /// reached me: claim text can't keep a claim fresh, or overflow the sum.
     fn is_stale(&self, w: &Wip, round: u32) -> bool {
         let since = match self.behaviour.stale_rule {
-            StaleRule::ClaimRound => w.round,
+            StaleRule::ClaimRound => {
+                let seen = self.first_seen.get(&w.id).copied().unwrap_or(round);
+                w.round.map_or(seen, |stated| stated.min(seen))
+            }
             StaleRule::Liveness => self.news.get(&w.id).map_or(round, |&(_, seen)| seen),
         };
-        round >= since + self.behaviour.stale_after
+        round >= since.saturating_add(self.behaviour.stale_after)
     }
 
-    /// Notes, for each open wip claim, the round its latest heartbeat first reached me.
+    /// Notes, for each open wip claim, the round it first reached me and the round its
+    /// latest heartbeat did.
     fn observe(&mut self, view: &View, round: u32) {
         for w in &view.wips {
+            self.first_seen.entry(w.id.clone()).or_insert(round);
             let news = self.news.entry(w.id.clone()).or_insert((w.heartbeats, round));
             if news.0 != w.heartbeats {
                 *news = (w.heartbeats, round);
             }
         }
+    }
+
+    /// Whether to accept `fix`, another agent's proposed replacement for my `mine`: it
+    /// implements the same spec with a different program, another agent's check has
+    /// failed `mine`, my own check
+    /// fails `mine` too (anyone can record a fail), and `fix` passes my own check. The
+    /// checks aren't recorded. A program that fails my check once stays rejected; a
+    /// proposal turned down because `mine` passed is checked again next time.
+    fn accepts(&mut self, mine: &Impl, fix: &Impl) -> bool {
+        let Some(spec) = task::spec(&mine.spec) else { return false };
+        let program = (fix.spec.clone(), fix.program.clone());
+        if fix.spec != mine.spec
+            || fix.program == mine.program
+            || mine.fails.is_empty()
+            || self.rejected.contains(&program)
+        {
+            return false;
+        }
+        if spec.check(&mine.program, &spec.sample(self.sample, &mut self.review_rng)).ok() {
+            return false;
+        }
+        let passes = spec.check(&fix.program, &spec.sample(self.sample, &mut self.review_rng)).ok();
+        if !passes {
+            self.rejected.insert(program);
+        }
+        passes
     }
 
     fn check(&mut self, turn: &Turn, target: &Impl) -> Result<()> {
@@ -305,10 +355,14 @@ impl Agent for ScriptedAgent {
 
         // 0. Accept others' fixes of my live implementations: only my relation retires mine.
         let mut accepted = false;
-        for mine in view.impls.values().filter(|i| i.live() && i.author == self.name) {
-            for (fix_name, fix_id) in &mine.proposed_fixes {
-                turn.replica.relate(fix_id, "supersedes", &mine.id, &format!("accepts {fix_name}"))?;
-                accepted = true;
+        let me = self.name.clone();
+        for mine in view.impls.values().filter(|i| i.live() && i.author == me) {
+            for fix in &mine.proposed_fixes {
+                let Some(fix) = view.impls.get(fix) else { continue };
+                if self.accepts(mine, fix) {
+                    turn.replica.relate(&fix.id, "supersedes", &mine.id, &format!("accepts {}", fix.name))?;
+                    accepted = true;
+                }
             }
         }
         if accepted {
@@ -352,18 +406,23 @@ impl Agent for ScriptedAgent {
 /// The evidence method of a heartbeat on a wip claim.
 pub const HEARTBEAT: &str = "heartbeat";
 
-/// An open wip claim (not retracted, superseded by its author, or taken over), as one replica sees it.
+/// An open wip claim (not retracted or superseded by its author), as one replica sees it.
 struct Wip {
     id: String,
     author: String,
     spec: String,
-    /// The round the claim states it was made in.
-    round: u32,
+    /// The round the claim states it was made in, if it states one. Its author's word only.
+    round: Option<u32>,
     /// Heartbeats its author has recorded on it.
     heartbeats: usize,
+    /// Whether another author's wip claim on the same spec has taken it over (`refines`
+    /// it). That doesn't end the claim, since anyone can write such a relation; it only
+    /// stops a second takeover.
+    taken_over: bool,
 }
 
-/// The round a wip claim states, from its trailing `(round N)`.
+/// The round a wip claim states, from its trailing `(round N)`. The author's word:
+/// see [`ScriptedAgent::is_stale`] for how much it counts.
 pub fn wip_round(statement: &str) -> Option<u32> {
     statement.strip_suffix(')')?.rsplit_once("(round ")?.1.parse().ok()
 }
@@ -379,9 +438,9 @@ struct Impl {
     retracted: bool,
     /// A supersession that counts: written by this implementation's author.
     superseded: bool,
-    /// Live fixes by other agents that claim to supersede it, which its author
-    /// hasn't accepted: fix name to fix id.
-    proposed_fixes: BTreeMap<String, String>,
+    /// Live implementations by other agents that claim to supersede it, which its
+    /// author hasn't accepted: their names and ids.
+    proposed_fixes: BTreeSet<(String, String)>,
     checked_by: BTreeSet<String>,
     fails: BTreeSet<String>,
 }
@@ -398,8 +457,9 @@ impl Impl {
 struct View {
     /// Spec name to its claim's id.
     specs: HashMap<String, String>,
-    /// Implementations by artifact name.
-    impls: BTreeMap<String, Impl>,
+    /// Implementations by artifact name, then id: a name is its author's choice, so
+    /// two artifacts may share one.
+    impls: BTreeMap<(String, String), Impl>,
     /// Open wip claims, ordered by author and round.
     wips: Vec<Wip>,
 }
@@ -429,8 +489,9 @@ impl View {
                 continue;
             }
             let artifact_name = artifact.text("name").to_owned();
-            name_of.insert(artifact.id.as_str(), artifact_name.clone());
-            impls.entry(artifact_name.clone()).or_insert_with(|| Impl {
+            let key = (artifact_name.clone(), artifact.id.clone());
+            name_of.insert(artifact.id.as_str(), key.clone());
+            impls.entry(key).or_insert_with(|| Impl {
                 id: artifact.id.clone(),
                 name: artifact_name,
                 author: name(&artifact.author),
@@ -438,7 +499,7 @@ impl View {
                 program: artifact.text("text").to_owned(),
                 retracted: artifact.retracted,
                 superseded: false,
-                proposed_fixes: BTreeMap::new(),
+                proposed_fixes: BTreeSet::new(),
                 checked_by: BTreeSet::new(),
                 fails: BTreeSet::new(),
             });
@@ -467,21 +528,32 @@ impl View {
                         && by_id[e.text("from")].author == e.author
                         && !by_id[e.text("from")].retracted
                     {
-                        i.proposed_fixes.insert(fix.clone(), e.text("from").to_owned());
+                        i.proposed_fixes.insert(fix.clone());
                     }
                 }
                 _ => {}
             }
         }
-        // Open wip claims: not retracted, not superseded by their own author, and not taken
-        // over (refined by another wip claim) as stale.
-        let is_wip = |id: &str| by_id.get(id).is_some_and(|c| c.kind == "claim" && c.tags().first() == Some(&"wip"));
-        let superseded: BTreeSet<&str> = log
-            .iter()
-            .filter(|e| e.kind == "relation" && !e.retracted)
-            .filter(|e| match e.text("kind") {
-                "supersedes" => by_id.get(e.text("to")).is_some_and(|t| t.author == e.author),
-                "refines" => is_wip(e.text("from")) && is_wip(e.text("to")),
+        // Open wip claims: not retracted, and not superseded by their own author. A takeover
+        // (another wip claim refining one) is noted but doesn't close it: it's stale or not
+        // by each agent's own judgement.
+        let relations = || log.iter().filter(|e| e.kind == "relation" && !e.retracted);
+        let superseded: BTreeSet<&str> = relations()
+            .filter(|e| e.text("kind") == "supersedes" && by_id.get(e.text("to")).is_some_and(|t| t.author == e.author))
+            .map(|e| e.text("to"))
+            .collect();
+        // A takeover is a refines from another author's wip claim on the same spec.
+        let wip_spec = |id: &str| match by_id.get(id) {
+            Some(c) if c.kind == "claim" => match c.tags()[..] {
+                ["wip", spec] => Some((spec, c.author.as_str())),
+                _ => None,
+            },
+            _ => None,
+        };
+        let taken_over: BTreeSet<&str> = relations()
+            .filter(|e| e.text("kind") == "refines")
+            .filter(|e| match (wip_spec(e.text("from")), wip_spec(e.text("to"))) {
+                (Some((s1, a1)), Some((s2, a2))) => s1 == s2 && a1 != a2,
                 _ => false,
             })
             .map(|e| e.text("to"))
@@ -496,15 +568,76 @@ impl View {
         let mut wips: Vec<Wip> = log
             .iter()
             .filter(|e| e.kind == "claim" && !e.retracted && !superseded.contains(e.id.as_str()))
-            .filter_map(|e| match (&e.tags()[..], wip_round(e.text("statement"))) {
-                (&["wip", spec], Some(round)) if task::spec(spec).is_some() => {
-                    let heartbeats = heartbeats.get(e.id.as_str()).copied().unwrap_or(0);
-                    Some(Wip { id: e.id.clone(), author: name(&e.author), spec: spec.to_owned(), round, heartbeats })
-                }
+            .filter_map(|e| match &e.tags()[..] {
+                &["wip", spec] if task::spec(spec).is_some() => Some(Wip {
+                    id: e.id.clone(),
+                    author: name(&e.author),
+                    spec: spec.to_owned(),
+                    round: wip_round(e.text("statement")),
+                    heartbeats: heartbeats.get(e.id.as_str()).copied().unwrap_or(0),
+                    taken_over: taken_over.contains(e.id.as_str()),
+                }),
                 _ => None,
             })
             .collect();
         wips.sort_by(|a, b| (&a.author, a.round, &a.spec).cmp(&(&b.author, b.round, &b.spec)));
         Ok(View { specs, impls, wips })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn abs_impl(id: &str, author: &str, program: &str, failed_by: &[&str]) -> Impl {
+        Impl {
+            id: id.to_owned(),
+            name: format!("impl/abs/{author}/{id}"),
+            author: author.to_owned(),
+            spec: "abs".to_owned(),
+            program: program.to_owned(),
+            retracted: false,
+            superseded: false,
+            proposed_fixes: BTreeSet::new(),
+            checked_by: BTreeSet::new(),
+            fails: failed_by.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_proposed_fix_that_fails_my_check_once_stays_rejected() {
+        // Wrong only at a = -1, so a sample of 6 of the 13 inputs misses the bug about
+        // half the time: checked afresh each time, it would be accepted sooner or later.
+        // Each proposal is a new artifact with the same program.
+        let mut agent = ScriptedAgent::new("agent-1", 1, 1, 6, Behaviour::default());
+        let mine = abs_impl("mine", "agent-1", "a", &["agent-2"]);
+        let verdicts: Vec<bool> = (0..50)
+            .map(|n| agent.accepts(&mine, &abs_impl(&format!("fix{n}"), "agent-0", "a -1 < a neg a ?", &[])))
+            .collect();
+        let first_no = verdicts.iter().position(|v| !v).expect("some sample finds the bug");
+        assert!(verdicts[first_no..].iter().all(|v| !v), "accepted after rejecting: {verdicts:?}");
+    }
+
+    #[test]
+    fn a_proposed_fix_is_only_accepted_for_failed_work_of_the_same_spec() {
+        let mut agent = ScriptedAgent::new("agent-1", 1, 1, 6, Behaviour::default());
+        let correct = task::spec("abs").expect("abs").correct[0];
+        let fix = abs_impl("fix", "agent-0", correct, &[]);
+        assert!(!agent.accepts(&abs_impl("ok", "agent-1", "a", &[]), &fix), "nobody failed it");
+        let mut other_spec = abs_impl("fix2", "agent-0", correct, &[]);
+        other_spec.spec = "sign".to_owned();
+        assert!(!agent.accepts(&abs_impl("bad", "agent-1", "a", &["agent-2"]), &other_spec), "another spec");
+        assert!(agent.accepts(&abs_impl("bad", "agent-1", "a", &["agent-2"]), &fix));
+    }
+
+    #[test]
+    fn a_made_up_fail_on_correct_work_never_gets_a_fix_accepted() {
+        // agent-0 records a fail on agent-1's correct implementation, then proposes a copy.
+        let mut agent = ScriptedAgent::new("agent-1", 1, 1, 6, Behaviour::default());
+        let correct = task::spec("abs").expect("abs").correct[0];
+        let mine = abs_impl("mine", "agent-1", correct, &["agent-0"]);
+        for n in 0..50 {
+            assert!(!agent.accepts(&mine, &abs_impl(&format!("copy{n}"), "agent-0", correct, &[])));
+        }
     }
 }
