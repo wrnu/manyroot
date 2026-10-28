@@ -44,10 +44,14 @@ how much of the subscription one run uses.
   can't write to: the token usage Claude Code reports for every turn, the
   tool event log, and the hidden grader run on every version of the
   integrated library. Nothing an agent says about its own work counts.
-- **Quota:** about 58 million tokens (3.6 million of them output, most of
-  the rest cache reads) and 1.5 to 2 hours for one 10-agent pilot of all
-  three modes on Claude Opus 5.5, capped by the driver at 75 million; about
-  3 million tokens and 25 minutes for the calibration run before it. One
+- **Quota:** 27 to 47 million tokens (7.2 million of them output counted at
+  the per-turn ceiling, an upper bound until real output is measured; most
+  of the rest cache reads) and 30 to 45 minutes for one 10-agent pilot of
+  all three modes on Claude Opus 5.5. The owner's go caps the whole pilot
+  at 75 million tokens, 5 million output and 3 hours, which the driver
+  enforces as a third per mode; the output bound at the ceiling is above
+  5 million, so a mode would stop at its cap first. The calibration run measured it (1.36 million tokens counted, about
+  5 minutes; section 5). One
   pilot calibrates; claims need three replicates. No money is spent beyond
   the subscription.
 - **Build:** 10 steps, each one PR, none touching `crates/manyroot` or the
@@ -917,43 +921,88 @@ Use is stated in tokens and wall-clock time, as Claude Code reports them.
 
 ### Estimate for one 10-agent pilot (all three modes)
 
-Assumptions, to be replaced by the calibration run's measurements: Claude
-Opus 5.5 at medium effort; a cached prefix (system prompt and tools) of
-about 5,000 tokens; about 15 model calls per turn; on average 13,000 cached
-and 2,000 new input tokens and 1,000 output tokens (thinking included) per
-call.
+Measured in the calibration run (step 8, 2026-10-28; reports `eb60e66777b3`
+and `c59e23bd4be6`): Claude Opus 5.5 at medium effort, 2 agents, 2 turns, all
+three modes, 12 turns in all. Every turn ended at the 25-tool-call cap, after
+5 to 14 model calls (8.7 on average): the model asks for 2 to 5 tools per
+call. So no turn had a `result` event, and each turn's output is counted at
+the fail-closed ceiling of 30,000 tokens. The real output, thinking included,
+is unmeasured: the stream shows only a stub, and the visible part (text and
+tool inputs) was about 1,200 to 2,300 tokens per mode of four turns. It will
+be measured once the soft stop at the cap (decision `147a36d5d623`) lets a
+turn end with its `result` event. Until then, the ceiling is the estimate's
+safe upper bound for output. Through the gateway, almost all input arrives
+as cache reads and writes (17 new input tokens a turn).
 
-| | Per call | Per turn (15 calls) | Per agent (8 turns) | Per mode (10 agents) | Pilot (3 modes) |
+The table scales the measured average turn (git, Bracken and CRDT together)
+to the pilot:
+
+| | Per call | Per turn (8.7 calls) | Per agent (8 turns) | Per mode (10 agents) | Pilot (3 modes) |
 |---|---|---|---|---|---|
-| Model calls | 1 | 15 | 120 | 1,200 | 3,600 |
-| Cache reads | 13,000 | 195,000 | 1.6 M | 16 M | 47 M |
-| New input | 2,000 | 30,000 | 240,000 | 2.4 M | 7.2 M |
-| Output (thinking included) | 1,000 | 15,000 | 120,000 | 1.2 M | 3.6 M |
-| **All tokens** | 16,000 | 240,000 | 1.9 M | 19 M | **58 M** |
+| Model calls | 1 | 8.7 | 69 | 690 | 2,100 |
+| Cache reads | 7,600 | 66,000 | 530,000 | 5.3 M | 16 M |
+| Cache writes | 2,000 | 17,000 | 140,000 | 1.4 M | 4.1 M |
+| New input | 2 | 17 | 140 | 1,400 | 4,200 |
+| Output (at the ceiling) | | 30,000 | 240,000 | 2.4 M | 7.2 M |
+| **All tokens** | | 113,000 | 0.9 M | 9.1 M | **27 M** |
 
-Output tokens, and to a lesser degree new input, are what weigh most against
-usage limits; cache reads are most of the total but the cheapest part. The
-estimate could be off by a factor of two either way; that is what the
-calibration run is for.
+By mode, a turn used 111,000 tokens in git, 138,000 in Bracken and 90,000 in
+CRDT, each with its 30,000 of counted output. These are first and second
+turns of 2 agents. Later turns, with 10 agents, read a bigger state: the largest
+context of one call was 11,000 tokens in git and CRDT and 38,000 in Bracken.
+So the input side is allowed to double by the eighth turn, which puts the
+pilot at **27 to 47 million tokens**, 7.2 million of them output counted at
+the ceiling. Real output will lower the total once it is measured. Until the
+soft stop lands, an agent whose every turn is counted at the ceiling reaches
+the per-agent output cap of 180,000 after 6 of its 8 turns.
 
-- **Calibration run:** 2 agents, 2 turns, all three modes: about 180 calls,
-  2.9 million tokens (180,000 output), about 25 minutes. An optional
-  shakedown on Haiku 5.5 first uses the same token counts on a much lighter
-  model (decision 2, section 8).
-- **Three replicates** for a claim about the modes: about 175 million tokens
-  (11 million output) and 5 to 6 hours, spread over separate sessions.
+The owner's go for the pilot (approval `3418fe14b8ed`) caps the whole pilot
+at 75 million tokens, 5 million output tokens and 3 hours. One `bracken-experiment
+run` is one mode, and the modes run one after another, so each run is capped
+at a third: 25 million tokens, 1,666,666 output tokens and 1 hour, equal in
+every mode (decision `ea053c2c4d48`; caps item 4 below):
+
+| | Re-estimate, pilot | Re-estimate, per mode | Pilot cap | Per-mode cap | Within it? |
+|---|---|---|---|---|---|
+| Tokens | 27 to 47 M | 9 to 16 M | 75 M | 25 M | Yes |
+| Output | 7.2 M at the ceiling; 5.4 M at most under the per-agent caps | 2.4 M at the ceiling; 1.8 M at most under the per-agent caps | 5 M | 1,666,666 | No, at the ceiling |
+| Wall-clock | 30 to 45 minutes | about 10 minutes | 3 hours | 1 hour | Yes |
+
+So the output bound is over the cap: 7.2 million at the ceiling, or 5.4
+million under the per-agent caps, against 5 million. It can't all happen. A
+mode whose counted output reaches 1,666,666 stops at its run cap, and its
+report is written from what exists. With the soft stop, real output is
+expected well below the ceiling: the visible part was under 600 tokens a
+turn. If it isn't, the manager goes back to the owner rather than raising a
+cap.
+
+Output tokens are what weigh most against usage limits; cache reads are most
+of the total but the cheapest part.
+
+- **Calibration run (done):** Opus 5.5, 104 model calls and 1.36 million
+  tokens counted (git 446,000, Bracken 552,000, CRDT 359,000; 360,000 of
+  them output at the ceiling), about 5 minutes for the three modes. The
+  Haiku 5.5 shakedown before it (decision 2, section 8): 65 model calls,
+  0.92 million tokens counted, also every turn at the cap. Both were clean:
+  every turn passed the gate, with no sandbox denial, unreadable usage,
+  crash or rate-limit wait.
+- **Three replicates** for a claim about the modes: about 80 to 140 million
+  tokens (22 million output at the ceiling), spread over separate sessions.
 - **Larger runs:** use grows at least with the number of agent turns, and
   faster once the state is bigger than a turn can read cheaply: 20 agents
-  about 120 million tokens a pilot, 100 agents well over 600 million. Those
-  are likely beyond what a subscription's limits allow in one sitting, and
+  about 55 to 95 million tokens a pilot, 100 agents well over 270 million.
+  Those may be beyond what a subscription's limits allow in one sitting, and
   each needs its own go.
 
 ### Wall-clock time
 
-At about 15 seconds a call, a turn takes about 4 minutes and an agent's 8
-turns about 30 minutes. Agents in a mode run at once, so a mode takes 30 to
-40 minutes, and the pilot 1.5 to 2 hours with the modes one after another,
-mode order randomized and recorded. Running the three modes at once (30
+Measured in the calibration run, a turn takes about 40 to 50 seconds (it
+ends at the tool-call cap after about 9 calls), and a mode of 2 agents and 2
+turns took 84 to 102 seconds. At that rate an agent's 8 turns take about 6
+to 7 minutes. Agents in a mode run at once, so a mode should take about 10
+minutes, and the pilot 30 to 45 minutes with the modes one after another,
+mode order randomized and recorded. The soft stop's grace at the cap, and
+rate-limit waits with 10 concurrent sessions, can lengthen that. Running the three modes at once (30
 concurrent sessions) is more likely to hit the subscription's limits and
 would hit the modes unequally, so it isn't proposed.
 
@@ -976,20 +1025,27 @@ Each layer stops a run's use on its own:
    call. Claude Code's `--max-budget-usd` does apply through a gateway base
    URL (step 6 checked it against a fake endpoint: it stopped the turn after
    the first call that crossed the limit), so it is set on every turn at
-   about twice a turn's expected use: 1 USD. At the price Claude Code
-   applied to claude-opus-5-5 in that probe (about 4 USD per million input
-   and 20 per million output tokens; cache reads taken at a tenth of
-   input), the expected turn above (195,000 cache reads, 30,000 new input,
-   15,000 output) is about 0.5 USD. The calibration run re-checks it. It counts Claude Code's
+   1 USD. At the price Claude Code applied to claude-opus-5-5 in that probe
+   (about 4 USD per million input and 20 per million output tokens; cache
+   reads taken at a tenth of input, and cache writes here at 1.25 times
+   input), the measured turn above (about 66,000 cache reads and 17,000
+   cache writes) is about 0.11 USD before output. Its output is unmeasured.
+   At the 30,000 ceiling the turn would be about 0.71 USD, and with only the
+   visible output about 0.12. The calibration couldn't re-check the stop:
+   no turn had a `result` event, so Claude Code's cost estimate was never
+   seen. That re-check waits for the soft stop (decision `147a36d5d623`). It counts Claude Code's
    API-equivalent estimate, not money spent, and it is the in-turn stop on
    output, which the driver only learns at the turn's end (below).
 3. **Per agent:** 3 million tokens and 180,000 output tokens, equal in every
    mode (about 1.5 times the estimate). An agent that reaches either stops.
-4. **Per run:** the announced use (pilot: 75 million tokens, 5 million
-   output), checked by the driver against its running total before every
-   turn and while each turn streams; at the limit it stops every agent and
-   writes the report from what exists. The run also stops after 3 hours of
-   wall-clock time.
+4. **Per run:** the announced use is for the whole pilot (75 million
+   tokens, 5 million output, 3 hours; approval `3418fe14b8ed`). One run is
+   one mode, so each run gets a third: 25 million tokens, 1,666,666 output
+   tokens and 1 hour of wall-clock time (decision `ea053c2c4d48`; the
+   driver's change is task `037bf6218a32`). The driver checks the run's
+   running total against them before every turn and while each turn
+   streams; at the limit it stops every agent and writes the report from
+   what exists.
 
 **The caps fail closed** (finding `8d72c61ddf30`):
 
@@ -1117,8 +1173,8 @@ library.
 | 5 | Metrics and report: graded snapshots, the six measures, the plan and its hashes, the comparison table; tested on mock runs of every mode | 2 (3 and 4 for their rows) | No | None (`blake3` for hashes) |
 | 6 | The agent driver: Claude Code started as section 3 says; the agent, tools and hub `sandbox-exec` profiles; the forwarding proxy; the shim; the `init` gate; token accounting; section 5's caps, failing closed; process groups; transcripts and the auth-value check on them. Tests with a fake `claude` executable: each profile refuses each forbidden access (the owner's home, a repository, `~/.ssh`, the keychain, another agent's copy, the hub, the event log, another HTTPS host direct and through the forwarding proxy, starting any process but its own); the tools and hub profiles refuse `/bin/sh` and `/bin/bash`, the hub profile can't write any copy and the tools profile can't write the hub, and a sync both ways in every mode still works under them; the shim refuses to start with any variable set; the gate refuses a stream with another version, model, permission mode, credential source, tool, skill, plugin or MCP server, and a changed turn-configuration file or binary; caps end a fake Claude Code that streams past them or drops its usage; killing the driver mid-turn leaves no agent process and sends no further request. Then the pinned real Claude Code binary, under the final agent profile, with a throwaway home and config directory and a fake auth value, pointed at a local fake endpoint through the forwarding proxy, run to its `init` event and its first request, with the forbidden-access checks repeated against it; no model is called (finding `b2a6109bbf92`). Any profile change found after this step, in calibration or later, is a new step-6 change with its own review, not a fix made during a run. Also finds out, against a fake endpoint, whether `--max-budget-usd` stops a turn when Claude Code runs through a proxy | 2, 0 | No | None (the proxy on `std::net`; process groups through the standard library and `rustix`; `sandbox-exec` is part of macOS) |
 | 7 | Prompts: base prompt and tool descriptions; neutrality review; a full mock run of all three modes | 3, 4, 5, 6 | No | None |
-| 8 | Calibration run: 2 agents, 2 turns, three modes; replace section 5's assumptions with measurements and re-estimate the pilot | 7; the manager tells the owner first | About 3 M tokens, 25 minutes | None |
-| 9 | The 10-agent pilot, plan contributed first | 8; the manager tells the owner the re-estimated use first | About 58 M tokens (3.6 M output), 1.5 to 2 hours | None |
+| 8 | Calibration run: 2 agents, 2 turns, three modes; replace section 5's assumptions with measurements and re-estimate the pilot | 7; the manager tells the owner first | Done: 1.36 M tokens counted on Opus 5.5 and 0.92 M on the Haiku 5.5 shakedown, about 5 minutes each | None |
+| 9 | The 10-agent pilot, plan contributed first | 8, and the soft stop at the tool-call cap (decision `147a36d5d623`); the manager tells the owner the re-estimated use first | 27 to 47 M tokens (7.2 M output at the ceiling, an upper bound), 30 to 45 minutes; capped at 75 M tokens, 5 M output and 3 hours in total, a third per mode | None |
 | 10 | Results in `docs/`, and the decision on replicates and scale | 9 | No | None |
 
 Steps 3, 4 and 6 can be built in parallel once step 2 lands.
@@ -1146,11 +1202,13 @@ The owner accepted all eight recommendations of the first draft (decision
 7. **Bracken's materialization rule:** current implementations with at
    least one independent pass, most passes first, then causal order, fixed
    in the plan before the run.
-8. **Quota and replicates:** the calibration run (about 3 million tokens,
-   25 minutes) first, then the pilot on its re-estimated use (expected about
-   58 million tokens, 3.6 million output, capped at 75 and 5 million), run
-   when the team is otherwise idle; replicates (about 175 million tokens for
-   three) are decided after reading the pilot.
+8. **Quota and replicates:** the calibration run (done: 1.36 million tokens
+   counted, about 5 minutes) first, then the pilot on its re-estimated use
+   (27 to 47 million tokens, 7.2 million output at the ceiling; capped at 75
+   million tokens, 5 million output and 3 hours for the whole pilot, a third
+   of each per mode), run
+   when the team is otherwise idle; replicates (about 80 to 140 million
+   tokens for three) are decided after reading the pilot.
 
 ## 9. After the pilot
 
