@@ -19,7 +19,13 @@
 #     main: no keys or stray files under .bracken/, the Ground append-only, the
 #     Ground opens, docs/vision.md matches it. Then don't pull them.
 # If origin can't be reached, it checks nothing there, says so, commits anyway (the
-# local files need no network) and names no commit to pull.
+# local files need no network) and names no commit to pull; rerun it once origin is
+# reachable, before pushing.
+#
+# The guards refuse any change to the root .gitattributes, which a manager merges by
+# hand. Once they have checked what it does to .bracken/, `--attributes-checked
+# <sha>` lands it: <sha> must be origin's main, every other guard still runs on it,
+# and a note saying so goes in the Ground as manager (process 9.3).
 # Pulling and pushing are separate steps: merge the commit it names as checked
 # (not a fresh `git pull`, which could bring in more), then push. That's the only
 # way to update the main checkout, after a merge too (process 9.3).
@@ -29,11 +35,14 @@
 # the setup PR.
 set -euo pipefail
 
+usage() { echo "usage: ground-checkpoint [--setup | --attributes-checked <full sha of origin's main>]" >&2; exit 2; }
 setup=false
-case "$*" in
-  --setup) setup=true ;;
+checked=""
+case "${1:-}" in
+  --setup) [ $# -eq 1 ] || usage; setup=true ;;
+  --attributes-checked) [ $# -eq 2 ] || usage; checked=$2 ;;
   "") ;;
-  *) echo "usage: ground-checkpoint [--setup]" >&2; exit 2 ;;
+  *) usage ;;
 esac
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -56,15 +65,24 @@ git diff --cached --quiet || stop "something is already staged; commit or unstag
 # What the next pull brings in is checked before anything is committed: a commit on origin's main
 # that skipped scripts/merge would otherwise land in the live Ground unchecked.
 pull=""
+offline=false
 if ! $setup && git remote get-url origin >/dev/null 2>&1; then
   if ! git fetch -q origin +refs/heads/main:refs/remotes/origin/main; then
+    offline=true
     echo "ground-checkpoint: couldn't fetch origin's main, so checked nothing there; don't pull until a checkpoint can" >&2
   elif pull=$(git rev-parse --verify refs/remotes/origin/main) && git merge-base --is-ancestor "$pull" HEAD; then
     pull=""
   else
-    "$here/ground-guards" HEAD "$pull" ||
-      stop "origin's main ($pull) fails the Ground guards above; don't pull it, and tell the owner if they name a key"
+    [ -z "$checked" ] || [ "$checked" = "$pull" ] ||
+      stop "--attributes-checked $checked isn't origin's main ($pull); check that commit's attribute change first"
+    GROUND_GUARDS_ATTRIBUTES_CHECKED=$checked "$here/ground-guards" HEAD "$pull" ||
+      stop "origin's main ($pull) fails the Ground guards above; don't pull it, and tell the owner if they name a key (if only .gitattributes is refused, see process 9.3)"
   fi
+fi
+if [ -n "$checked" ]; then
+  [ -n "$pull" ] || stop "--attributes-checked: origin's main has nothing to pull, so there's no attribute change to land"
+  "$here/bk" claim "ground-checkpoint: origin's main $pull changes the root .gitattributes; a manager checked what it does to .bracken/ and passed it to ground-checkpoint --attributes-checked" \
+    --tag note --as manager >/dev/null || stop "couldn't record the note for --attributes-checked; nothing was committed"
 fi
 then_pull() { [ -z "$pull" ] || echo "ground-checkpoint: origin's main passes the Ground guards; pull exactly it with: git merge --no-edit $pull"; }
 
@@ -115,4 +133,8 @@ fi
 git commit -q -m "ground: checkpoint $(date -u +%Y-%m-%dT%H:%MZ)"
 echo "ground-checkpoint: committed $(git rev-parse HEAD) ($(printf '%s\n' "$new" | wc -l | tr -d ' ') files)"
 then_pull
-echo "ground-checkpoint: push it with: git push origin $branch"
+if $offline; then
+  echo "ground-checkpoint: origin wasn't reachable; once it is, rerun ground-checkpoint (it fetches and checks first), then push"
+else
+  echo "ground-checkpoint: push it with: git push origin $branch"
+fi
