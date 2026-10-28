@@ -269,11 +269,13 @@ It pins:
   replica doesn't hold, and either end of a relation), another author's
   retraction of each kind of contribution, and a blank claim statement,
   artifact name or evidence method, made of each White_Space character in
-  turn. On the other side, a field made of U+FEFF, U+200B, U+180E or U+001C to
-  U+001F is accepted, and a test checks that the toolchain's White_Space set
-  is exactly the 25 that rule 8 lists, so a Unicode upgrade that changes it
-  fails. The size limit is pinned at its boundary: exactly 16 MiB passes, one
-  byte more fails both decoding and the validity check.
+  turn. On the other side, a field made of any one control, format or
+  separator character outside White_Space (every Cc, Cf, Zs, Zl and Zp scalar
+  in Unicode 17.0, U+FEFF, U+200B, U+180E and U+001C to U+001F among them) is
+  accepted, and a test checks that the toolchain's White_Space set is exactly
+  the 25 that rule 8 lists, so a Unicode upgrade that changes it fails. The
+  size limit is pinned at its boundary: exactly 16 MiB passes, one byte more
+  fails both decoding and the validity check.
 - **Causal order vector.** The pinned order of six contributions, some of
   them concurrent, which pins the tie-break: the smallest id whose parents
   are all listed comes next.
@@ -322,14 +324,29 @@ tests them:
   does pin that a contribution is added once its parents are present.
 
 These lists say what each test was written to pin, not that a rule can't be
-loosened in a way no test notices. Gaps are found by mutation: changing one
-rule at a time in `crates/manyroot/src` and checking that `cargo test
---workspace` fails. That sweep is a standing task (`7c6e5b8b4326` in this
-repository's Ground), and every surviving mutant it finds is either pinned
-by a new test or listed here. One check has no mutant that changes
-behaviour: evidence counts only for its own target, but the reader only
-looks at a subject's referrers, and evidence refers to nothing but its
-target.
+loosened in a way no test notices. Gaps are found by mutation, with
+[cargo-mutants](https://mutants.rs), one file at a time:
+
+```sh
+cargo mutants -p manyroot --file crates/manyroot/src/graph.rs -j 1
+```
+
+over `graph.rs`, `validation.rs`, `contribution.rs`, `bundle.rs` and
+`sync.rs`, counting only `manyroot`'s own tests. That sweep is a standing
+task (`7c6e5b8b4326` in this repository's Ground), and every surviving
+mutant it finds is either pinned by a new test or listed below. The last
+sweep, on 2026-10-28, killed every mutant that compiles except these:
+
+- **Equivalent:** `truncate` in `sync.rs` with `>` changed to `>=`. A reason
+  of exactly 256 bytes is cut at 256 bytes, which changes nothing. Evidence
+  counts only for its own target, but the reader only looks at a subject's
+  referrers, and evidence refers to nothing but its target, so dropping that
+  check changes nothing either (cargo-mutants doesn't generate it; an earlier
+  hand-made sweep did).
+- **Known gap:** a `need` list of exactly 65 536 ids, which must wait for an
+  empty `need` to end it. Testing it takes 65 536 real, signed contributions
+  to offer, minutes in a debug build. The same boundary for `heads` and
+  `offer` is pinned with made-up ids.
 
 Changing a pinned value or the fixture is a protocol change: it needs
 independent review, the manager's go (logged as `owner-review`) and a migration note in

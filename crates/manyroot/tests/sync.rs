@@ -679,3 +679,54 @@ fn a_batch_after_the_last_one_is_refused() {
     assert_eq!(s.receive(&g, batch(vec![], true)).unwrap_err(), SyncError::Unexpected("batch"));
     assert_eq!(s.receive(&g, batch(children, true)).unwrap_err(), SyncError::Unexpected("batch"));
 }
+
+#[test]
+fn a_need_or_result_out_of_turn_ends_the_session() {
+    let all = random_history(&mut Rng(53), 6);
+    let g = closure(&all, &(0..all.len()).collect::<Vec<_>>());
+
+    // A result with no batch outstanding: right after hello, and again once our last batch was answered.
+    let mut s = opened(&g);
+    let result = Message::Result { added: 0, already_present: 0, rejected: vec![], unresolved: 0 };
+    assert_eq!(s.receive(&g, result.clone()).unwrap_err(), SyncError::Unexpected("result"));
+    let mut s = opened(&g);
+    s.receive(&g, Message::Heads { heads: vec![] }).unwrap();
+    assert!(s.receive(&g, result.clone()).unwrap().send.is_empty(), "our only batch was the last");
+    assert_eq!(s.receive(&g, result).unwrap_err(), SyncError::Unexpected("result"));
+
+    // A need, even an empty one, when we didn't offer: we took the shortcut.
+    let mut s = opened(&g);
+    s.receive(&g, Message::Heads { heads: vec![] }).unwrap();
+    assert_eq!(s.receive(&g, Message::Need { ids: vec![] }).unwrap_err(), SyncError::Unexpected("need"));
+}
+
+#[test]
+fn a_sender_counts_what_it_sent() {
+    let all = random_history(&mut Rng(59), 10);
+    let g = closure(&all, &(0..all.len()).collect::<Vec<_>>());
+    let order: Vec<Contribution> = g.topo_order().iter().map(|id| g.get(id).unwrap().clone()).collect();
+    let mut s = Session::new(GROUND, Limits::default());
+    s.start(&g);
+    let peer = Limits { batch_bytes: bundle_len(&order[..4]) as u64 };
+    s.receive(&g, Message::Hello { protocol: 1, ground: GROUND, limits: peer, features: vec![] }).unwrap();
+    assert_eq!(s.sent(), Tally::default());
+    s.receive(&g, Message::Heads { heads: vec![] }).unwrap();
+    assert_eq!(s.sent(), Tally { contributions: 4, batches: 1 });
+    let result = Message::Result { added: 4, already_present: 0, rejected: vec![], unresolved: 0 };
+    s.receive(&g, result).unwrap();
+    assert_eq!(s.sent().batches, 2);
+    assert!(s.sent().contributions > 4);
+}
+
+#[test]
+fn a_contribution_too_large_for_equal_limits_is_too_large_for_the_peer() {
+    let all = random_history(&mut Rng(61), 3);
+    let g = closure(&all, &[0]);
+    let first = g.iter().next().unwrap().clone();
+    // Both sides' limits one byte short of the contribution's bundle: the peer's limit is the reason.
+    let limits = Limits { batch_bytes: bundle_len(std::slice::from_ref(&first)) as u64 - 1 };
+    let mut s = Session::new(GROUND, limits);
+    s.start(&g);
+    s.receive(&g, Message::Hello { protocol: 1, ground: GROUND, limits, features: vec![] }).unwrap();
+    assert_eq!(s.receive(&g, Message::Heads { heads: vec![] }).unwrap_err(), SyncError::TooLargeForPeer(first.id()));
+}
