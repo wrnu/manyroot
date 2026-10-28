@@ -168,17 +168,51 @@ the chat channel.
   own clone. git runs with a cleared environment, no system or global
   config, hooks disabled (`core.hooksPath` to an empty directory), and no
   remote but the hub.
-- **Tools:** read a file, edit a file (replace a line range or a unique
-  string), `status`, `diff`, create or switch branch, commit, push branch,
-  fetch, merge or rebase onto `main`, resolve a conflict by editing, and a
-  small local PR system the harness provides: open, list, view (diff,
-  checks, reviews, comments), comment, review (approve or request changes),
-  merge.
-- **Merge rule:** a PR merges into `main` when the CI check passes on the
-  merge result (the public cases for every function in the library, run by
-  the harness, so CI is the same checker) and someone other than the author
-  has approved it. That's the common rule in practice (decision 6, section 8).
-- **Integrated state:** `main` on the hub.
+- **Tools:** read a file (a module or `TASKS.md`), edit a module file
+  (replace a line range or a unique string), `status`, `diff`, `log`, create
+  or switch a branch (from the hub's `main` or an open PR's head), commit,
+  merge `main` into the branch (conflicts are left to edit and commit) or
+  rebase onto it, `check`, and a small local PR system the hub serves: open,
+  list, view (diff, CI, reviews, comments), comment, review (approve or
+  request changes), merge, close. There are no separate push and fetch
+  tools: every sync pushes all the agent's branches to the hub's
+  per-agent namespace and fetches `main` and every open PR's head, and the
+  tool descriptions say so (decision `6b13e672e7d4` point 5). PR tools'
+  values are checked in the agent's own tool worker, and the hub runs the
+  checked form as that agent; free text in PRs is data in the hub's PR
+  record, never an argument.
+- **Task and change requests:** `TASKS.md` on `main`, with a
+  machine-readable line of released change tags. Only the setter commits it,
+  at setup and at the change release; agents can't edit it (the file-name
+  rule), and CI refuses any PR that changes it (decision `6b13e672e7d4`
+  point 6, like Bracken mode's setter-only spec claims). A copy's `check`
+  uses the version its last-fetched `main` states.
+- **Merge rule** (decision 6, section 8, made exact by decision
+  `6b13e672e7d4`, all part of the pre-registered plan): a PR merges into
+  `main` when
+  1. **CI** passes on the merge result: every module parses with no name
+     defined twice, only module files change, every function that passes
+     its public cases on `main` still does, and every function the PR
+     changes does, against the cases of the hub's released version. Missing
+     functions are skipped, so after the change release a PR fixing one
+     function isn't blocked by others that now fail on `main`. The hub
+     computes CI at merge time (and shows it in `list` and `view`);
+  2. someone other than the author **approved the PR's current head**: a new
+     push needs a new approval, so approve-then-swap can't merge unreviewed
+     code;
+  3. no reviewer's latest review **requests changes**. Each reviewer counts
+     once, by their latest review, and the author never counts. A request
+     for changes blocks until that reviewer approves, parallel to Bracken's
+     counted fail (decision `5e8df6996a2e`), and is measured the same way: a
+     block on a PR the hidden grader scores correct is a semantic-conflict
+     event (section 4);
+  4. **any agent** may merge an open PR once 1 to 3 hold. The hub makes a
+     `--no-ff` merge commit of the PR's head into `main`; a merge that
+     conflicts is refused and the PR stays open, for its author to merge
+     `main` into the branch, resolve, commit and sync.
+- **Integrated state:** `main` on the hub. Unlike a superseded Bracken spec,
+  a function merged before the change release stays on `main` until a PR
+  changes it.
 
 The PR system is built locally rather than using the Forge: the Forge is an
 outside service with credentials, and its API latency and rate limits would
@@ -328,18 +362,74 @@ used.
 
 | Mode | Copy to hub (push, a sync's first half) | Hub to copy (fetch, a sync's second half) |
 |---|---|---|
-| Git | The tool worker runs `git bundle create - <validated branches>` in its copy; the hub worker writes the bytes to a file in the hub and runs `git fetch` from it into that agent's namespace (`refs/agents/<agent>/<branch>`); a PR merge is then a merge inside the hub | The hub worker runs `git bundle create - main <PR branches>` in the hub; the tool worker writes the bytes to a file in its copy and runs `git fetch` from it into `refs/remotes/hub/*` |
+| Git | The tool worker bundles every branch of its copy without what the hub has (`--not --remotes=hub` and the tips the hub last said it holds of this agent's branches) and sends the tips with it; the hub worker checks the bundle (below) and fetches its `refs/heads/<branch>` into that agent's namespace (`refs/agents/<agent>/<branch>`), then moves any branch whose tip it already had. A PR merge is then a merge inside the hub. Each agent's pushes are capped at the run's per-agent byte quota | The hub worker bundles `main` and every open PR's head (`refs/pr/<n>`) without the commits the copy said it has, and sends their tips and what it holds of the agent's branches; the tool worker checks the bundle and fetches it into `refs/remotes/hub/main` and `refs/remotes/hub/pr-<n>`, moves any of those whose tip it already had, and drops PRs no longer open. A sync with nothing new moves no bundle at all |
 | CRDT | The tool worker produces an Automerge sync message from its document's sync state; the hub worker applies it | The reverse, repeated until neither side has anything to send |
-| Bracken | One session, both halves: the tool worker runs `bracken sync --exec <bracken-experiment> shim --socket <driver socket>` in its replica, and the hub worker runs `bracken serve --stdio --allow <the agents' keys>` in the hub, relaying its standard input and output to its own driver socket. The driver relays between the two sockets, counting and hashing each direction. Heads and offers go first, so only what each side is missing moves. Both sides cap the session's time and bytes (60 s, 32 MiB) | (same session) |
+| Bracken | One session, both halves: the tool worker runs `bracken sync --exec <bracken-experiment> shim --socket <driver socket>` in its replica, and the hub worker runs `bracken serve --stdio --allow <the agents' keys>` in the hub, relaying its standard input and output to its own driver socket. The driver relays between the two sockets, counting and hashing each direction. Heads and offers go first, so only what each side is missing moves. Both sides cap the session's time and bytes (60 s, 32 MiB). Over stdio every session has the same credential, so the hub gives each agent its own first-seen log, and with it its own quota, set from the run's caps (turns × 25 calls × 9, the most contributions one call adds, and their bytes): no agent within the caps reaches it, and one past them is refused alone (finding `57acf0d9ce57`) | (same session) |
 
 Every import validates what it receives as it does any bundle (Bracken
 checks signatures and parents; git checks objects), and a bundle that fails
-is refused and logged, never retried as a different command. The demo's
+is refused and logged, never retried as a different command. A git worker
+fetches only bytes it has written to a file of its own that start with a
+bundle signature (`# v2 git bundle` or `# v3 git bundle`) and pass `git
+bundle verify`, and only the refs `git bundle list-heads` shows that map to
+its fixed namespaces; every other ref, or a gitfile, a directory or any
+other payload, is refused before git reads it as a repository, so the hub
+never starts `git-upload-pack` (task `d0f9eefc612c`). With
+`transfer.fsckObjects` and `fetch.fsckObjects` on, a malformed object is
+refused too. A bundle is fetched, with no ref written, into a quarantine
+object directory (git's `GIT_OBJECT_DIRECTORY`, with the store's own
+objects as an alternate). A push may bring at most 500 commits the hub
+doesn't have, counted before any tree is read. Its objects join the store
+only if every new commit's tree holds nothing but regular (`100644`) files
+at the four module paths and `TASKS.md`, each at most 64 KiB, checked in
+three `git cat-file` processes however many commits there are; then only
+the objects its refs reach are packed into the store. Otherwise the
+quarantine is dropped, so a refused push leaves nothing behind. A store
+remembers the heads it has checked and never checks one again, so a long
+PR costs other agents' syncs and views nothing (finding `4bcfe41f2818`).
+An agent may have at most 4 PRs open, each on a branch with commits `main`
+doesn't have. A sync reads and writes every PR ref in one git process each
+way, and CI is computed once per (`main`, head) pair, so another agent's
+sync costs a fixed number of git processes however many PRs are open
+(finding `f582d00f535f`). PR text is capped too: a title of 200 bytes, a
+body, comment or review of 4000; at most 8 comments and reviews by one
+agent on one PR, 32 PRs by one agent over a run, and 128 KiB of PR text by
+one agent as the hub's record stores it. `pr_view` shows a PR's latest 20
+comments and reviews, and `pr_list` only the number, author and state of a
+closed or merged PR. A sync reads only the list of open PRs and the push
+counter, each in a small file of its own, never the PR record (finding
+`7d119d53922f`). Every child process that is both fed and read
+(`git cat-file --batch`, `bracken import -`) gets its input from a thread
+while its output is read, so neither pipe can fill and stall it (finding
+`0521992b7de5`). A symlink, gitlink,
+executable, directory or other path is refused, in the hub and in every
+copy, before anything is checked out (finding `f1dcf89fd948`). Every ref
+the hub or a copy moves to a commit a peer named checks that commit's
+history new to the store the same way, so a later push can't name a
+commit that never passed (finding `44769e26999c`). Refused pushes count
+toward the agent's quota. The hub leaves out of every copy's sync any open
+PR head whose history fails the check, and says so in the sync's event, so
+one agent's PR never fails another's sync; `pr_view` shows such a PR's
+problem and reads none of its content. CI checks the merge result's tree
+the same way, and reads a module only after its size (finding
+`32a67d979d81`). The demo's
 `bracken sync <dir>`, which writes both replicas, isn't used. A sync that
 fails, like any failure of one agent's (a dropped connection, an MCP
 message over 256 KiB, its backend's error), is logged as that agent's
 `turn_error`, with its size and digest only, and ends only that turn. The
-run goes on (finding `2b37d97ab9c6`).
+run goes on (finding `2b37d97ab9c6`). Nothing waits without a deadline:
+the driver serves a turn's connection until the turn's time (10 minutes)
+is spent, every read of a sync relay has a deadline past bracken's own
+60 s session deadline, and the hub's relay into `bracken serve` stops once
+bracken has finished rather than waiting for the socket to close, since on
+macOS a shutdown doesn't wake a read blocked on the socket's clone
+(finding `05bee0cd4fc4`). Both halves of that relay run on their own
+threads, and the hub worker stops `bracken serve` once the session's
+deadline passes, whatever the relay is waiting on; a reply to an agent
+that has stopped reading waits at most until the turn's deadline (finding
+`a8cd5b213d6f`). A worker whose reply can't be read whole (over the line
+limit, say) is stopped and fails every later call, so no call is ever
+answered with another call's reply.
 
 ### Starting Claude Code
 
@@ -426,11 +516,19 @@ And for every command the workers run:
   agent value selects an option, and no value an agent supplies reaches
   `--output`, `--details-file`, `-C`, `--git-dir`, `--receive-pack`,
   `--upload-pack`, `--exec` or the like;
-- git runs with `core.hooksPath` pointing at an empty directory,
-  `core.fsmonitor` off, only the `file` protocol allowed, and no system or
-  global config, so no file in a working copy can make git run a program
-  (and the file-name rule means no agent can write `.gitattributes` or
-  `.git/config` anyway).
+- git runs from the real binary in git's exec path (never a launcher such
+  as macOS's `/usr/bin/git`, which starts `xcrun`), with a cleared
+  environment, no system or global config, `core.hooksPath` pointing at an
+  empty directory, `core.fsmonitor` off, `core.symlinks` off (a link checks
+  out as a plain file), no attributes or excludes file,
+  only the `file` protocol allowed, `transfer.fsckObjects` and
+  `fetch.fsckObjects` on, and automatic gc and maintenance off, so no file
+  in a working copy can make git run a program (and the file-name rule means
+  no agent can write `.gitattributes` or `.git/config` anyway). A tool
+  worker reads and writes only regular files, never following a link.
+  Step 3's
+  tests read git's own trace of every program it starts and find only git
+  itself: no shell, no `git-upload-pack`, no hook.
 
 Tests (steps 2, 3 and 6): for every tool, a table of hostile arguments (a
 leading `-`, `--receive-pack=<command>`, `--upload-pack=`, `--output=`,
@@ -588,7 +686,7 @@ agent can write to:
 | Duplicated work | A **delivery** is a write of a function's definition that differs from the then-integrated one. A delivery is **duplicated** if, when the agent made it, another agent's correct (by the grader) version of that function had already reached the hub (**visible**), or another agent delivered one after this agent last read that function's state (**blind**), as in the demo. Reported as counts and as the share of output tokens spent in the turns that made them | Event log, snapshots |
 | Integration and validation overhead | The share of tokens and of wall time spent on calls whose tools integrate (sync, fetch, merge, rebase, conflict editing, PR operations, Bracken sync sessions) or validate (`check`, reviews, evidence), and the count of failed integrations (merge conflicts, PRs closed unmerged, failed CI) | Token accounting, event log |
 | Time until a useful discovery is available to others | A **useful discovery** is a delivery that passes the grader standalone, or a bug report naming an input that really fails (section below). **Available**: seconds and other agents' turns from its making until it reached the hub where others could read it (pushed branch, synced edit, synced contribution). **Integrated**: until it was in the integrated state. **Taken up**: until another agent first read it | Event log |
-| Semantically incompatible contributions | Changes to the integrated state after which a function the change didn't touch still passes standalone but no longer passes in library: each change was fine alone, together they're wrong. Also counted: changes after which a module no longer parses (mostly interleaved CRDT edits), and in Bracken mode the semantic-conflict events, counted fails on implementations the hidden grader scores correct (decision `5e8df6996a2e`) | Snapshots, the Ground |
+| Semantically incompatible contributions | Changes to the integrated state after which a function the change didn't touch still passes standalone but no longer passes in library: each change was fine alone, together they're wrong. Also counted: changes after which a module no longer parses (mostly interleaved CRDT edits), and the semantic-conflict events: in Bracken mode a counted fail on an implementation the hidden grader scores correct (decision `5e8df6996a2e`), in Git mode a request for changes blocking a PR the grader scores correct (decision `6b13e672e7d4`) | Snapshots, the Ground |
 | Quality of the final artifact | The final integrated library: functions correct in library under the latest specs (all change requests applied), out of about 30, and the number that are present but wrong | Final snapshot |
 
 Bug reports are found in what agents write (PR comments, CRDT notes,
@@ -619,8 +717,14 @@ gains nothing.
   mode counts verdicts (decision `5e8df6996a2e`: one per validator, its
   latest; never the author; at least one pass and no counted fail; fails on
   implementations the grader scores correct counted as semantic-conflict
-  events), Bracken mode's working-library rule for `check` (answer
-  `88ae128c5fcd`) and the seeds. It is
+  events), Git mode's merge rule (decision `6b13e672e7d4` points 1 to 4:
+  CI on the merge result with no regressions and every changed function
+  passing; an approval of the current head by someone else; no reviewer's
+  latest review requesting changes, each reviewer once and never the author,
+  with blocks on PRs the grader scores correct counted as semantic-conflict
+  events; any agent merges, `--no-ff`, and a conflicting merge is refused),
+  Bracken mode's working-library rule for `check` (answer `88ae128c5fcd`)
+  and the seeds. It is
   contributed to the team's Ground as an artifact before the first model
   call, and the report quotes its id. Changing the analysis afterwards means
   a new plan and saying why.

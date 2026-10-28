@@ -138,6 +138,19 @@ impl<'a> Args<'a> {
         }
     }
 
+    /// An integer in `range`, required.
+    pub fn int(&self, key: &str, range: std::ops::RangeInclusive<i64>) -> Result<i64, String> {
+        self.int_opt(key, range)?.ok_or_else(|| format!("`{key}` is required"))
+    }
+
+    /// A branch name: `^[a-z][a-z0-9-]{0,39}$`, and not `main`, which only the hub moves.
+    pub fn branch(&self, key: &str) -> Result<&'a str, String> {
+        let v = self.str(key)?;
+        let check =
+            if is_branch(v) { Ok(()) } else { Err(format!("{} is not a branch name (a-z, 0-9 and -)", short(v))) };
+        self.ruled(key, v, check)
+    }
+
     pub fn bool_opt(&self, key: &str) -> Result<bool, String> {
         match self.get(key) {
             None | Some(Value::Null) => Ok(false),
@@ -174,6 +187,19 @@ pub fn check_text(v: &str, max: usize) -> Result<(), String> {
     } else {
         Ok(())
     }
+}
+
+pub fn is_branch(b: &str) -> bool {
+    let mut chars = b.chars();
+    b.len() <= 40
+        && b != "main"
+        && chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// A full commit id: 40 lowercase hex digits.
+pub fn is_commit(c: &str) -> bool {
+    c.len() == 40 && c.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn is_tag(t: &str) -> bool {

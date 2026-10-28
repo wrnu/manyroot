@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::args::{Args, MAX_NOTES, check_text};
-use crate::mode::{Store, StoreConfig, mode_named};
+use crate::mode::{Session, Store, StoreConfig, Transfer, mode_named};
 
 /// The largest request or reply line a worker accepts: the hub's first export, which seeds each copy, fits easily.
 pub const MAX_LINE: usize = 64 * 1024 * 1024;
@@ -90,13 +90,25 @@ fn handle(store: &mut dyn Store, notes: &Path, req: Request) -> Reply {
             let me = std::env::current_exe().map_err(|e| format!("finding the relay: {e}"))?;
             store.sync_client(&s, &me)
         })),
-        "sync_server" => Reply::from(socket(&req.args).and_then(|s| {
-            let peers: Vec<String> = serde_json::from_value(req.args["peers"].clone()).map_err(|e| e.to_string())?;
-            if !peers.iter().all(|p| p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit())) {
-                return Err("peers are public keys".into());
-            }
-            store.sync_server(&s, &peers)
+        "sync_server" => Reply::from(socket(&req.args).and_then(|s| store.sync_server(&s, &session(&req.args)?))),
+        "push" => match store.push() {
+            Ok(t) => Reply { ok: true, result: t.meta, bytes: Some(hex::encode(t.bytes)), ..Reply::default() },
+            Err(e) => Reply::from(Err(e)),
+        },
+        "receive" => Reply::from(session(&req.args).and_then(|s| {
+            store.receive(&s, Transfer { meta: req.args["meta"].clone(), bytes: bytes.unwrap_or_default() })
         })),
+        "send" => match session(&req.args).and_then(|s| store.send(&s, &req.args["have"])) {
+            Ok(t) => Reply { ok: true, result: t.meta, bytes: Some(hex::encode(t.bytes)), ..Reply::default() },
+            Err(e) => Reply::from(Err(e)),
+        },
+        "fetch" => {
+            Reply::from(store.fetch(Transfer { meta: req.args["meta"].clone(), bytes: bytes.unwrap_or_default() }))
+        }
+        "validate" => Reply::from(store.validate(&req.tool.unwrap_or_default(), &req.args)),
+        "hub_tool" => Reply::from(
+            session(&req.args).and_then(|s| store.hub_tool(&s, &req.tool.unwrap_or_default(), &req.args["args"])),
+        ),
         "release" => Reply::from(store.release_changes()),
         "integrated" => Reply::from(store.integrated().map(|m| json!(m))),
         "tool" => {
@@ -109,6 +121,15 @@ fn handle(store: &mut dyn Store, notes: &Path, req: Request) -> Reply {
         }
         op => Reply::from(Err(format!("unknown op {}", crate::args::short(op)))),
     }
+}
+
+/// The session a hub op is for, from the driver.
+fn session(args: &Value) -> Result<Session, String> {
+    let session: Session = serde_json::from_value(args["session"].clone()).map_err(|e| e.to_string())?;
+    if !session.peers.iter().all(|p| p.len() == 64 && p.bytes().all(|b| b.is_ascii_hexdigit())) {
+        return Err("peers are public keys".into());
+    }
+    Ok(session)
 }
 
 /// The socket a sync op names: the driver's, never an agent's choice.
@@ -166,19 +187,24 @@ pub struct Worker {
     child: Child,
     stdin: ChildStdin,
     stdout: Lines<BufReader<ChildStdout>>,
+    /// Set once a reply couldn't be read whole: the worker is killed, and every later call fails.
+    failed: bool,
 }
 
 impl Worker {
     /// Starts `bin worker` for `mode` on `config`, with an empty environment, in the store's directory.
     pub fn spawn(bin: &Path, mode: &str, config: &StoreConfig) -> Result<Worker, String> {
         std::fs::create_dir_all(&config.dir).map_err(|e| format!("creating {}: {e}", config.dir.display()))?;
-        let mut child = Command::new(bin)
+        let child = Command::new(bin)
             .arg("worker")
             .args(["--mode", mode, "--identity", &config.identity])
             .arg("--store")
             .arg(&config.dir)
             .arg("--bracken")
             .arg(&config.bracken)
+            .arg("--git")
+            .arg(&config.git)
+            .args(config.trace.then_some("--trace"))
             .env_clear()
             .current_dir(&config.dir)
             .stdin(Stdio::piped())
@@ -186,20 +212,38 @@ impl Worker {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| format!("starting a worker: {e}"))?;
-        let stdin = child.stdin.take().ok_or("no worker stdin")?;
-        let stdout = Lines::new(BufReader::new(child.stdout.take().ok_or("no worker stdout")?), MAX_LINE);
-        Ok(Worker { child, stdin, stdout })
+        Worker::from_child(child, MAX_LINE)
     }
 
-    /// Sends one request and waits for its reply.
+    /// A worker over an already started `child`, whose reply lines may be at most `max` bytes.
+    pub(crate) fn from_child(mut child: Child, max: usize) -> Result<Worker, String> {
+        let stdin = child.stdin.take().ok_or("no worker stdin")?;
+        let stdout = Lines::new(BufReader::new(child.stdout.take().ok_or("no worker stdout")?), max);
+        Ok(Worker { child, stdin, stdout, failed: false })
+    }
+
+    /// Sends one request and waits for its reply. A reply that can't be read whole (over the line
+    /// limit, cut, not UTF-8) leaves the rest of it in the pipe, so the worker is killed and
+    /// fails every later call rather than answer one call with another's reply (finding `7d119d53922f`).
     pub fn call(&mut self, req: &Request) -> Result<Reply, String> {
+        if self.failed {
+            return Err("the worker failed earlier and was stopped".into());
+        }
         let text = serde_json::to_string(req).map_err(|e| e.to_string())?;
         writeln!(self.stdin, "{text}").and_then(|()| self.stdin.flush()).map_err(|e| format!("worker gone: {e}"))?;
         let mut line = String::new();
-        if !self.stdout.next_line(&mut line)? {
-            return Err("the worker exited".into());
+        let read = self.stdout.next_line(&mut line);
+        let reply = match read {
+            Ok(true) => serde_json::from_str(&line).map_err(|e| format!("bad reply from a worker: {e}")),
+            Ok(false) => Err("the worker exited".into()),
+            Err(e) => Err(e),
+        };
+        if reply.is_err() {
+            self.failed = true;
+            let _ = self.child.kill();
+            let _ = self.child.wait();
         }
-        serde_json::from_str(&line).map_err(|e| format!("bad reply from a worker: {e}"))
+        reply
     }
 
     /// The same, turning a failed reply into an error.
@@ -217,5 +261,28 @@ impl Drop for Worker {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reply_over_the_line_limit_stops_the_worker_for_good() {
+        // `cat` answers each request with the request itself: a 16-byte limit is passed at once.
+        let child = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("cat");
+        let mut w = Worker::from_child(child, 16).expect("a worker");
+        let req = Request { op: "a request longer than sixteen bytes".into(), ..Request::default() };
+        assert!(w.call(&req).is_err_and(|e| e.contains("a line over")));
+        // The rest of that reply is still in the pipe: no later call may read it as its own.
+        let short = Request { op: "x".into(), ..Request::default() };
+        assert!(w.call(&short).is_err_and(|e| e.contains("stopped")));
+        assert!(w.child.try_wait().expect("waited").is_some(), "the child was killed");
     }
 }

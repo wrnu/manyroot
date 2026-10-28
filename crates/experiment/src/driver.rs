@@ -21,15 +21,25 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::mode::{StoreConfig, ToolSpec, mode_named};
+use crate::mode::{Mode, Session, StoreConfig, SyncKind, ToolSpec, mode_named};
 use crate::worker::{Lines, Request, Worker};
 
 /// Turns used, as a share of all turns, before the change requests are released (design section 1).
 pub const RELEASE_AT: f64 = 0.4;
+/// Tool calls an agent may make in one turn (design section 5); the driver refuses the next.
+pub const CALLS_PER_TURN: u32 = 25;
+/// The most contributions one tool call can add in any mode: a Bracken claim superseding 8 of its own adds 9.
+pub const CONTRIBUTIONS_PER_CALL: u64 = 9;
+/// The most bytes one contribution can hold: the largest free text and its envelope.
+pub const BYTES_PER_CONTRIBUTION: u64 = crate::args::MAX_TEXT as u64 + 4096;
 /// The longest MCP message the driver reads from an agent.
 pub const MAX_MCP_LINE: usize = 256 * 1024;
 /// How long the driver waits for both ends of a sync session to connect.
 const SYNC_CONNECT: Duration = Duration::from_secs(30);
+/// The longest a sync session's relay runs: past bracken's own 60 s session deadline.
+const SYNC_RELAY: Duration = Duration::from_secs(75);
+/// The longest one turn may take (design section 5): the driver stops serving it then.
+pub const TURN_LIMIT: Duration = Duration::from_secs(600);
 
 pub struct RunConfig {
     /// Must not exist yet.
@@ -40,6 +50,31 @@ pub struct RunConfig {
     /// The `bracken-experiment` binary, for workers.
     pub worker_bin: PathBuf,
     pub bracken: PathBuf,
+    /// The real `git` binary, by absolute path (see [`git_binary`]).
+    pub git: PathBuf,
+    /// Tests only: workers record every command git starts.
+    pub trace: bool,
+    /// Tool calls an agent may make per turn: [`CALLS_PER_TURN`] in a real run.
+    pub calls_per_turn: u32,
+    /// The longest a turn may take: [`TURN_LIMIT`] in a real run.
+    pub turn_limit: Duration,
+}
+
+/// The real `git` binary: the one in the exec path of the `git` on `PATH`, so
+/// a launcher such as macOS's `/usr/bin/git` (which starts `xcrun`) is never run by a worker.
+pub fn git_binary() -> Result<PathBuf, String> {
+    let out = std::process::Command::new("git").arg("--exec-path").output().map_err(|e| format!("finding git: {e}"))?;
+    let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    std::fs::canonicalize(Path::new(&dir).join("git")).map_err(|e| format!("no git in {dir}: {e}"))
+}
+
+impl RunConfig {
+    /// What one agent's sync sessions may add to the hub over the whole run: more than any agent within
+    /// the caps can make, so only a run past them reaches it, and then only for that agent.
+    pub fn quota(&self) -> (u64, u64) {
+        let contributions = u64::from(self.turns) * u64::from(self.calls_per_turn) * CONTRIBUTIONS_PER_CALL;
+        (contributions, contributions * BYTES_PER_CONTRIBUTION)
+    }
 }
 
 /// What plays an agent's turn: the mock backend now, Claude Code from step 6.
@@ -111,6 +146,7 @@ fn make_dir(path: &Path) -> Result<(), String> {
 
 struct Run<'a> {
     cfg: &'a RunConfig,
+    mode: &'static dyn Mode,
     events: EventLog,
     hub: Mutex<Worker>,
     copies: Vec<Mutex<Worker>>,
@@ -135,8 +171,13 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         make_dir(&root.join(sub))?;
     }
     let events = EventLog::create(&root.join("events.jsonl"))?;
-    let store =
-        |dir: PathBuf, identity: &str| StoreConfig { dir, bracken: cfg.bracken.clone(), identity: identity.into() };
+    let store = |dir: PathBuf, identity: &str| StoreConfig {
+        dir,
+        bracken: cfg.bracken.clone(),
+        git: cfg.git.clone(),
+        identity: identity.into(),
+        trace: cfg.trace,
+    };
 
     let mut hub = Worker::spawn(&cfg.worker_bin, mode.name(), &store(root.join("hub"), "setter"))?;
     hub.ok(&Request { op: "setup".into(), ..Request::default() })?;
@@ -146,7 +187,9 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     for name in &names {
         let mut w = Worker::spawn(&cfg.worker_bin, mode.name(), &store(root.join("agents").join(name), name))?;
         let reply = w.ok(&Request { op: "setup".into(), bytes: Some(hex::encode(&seed)), ..Request::default() })?;
-        peers.push(reply.result["key"].as_str().ok_or("a copy's setup gave no key")?.to_string());
+        if let Some(key) = reply.result["key"].as_str() {
+            peers.push(key.to_string());
+        }
         copies.push(Mutex::new(w));
     }
     events.log(None, "setup", json!({"mode": mode.name(), "agents": cfg.agents, "turns": cfg.turns}));
@@ -155,6 +198,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     tools.extend(core_tools());
     let run = Run {
         cfg,
+        mode,
         events,
         hub: Mutex::new(hub),
         copies,
@@ -249,41 +293,26 @@ impl Run<'_> {
         Ok(())
     }
 
-    /// One sync session between copy `i` and the hub, both ways, its bytes
-    /// relayed through the driver: only what each side is missing moves.
+    /// What the hub takes from agent `i`, and as whom.
+    fn session(&self, i: usize) -> Session {
+        let (quota_contributions, quota_bytes) = self.cfg.quota();
+        Session {
+            agent: i,
+            name: self.names[i].clone(),
+            peers: self.peers.clone(),
+            quota_contributions,
+            quota_bytes,
+            sync_seconds: 0,
+        }
+    }
+
+    /// One sync between copy `i` and the hub, as the mode syncs ([`sync_session`], [`sync_transfers`]), logged.
     fn sync(&self, i: usize) -> Result<Value, String> {
-        let mut hub = self.hub();
-        let mut copy = self.copy(i);
-        let end = |side: &str| -> Result<(PathBuf, UnixListener), String> {
-            let path = self.sockets.join(format!("{side}{i}.sock"));
-            let _ = std::fs::remove_file(&path);
-            let l = UnixListener::bind(&path).map_err(|e| format!("binding {}: {e}", path.display()))?;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
-            l.set_nonblocking(true).map_err(|e| e.to_string())?;
-            Ok((path, l))
+        let session = self.session(i);
+        let summary = match self.mode.sync_kind() {
+            SyncKind::Session => sync_session(&mut self.hub(), &mut self.copy(i), &self.sockets, &session)?,
+            SyncKind::Transfers => sync_transfers(&mut self.hub(), &mut self.copy(i), &session)?,
         };
-        let (copy_path, copy_end) = end("c")?;
-        let (hub_path, hub_end) = end("h")?;
-        let session = |op: &str, path: &Path| Request {
-            op: op.into(),
-            args: json!({"socket": path, "peers": self.peers}),
-            ..Request::default()
-        };
-        let (server, client) = (session("sync_server", &hub_path), session("sync_client", &copy_path));
-        let (hub, copy, server, client) = (&mut *hub, &mut *copy, &server, &client);
-        let result = std::thread::scope(|scope| {
-            let served = scope.spawn(move || hub.ok(server));
-            let synced = scope.spawn(move || copy.ok(client));
-            // The listeners go with the relay, so a side left waiting sees its connection close.
-            let relayed = relay_session(copy_end, hub_end, || served.is_finished() || synced.is_finished());
-            let served = served.join().unwrap_or_else(|_| Err("the hub's session panicked".into()));
-            let synced = synced.join().unwrap_or_else(|_| Err("the copy's session panicked".into()));
-            served.and(synced).and(relayed)
-        });
-        let _ = std::fs::remove_file(&copy_path);
-        let _ = std::fs::remove_file(&hub_path);
-        let ((up, up_digest), (down, down_digest)) = result?;
-        let summary = json!({"up": {"bytes": up, "digest": up_digest}, "down": {"bytes": down, "digest": down_digest}});
         self.events.log(Some(&self.names[i]), "sync", summary.clone());
         Ok(summary)
     }
@@ -296,14 +325,19 @@ impl Run<'_> {
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let name = self.names[i].clone();
+        let deadline = Instant::now() + self.cfg.turn_limit;
         let result = std::thread::scope(|scope| {
             let player = scope.spawn(|| backend.turn(i, &name, turn, socket));
             let served = loop {
                 match listener.accept() {
-                    Ok((stream, _)) => break self.serve(i, turn, stream),
+                    Ok((stream, _)) => break self.serve(i, turn, stream, deadline),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         if player.is_finished() {
                             break Ok(());
+                        }
+                        if Instant::now() > deadline {
+                            // Step 6 ends the agent's process here; the mock's thread is waited for.
+                            break Err("no connection before the turn's deadline".into());
                         }
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -317,13 +351,15 @@ impl Run<'_> {
         result
     }
 
-    /// MCP over newline-delimited JSON-RPC, for one connection.
-    fn serve(&self, i: usize, turn: u32, stream: UnixStream) -> Result<(), String> {
+    /// MCP over newline-delimited JSON-RPC, for one connection, until it closes or `deadline`
+    /// passes (finding `05bee0cd4fc4`), when the turn ends with an error.
+    fn serve(&self, i: usize, turn: u32, stream: UnixStream, deadline: Instant) -> Result<(), String> {
         stream.set_nonblocking(false).map_err(|e| e.to_string())?;
         let mut out = stream.try_clone().map_err(|e| e.to_string())?;
-        let mut lines = Lines::new(BufReader::new(stream), MAX_MCP_LINE);
+        let mut lines = Lines::new(BufReader::new(crate::shim::Timed { stream, deadline }), MAX_MCP_LINE);
         let mut line = String::new();
         let name = &self.names[i];
+        let mut calls = 0;
         while lines.next_line(&mut line)? {
             let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                 self.events.log(Some(name), "bad_message", json!({"turn": turn, "bytes": line.len()}));
@@ -337,13 +373,28 @@ impl Run<'_> {
                     "serverInfo": {"name": "experiment", "version": env!("CARGO_PKG_VERSION")},
                 }}),
                 "tools/list" => json!({"result": {"tools": self.tools}}),
-                "tools/call" => json!({"result": self.call(i, turn, &msg["params"])}),
+                "tools/call" if calls >= self.cfg.calls_per_turn => {
+                    self.events.log(Some(name), "call_refused", json!({"turn": turn, "calls": calls}));
+                    let text = "this turn's tool calls are spent";
+                    json!({"result": {"content": [{"type": "text", "text": text}], "isError": true}})
+                }
+                "tools/call" => {
+                    calls += 1;
+                    json!({"result": self.call(i, turn, &msg["params"])})
+                }
                 "ping" => json!({"result": {}}),
                 _ => json!({"error": {"code": -32601, "message": "method not found"}}),
             };
             let mut reply = reply;
             reply["jsonrpc"] = json!("2.0");
             reply["id"] = id;
+            // A client that stops reading holds a reply for at most the turn's time (finding `a8cd5b213d6f`).
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err("the turn's time is spent".into());
+            }
+            // macOS refuses a timeout (EINVAL) once the peer has gone; the write then fails at once anyway.
+            let _ = out.set_write_timeout(Some(left));
             writeln!(out, "{reply}").and_then(|()| out.flush()).map_err(|e| format!("replying: {e}"))?;
         }
         Ok(())
@@ -362,6 +413,14 @@ impl Run<'_> {
         );
         let result = if tool == "sync" {
             crate::args::Args::new(&args, &[]).and_then(|_| self.sync(i))
+        } else if self.mode.hub_tools().contains(&tool.as_str()) {
+            // The agent's own worker checks the values; the hub runs the checked form, as this agent.
+            let req = Request { op: "validate".into(), tool: Some(tool.clone()), args, ..Request::default() };
+            self.copy(i).ok(&req).map(|r| r.result).and_then(|checked| {
+                let args = json!({"session": self.session(i), "args": checked});
+                let req = Request { op: "hub_tool".into(), tool: Some(tool), args, ..Request::default() };
+                self.hub().ok(&req).map(|r| r.result)
+            })
         } else {
             self.copy(i)
                 .ok(&Request { op: "tool".into(), tool: Some(tool), args, ..Request::default() })
@@ -378,6 +437,63 @@ impl Run<'_> {
         );
         json!({"content": [{"type": "text", "text": text}], "isError": is_error})
     }
+}
+
+/// One sync session between `copy` and `hub`, both ways, its bytes relayed
+/// through the driver over two sockets in `sockets`: only what each side is
+/// missing moves. Its summary: the bytes and digest each way.
+pub fn sync_session(hub: &mut Worker, copy: &mut Worker, sockets: &Path, session: &Session) -> Result<Value, String> {
+    let i = session.agent;
+    let end = |side: &str| -> Result<(PathBuf, UnixListener), String> {
+        let path = sockets.join(format!("{side}{i}.sock"));
+        let _ = std::fs::remove_file(&path);
+        let l = UnixListener::bind(&path).map_err(|e| format!("binding {}: {e}", path.display()))?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
+        l.set_nonblocking(true).map_err(|e| e.to_string())?;
+        Ok((path, l))
+    };
+    let (copy_path, copy_end) = end("c")?;
+    let (hub_path, hub_end) = end("h")?;
+    let request = |op: &str, path: &Path| Request {
+        op: op.into(),
+        args: json!({"socket": path, "session": session}),
+        ..Request::default()
+    };
+    let (server, client) = (request("sync_server", &hub_path), request("sync_client", &copy_path));
+    let (server, client) = (&server, &client);
+    let result = std::thread::scope(|scope| {
+        let served = scope.spawn(move || hub.ok(server));
+        let synced = scope.spawn(move || copy.ok(client));
+        // The listeners go with the relay, so a side left waiting sees its connection close.
+        let relayed = relay_session(copy_end, hub_end, || served.is_finished() || synced.is_finished());
+        let served = served.join().unwrap_or_else(|_| Err("the hub's session panicked".into()));
+        let synced = synced.join().unwrap_or_else(|_| Err("the copy's session panicked".into()));
+        served.and(synced).and(relayed)
+    });
+    let _ = std::fs::remove_file(&copy_path);
+    let _ = std::fs::remove_file(&hub_path);
+    let ((up, up_digest), (down, down_digest)) = result?;
+    Ok(json!({"up": {"bytes": up, "digest": up_digest}, "down": {"bytes": down, "digest": down_digest}}))
+}
+
+/// One sync by transfers: the copy's push to the hub, then the hub's answer
+/// to the copy, each as bytes the driver carries and each receiver checks.
+pub fn sync_transfers(hub: &mut Worker, copy: &mut Worker, session: &Session) -> Result<Value, String> {
+    let up = copy.ok(&Request { op: "push".into(), ..Request::default() })?;
+    let up_bytes = Worker::bytes(&up)?;
+    let have = up.result["have"].clone();
+    let args = json!({"session": session, "meta": up.result});
+    hub.ok(&Request { op: "receive".into(), args, bytes: up.bytes, ..Request::default() })?;
+    let down =
+        hub.ok(&Request { op: "send".into(), args: json!({"session": session, "have": have}), ..Request::default() })?;
+    let down_bytes = Worker::bytes(&down)?;
+    let args = json!({"meta": down.result});
+    copy.ok(&Request { op: "fetch".into(), args, bytes: down.bytes, ..Request::default() })?;
+    Ok(json!({
+        "up": {"bytes": up_bytes.len(), "digest": digest(&up_bytes)},
+        "down": {"bytes": down_bytes.len(), "digest": digest(&down_bytes)},
+        "skipped_prs": down.result["skipped"],
+    }))
 }
 
 /// Bytes relayed one way, and their digest.
@@ -411,10 +527,12 @@ fn relay_session(
         }
     }
     let (copy, hub) = (copy.expect("accepted above"), hub.expect("accepted above"));
+    let deadline = Instant::now() + SYNC_RELAY;
     let one_way = |from: &UnixStream, to: &UnixStream| -> Result<Relayed, String> {
         from.set_nonblocking(false).map_err(|e| e.to_string())?;
         let mut hashing = Hashing { to, hasher: blake3::Hasher::new() };
-        let n = crate::shim::relay(&mut &*from, &mut hashing);
+        let mut timed = crate::shim::Timed { stream: from.try_clone().map_err(|e| e.to_string())?, deadline };
+        let n = crate::shim::relay(&mut timed, &mut hashing);
         let _ = to.shutdown(std::net::Shutdown::Write);
         let n = n?;
         Ok((n, hashing.hasher.finalize().to_hex()[..16].to_string()))

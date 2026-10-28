@@ -71,7 +71,9 @@ fn is_free_text(tool: &str, slot: &str) -> bool {
 }
 
 fn store(dir: PathBuf, bracken: PathBuf) -> BrackenStore {
-    BrackenStore { config: StoreConfig { dir, bracken, identity: "me".into() }, runs: 0, files: 0 }
+    let config =
+        StoreConfig { dir, bracken, git: PathBuf::from("/nonexistent/git"), identity: "me".into(), trace: false };
+    BrackenStore { config, runs: 0, files: 0 }
 }
 
 #[test]
@@ -304,6 +306,18 @@ fn each_validator_counts_once_with_its_latest_verdict_and_never_the_author() {
 }
 
 #[test]
+fn one_counted_fail_keeps_an_implementation_out() {
+    // Decision 5e8df6996a2e: two passes and another validator's fail is missing, not two passes against one.
+    let mut g = Ground::new();
+    g.implement("a1", "x", "abs", "a 0 < a neg a ?", 2);
+    g.verdict("a1", "validator-2", "fail");
+    assert!(g.snapshot().integrated().is_empty(), "{:?}", g.snapshot().integrated());
+    // The same validator's later pass lifts its fail: three passes.
+    g.verdict("a1", "validator-2", "pass");
+    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
+}
+
+#[test]
 fn one_artifact_cant_break_its_module() {
     let padded = |n: usize| {
         let head = "def abs 1 : a 0 < a neg a ?\n#";
@@ -359,4 +373,46 @@ fn the_artifact_tool_refuses_what_cant_be_an_implementation() {
         assert!(result.is_err(), "{content:.40}");
     }
     assert_eq!(s.runs, 0, "a refused artifact starts no process");
+}
+
+#[test]
+fn a_sync_session_ends_at_its_deadline_whatever_bracken_does() {
+    // `yes` stands in for a bracken that never stops writing, and the peer never reads.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let socket = dir.path().join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let mut s = store(dir.path().to_path_buf(), PathBuf::from("/usr/bin/yes"));
+    let session = Session { sync_seconds: 1, ..Session::default() };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let held = std::thread::spawn(move || {
+        let (peer, _) = listener.accept().expect("accept");
+        rx.recv().ok();
+        drop(peer);
+    });
+    let started = std::time::Instant::now();
+    let result = s.sync_server(&socket, &session);
+    assert!(result.is_err_and(|e| e.contains("deadline")));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    tx.send(()).ok();
+    held.join().expect("the peer");
+}
+
+#[test]
+fn a_sync_session_that_never_ends_by_itself_is_stopped_at_its_deadline() {
+    // `yes` never stops writing and this peer never stops reading, so only the deadline ends it.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let socket = dir.path().join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+    let mut s = store(dir.path().to_path_buf(), PathBuf::from("/usr/bin/yes"));
+    let session = Session { sync_seconds: 1, ..Session::default() };
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let (mut peer, _) = listener.accept().expect("accept");
+        let mut buf = [0u8; 65536];
+        while peer.read(&mut buf).is_ok_and(|n| n > 0) {}
+    });
+    let started = std::time::Instant::now();
+    assert!(s.sync_server(&socket, &session).is_err_and(|e| e.contains("deadline")));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    reader.join().expect("the peer");
 }

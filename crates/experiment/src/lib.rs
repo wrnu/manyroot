@@ -5,7 +5,8 @@
 //! Build step 1 is `stacklib`, the task (section 1 of
 //! `docs/design/phase1-experiment.md`); step 2 is the core (the [`driver`],
 //! its [`worker`]s, the [`shim`] and the [`mock`] backend) and Bracken mode
-//! ([`bracken_mode`]), behind the [`mode`] interface.
+//! ([`bracken_mode`]); step 3 is Git mode ([`git_mode`]), behind the same
+//! [`mode`] interface.
 //!
 //! What an agent may see goes through [`task`] only: the language, the specs,
 //! the change requests, the public cases and the public check. [`grader`]
@@ -16,6 +17,7 @@ pub mod args;
 pub mod bracken_mode;
 pub mod candidates;
 pub mod driver;
+pub mod git_mode;
 pub mod grader;
 pub mod lang;
 pub mod mock;

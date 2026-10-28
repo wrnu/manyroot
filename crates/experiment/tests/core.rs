@@ -8,11 +8,13 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
-use bracken_experiment::driver::{Backend, MAX_MCP_LINE, RunConfig, run};
+use bracken_experiment::driver::{
+    Backend, CALLS_PER_TURN, MAX_MCP_LINE, RunConfig, TURN_LIMIT, git_binary, run, sync_session,
+};
 use bracken_experiment::grader::{HiddenCases, grade};
 use bracken_experiment::lang::Library;
 use bracken_experiment::mock::{Client, MockBackend};
-use bracken_experiment::mode::StoreConfig;
+use bracken_experiment::mode::{Session, StoreConfig};
 use bracken_experiment::task::{SPECS, Version};
 use bracken_experiment::worker::{Request, Worker};
 
@@ -44,6 +46,10 @@ fn a_mock_run_goes_end_to_end_through_the_shim() {
         turns: 3,
         worker_bin: bin(),
         bracken: bracken(),
+        git: git_binary().expect("git"),
+        trace: false,
+        calls_per_turn: CALLS_PER_TURN,
+        turn_limit: TURN_LIMIT,
     };
     let outcome = run(&cfg, &MockBackend { seed: 3, wrong_rate: 0.0, shim: Some(bin()) }).expect("the run");
 
@@ -102,7 +108,9 @@ fn each_worker_writes_only_its_own_store() {
     let config = |name: &str, identity: &str| StoreConfig {
         dir: dir.path().join(name),
         bracken: bracken(),
+        git: git_binary().expect("git"),
         identity: identity.into(),
+        trace: false,
     };
     let mut hub = Worker::spawn(&bin(), "bracken", &config("hub", "setter")).expect("hub");
     hub.ok(&request("setup")).expect("hub setup");
@@ -166,6 +174,7 @@ fn the_shim_and_workers_refuse_to_start_with_any_environment() {
         .arg(dir.path())
         .arg("--bracken")
         .arg(bracken())
+        .args(["--git", "/nonexistent/git"])
         .env_clear()
         .env("HOME", "/")
         .stdin(Stdio::null())
@@ -185,6 +194,10 @@ fn a_run_refuses_a_directory_that_exists() {
         turns: 1,
         worker_bin: bin(),
         bracken: bracken(),
+        git: git_binary().expect("git"),
+        trace: false,
+        calls_per_turn: CALLS_PER_TURN,
+        turn_limit: TURN_LIMIT,
     };
     let err = run(&cfg, &MockBackend { seed: 1, wrong_rate: 0.0, shim: None }).err().expect("refused");
     assert!(err.contains("already exists"));
@@ -222,7 +235,18 @@ impl Backend for Claiming {
 }
 
 fn config(dir: &Path, agents: usize, turns: u32) -> RunConfig {
-    RunConfig { root: dir.join("run"), mode: "bracken", agents, turns, worker_bin: bin(), bracken: bracken() }
+    RunConfig {
+        root: dir.join("run"),
+        mode: "bracken",
+        agents,
+        turns,
+        worker_bin: bin(),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        trace: false,
+        calls_per_turn: CALLS_PER_TURN,
+        turn_limit: TURN_LIMIT,
+    }
 }
 
 #[test]
@@ -231,7 +255,13 @@ fn sync_moves_only_what_is_missing() {
     let mut hub = Worker::spawn(
         &bin(),
         "bracken",
-        &StoreConfig { dir: dir.path().join("hub"), bracken: bracken(), identity: "setter".into() },
+        &StoreConfig {
+            dir: dir.path().join("hub"),
+            bracken: bracken(),
+            git: git_binary().expect("git"),
+            identity: "setter".into(),
+            trace: false,
+        },
     )
     .expect("hub");
     hub.ok(&request("setup")).expect("hub setup");
@@ -276,4 +306,254 @@ fn one_agents_failure_stays_in_its_own_turn() {
         assert_eq!(count(agent, "tool_result"), 2, "{agent}'s calls went through");
     }
     assert_eq!(log.iter().filter(|e| e["event"] == "changes_released").count(), 1);
+}
+
+#[test]
+fn one_agent_spending_its_hub_quota_leaves_anothers_sync_alone() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let config = |name: &str, identity: &str| StoreConfig {
+        dir: dir.path().join(name),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        identity: identity.into(),
+        trace: false,
+    };
+    let sockets = dir.path().join("s");
+    std::fs::create_dir(&sockets).expect("sockets");
+    let mut hub = Worker::spawn(&bin(), "bracken", &config("hub", "setter")).expect("hub");
+    hub.ok(&request("setup")).expect("hub setup");
+    let seed = Worker::bytes(&hub.ok(&request("export")).expect("export")).expect("bytes");
+    let (mut copies, mut peers) = (Vec::new(), Vec::new());
+    for name in ["a", "b"] {
+        let mut w = Worker::spawn(&bin(), "bracken", &config(name, name)).expect("copy");
+        let reply = w
+            .ok(&Request { op: "setup".into(), bytes: Some(hex::encode(&seed)), ..Request::default() })
+            .expect("copy setup");
+        peers.push(reply.result["key"].as_str().expect("a key").to_string());
+        copies.push(w);
+    }
+    let claims = |w: &mut Worker, n: usize| {
+        for k in 0..n {
+            let args = serde_json::json!({"statement": format!("claim {k}"), "tags": ["note"]});
+            w.ok(&Request { op: "tool".into(), tool: Some("claim".into()), args, ..Request::default() })
+                .expect("claim");
+        }
+    };
+    let session = |agent: usize| Session {
+        agent,
+        name: format!("agent-{agent}"),
+        peers: peers.clone(),
+        quota_contributions: 3,
+        quota_bytes: 1 << 20,
+        sync_seconds: 0,
+    };
+    // Agent a adds more than its quota: its sync is refused.
+    claims(&mut copies[0], 5);
+    assert!(sync_session(&mut hub, &mut copies[0], &sockets, &session(0)).is_err());
+    // Agent b, within its own quota, still syncs, and the hub keeps its claims.
+    claims(&mut copies[1], 3);
+    sync_session(&mut hub, &mut copies[1], &sockets, &session(1)).expect("b's sync");
+    let log = hub
+        .ok(&Request {
+            op: "tool".into(),
+            tool: Some("log".into()),
+            args: serde_json::json!({"tag": "note"}),
+            ..Request::default()
+        })
+        .expect("the hub's log")
+        .result;
+    let by_b = log.as_array().expect("a list").iter().filter(|e| e["author"] == peers[1].as_str()).count();
+    assert_eq!(by_b, 3);
+}
+
+/// Calls `notes_read` until refused, then once more.
+struct Greedy;
+
+impl Backend for Greedy {
+    fn turn(&self, _agent: usize, _name: &str, _turn: u32, socket: &Path) -> Result<(), String> {
+        let mut c = Client::connect(socket, None)?;
+        let mut ok = 0;
+        while c.tool("notes_read", serde_json::json!({})).is_ok() {
+            ok += 1;
+        }
+        assert!(c.tool("notes_read", serde_json::json!({})).is_err());
+        assert_eq!(ok, 3, "three calls a turn");
+        Ok(())
+    }
+}
+
+#[test]
+fn the_driver_refuses_calls_past_the_turns_cap() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = RunConfig { calls_per_turn: 3, ..config(dir.path(), 1, 2) };
+    let outcome = run(&cfg, &Greedy).expect("the run");
+    let log = events(&outcome.events);
+    assert_eq!(log.iter().filter(|e| e["event"] == "tool_call").count(), 6);
+    assert_eq!(log.iter().filter(|e| e["event"] == "call_refused").count(), 4);
+    assert!(log.iter().all(|e| e["event"] != "turn_error"));
+}
+
+/// Every program git started in the stores under `dir`, by their traces, is git itself.
+fn only_git_started(dir: &Path) -> usize {
+    let mut programs = 0;
+    for (path, _) in tree(dir).into_iter().filter(|(p, _)| p.ends_with("git-trace.log")) {
+        let trace = std::fs::read_to_string(&path).expect("a trace");
+        for cmd in trace.lines().filter_map(|l| l.split_once("trace: start_command: ")).map(|(_, c)| c) {
+            let program = cmd.split_whitespace().next().unwrap_or_default();
+            assert!(program.ends_with("/git-core/git"), "{}: git started {program}", path.display());
+            programs += 1;
+        }
+    }
+    programs
+}
+
+#[test]
+fn a_git_mode_mock_run_goes_end_to_end_through_the_shim() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = RunConfig { mode: "git", trace: true, ..config(dir.path(), 3, 4) };
+    let outcome = run(&cfg, &MockBackend { seed: 3, wrong_rate: 0.0, shim: Some(bin()) }).expect("the run");
+    let log = events(&outcome.events);
+    let seqs: Vec<u64> = log.iter().map(|e| e["seq"].as_u64().expect("seq")).collect();
+    assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "one writer, no gaps");
+    assert!(log.iter().all(|e| e["event"] != "turn_error"), "no turn failed");
+    assert_eq!(log.iter().filter(|e| e["event"] == "changes_released").count(), 1);
+    for agent in ["agent-0", "agent-1", "agent-2"] {
+        assert_eq!(log.iter().filter(|e| e["agent"] == agent && e["event"] == "turn_end").count(), 4);
+    }
+    // Calls fail only where two agents race to review or merge the same PR.
+    for e in log.iter().filter(|e| e["event"] == "tool_result" && e["data"]["ok"] == false) {
+        assert!(
+            ["`pr_merge`", "`pr_review`", "`pr_open`"].contains(&e["data"]["tool"].as_str().unwrap_or_default()),
+            "{e}"
+        );
+    }
+    // Merged work is on main, correct, and every function once.
+    let library = Library::parse(outcome.modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
+    assert!(library.broken.is_empty() && library.duplicates.is_empty());
+    // Main keeps what merged before the change requests, unlike a superseded Bracken spec: each
+    // function is correct as of the original contract or the changed one.
+    let (before, after) = (
+        grade(&library, Version::ORIGINAL, &HiddenCases::new(1)),
+        grade(&library, Version::all(), &HiddenCases::new(1)),
+    );
+    assert!(after.iter().filter(|g| g.present).count() >= 2, "PRs were merged");
+    for (b, a) in before.iter().zip(&after).filter(|(_, a)| a.present) {
+        assert!(b.standalone || a.standalone, "{} is a correct program", a.name);
+    }
+    // No worker's git started anything but git.
+    assert!(only_git_started(&dir.path().join("run")) > 0);
+}
+
+fn git_store(dir: &Path, name: &str) -> StoreConfig {
+    StoreConfig {
+        dir: dir.join(name),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        identity: name.into(),
+        trace: true,
+    }
+}
+
+#[test]
+fn each_git_worker_writes_only_its_own_store_and_the_hub_takes_only_bundles() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let mut hub = Worker::spawn(&bin(), "git", &git_store(dir.path(), "hub")).expect("hub");
+    hub.ok(&request("setup")).expect("hub setup");
+    let seed = Worker::bytes(&hub.ok(&request("export")).expect("export")).expect("bytes");
+    let mut a = Worker::spawn(&bin(), "git", &git_store(dir.path(), "agent-a")).expect("a");
+    let mut b = Worker::spawn(&bin(), "git", &git_store(dir.path(), "agent-b")).expect("b");
+    for w in [&mut a, &mut b] {
+        w.ok(&Request { op: "setup".into(), bytes: Some(hex::encode(&seed)), ..Request::default() })
+            .expect("copy setup");
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let now = |n: &str| tree(&dir.path().join(n));
+    let (hub0, b0) = (now("hub"), now("agent-b"));
+    let tool = |w: &mut Worker, name: &str, args: Value| {
+        w.ok(&Request { op: "tool".into(), tool: Some(name.into()), args, ..Request::default() }).expect(name)
+    };
+    tool(&mut a, "switch", serde_json::json!({"branch": "abs", "create": true}));
+    tool(&mut a, "edit", serde_json::json!({"file": "base.stk", "start": 1, "end": 0, "text": "def abs 1 : a"}));
+    tool(&mut a, "commit", serde_json::json!({"message": "abs"}));
+    assert_eq!(now("hub"), hub0);
+    assert_eq!(now("agent-b"), b0);
+
+    // A sync's halves: each side writes only itself.
+    let session = Session { agent: 0, name: "agent-a".into(), quota_bytes: 1 << 20, ..Session::default() };
+    let a1 = now("agent-a");
+    let push = a.ok(&request("push")).expect("push");
+    let args = serde_json::json!({"session": session, "meta": push.result});
+    hub.ok(&Request { op: "receive".into(), args, bytes: push.bytes, ..Request::default() }).expect("receive");
+    assert_ne!(now("hub"), hub0);
+    assert_eq!(now("agent-b"), b0);
+    let pushed = now("agent-a");
+    assert!(pushed.keys().all(|p| a1.contains_key(p) || p.starts_with(dir.path().join("agent-a/files"))));
+
+    // A gitfile, or anything that isn't a bundle, sent as a push is refused, and git isn't started.
+    let hub1 = now("hub");
+    let gitfile = format!("gitdir: {}\n", dir.path().join("agent-a/work/.git").display());
+    for bytes in [gitfile.into_bytes(), b"PACK\0\0\0\x02".to_vec(), b"#!/bin/sh\nexit 0\n".to_vec()] {
+        let args = serde_json::json!({"session": session, "meta": {"branches": {}}});
+        let reply =
+            hub.call(&Request { op: "receive".into(), args, bytes: Some(hex::encode(&bytes)), ..Request::default() });
+        let reply = reply.expect("a reply");
+        assert!(!reply.ok && reply.error.is_some_and(|e| e.contains("not a git bundle")));
+    }
+    // Only the quota record changed (refused pushes count); git didn't run, so its trace is unchanged.
+    let records = dir.path().join("hub/received.json");
+    let without = |t: BTreeMap<PathBuf, (u64, SystemTime)>| {
+        t.into_iter().filter(|(p, _)| *p != records).collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(without(now("hub")), without(hub1));
+    assert!(std::fs::read_to_string(&records).expect("records").contains("agent-a"));
+    assert!(only_git_started(dir.path()) > 0);
+}
+
+/// Connects, then says nothing until the driver hangs up.
+struct Silent;
+
+impl Backend for Silent {
+    fn turn(&self, _agent: usize, _name: &str, _turn: u32, socket: &Path) -> Result<(), String> {
+        use std::io::Read;
+        let mut s = std::os::unix::net::UnixStream::connect(socket).map_err(|e| e.to_string())?;
+        let _ = s.read(&mut [0u8; 1]);
+        Ok(())
+    }
+}
+
+#[test]
+fn a_silent_agent_ends_at_the_turns_deadline() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = RunConfig { turn_limit: std::time::Duration::from_secs(2), ..config(dir.path(), 1, 2) };
+    let started = std::time::Instant::now();
+    let outcome = run(&cfg, &Silent).expect("the run ends");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "{:?}", started.elapsed());
+    let log = events(&outcome.events);
+    let errors = log.iter().filter(|e| e["event"] == "turn_error" && e["data"]["step"] == "play").count();
+    assert_eq!(errors, 2, "each turn ended at its deadline");
+    assert_eq!(log.iter().filter(|e| e["event"] == "turn_end").count(), 2);
+}
+
+/// Sends pings and never reads a reply, until the driver hangs up.
+struct Deaf;
+
+impl Backend for Deaf {
+    fn turn(&self, _agent: usize, _name: &str, _turn: u32, socket: &Path) -> Result<(), String> {
+        use std::io::Write;
+        let mut s = std::os::unix::net::UnixStream::connect(socket).map_err(|e| e.to_string())?;
+        let ping = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+        while s.write_all(ping).is_ok() {}
+        Ok(())
+    }
+}
+
+#[test]
+fn an_agent_that_stops_reading_ends_at_the_turns_deadline() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = RunConfig { turn_limit: std::time::Duration::from_secs(3), ..config(dir.path(), 1, 1) };
+    let started = std::time::Instant::now();
+    let outcome = run(&cfg, &Deaf).expect("the run ends");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "{:?}", started.elapsed());
+    let log = events(&outcome.events);
+    assert_eq!(log.iter().filter(|e| e["event"] == "turn_error" && e["data"]["step"] == "play").count(), 1);
 }

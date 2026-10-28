@@ -4,8 +4,10 @@
 //!
 //! Each turn the mock implements one function it hasn't yet (usually with a
 //! correct program, sometimes a wrong one), checks up to two implementations
-//! by others and records the result as evidence, and keeps what it has done in
-//! its private notes.
+//! by others and records the result (Bracken evidence, Git reviews), and keeps
+//! what it has done in its private notes. In Git mode it works on a branch per
+//! function, opens a PR, merges what is approved and passes CI, and brings its
+//! own PRs up to date when they conflict with `main`.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -19,6 +21,7 @@ use serde_json::{Value, json};
 use crate::bracken_mode::change_tag;
 use crate::candidates::{candidates, correct_programs};
 use crate::driver::Backend;
+use crate::git_mode::version_of;
 use crate::task::{CHANGES, SPECS, Version};
 
 pub struct MockBackend {
@@ -34,6 +37,8 @@ pub struct Client {
     reader: BufReader<Box<dyn Read + Send>>,
     writer: Box<dyn Write + Send>,
     next: u64,
+    /// Tool calls made so far.
+    pub calls: u32,
     _child: Option<std::process::Child>,
 }
 
@@ -60,7 +65,7 @@ impl Client {
                 (Box::new(r), Box::new(w), Some(child))
             }
         };
-        let mut c = Client { reader: BufReader::new(reader), writer, next: 1, _child: child };
+        let mut c = Client { reader: BufReader::new(reader), writer, next: 1, calls: 0, _child: child };
         c.request(
             "initialize",
             json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "mock"}}),
@@ -91,6 +96,7 @@ impl Client {
 
     /// Calls a tool; its result text as JSON, or the tool's error.
     pub fn tool(&mut self, name: &str, args: Value) -> Result<Value, String> {
+        self.calls += 1;
         let r = self.request("tools/call", json!({"name": name, "arguments": args}))?;
         let text = r["content"][0]["text"].as_str().unwrap_or_default().to_string();
         if r["isError"].as_bool().unwrap_or(true) {
@@ -106,6 +112,14 @@ struct Memory {
     implemented: Vec<String>,
     mine: Vec<String>,
     checked: Vec<String>,
+    /// Git mode: my PRs, by number, with their branches.
+    prs: Vec<(u64, String)>,
+}
+
+/// The next function to implement: low layers first, spread across agents.
+fn next_spec(memory: &Memory, agent: usize) -> Option<&'static crate::task::Spec> {
+    let todo: Vec<_> = SPECS.iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
+    todo.get(agent % 3).or(todo.first()).copied()
 }
 
 fn first_line(v: &Value) -> String {
@@ -117,11 +131,19 @@ impl Backend for MockBackend {
         let mut rng = Rng::derive(self.seed, (agent as u64) << 16 | u64::from(turn));
         let mut c = Client::connect(socket, self.shim.as_deref())?;
         let tools = c.request("tools/list", json!({}))?;
-        if !tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == "log")) {
-            return Err(format!("{name}: no log tool"));
-        }
+        let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
+        if has("pr_open") {
+            self.git_turn(&mut c, agent, &mut rng, &mut memory)?;
+            let text = serde_json::to_string(&memory).map_err(|e| e.to_string())?;
+            c.tool("notes_write", json!({"text": text}))?;
+            c.tool("sync", json!({}))?;
+            return Ok(());
+        }
+        if !has("log") {
+            return Err(format!("{name}: no log tool"));
+        }
 
         let changes = c.tool("log", json!({"tag": "change", "current": true}))?;
         let seen: Vec<&str> = changes
@@ -147,9 +169,8 @@ impl Backend for MockBackend {
                 .map(str::to_string)
         };
 
-        // Implement one function not done yet, low layers first, spread across agents.
-        let todo: Vec<_> = SPECS.iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
-        if let Some(spec) = todo.get(agent % 3).or(todo.first()) {
+        // Implement one function not done yet.
+        if let Some(spec) = next_spec(&memory, agent) {
             let program = if rng.chance(self.wrong_rate) {
                 candidates(spec.name).wrong[0].to_string()
             } else {
@@ -190,6 +211,109 @@ impl Backend for MockBackend {
         let text = serde_json::to_string(&memory).map_err(|e| e.to_string())?;
         c.tool("notes_write", json!({"text": text}))?;
         c.tool("sync", json!({}))?;
+        Ok(())
+    }
+}
+
+/// A file's text from a `read` result, without its line numbers.
+fn file_text(read: &Value) -> String {
+    read["text"]
+        .as_str()
+        .unwrap_or_default()
+        .lines()
+        .map(|l| format!("{}\n", l.split_once("| ").map_or("", |(_, t)| t)))
+        .collect()
+}
+
+impl MockBackend {
+    fn git_turn(&self, c: &mut Client, agent: usize, rng: &mut Rng, memory: &mut Memory) -> Result<(), String> {
+        let version = version_of(&file_text(&c.tool("read", json!({"file": "TASKS.md"}))?));
+        let program = |spec: &crate::task::Spec, rng: &mut Rng| {
+            if rng.chance(self.wrong_rate) {
+                candidates(spec.name).wrong[0].to_string()
+            } else {
+                correct_programs(version)[spec.name].to_string()
+            }
+        };
+
+        // Keep within the turn's calls, with two left for the notes and the last sync.
+        let budget = crate::driver::CALLS_PER_TURN - 2;
+        let list = c.tool("pr_list", json!({}))?;
+        let open: Vec<Value> =
+            list.as_array().into_iter().flatten().filter(|p| p["state"] == "open").cloned().collect();
+
+        // My open PRs failing CI: bring one that conflicts up to date with main.
+        for (n, branch) in memory.prs.clone() {
+            let failing = open.iter().any(|p| p["number"] == n && p["ci"] == false);
+            if !failing || c.calls + 8 > budget {
+                continue;
+            }
+            let view = c.tool("pr_view", json!({"number": n}))?;
+            let details = view["ci"]["details"].as_array().cloned().unwrap_or_default();
+            if !details.iter().any(|d| d.as_str().is_some_and(|d| d.contains("conflicts"))) {
+                continue;
+            }
+            c.tool("switch", json!({"branch": branch}))?;
+            let merged = c.tool("merge", json!({}))?;
+            if merged["merged"] == true {
+                continue;
+            }
+            for file in merged["conflicts"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+                // Both sides only add definitions: keep both.
+                let read = c.tool("read", json!({"file": file}))?;
+                let kept: String = file_text(&read)
+                    .lines()
+                    .filter(|l| !(l.starts_with("<<<<<<<") || l.starts_with("=======") || l.starts_with(">>>>>>>")))
+                    .map(|l| format!("{l}\n"))
+                    .collect();
+                let lines = read["lines"].as_u64().unwrap_or(0);
+                c.tool("edit", json!({"file": file, "start": 1, "end": lines, "text": kept}))?;
+            }
+            c.tool("commit", json!({"message": format!("Merge main into {branch}")}))?;
+        }
+
+        // Implement one function on a branch of its own, and open a PR.
+        if let Some(spec) = next_spec(memory, agent).filter(|_| c.calls + 6 <= budget) {
+            let branch = format!("f-{}", spec.name);
+            memory.implemented.push(spec.name.to_string());
+            c.tool("switch", json!({"branch": branch, "create": true}))?;
+            let file = format!("{}.stk", spec.module);
+            let lines = c.tool("read", json!({"file": file}))?["lines"].as_u64().unwrap_or(0);
+            let def = format!("def {} {} : {}", spec.name, spec.arity, program(spec, rng));
+            c.tool("edit", json!({"file": file, "start": lines + 1, "end": lines, "text": def}))?;
+            c.tool("commit", json!({"message": format!("Implement {}", spec.name)}))?;
+            c.tool("sync", json!({}))?;
+            // At the open-PR cap the hub refuses; the branch waits for a later turn.
+            if let Ok(opened) =
+                c.tool("pr_open", json!({"branch": branch, "title": format!("Implement {}", spec.name)}))
+            {
+                memory.prs.push((opened["number"].as_u64().unwrap_or(0), branch));
+            }
+        }
+
+        // Review up to two others' PRs at their current heads (as of the list); merge what is ready.
+        let mut reviewed = 0;
+        for p in &open {
+            if c.calls + 2 > budget {
+                break;
+            }
+            let n = p["number"].as_u64().unwrap_or(0);
+            let key = format!("{n}@{}", p["head"].as_str().unwrap_or_default());
+            let mine = memory.prs.iter().any(|(m, _)| *m == n);
+            let mut approved = p["approved"] == true;
+            if !mine && reviewed < 2 && !memory.checked.contains(&key) {
+                let verdict = if p["ci"] == true { "approve" } else { "request_changes" };
+                // Another agent may have merged it since the list; that refusal is expected.
+                let done = c.tool("pr_review", json!({"number": n, "verdict": verdict})).is_ok();
+                memory.checked.push(key);
+                reviewed += 1;
+                approved |= done && verdict == "approve";
+            }
+            if p["ci"] == true && approved && p["blocked_by"].as_array().is_some_and(Vec::is_empty) {
+                // Another agent may merge it first; that refusal is expected.
+                let _ = c.tool("pr_merge", json!({"number": n}));
+            }
+        }
         Ok(())
     }
 }
