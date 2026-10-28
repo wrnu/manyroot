@@ -51,10 +51,13 @@ to, made in the system's temporary directory (`TMPDIR`). bracken writes the
 run's files, keys included, by path, so the demo first checks that nobody else
 can rename entries in that directory or any directory above it: each must be
 owned by you or root, and either not writable by group or others, or sticky,
-like `/tmp`. On macOS each must also have no ACL entry allowing anyone to add,
-delete or rename entries, or to change its permissions or owner (on Linux, ACLs
-show in the group bits, so the mode check covers them). Otherwise it refuses to run and asks for a `TMPDIR` only you can
-write to.
+like `/tmp`. On macOS each must also have no ACL allow entry, for anyone,
+that grants adding, deleting or renaming entries, or changing permissions or
+owner, and none that new files inherit, whatever it grants: the run's files,
+keys included, would get it whatever their mode. The run's directory is then
+checked for any allow entry it got anyway. (On Linux, ACLs show in the group
+bits, so the mode check covers them.) Otherwise it refuses to run and asks for
+a `TMPDIR` only you can write to.
 
 `--keep` copies the finished run out of the temporary directory, so a relative
 `--keep` stays where you asked, and a `--keep` path with `..` after a directory
@@ -125,12 +128,16 @@ The shipped agent is scripted and deterministic given the seed. Each round it:
   only counts when the replaced contribution's author writes it (protocol.md,
   "Supersession"), so until then another agent's fix is a proposal and the
   old implementation stays current. It accepts a fix only if the fix
-  implements the same spec with a different program, another agent's check
-  has failed the implementation it replaces, the agent's own check of that
-  implementation fails too (anyone can record a fail), and the fix passes the
+  implements the same spec and doesn't behave like the implementation it
+  replaces, another agent's check has failed that implementation, the agent's
+  own check of it fails too (anyone can record a fail), and the fix passes the
   agent's own check. These checks use a sample and aren't recorded as
-  evidence. A program that fails the check once stays rejected, however often
-  it's proposed; any other proposal stays a proposal;
+  evidence. What a program does is the set of inputs it gets wrong, so
+  changing its text without changing what it does (` 0 +`) makes no
+  difference: a program that fails the check once stays rejected, and so does
+  any that behaves like it, however often it's proposed. It accepts at most one
+  fix of an implementation in a turn, the first in name order; any other
+  proposal stays a proposal;
 - fixes its own failing implementation if it has one (a new artifact that
   `supersedes` it), sometimes fixes someone else's instead, or else implements
   a spec it sees no live, unfailed implementation of. Sometimes it implements

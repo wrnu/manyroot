@@ -112,10 +112,11 @@ pub struct ScriptedAgent {
     /// For checking others' proposed fixes of my work, apart from `rng` so that
     /// proposals don't change the rest of the script.
     review_rng: Rng,
-    /// Programs proposed as fixes of my work that failed my check, with their spec: each
-    /// is checked once, so a wrong fix can't pass by being re-sampled, under the same id
-    /// or as a new artifact.
-    rejected: HashSet<(String, String)>,
+    /// What proposed fixes of my work that failed my check do: their spec and the inputs
+    /// they get wrong. A program that behaves like one I rejected is rejected unchecked,
+    /// so a wrong fix can't pass by being re-sampled, under the same id, as a new
+    /// artifact, or with its text changed but not what it does.
+    rejected: HashSet<(String, Vec<(i64, i64)>)>,
     silent_drops: Vec<(String, u32)>,
 }
 
@@ -306,18 +307,21 @@ impl ScriptedAgent {
     }
 
     /// Whether to accept `fix`, another agent's proposed replacement for my `mine`: it
-    /// implements the same spec with a different program, another agent's check has
-    /// failed `mine`, my own check
-    /// fails `mine` too (anyone can record a fail), and `fix` passes my own check. The
-    /// checks aren't recorded. A program that fails my check once stays rejected; a
-    /// proposal turned down because `mine` passed is checked again next time.
+    /// implements the same spec and doesn't behave like `mine`, another agent's check
+    /// has failed `mine`, my own check fails `mine` too (anyone can record a fail), and
+    /// `fix` passes my own check. The checks aren't recorded. A program that fails my
+    /// check once stays rejected, and so does any that behaves like it; a proposal
+    /// turned down because `mine` passed is checked again next time.
+    ///
+    /// What a program does is the set of grid inputs it gets wrong. It's used only to
+    /// tell programs apart, never to decide whether one is right: that's the sample's job.
     fn accepts(&mut self, mine: &Impl, fix: &Impl) -> bool {
         let Some(spec) = task::spec(&mine.spec) else { return false };
-        let program = (fix.spec.clone(), fix.program.clone());
+        let behaviour = (fix.spec.clone(), spec.wrong_on(&fix.program));
         if fix.spec != mine.spec
-            || fix.program == mine.program
+            || behaviour.1 == spec.wrong_on(&mine.program)
             || mine.fails.is_empty()
-            || self.rejected.contains(&program)
+            || self.rejected.contains(&behaviour)
         {
             return false;
         }
@@ -326,9 +330,24 @@ impl ScriptedAgent {
         }
         let passes = spec.check(&fix.program, &spec.sample(self.sample, &mut self.review_rng)).ok();
         if !passes {
-            self.rejected.insert(program);
+            self.rejected.insert(behaviour);
         }
         passes
+    }
+
+    /// The fixes to accept this turn: for each of my live implementations, the first
+    /// proposal, in name order, that [`Self::accepts`]. At most one each, so two
+    /// proposals can't both replace it.
+    fn fixes_to_accept<'v>(&mut self, view: &'v View) -> Vec<(&'v Impl, &'v Impl)> {
+        let me = self.name.clone();
+        let mut chosen = Vec::new();
+        for mine in view.impls.values().filter(|i| i.live() && i.author == me) {
+            let fixes = mine.proposed_fixes.iter().filter_map(|f| view.impls.get(f));
+            if let Some(fix) = fixes.into_iter().find(|fix| self.accepts(mine, fix)) {
+                chosen.push((mine, fix));
+            }
+        }
+        chosen
     }
 
     fn check(&mut self, turn: &Turn, target: &Impl) -> Result<()> {
@@ -354,18 +373,11 @@ impl Agent for ScriptedAgent {
         let mut view = View::read(turn)?;
 
         // 0. Accept others' fixes of my live implementations: only my relation retires mine.
-        let mut accepted = false;
-        let me = self.name.clone();
-        for mine in view.impls.values().filter(|i| i.live() && i.author == me) {
-            for fix in &mine.proposed_fixes {
-                let Some(fix) = view.impls.get(fix) else { continue };
-                if self.accepts(mine, fix) {
-                    turn.replica.relate(&fix.id, "supersedes", &mine.id, &format!("accepts {}", fix.name))?;
-                    accepted = true;
-                }
-            }
+        let accepted = self.fixes_to_accept(&view);
+        for (mine, fix) in &accepted {
+            turn.replica.relate(&fix.id, "supersedes", &mine.id, &format!("accepts {}", fix.name))?;
         }
-        if accepted {
+        if !accepted.is_empty() {
             view = View::read(turn)?;
         }
         self.observe(&view, turn.round);
@@ -608,11 +620,15 @@ mod tests {
     fn a_proposed_fix_that_fails_my_check_once_stays_rejected() {
         // Wrong only at a = -1, so a sample of 6 of the 13 inputs misses the bug about
         // half the time: checked afresh each time, it would be accepted sooner or later.
-        // Each proposal is a new artifact with the same program.
+        // Each proposal is a new artifact, its text changed by a no-op (' 0 +') that
+        // leaves what it does alone.
         let mut agent = ScriptedAgent::new("agent-1", 1, 1, 6, Behaviour::default());
         let mine = abs_impl("mine", "agent-1", "a", &["agent-2"]);
         let verdicts: Vec<bool> = (0..50)
-            .map(|n| agent.accepts(&mine, &abs_impl(&format!("fix{n}"), "agent-0", "a -1 < a neg a ?", &[])))
+            .map(|n| {
+                let program = format!("a -1 < a neg a ?{}", " 0 +".repeat(n));
+                agent.accepts(&mine, &abs_impl(&format!("fix{n}"), "agent-0", &program, &[]))
+            })
             .collect();
         let first_no = verdicts.iter().position(|v| !v).expect("some sample finds the bug");
         assert!(verdicts[first_no..].iter().all(|v| !v), "accepted after rejecting: {verdicts:?}");
@@ -632,12 +648,42 @@ mod tests {
 
     #[test]
     fn a_made_up_fail_on_correct_work_never_gets_a_fix_accepted() {
-        // agent-0 records a fail on agent-1's correct implementation, then proposes a copy.
-        let mut agent = ScriptedAgent::new("agent-1", 1, 1, 6, Behaviour::default());
-        let correct = task::spec("abs").expect("abs").correct[0];
-        let mine = abs_impl("mine", "agent-1", correct, &["agent-0"]);
-        for n in 0..50 {
-            assert!(!agent.accepts(&mine, &abs_impl(&format!("copy{n}"), "agent-0", correct, &[])));
+        // agent-0 records a fail on agent-1's correct implementation, then proposes a copy,
+        // a copy with its text changed, a different correct program, and a program wrong
+        // only at a = -1, which a sample of 6 misses about half the time. Only my own
+        // re-check of my implementation turns that last one down every time, so each seed
+        // gets a fresh agent, with nothing remembered.
+        let correct = task::spec("abs").expect("abs").correct;
+        let mine = abs_impl("mine", "agent-1", correct[0], &["agent-0"]);
+        let programs = [correct[0].to_owned(), format!("{} 0 +", correct[0]), correct[1].to_owned()];
+        for seed in 0..50 {
+            let mut agent = ScriptedAgent::new("agent-1", seed, 1, 6, Behaviour::default());
+            for program in programs.iter().map(String::as_str).chain(["a -1 < a neg a ?"]) {
+                let fix = abs_impl("fix", "agent-0", program, &[]);
+                assert!(!agent.accepts(&mine, &fix), "seed {seed} accepted {program}");
+            }
         }
+    }
+
+    #[test]
+    fn at_most_one_proposed_fix_replaces_an_implementation_in_a_turn() {
+        // Three acceptable fixes of agent-1's wrong implementation: a correct program, the
+        // same with a no-op (' 0 +') added, and another correct program.
+        let mut agent = ScriptedAgent::new("agent-1", 1, 1, 6, Behaviour::default());
+        let correct = task::spec("abs").expect("abs").correct;
+        let mut mine = abs_impl("mine", "agent-1", "a", &["agent-2"]);
+        let noop = format!("{} 0 +", correct[0]);
+        let fixes = [
+            abs_impl("fix0", "agent-0", correct[0], &[]),
+            abs_impl("fix1", "agent-0", &noop, &[]),
+            abs_impl("fix2", "agent-2", correct[1], &[]),
+        ];
+        let key = |i: &Impl| (i.name.clone(), i.id.clone());
+        mine.proposed_fixes = fixes.iter().map(key).collect();
+        let mut impls: BTreeMap<_, _> = fixes.into_iter().map(|f| (key(&f), f)).collect();
+        impls.insert(key(&mine), mine);
+        let view = View { specs: HashMap::new(), impls, wips: Vec::new() };
+        let accepted: Vec<&str> = agent.fixes_to_accept(&view).iter().map(|(_, fix)| fix.id.as_str()).collect();
+        assert_eq!(accepted, ["fix0"]);
     }
 }

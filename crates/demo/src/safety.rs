@@ -82,19 +82,36 @@ pub fn run_dir(allowed: bool, advice: &Advice) -> Result<(tempfile::TempDir, Pat
     let base = std::env::temp_dir();
     let base = std::fs::canonicalize(&base).with_context(|| format!("resolving {}", base.display()))?;
     refuse_shared(&base)?;
-    let temp = tempfile::Builder::new().tempdir_in(&base).context("creating a temporary directory")?;
+    run_dir_in(&base, allowed, advice)
+}
+
+/// Makes the run's directory in `base`, which [`refuse_shared`] has passed, and checks
+/// what it got: on macOS, a new directory inherits ACL entries from its parent, and so
+/// does everything made in it, keys included, so it must have no allow entry at all.
+fn run_dir_in(base: &Path, allowed: bool, advice: &Advice) -> Result<(tempfile::TempDir, PathBuf)> {
+    let temp = tempfile::Builder::new().tempdir_in(base).context("creating a temporary directory")?;
     let root = temp.path().to_owned();
+    #[cfg(target_os = "macos")]
+    if acl::entries(&root).with_context(|| format!("reading the ACL of {}", root.display()))?.iter().any(|e| e.allow) {
+        bail!(
+            "the run's directory {} got an ACL entry from {} that lets others in; \
+             set TMPDIR to a directory only you can use",
+            root.display(),
+            base.display()
+        );
+    }
     refuse_git_checkout(&root, allowed, advice)?;
     Ok((temp, root))
 }
 
 /// Fails unless nobody else can rename entries in `dir`, a real path, or in any
 /// directory above it: each must be owned by this user or root, and either not
-/// writable by group or others, or sticky. On macOS each must also have no ACL entry
-/// that allows adding, deleting or renaming entries, or changing its permissions or
-/// owner, whoever it names (on Linux, ACLs show in the group bits). bracken writes a
-/// run's files, keys included, by path, so a rename there could send them into a
-/// checkout.
+/// writable by group or others, or sticky. On macOS each must also have no ACL allow
+/// entry, whoever it names, that grants adding, deleting or renaming entries, or
+/// changing its permissions or owner, and none that new files and directories inherit,
+/// whatever it grants: the run's directory and its keys would get it, whatever their
+/// mode. (On Linux, ACLs show in the group bits.) bracken writes a run's files, keys
+/// included, by path, so a rename there could send them into a checkout.
 #[cfg(unix)]
 pub fn refuse_shared(dir: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
@@ -103,24 +120,32 @@ pub fn refuse_shared(dir: &Path) -> Result<()> {
         let m = std::fs::metadata(d).with_context(|| format!("reading {}", d.display()))?;
         let owned = m.uid() == me || m.uid() == 0;
         let closed = m.mode() & 0o022 == 0 || m.mode() & 0o1000 != 0;
+        // On macOS: an allow entry granting a change, and whether any allow entry is inherited.
         #[cfg(target_os = "macos")]
-        let acl = acl::grants_change(d).with_context(|| format!("reading the ACL of {}", d.display()))?;
+        let (change, inherited) = {
+            let acl = acl::entries(d).with_context(|| format!("reading the ACL of {}", d.display()))?;
+            let allow: Vec<&acl::Entry> = acl.iter().filter(|e| e.allow).collect();
+            (allow.iter().find_map(|e| e.changes), allow.iter().any(|e| e.inherits))
+        };
         #[cfg(not(target_os = "macos"))]
-        let acl: Option<&str> = None;
-        if !owned || !closed || acl.is_some() {
-            let why = match acl {
-                _ if !owned => "belongs to another user".to_owned(),
-                _ if !closed => "is writable by others and not sticky".to_owned(),
-                Some(perm) => format!("has an ACL entry allowing {perm}"),
-                None => unreachable!("one of the checks failed"),
-            };
-            bail!(
-                "the temporary directory {} isn't private: {} {why}, so others could swap the run's files \
-                 into a repository; set TMPDIR to a directory only you can write to",
-                dir.display(),
-                d.display()
-            );
-        }
+        let (change, inherited): (Option<&str>, bool) = (None, false);
+        let why = if !owned {
+            "belongs to another user".to_owned()
+        } else if !closed {
+            "is writable by others and not sticky".to_owned()
+        } else if let Some(perm) = change {
+            format!("has an ACL entry allowing {perm}")
+        } else if inherited {
+            "has an ACL entry that new files inherit, whatever their mode".to_owned()
+        } else {
+            continue;
+        };
+        bail!(
+            "the temporary directory {} isn't private: {} {why}, so others could reach the run's files, \
+             keys included; set TMPDIR to a directory only you can write to",
+            dir.display(),
+            d.display()
+        );
     }
     Ok(())
 }
@@ -139,6 +164,8 @@ mod acl {
         fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
         fn acl_get_permset(entry: *mut c_void, permset: *mut *mut c_void) -> c_int;
         fn acl_get_perm_np(permset: *mut c_void, perm: c_int) -> c_int;
+        fn acl_get_flagset_np(obj: *mut c_void, flagset: *mut *mut c_void) -> c_int;
+        fn acl_get_flag_np(flagset: *mut c_void, flag: c_int) -> c_int;
         fn acl_free(obj: *mut c_void) -> c_int;
     }
     const ACL_TYPE_EXTENDED: c_int = 0x100;
@@ -154,12 +181,24 @@ mod acl {
         (1 << 12, "writesecurity"),
         (1 << 13, "chown"),
     ];
+    /// Flags that pass an entry on to new files and directories.
+    const INHERITS: [c_int; 2] = [1 << 5, 1 << 6];
     const ENOENT: i32 = 2;
     const ENOTSUP: i32 = 45;
     const EOPNOTSUPP: i32 = 102;
 
-    /// The first of [`CHANGES`] that an allow entry in `path`'s ACL grants, if any.
-    pub fn grants_change(path: &Path) -> std::io::Result<Option<&'static str>> {
+    /// One entry of an ACL.
+    pub struct Entry {
+        /// An allow entry, not a deny one.
+        pub allow: bool,
+        /// The first of [`CHANGES`] it grants, if any.
+        pub changes: Option<&'static str>,
+        /// Whether new files or directories inherit it.
+        pub inherits: bool,
+    }
+
+    /// The entries of `path`'s ACL; none if it has no ACL.
+    pub fn entries(path: &Path) -> std::io::Result<Vec<Entry>> {
         let c = CString::new(path.as_os_str().as_bytes())?;
         // SAFETY: `c` is a NUL-terminated path. A non-null ACL is freed below.
         let acl = unsafe { acl_get_link_np(c.as_ptr(), ACL_TYPE_EXTENDED) };
@@ -167,28 +206,35 @@ mod acl {
             // No ACL, or a file system without them.
             let err = std::io::Error::last_os_error();
             return match err.raw_os_error() {
-                Some(ENOENT | ENOTSUP | EOPNOTSUPP) => Ok(None),
+                Some(ENOENT | ENOTSUP | EOPNOTSUPP) => Ok(Vec::new()),
                 _ => Err(err),
             };
         }
-        let mut found = None;
-        // SAFETY: `acl` is valid until `acl_free`, and every entry and permission set read
-        // here points into it; each call's result is checked before its output is used.
+        let mut entries = Vec::new();
+        // SAFETY: `acl` is valid until `acl_free`, and every entry, permission set and flag
+        // set read here points into it; each call's result is checked before its output
+        // is used.
         unsafe {
             let (mut id, mut entry) = (ACL_FIRST_ENTRY, std::ptr::null_mut());
-            while found.is_none() && acl_get_entry(acl, id, &mut entry) == 0 {
+            while acl_get_entry(acl, id, &mut entry) == 0 {
                 id = ACL_NEXT_ENTRY;
-                let (mut tag, mut perms) = (0, std::ptr::null_mut());
-                if acl_get_tag_type(entry, &mut tag) == 0
-                    && tag == ACL_EXTENDED_ALLOW
-                    && acl_get_permset(entry, &mut perms) == 0
+                let (mut tag, mut perms, mut flags) = (0, std::ptr::null_mut(), std::ptr::null_mut());
+                if acl_get_tag_type(entry, &mut tag) != 0
+                    || acl_get_permset(entry, &mut perms) != 0
+                    || acl_get_flagset_np(entry, &mut flags) != 0
                 {
-                    found = CHANGES.iter().find(|&&(perm, _)| acl_get_perm_np(perms, perm) == 1).map(|&(_, n)| n);
+                    acl_free(acl);
+                    return Err(std::io::Error::last_os_error());
                 }
+                entries.push(Entry {
+                    allow: tag == ACL_EXTENDED_ALLOW,
+                    changes: CHANGES.iter().find(|&&(perm, _)| acl_get_perm_np(perms, perm) == 1).map(|&(_, n)| n),
+                    inherits: INHERITS.iter().any(|&flag| acl_get_flag_np(flags, flag) == 1),
+                });
             }
             acl_free(acl);
         }
-        Ok(found)
+        Ok(entries)
     }
 }
 
@@ -303,7 +349,6 @@ mod handles {
     use std::ffi::{OsStr, OsString};
     use std::io::Write;
     use std::os::fd::OwnedFd;
-    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
 
@@ -327,6 +372,7 @@ mod handles {
     pub fn path_of(fd: &OwnedFd) -> Result<PathBuf> {
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
+            use std::os::unix::ffi::OsStrExt;
             let path = rustix::fs::getpath(fd).context("asking where a directory is")?;
             Ok(PathBuf::from(OsStr::from_bytes(path.as_bytes())))
         }
@@ -614,8 +660,44 @@ mod tests {
             let refused = refuse_shared(&dir).unwrap_err().to_string();
             assert!(refused.contains(&format!("has an ACL entry allowing {perm}")), "{perm}: {refused}");
         }
+        // Read only, but inherited: the run's directory and its keys would get it.
+        chmod(&["-N"]);
+        chmod(&[
+            "+a",
+            "everyone allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit",
+        ]);
+        let refused = refuse_shared(&dir).unwrap_err().to_string();
+        assert!(refused.contains("has an ACL entry that new files inherit"), "{refused}");
         chmod(&["-N"]);
         refuse_shared(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_run_directory_that_inherits_an_acl_entry_is_refused_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = real(&tmp).join("base");
+        std::fs::create_dir(&base).unwrap();
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let chmod =
+            |args: &[&str]| assert!(Command::new("/bin/chmod").args(args).arg(&base).status().unwrap().success());
+
+        // A clean base: the run directory, and a key made in it, carry no ACL entry.
+        let (temp, root) = run_dir_in(&base, false, &DEMO).unwrap();
+        let key = root.join("agent-0/.bracken/identities/agent-0.json");
+        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+        std::fs::write(&key, "secret").unwrap();
+        assert!(acl::entries(&root).unwrap().is_empty());
+        assert!(acl::entries(&key).unwrap().is_empty(), "the key has an ACL entry");
+        drop(temp);
+
+        // An inherited entry that refuse_shared would refuse, made here to test the check
+        // after creation on its own.
+        chmod(&["+a", "everyone allow list,search,read,file_inherit,directory_inherit"]);
+        let refused = run_dir_in(&base, false, &DEMO).unwrap_err().to_string();
+        assert!(refused.contains("got an ACL entry from"), "{refused}");
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0, "the refused directory is removed");
+        chmod(&["-N"]);
     }
 
     /// Replaces directory `name` in `parent` with a symlink to `to`, keeping it as `<name>.moved`.

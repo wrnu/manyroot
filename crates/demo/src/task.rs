@@ -127,6 +127,11 @@ impl Spec {
     pub fn is_correct(&self, program: &str) -> bool {
         self.check(program, &self.grid()).ok()
     }
+
+    /// The inputs `program` gets wrong, in grid order: what it does, whatever its text.
+    pub fn wrong_on(&self, program: &str) -> Vec<(i64, i64)> {
+        self.grid().into_iter().filter(|&(a, b)| eval(program, a, b) != Ok((self.reference)(a, b))).collect()
+    }
 }
 
 /// The outcome of running a program on some inputs.
