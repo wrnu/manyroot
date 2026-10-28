@@ -644,9 +644,13 @@ the same values; the security review's `--receive-pack` reproduction
    usage, and the final `result` event with the turn's usage per model and
    its duration.
 3. The turn ends when the model stops, or when the driver ends the process
-   at a cap (section 5): 25 tool calls (the driver also refuses the 26th),
-   150,000 tokens of context, or 10 minutes. The harness then syncs the
-   agent with the hub and saves its notes.
+   at a cap (section 5): 150,000 tokens of context, or 10 minutes. The
+   25-tool-call cap ends a turn softly (decision `147a36d5d623`): the
+   driver's MCP server refuses the 26th call and every later one, telling
+   the agent its tool calls are used up and to stop, and the turn may still
+   end itself and write its `result` event. Only if it hasn't within 60
+   seconds or 3 more model calls does the driver end the process. The
+   harness then syncs the agent with the hub and saves its notes.
 
 Agents run their turns back to back, concurrently with each other, not in
 lockstep rounds: real agents take minutes per turn, and lockstep would make
@@ -1018,11 +1022,19 @@ measures, so throttling can't favour one mode.
 Each layer stops a run's use on its own:
 
 1. **Per call:** Claude Code's own output limit per response.
-2. **Per turn:** 25 tool calls (counted by the driver, which refuses the
-   26th), 150,000 tokens of context, 10 minutes. The driver ends the process
-   at any of them. The tool-call count is taken from the event stream (the
-   `tool_use` blocks); the driver's MCP server separately refuses the 26th
-   call. Claude Code's `--max-budget-usd` does apply through a gateway base
+2. **Per turn:** 25 tool calls, 150,000 tokens of context, 10 minutes.
+   The driver ends the process at the context and time caps. The tool-call
+   cap is a soft stop (decision `147a36d5d623`): the driver's MCP server
+   refuses the 26th call and every later one, so none reaches a tool, with
+   the message "This turn's tool calls are used up: no more will run this
+   turn. Finish now: stop and end your turn." The count is also taken from
+   the event stream (the `tool_use` blocks): from the 26th, the turn has a
+   grace of 60 seconds and 3 more model calls to end with its own `result`
+   event, which is then counted as any other turn's. Past the grace the
+   driver ends the process, and the turn counts at the output ceiling below,
+   as any turn without a result does. In the calibration run every turn
+   ended at the cap by kill, so no turn had a result and real output was
+   never measured; the grace lets the pilot measure below the ceiling. Claude Code's `--max-budget-usd` does apply through a gateway base
    URL (step 6 checked it against a fake endpoint: it stopped the turn after
    the first call that crossed the limit), so it is set on every turn at
    1 USD. At the price Claude Code applied to claude-opus-5-5 in that probe

@@ -149,6 +149,16 @@ impl Setup {
         run(&cfg, backend).map(|o| o.events)
     }
 
+    /// A run of one agent whose driver refuses tool calls past `calls` a turn, as the backend's caps should match.
+    fn run_calls(&self, backend: &ClaudeBackend, calls: u32) -> Result<PathBuf, String> {
+        self.run_calls_for(backend, calls, 1)
+    }
+
+    fn run_calls_for(&self, backend: &ClaudeBackend, calls: u32, turns: u32) -> Result<PathBuf, String> {
+        let cfg = RunConfig { calls_per_turn: calls, ..run_config(self.dir.join("run"), "bracken", 1, turns, true) };
+        run(&cfg, backend).map(|o| o.events)
+    }
+
     fn transcript(&self, agent: &str, turn: u32) -> Option<String> {
         std::fs::read_to_string(self.dir.join(format!("claude/transcripts/{agent}-{turn}.jsonl"))).ok()
     }
@@ -543,28 +553,109 @@ fn the_report_reads_the_backends_usage_rows() {
     assert!(m.overhead.integrate_tokens.is_some_and(|t| t > 0.0), "{:?}", m.overhead);
 }
 
-#[test]
-fn tool_calls_past_the_cap_end_the_turn() {
-    let s = Setup::new();
-    let script: String = (0..30).map(|_| "call notes_read {}\nsleep 100\n").collect::<String>() + "result 10";
-    let backend = s.backend(&script, Caps { calls_per_turn: 3, ..caps() });
-    let events_path = s.run(&backend, 1, 1).expect("the run goes on");
-    assert_eq!(turn_error_for(&s, &events_path), 1);
-    let calls = events(&events_path).iter().filter(|e| e["event"] == "tool_call").count();
-    // The driver's own refusal of extra calls is serve()'s (PR #26); here the process ends just past the cap.
-    assert!(calls <= 5, "{calls} calls reached the driver");
-    let (mine, _) = backend.totals("agent-0");
-    assert_eq!(mine.output, caps().turn_output, "a turn without a result counts at its output cap");
+/// Counts of `kind` events in the run's log.
+fn count(events_path: &Path, kind: &str) -> usize {
+    events(events_path).iter().filter(|e| e["event"] == kind).count()
+}
 
-    // At the cap exactly, the turn runs to its result.
+/// `n` tool calls, `pause` milliseconds apart.
+fn calls(n: usize, pause: u64) -> String {
+    (0..n).map(|_| format!("call notes_read {{}}\nsleep {pause}\n")).collect()
+}
+
+#[test]
+fn a_turn_that_stops_after_the_refusal_is_counted_from_its_result() {
     let s = Setup::new();
-    let backend = s.backend(
-        "call notes_read {}\ncall notes_read {}\ncall notes_read {}\nresult 10",
-        Caps { calls_per_turn: 3, ..caps() },
-    );
-    let events_path = s.run(&backend, 1, 1).expect("the run");
+    let backend = s.backend(&(calls(4, 0) + "say\nresult 10"), Caps { calls_per_turn: 3, ..caps() });
+    let events_path = s.run_calls(&backend, 3).expect("the run");
+    assert_eq!(turn_error_for(&s, &events_path), 0, "the turn ended itself");
+    assert_eq!(count(&events_path, "tool_call"), 3, "the 4th call never reached a tool");
+    assert_eq!(count(&events_path, "call_refused"), 1);
+    let transcript = s.transcript("agent-0", 1).expect("a transcript");
+    assert!(transcript.contains("tool calls are used up"), "the agent was told to finish");
+    assert_eq!(backend.totals("agent-0").0.output, 10, "real output, not the ceiling");
+    let rows = s.usage();
+    assert!(rows.iter().any(|r| r["past_tool_call_cap"] == 4), "a row says the turn passed its cap");
+    assert!(rows.iter().any(|r| r["output"] == 10 && r["ended"] == "success"));
+
+    // At the cap exactly, nothing is refused.
+    let s = Setup::new();
+    let backend = s.backend(&(calls(3, 0) + "result 10"), Caps { calls_per_turn: 3, ..caps() });
+    let events_path = s.run_calls(&backend, 3).expect("the run");
     assert_eq!(turn_error_for(&s, &events_path), 0, "the cap-th call is allowed");
+    assert_eq!(count(&events_path, "call_refused"), 0);
+    assert!(!s.usage().iter().any(|r| r["past_tool_call_cap"].is_u64()));
     assert_eq!(backend.totals("agent-0").0.output, 10);
+}
+
+/// Three runs, one per mode, stay within the owner's go for the pilot (decision `ea053c2c4d48`).
+#[test]
+fn the_pilots_run_caps_are_a_third_of_its_go_each() {
+    let c = Caps::pilot();
+    assert_eq!((c.run_tokens, c.run_output, c.run_time), (25_000_000, 1_666_666, Duration::from_secs(3600)));
+    assert!(
+        3 * c.run_tokens <= 75_000_000
+            && 3 * c.run_output <= 5_000_000
+            && 3 * c.run_time <= Duration::from_secs(3 * 3600)
+    );
+    assert_eq!((c.agent_tokens, c.agent_output, c.turn_output), (3_000_000, 180_000, 30_000), "unchanged");
+}
+
+/// Report `aba12882829a` point 6: at the 30,000 ceiling, the per-agent cap of 180,000 output tokens
+/// stopped an agent after 6 of its 8 turns. Turns that reach the tool-call cap and end themselves
+/// count their real output, so the agent gets all 8; the per-agent cap is unchanged.
+#[test]
+fn an_agent_whose_turns_end_softly_at_the_cap_gets_all_its_turns() {
+    assert_eq!((caps().agent_output, caps().turn_output), (180_000, 30_000), "the pilot's figures");
+    let s = Setup::new();
+    let backend = s.backend(&(calls(4, 0) + "result 2000"), Caps { calls_per_turn: 3, ..caps() });
+    let events_path = s.run_calls_for(&backend, 3, 8).expect("the run");
+    assert_eq!(turn_error_for(&s, &events_path), 0);
+    assert_eq!(count(&events_path, "call_refused"), 8, "every turn passed the cap");
+    let ended = s.usage().iter().filter(|r| r["ended"] == "success").count();
+    assert_eq!(ended, 8, "all 8 turns ran to their result");
+    assert_eq!(backend.totals("agent-0").0.output, 8 * 2000);
+
+    // The same turns, hard-stopped after the grace: each counts at the ceiling, and the agent stops after 6.
+    let s = Setup::new();
+    let grace = Caps { calls_per_turn: 3, cap_grace: Duration::from_millis(500), ..caps() };
+    let backend = s.backend(&(calls(4, 0) + SLEEP + "\nresult 2000"), grace);
+    let events_path = s.run_calls_for(&backend, 3, 8).expect("the run goes on");
+    assert_eq!(s.usage().iter().filter(|r| r["output_counted_at"] == 30_000).count(), 6, "6 turns ran");
+    assert_eq!(turn_error_for(&s, &events_path), 8, "6 hard stops and 2 turns refused for spent tokens");
+    assert!(s.transcript("agent-0", 7).is_none());
+    assert_eq!(backend.totals("agent-0").0.output, 180_000);
+}
+
+#[test]
+fn a_turn_that_ignores_the_refusal_is_ended_after_the_grace_at_the_ceiling() {
+    let s = Setup::new();
+    let grace = Caps { calls_per_turn: 3, cap_grace: Duration::from_secs(2), turn_time: LONG_TURN, ..caps() };
+    let backend = s.backend(&(calls(4, 0) + SLEEP + "\nresult 10"), grace);
+    let start = Instant::now();
+    let events_path = s.run_calls(&backend, 3).expect("the run goes on");
+    assert!(start.elapsed() < EARLY, "the grace, not the turn's time, ended it");
+    assert_eq!(turn_error_for(&s, &events_path), 1);
+    assert_eq!(count(&events_path, "tool_call"), 3);
+    assert_eq!(backend.totals("agent-0").0.output, caps().turn_output, "a turn without a result counts at the ceiling");
+    assert!(s.usage().iter().any(|r| r["output_counted_at"] == caps().turn_output));
+}
+
+#[test]
+fn a_turn_that_keeps_calling_is_ended_after_the_grace_calls() {
+    let s = Setup::new();
+    let grace = Caps { calls_per_turn: 3, cap_grace: LONG_TURN, cap_grace_calls: 3, turn_time: LONG_TURN, ..caps() };
+    let backend = s.backend(&(calls(30, 100) + "result 10"), grace);
+    let start = Instant::now();
+    let events_path = s.run_calls(&backend, 3).expect("the run goes on");
+    assert!(start.elapsed() < EARLY);
+    assert_eq!(turn_error_for(&s, &events_path), 1);
+    assert_eq!(count(&events_path, "tool_call"), 3, "no call past the cap reached a tool");
+    // The call that crossed the cap and the three grace calls were refused; the next one ended the process,
+    // perhaps after its own refusal.
+    let refused = count(&events_path, "call_refused");
+    assert!((4..=5).contains(&refused), "{refused} refused");
+    assert_eq!(backend.totals("agent-0").0.output, caps().turn_output);
 }
 
 /// A result event with input `input` (the stream counted 1000 per message) and output `output`.
