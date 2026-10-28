@@ -302,19 +302,43 @@ impl MockBackend {
         let line = format!("def {} {} : {program}", spec.name, spec.arity);
         let index = crate::task::MODULES.iter().position(|m| *m == spec.module).ok_or("a spec in no module")?;
         let file = MODULE_FILES[index];
+        // Concurrent edits of one line merge character by character, and can leave a line that
+        // doesn't parse, which breaks its whole module for everyone. Like an agent reading the
+        // check's error, delete such lines first, from the bottom so line numbers above stay put.
         let text = file_text(&c.tool("read", json!({"file": file}))?);
+        let broken: Vec<i64> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| crate::lang::parse_module(spec.module, l).is_err())
+            .map(|(i, _)| i as i64 + 1)
+            .collect();
+        for &k in broken.iter().rev() {
+            c.tool("edit", json!({"file": file, "start": k, "end": k, "text": ""}))?;
+        }
+        let text = if broken.is_empty() { text } else { file_text(&c.tool("read", json!({"file": file}))?) };
         let prefix = format!("def {} ", spec.name);
-        match text.lines().find(|l| l.starts_with(&prefix)) {
-            Some(old) => c.tool("replace", json!({"file": file, "old": old, "new": line}))?,
+        // Two agents appending the same function at once both keep their line when the CRDT
+        // merges them, so there may be several. Delete all but the first, from the bottom so the
+        // line numbers above stay put, then rewrite the first.
+        let at: Vec<i64> =
+            text.lines().enumerate().filter(|(_, l)| l.starts_with(&prefix)).map(|(i, _)| i as i64 + 1).collect();
+        match at.split_first() {
+            Some((&first, extra)) => {
+                for &k in extra.iter().rev() {
+                    c.tool("edit", json!({"file": file, "start": k, "end": k, "text": ""}))?;
+                }
+                c.tool("edit", json!({"file": file, "start": first, "end": first, "text": line}))?
+            }
             None => {
                 let n = text.lines().count() as i64;
                 c.tool("edit", json!({"file": file, "start": n + 1, "end": n, "text": line}))?
             }
         };
-        let checked = c.tool("check", json!({"function": spec.name}))?;
+        // Another module can still be broken by someone else's merge: then the check can't run,
+        // and the mock counts that as failing, as an agent would.
+        let ok = c.tool("check", json!({"function": spec.name})).is_ok_and(|v| v["ok"].as_bool().unwrap_or(false));
         let notes = file_text(&c.tool("read", json!({"file": NOTES}))?);
         let n = notes.lines().count() as i64;
-        let ok = checked["ok"].as_bool().unwrap_or(false);
         let note =
             format!("{name}, turn {turn}: wrote {} (public check {})", spec.name, if ok { "passes" } else { "fails" });
         c.tool("edit", json!({"file": NOTES, "start": n + 1, "end": n, "text": note}))?;
