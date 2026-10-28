@@ -178,6 +178,7 @@ dependencies = [
  "clap",
  "hex",
  "hexane",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

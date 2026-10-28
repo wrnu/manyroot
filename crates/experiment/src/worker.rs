@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 
 use crate::args::{Args, MAX_NOTES, check_text};
 use crate::mode::{Session, Store, StoreConfig, Transfer, mode_named};
+use crate::sandbox::Sandbox;
 
 /// The largest request or reply line a worker accepts: the hub's first export, which seeds each copy, fits easily.
 pub const MAX_LINE: usize = 64 * 1024 * 1024;
@@ -194,8 +195,17 @@ pub struct Worker {
 impl Worker {
     /// Starts `bin worker` for `mode` on `config`, with an empty environment, in the store's directory.
     pub fn spawn(bin: &Path, mode: &str, config: &StoreConfig) -> Result<Worker, String> {
+        Worker::spawn_in(bin, mode, config, None)
+    }
+
+    /// The same, under `sandbox` if given (the tools or hub profile).
+    pub fn spawn_in(bin: &Path, mode: &str, config: &StoreConfig, sandbox: Option<&Sandbox>) -> Result<Worker, String> {
         std::fs::create_dir_all(&config.dir).map_err(|e| format!("creating {}: {e}", config.dir.display()))?;
-        let child = Command::new(bin)
+        let mut command = match sandbox {
+            Some(s) => s.command(bin),
+            None => Command::new(bin),
+        };
+        let child = command
             .arg("worker")
             .args(["--mode", mode, "--identity", &config.identity])
             .arg("--store")

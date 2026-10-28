@@ -50,6 +50,7 @@ fn a_mock_run_goes_end_to_end_through_the_shim() {
         trace: false,
         calls_per_turn: CALLS_PER_TURN,
         turn_limit: TURN_LIMIT,
+        sandbox: false,
     };
     let outcome = run(&cfg, &MockBackend { seed: 3, wrong_rate: 0.0, shim: Some(bin()) }).expect("the run");
 
@@ -198,6 +199,7 @@ fn a_run_refuses_a_directory_that_exists() {
         trace: false,
         calls_per_turn: CALLS_PER_TURN,
         turn_limit: TURN_LIMIT,
+        sandbox: false,
     };
     let err = run(&cfg, &MockBackend { seed: 1, wrong_rate: 0.0, shim: None }).err().expect("refused");
     assert!(err.contains("already exists"));
@@ -246,6 +248,7 @@ fn config(dir: &Path, agents: usize, turns: u32) -> RunConfig {
         trace: false,
         calls_per_turn: CALLS_PER_TURN,
         turn_limit: TURN_LIMIT,
+        sandbox: false,
     }
 }
 
@@ -322,6 +325,7 @@ fn a_crdt_mode_mock_run_goes_end_to_end_through_the_shim() {
         trace: false,
         calls_per_turn: CALLS_PER_TURN,
         turn_limit: TURN_LIMIT,
+        sandbox: false,
     };
     let outcome = run(&cfg, &MockBackend { seed: 5, wrong_rate: 0.0, shim: Some(bin()) }).expect("the run");
     assert_eq!(outcome.released_after, Some(4));

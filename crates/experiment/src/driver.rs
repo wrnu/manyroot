@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::mode::{Mode, Session, StoreConfig, SyncKind, ToolSpec, mode_named};
+use crate::sandbox::{Git, Sandbox, WorkerPaths};
 use crate::worker::{Lines, Request, Worker};
 
 /// Turns used, as a share of all turns, before the change requests are released (design section 1).
@@ -50,6 +51,8 @@ pub struct RunConfig {
     /// The `bracken-experiment` binary, for workers.
     pub worker_bin: PathBuf,
     pub bracken: PathBuf,
+    /// Run each worker under its `sandbox-exec` profile: the tools profile for a copy, the hub profile for the hub.
+    pub sandbox: bool,
     /// The real `git` binary, by absolute path (see [`git_binary`]).
     pub git: PathBuf,
     /// Tests only: workers record every command git starts.
@@ -81,6 +84,11 @@ impl RunConfig {
 pub trait Backend: Sync {
     /// Plays one turn, talking MCP to the driver over `socket`.
     fn turn(&self, agent: usize, name: &str, turn: u32, socket: &Path) -> Result<(), String>;
+
+    /// Why the whole run must stop, once it must (a failed gate, a cap breach): no agent starts another turn.
+    fn halted(&self) -> Option<String> {
+        None
+    }
 }
 
 pub struct Outcome {
@@ -179,13 +187,34 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         trace: cfg.trace,
     };
 
-    let mut hub = Worker::spawn(&cfg.worker_bin, mode.name(), &store(root.join("hub"), "setter"))?;
+    let sockets = root.join("sockets");
+    // Only Git mode's workers may run git: its binary and the helpers in its exec path.
+    let git = match (mode.name(), cfg.git.parent()) {
+        ("git", Some(exec_path)) => Some(Git { binary: cfg.git.clone(), exec_path: exec_path.to_path_buf() }),
+        ("git", None) => return Err("git's binary has no directory".into()),
+        _ => None,
+    };
+    let profile = |dir: &Path, sockets: &[PathBuf], hub: bool| -> Result<Option<Sandbox>, String> {
+        if !cfg.sandbox {
+            return Ok(None);
+        }
+        make_dir(dir)?;
+        let paths =
+            WorkerPaths { store: dir, worker: &cfg.worker_bin, bracken: &cfg.bracken, git: git.as_ref(), sockets };
+        if hub { Sandbox::hub(&paths).map(Some) } else { Sandbox::tools(&paths).map(Some) }
+    };
+    let hub_sockets: Vec<PathBuf> = (0..cfg.agents).map(|i| sockets.join(format!("h{i}.sock"))).collect();
+    let hub_profile = profile(&root.join("hub"), &hub_sockets, true)?;
+    let hub_store = store(root.join("hub"), "setter");
+    let mut hub = Worker::spawn_in(&cfg.worker_bin, mode.name(), &hub_store, hub_profile.as_ref())?;
     hub.ok(&Request { op: "setup".into(), ..Request::default() })?;
     let seed = Worker::bytes(&hub.ok(&Request { op: "export".into(), ..Request::default() })?)?;
     let names: Vec<String> = (0..cfg.agents).map(|i| format!("agent-{i}")).collect();
     let (mut copies, mut peers) = (Vec::new(), Vec::new());
-    for name in &names {
-        let mut w = Worker::spawn(&cfg.worker_bin, mode.name(), &store(root.join("agents").join(name), name))?;
+    for (i, name) in names.iter().enumerate() {
+        let dir = root.join("agents").join(name);
+        let copy_profile = profile(&dir, &[sockets.join(format!("c{i}.sock"))], false)?;
+        let mut w = Worker::spawn_in(&cfg.worker_bin, mode.name(), &store(dir, name), copy_profile.as_ref())?;
         let reply = w.ok(&Request { op: "setup".into(), bytes: Some(hex::encode(&seed)), ..Request::default() })?;
         if let Some(key) = reply.result["key"].as_str() {
             peers.push(key.to_string());
@@ -204,7 +233,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         copies,
         names,
         peers,
-        sockets: root.join("sockets"),
+        sockets,
         tools,
         turns_done: AtomicU32::new(0),
         released_after: Mutex::new(None),
@@ -221,6 +250,10 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     for r in results {
         r?;
     }
+    if let Some(why) = backend.halted() {
+        run.events.log(None, "run_stopped", json!({"bytes": why.len(), "digest": digest(why.as_bytes())}));
+        return Err(format!("the run stopped: {why}"));
+    }
     let reply = run.hub().ok(&Request { op: "integrated".into(), ..Request::default() })?;
     let modules: Vec<(String, String)> = serde_json::from_value(reply.result).map_err(|e| e.to_string())?;
     run.events.log(None, "integrated", json!({"modules": modules.iter().map(|(m, t)| json!({"module": m, "bytes": t.len(), "digest": digest(t.as_bytes())})).collect::<Vec<_>>()}));
@@ -232,7 +265,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
 }
 
 /// Tools every mode has, which the core serves.
-fn core_tools() -> Vec<ToolSpec> {
+pub fn core_tools() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "sync",
@@ -265,6 +298,9 @@ impl Run<'_> {
         let name = &self.names[i];
         let socket = root.join("sockets").join(format!("a{i}.sock"));
         for turn in 1..=self.cfg.turns {
+            if backend.halted().is_some() {
+                break;
+            }
             self.events.log(Some(name), "turn_start", json!({"turn": turn}));
             let played = self.sync(i).and_then(|_| self.serve_turn(i, turn, &socket, backend));
             let ended = self.sync(i);

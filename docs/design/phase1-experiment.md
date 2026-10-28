@@ -522,11 +522,12 @@ answered with another call's reply.
   --setting-sources "" --settings <turn config>/settings.json \
   --permission-mode dontAsk \
   --no-session-persistence \
-  --output-format stream-json --verbose
+  --output-format stream-json --verbose \
+  --max-budget-usd <per-turn stop> < /dev/null
 ```
 
-Its environment is exactly: `HOME`, `CLAUDE_CONFIG_DIR` and `TMPDIR`
-pointing into the agent's own directory, a minimal `PATH`, `HTTPS_PROXY`
+Its environment is exactly: `HOME`, `CLAUDE_CONFIG_DIR`, `TMPDIR` and
+`CLAUDE_CODE_TMPDIR` pointing into the agent's own directory, a minimal `PATH`, `HTTPS_PROXY`
 pointing at the driver's local proxy, the setting that turns off
 non-essential traffic, and the owner's routing entries
 (`ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`,
@@ -539,6 +540,12 @@ nothing bypassed and no second login.
 - `--tools ""` switches off every built-in tool (shell, files, web, agents),
   and `--strict-mcp-config` loads no MCP server but the shim, so the model's
   only tools are the mode's.
+- Three traps found by probing the pinned binary (note `24aa40160488`):
+  `sandbox-exec` matches resolved paths, so every path a profile names is
+  resolved first (`/tmp/x` is `/private/tmp/x` to the kernel); Claude Code
+  writes `/tmp/claude-<uid>` whatever `TMPDIR` says, unless
+  `CLAUDE_CODE_TMPDIR` points elsewhere; and with a standard input that
+  isn't closed it waits for input first, so it gets `/dev/null`.
 - `--setting-sources ""` and the agent's own `CLAUDE_CONFIG_DIR` and `HOME`
   load none of the owner's Claude Code settings: no hooks (the owner's
   settings set four kinds), no model or attribution settings, no user
@@ -556,7 +563,7 @@ nothing bypassed and no second login.
   hashes against the plan before every turn.
 - The **binary is pinned**: the plan records the real path of the versioned
   Claude Code binary (not the package manager's `latest` link) and its
-  SHA-256, and the driver checks both before every turn, so an upgrade
+  blake3 hash (the workspace's hash; no new crate for SHA-256), and the driver checks both before every turn, so an upgrade
   during a run stops the run rather than changing it.
 
 **The gate.** Before the model's first move, the driver reads Claude Code's
@@ -565,7 +572,9 @@ pinned `claude_code_version`; the planned model; permission mode `dontAsk`;
 no built-in tools and exactly the mode's tools; the shim as the only MCP
 server; skills and plugins equal to the bundled list recorded in the plan; a
 memory path inside the agent's directory; and the expected credential source
-(the auth token from the environment). The shim separately refuses to start
+(the auth token from the environment, which Claude Code reports as
+`apiKeySource: none`). Claude Code's per-content-block `assistant` events
+come after it. The shim separately refuses to start
 with any environment variable set.
 
 ### Arguments
@@ -675,7 +684,7 @@ The layers, each of which holds if another fails:
    denies everything else:
    - **agent profile** (Claude Code and the shim): no reads of the owner's
      home outside the agent's directory, of any repository, `~/.ssh` or the
-     team's Ground; no keychain service; no process started but the shim
+     team's Ground; no mach service at all, so no keychain; no process started but the shim
      (through `/usr/bin/env`); outbound connections only to the driver's
      local proxy port and the shim's socket;
    - **tools profile**: reads and writes only its agent's copy; runs only
@@ -884,10 +893,18 @@ Each layer stops a run's use on its own:
 1. **Per call:** Claude Code's own output limit per response.
 2. **Per turn:** 25 tool calls (counted by the driver, which refuses the
    26th), 150,000 tokens of context, 10 minutes. The driver ends the process
-   at any of them. If Claude Code's `--max-budget-usd` applies when it runs
-   through the proxy (step 6 checks), it is set as a further per-turn stop
-   at about twice a turn's expected use; it counts Claude Code's
-   API-equivalent estimate, not money spent.
+   at any of them. The tool-call count is taken from the event stream (the
+   `tool_use` blocks); the driver's MCP server separately refuses the 26th
+   call. Claude Code's `--max-budget-usd` does apply through a gateway base
+   URL (step 6 checked it against a fake endpoint: it stopped the turn after
+   the first call that crossed the limit), so it is set on every turn at
+   about twice a turn's expected use: 1 USD. At the price Claude Code
+   applied to claude-opus-5-5 in that probe (about 4 USD per million input
+   and 20 per million output tokens; cache reads taken at a tenth of
+   input), the expected turn above (195,000 cache reads, 30,000 new input,
+   15,000 output) is about 0.5 USD. The calibration run re-checks it. It counts Claude Code's
+   API-equivalent estimate, not money spent, and it is the in-turn stop on
+   output, which the driver only learns at the turn's end (below).
 3. **Per agent:** 3 million tokens and 180,000 output tokens, equal in every
    mode (about 1.5 times the estimate). An agent that reaches either stops.
 4. **Per run:** the announced use (pilot: 75 million tokens, 5 million
@@ -900,17 +917,30 @@ Each layer stops a run's use on its own:
 
 - **Missing usage is a breach.** An assistant message or `result` event
   without a usage record the driver can parse (a field missing, renamed or
-  not a number, a truncated stream, a turn that ends without a `result`
-  event) stops the run, as a cap breach would. Nothing is ever counted as 0
+  not a number, a `result` without usage per model, a line that isn't JSON)
+  stops the run, as a cap breach would. Nothing is ever counted as 0
   because it couldn't be read.
+- **Output comes from the `result` event.** Claude Code's `assistant`
+  events repeat the usage of the response's start, whose output is a stub
+  (1), and even its re-emitted `message_delta` shows that stub; only the
+  `result` event has the true output (note `24aa40160488`). So the stream's
+  output is a lower bound while the turn runs, and the result's is counted.
+  A turn that ends without a readable `result` event (ended at a cap,
+  crashed, cut off) is counted at the larger of its output cap, 30,000
+  tokens (twice a turn's expected output of 15,000), and what the stream
+  already counted, never less (decisions `e753d794dd1d`, `312e385f673c`).
 - **Totals count the larger figure.** The `result` event's usage per model
   (which includes any model calls Claude Code makes besides the agent's own)
   is added up and compared with the sum of the per-message usage; the turn
-  counts whichever is larger, and a gap of more than 10% stops the run.
+  counts whichever is larger, field by field. A gap of more than 10% on the
+  input side (input, cache reads and cache writes, where both figures are
+  exact) stops the run.
 - **Agents die with the driver.** Each Claude Code process starts in its own
   process group, which the driver kills on every exit path (normal end,
-  error, panic, signal). If the driver dies without doing so, two things
-  still stop the agents: the shim and the tool workers refuse every call
+  error, panic, signal). The group's leader is a small guard process,
+  `bracken-experiment guard`, holding a pipe from the driver: if the driver
+  dies, even by `SIGKILL`, the pipe closes and the guard kills the group.
+  Two more things still stop the agents: the shim and the tool workers refuse every call
   once the driver's socket closes, and the forwarding proxy, which is part
   of the driver, is gone, so Claude Code can't reach the model at all.
   Step 6 tests this by killing the driver mid-turn and checking that no

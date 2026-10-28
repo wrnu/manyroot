@@ -6,7 +6,8 @@
 //! `docs/design/phase1-experiment.md`); step 2 is the core (the [`driver`],
 //! its [`worker`]s, the [`shim`] and the [`mock`] backend) and Bracken mode
 //! ([`bracken_mode`]); step 3 is Git mode ([`git_mode`]); step 4 is CRDT mode
-//! ([`crdt_mode`]), on Automerge; all behind the same [`mode`] interface.
+//! ([`crdt_mode`]), on Automerge; all behind the same [`mode`] interface. Step 6
+//! is the [`claude`] backend, with its [`sandbox`] profiles and forwarding [`proxy`].
 //!
 //! What an agent may see goes through [`task`] only: the language, the specs,
 //! the change requests, the public cases and the public check. [`grader`]
@@ -16,6 +17,7 @@
 pub mod args;
 pub mod bracken_mode;
 pub mod candidates;
+pub mod claude;
 pub mod crdt_mode;
 pub mod driver;
 pub mod git_mode;
@@ -23,6 +25,8 @@ pub mod grader;
 pub mod lang;
 pub mod mock;
 pub mod mode;
+pub mod proxy;
+pub mod sandbox;
 pub mod shim;
 pub mod task;
 pub mod worker;
