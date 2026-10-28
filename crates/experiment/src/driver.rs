@@ -35,6 +35,10 @@ pub const CALLS_PER_TURN: u32 = 25;
 pub const CONTRIBUTIONS_PER_CALL: u64 = 9;
 /// The most bytes one contribution can hold: the largest free text and its envelope.
 pub const BYTES_PER_CONTRIBUTION: u64 = crate::args::MAX_TEXT as u64 + 4096;
+/// The most characters of one tool result an agent is shown, in every mode (decision `74d00180c642`):
+/// below Claude Code's own tool-result limit, about 50,000 characters, with room for the note
+/// [`bounded`] adds, so Claude Code never cuts a result itself.
+pub const MAX_RESULT_CHARS: usize = 40_000;
 /// The longest MCP message the driver reads from an agent.
 pub const MAX_MCP_LINE: usize = 256 * 1024;
 /// How long the driver waits for both ends of a sync session to connect.
@@ -435,6 +439,8 @@ impl Run<'_> {
         let mut line = String::new();
         let name = &self.names[i];
         let mut calls = 0;
+        // Past the cap, one notes_write still runs, so a turn at the cap can keep its notes (decision `74d00180c642`).
+        let mut noted_past_cap = false;
         while lines.next_line(&mut line)? {
             let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                 self.events.log(Some(name), "bad_message", json!({"turn": turn, "bytes": line.len()}));
@@ -448,9 +454,17 @@ impl Run<'_> {
                     "serverInfo": {"name": "experiment", "version": env!("CARGO_PKG_VERSION")},
                 }}),
                 "tools/list" => json!({"result": {"tools": self.tools}}),
+                "tools/call"
+                    if calls >= self.cfg.calls_per_turn
+                        && !noted_past_cap
+                        && msg["params"]["name"] == "notes_write" =>
+                {
+                    noted_past_cap = true;
+                    json!({"result": self.call(i, turn, &msg["params"])})
+                }
                 "tools/call" if calls >= self.cfg.calls_per_turn => {
                     self.events.log(Some(name), "call_refused", json!({"turn": turn, "calls": calls}));
-                    let text = "This turn's tool calls are used up: no more will run this turn. Finish now: stop and end your turn.";
+                    let text = "This turn's tool calls are used up: no more will run this turn, except one notes_write. Finish now: save your notes if you haven't, then stop and end your turn.";
                     json!({"result": {"content": [{"type": "text", "text": text}], "isError": true}})
                 }
                 "tools/call" => {
@@ -516,16 +530,32 @@ impl Run<'_> {
             Ok(v) => (v.to_string(), false),
             Err(e) => (e.clone(), true),
         };
+        let (text, cut_from) = bounded(text);
         self.events.log(
             Some(name),
             "tool_result",
-            json!({"turn": turn, "tool": shown, "ok": !is_error, "bytes": text.len(), "digest": digest(text.as_bytes()), "record": record}),
+            json!({"turn": turn, "tool": shown, "ok": !is_error, "bytes": text.len(), "digest": digest(text.as_bytes()), "cut_from": cut_from, "record": record}),
         );
         json!({"content": [{"type": "text", "text": text}], "isError": is_error})
     }
 }
 
 /// Every string in `v`, at any depth.
+/// `text` cut to [`MAX_RESULT_CHARS`] characters, with a note saying so and how to see more, and the
+/// length it had if it was cut. The same for every tool in every mode: no result is cut silently.
+pub fn bounded(text: String) -> (String, Option<usize>) {
+    let chars = text.chars().count();
+    if chars <= MAX_RESULT_CHARS {
+        return (text, None);
+    }
+    let kept: String = text.chars().take(MAX_RESULT_CHARS).collect();
+    let note = format!(
+        "\n[Cut: this result has {chars} characters and only the first {MAX_RESULT_CHARS} are shown. To see the \
+         rest, narrow the call: one file, function or item, a line range or a smaller count, where the tool takes one.]"
+    );
+    (kept + &note, Some(chars))
+}
+
 fn strings(v: &Value) -> Box<dyn Iterator<Item = &str> + '_> {
     match v {
         Value::String(s) => Box::new(std::iter::once(s.as_str())),

@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use bracken_experiment::claude::{Caps, ClaudeBackend, ClaudeConfig, Expect, Pin, RUN_TIME_CAP, Routing, Tokens};
-use bracken_experiment::driver::{Backend, CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
+use bracken_experiment::driver::{
+    Backend, CALLS_PER_TURN, MAX_RESULT_CHARS, RunConfig, TURN_LIMIT, core_tools, git_binary, run,
+};
 use bracken_experiment::mode::mode_named;
 use bracken_experiment::plan::{PlanInputs, report};
 use bracken_experiment::proxy::Attempt;
@@ -65,7 +67,11 @@ fn routing() -> Routing {
 }
 
 fn tools() -> Vec<String> {
-    let mode = mode_named("bracken").expect("Bracken mode");
+    tools_of("bracken")
+}
+
+fn tools_of(mode: &str) -> Vec<String> {
+    let mode = mode_named(mode).expect("a mode");
     mode.tools().into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect()
 }
 
@@ -130,6 +136,10 @@ impl Setup {
     }
 
     fn backend_with(&self, script: &str, caps: Caps, pin: Pin) -> ClaudeBackend {
+        self.backend_in("bracken", script, caps, pin)
+    }
+
+    fn backend_in(&self, mode: &str, script: &str, caps: Caps, pin: Pin) -> ClaudeBackend {
         ClaudeBackend::new(ClaudeConfig {
             pin,
             expect: Expect::pinned_2_1_311("claude-opus-5-5"),
@@ -139,7 +149,7 @@ impl Setup {
             shim: bin(),
             prompt: script.to_string(),
             turns: 8,
-            tools: tools(),
+            tools: tools_of(mode),
             upstream: Some(self.endpoint.addr),
         })
         .expect("the backend")
@@ -632,6 +642,90 @@ fn an_agent_whose_turns_end_softly_at_the_cap_gets_all_its_turns() {
     assert_eq!(turn_error_for(&s, &events_path), 8, "6 hard stops and 2 turns refused for spent tokens");
     assert!(s.transcript("agent-0", 7).is_none());
     assert_eq!(backend.totals("agent-0").0.output, 180_000);
+}
+
+/// Decision `74d00180c642`: past the cap, one notes_write still runs and is saved; a second, and
+/// any other tool, is refused.
+#[test]
+fn one_notes_write_runs_past_the_cap_and_no_other_call() {
+    let s = Setup::new();
+    let script = calls(3, 0)
+        + "call notes_write {\"text\":\"kept past the cap\"}\n"
+        + "call notes_write {\"text\":\"a second note\"}\n"
+        + "call notes_read {}\n"
+        + "result 10";
+    let backend = s.backend(&script, Caps { calls_per_turn: 3, ..caps() });
+    let events_path = s.run_calls_for(&backend, 3, 2).expect("the run");
+    assert_eq!(turn_error_for(&s, &events_path), 0, "each turn ended itself");
+    let log = events(&events_path);
+    let tools = |turn: u64| -> Vec<String> {
+        log.iter()
+            .filter(|e| e["event"] == "tool_call" && e["data"]["turn"] == turn)
+            .map(|e| e["data"]["tool"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    for turn in [1, 2] {
+        assert_eq!(tools(turn), ["`notes_read`", "`notes_read`", "`notes_read`", "`notes_write`"], "turn {turn}");
+    }
+    assert_eq!(count(&events_path, "call_refused"), 4, "the second notes_write and the notes_read, each turn");
+    let first = s.transcript("agent-0", 1).expect("a transcript");
+    assert_eq!(first.matches("tool calls are used up").count(), 2, "both refusals told the agent");
+    // The note written past the cap is the one the next turn reads.
+    let second = s.transcript("agent-0", 2).expect("a transcript");
+    let read = |note: &str| format!(r#"{{\"notes\":\"{note}\"}}"#);
+    assert!(second.contains(&read("kept past the cap")) && !second.contains(&read("a second note")), "{second}");
+    assert_eq!(backend.totals("agent-0").0.output, 20, "real output, counted from each turn's result");
+}
+
+#[test]
+fn bounded_cuts_at_the_limit_in_characters_and_says_so() {
+    use bracken_experiment::driver::bounded;
+    let at = "é".repeat(MAX_RESULT_CHARS);
+    assert_eq!(bounded(at.clone()), (at.clone(), None), "at the limit, untouched");
+    let (text, cut) = bounded(at.clone() + "ab");
+    assert_eq!(cut, Some(MAX_RESULT_CHARS + 2));
+    assert!(text.starts_with(&at), "the first {MAX_RESULT_CHARS} characters, whole");
+    let note = &text[at.len()..];
+    assert!(note.starts_with("\n[Cut: this result has 40002 characters") && note.contains("narrow the call"), "{note}");
+    assert!(note.chars().count() < 300);
+}
+
+/// A script that makes one result over [`MAX_RESULT_CHARS`] in `mode`, then a result event.
+fn oversized(mode: &str) -> String {
+    let big = |n: usize| "x".repeat(n);
+    let moves = match mode {
+        "bracken" => (0..3)
+            .map(|i| format!("call claim {}\n", json!({"statement": format!("{i} {}", big(15_000)), "tags": ["note"]})))
+            .chain(["call log {}\n".to_string()])
+            .collect::<String>(),
+        _ => (0..3)
+            .map(|_| format!("call edit {}\n", json!({"file": "shape.stk", "start": 1, "end": 0, "text": big(15_000)})))
+            .chain(["call read {\"file\":\"shape.stk\"}\n".to_string()])
+            .collect::<String>(),
+    };
+    moves + "result 10"
+}
+
+#[test]
+fn an_oversized_result_comes_back_bounded_with_a_note_in_every_mode() {
+    for mode in ["bracken", "git", "crdt"] {
+        let s = Setup::new();
+        let backend = s.backend_in(mode, &oversized(mode), caps(), Pin::of(&fake(), "2.1.311").expect("pin"));
+        let cfg = run_config(s.dir.join("run"), mode, 1, 1, true);
+        let events_path = run(&cfg, &backend).expect("the run").events;
+        assert_eq!(turn_error_for(&s, &events_path), 0, "{mode}");
+        let log = events(&events_path);
+        let results: Vec<&Value> = log.iter().filter(|e| e["event"] == "tool_result").map(|e| &e["data"]).collect();
+        assert!(results[..3].iter().all(|r| r["ok"] == true && r["cut_from"].is_null()), "{mode}: {results:?}");
+        let last = results[3];
+        let cut = last["cut_from"].as_u64().expect("the read was cut") as usize;
+        assert!(cut > MAX_RESULT_CHARS, "{mode}");
+        let shown = last["bytes"].as_u64().expect("bytes") as usize;
+        assert!(shown < MAX_RESULT_CHARS + 400, "{mode}: {shown} bytes shown");
+        let transcript = s.transcript("agent-0", 1).expect("a transcript");
+        let note = format!("[Cut: this result has {cut} characters and only the first {MAX_RESULT_CHARS} are shown.");
+        assert!(transcript.contains(&note), "{mode}: the agent is told, and how to narrow the call");
+    }
 }
 
 #[test]
