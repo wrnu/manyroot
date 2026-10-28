@@ -75,10 +75,10 @@ fn caps() -> Caps {
 
 /// For tests that a cap ends a turn or run early: the fake sleeps this long (10 minutes, in its
 /// milliseconds) under a turn cap as long, so nothing else ends it, and the test allows
-/// [`EARLY`], generous for a loaded machine and still far short of the sleep.
+/// [`EARLY`], generous for a loaded machine (several cargo builds at once) and still half the sleep.
 const SLEEP: &str = "sleep 600000";
 const LONG_TURN: Duration = Duration::from_secs(600);
-const EARLY: Duration = Duration::from_secs(60);
+const EARLY: Duration = Duration::from_secs(300);
 
 /// A local stand-in for the LLM proxy: records the first bytes of every connection.
 struct Endpoint {
@@ -786,15 +786,24 @@ fn token_caps_act_while_a_turn_streams() {
 
 #[test]
 fn the_run_time_cap_stops_the_run() {
-    let s = Setup::new();
-    // Long enough that the first turn starts after the run's setup, so the check while a turn streams
-    // is the one that acts, not the check before each turn.
-    let caps = Caps { run_time: Duration::from_secs(10), turn_time: LONG_TURN, ..caps() };
-    let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), caps.clone());
-    let start = Instant::now();
-    let err = s.run(&backend, 2, 2).expect_err("the run stops");
-    assert!(err.contains("time cap") && start.elapsed() < EARLY, "{err}");
-    assert!(s.transcript("agent-0", 1).is_some(), "the cap acted while a turn ran, not before one started");
+    // The cap must run out while a turn streams, so the check during a turn is the one that acts,
+    // not the check before each turn. On a loaded machine the run's setup alone can take longer
+    // than the cap, and then the check before the first turn stops the run, also rightly; so try
+    // a longer cap until a turn has started before it runs out.
+    let mut acted = None;
+    for secs in [10, 30, 90] {
+        let s = Setup::new();
+        let caps = Caps { run_time: Duration::from_secs(secs), turn_time: LONG_TURN, ..caps() };
+        let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), caps.clone());
+        let start = Instant::now();
+        let err = s.run(&backend, 2, 2).expect_err("the run stops");
+        assert!(err.contains("time cap") && start.elapsed() < caps.run_time + EARLY, "{err}");
+        if s.transcript("agent-0", 1).is_some() {
+            acted = Some((s, caps));
+            break;
+        }
+    }
+    let (s, caps) = acted.expect("the cap acted while a turn ran, not only before one started");
 
     // The driver names the cap, so the report measures the run if the plan expects that stop, and not otherwise.
     let usage = s.dir.join("claude/usage.jsonl");
