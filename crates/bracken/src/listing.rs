@@ -78,20 +78,6 @@ pub fn compact_text(body: &Body, summary: String) -> String {
     }
 }
 
-/// `text` with every character that could move the cursor, break the line or reorder what a terminal
-/// shows written as a visible escape (`\u{1b}`): control characters (C0, DEL and C1, so CR, ESC, VT, FF,
-/// NEL and newline too), the line and paragraph separators, and the bidirectional overrides and isolates.
-/// Other agents write the text a log prints, so none of it may forge or hide a line.
-pub fn printable(text: &str) -> String {
-    let unsafe_char = |c: char| {
-        c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
-    };
-    if !text.chars().any(unsafe_char) {
-        return text.to_owned();
-    }
-    text.chars().map(|c| if unsafe_char(c) { format!("\\u{{{:x}}}", c as u32) } else { c.to_string() }).collect()
-}
-
 /// `line`, cut to `COMPACT_LINE_CHARS` characters (chars, not display columns), ending in "…" when cut.
 pub fn cap_line(line: String) -> String {
     match line.char_indices().nth(COMPACT_LINE_CHARS - 1) {
@@ -115,15 +101,6 @@ mod tests {
         assert_eq!((p[&a].as_str(), p[&b].as_str(), p[&c].as_str()), ("abcdef0123", "abcdef0124", "12000000"));
         // Alone, the same id needs only the minimum.
         assert_eq!(unique_prefixes([a], 8)[&a], "abcdef01");
-    }
-
-    #[test]
-    fn printable_escapes_what_could_forge_a_line() {
-        assert_eq!(printable("plain é 文"), "plain é 文");
-        assert_eq!(
-            printable("a\rb\x1b[2Kc\u{85}d\u{2028}e\u{202e}f\n"),
-            "a\\u{d}b\\u{1b}[2Kc\\u{85}d\\u{2028}e\\u{202e}f\\u{a}"
-        );
     }
 
     #[test]

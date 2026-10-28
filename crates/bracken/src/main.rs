@@ -20,6 +20,7 @@ use serde_json::{Value, json};
 mod listing;
 mod remote;
 mod serve;
+mod terminal;
 mod wire;
 
 /// `println!`, through [`write_stdout`]. Shadows the standard macro in this file.
@@ -97,6 +98,10 @@ enum Command {
         name: Option<String>,
         #[arg(long, default_value = "application/octet-stream")]
         media_type: String,
+        /// The claim (or other contribution) this artifact implements: records the implements relation
+        /// too, signed by the same identity.
+        #[arg(long, value_name = "ID")]
+        implements: Option<String>,
     },
     /// Relate two contributions, e.g. `bracken relate <a> supersedes <b>`.
     Relate {
@@ -183,6 +188,17 @@ enum Command {
     },
     /// The accepted layer under a validation policy, and its conflicts.
     Accepted {
+        #[command(flatten)]
+        policy: PolicyArgs,
+        #[command(flatten)]
+        out: Output,
+    },
+    /// For each current claim that something implements, what implements it: which one the policy
+    /// accepts, and which are still waiting for an independent pass (listed first).
+    Status {
+        /// Also list the current claims that nothing implements, at the end.
+        #[arg(long)]
+        all: bool,
         #[command(flatten)]
         policy: PolicyArgs,
         #[command(flatten)]
@@ -361,11 +377,31 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 println!("{id}");
             }
         }
-        Command::Artifact { file, name, media_type } => {
+        Command::Artifact { file, name, media_type, implements } => {
             let who = signer(&s, agent)?;
+            // Resolved first, so an unknown id writes nothing.
+            let target = implements.as_deref().map(|id| resolve(&s, id)).transpose()?;
             let content = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             let name = name.unwrap_or_else(|| file.display().to_string());
-            println!("{}", contribute(&mut s, &who, Body::Artifact { name, media_type, content })?);
+            let artifact = contribute(&mut s, &who, Body::Artifact { name, media_type, content })?;
+            println!("{artifact}");
+            if let Some(to) = target {
+                let relation =
+                    Body::Relation { from: artifact, kind: RelationKind::Implements, to, note: String::new() };
+                match contribute(&mut s, &who, relation) {
+                    Ok(id) => println!("{id}"),
+                    // The artifact stays: the Ground is append-only. Its id is printed above.
+                    Err(e) => {
+                        eprintln!(
+                            "bracken: artifact {artifact} was recorded, but its implements relation to {to} couldn't be: \
+                             {e:#}; relate it with `bracken relate {} implements {}`",
+                            artifact.short(),
+                            to.short()
+                        );
+                        return Ok(decide(false));
+                    }
+                }
+            }
         }
         Command::Relate { from, kind, to, note } => {
             let who = signer(&s, agent)?;
@@ -525,6 +561,7 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 }
             }
         }
+        Command::Status { all, policy, out } => print_status(&s, all, &policy, out.json)?,
         Command::Sync { exec: Some(program), confirm, bounds, .. } => {
             return sync_remote(&mut s, confirm, |s| remote::sync_exec(s, &program, bounds.bounds()));
         }
@@ -743,6 +780,133 @@ fn own_claim(s: &Store, names: &Names, who: &Identity, prefix: &str) -> Result<C
     Ok(id)
 }
 
+/// `status`: each current claim that something implements, with what implements it and how the policy
+/// assesses each, waiting ones first; with `all`, then the current claims nothing implements. A
+/// contribution implements a claim through a current `implements` relation from it to the claim,
+/// whoever wrote the relation, and whatever kind of contribution it is.
+fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Result<()> {
+    let names = Names::load(s)?;
+    let policy = policy.build(&names)?;
+    let g = s.graph();
+    let order = g.topo_order();
+    let view = CurrentView::new(g, &order);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let rank = |status: Status| match status {
+        Status::Pending => 0,
+        Status::Accepted => 1,
+        Status::Superseded => 2,
+        Status::Rejected => 3,
+        Status::Retracted => 4,
+    };
+    let mut implemented: Vec<(&Contribution, Vec<(&Contribution, Assessment)>)> = Vec::new();
+    let mut unimplemented: Vec<&Contribution> = Vec::new();
+    for id in &order {
+        let c = g.get(id).expect("ordered ids exist");
+        if view.hidden.contains(id) || !matches!(c.body(), Body::Claim { .. }) {
+            continue;
+        }
+        let mut by: Vec<ContributionId> = g
+            .referrers(id)
+            .filter(|r| !view.hidden.contains(&r.id()))
+            .filter_map(|r| match r.body() {
+                Body::Relation { from, kind: RelationKind::Implements, to, .. } if to == id => Some(*from),
+                _ => None,
+            })
+            .filter(|from| !view.hidden.contains(from))
+            .collect();
+        by.sort();
+        by.dedup();
+        let mut rows: Vec<(&Contribution, Assessment)> =
+            by.iter().filter_map(|i| Some((g.get(i).expect("related ids exist"), policy.assess(g, i)?))).collect();
+        if rows.is_empty() {
+            if all {
+                unimplemented.push(c);
+            }
+            continue;
+        }
+        rows.sort_by_key(|(i, a)| (rank(a.status), i.content().timestamp_ms));
+        implemented.push((c, rows));
+    }
+    // Claims with something waiting first; otherwise in causal order (the sort is stable).
+    implemented.sort_by_key(|(_, rows)| rows.iter().all(|(_, a)| a.status != Status::Pending));
+
+    let age_ms = |c: &Contribution| now.saturating_sub(c.content().timestamp_ms);
+    // Distinct validators with a counted pass, as the policy counts them: one validator passing twice is one.
+    let independent =
+        |a: &Assessment| a.passes.iter().filter_map(|e| g.get(e)).map(|e| e.author()).collect::<HashSet<_>>().len();
+    if json_out {
+        let claims: Vec<Value> = implemented
+            .iter()
+            .map(|(c, rows)| {
+                let by: Vec<Value> = rows
+                    .iter()
+                    .map(|(i, a)| {
+                        let mut v = contribution_json(g, &names, i);
+                        v["assessment"] = json!(a);
+                        v["waiting"] = json!(a.status == Status::Pending);
+                        v["independent_passes"] = json!(independent(a));
+                        v["age_ms"] = json!(age_ms(i));
+                        v
+                    })
+                    .collect();
+                json!({"claim": contribution_json(g, &names, c), "implemented_by": by})
+            })
+            .collect();
+        let unimplemented: Vec<Value> = unimplemented.iter().map(|c| contribution_json(g, &names, c)).collect();
+        print_json(&json!({"min_passes": policy.min_passes, "claims": claims, "unimplemented": unimplemented}));
+        return Ok(());
+    }
+    if implemented.is_empty() {
+        println!("no current claim is implemented by anything");
+    }
+    for (n, (c, rows)) in implemented.iter().enumerate() {
+        if n > 0 {
+            println!();
+        }
+        // Other agents' text is printed escaped, so it can't forge lines (finding 252f052a283d).
+        println!("{}", terminal::printable(&line(g, &names, c)));
+        for (i, a) in rows {
+            let label = match a.status {
+                Status::Pending => "waiting",
+                Status::Accepted => "accepted",
+                Status::Superseded => "superseded",
+                Status::Rejected => "rejected",
+                Status::Retracted => "retracted",
+            };
+            let row = format!(
+                "  {label:<10}  {}  {:<8}  {:<12}  {:>4} ago  {}/{} passes  {}",
+                i.id().short(),
+                i.body().kind(),
+                names.display(&i.author()),
+                age(age_ms(i)),
+                independent(a),
+                policy.min_passes,
+                summary(g, i)
+            );
+            println!("{}", terminal::printable(&row));
+        }
+    }
+    if !unimplemented.is_empty() {
+        println!();
+        println!("nothing implements:");
+        for c in &unimplemented {
+            println!("{}", terminal::printable(&line(g, &names, c)));
+        }
+    }
+    Ok(())
+}
+
+/// A duration in milliseconds, in its largest whole unit: 45s, 12m, 3h, 2d.
+fn age(ms: u64) -> String {
+    let s = ms / 1000;
+    match s {
+        0..60 => format!("{s}s"),
+        60..3600 => format!("{}m", s / 60),
+        3600..86400 => format!("{}h", s / 3600),
+        _ => format!("{}d", s / 86400),
+    }
+}
+
 /// What `log --current` shows.
 struct CurrentView {
     /// Omitted: retracted contributions; claims and artifacts with a supersession that counts under
@@ -916,7 +1080,7 @@ fn line(g: &Graph, names: &Names, c: &Contribution) -> String {
         names.display(&c.author()),
         summary(g, c)
     );
-    listing::printable(&line)
+    terminal::printable(&line)
 }
 
 /// A contribution on one short line: its shortest unique prefix, author, kind and tags, and its text.
@@ -929,7 +1093,7 @@ fn compact_line(g: &Graph, names: &Names, prefixes: &HashMap<ContributionId, Str
     let text = listing::compact_text(c.body(), summary(g, c));
     let line =
         format!("{} {} {}{tags}{retracted} {text}", prefixes[&c.id()], names.display(&c.author()), c.body().kind());
-    listing::cap_line(listing::printable(&line))
+    listing::cap_line(terminal::printable(&line))
 }
 
 fn body_json(body: &Body) -> Value {
