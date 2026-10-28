@@ -41,8 +41,8 @@ bracken id new alice && bracken id new val
 export BRACKEN_AGENT=alice           # or pass --as on each command
 
 REQ=$(bracken claim "Sessions need bounded token lifetimes" --tag auth)
-IMPL=$(bracken artifact src/session.rs --media-type text/x-rust)
-bracken relate $IMPL implements $REQ
+# The artifact and its implements relation in one call; it prints both ids, the artifact's first.
+IMPL=$(bracken artifact src/session.rs --media-type text/x-rust --implements $REQ | head -1)
 bracken evidence $IMPL pass --method "cargo test" --as val
 
 bracken log                          # everything, in causal order
@@ -60,6 +60,8 @@ such as `\u{1b}`, so no contribution can forge or hide a line; `--json` escapes 
 ```sh
 bracken accepted                     # what the default policy accepts
 bracken accepted --min-passes 2 --validator val
+bracken status                       # per claim: what implements it, accepted or still waiting
+bracken status --all                 # plus the claims nothing implements yet
 bracken conflicts                    # divergences and contradictions
 bracken show $REQ --json             # every read command supports --json
 ```

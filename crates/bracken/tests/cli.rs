@@ -493,6 +493,192 @@ fn a_local_private_key_never_reaches_the_ground() {
     bracken(dir, &["claim", "Never commit a file with a secret_key field", "--as", "val"]);
 }
 
+/// `status` lists each current claim that something implements, with each implementer's assessment:
+/// waiting ones first, within a claim and across claims; implementers of any kind; only current
+/// relations and claims. `--all` adds the claims nothing implements; `--json` has the same content.
+#[test]
+fn status_shows_what_implements_each_claim_and_what_is_waiting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "status"]);
+    for who in ["alice", "bob", "val"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let artifact = |name: &str, who: &str| {
+        std::fs::write(dir.join("f"), name).unwrap();
+        bracken(dir, &["artifact", "f", "--name", name, "--as", who])
+    };
+    let implements = |from: &str, to: &str, who: &str| bracken(dir, &["relate", from, "implements", to, "--as", who]);
+    let pass = |id: &str| bracken(dir, &["evidence", id, "pass", "--method", "review", "--as", "val"]);
+
+    // done: implemented and accepted, nothing waiting; written first.
+    let done = bracken(dir, &["claim", "spec: done", "--as", "alice"]);
+    let finished = artifact("finished.rs", "bob");
+    implements(&finished, &done, "bob");
+    pass(&finished);
+    // A claim can implement a claim: nothing assumes code.
+    let note = bracken(dir, &["claim", "a written answer", "--as", "bob"]);
+    implements(&note, &done, "alice");
+    pass(&note);
+    // busy: one accepted, one waiting (its author's own pass doesn't count), one whose relation was retracted.
+    let busy = bracken(dir, &["claim", "spec: busy", "--as", "alice"]);
+    let accepted = artifact("accepted.rs", "bob");
+    implements(&accepted, &busy, "bob");
+    pass(&accepted);
+    let waiting = artifact("waiting.rs", "alice");
+    implements(&waiting, &busy, "alice");
+    bracken(dir, &["evidence", &waiting, "pass", "--method", "self", "--as", "alice"]);
+    let dropped = artifact("dropped.rs", "bob");
+    let link = implements(&dropped, &busy, "bob");
+    bracken(dir, &["retract", &link, "--as", "bob"]);
+    // A superseded claim isn't current, so what implements it isn't listed.
+    let old = bracken(dir, &["claim", "spec: old", "--as", "alice"]);
+    implements(&artifact("old.rs", "bob"), &old, "bob");
+    bracken(dir, &["claim", "spec: new", "--supersedes", &old, "--as", "alice"]);
+    let idle = bracken(dir, &["claim", "spec: nobody yet", "--as", "alice"]);
+    // many: three waiting and three accepted, made interleaved; listed waiting then accepted, each by
+    // age. Rows start in id order, which is random, so this pins the sort (1 chance in 720 otherwise).
+    let many = bracken(dir, &["claim", "spec: many", "--as", "alice"]);
+    let (mut waits, mut oks) = (Vec::new(), Vec::new());
+    for n in 0..3 {
+        let w = artifact(&format!("w{n}.rs"), "alice");
+        implements(&w, &many, "alice");
+        waits.push(w);
+        let a = artifact(&format!("a{n}.rs"), "bob");
+        implements(&a, &many, "bob");
+        pass(&a);
+        oks.push(a);
+    }
+
+    let text = bracken(dir, &["status"]);
+    let lines: Vec<&str> = text.lines().collect();
+    let at = |id: &str| lines.iter().position(|l| l.contains(&id[..12])).unwrap_or_else(|| panic!("{id}: {text}"));
+    assert!(at(&busy) < at(&done), "the claim with something waiting comes first:\n{text}");
+    assert!(at(&waiting) < at(&accepted), "waiting before accepted:\n{text}");
+    assert!(lines[at(&waiting)].trim_start().starts_with("waiting") && lines[at(&waiting)].contains("0/1 passes"));
+    assert!(lines[at(&accepted)].trim_start().starts_with("accepted") && lines[at(&accepted)].contains("1/1 passes"));
+    assert!(lines[at(&note)].contains("claim") && lines[at(&note)].contains("a written answer"), "{text}");
+    for hidden in [&dropped, &old, &idle] {
+        assert!(!text.contains(&hidden[..12]), "{hidden} listed:\n{text}");
+    }
+    let all = bracken(dir, &["status", "--all"]);
+    let tail = all.split("nothing implements:").nth(1).unwrap_or_else(|| panic!("{all}"));
+    assert!(tail.contains(&idle[..12]) && tail.contains("spec: new") && !tail.contains(&busy[..12]), "{all}");
+    // A stricter policy: nothing has two passes, so all waits. A second pass by the same validator is
+    // still one independent pass.
+    pass(&accepted);
+    let strict = bracken(dir, &["status", "--min-passes", "2"]);
+    assert!(!strict.contains("accepted ") && strict.contains("1/2 passes") && !strict.contains("2/2"), "{strict}");
+    let accepted_row = strict.lines().find(|l| l.contains(&accepted[..12])).unwrap();
+    assert!(accepted_row.trim_start().starts_with("waiting") && accepted_row.contains("1/2 passes"), "{strict}");
+    let v = json(dir, &["status", "--min-passes", "2", "--json"]);
+    let row = v["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|c| c["implemented_by"].as_array().unwrap())
+        .find(|i| i["id"] == accepted.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(row["independent_passes"], 1);
+    assert_eq!(row["assessment"]["passes"].as_array().unwrap().len(), 2);
+
+    let v = json(dir, &["status", "--json"]);
+    assert_eq!(v["min_passes"], 1);
+    assert_eq!(v["unimplemented"], serde_json::json!([]));
+    let claims = v["claims"].as_array().unwrap();
+    let ids: Vec<&str> = claims.iter().map(|c| c["claim"]["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [busy.as_str(), many.as_str(), done.as_str()]);
+    let rows: Vec<&str> =
+        claims[1]["implemented_by"].as_array().unwrap().iter().map(|i| i["id"].as_str().unwrap()).collect();
+    let expected: Vec<&str> = waits.iter().chain(&oks).map(String::as_str).collect();
+    assert_eq!(rows, expected, "waiting first, then accepted, each oldest first");
+    let by = claims[0]["implemented_by"].as_array().unwrap();
+    let by_ids: Vec<&str> = by.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(by_ids, [waiting.as_str(), accepted.as_str()]);
+    assert_eq!(by[0]["waiting"], true);
+    assert_eq!(by[0]["assessment"]["status"], "pending");
+    assert_eq!(by[0]["author_name"], "alice");
+    assert_eq!(by[0]["kind"], "artifact");
+    assert_eq!(by[1]["assessment"]["status"], "accepted");
+    assert_eq!(by[1]["independent_passes"], 1);
+    assert!(by[1]["age_ms"].as_u64().is_some() && by[1]["timestamp_ms"].as_u64().is_some());
+    let v = json(dir, &["status", "--all", "--json"]);
+    let unimplemented: Vec<&str> =
+        v["unimplemented"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert!(unimplemented.contains(&idle.as_str()) && !unimplemented.contains(&busy.as_str()), "{unimplemented:?}");
+}
+
+/// `artifact --implements` records the artifact and its implements relation, both signed by the same
+/// identity, and prints both ids. An id that doesn't resolve fails before anything is written.
+#[test]
+fn artifact_implements_records_the_artifact_and_its_relation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "deliver"]);
+    bracken(dir, &["id", "new", "alice"]);
+    bracken(dir, &["id", "new", "bob"]);
+    let spec = bracken(dir, &["claim", "spec: parse dates", "--as", "alice"]);
+    std::fs::write(dir.join("dates.rs"), "fn parse() {}\n").unwrap();
+
+    let out = bracken(dir, &["artifact", "dates.rs", "--implements", &spec[..12], "--as", "bob"]);
+    let printed: Vec<&str> = out.lines().collect();
+    assert_eq!(printed.len(), 2, "{out}");
+    let artifact = json(dir, &["show", printed[0], "--json"]);
+    assert_eq!(artifact["kind"], "artifact");
+    assert_eq!(artifact["body"]["name"], "dates.rs");
+    let relation = json(dir, &["show", printed[1], "--json"]);
+    assert_eq!(relation["kind"], "relation");
+    assert_eq!(relation["body"]["kind"], "implements");
+    assert_eq!(relation["body"]["from"], printed[0]);
+    assert_eq!(relation["body"]["to"], spec.as_str());
+    assert_eq!(relation["author_name"], "bob");
+    assert_eq!(artifact["author_name"], "bob");
+    let status = json(dir, &["status", "--json"]);
+    assert_eq!(status["claims"][0]["implemented_by"][0]["id"], printed[0]);
+
+    let before = bracken(dir, &["log", "--json"]);
+    let err = bracken_fails(dir, &["artifact", "dates.rs", "--implements", "ffffffffffff", "--as", "bob"]);
+    assert!(err.contains("no matching contribution"), "{err}");
+    let err = bracken_fails(dir, &["artifact", "missing.rs", "--implements", &spec, "--as", "bob"]);
+    assert!(err.contains("missing.rs"), "{err}");
+    assert_eq!(bracken(dir, &["log", "--json"]), before, "a failed artifact --implements wrote something");
+}
+
+/// `status` prints other agents' statements, tags and names with control characters and line or
+/// paragraph separators escaped, so they can't forge lines on a terminal (finding 252f052a283d).
+/// `--json` keeps the text as it is.
+#[test]
+fn status_escapes_control_characters_in_what_it_prints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "escape"]);
+    bracken(dir, &["id", "new", "alice"]);
+    bracken(dir, &["id", "new", "mallory"]);
+    let forged = "spec\r\u{1b}[2Kaccepted  fake\u{b}\u{c}\u{85}\u{2028}\u{2029}\nsecond line";
+    let spec = bracken(dir, &["claim", forged, "--tag", "t\u{1b}[31m", "--as", "alice"]);
+    let idle = bracken(dir, &["claim", "idle\u{2028}spec", "--as", "mallory"]);
+    std::fs::write(dir.join("f"), "x").unwrap();
+    bracken(dir, &["artifact", "f", "--name", "impl\u{1b}]0;title\u{7}.rs", "--implements", &spec, "--as", "mallory"]);
+
+    let text = bracken(dir, &["status", "--all"]);
+    for (n, line) in text.lines().enumerate() {
+        let bad: Vec<char> = line.chars().filter(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')).collect();
+        assert!(bad.is_empty(), "line {n} holds {bad:?}:\n{text}");
+    }
+    assert!(
+        text.contains("spec\\u{d}\\u{1b}[2Kaccepted  fake\\u{b}\\u{c}\\u{85}\\u{2028}\\u{2029}\\u{a}second line"),
+        "{text}"
+    );
+    assert!(text.contains("t\\u{1b}[31m") && text.contains("impl\\u{1b}]0;title\\u{7}.rs"), "{text}");
+    assert!(text.contains(&idle[..12]) && text.contains("idle\\u{2028}spec"), "{text}");
+    // One line for the claim, one for its implementer, then the "nothing implements" section.
+    assert_eq!(text.lines().filter(|l| !l.is_empty()).count(), 4, "{text}");
+
+    let v = json(dir, &["status", "--json"]);
+    assert_eq!(v["claims"][0]["claim"]["body"]["statement"], forged);
+}
+
 /// `log --since` prints only what the cursor hasn't seen, then the cursor for next time; a cursor with two
 /// heads (after concurrent work on two replicas) covers both, the filters and --json work with it, and an
 /// unknown id in a cursor is refused.
