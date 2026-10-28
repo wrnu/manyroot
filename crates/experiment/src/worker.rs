@@ -41,6 +41,9 @@ pub struct Reply {
     /// Hex.
     #[serde(default)]
     pub bytes: Option<String>,
+    /// For the event log only: what [`Store::record`] says about a tool call.
+    #[serde(default, skip_serializing_if = "Value::is_null")]
+    pub record: Value,
 }
 
 impl Reply {
@@ -107,20 +110,37 @@ fn handle(store: &mut dyn Store, notes: &Path, req: Request) -> Reply {
             Reply::from(store.fetch(Transfer { meta: req.args["meta"].clone(), bytes: bytes.unwrap_or_default() }))
         }
         "validate" => Reply::from(store.validate(&req.tool.unwrap_or_default(), &req.args)),
-        "hub_tool" => Reply::from(
-            session(&req.args).and_then(|s| store.hub_tool(&s, &req.tool.unwrap_or_default(), &req.args["args"])),
-        ),
+        "hub_tool" => {
+            let name = req.tool.unwrap_or_default();
+            let args = &req.args["args"];
+            let result = session(&req.args).and_then(|s| store.hub_tool(&s, &name, args));
+            recorded(store, &name, args, result)
+        }
         "release" => Reply::from(store.release_changes()),
         "integrated" => Reply::from(store.integrated().map(|m| json!(m))),
         "tool" => {
             let name = req.tool.unwrap_or_default();
-            Reply::from(match name.as_str() {
-                "notes_read" => notes_read(notes, &req.args),
-                "notes_write" => notes_write(notes, &req.args),
-                _ => store.tool(&name, &req.args),
-            })
+            match name.as_str() {
+                "notes_read" => Reply::from(notes_read(notes, &req.args)),
+                "notes_write" => Reply::from(notes_write(notes, &req.args)),
+                _ => {
+                    let result = store.tool(&name, &req.args);
+                    recorded(store, &name, &req.args, result)
+                }
+            }
         }
         op => Reply::from(Err(format!("unknown op {}", crate::args::short(op)))),
+    }
+}
+
+/// A tool's reply with the store's record of it. A record that fails is an error for the driver, never the agent.
+fn recorded(store: &mut dyn Store, tool: &str, args: &Value, result: Result<Value, String>) -> Reply {
+    match result {
+        Ok(v) => {
+            let record = store.record(tool, args, &v).unwrap_or_else(|e| json!({"error": e}));
+            Reply { ok: true, result: v, record, ..Reply::default() }
+        }
+        Err(e) => Reply::from(Err(e)),
     }
 }
 

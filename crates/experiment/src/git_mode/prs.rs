@@ -409,6 +409,16 @@ pub fn run(store: &mut GitStore, session: &Session, name: &str, args: &Value) ->
     Ok(result)
 }
 
+/// The task functions PR `number`'s head defines differently from where it left main, for the measures.
+pub fn changed(store: &mut GitStore, number: i64) -> Result<Vec<(String, String)>, String> {
+    let p = Prs::load(&store.config.dir.clone())?.get(number)?.clone();
+    let Some(head) = head_of(store, &p)? else { return Ok(Vec::new()) };
+    let base = store.git(&["merge-base", "refs/heads/main", &head], None)?.trim().to_string();
+    let before = crate::metrics::definitions(&store.modules_at(&base)?);
+    let after = crate::metrics::definitions(&store.modules_at(&head)?);
+    Ok(after.into_iter().filter(|(f, d)| before.get(f) != Some(d)).collect())
+}
+
 /// The PR's current head: its author's branch at the hub.
 fn head_of(store: &mut GitStore, p: &Pr) -> Result<Option<String>, String> {
     store.rev(&format!("refs/agents/{}/{}", p.author, p.branch))

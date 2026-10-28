@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use bracken_experiment::claude::{Caps, ClaudeBackend, ClaudeConfig, Expect, Pin, Routing, Tokens};
+use bracken_experiment::claude::{Caps, ClaudeBackend, ClaudeConfig, Expect, Pin, RUN_TIME_CAP, Routing, Tokens};
 use bracken_experiment::driver::{Backend, CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
 use bracken_experiment::mode::mode_named;
+use bracken_experiment::plan::{PlanInputs, report};
 use bracken_experiment::sandbox::{Git, Sandbox, WorkerPaths, resolved};
 
 const FAKE_AUTH: &str = "fake-auth-value-not-a-secret-0123456789";
@@ -49,6 +50,7 @@ fn run_config(root: PathBuf, mode: &'static str, agents: usize, turns: u32, sand
         trace: false,
         calls_per_turn: CALLS_PER_TURN,
         turn_limit: TURN_LIMIT,
+        plan: PlanInputs::default(),
         sandbox,
     }
 }
@@ -362,7 +364,7 @@ fn the_hub_profile_writes_no_copy_and_runs_no_shell() {
 fn syncs_both_ways_sandboxed(mode: &'static str) {
     let tmp = tempfile::tempdir().expect("a temp dir");
     let cfg = run_config(tmp.path().join("run"), mode, 2, 2, true);
-    let backend = bracken_experiment::mock::MockBackend { seed: 5, wrong_rate: 0.0, shim: Some(bin()) };
+    let backend = bracken_experiment::mock::MockBackend { seed: 5, wrong_rate: 0.0, shim: Some(bin()), usage: None };
     let outcome = run(&cfg, &backend).unwrap_or_else(|e| panic!("{mode}: the run: {e}"));
     let log = events(&outcome.events);
     assert!(!log.iter().any(|e| e["event"] == "turn_error"), "{mode}: no turn failed: {log:?}");
@@ -513,6 +515,19 @@ fn output_comes_from_the_result_and_repeated_blocks_count_once() {
     let rows = s.usage();
     assert_eq!(rows.iter().filter(|r| r["message"].is_string()).count(), 4, "every assistant event is recorded");
     assert!(rows.iter().any(|r| r["output"] == 5000 && r["ended"] == "success"));
+}
+
+#[test]
+fn the_report_reads_the_backends_usage_rows() {
+    let s = Setup::new();
+    let backend = s.backend("call notes_read {}\ncall sync {}\nresult 4000", caps());
+    s.run(&backend, 1, 1).expect("the run");
+    let (mine, _) = backend.totals("agent-0");
+    let m = report(&s.dir.join("run"), Some(&s.dir.join("claude/usage.jsonl"))).expect("the report").measures;
+    assert_eq!(m.tokens, mine.input + mine.cache_read + mine.cache_write + mine.output);
+    assert_eq!(m.output_tokens, 4000);
+    // Claude Code names the tools mcp__experiment__<tool>: the sync still counts as integrating.
+    assert!(m.overhead.integrate_tokens.is_some_and(|t| t > 0.0), "{:?}", m.overhead);
 }
 
 #[test]
@@ -669,10 +684,27 @@ fn token_caps_act_while_a_turn_streams() {
 fn the_run_time_cap_stops_the_run() {
     let s = Setup::new();
     let caps = Caps { run_time: Duration::from_secs(2), turn_time: LONG_TURN, ..caps() };
-    let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), caps);
+    let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), caps.clone());
     let start = Instant::now();
     let err = s.run(&backend, 2, 2).expect_err("the run stops");
     assert!(err.contains("time cap") && start.elapsed() < EARLY, "{err}");
+
+    // The driver names the cap, so the report measures the run if the plan expects that stop, and not otherwise.
+    let usage = s.dir.join("claude/usage.jsonl");
+    let log = events(&s.dir.join("run/events.jsonl"));
+    assert_eq!(
+        log.last().map(|e| (e["event"].clone(), e["data"]["cap"].clone())),
+        Some(("run_stopped".into(), RUN_TIME_CAP.into()))
+    );
+    let refused = report(&s.dir.join("run"), Some(&usage)).expect_err("not expected");
+    assert!(refused.contains("not by a stop the plan expects"), "{refused}");
+    let s = Setup::new();
+    let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), caps);
+    let expected = PlanInputs { expected_stops: vec![RUN_TIME_CAP.into()], ..PlanInputs::default() };
+    let cfg = RunConfig { plan: expected, ..run_config(s.dir.join("run"), "bracken", 2, 2, true) };
+    assert!(run(&cfg, &backend).is_err(), "the run stops");
+    let m = report(&s.dir.join("run"), Some(&s.dir.join("claude/usage.jsonl"))).expect("measured").measures;
+    assert_eq!(m.stopped.as_deref(), Some(RUN_TIME_CAP));
 }
 
 /// A backend that halts the run in its first turn.

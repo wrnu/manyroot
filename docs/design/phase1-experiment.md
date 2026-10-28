@@ -820,6 +820,44 @@ gains nothing.
 - **Agents don't know they're measured.** The prompts don't mention metrics
   or other modes.
 
+### How step 5 records and reports
+
+Built in step 5 (`crates/experiment`, `plan.rs` and `metrics.rs`), with the
+definitions the manager settled (question `6c4aa5dc0a01`, decision
+`bbb261d50871`):
+
+- **The plan** is written to `plan.json` before any worker starts, and the
+  setup event logs its blake3. It holds the run's configuration, the model,
+  effort, caps and seeds, `git --version`, the blake3 of the measuring code
+  (`metrics.rs`, `grader.rs`, and the `task.rs` and `lang.rs` it judges by)
+  and of the task texts, tool list and turn message, the
+  integration rules, and every measure's definition as `metrics.rs` computes
+  it. The report refuses a plan whose hash isn't the logged one, or whose
+  measuring code isn't this build's. It also refuses records that would make
+  a number silently wrong: a log with a gap or cut short (no closing
+  `integrated` event), a stop the plan doesn't expect, a failed snapshot or
+  record, or a turn without usage that didn't fail before playing. A run
+  stopped by one of the backend's own caps (design section 5), which the
+  real run's plan expects, is measured from what exists, and the table says
+  which cap stopped it.
+- **Snapshots:** the driver logs the hub's integrated library (a `snapshot`
+  event) after setup, after the release, and after any sync or hub tool call
+  that changes it. The report grades them afterwards.
+- **Writes:** after each successful tool call the store's `record` says, for
+  the log only, which function definitions the call wrote (a commit's,
+  compared with every parent; an artifact's), which ones a verdict blocks,
+  and whether a merge stopped on a conflict. In CRDT mode, deliveries come
+  from the snapshots instead.
+- **Bug reports** are the form `check` prints, `f(1, 2) gave 3`, found in any
+  tool's arguments except `notes_write` and logged with the tool call.
+- **Tokens** come from `usage.jsonl` in the rows step 6's backend writes
+  (its tool names, `mcp__experiment__<tool>`, are read without the prefix),
+  at the path the plan names; the mock writes the same rows with made-up
+  numbers. The real run's plan also states the model, effort, caps and the
+  system prompt's hash.
+- `bracken-experiment report <run>...` prints the comparison table, one
+  column per run (`--json` for the full measures).
+
 ### What this can't show
 
 All agents are one model with one prompt, so the run says nothing about

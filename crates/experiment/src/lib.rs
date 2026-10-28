@@ -8,6 +8,8 @@
 //! ([`bracken_mode`]); step 3 is Git mode ([`git_mode`]); step 4 is CRDT mode
 //! ([`crdt_mode`]), on Automerge; all behind the same [`mode`] interface. Step 6
 //! is the [`claude`] backend, with its [`sandbox`] profiles and forwarding [`proxy`].
+//! Step 5 measures a run: the [`plan`] fixed before it, and the six [`metrics`]
+//! over its records.
 //!
 //! What an agent may see goes through [`task`] only: the language, the specs,
 //! the change requests, the public cases and the public check. [`grader`]
@@ -23,8 +25,10 @@ pub mod driver;
 pub mod git_mode;
 pub mod grader;
 pub mod lang;
+pub mod metrics;
 pub mod mock;
 pub mod mode;
+pub mod plan;
 pub mod proxy;
 pub mod sandbox;
 pub mod shim;

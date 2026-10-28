@@ -159,7 +159,7 @@ pub const CHANGES: &[ChangeRequest] = &[
 ];
 
 /// Which change requests apply.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version(u8);
 
 impl Version {
