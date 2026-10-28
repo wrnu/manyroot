@@ -319,6 +319,40 @@ fn blank_statements_names_and_methods_are_rejected() {
 }
 
 #[test]
+fn no_control_format_or_separator_character_is_blank() {
+    // A trim that also strips U+0000, U+00AD or U+2060 would agree with rule 8 on
+    // every White_Space character and still reject valid fields. Every scalar in the
+    // categories such trims reach for (Cc, Cf, Zs, Zl, Zp) that isn't White_Space
+    // must count as text, alone, in every field.
+    use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
+    let (major, minor, update) = unicode_properties::UNICODE_VERSION;
+    assert_eq!((major, minor, update), (17, 0, 0), "rule 8 is pinned to Unicode 17.0");
+    assert_eq!(char::UNICODE_VERSION, (17, 0, 0), "the toolchain's Unicode version changed");
+
+    let alice = identity(ALICE);
+    let mut graph = Graph::new(GROUND);
+    let target = Contribution::create(GROUND, &alice, [], 1, claim("target", &[]));
+    let target_id = target.id();
+    graph.insert(target).unwrap();
+
+    let candidates: Vec<char> = (0..=0x10ffff)
+        .filter_map(char::from_u32)
+        .filter(|c| {
+            use GeneralCategory::*;
+            matches!(c.general_category(), Control | Format | SpaceSeparator | LineSeparator | ParagraphSeparator)
+        })
+        .filter(|c| !WHITE_SPACE.contains(c))
+        .collect();
+    assert!(candidates.len() > 200, "expected every Cc and Cf scalar, got {}", candidates.len());
+    for c in candidates {
+        for (body, field) in rule_8_fields(&c.to_string(), target_id) {
+            let contribution = Contribution::create(GROUND, &alice, [target_id], 2, body);
+            assert_eq!(graph.check(&contribution), Ok(()), "{field} U+{:04X} is not blank", c as u32);
+        }
+    }
+}
+
+#[test]
 fn the_toolchain_agrees_on_white_space() {
     // Rule 8 follows Rust's char::is_whitespace, which follows the toolchain's
     // Unicode version. If a toolchain upgrade changes the set, validity changes

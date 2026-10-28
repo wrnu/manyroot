@@ -1,3 +1,4 @@
+use manyroot::graph::{MIN_PREFIX_LEN, ResolveErrorKind};
 use manyroot::validation::{open_conflicts, open_supersessors};
 use manyroot::*;
 
@@ -488,4 +489,49 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
         let dest = to.join(path.file_name().unwrap());
         if path.is_dir() { copy_dir(&path, &dest) } else { std::fs::copy(&path, &dest).map(|_| ()).unwrap() }
     }
+}
+
+#[test]
+fn import_reports_and_graph_queries_say_what_they_hold() {
+    let alice = agent("alice");
+    let mut source = Graph::new(ground());
+    let a = add(&mut source, &alice, claim("a"));
+    let b = add_detached(&mut source, &alice, claim("b"));
+    let c = add(&mut source, &alice, claim("c"));
+
+    // A report is clean only with nothing rejected and nothing unresolved.
+    let rejected = ImportReport { rejected: vec![(a, RuleViolation::SelfRelation)], ..Default::default() };
+    let unresolved = ImportReport { unresolved: vec![a], ..Default::default() };
+    assert!(ImportReport::default().is_clean());
+    assert!(!rejected.is_clean() && !unresolved.is_clean());
+
+    // Importing what's already there counts it.
+    let mut g = Graph::new(ground());
+    assert!(g.is_empty());
+    let all = source.missing_from(&g);
+    assert_eq!(g.import(all.clone()).added.len(), 3);
+    assert!(!g.is_empty());
+    let again = g.import(all);
+    assert_eq!((again.added.len(), again.already_present), (0, 3));
+
+    // An unrelated contribution with parents is not an ancestor.
+    assert!(g.is_ancestor(&a, &c) && !g.is_ancestor(&c, &a));
+    let d = add_detached(&mut g, &alice, relate(b, RelationKind::Supports, a));
+    assert!(!g.is_ancestor(&c, &d), "d's parents are a and b, not c");
+}
+
+#[test]
+fn ids_resolve_from_a_prefix_of_at_least_four_hex_characters() {
+    let alice = agent("alice");
+    let mut g = Graph::new(ground());
+    let id = add(&mut g, &alice, claim("a"));
+    let hex = id.to_hex();
+    for len in [MIN_PREFIX_LEN, 12, 64] {
+        assert_eq!(g.resolve_prefix(&hex[..len]).unwrap(), id, "{len} characters");
+    }
+    assert_eq!(g.resolve_prefix(&hex[..12].to_uppercase()).unwrap(), id, "case doesn't matter");
+    let short = g.resolve_prefix(&hex[..MIN_PREFIX_LEN - 1]).unwrap_err();
+    assert!(matches!(short.kind, ResolveErrorKind::TooShort), "{short}");
+    let not_hex = g.resolve_prefix("zzzzzz").unwrap_err();
+    assert!(matches!(not_hex.kind, ResolveErrorKind::NotHex), "{not_hex}");
 }
