@@ -11,9 +11,12 @@
 #      key, backup copy of the keys, stray file or .gitattributes); or an agents/*.json
 #      entry holds a private key. Treat any such file as leaked if it holds a key. Also
 #      if any path in <head> has a non-ASCII byte (a case-insensitive filesystem can fold
-#      one, such as a Kelvin sign for k, into .bracken), or a .gitattributes file was
+#      one, such as a Kelvin sign for k, into .bracken), or the root .gitattributes was
 #      added, changed or removed since the merge base: checkout applies attributes to
-#      the Ground's files (eol=crlf breaks it), so a manager merges those by hand;
+#      the Ground's files (eol=crlf breaks it), so a manager merges those by hand, and
+#      GROUND_GUARDS_ATTRIBUTES_CHECKED=<head's full sha> lets one they checked through
+#      (ground-checkpoint --attributes-checked). A nested .gitattributes applies only to
+#      its own directory, and one under .bracken/ isn't a Ground file;
 #   2. a Ground file was deleted or changed since the merge base of <base> and <head>:
 #      the Ground is append-only, and editing a contribution (a finding, a failing
 #      piece of evidence) would change what the merge gate concludes. If that merge
@@ -80,10 +83,13 @@ keyed=$(git grep -l -e secret_key "$head" -- '.bracken/agents/*' | sed "s/^$head
 [ ${#bad[@]} -eq 0 ] && [ -z "$keyed" ] ||
   fail "only Ground files under .bracken: files under .bracken/ (or that a filesystem could put there) that aren't Ground files, or agent entries holding a private key (if any is a key, treat it as leaked and tell the owner):
 $(printf '%s\n' "${bad[@]}" "$keyed" | sed '/^$/d')"
-attributes=$(git diff --no-renames --name-status "$base" "$head" -- ':(glob,icase)**/.gitattributes')
-[ -z "$attributes" ] ||
-  fail "only Ground files under .bracken: .gitattributes changed since $base, and checkout applies attributes to the Ground's files; a manager merges attribute changes by hand, after checking what they do to .bracken/:
+attributes=$(git diff --no-renames --name-status "$base" "$head" -- ':(icase).gitattributes')
+if [ -n "$attributes" ] && [ "${GROUND_GUARDS_ATTRIBUTES_CHECKED:-}" = "$head" ]; then
+  echo "ground-guards: the root .gitattributes changed since $base; let through, as checked by hand at $head"
+elif [ -n "$attributes" ]; then
+  fail "only Ground files under .bracken: the root .gitattributes changed since $base, and checkout applies attributes to the Ground's files; a manager merges attribute changes by hand, after checking what they do to .bracken/, and lands one with ground-checkpoint --attributes-checked <sha> (process 9.3):
 $attributes"
+fi
 
 # 2. Append-only.
 [ "$base" != "$head" ] ||

@@ -513,6 +513,13 @@ fn ground_guards_refuse_each_way_a_head_can_hide_or_break_the_ground() {
             ("clean", ".", ["main", "pr"], Box::new(|dir| stage(dir, "100644", "code.txt", "a change\n")), ""),
             ("export-ignore", ".", ["main", "pr"], Box::new(|dir| stage(dir, "100644", HIDDEN, &key)), "Ground opens"),
             (
+                "a nested .gitattributes",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| stage(dir, "100644", "crates/manyroot/tests/fixtures/.gitattributes", "* -text\n")),
+                "",
+            ),
+            (
                 "attributes converting the Ground",
                 ".",
                 ["main", "pr"],
@@ -613,7 +620,8 @@ fn ground_guards_refuse_each_way_a_head_can_hide_or_break_the_ground() {
 }
 
 /// ground-checkpoint runs ground-guards on what origin's main gained before anything is pulled: it names a
-/// clean commit as checked, and stops on one that edits a committed Ground object. Offline, it still commits.
+/// clean commit as checked, and stops on one that edits a committed Ground object. Offline, it still commits,
+/// and says to rerun it before pushing. A root .gitattributes change lands only with --attributes-checked.
 #[test]
 fn ground_checkpoint_runs_the_ground_guards_on_what_it_would_pull() {
     for scripts in SCRIPTS {
@@ -628,6 +636,7 @@ fn ground_checkpoint_runs_the_ground_guards_on_what_it_would_pull() {
         };
         bk(&dir, &["init", "--name", "checkpoint"]);
         bk(&dir, &["id", "new", "val"]);
+        bk(&dir, &["id", "new", "manager"]);
         bk(&dir, &["claim", "first", "--tag", "note", "--as", "val"]);
         git(&["add", "-A"]);
         git(&["commit", "-qm", "ground"]);
@@ -684,7 +693,40 @@ fn ground_checkpoint_runs_the_ground_guards_on_what_it_would_pull() {
         assert!(out.status.success(), "{}: {stdout}{stderr}", case("offline"));
         assert!(stderr.contains("checked nothing there"), "{}: {stderr}", case("offline"));
         assert!(stdout.contains("committed") && !stdout.contains("git merge"), "{}: {stdout}", case("offline"));
+        assert!(
+            stdout.contains("rerun ground-checkpoint") && !stdout.contains("push it"),
+            "{}: {stdout}",
+            case("offline")
+        );
         assert_ne!(git(&["rev-parse", "HEAD"]), before, "{}: nothing was committed", case("offline"));
+
+        // A change to the root .gitattributes stops every checkpoint until a manager lands it with
+        // --attributes-checked and origin's main's full sha, which records a note.
+        git(&["remote", "set-url", "origin", forge.to_str().unwrap()]);
+        git(&["push", "-qf", "origin", &format!("{clean}:main")]);
+        let attributes = push_ahead(&|dir| std::fs::write(dir.join(".gitattributes"), "*.png binary\n").unwrap());
+        let checkpoint = |args: &[&str]| {
+            let out = run(&dir, "scripts/ground-checkpoint", args);
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            (out.status.code(), text)
+        };
+        let (code, text) = checkpoint(&[]);
+        assert_eq!(code, Some(1), "{}: {text}", case("attributes"));
+        assert!(text.contains("root .gitattributes changed") && text.contains("--attributes-checked"), "{text}");
+        let (code, text) = checkpoint(&["--attributes-checked", &clean]);
+        assert_eq!(code, Some(1), "{}: took another sha: {text}", case("attributes"));
+        assert!(text.contains("isn't origin's main"), "{}: {text}", case("attributes"));
+        assert!(!bk(&dir, &["log", "--tag", "note"]).contains("--attributes-checked"), "{}", case("attributes"));
+        let (code, text) = checkpoint(&["--attributes-checked", &attributes]);
+        assert_eq!(code, Some(0), "{}: {text}", case("attributes"));
+        assert!(text.contains(&format!("git merge --no-edit {attributes}")), "{}: {text}", case("attributes"));
+        let notes = bk(&dir, &["log", "--tag", "note"]);
+        assert!(notes.contains("manager") && notes.contains("--attributes-checked"), "{}: {notes}", case("attributes"));
+        assert!(
+            git(&["status", "--porcelain", "--", ".bracken"]).is_empty(),
+            "{}: the note wasn't committed",
+            case("attributes")
+        );
     }
 }
 
