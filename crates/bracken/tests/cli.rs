@@ -492,3 +492,238 @@ fn a_local_private_key_never_reaches_the_ground() {
     );
     bracken(dir, &["claim", "Never commit a file with a secret_key field", "--as", "val"]);
 }
+
+/// `log --since` prints only what the cursor hasn't seen, then the cursor for next time; a cursor with two
+/// heads (after concurrent work on two replicas) covers both, the filters and --json work with it, and an
+/// unknown id in a cursor is refused.
+#[test]
+fn log_since_a_cursor_prints_only_what_is_new_and_the_next_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (laptop, server) = (tmp.path().join("laptop"), tmp.path().join("server"));
+    std::fs::create_dir_all(&laptop).unwrap();
+    std::fs::create_dir_all(&server).unwrap();
+    bracken(&laptop, &["init", "--name", "since"]);
+    bracken(&laptop, &["id", "new", "alice"]);
+    let first = bracken(&laptop, &["claim", "first", "--as", "alice"]);
+    // The text form ends with the cursor; everything before it is the log.
+    let since = |dir: &Path, cursor: &str, also: &[&str]| {
+        let out = bracken(dir, &[&["log", "--since", cursor][..], also].concat());
+        let (rows, last) = out.rsplit_once('\n').map_or(("", out.as_str()), |(r, l)| (r, l));
+        let cursor = last.strip_prefix("cursor: ").unwrap_or_else(|| panic!("no cursor after: {out}")).to_owned();
+        let ids: Vec<String> = rows.lines().map(|l| l.split_whitespace().next().unwrap().to_owned()).collect();
+        (ids, cursor)
+    };
+    let short = |id: &str| id[..12].to_owned();
+
+    let (ids, start) = since(&laptop, "", &[]);
+    assert_eq!((ids, start.clone()), (vec![short(&first)], first.clone()));
+
+    let bundle = tmp.path().join("seed.mrb");
+    bracken(&laptop, &["export", bundle.to_str().unwrap()]);
+    bracken(&server, &["join", bundle.to_str().unwrap()]);
+    bracken(&server, &["id", "new", "bob"]);
+    let ours = bracken(&laptop, &["claim", "ours", "--tag", "x", "--as", "alice"]);
+    let theirs = bracken(&server, &["claim", "theirs", "--as", "bob"]);
+    bracken(&laptop, &["sync", "../server"]);
+    let (mut ids, two) = since(&laptop, &start, &[]);
+    ids.sort();
+    let mut expected = vec![short(&ours), short(&theirs)];
+    expected.sort();
+    assert_eq!(ids, expected);
+    let mut heads = [ours.clone(), theirs.clone()];
+    heads.sort();
+    assert_eq!(two, heads.join(","), "the cursor is both heads");
+    assert_eq!(since(&laptop, &start, &["--tag", "x"]).0, vec![short(&ours)], "filters still apply");
+    assert_eq!(since(&laptop, &two, &[]), (vec![], two.clone()), "nothing new since the latest cursor");
+
+    let next = bracken(&laptop, &["claim", "after both", "--as", "alice"]);
+    assert_eq!(since(&laptop, &two, &[]), (vec![short(&next)], next.clone()));
+    // Either head alone hasn't seen the other.
+    assert_eq!(since(&laptop, &ours[..12], &[]).0, vec![short(&theirs), short(&next)]);
+
+    let v = json(&laptop, &["log", "--since", &two, "--json"]);
+    let ids: Vec<&str> = v["contributions"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!((ids, v["cursor"].as_str()), (vec![next.as_str()], Some(next.as_str())));
+
+    let unknown = "0".repeat(64);
+    let err = bracken_fails(&laptop, &["log", "--since", &format!("{next},{unknown}")]);
+    assert!(err.contains("unknown id") && err.contains(&unknown), "{err}");
+}
+
+/// `log --compact` and `heads --compact` print the shortest unique prefix, at least 8 digits, and it
+/// resolves. When a new contribution shares those 8 digits, the old prefix becomes ambiguous and the
+/// compact form grows to one that isn't. The pair that share 8 digits is found by making candidate claims
+/// (about 80,000, on every core) and adding just those two.
+#[test]
+fn compact_ids_are_the_shortest_unique_prefix_and_grow_when_one_becomes_ambiguous() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "compact"]);
+    bracken(dir, &["id", "new", "alice"]);
+    bracken(dir, &["claim", "a line\nand another", "--tag", "t", "--as", "alice"]);
+
+    let mut store = manyroot::Store::open(&dir.join(".bracken")).unwrap();
+    let alice = store.identity("alice").unwrap();
+    let (ground, heads) = (store.info().ground, store.graph().heads().collect::<Vec<_>>());
+    let candidate = |n: u64| {
+        let body = manyroot::Body::Claim { statement: format!("candidate {n}"), tags: vec![] };
+        manyroot::Contribution::create(ground, &alice, heads.clone(), n, body)
+    };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()) as u64;
+    let mut by_prefix: std::collections::HashMap<[u8; 4], u64> = std::collections::HashMap::new();
+    let (mut start, chunk) = (0u64, 4096u64);
+    let (a, b) = 'search: loop {
+        let found: Vec<Vec<([u8; 4], u64)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|t| {
+                    let from = start + t * chunk;
+                    scope.spawn(move || {
+                        (from..from + chunk)
+                            .map(|n| (candidate(n).id().as_bytes()[..4].try_into().unwrap(), n))
+                            .collect()
+                    })
+                })
+                .collect();
+            workers.into_iter().map(|w| w.join().unwrap()).collect()
+        });
+        for (prefix, n) in found.into_iter().flatten() {
+            if let Some(&m) = by_prefix.get(&prefix) {
+                break 'search (candidate(m), candidate(n));
+            }
+            by_prefix.insert(prefix, n);
+        }
+        start += threads * chunk;
+        assert!(start < 2_000_000, "no two of {start} candidates share 8 hex digits");
+    };
+    let (a_hex, b_hex) = (a.id().to_hex(), b.id().to_hex());
+    assert_eq!(a_hex[..8], b_hex[..8]);
+
+    store.add(a).unwrap();
+    let compact = |args: &[&str]| -> Vec<String> { bracken(dir, args).lines().map(str::to_owned).collect() };
+    let log = compact(&["log", "--compact"]);
+    assert_eq!(log.len(), 2, "{log:?}");
+    assert!(log[0].ends_with(" alice claim [t] a line …"), "{}", log[0]);
+    let line = log.iter().find(|l| a_hex.starts_with(l.split(' ').next().unwrap())).expect("a's line");
+    let prefix = line.split(' ').next().unwrap();
+    assert_eq!(prefix, &a_hex[..8], "{line}");
+    assert!(bracken(dir, &["show", prefix]).contains(&a_hex));
+    assert_eq!(compact(&["heads", "--compact"]), vec![line.clone()]);
+
+    store.add(b).unwrap();
+    let err = bracken_fails(dir, &["show", prefix]);
+    assert!(err.contains("matches 2 contributions"), "{err}");
+    let log = compact(&["log", "--compact"]);
+    let grown: Vec<&str> = log.iter().map(|l| l.split(' ').next().unwrap()).collect();
+    assert_eq!(grown.len(), 3);
+    for (hex, want) in [(&a_hex, &a_hex), (&b_hex, &b_hex)] {
+        let p = grown.iter().find(|p| hex.starts_with(**p)).expect("a line for each");
+        assert!(p.len() > 8, "{p} is still ambiguous");
+        assert!(bracken(dir, &["show", p]).contains(want.as_str()));
+    }
+}
+
+/// However long a Ground's statements, tags and notes are, `log --compact` prints one line per contribution
+/// of at most 200 characters, so a long Ground's log stays small. `--limit` keeps the most recent N after
+/// the filters, says how many it left out, and still ends with the heads as the cursor.
+#[test]
+fn compact_lines_stay_short_and_limit_keeps_the_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "long"]);
+    bracken(dir, &["id", "new", "alice"]);
+    let mut store = manyroot::Store::open(&dir.join(".bracken")).unwrap();
+    let alice = store.identity("alice").unwrap();
+    let statement = format!("{}\nand a second line", "a long statement ".repeat(80));
+    let tags: Vec<String> = (0..20).map(|i| format!("a-rather-long-tag-number-{i}")).collect();
+    let (mut first, mut last) = (None, None);
+    for i in 0..300 {
+        let body = if i % 3 == 2 {
+            let (from, to) = (last.unwrap(), first.unwrap());
+            manyroot::Body::Relation { from, kind: manyroot::RelationKind::Supports, to, note: "n".repeat(5000) }
+        } else {
+            manyroot::Body::Claim { statement: statement.clone(), tags: tags.clone() }
+        };
+        last = Some(store.contribute(&alice, body).unwrap());
+        first = first.or(last);
+    }
+
+    let log = bracken(dir, &["log", "--compact"]);
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 300);
+    for line in &lines {
+        assert!(line.chars().count() <= 200, "{} characters: {line}", line.chars().count());
+    }
+    assert!(log.len() < 300 * 200 * 2, "{} bytes", log.len());
+
+    let out = bracken(dir, &["log", "--since", "", "--limit", "5", "--compact", "--kind", "claim"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 7, "{out}");
+    assert!(lines[..5].iter().all(|l| l.contains(" claim ")), "{out}");
+    assert_eq!(lines[5], "omitted: 195 earlier (--limit)");
+    let cursor = lines[6].strip_prefix("cursor: ").unwrap().to_owned();
+    assert_eq!(cursor, last.unwrap().to_hex(), "the cursor is the one head");
+    let v = json(dir, &["log", "--limit", "2", "--json"]);
+    assert_eq!((v["contributions"].as_array().unwrap().len(), v["omitted"].as_u64()), (2, Some(298)));
+    let next = bracken(dir, &["claim", "the next one", "--as", "alice"]);
+    let out = bracken(dir, &["log", "--since", &cursor, "--limit", "5"]);
+    assert_eq!(out.lines().count(), 2, "{out}");
+    assert!(out.starts_with(&next[..12]) && out.ends_with(&format!("cursor: {next}")), "{out}");
+}
+
+/// Other agents write the text a log prints, so no statement, tag or note may reach the terminal with a
+/// character that moves the cursor, breaks the line or reorders it: CR, ESC sequences, VT, FF, newline,
+/// NEL, the line and paragraph separators, and bidi overrides. Each prints as a visible escape instead, in
+/// `log`, `log --compact`, `heads` and `heads --compact`, one line per contribution.
+#[test]
+fn log_lines_escape_control_characters_from_other_agents_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "escapes"]);
+    bracken(dir, &["id", "new", "mallory"]);
+    let kinds = [
+        ('\r', "\\u{d}"),
+        ('\u{1b}', "\\u{1b}"),
+        ('\u{b}', "\\u{b}"),
+        ('\u{c}', "\\u{c}"),
+        ('\n', "\\u{a}"),
+        ('\u{85}', "\\u{85}"),
+        ('\u{2028}', "\\u{2028}"),
+        ('\u{2029}', "\\u{2029}"),
+        ('\u{202e}', "\\u{202e}"),
+        ('\t', "\\u{9}"),
+    ];
+    let forged = |c: char| format!("{c}[2K{c}00000000 manager claim [decision] forged");
+    let mut last = String::new();
+    for (c, _) in kinds {
+        // Not first, so the compact form, which keeps a statement's first line, still has the character.
+        last = bracken(dir, &["claim", &format!("ok{}", forged(c)), "--tag", &format!("t{c}x"), "--as", "mallory"]);
+    }
+    let note = format!("n{}", forged('\r'));
+    let first = bracken(dir, &["log", "--json"]);
+    let first: Value = serde_json::from_str(&first).unwrap();
+    let first = first[0]["id"].as_str().unwrap().to_owned();
+    bracken(dir, &["relate", &last, "supports", &first, "--note", &note, "--as", "mallory"]);
+    let count = kinds.len() + 1;
+
+    let unsafe_char = |c: char| {
+        c != '\n'
+            && (c.is_control()
+                || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'))
+    };
+    for args in [&["log"][..], &["log", "--compact"], &["heads"], &["heads", "--compact"]] {
+        let out = bracken(dir, args);
+        let bad: Vec<char> = out.chars().filter(|&c| unsafe_char(c)).collect();
+        assert!(bad.is_empty(), "{args:?} printed {bad:?}:\n{out}");
+        let lines = if args[0] == "log" { count } else { 1 };
+        assert_eq!(out.lines().count(), lines, "{args:?}:\n{out}");
+        if args[0] == "log" {
+            for (c, escape) in kinds {
+                // Plain log shows the whole statement; compact cuts at a newline, so that one's escape is gone.
+                if c != '\n' || args.len() == 1 {
+                    assert!(out.contains(&format!("ok{escape}[2K")), "{args:?} lost {escape}:\n{out}");
+                }
+            }
+        }
+        assert!(out.contains("n\\u{d}[2K"), "{args:?} lost the note's CR:\n{out}");
+    }
+}

@@ -17,6 +17,7 @@ use manyroot::validation::{open_conflicts, open_supersessors};
 use manyroot::*;
 use serde_json::{Value, json};
 
+mod listing;
 mod remote;
 mod serve;
 mod wire;
@@ -139,6 +140,21 @@ enum Command {
         /// omitted. Another author's supersession doesn't count, and is shown as a marker instead.
         #[arg(long)]
         current: bool,
+        /// Only what arrived since a cursor: contributions that are neither in it nor ancestors of any id in
+        /// it. A cursor is comma-separated ids, the causal heads `log --since` printed last ("" for
+        /// everything). Prints the next cursor after the list, or adds it to the JSON as "cursor". A cursor
+        /// means the same only under the same filters: new work the filters hid is past it all the same.
+        #[arg(long, value_name = "CURSOR")]
+        since: Option<String>,
+        /// Only the most recent N, after every other filter. Says how many earlier ones it left out (in the
+        /// JSON as "omitted"); the cursor is still the heads, so the next --since starts after all of them.
+        #[arg(long, value_name = "N")]
+        limit: Option<usize>,
+        /// One short line each, at most 200 characters (counted as chars, not display columns): the
+        /// shortest unique id prefix (at least 8 digits), author, kind and tags, and the statement or name
+        /// cut to one line. Control characters print as escapes such as \u{1b}, as in every log line.
+        #[arg(long, conflicts_with = "json")]
+        compact: bool,
         #[command(flatten)]
         out: Output,
     },
@@ -154,6 +170,9 @@ enum Command {
     Cat { id: String },
     /// List causal heads.
     Heads {
+        /// One short line each, as `log --compact`.
+        #[arg(long, conflicts_with = "json")]
+        compact: bool,
         #[command(flatten)]
         out: Output,
     },
@@ -367,14 +386,16 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let target = resolve(&s, &target)?;
             println!("{}", contribute(&mut s, &who, Body::Retract { target, reason })?);
         }
-        Command::Log { kind, tag, author, current, out } => {
+        Command::Log { kind, tag, author, current, since, limit, compact, out } => {
             let names = Names::load(&s)?;
             let author = author.map(|a| names.resolve(&a)).transpose()?;
             let g = s.graph();
+            let seen = since.as_deref().map(|c| listing::seen(g, c)).transpose()?;
             let order = g.topo_order();
             let view = current.then(|| CurrentView::new(g, &order));
             let rows: Vec<&Contribution> = order
                 .iter()
+                .filter(|id| seen.as_ref().is_none_or(|s| !s.contains(id)))
                 .filter(|id| view.as_ref().is_none_or(|v| !v.hidden.contains(id)))
                 .map(|id| g.get(id).expect("ordered ids exist"))
                 .filter(|c| kind.is_none_or(|k| c.body().kind() == k))
@@ -383,6 +404,8 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                     tag.as_ref().is_none_or(|t| matches!(c.body(), Body::Claim { tags, .. } if tags.contains(t)))
                 })
                 .collect();
+            let omitted = limit.map_or(0, |n| rows.len().saturating_sub(n));
+            let rows = &rows[omitted..];
             if out.json {
                 let rows: Vec<Value> = rows
                     .iter()
@@ -398,15 +421,33 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                         v
                     })
                     .collect();
-                print_json(&rows);
+                if since.is_some() || limit.is_some() {
+                    print_json(&json!({"contributions": rows, "cursor": listing::cursor(g), "omitted": omitted}));
+                } else {
+                    print_json(&rows);
+                }
             } else {
-                for c in rows {
-                    let mut text = line(g, &names, c);
+                let prefixes =
+                    compact.then(|| listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS));
+                for &c in rows {
+                    let mut text = match &prefixes {
+                        Some(p) => compact_line(g, &names, p, c),
+                        None => line(g, &names, c),
+                    };
                     for (by, author) in view.as_ref().map_or(&[][..], |v| v.by_others(&c.id())) {
                         let author = names.display(author);
                         text.push_str(&format!("  (superseded by {author} {})", by.short()));
                     }
+                    if compact {
+                        text = listing::cap_line(text);
+                    }
                     println!("{text}");
+                }
+                if omitted > 0 {
+                    println!("omitted: {omitted} earlier (--limit)");
+                }
+                if since.is_some() {
+                    println!("cursor: {}", listing::cursor(g));
                 }
             }
         }
@@ -433,15 +474,20 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             };
             write_stdout(content);
         }
-        Command::Heads { out } => {
+        Command::Heads { compact, out } => {
             let names = Names::load(&s)?;
             let g = s.graph();
             let heads: Vec<&Contribution> = g.heads().map(|id| g.get(&id).expect("heads exist")).collect();
             if out.json {
                 print_json(&heads.iter().map(|c| contribution_json(g, &names, c)).collect::<Vec<_>>());
             } else {
+                let prefixes =
+                    compact.then(|| listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS));
                 for c in heads {
-                    println!("{}", line(g, &names, c));
+                    match &prefixes {
+                        Some(p) => println!("{}", compact_line(g, &names, p, c)),
+                        None => println!("{}", line(g, &names, c)),
+                    }
                 }
             }
         }
@@ -863,13 +909,27 @@ fn summary(g: &Graph, c: &Contribution) -> String {
 
 fn line(g: &Graph, names: &Names, c: &Contribution) -> String {
     let retracted = if g.is_retracted(&c.id()) { "  (retracted)" } else { "" };
-    format!(
+    let line = format!(
         "{}  {:<8}  {:<12}  {}{retracted}",
         c.id().short(),
         c.body().kind(),
         names.display(&c.author()),
         summary(g, c)
-    )
+    );
+    listing::printable(&line)
+}
+
+/// A contribution on one short line: its shortest unique prefix, author, kind and tags, and its text.
+fn compact_line(g: &Graph, names: &Names, prefixes: &HashMap<ContributionId, String>, c: &Contribution) -> String {
+    let tags = match c.body() {
+        Body::Claim { tags, .. } if !tags.is_empty() => format!(" [{}]", tags.join(",")),
+        _ => String::new(),
+    };
+    let retracted = if g.is_retracted(&c.id()) { " (retracted)" } else { "" };
+    let text = listing::compact_text(c.body(), summary(g, c));
+    let line =
+        format!("{} {} {}{tags}{retracted} {text}", prefixes[&c.id()], names.display(&c.author()), c.body().kind());
+    listing::cap_line(listing::printable(&line))
 }
 
 fn body_json(body: &Body) -> Value {

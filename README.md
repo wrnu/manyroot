@@ -46,6 +46,18 @@ bracken relate $IMPL implements $REQ
 bracken evidence $IMPL pass --method "cargo test" --as val
 
 bracken log                          # everything, in causal order
+bracken log --since ""               # the same, then a cursor: pass it next time for only what is new
+bracken log --compact                # one line each (at most 200 characters), shortest unique ids (8+ digits)
+bracken log --since "$C" --limit 50  # only the most recent 50 of what is new; the cursor still moves past all
+```
+
+With `--since` or `--limit`, `log --json` prints an object, `{"contributions": [...], "cursor": "...",
+"omitted": N}`, instead of the bare array. A cursor means the same only under the same filters: new work
+that `--tag`, `--kind`, `--author` or `--current` hid is past it all the same, so keep one cursor per set of
+filters. Log lines print control characters from contributions (CR, ESC, newlines and the like) as escapes
+such as `\u{1b}`, so no contribution can forge or hide a line; `--json` escapes them as JSON does.
+
+```sh
 bracken accepted                     # what the default policy accepts
 bracken accepted --min-passes 2 --validator val
 bracken conflicts                    # divergences and contradictions
