@@ -91,7 +91,7 @@ impl Proxy {
         self.port
     }
 
-    /// Every attempt so far, in the order they finished.
+    /// Every attempt so far: a refusal before its client sees the 403, a tunnel once it has closed.
     pub fn attempts(&self) -> Vec<Attempt> {
         self.shared.attempts.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -134,9 +134,10 @@ impl Shared {
         let upstream = if allowed { self.connect() } else { None };
         let Some(upstream) = upstream.filter(|u| self.track(&client) && self.track(u)) else {
             attempt.allowed = false;
+            // Recorded before the reply, so a refusal the client has seen is always counted.
+            self.record(attempt);
             let _ = client.write_all(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
             let _ = client.shutdown(Shutdown::Both);
-            self.record(attempt);
             return;
         };
         if client.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n").is_err() {

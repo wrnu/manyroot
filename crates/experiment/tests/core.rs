@@ -214,11 +214,13 @@ struct Claiming {
     hostile: bool,
     /// Times the driver closed agent 0's connection after the over-long line.
     closed: std::sync::atomic::AtomicUsize,
+    /// What each of agent 0's reads after the line saw, for the assertion's message.
+    seen: std::sync::Mutex<Vec<String>>,
 }
 
 impl Claiming {
     fn new(hostile: bool) -> Claiming {
-        Claiming { hostile, closed: Default::default() }
+        Claiming { hostile, closed: Default::default(), seen: Default::default() }
     }
 }
 
@@ -229,9 +231,14 @@ impl Backend for Claiming {
             let mut s = std::os::unix::net::UnixStream::connect(socket).map_err(|e| e.to_string())?;
             let _ = s.write_all(&vec![b'x'; MAX_MCP_LINE + 10]);
             s.set_read_timeout(Some(std::time::Duration::from_secs(60))).map_err(|e| e.to_string())?;
-            if matches!(s.read(&mut [0u8; 1]), Ok(0)) {
+            // A hang-up reads as the end of the stream, or as a reset when the driver closed with
+            // some of the line unread; a timeout or a byte is no hang-up.
+            let read = s.read(&mut [0u8; 1]);
+            let kind = read.as_ref().map_err(std::io::Error::kind);
+            if matches!(kind, Ok(0) | Err(std::io::ErrorKind::ConnectionReset)) {
                 self.closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }
+            self.seen.lock().expect("lock").push(format!("{read:?}"));
             return Err("sent an over-long line".into());
         }
         let mut c = Client::connect(socket, None)?;
@@ -301,7 +308,12 @@ fn one_agents_failure_stays_in_its_own_turn() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let backend = Claiming::new(true);
     let outcome = run(&config(dir.path(), 3, 2), &backend).expect("the run goes on");
-    assert_eq!(backend.closed.load(std::sync::atomic::Ordering::SeqCst), 2, "the driver hung up on the over-long line");
+    let seen = backend.seen.lock().expect("lock").clone();
+    assert_eq!(
+        backend.closed.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "the driver hung up on the over-long line: {seen:?}"
+    );
     let log = events(&outcome.events);
     let count = |agent: &str, event: &str| log.iter().filter(|e| e["agent"] == agent && e["event"] == event).count();
     assert_eq!(count("agent-0", "turn_error"), 2, "each of agent 0's turns ended in an error");
