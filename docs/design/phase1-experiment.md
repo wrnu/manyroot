@@ -1237,7 +1237,8 @@ with their expected use and caps, are in [phase1-results.md](phase1-results.md).
   before claiming that one mode beats another.
 - **A real-code task**: a small Rust or Python library with a held-out test
   suite, agent code running in a sandbox with no network and no host access
-  (its design is a proposal of its own).
+  (its design is a proposal of its own; the candidates for the next task are
+  in [phase2-task.md](phase2-task.md)).
 - **Scale**: 20, 50 and 100 agents, as the vision asks, each with its own
   expected use and the owner's go.
 - **Bracken variants**: peer-to-peer sync, wip claims, liveness, stricter
