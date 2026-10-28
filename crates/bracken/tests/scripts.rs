@@ -250,6 +250,46 @@ fn merge_keeps_the_token_out_of_the_environment_when_the_caller_exports_token() 
 /// (`git add -A`, so a caller forces anything ignored in itself). The pr claim is by `builder` and passed
 /// by `val`, so the gate accepts it.
 fn merge_dry_run(scripts: &str, on_branch: impl FnOnce(&Path), on_main: impl FnOnce(&Path)) -> Output {
+    merge_dry_run_on(scripts, |_| {}, on_branch, on_main, None)
+}
+
+/// Evidence on the pr claim as bk-evidence --on records it: `<command> @ <head> on <main sha>`.
+#[derive(Clone, Copy)]
+struct Tested<'a> {
+    who: &'a str,
+    /// main's rev at the end, or a 40-hex sha taken as it is.
+    rev: &'a str,
+    /// The PR's head if None.
+    head: Option<&'a str>,
+    verdict: &'a str,
+    /// Retracted by `who` afterwards.
+    retracted: bool,
+}
+
+fn tested<'a>(who: &'a str, rev: &'a str) -> Tested<'a> {
+    Tested { who, rev, head: None, verdict: "pass", retracted: false }
+}
+
+/// The same, with `at_base` committed in the branch point, and `tested` recorded on the claim.
+fn merge_dry_run_on(
+    scripts: &str,
+    at_base: impl FnOnce(&Path),
+    on_branch: impl FnOnce(&Path),
+    on_main: impl FnOnce(&Path),
+    tested: Option<Tested>,
+) -> Output {
+    let (_tmp, _dir, mut command) = merge_dry_run_command(scripts, at_base, on_branch, on_main, tested);
+    command.output().unwrap()
+}
+
+/// The repository and the `scripts/merge --dry-run` command for [`merge_dry_run_on`], not yet run.
+fn merge_dry_run_command(
+    scripts: &str,
+    at_base: impl FnOnce(&Path),
+    on_branch: impl FnOnce(&Path),
+    on_main: impl FnOnce(&Path),
+    tested: Option<Tested>,
+) -> (tempfile::TempDir, PathBuf, Command) {
     let file = |name: &str| repo_root().join(scripts).join(name);
     let (merge, guards) = (file("merge"), file("ground-guards"));
     let (tmp, dir) =
@@ -262,7 +302,9 @@ fn merge_dry_run(scripts: &str, on_branch: impl FnOnce(&Path), on_main: impl FnO
     bk(&dir, &["init", "--name", "merge"]);
     bk(&dir, &["id", "new", "builder"]);
     bk(&dir, &["id", "new", "val"]);
+    bk(&dir, &["id", "new", "manager"]);
     bk(&dir, &["claim", "first", "--tag", "note", "--as", "val"]);
+    at_base(&dir);
     commit("ground");
     git(&["switch", "-qc", "pr"]);
     on_branch(&dir);
@@ -281,17 +323,28 @@ fn merge_dry_run(scripts: &str, on_branch: impl FnOnce(&Path), on_main: impl FnO
     git(&["config", "credential.https://forge.example.helper", "!f() { echo username=t; echo password=DUMMY; }; f"]);
     let claim = bk(&dir, &["claim", &format!("PR #1 pr @ {sha}: a change"), "--tag", "pr", "--as", "builder"]);
     bk(&dir, &["evidence", &claim, "pass", "--method", "checked", "--as", "val"]);
+    if let Some(t) = tested {
+        let on = if t.rev.len() == 40 {
+            t.rev.to_owned()
+        } else {
+            String::from_utf8(run(&dir, "git", &["rev-parse", t.rev]).stdout).unwrap().trim().to_owned()
+        };
+        let method = format!("cargo test @ {} on {on}", t.head.unwrap_or(&sha));
+        let id = bk(&dir, &["evidence", &claim, t.verdict, "--method", &method, "--as", t.who]);
+        if t.retracted {
+            bk(&dir, &["retract", &id, "--as", t.who]);
+        }
+    }
 
     std::fs::create_dir_all(tmp.path().join("stubs")).unwrap();
     let pr =
         format!(r#"{{"head":{{"sha":"{sha}"}},"state":"open","merged":false,"base":{{"ref":"main"}},"title":"t"}}"#);
     write_executable(&tmp.path().join("stubs/curl"), &format!("#!/bin/sh\necho '{pr}'\n"));
     let path = std::env::var("PATH").unwrap();
-    command(&dir, "scripts/merge", &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"])
-        .env("PATH", format!("{}:{path}", tmp.path().join("stubs").display()))
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .output()
-        .unwrap()
+    let mut merge =
+        command(&dir, "scripts/merge", &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"]);
+    merge.env("PATH", format!("{}:{path}", tmp.path().join("stubs").display())).env("GIT_CONFIG_NOSYSTEM", "1");
+    (tmp, dir, merge)
 }
 
 /// The line `merge` printed for check `name`: `ok` or `FAIL`, then the check's name and detail.
@@ -632,5 +685,215 @@ fn ground_checkpoint_runs_the_ground_guards_on_what_it_would_pull() {
         assert!(stderr.contains("checked nothing there"), "{}: {stderr}", case("offline"));
         assert!(stdout.contains("committed") && !stdout.contains("git merge"), "{}: {stdout}", case("offline"));
         assert_ne!(git(&["rev-parse", "HEAD"]), before, "{}: nothing was committed", case("offline"));
+    }
+}
+
+/// Writes `text` at `path` in `dir`, making its directories.
+fn put(dir: &Path, path: &str, text: &str) {
+    let file = dir.join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, text).unwrap();
+}
+
+/// Commits everything in `dir` as `message`.
+fn commit_all(dir: &Path, message: &str) {
+    assert!(run(dir, "git", &["add", "-A"]).status.success());
+    assert!(run(dir, "git", &["commit", "-qm", message]).status.success());
+}
+
+/// main may be ahead of the head in code once the manager has tested the merge: a pass naming the head
+/// and a main sha ('@ <head> on <main>', as bk-evidence --on records it) that main's tip has moved past
+/// only in .bracken/ and docs. Evidence on an older main that main has since moved past in code is refused,
+/// naming that sha, as are no such evidence, evidence by anyone but the manager, and evidence on another head.
+#[test]
+fn merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge() {
+    let code = |dir: &Path| put(dir, "code.txt", "a change\n");
+    for scripts in SCRIPTS {
+        let case = |what: &str| format!("{scripts}: {what}");
+
+        let lib = |dir: &Path| put(dir, "lib.rs", "main's code\n");
+
+        // Tested on main's tip.
+        let out = merge_dry_run_on(scripts, |_| {}, code, lib, Some(tested("manager", "main")));
+        let line = check_line(&out, "main");
+        assert!(out.status.success(), "{}: {line}", case("on the tip"));
+        assert!(line.starts_with("ok ") && line.contains("tested") && !line.contains("moved past"), "{line}");
+
+        // Tested on a main that main's tip has moved past only in the Ground and docs.
+        let ground_after = |dir: &Path| {
+            lib(dir);
+            commit_all(dir, "code on main");
+            bk(dir, &["claim", "later", "--tag", "note", "--as", "val"]);
+            put(dir, "docs/guide.md", "a guide\n");
+        };
+        let out = merge_dry_run_on(scripts, |_| {}, code, ground_after, Some(tested("manager", "main~1")));
+        let line = check_line(&out, "main");
+        assert!(out.status.success(), "{}: {line}", case("ground and docs after"));
+        assert!(line.contains("moved past only in .bracken/ and docs"), "{line}");
+
+        // Tested on a main that main's tip has moved past in code.
+        let code_after = |dir: &Path| {
+            lib(dir);
+            commit_all(dir, "code on main");
+            put(dir, "more.rs", "more code\n");
+        };
+        let out = merge_dry_run_on(scripts, |_| {}, code, code_after, Some(tested("manager", "main~1")));
+        let line = check_line(&out, "main");
+        assert_eq!(out.status.code(), Some(1), "{}: {line}", case("code after"));
+        assert!(
+            line.starts_with("FAIL") && line.contains("has moved in code since") && line.contains("more.rs"),
+            "{line}"
+        );
+
+        // Tested on a main older than the branch point (finding e82a2f2c7ff5): main added x.rs at the branch
+        // point and reverted it later, so the diff from the evidence's main to the tip is empty, yet the
+        // tested tree held x.rs and the merge won't.
+        let out = merge_dry_run_on(
+            scripts,
+            |dir| put(dir, "x.rs", "used by the branch\n"),
+            |dir| put(dir, "code.txt", "uses x.rs\n"),
+            |dir| std::fs::remove_file(dir.join("x.rs")).unwrap(),
+            Some(tested("manager", ":/^scripts")),
+        );
+        let line = check_line(&out, "main");
+        assert_eq!(out.status.code(), Some(1), "{}: {line}", case("evidence before the branch point"));
+        assert!(line.starts_with("FAIL") && line.contains("x.rs"), "{line}");
+
+        // Tested on a commit off main that holds the branch point and differs from the tip only in docs,
+        // but isn't on main: it isn't the main the merge will use.
+        let side = |dir: &Path| {
+            lib(dir);
+            commit_all(dir, "code on main");
+            assert!(run(dir, "git", &["switch", "-qc", "side"]).status.success());
+            put(dir, "docs/side.md", "off main\n");
+            commit_all(dir, "side");
+            assert!(run(dir, "git", &["switch", "-q", "main"]).status.success());
+        };
+        let out = merge_dry_run_on(scripts, |_| {}, code, side, Some(tested("manager", "side")));
+        let line = check_line(&out, "main");
+        assert_eq!(out.status.code(), Some(1), "{}: {line}", case("evidence off main"));
+        assert!(line.starts_with("FAIL"), "{line}");
+
+        // Evidence that doesn't count (finding eed0580eba69 for the last three).
+        let (other_head, unknown) = ("f".repeat(40), "e".repeat(40));
+        let manager = tested("manager", "main");
+        for (what, evidence) in [
+            ("no evidence", None),
+            ("val's evidence", Some(tested("val", "main"))),
+            ("evidence on another head", Some(Tested { head: Some(other_head.as_str()), ..manager })),
+            ("a manager fail", Some(Tested { verdict: "fail", ..manager })),
+            ("a retracted manager pass", Some(Tested { retracted: true, ..manager })),
+            ("a main sha this checkout lacks", Some(Tested { rev: unknown.as_str(), ..manager })),
+        ] {
+            let out = merge_dry_run_on(scripts, |_| {}, code, lib, evidence);
+            let line = check_line(&out, "main");
+            assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
+            assert!(
+                line.starts_with("FAIL") && line.contains("bk-evidence --on origin/main"),
+                "{}: {line}",
+                case(what)
+            );
+        }
+    }
+}
+
+/// bk-evidence --on tests the tree the merge will produce, in a scratch worktree it removes, and records
+/// '@ <head> on <main sha>'. A head that conflicts with main is refused with nothing run or recorded.
+#[test]
+fn bk_evidence_on_main_tests_the_merge_and_names_both_shas() {
+    for scripts in SCRIPTS {
+        let script = format!("{scripts}/bk-evidence");
+        let (_tmp, dir, _) = workspace(&repo_root().join(&script));
+        let git = |args: &[&str]| {
+            let out = run(&dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["switch", "-qc", "pr"]);
+        put(&dir, "a.txt", "the branch\n");
+        put(&dir, "sub/c.txt", "in a subdirectory\n");
+        commit_all(&dir, "branch");
+        let head = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "-q", "main"]);
+        put(&dir, "b.txt", "main\n");
+        commit_all(&dir, "main");
+        let tip = git(&["rev-parse", "HEAD"]);
+        git(&["switch", "-q", "pr"]);
+        let claim = bk(&dir, &["claim", &format!("PR #1 pr @ {head}: a change"), "--tag", "pr", "--as", "val"]);
+        let both = ["--as", "val", "--on", "main", "--", "/bin/sh", "-c", "test -f a.txt && test -f b.txt"];
+        // A caller that signs commits: the scratch merge doesn't (note c83c6d8423d5).
+        git(&["config", "commit.gpgsign", "true"]);
+        git(&["config", "gpg.program", "/usr/bin/false"]);
+
+        let out = run(&dir, "scripts/bk-evidence", &[&[&claim[..12]][..], &both].concat());
+        assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+        let evidence = bk(&dir, &["log", "--kind", "evidence", "--json"]);
+        assert!(evidence.contains(&format!("@ {head} on {tip}\"")), "{script}: {evidence}");
+        assert_eq!(
+            git(&["worktree", "list", "--porcelain"]).matches("worktree ").count(),
+            1,
+            "{script}: left a worktree"
+        );
+        assert_eq!(git(&["rev-parse", "HEAD"]), head, "{script}: moved HEAD");
+        git(&["config", "--unset", "commit.gpgsign"]);
+
+        // From a subdirectory, the command runs in that subdirectory of the merged tree (findings
+        // 405c31a313ac, 607a3268141a).
+        let sub = ["--as", "val", "--on", "main", "--", "/bin/sh", "-c", "test -f c.txt && test -f ../b.txt"];
+        let out = command(&dir, "../scripts/bk-evidence", &[&[&claim[..12]][..], &sub].concat())
+            .current_dir(dir.join("sub"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{script} from sub/: {}", String::from_utf8_lossy(&out.stderr));
+
+        // A command that changes the merged tree records nothing (finding eed0580eba69).
+        let before = bk(&dir, &["log", "--kind", "evidence", "--json"]);
+        let writes = ["--as", "val", "--on", "main", "--", "/bin/sh", "-c", "echo more >>a.txt"];
+        let out = run(&dir, "scripts/bk-evidence", &[&[&claim[..12]][..], &writes].concat());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{script}: {stderr}");
+        assert!(stderr.contains("changed the merged tree"), "{script}: {stderr}");
+        assert_eq!(bk(&dir, &["log", "--kind", "evidence", "--json"]), before, "{script}: recorded evidence");
+
+        // Without --on the same command sees only the head.
+        let out =
+            run(&dir, "scripts/bk-evidence", &[&claim[..12], "--as", "val", "--", "/bin/sh", "-c", "test -f b.txt"]);
+        assert_eq!(out.status.code(), Some(1), "{script}: b.txt isn't on the head");
+
+        // A head that conflicts with main: nothing run, nothing recorded, no worktree left.
+        git(&["switch", "-q", "main"]);
+        put(&dir, "a.txt", "main's own a\n");
+        commit_all(&dir, "conflict");
+        git(&["switch", "-q", "pr"]);
+        let before = bk(&dir, &["log", "--kind", "evidence", "--json"]);
+        let out = run(&dir, "scripts/bk-evidence", &[&[&claim[..12]][..], &both].concat());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{script}: {stderr}");
+        assert!(stderr.contains("doesn't merge cleanly"), "{script}: {stderr}");
+        assert_eq!(bk(&dir, &["log", "--kind", "evidence", "--json"]), before, "{script}: recorded evidence");
+        assert_eq!(
+            git(&["worktree", "list", "--porcelain"]).matches("worktree ").count(),
+            1,
+            "{script}: left a worktree"
+        );
+    }
+}
+
+/// merge runs ground-guards with GROUND_GUARDS_ATTRIBUTES_CHECKED cleared, so a value exported in the
+/// manager's shell can't let a root .gitattributes change through (note 0e50e7fc03af). A stub
+/// ground-guards fails if the variable reaches it.
+#[test]
+fn merge_clears_the_attributes_checked_variable_for_ground_guards() {
+    let stub = "#!/bin/sh\n[ -z \"$GROUND_GUARDS_ATTRIBUTES_CHECKED\" ] || \
+                { echo \"ground-guards: GROUND_GUARDS_ATTRIBUTES_CHECKED reached me\" >&2; exit 1; }\n\
+                echo \"ground-guards: all guards pass\"\n";
+    for scripts in SCRIPTS {
+        let (_tmp, dir, mut merge) =
+            merge_dry_run_command(scripts, |_| {}, |dir| put(dir, "code.txt", "a change\n"), |_| {}, None);
+        write_executable(&dir.join("scripts/ground-guards"), stub);
+        let out = merge.env("GROUND_GUARDS_ATTRIBUTES_CHECKED", "0".repeat(40)).output().unwrap();
+        let line = check_line(&out, "guards");
+        assert!(line.starts_with("ok "), "{scripts}: {line}");
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
     }
 }

@@ -18,7 +18,10 @@
 #      branch point is under .bracken/, or is untouched by the branch and either
 #      under docs/ (not docs/vision.md) or a .md file under .claude/skills/ outside
 #      any templates/ directory: none of these can change what builds, tests or
-#      runs. Renames count as a deletion and an addition;
+#      runs. Renames count as a deletion and an addition. Otherwise, main may be
+#      ahead in any path if a manager pass on the claim tested the merge
+#      ('<command> @ <sha> on <main sha>', from bk-evidence --on) with a main sha
+#      that main's tip has moved past only in those same paths;
 #   6. scripts/ground-guards passes on the sha against main's tip: no keys or stray
 #      files under .bracken/, the Ground append-only, the Ground opens, and
 #      docs/vision.md matches it.
@@ -196,27 +199,53 @@ else
   base=$(git -C "$main" merge-base "$tip" "$sha")
   # --no-renames: a file moved from code into docs/ must count under both paths.
   ours=$(git -C "$main" diff --no-renames --name-only "$base" "$sha")
-  bad=$(git -C "$main" diff --no-renames --name-only "$base" "$tip" | while IFS= read -r f; do
-    case "$f" in
-      .bracken/*) ;;
-      docs/vision.md) echo "$f" ;;
-      .claude/skills/templates/* | .claude/skills/*/templates/*) echo "$f" ;;
-      docs/* | .claude/skills/*.md) ! grep -qxF -- "$f" <<<"$ours" || echo "$f" ;;
-      *) echo "$f" ;;
-    esac
-  done)
+  # untested <from>: what main changed from <from> to its tip that can change what builds, tests or runs.
+  untested() {
+    git -C "$main" diff --no-renames --name-only "$1" "$tip" | while IFS= read -r f; do
+      case "$f" in
+        .bracken/*) ;;
+        docs/vision.md) echo "$f" ;;
+        .claude/skills/templates/* | .claude/skills/*/templates/*) echo "$f" ;;
+        docs/* | .claude/skills/*.md) ! grep -qxF -- "$f" <<<"$ours" || echo "$f" ;;
+        *) echo "$f" ;;
+      esac
+    done
+  }
+  bad=$(untested "$base")
+  # The main shas the manager's passes tested this head merged with ('<command> @ <sha> on <main sha>').
+  verified=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
+    and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
+    | .body.method | capture(" @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40})$")? | select(.h == $sha) | .m]
+    | unique | .[]' <<<"$shown")
+  on=""
+  # m must hold the branch point, or the tested merge added nothing and m..tip can hide a change
+  # main made and reverted after m (finding e82a2f2c7ff5); then m..tip is exactly what the test lacked.
+  for m in $verified; do
+    if git -C "$main" merge-base --is-ancestor "$base" "$m" 2>/dev/null &&
+      git -C "$main" merge-base --is-ancestor "$m" "$tip" 2>/dev/null && [ -z "$(untested "$m")" ]; then
+      on=$m
+      break
+    fi
+  done
   if [ -z "$bad" ]; then
     main_case="main ($tip) is ahead of $sha only in .bracken/, and docs/ or skill .md files the branch doesn't touch"
     check ok main "$main_case"
+  elif [ -n "$on" ]; then
+    main_case="main ($tip) is ahead of $sha in code, and the manager's pass tested $sha merged with main $on"
+    [ "$on" = "$tip" ] || main_case="$main_case, which main has moved past only in .bracken/ and docs"
+    check ok main "$main_case"
+  elif [ -n "$verified" ]; then
+    check FAIL main "main ($tip) has moved in code since the main the manager's passes tested $sha on ($(tr "\n" " " <<<"$verified" | sed 's/ $//')); verify again with bk-evidence --on origin/main: $(printf "%s" "$bad" | tr "\n" " ")"
   else
-    check FAIL main "main ($tip) is ahead of $sha with changes the verified head didn't test; merge main into the branch and verify again: $(printf "%s" "$bad" | tr "\n" " ")"
+    check FAIL main "main ($tip) is ahead of $sha with changes the verified head didn't test; verify the merge with bk-evidence --on origin/main, or merge main into the branch and verify again: $(printf "%s" "$bad" | tr "\n" " ")"
   fi
 fi
 
 # 6. The Ground guards, on what the head committed.
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
   check FAIL guards "$sha isn't on the forge"
-elif guards=$(cd "$main" && "$here/ground-guards" "$tip" "$sha" 2>&1); then
+# Cleared: a value exported in the caller's shell would let a root .gitattributes change through (note 0e50e7fc03af).
+elif guards=$(cd "$main" && GROUND_GUARDS_ATTRIBUTES_CHECKED='' "$here/ground-guards" "$tip" "$sha" 2>&1); then
   guards_case=$(tail -1 <<<"$guards")
   check ok guards "$guards_case"
 else
