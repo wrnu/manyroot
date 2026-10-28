@@ -63,6 +63,7 @@ bracken accepted                     # what the default policy accepts
 bracken accepted --min-passes 2 --validator val
 bracken status                       # per claim: what implements it, accepted or still waiting
 bracken status --all                 # plus the claims nothing implements yet
+bracken intend $REQ --for 30m        # "I'm on this": shown in status and show until it ends
 bracken conflicts                    # divergences and contradictions
 bracken show $REQ --json             # every read command supports --json
 ```
@@ -90,6 +91,13 @@ bracken import ground.mrb            # add a bundle to an existing replica
 | Evidence     | A `pass` or `fail` from checking a contribution, with the method used.                    |
 | Policy       | Local rules for turning evidence into acceptance: minimum passes, trusted validators.     |
 | Conflict     | A *divergence* (competing replacements) or a *contradiction* between current work.        |
+
+**Intents** are a convention on ordinary contributions, not part of the protocol. An intent is a
+claim tagged `intent` and `until:<RFC 3339 time>`, related to the contribution it's about by a
+`refines` relation from the same author; `bracken intend <id> [--for 1h]` writes both. `status`
+and `show` list an intent as live until it expires, its author retracts it, or its author relates
+something that `implements` the contribution. Like every timestamp, the expiry is advisory: it's
+the author's clock, so readers treat it as a hint, not a lock.
 
 The protocol is specified in [docs/protocol.md](docs/protocol.md). The long-term vision, principles
 and roadmap are in [docs/vision.md](docs/vision.md).
