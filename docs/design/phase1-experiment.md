@@ -666,21 +666,22 @@ hashes go into the run's plan.
 The files are in `crates/experiment/prompts/`: `base.md`, shared, and one
 "Where things are" section per mode (decision `4cf00e1d701d`). The system
 prompt is the base, then the mode's section. They are built into the binary.
-`bracken-experiment run` prints the blake3 of the system prompt it actually
-gives agents, the turn message and the tools as agents see them
-(`prompts::hashes`), for the plan.
+The run's `plan.json` holds the blake3 of the system prompt it actually gives
+agents (`inputs.system_prompt`, from `--prompt-file` in tests), of the tools
+as agents see them (`prompts.tools`) and of the turn message template
+(`prompts.turn-message`).
 Each turn's first message is the same in every mode: "This is your turn
 <t> of <n>. You are <name>. Start by reading your notes."
 
 The mode sections have one shape: the same four sentences in the same order,
-of 84 to 98 words. A test holds that shape, and holds that no prompt or tool
+of 84 to 99 words. A test holds that shape, and holds that no prompt or tool
 description mentions the experiment, a measure or another mode.
 
 | Sentence | Git | CRDT | Bracken | Why it differs |
 |---|---|---|---|---|
 | 1. Where the task is | TASKS.md on the hub's main, written only by the setter | TASKS.md in the shared document, written only by the setter | The setter's task claim and one spec claim per function | Each mode states the task in its own native form (section 2). An agent can't start without knowing where to look |
 | 2. Where changes appear | A new version of TASKS.md on main; its last line lists the released changes | The same, in the shared document | A new spec claim superseding the old one, with a claim tagged change | The same release, in each mode's native form |
-| 3. What counts as integrated | Main on the hub: a PR gets there only when someone merges it with pr_merge, which needs passing checks, a non-author's approval of its head, and no one else's latest review asking for changes | The hub's copy of the document: every edit to a module file counts on reaching the hub, with no other step | What the hub counts, as the accepted tool shows: an implementation its author related to the current spec claim, with a non-author's pass and no one else's latest verdict a fail | This is the difference under test. Each sentence states the mode's real rule (decisions `6b13e672e7d4`, `5e8df6996a2e`), names the step an agent must take where one exists (Git's pr_merge), and says where the agent can see the integrated state (main, the hub's document, the accepted tool, which shows exactly the harness's count). CRDT's is shortest because it has no gate |
+| 3. What counts as integrated | Main on the hub: a PR gets there only when someone merges it with pr_merge, which needs passing checks, a non-author's approval of its head, and no one else's latest review asking for changes | The hub's copy of the document: every edit to a module file counts on reaching the hub, with no other step | At the hub: implementations their authors related to each function's current spec claim, with a non-author's pass and no one else's latest verdict a fail; the accepted tool lists them as of the agent's last sync | This is the difference under test. Each sentence states the mode's real rule (decisions `6b13e672e7d4`, `5e8df6996a2e`), names the step an agent must take where one exists (Git's pr_merge), and says where the agent can see the integrated state (main, the hub's document, the accepted tool, which shows exactly the harness's count). CRDT's is shortest because it has no gate |
 | 4. How work moves | Only when you sync | Only when you sync | Only when you sync | Identical: every mode syncs with one hub (section 2) |
 
 What the three share word for word: the base prompt, the turn message, the
@@ -688,8 +689,13 @@ core tools (`sync`, `notes_read`, `notes_write`), and the fourth sentence. The
 mode tools' descriptions differ because the tools do (section 2). Each says
 what its tool does, in the same register, with no advice on strategy.
 Bracken's use plain words for the terms other modes don't need (replica,
-current, the relation's direction, a verdict's method), at about the words
-per tool of Git's, whose vocabulary models already know.
+current, the relation's direction, a verdict's method), so they are the
+longest per tool: counted at PR #33's head, Git's mode tools average 14.3
+words (258 over 18 tools), CRDT's 19.2 (77 over 4) and Bracken's 22.8 (273
+over 12). The extra words define Bracken's terms and parameters and give its
+check rule; models already know Git's vocabulary. The neutrality review
+judged the detail comparable, with no strategy beyond the integration step
+Git's prompt names too (evidence `e7e5868b02e8`).
 
 Each mode names its shared channel once, in one tool description, in the same
 sentence: "<it> is where agents talk to each other: everyone can read it
