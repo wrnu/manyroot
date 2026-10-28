@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bk-evidence: run a check and record its real result as evidence on a pr claim.
 #
-#   bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] -- <command> [args...]
+#   bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] [--on <main>] -- <command> [args...]
 #
 # Runs the command in the current checkout, streaming its output, and records
 # evidence on <claim> through scripts/bk: `pass` if it exits 0, otherwise `fail`,
@@ -9,6 +9,13 @@
 # exit code and the last N lines (default 40, at most 8000 bytes) of its combined
 # output, with control characters and invalid UTF-8 removed. Then exits with the
 # command's exit code.
+#
+# With --on <main> (a commit, such as origin/main), it tests the tree the merge will produce
+# instead: it merges that commit into HEAD in a scratch worktree, runs the command there (in the
+# same subdirectory), removes the worktree, and records --method "<command> @ <HEAD sha> on <main
+# sha>". The pr claim stays on HEAD. scripts/merge accepts main ahead of the head in any path when
+# the manager's pass names this head and a main that main's tip has moved past only in .bracken/
+# and docs. It refuses, recording nothing, if the merge conflicts: then merge main into the branch.
 #
 # It refuses, recording nothing, when:
 #   - it isn't run inside a git checkout;
@@ -35,7 +42,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] -- <command> [args...]" >&2
+  echo "usage: bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] [--on <main>] -- <command> [args...]" >&2
   exit 2
 }
 fail() { echo "bk-evidence: $*" >&2; exit 1; }
@@ -46,11 +53,13 @@ shift
 agent=${BRACKEN_AGENT:-}
 lines=40
 any_head=false
+on=
 while [ $# -gt 0 ]; do
   case "$1" in
     --as) [ $# -ge 2 ] || usage; agent=$2; shift 2 ;;
     --lines) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || usage; lines=$2; shift 2 ;;
     --any-head) any_head=true; shift ;;
+    --on) [ $# -ge 2 ] || usage; on=$2; shift 2 ;;
     --) shift; break ;;
     *) usage ;;
   esac
@@ -66,12 +75,30 @@ sha=$(git -C "$top" rev-parse HEAD)
 dirty=$(changes)
 [ -z "$dirty" ] || fail "the checkout has uncommitted changes, so '@ $sha' would be wrong; commit first:
 $dirty"
-kind=$(type -t "$1" || true)
+# With --on, the command runs in a scratch worktree holding HEAD merged with that commit.
+run_dir=$PWD
+scratch=
+remove_scratch() { [ -z "$scratch" ] || git -C "$top" worktree remove --force "$scratch/tree" 2>/dev/null || true; }
+trap remove_scratch EXIT
+if [ -n "$on" ]; then
+  onto=$(git -C "$top" rev-parse --verify -q "$on^{commit}") || fail "no commit '$on' (nothing run)"
+  scratch=$(mktemp -d)
+  git -C "$top" worktree add -q --detach "$scratch/tree" "$sha" || fail "couldn't make a worktree at $sha (nothing run)"
+  # No hooks, no signing, and a fixed identity: the merge commit is only for this run.
+  if ! err=$(git -C "$scratch/tree" -c core.hooksPath=/dev/null -c commit.gpgsign=false -c merge.verifySignatures=false \
+    -c user.name=bk-evidence -c user.email=bk-evidence@invalid merge -q --no-ff --no-edit "$onto" 2>&1); then
+    fail "$sha doesn't merge cleanly with $onto: merge main into the branch, then test that head (nothing run). git said: $(tail -n 3 <<<"$err")"
+  fi
+  merged=$(git -C "$scratch/tree" rev-parse HEAD)
+  # The caller's subdirectory, from where it runs (with -C the prefix would always be empty).
+  run_dir="$scratch/tree/$(git rev-parse --show-prefix)"
+fi
+kind=$(cd "$run_dir" && type -t "$1" || true)
 case "$kind" in
   file) ;;
   "") echo "bk-evidence: command not found: $1 (nothing recorded)" >&2; exit 127 ;;
   *)
-    path=$(type -P "$1" || true)
+    path=$(cd "$run_dir" && type -P "$1" || true)
     echo "bk-evidence: '$1' is a shell $kind, and bk-evidence runs only executable files; pass ${path:-the program path}, or wrap it in bash -c '...' (nothing recorded)" >&2
     exit 127
     ;;
@@ -104,9 +131,9 @@ fi
 out=$(mktemp)
 kept=$(mktemp)
 details=$(mktemp)
-trap 'rm -f "$out" "$kept" "$details"' EXIT
+trap 'rm -f "$out" "$kept" "$details"; remove_scratch' EXIT
 set +e
-"$@" 2>&1 | tee "$out"
+(cd "$run_dir" && "$@") 2>&1 | tee "$out"
 code=${PIPESTATUS[0]}
 set -e
 
@@ -115,6 +142,11 @@ after=$(git -C "$top" rev-parse HEAD)
 dirty=$(changes)
 [ -z "$dirty" ] || fail "the command changed the checkout, so the run didn't test $sha; nothing recorded (exit $code):
 $dirty"
+if [ -n "$on" ]; then
+  [ "$(git -C "$scratch/tree" rev-parse HEAD)" = "$merged" ] &&
+    [ -z "$(git -C "$scratch/tree" status --porcelain | grep -E -v '^\?\? \.bracken/' || true)" ] ||
+    fail "the command changed the merged tree, so the run didn't test it; nothing recorded (exit $code)"
+fi
 
 verdict=pass
 [ "$code" -eq 0 ] || verdict=fail
@@ -132,6 +164,7 @@ fi
     LC_ALL=C sed $'s/\xc2[\x80-\x9f]//g' || true
 } >"$details"
 method="$(printf '%q ' "$@")@ $sha"
+[ -z "$on" ] || method="$method on $onto"
 if id=$("$here/bk" evidence "$claim" "$verdict" --method "$method" --details-file "$details" --as "$agent"); then
   echo "bk-evidence: recorded $verdict $id (exit $code)" >&2
   exit "$code"
