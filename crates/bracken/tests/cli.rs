@@ -562,7 +562,7 @@ fn status_shows_what_implements_each_claim_and_what_is_waiting() {
         assert!(!text.contains(&hidden[..12]), "{hidden} listed:\n{text}");
     }
     let all = bracken(dir, &["status", "--all"]);
-    let tail = all.split("nothing implements:").nth(1).unwrap_or_else(|| panic!("{all}"));
+    let tail = all.split("nothing implements, or intends to:").nth(1).unwrap_or_else(|| panic!("{all}"));
     assert!(tail.contains(&idle[..12]) && tail.contains("spec: new") && !tail.contains(&busy[..12]), "{all}");
     // A stricter policy: nothing has two passes, so all waits. A second pass by the same validator is
     // still one independent pass.
@@ -912,6 +912,104 @@ fn log_lines_escape_control_characters_from_other_agents_text() {
         }
         assert!(out.contains("n\\u{d}[2K"), "{args:?} lost the note's CR:\n{out}");
     }
+}
+
+/// `intend` records an intent claim (tagged intent, with its expiry) and its refines relation, both by the
+/// same identity. `status` and `show` list live intents: not expired, not retracted, related by their own
+/// author, and not ended by that author delivering. Intents aren't listed as claims of their own.
+#[test]
+fn intents_show_who_is_working_on_a_claim_until_they_expire_or_deliver() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "intent"]);
+    for who in ["alice", "bob", "carol", "dave", "erin", "mallory"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let spec = bracken(dir, &["claim", "spec: parse dates", "--as", "alice"]);
+    let now_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+
+    // alice: live for 30 minutes.
+    let before = now_ms();
+    let out = bracken(dir, &["intend", &spec[..12], "--for", "30m", "--as", "alice"]);
+    let printed: Vec<&str> = out.lines().collect();
+    assert_eq!(printed.len(), 2, "{out}");
+    let alice = printed[0].to_owned();
+    let intent = json(dir, &["show", &alice, "--json"]);
+    let tags: Vec<&str> = intent["body"]["tags"].as_array().unwrap().iter().map(|t| t.as_str().unwrap()).collect();
+    assert_eq!(tags[0], "intent");
+    assert!(tags[1].starts_with("until:") && tags[1].ends_with('Z'), "{tags:?}");
+    let relation = json(dir, &["show", printed[1], "--json"]);
+    assert_eq!(relation["body"]["kind"], "refines");
+    assert_eq!(relation["body"]["from"], alice.as_str());
+    assert_eq!(relation["body"]["to"], spec.as_str());
+    assert_eq!(relation["author_name"], "alice");
+
+    // erin: expired, and nothing else ends it. Written by hand, as the convention allows.
+    let old = bracken(
+        dir,
+        &["claim", "intent: on it", "--tag", "intent", "--tag", "until:2020-01-01T00:00:00Z", "--as", "erin"],
+    );
+    bracken(dir, &["relate", &old, "refines", &spec, "--as", "erin"]);
+    // carol: retracted, which hides its relation too.
+    let carol = bracken(dir, &["intend", &spec, "--as", "carol"]).lines().next().unwrap().to_owned();
+    bracken(dir, &["retract", &carol, "--as", "carol"]);
+    // mallory's intent, related to the spec by someone else: not mallory's intent on it.
+    let mallory = bracken(
+        dir,
+        &["claim", "intent: mine", "--tag", "intent", "--tag", "until:2999-01-01T00:00:00Z", "--as", "mallory"],
+    );
+    bracken(dir, &["relate", &mallory, "refines", &spec, "--as", "bob"]);
+    // dave: ended by delivering; bob's delivery doesn't end alice's.
+    let dave = bracken(dir, &["intend", &spec, "--as", "dave"]).lines().next().unwrap().to_owned();
+    std::fs::write(dir.join("f"), "x").unwrap();
+    bracken(dir, &["artifact", "f", "--name", "dave.rs", "--implements", &spec, "--as", "dave"]);
+    bracken(dir, &["artifact", "f", "--name", "bob.rs", "--implements", &spec, "--as", "bob"]);
+
+    let v = json(dir, &["status", "--json"]);
+    let claims = v["claims"].as_array().unwrap();
+    assert_eq!(claims.len(), 1, "intents aren't claims of their own: {v}");
+    let intents = claims[0]["intents"].as_array().unwrap();
+    let ids: Vec<&str> = intents.iter().map(|i| i["id"].as_str().unwrap()).collect();
+    assert_eq!(ids, [alice.as_str()], "only alice's intent is live");
+    assert_eq!(intents[0]["author_name"], "alice");
+    let until = intents[0]["until_ms"].as_u64().unwrap();
+    assert!(until >= before + 29 * 60_000 && until <= now_ms() + 30 * 60_000, "{until}");
+    assert!(intents[0]["until"].as_str().unwrap().ends_with('Z') && intents[0]["age_ms"].as_u64().is_some());
+
+    let text = bracken(dir, &["status"]);
+    let row = text.lines().find(|l| l.contains(&alice[..12])).unwrap_or_else(|| panic!("{text}"));
+    assert!(row.trim_start().starts_with("intent") && row.contains("alice") && row.contains("until "), "{row}");
+    for gone in [&old, &carol, &mallory, &dave] {
+        assert!(!text.contains(&gone[..12]), "{gone} shown live:\n{text}");
+    }
+    let shown = bracken(dir, &["show", &spec]);
+    let section = shown.split("live intents:").nth(1).unwrap_or_else(|| panic!("{shown}"));
+    assert!(section.contains(&alice[..12]) && !section.contains(&dave[..12]), "{shown}");
+    let shown = json(dir, &["show", &spec, "--json"]);
+    assert_eq!(shown["intents"][0]["id"], alice.as_str());
+    assert_eq!(shown["intents"].as_array().unwrap().len(), 1);
+
+    // A claim with only a live intent is listed, with nothing implementing it.
+    let other = bracken(dir, &["claim", "spec: format dates", "--as", "alice"]);
+    bracken(dir, &["intend", &other, "--for", "2h", "--as", "bob"]);
+    let v = json(dir, &["status", "--json"]);
+    let listed = v["claims"].as_array().unwrap().iter().find(|c| c["claim"]["id"] == other.as_str()).unwrap().clone();
+    assert_eq!(listed["implemented_by"], serde_json::json!([]));
+    assert_eq!(listed["intents"][0]["author_name"], "bob");
+
+    // Intents aren't claims nothing implements, either.
+    let v = json(dir, &["status", "--all", "--json"]);
+    let unimplemented: Vec<&str> =
+        v["unimplemented"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    for i in [&alice, &old, &mallory] {
+        assert!(!unimplemented.contains(&i.as_str()), "intent {i} listed as a claim: {unimplemented:?}");
+    }
+
+    // Bad input writes nothing.
+    let log = bracken(dir, &["log", "--json"]);
+    assert!(bracken_fails(dir, &["intend", "ffffffffffff", "--as", "alice"]).contains("no matching contribution"));
+    assert!(bracken_fails(dir, &["intend", &spec, "--for", "soon", "--as", "alice"]).contains("soon"));
+    assert_eq!(bracken(dir, &["log", "--json"]), log, "a failed intend wrote something");
 }
 
 /// Characters from other agents' text that could forge, overwrite or reorder a line: none may reach the

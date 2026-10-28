@@ -193,8 +193,18 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
-    /// For each current claim that something implements, what implements it: which one the policy
-    /// accepts, and which are still waiting for an independent pass (listed first).
+    /// Say you're working on a contribution, so others don't start the same work: an intent claim
+    /// (tagged `intent`, with its expiry) that refines it. It ends when it expires, when you retract
+    /// it, or when you relate something that implements the contribution.
+    Intend {
+        id: String,
+        /// How long the intent holds, e.g. 30m or 2h. Advisory, like every timestamp.
+        #[arg(long = "for", value_name = "DURATION", default_value = "1h", value_parser = humantime::parse_duration)]
+        duration: std::time::Duration,
+    },
+    /// For each current claim that something implements or intends to, what does: which one the
+    /// policy accepts, which are still waiting for an independent pass (listed first), and the live
+    /// intents.
     Status {
         /// Also list the current claims that nothing implements, at the end.
         #[arg(long)]
@@ -471,8 +481,7 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                         None => line(g, &names, c),
                     };
                     for (by, author) in view.as_ref().map_or(&[][..], |v| v.by_others(&c.id())) {
-                        let author = names.display(author);
-                        text.push_str(&format!("  (superseded by {author} {})", by.short()));
+                        text.push_str(&superseded_by_suffix(&names, by, author));
                     }
                     if compact {
                         text = listing::cap_line(text);
@@ -494,13 +503,22 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let c = g.get(&resolve(&s, &id)?).expect("resolved ids exist");
             let assessment = policy.assess(g, &c.id());
             let referrers: Vec<&Contribution> = g.referrers(&c.id()).collect();
+            let intents = live_intents(g, &CurrentView::new(g, &g.topo_order()), &c.id(), now_ms());
             if out.json {
                 let mut v = contribution_json(g, &names, c);
                 v["assessment"] = json!(assessment);
                 v["referrers"] = referrers.iter().map(|r| contribution_json(g, &names, r)).collect();
+                v["intents"] = intents.iter().map(|i| intent_json(g, &names, i, now_ms())).collect();
                 print_json(&v);
             } else {
                 print_show(g, &names, c, assessment.as_ref(), &referrers);
+                if !intents.is_empty() {
+                    println!();
+                    println!("live intents:");
+                    for i in &intents {
+                        println!("{}", terminal::printable(&intent_line(&names, i, now_ms())));
+                    }
+                }
             }
         }
         Command::Cat { id } => {
@@ -562,6 +580,30 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             }
         }
         Command::Status { all, policy, out } => print_status(&s, all, &policy, out.json)?,
+        Command::Intend { id, duration } => {
+            let who = signer(&s, agent)?;
+            let target = resolve(&s, &id)?;
+            let until = humantime::format_rfc3339_seconds(std::time::SystemTime::now() + duration).to_string();
+            let statement = format!("intent: working on {} until {until}", target.short());
+            let tags = vec![INTENT_TAG.to_owned(), format!("{UNTIL_TAG}{until}")];
+            let intent = contribute(&mut s, &who, Body::Claim { statement, tags })?;
+            println!("{intent}");
+            let relation =
+                Body::Relation { from: intent, kind: RelationKind::Refines, to: target, note: String::new() };
+            match contribute(&mut s, &who, relation) {
+                Ok(id) => println!("{id}"),
+                // The claim stays: the Ground is append-only. Its id is printed above.
+                Err(e) => {
+                    eprintln!(
+                        "bracken: intent {intent} was recorded, but its refines relation to {target} couldn't be: \
+                         {e:#}; relate it with `bracken relate {} refines {}`",
+                        intent.short(),
+                        target.short()
+                    );
+                    return Ok(decide(false));
+                }
+            }
+        }
         Command::Sync { exec: Some(program), confirm, bounds, .. } => {
             return sync_remote(&mut s, confirm, |s| remote::sync_exec(s, &program, bounds.bounds()));
         }
@@ -780,17 +822,18 @@ fn own_claim(s: &Store, names: &Names, who: &Identity, prefix: &str) -> Result<C
     Ok(id)
 }
 
-/// `status`: each current claim that something implements, with what implements it and how the policy
-/// assesses each, waiting ones first; with `all`, then the current claims nothing implements. A
-/// contribution implements a claim through a current `implements` relation from it to the claim,
-/// whoever wrote the relation, and whatever kind of contribution it is.
+/// `status`: each current claim that something implements or has a live intent on, with what
+/// implements it and how the policy assesses each, waiting ones first, and its live intents; with
+/// `all`, then the current claims with neither. A contribution implements a claim through a current
+/// `implements` relation from it to the claim, whoever wrote the relation, and whatever kind of
+/// contribution it is.
 fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Result<()> {
     let names = Names::load(s)?;
     let policy = policy.build(&names)?;
     let g = s.graph();
     let order = g.topo_order();
     let view = CurrentView::new(g, &order);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let now = now_ms();
     let rank = |status: Status| match status {
         Status::Pending => 0,
         Status::Accepted => 1,
@@ -798,11 +841,15 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
         Status::Rejected => 3,
         Status::Retracted => 4,
     };
-    let mut implemented: Vec<(&Contribution, Vec<(&Contribution, Assessment)>)> = Vec::new();
+    // Each claim, with what implements it and its live intents.
+    type Row<'a> = (&'a Contribution, Vec<(&'a Contribution, Assessment)>, Vec<Intent<'a>>);
+    let mut implemented: Vec<Row> = Vec::new();
     let mut unimplemented: Vec<&Contribution> = Vec::new();
     for id in &order {
         let c = g.get(id).expect("ordered ids exist");
-        if view.hidden.contains(id) || !matches!(c.body(), Body::Claim { .. }) {
+        // Intents are about other claims, not subjects of their own.
+        let is_claim = matches!(c.body(), Body::Claim { tags, .. } if !tags.iter().any(|t| t == INTENT_TAG));
+        if view.hidden.contains(id) || !is_claim {
             continue;
         }
         let mut by: Vec<ContributionId> = g
@@ -818,17 +865,18 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
         by.dedup();
         let mut rows: Vec<(&Contribution, Assessment)> =
             by.iter().filter_map(|i| Some((g.get(i).expect("related ids exist"), policy.assess(g, i)?))).collect();
-        if rows.is_empty() {
+        let intents = live_intents(g, &view, id, now);
+        if rows.is_empty() && intents.is_empty() {
             if all {
                 unimplemented.push(c);
             }
             continue;
         }
         rows.sort_by_key(|(i, a)| (rank(a.status), i.content().timestamp_ms));
-        implemented.push((c, rows));
+        implemented.push((c, rows, intents));
     }
     // Claims with something waiting first; otherwise in causal order (the sort is stable).
-    implemented.sort_by_key(|(_, rows)| rows.iter().all(|(_, a)| a.status != Status::Pending));
+    implemented.sort_by_key(|(_, rows, _)| rows.iter().all(|(_, a)| a.status != Status::Pending));
 
     let age_ms = |c: &Contribution| now.saturating_sub(c.content().timestamp_ms);
     // Distinct validators with a counted pass, as the policy counts them: one validator passing twice is one.
@@ -837,7 +885,7 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
     if json_out {
         let claims: Vec<Value> = implemented
             .iter()
-            .map(|(c, rows)| {
+            .map(|(c, rows, intents)| {
                 let by: Vec<Value> = rows
                     .iter()
                     .map(|(i, a)| {
@@ -849,7 +897,8 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
                         v
                     })
                     .collect();
-                json!({"claim": contribution_json(g, &names, c), "implemented_by": by})
+                let intents: Vec<Value> = intents.iter().map(|i| intent_json(g, &names, i, now)).collect();
+                json!({"claim": contribution_json(g, &names, c), "implemented_by": by, "intents": intents})
             })
             .collect();
         let unimplemented: Vec<Value> = unimplemented.iter().map(|c| contribution_json(g, &names, c)).collect();
@@ -857,14 +906,17 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
         return Ok(());
     }
     if implemented.is_empty() {
-        println!("no current claim is implemented by anything");
+        println!("no current claim is implemented by anything, or has a live intent");
     }
-    for (n, (c, rows)) in implemented.iter().enumerate() {
+    for (n, (c, rows, intents)) in implemented.iter().enumerate() {
         if n > 0 {
             println!();
         }
         // Other agents' text is printed escaped, so it can't forge lines (finding 252f052a283d).
         println!("{}", terminal::printable(&line(g, &names, c)));
+        for i in intents {
+            println!("{}", terminal::printable(&intent_line(&names, i, now)));
+        }
         for (i, a) in rows {
             let label = match a.status {
                 Status::Pending => "waiting",
@@ -888,12 +940,83 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
     }
     if !unimplemented.is_empty() {
         println!();
-        println!("nothing implements:");
+        println!("nothing implements, or intends to:");
         for c in &unimplemented {
             println!("{}", terminal::printable(&line(g, &names, c)));
         }
     }
     Ok(())
+}
+
+/// Milliseconds since the Unix epoch, now.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The tag that makes a claim an intent, and the prefix of the tag holding its expiry.
+const INTENT_TAG: &str = "intent";
+const UNTIL_TAG: &str = "until:";
+
+/// A live intent: a current claim tagged `intent`, with a tag `until:<RFC 3339 time>` still in the
+/// future, related to its target by a current `refines` relation its own author wrote, and not
+/// ended by delivery: no current `implements` relation to the target by the same author that isn't
+/// causally before the intent. A convention on ordinary contributions; the time is advisory.
+struct Intent<'a> {
+    claim: &'a Contribution,
+    until: String,
+    until_ms: u64,
+}
+
+/// The live intents on `target`, oldest first.
+fn live_intents<'a>(g: &'a Graph, view: &CurrentView, target: &ContributionId, now: u64) -> Vec<Intent<'a>> {
+    let current = |c: &&Contribution| !view.hidden.contains(&c.id());
+    let relations = |kind: RelationKind| {
+        g.referrers(target).filter(current).filter_map(move |r| match r.body() {
+            Body::Relation { from, kind: k, to, .. } if *k == kind && to == target => Some((r, *from)),
+            _ => None,
+        })
+    };
+    let mut intents: Vec<Intent> = relations(RelationKind::Refines)
+        .filter_map(|(r, from)| {
+            // Current already: a relation that refers to a hidden (retracted, superseded) claim is hidden too.
+            let claim = g.get(&from)?;
+            let Body::Claim { tags, .. } = claim.body() else { return None };
+            if r.author() != claim.author() || !tags.iter().any(|t| t == INTENT_TAG) {
+                return None;
+            }
+            let until = tags.iter().find_map(|t| t.strip_prefix(UNTIL_TAG))?;
+            let at = humantime::parse_rfc3339(until).ok()?;
+            let until_ms = at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
+            let delivered = relations(RelationKind::Implements)
+                .any(|(d, _)| d.author() == claim.author() && !g.is_ancestor(&d.id(), &claim.id()));
+            (until_ms > now && !delivered).then(|| Intent { claim, until: until.to_owned(), until_ms })
+        })
+        .collect();
+    intents.sort_by_key(|i| (i.claim.content().timestamp_ms, i.claim.id()));
+    intents.dedup_by_key(|i| i.claim.id());
+    intents
+}
+
+fn intent_json(g: &Graph, names: &Names, i: &Intent, now: u64) -> Value {
+    let mut v = contribution_json(g, names, i.claim);
+    v["until"] = json!(i.until);
+    v["until_ms"] = json!(i.until_ms);
+    v["age_ms"] = json!(now.saturating_sub(i.claim.content().timestamp_ms));
+    v
+}
+
+/// A live intent's row: its id, author, age and expiry.
+fn intent_line(names: &Names, i: &Intent, now: u64) -> String {
+    format!(
+        "  {:<10}  {}  {:<8}  {:<12}  {:>4} ago  until {} ({} left)",
+        "intent",
+        i.claim.id().short(),
+        "claim",
+        names.display(&i.claim.author()),
+        age(now.saturating_sub(i.claim.content().timestamp_ms)),
+        i.until,
+        age(i.until_ms.saturating_sub(now))
+    )
 }
 
 /// A duration in milliseconds, in its largest whole unit: 45s, 12m, 3h, 2d.
@@ -1032,6 +1155,13 @@ impl PolicyArgs {
         };
         Ok(Policy { min_passes: self.min_passes, validators })
     }
+}
+
+/// `log --current`'s mark on a line that another author claims to supersede. The rest of the line is
+/// escaped already; the name is escaped here, since an agent entry's name isn't checked when it's read
+/// (security evidence cb1a56001700).
+fn superseded_by_suffix(names: &Names, by: &ContributionId, author: &AgentId) -> String {
+    format!("  (superseded by {} {})", terminal::printable(&names.display(author)), by.short())
 }
 
 /// Local names for agents. Agents without a local identity show by key.
@@ -1233,4 +1363,20 @@ fn write_stdout(bytes: &[u8]) {
 
 fn print_json(v: &impl serde::Serialize) {
     println!("{}", serde_json::to_string_pretty(v).expect("values serialize"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_superseded_by_mark_escapes_the_agent_name() {
+        let author: AgentId = "a".repeat(64).parse().expect("a test key");
+        let by: ContributionId = "b".repeat(64).parse().expect("a test id");
+        let names = Names(HashMap::from([(author, "ev\u{1b}[2Kil\r\nfake".to_owned())]));
+        assert_eq!(
+            superseded_by_suffix(&names, &by, &author),
+            format!("  (superseded by ev\\u{{1b}}[2Kil\\u{{d}}\\u{{a}}fake {})", by.short())
+        );
+    }
 }

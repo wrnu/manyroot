@@ -15,6 +15,7 @@ anyhow.workspace = true
 blake3.workspace = true
 getrandom.workspace = true
 httparse.workspace = true
+humantime.workspace = true
 manyroot.workspace = true
 clap.workspace = true
 serde.workspace = true
