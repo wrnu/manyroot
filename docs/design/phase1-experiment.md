@@ -652,8 +652,9 @@ the same values; the security review's `--receive-pack` reproduction
 3. The turn ends when the model stops, or when the driver ends the process
    at a cap (section 5): 150,000 tokens of context, or 10 minutes. The
    25-tool-call cap ends a turn softly (decision `147a36d5d623`): the
-   driver's MCP server refuses the 26th call and every later one, telling
-   the agent its tool calls are used up and to stop, and the turn may still
+   driver's MCP server refuses the 26th call and every later one, except
+   one `notes_write` (decision `74d00180c642`), telling the agent its tool
+   calls are used up and to save its notes and stop, and the turn may still
    end itself and write its `result` event. Only if it hasn't within 60
    seconds or 3 more model calls does the driver end the process. The
    harness then syncs the agent with the hub and saves its notes.
@@ -697,6 +698,14 @@ description mentions the experiment, a measure or another mode.
 | 2. Where changes appear | A new version of TASKS.md on main; its last line lists the released changes | The same, in the shared document | A new spec claim superseding the old one, with a claim tagged change | The same release, in each mode's native form |
 | 3. What counts as integrated | Main on the hub: a PR gets there only when someone merges it with pr_merge, which needs passing checks, a non-author's approval of its head, and no one else's latest review asking for changes | The hub's copy of the document: every edit to a module file counts on reaching the hub, with no other step | At the hub: implementations their authors related to each function's current spec claim, with a non-author's pass and no one else's latest verdict a fail; the accepted tool lists them as of the agent's last sync | This is the difference under test. Each sentence states the mode's real rule (decisions `6b13e672e7d4`, `5e8df6996a2e`), names the step an agent must take where one exists (Git's pr_merge), and says where the agent can see the integrated state (main, the hub's document, the accepted tool, which shows exactly the harness's count). CRDT's is shortest because it has no gate |
 | 4. How work moves | Only when you sync | Only when you sync | Only when you sync | Identical: every mode syncs with one hub (section 2) |
+
+Every tool result, in every mode, is bounded at 40,000 characters
+(`MAX_RESULT_CHARS`, decision `74d00180c642`), below Claude Code's own
+tool-result limit of about 50,000, so Claude Code never cuts one itself. A
+longer result keeps its first 40,000 characters and ends with a note giving
+its full length and saying how to narrow the call (one file, function or
+item, a line range or a smaller count, where the tool takes one); the event
+log records the full length as `cut_from`. No result is cut silently.
 
 What the three share word for word: the base prompt, the turn message, the
 core tools (`sync`, `notes_read`, `notes_write`), and the fourth sentence. The
@@ -1033,7 +1042,12 @@ Each layer stops a run's use on its own:
    cap is a soft stop (decision `147a36d5d623`): the driver's MCP server
    refuses the 26th call and every later one, so none reaches a tool, with
    the message "This turn's tool calls are used up: no more will run this
-   turn. Finish now: stop and end your turn." The count is also taken from
+   turn, except one notes_write. Finish now: save your notes if you haven't,
+   then stop and end your turn." The one exception is the turn's first
+   `notes_write` past the cap, in every mode (decision `74d00180c642`): in
+   the pilot data, Bracken agents saved notes in 7 to 19 of 80 turns against
+   Git's 64 to 71, so turns at the cap lost their notes. A second
+   `notes_write` is refused like any other call. The count is also taken from
    the event stream (the `tool_use` blocks): from the 26th, the turn has a
    grace of 60 seconds and 3 more model calls to end with its own `result`
    event, which is then counted as any other turn's. Past the grace the
