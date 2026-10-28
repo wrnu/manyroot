@@ -450,7 +450,7 @@ impl Run<'_> {
                 "tools/list" => json!({"result": {"tools": self.tools}}),
                 "tools/call" if calls >= self.cfg.calls_per_turn => {
                     self.events.log(Some(name), "call_refused", json!({"turn": turn, "calls": calls}));
-                    let text = "this turn's tool calls are spent";
+                    let text = "This turn's tool calls are used up: no more will run this turn. Finish now: stop and end your turn.";
                     json!({"result": {"content": [{"type": "text", "text": text}], "isError": true}})
                 }
                 "tools/call" => {

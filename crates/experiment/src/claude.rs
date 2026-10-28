@@ -198,8 +198,13 @@ impl Expect {
 /// Section 5's caps.
 #[derive(Debug, Clone)]
 pub struct Caps {
-    /// Tool calls asked for in one turn; the process ends past it.
+    /// Tool calls asked for in one turn. Past it the driver refuses each call and the turn has
+    /// [`Caps::cap_grace`] and [`Caps::cap_grace_calls`] to end itself (decision `147a36d5d623`).
     pub calls_per_turn: u32,
+    /// How long a turn past its tool-call cap may take to write its result; then the process ends.
+    pub cap_grace: Duration,
+    /// How many more model calls a turn past its tool-call cap may make; at the next, the process ends.
+    pub cap_grace_calls: usize,
     /// Context of one model call (input, cache reads and cache writes).
     pub context: u64,
     pub turn_time: Duration,
@@ -220,6 +225,8 @@ impl Caps {
     pub fn pilot() -> Caps {
         Caps {
             calls_per_turn: 25,
+            cap_grace: Duration::from_secs(60),
+            cap_grace_calls: 3,
             context: 150_000,
             turn_time: Duration::from_secs(600),
             turn_output: 30_000,
@@ -227,9 +234,12 @@ impl Caps {
             turn_budget_usd: Some(1.0),
             agent_tokens: 3_000_000,
             agent_output: 180_000,
-            run_tokens: 75_000_000,
-            run_output: 5_000_000,
-            run_time: Duration::from_secs(3 * 3600),
+            // One run is one mode, and the modes run one after another: each run's caps are a third
+            // of the owner's go for the whole pilot, 75M tokens, 5M output and 3 h (decisions
+            // `3418fe14b8ed`, `ea053c2c4d48`), equal in every mode.
+            run_tokens: 25_000_000,
+            run_output: 1_666_666,
+            run_time: Duration::from_secs(3600),
         }
     }
 }
@@ -572,6 +582,8 @@ impl ClaudeBackend {
         let mut tool_uses: BTreeSet<String> = BTreeSet::new();
         // Whether a result event's figures were counted.
         let mut settled = false;
+        // Once past the tool-call cap: until when, and after how many model calls, the turn may end itself.
+        let mut grace: Option<(Instant, usize)> = None;
         let ended = loop {
             if let Some(why) = self.halted() {
                 break End::Halt(why);
@@ -582,6 +594,9 @@ impl ClaudeBackend {
             }
             if now >= deadline {
                 break End::Cap("turn time");
+            }
+            if grace.is_some_and(|(until, _)| now >= until) {
+                break End::Cap("tool calls");
             }
             let line = match lines.recv_timeout(POLL.min(deadline - now)) {
                 Ok(Ok(l)) => l,
@@ -619,6 +634,10 @@ impl ClaudeBackend {
                     let Some(tools) = tools else {
                         break End::Halt("a tool call without an id".into());
                     };
+                    // A model call beyond the grace's: counted, then the process ends.
+                    let beyond_grace = grace.is_some_and(|(_, at)| {
+                        !messages.contains_key(id) && messages.len() >= at + caps.cap_grace_calls
+                    });
                     let seen = messages.entry(id.to_string()).or_default();
                     let grown = usage.beyond(seen);
                     seen.add(&grown);
@@ -634,8 +653,13 @@ impl ClaudeBackend {
                     if usage.input_side() >= caps.context {
                         break End::Cap("context");
                     }
-                    if tool_uses.len() > caps.calls_per_turn as usize {
+                    if beyond_grace {
                         break End::Cap("tool calls");
+                    }
+                    if grace.is_none() && tool_uses.len() > caps.calls_per_turn as usize {
+                        // The driver refuses this call and every later one; the turn may still end itself.
+                        self.record(json!({"agent": name, "turn": turn, "past_tool_call_cap": tool_uses.len()}));
+                        grace = Some((now + caps.cap_grace, messages.len()));
                     }
                 }
                 Some("result") => {
