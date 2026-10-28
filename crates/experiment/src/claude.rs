@@ -45,6 +45,13 @@ use crate::worker::Lines;
 /// The only entries the owner's settings may hold under `env`; any other stops the run before it starts.
 pub const ROUTING_KEYS: [&str; 3] =
     ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"];
+/// The run's own caps (design section 5): stops a plan expects, which the driver logs by name.
+pub const RUN_TOKEN_CAP: &str = "the run's token cap is reached";
+pub const RUN_TIME_CAP: &str = "the run's time cap is reached";
+
+/// The message that starts each turn; the plan hashes it.
+pub const TURN_MESSAGE: &str = "This is turn {turn} of yours. You are {name}.";
+
 /// The MCP server name the shim is registered under: its tools are `mcp__experiment__<tool>`.
 pub const SERVER: &str = "experiment";
 /// The longest event line read from Claude Code.
@@ -391,7 +398,7 @@ impl ClaudeBackend {
         let mine = totals.agents.entry(agent.to_string()).or_default();
         mine.add(t);
         if run.total() >= caps.run_tokens || run.output >= caps.run_output {
-            return Some(End::Halt("the run's token cap is reached".into()));
+            return Some(End::Halt(RUN_TOKEN_CAP.into()));
         }
         (mine.total() >= caps.agent_tokens || mine.output >= caps.agent_output).then_some(End::Cap("agent tokens"))
     }
@@ -529,7 +536,7 @@ impl ClaudeBackend {
     fn play(&self, name: &str, turn: u32, socket: &Path) -> Result<End, String> {
         let turn_dir =
             self.cfg.pin.check().and_then(|()| self.turn_config(name, socket)).map_err(|e| self.halting(e))?;
-        let message = format!("This is turn {turn} of yours. You are {name}.");
+        let message = TURN_MESSAGE.replace("{turn}", &turn.to_string()).replace("{name}", name);
         let mut cmd = self.command(name, &turn_dir, socket, &message)?;
         let path = self.cfg.dir.join("transcripts").join(format!("{name}-{turn}.jsonl"));
         let mut transcript = Transcript::create(&path, self.cfg.routing.secret())?;
@@ -569,7 +576,7 @@ impl ClaudeBackend {
             }
             let now = Instant::now();
             if now >= self.started + caps.run_time {
-                break End::Halt("the run's time cap is reached".into());
+                break End::Halt(RUN_TIME_CAP.into());
             }
             if now >= deadline {
                 break End::Cap("turn time");
@@ -704,10 +711,10 @@ impl Backend for ClaudeBackend {
         let (mine, run) = self.totals(name);
         let caps = &self.cfg.caps;
         if run.total() >= caps.run_tokens || run.output >= caps.run_output {
-            return Err(self.halting("the run's token cap is reached".into()));
+            return Err(self.halting(RUN_TOKEN_CAP.into()));
         }
         if self.started.elapsed() >= caps.run_time {
-            return Err(self.halting("the run's time cap is reached".into()));
+            return Err(self.halting(RUN_TIME_CAP.into()));
         }
         if mine.total() >= caps.agent_tokens || mine.output >= caps.agent_output {
             return Err(format!("{name} has spent its tokens"));

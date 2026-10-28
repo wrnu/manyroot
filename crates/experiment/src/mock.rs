@@ -29,6 +29,9 @@ pub struct MockBackend {
     pub wrong_rate: f64,
     /// Talk through `bracken-experiment shim` at this path, as Claude Code would, instead of the socket directly.
     pub shim: Option<PathBuf>,
+    /// Append made-up token usage here, in the rows Claude Code's backend writes: one message per tool call,
+    /// then the turn's settled total.
+    pub usage: Option<PathBuf>,
 }
 
 /// A minimal MCP client over newline-delimited JSON-RPC.
@@ -38,6 +41,8 @@ pub struct Client {
     next: u64,
     /// Tool calls made so far.
     pub calls: u32,
+    /// Each call's tool and the size of its arguments.
+    pub asked: Vec<(String, usize)>,
     _child: Option<std::process::Child>,
 }
 
@@ -64,7 +69,8 @@ impl Client {
                 (Box::new(r), Box::new(w), Some(child))
             }
         };
-        let mut c = Client { reader: BufReader::new(reader), writer, next: 1, calls: 0, _child: child };
+        let mut c =
+            Client { reader: BufReader::new(reader), writer, next: 1, calls: 0, asked: Vec::new(), _child: child };
         c.request(
             "initialize",
             json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "mock"}}),
@@ -96,6 +102,7 @@ impl Client {
     /// Calls a tool; its result text as JSON, or the tool's error.
     pub fn tool(&mut self, name: &str, args: Value) -> Result<Value, String> {
         self.calls += 1;
+        self.asked.push((name.to_string(), args.to_string().len()));
         let r = self.request("tools/call", json!({"name": name, "arguments": args}))?;
         let text = r["content"][0]["text"].as_str().unwrap_or_default().to_string();
         if r["isError"].as_bool().unwrap_or(true) {
@@ -127,21 +134,61 @@ fn first_line(v: &Value) -> String {
 
 impl Backend for MockBackend {
     fn turn(&self, agent: usize, name: &str, turn: u32, socket: &Path) -> Result<(), String> {
-        let mut rng = Rng::derive(self.seed, (agent as u64) << 16 | u64::from(turn));
         let mut c = Client::connect(socket, self.shim.as_deref())?;
+        let played = self.play(&mut c, agent, name, turn);
+        match &self.usage {
+            Some(path) => usage(path, name, turn, &c.asked).and(played),
+            None => played,
+        }
+    }
+}
+
+/// Appends a turn's made-up usage: each call a message whose context grows with the turn, written as
+/// step 6's backend writes it, a row per content block (a text block, then the call), each with the
+/// message's usage.
+fn usage(path: &Path, name: &str, turn: u32, asked: &[(String, usize)]) -> Result<(), String> {
+    let mut rows = String::new();
+    let (mut input, mut output) = (0, 0);
+    for (k, (tool, bytes)) in asked.iter().enumerate() {
+        let (i, o) = (2000 + 300 * k, 60 + bytes / 4);
+        for tools in [vec![], vec![format!("mcp__experiment__{tool}")]] {
+            let row = json!({"agent": name, "turn": turn, "message": format!("m{k}"), "model": "mock", "input": i,
+                "cache_read": 8000, "cache_write": 400, "output_at_least": o, "tools": tools});
+            rows.push_str(&format!("{row}\n"));
+        }
+        (input, output) = (input + i, output + o);
+    }
+    let n = asked.len();
+    rows.push_str(&format!(
+        "{}\n",
+        json!({"agent": name, "turn": turn, "ended": "success", "input": input, "cache_read": 8000 * n,
+            "cache_write": 400 * n, "output": output})
+    ));
+    // One append per turn, so concurrent agents' rows don't interleave.
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("opening {}: {e}", path.display()))?;
+    file.write_all(rows.as_bytes()).map_err(|e| format!("writing {}: {e}", path.display()))
+}
+
+impl MockBackend {
+    fn play(&self, c: &mut Client, agent: usize, name: &str, turn: u32) -> Result<(), String> {
+        let mut rng = Rng::derive(self.seed, (agent as u64) << 16 | u64::from(turn));
         let tools = c.request("tools/list", json!({}))?;
         let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
         if has("replace") && !has("pr_open") {
-            self.crdt_turn(&mut c, agent, name, turn, &mut rng, &mut memory)?;
+            self.crdt_turn(c, agent, name, turn, &mut rng, &mut memory)?;
             let text = serde_json::to_string(&memory).map_err(|e| e.to_string())?;
             c.tool("notes_write", json!({"text": text}))?;
             c.tool("sync", json!({}))?;
             return Ok(());
         }
         if has("pr_open") {
-            self.git_turn(&mut c, agent, &mut rng, &mut memory)?;
+            self.git_turn(c, agent, &mut rng, &mut memory)?;
             let text = serde_json::to_string(&memory).map_err(|e| e.to_string())?;
             c.tool("notes_write", json!({"text": text}))?;
             c.tool("sync", json!({}))?;

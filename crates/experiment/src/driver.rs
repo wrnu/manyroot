@@ -21,7 +21,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::metrics::bug_reports;
 use crate::mode::{Mode, Session, StoreConfig, SyncKind, ToolSpec, mode_named};
+use crate::plan::{Plan, PlanInputs};
 use crate::sandbox::{Git, Sandbox, WorkerPaths};
 use crate::worker::{Lines, Request, Worker};
 
@@ -61,6 +63,8 @@ pub struct RunConfig {
     pub calls_per_turn: u32,
     /// The longest a turn may take: [`TURN_LIMIT`] in a real run.
     pub turn_limit: Duration,
+    /// What the run's plan states beyond this configuration.
+    pub plan: PlanInputs,
 }
 
 /// The real `git` binary: the one in the exec path of the `git` on `PATH`, so
@@ -165,6 +169,8 @@ struct Run<'a> {
     tools: Vec<ToolSpec>,
     turns_done: AtomicU32,
     released_after: Mutex<Option<u32>>,
+    /// The digest of the hub's integrated library at the last snapshot.
+    integrated: Mutex<String>,
 }
 
 /// Runs a whole mode with `backend` playing every agent.
@@ -178,6 +184,9 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     for sub in ["agents", "sockets"] {
         make_dir(&root.join(sub))?;
     }
+    // The plan comes first: nothing an agent does can precede it.
+    let plan = Plan::new(cfg, mode).bytes();
+    std::fs::write(root.join("plan.json"), &plan).map_err(|e| format!("writing the plan: {e}"))?;
     let events = EventLog::create(&root.join("events.jsonl"))?;
     let store = |dir: PathBuf, identity: &str| StoreConfig {
         dir,
@@ -221,7 +230,8 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         }
         copies.push(Mutex::new(w));
     }
-    events.log(None, "setup", json!({"mode": mode.name(), "agents": cfg.agents, "turns": cfg.turns}));
+    let plan = blake3::hash(&plan).to_hex().to_string();
+    events.log(None, "setup", json!({"mode": mode.name(), "agents": cfg.agents, "turns": cfg.turns, "plan": plan}));
 
     let mut tools = mode.tools();
     tools.extend(core_tools());
@@ -237,7 +247,9 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         tools,
         turns_done: AtomicU32::new(0),
         released_after: Mutex::new(None),
+        integrated: Mutex::new(String::new()),
     };
+    run.snapshot(&mut run.hub(), None, "setup");
     let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..cfg.agents)
             .map(|i| {
@@ -251,7 +263,9 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         r?;
     }
     if let Some(why) = backend.halted() {
-        run.events.log(None, "run_stopped", json!({"bytes": why.len(), "digest": digest(why.as_bytes())}));
+        // Only the backend's own cap stops are named: any other reason could quote what an agent sent.
+        let cap = [crate::claude::RUN_TOKEN_CAP, crate::claude::RUN_TIME_CAP].into_iter().find(|c| *c == why);
+        run.events.log(None, "run_stopped", json!({"bytes": why.len(), "digest": digest(why.as_bytes()), "cap": cap}));
         return Err(format!("the run stopped: {why}"));
     }
     let reply = run.hub().ok(&Request { op: "integrated".into(), ..Request::default() })?;
@@ -322,8 +336,10 @@ impl Run<'_> {
         let total = self.cfg.turns * self.cfg.agents as u32;
         let mut released = self.released_after.lock().unwrap_or_else(|e| e.into_inner());
         if released.is_none() && f64::from(done) >= RELEASE_AT * f64::from(total) {
-            let reply = self.hub().ok(&Request { op: "release".into(), ..Request::default() })?;
+            let mut hub = self.hub();
+            let reply = hub.ok(&Request { op: "release".into(), ..Request::default() })?;
             self.events.log(None, "changes_released", json!({"turns_done": done, "result": reply.result}));
+            self.snapshot(&mut hub, None, "release");
             *released = Some(done);
         }
         Ok(())
@@ -345,12 +361,36 @@ impl Run<'_> {
     /// One sync between copy `i` and the hub, as the mode syncs ([`sync_session`], [`sync_transfers`]), logged.
     fn sync(&self, i: usize) -> Result<Value, String> {
         let session = self.session(i);
+        let mut hub = self.hub();
         let summary = match self.mode.sync_kind() {
-            SyncKind::Session => sync_session(&mut self.hub(), &mut self.copy(i), &self.sockets, &session)?,
-            SyncKind::Transfers => sync_transfers(&mut self.hub(), &mut self.copy(i), &session)?,
+            SyncKind::Session => sync_session(&mut hub, &mut self.copy(i), &self.sockets, &session),
+            SyncKind::Transfers => sync_transfers(&mut hub, &mut self.copy(i), &session),
         };
-        self.events.log(Some(&self.names[i]), "sync", summary.clone());
-        Ok(summary)
+        if let Ok(summary) = &summary {
+            self.events.log(Some(&self.names[i]), "sync", summary.clone());
+        }
+        self.snapshot(&mut hub, Some(&self.names[i]), "sync");
+        summary
+    }
+
+    /// Logs the hub's integrated library if it changed since the last snapshot (design section 4, Sources).
+    fn snapshot(&self, hub: &mut Worker, agent: Option<&str>, after: &str) {
+        let modules = hub
+            .ok(&Request { op: "integrated".into(), ..Request::default() })
+            .and_then(|r| serde_json::from_value::<Vec<(String, String)>>(r.result).map_err(|e| e.to_string()));
+        let modules = match modules {
+            Ok(m) => m,
+            Err(e) => {
+                let data = json!({"after": after, "bytes": e.len(), "digest": digest(e.as_bytes())});
+                return self.events.log(agent, "snapshot_failed", data);
+            }
+        };
+        let now = digest(serde_json::to_string(&modules).unwrap_or_default().as_bytes());
+        let mut last = self.integrated.lock().unwrap_or_else(|e| e.into_inner());
+        if *last != now {
+            self.events.log(agent, "snapshot", json!({"after": after, "modules": modules}));
+            *last = now;
+        }
     }
 
     /// Opens the agent's socket, lets the backend play its turn on it, and serves
@@ -442,11 +482,15 @@ impl Run<'_> {
         let shown = crate::args::short(&tool);
         let args_text = args.to_string();
         let name = &self.names[i];
+        // Bug reports, for the measures: private notes are no one else's to read.
+        let reports: Vec<(String, Vec<i64>)> =
+            if tool == "notes_write" { Vec::new() } else { strings(&args).flat_map(bug_reports).collect() };
         self.events.log(
             Some(name),
             "tool_call",
-            json!({"turn": turn, "tool": shown, "args_bytes": args_text.len(), "args_digest": digest(args_text.as_bytes())}),
+            json!({"turn": turn, "tool": shown, "args_bytes": args_text.len(), "args_digest": digest(args_text.as_bytes()), "reports": reports}),
         );
+        let mut record = Value::Null;
         let result = if tool == "sync" {
             crate::args::Args::new(&args, &[]).and_then(|_| self.sync(i))
         } else if self.mode.hub_tools().contains(&tool.as_str()) {
@@ -455,12 +499,19 @@ impl Run<'_> {
             self.copy(i).ok(&req).map(|r| r.result).and_then(|checked| {
                 let args = json!({"session": self.session(i), "args": checked});
                 let req = Request { op: "hub_tool".into(), tool: Some(tool), args, ..Request::default() };
-                self.hub().ok(&req).map(|r| r.result)
+                let mut hub = self.hub();
+                let reply = hub.ok(&req);
+                self.snapshot(&mut hub, Some(name), "hub_tool");
+                reply.map(|r| {
+                    record = r.record;
+                    r.result
+                })
             })
         } else {
-            self.copy(i)
-                .ok(&Request { op: "tool".into(), tool: Some(tool), args, ..Request::default() })
-                .map(|r| r.result)
+            self.copy(i).ok(&Request { op: "tool".into(), tool: Some(tool), args, ..Request::default() }).map(|r| {
+                record = r.record;
+                r.result
+            })
         };
         let (text, is_error) = match &result {
             Ok(v) => (v.to_string(), false),
@@ -469,9 +520,19 @@ impl Run<'_> {
         self.events.log(
             Some(name),
             "tool_result",
-            json!({"turn": turn, "tool": shown, "ok": !is_error, "bytes": text.len(), "digest": digest(text.as_bytes())}),
+            json!({"turn": turn, "tool": shown, "ok": !is_error, "bytes": text.len(), "digest": digest(text.as_bytes()), "record": record}),
         );
         json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+    }
+}
+
+/// Every string in `v`, at any depth.
+fn strings(v: &Value) -> Box<dyn Iterator<Item = &str> + '_> {
+    match v {
+        Value::String(s) => Box::new(std::iter::once(s.as_str())),
+        Value::Array(a) => Box::new(a.iter().flat_map(strings)),
+        Value::Object(o) => Box::new(o.values().flat_map(strings)),
+        _ => Box::new(std::iter::empty()),
     }
 }
 

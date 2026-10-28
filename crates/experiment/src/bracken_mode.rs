@@ -494,6 +494,32 @@ impl Store for BrackenStore {
         let state = self.state()?;
         Ok(modules_of(&state.integrated()))
     }
+
+    fn record(&mut self, tool: &str, args: &Value, _result: &Value) -> Result<Value, String> {
+        let of = |function: &str, text: &str| {
+            let defs = crate::metrics::definitions(&[("artifact".into(), text.into())]);
+            defs.get(function).map(|d| vec![(function.to_string(), d.clone())]).unwrap_or_default()
+        };
+        match tool {
+            "artifact" => {
+                let function = args["function"].as_str().unwrap_or_default();
+                Ok(json!({ "writes": of(function, args["content"].as_str().unwrap_or_default()) }))
+            }
+            // A non-author's fail on an implementation: a counted fail, which keeps it out (decision `5e8df6996a2e`).
+            "evidence" if args["verdict"] == "fail" => {
+                let (state, me) = (self.state()?, self.saved("key.txt")?);
+                let target = args["target"].as_str().unwrap_or_default();
+                let blocks = match state.find(target) {
+                    Some(e) if e.kind == "artifact" && e.author != me => {
+                        of(e.body["name"].as_str().unwrap_or_default(), e.body["text"].as_str().unwrap_or_default())
+                    }
+                    _ => Vec::new(),
+                };
+                Ok(json!({ "blocks": blocks }))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
 }
 
 impl BrackenStore {

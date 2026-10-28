@@ -1108,6 +1108,32 @@ impl Store for GitStore {
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String> {
         self.modules_at("refs/heads/main")
     }
+
+    fn record(&mut self, tool: &str, args: &Value, result: &Value) -> Result<Value, String> {
+        use crate::metrics::definitions as defs;
+        match tool {
+            // A commit writes each function whose definition differs from every parent's, so a merge
+            // commit doesn't credit its author with what it merged.
+            "commit" => {
+                let line = self.git(&["rev-list", "--parents", "--max-count=1", "HEAD"], None)?;
+                let ids: Vec<String> = line.split_whitespace().map(str::to_string).collect();
+                let head = ids.first().ok_or("a commit without HEAD")?;
+                let now = defs(&self.modules_at(head)?);
+                let mut parents = Vec::new();
+                for p in &ids[1..] {
+                    parents.push(defs(&self.modules_at(p)?));
+                }
+                let writes: Vec<_> =
+                    now.into_iter().filter(|(f, d)| parents.iter().all(|b| b.get(f) != Some(d))).collect();
+                Ok(json!({ "writes": writes }))
+            }
+            "merge" => Ok(json!({ "conflict": result["merged"] == false })),
+            "pr_review" if args["verdict"] == "request_changes" => {
+                Ok(json!({ "blocks": prs::changed(self, args["number"].as_i64().unwrap_or_default())? }))
+            }
+            _ => Ok(Value::Null),
+        }
+    }
 }
 
 /// A raw tree's entries: mode, name and object id (hex).

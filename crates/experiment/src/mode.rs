@@ -88,6 +88,12 @@ pub trait Store {
     fn release_changes(&mut self) -> Result<Value, String>;
     /// The hub only: the integrated library, as `(module, text)` pairs.
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String>;
+    /// What the measures need to know about a tool call that just succeeded, for the event log only
+    /// (never the agent): `writes`, the `[function, definition]` pairs it created or changed;
+    /// `blocks`, the definitions a verdict against them stops; `conflict`, a merge that stopped.
+    fn record(&mut self, _tool: &str, _args: &Value, _result: &Value) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
 }
 
 fn not_this_mode() -> String {

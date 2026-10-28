@@ -849,3 +849,30 @@ fn pr_text_is_capped_and_replies_and_syncs_stay_bounded() {
     // And a title is capped where it is checked.
     assert!(f.tool(0, "pr_open", json!({"branch": "abs", "title": "t".repeat(prs::MAX_TITLE + 1)})).is_err());
 }
+
+#[test]
+fn records_say_what_a_commit_wrote_and_what_a_review_blocks() {
+    let mut f = Fixture::new(&["agent-a", "agent-b"]);
+    f.tool(1, "switch", json!({"branch": "sign", "create": true})).expect("switch");
+    let n = f.propose(0, "abs", "base.stk", &def("abs"));
+    let wrote = f.copies[0].record("commit", &json!({}), &json!({})).expect("record");
+    assert_eq!(wrote["writes"], json!([["abs", def("abs")]]));
+    let review = json!({"number": n, "verdict": "request_changes"});
+    assert_eq!(f.hub.record("pr_review", &review, &json!({})).expect("record")["blocks"], json!([["abs", def("abs")]]));
+    f.review(1, n, "approve");
+    f.merge(1, n).expect("merged");
+
+    // b adds sign where a added abs: merging main stops on a conflict.
+    f.tool(1, "edit", json!({"file": "base.stk", "start": 1, "end": 0, "text": def("sign")})).expect("edit");
+    f.tool(1, "commit", json!({"message": "sign"})).expect("commit");
+    f.sync(1);
+    let merged = f.tool(1, "merge", json!({})).expect("merge");
+    assert_eq!(f.copies[1].record("merge", &json!({}), &merged).expect("record")["conflict"], true);
+
+    // The resolution keeps both, so its commit wrote nothing: abs is main's, sign was b's already.
+    let lines = f.tool(1, "read", json!({"file": "base.stk"})).expect("read")["lines"].as_i64().expect("lines");
+    let both = format!("{}\n{}", def("abs"), def("sign"));
+    f.tool(1, "edit", json!({"file": "base.stk", "start": 1, "end": lines, "text": both})).expect("resolve");
+    f.tool(1, "commit", json!({"message": "merge main"})).expect("commit");
+    assert_eq!(f.copies[1].record("commit", &json!({}), &json!({})).expect("record")["writes"], json!([]));
+}
