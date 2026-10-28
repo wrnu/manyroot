@@ -275,6 +275,9 @@ They don't support:
   30 of 30 in every run. A harder task, fewer turns or more agents would test
   whether the costs above buy anything that this task can't show.
 
+Why Bracken mode cost what it did, and what to change in Bracken, is analysed
+in [phase1-bracken-lessons.md](phase1-bracken-lessons.md).
+
 ## Options for the next runs
 
 Each option needs the owner's own go (approval `3418fe14b8ed` covered the pilot
