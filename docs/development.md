@@ -19,7 +19,7 @@ the same PR (process section 8, "Keeping the skill current").
 | Change classes | docs, process, cli, library, merge-gate tooling, crypto, protocol, storage. Release path per class: [releases.md](releases.md) |
 | Release stages | None yet; nothing is published. See [releases.md](releases.md) |
 | What deploys on merge | Nothing. `.forgejo/workflows/ci.yml` only runs checks, and only by hand |
-| Shared resources | The pinned `bracken` in `.bracken-bin/`; Ground checkpoint commits; merges to `main` |
+| Shared resources | The pinned `bracken` in `.bracken-bin/`; Ground checkpoint commits; merges to `main`; the team server (manager only, [Team server](#team-server)) |
 | Remote | Private `Autimo/manyroot` on forge.jx.rs (Forgejo). Agents push as `warren` for now; a bot account is backlog (decision 247eb4d1240c, task 284f93c1fd6b) |
 | CI role | Manual (owner decision `20a06f9b815e`, 2026-10-28, a trial: the forge's runner is too slow). `ci.yml` runs only on `workflow_dispatch`, never on a PR or push, so no PR waits on it. The manager's counted run of the `AGENTS.md` test table on the exact head merged with `main`'s tip (`scripts/bk-evidence --on origin/main`, process section 5 step 5) is the CI, and `scripts/merge` runs `scripts/ground-guards` on the head before every merge. A manual run is an observer, as before (decision `8b2454e4cf81`). Nothing runs on Linux: for cfg-gated code, add `cargo clippy --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings` (gotcha `2c9aebd6d370`) |
 | Branch protection | `main`: blocks force-push and deletion, applies to admins, allows direct pushes, no required checks. Tested on a scratch branch 2026-10-27 |
@@ -53,6 +53,19 @@ the same PR (process section 8, "Keeping the skill current").
 
 - **Where worktrees live:** builders' in `~/.t3/worktrees/bracken/<branch>`; delegated children's in `~/.t3/worktrees/bracken/t3-<id>`, on a `t3/<name>` branch or detached. T3 doesn't remove either, so the manager does (process section 6, Worktrees). Threads the owner opens on this repo also get `t3-<id>` worktrees, so match each one to a finished child or builder through `t3_worktree_list` and the thread's status before removing it. Scratch worktrees go under `$TMPDIR`.
 - **No file deletion in Bash.** Claude Code asks a human to approve an `rm` it can't prove safe, even in full-access mode, and overnight that blocks the agent until the owner wakes. The owner's user-level hook `~/.claude/hooks/bracken-no-rm.py` refuses any Bash command running `rm` in this repo's checkouts and worktrees, with advice, so the agent carries on at once. Use `git worktree remove`, `git rm` or `trash <path>`, and leave `mktemp -d` directories in place. The hook is outside the repo: a new machine needs it installed in `~/.claude/settings.json` under `PreToolUse`, matcher `Bash|Monitor`.
+
+## Team server
+
+Network-sync step 3 (task `c03e893d04eb`, owner approval `f0f7caf53376`): the team's sync server runs on the owner's machine, on 127.0.0.1 only (decision `e8614790cd5d`). Process section 4.3 says what changes for agents. There's no off-host backup yet, so checkpoints continue (process 9.3).
+
+| Task | Command (manager, from the main checkout) |
+|---|---|
+| Set up, once | `scripts/team-server setup ~/.bracken-team/manyroot` (port 7391; a second argument picks another). It copies the main checkout's Ground into the server's replica and writes `.bracken-team`, which switches `scripts/bk` and `scripts/merge` over |
+| Issue or replace a token | `scripts/team-server token <identity>`. The server reads its tokens and allowlist only when it starts, so this restarts a running server itself, and says so. One per identity; it needs `b3sum` (`cargo install --locked b3sum`, reference `debeaf8ecba6`) |
+| Start, stop | `scripts/team-server start` returns once the server is listening and has answered a sync; `scripts/team-server stop`. Nothing starts it after a reboot (a launchd job would need the owner's go, decision `1ffd3b5214ac`), so the manager runs `scripts/team-server start` after each one. Until then every write fails unconfirmed, and `scripts/merge` refuses |
+| What agents set | `BRACKEN_AGENT=<identity>` (process 4.3) |
+
+`~/.bracken-team/manyroot/` (mode 0700) holds the server's replica (`ground/`), the tokens (`tokens/<identity>`, 0600), their blake3 hashes (`tokens.b3`), the allowlist (every identity the main checkout knows, rebuilt at each start), the first-seen log, `server.log`, `server.pid` and `url`. The server uses the limits recommended in `docs/design/network-sync.md` (17 MiB batches, an 8 MiB id budget, 16 sessions). It runs the pinned binary, which must include `bracken sync --confirm`: upgrade it before setting up. Nothing else writes the server's replica.
 
 ## Forge commands
 

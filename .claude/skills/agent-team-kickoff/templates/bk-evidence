@@ -112,14 +112,14 @@ grep -q -- --details-file <<<"$help" ||
   fail "the pinned bracken is too old: it can't take --details-file. Ask the manager to upgrade it (docs/releases.md, 'Upgrading the pinned binary'). Nothing was run."
 # The JSON keeps each string on one line with its quotes escaped, so a statement can't
 # contain an unescaped '"statement": "' or '"id": "', and the first of each is the claim's own.
-shown=$("$here/bk" show "$claim" --json 2>/dev/null) || fail "no contribution $claim in the Ground"
+shown=$(BRACKEN_AGENT=$agent "$here/bk" show "$claim" --json 2>/dev/null) || fail "no contribution $claim in the Ground"
 statement=$(grep -m1 -E '^ *"statement": "' <<<"$shown" || true)
 [ -n "$statement" ] || fail "$claim isn't a claim in the Ground"
 [[ $shown =~ \"id\":\ \"([0-9a-f]{64})\" ]] || fail "couldn't read $claim's id from the Ground"
 full=${BASH_REMATCH[1]}
 if $any_head; then
   # bracken matches the tag exactly, so no tag can hide 'pr'.
-  prs=$("$here/bk" log --tag pr --json)
+  prs=$(BRACKEN_AGENT=$agent "$here/bk" log --tag pr --json)
   ! grep -qF "\"id\": \"$full\"" <<<"$prs" ||
     fail "--any-head is for claims that aren't pr claims; $claim is tagged pr, so its head must be HEAD ($sha)"
 else

@@ -182,6 +182,10 @@ enum Command {
         /// For an http:// server: read the bearer token from this file. Defaults to $BRACKEN_TOKEN.
         #[arg(long, value_name = "PATH")]
         token_file: Option<PathBuf>,
+        /// With a server: after the sync, open a second session and fail unless the server's heads
+        /// then cover everything this replica held when the first began.
+        #[arg(long)]
+        confirm: bool,
         #[command(flatten)]
         bounds: BoundsArgs,
     },
@@ -475,16 +479,17 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 }
             }
         }
-        Command::Sync { exec: Some(program), bounds, .. } => {
-            return sync_remote(remote::sync_exec(&mut s, &program, bounds.bounds())?);
+        Command::Sync { exec: Some(program), confirm, bounds, .. } => {
+            return sync_remote(&mut s, confirm, |s| remote::sync_exec(s, &program, bounds.bounds()));
         }
-        Command::Sync { other: Some(url), token_file, bounds, .. } if url.contains("://") => {
+        Command::Sync { other: Some(url), token_file, confirm, bounds, .. } if url.contains("://") => {
             let token = match token_file {
                 Some(path) => std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?,
                 None => std::env::var("BRACKEN_TOKEN").context("set BRACKEN_TOKEN or pass --token-file")?,
             };
-            return sync_remote(remote::sync_http(&mut s, &url, token.trim(), bounds.bounds())?);
+            return sync_remote(&mut s, confirm, |s| remote::sync_http(s, &url, token.trim(), bounds.bounds()));
         }
+        Command::Sync { confirm: true, .. } => bail!("--confirm is for a server: an http:// URL or --exec"),
         Command::Sync { other, .. } => {
             let other = PathBuf::from(other.expect("clap requires a target without --exec"));
             let other_dir = if other.join(DIR_NAME).is_dir() { other.join(DIR_NAME) } else { other };
@@ -739,11 +744,42 @@ impl CurrentView {
     }
 }
 
-/// Reports a session with a server: what each side refused, and what each received. Fails if
-/// either side refused anything or was left with contributions missing ancestors.
-fn sync_remote(side: wire::Side) -> Result<ExitCode> {
+/// Syncs with a server and reports the session: what each side refused, and what each received.
+/// Fails if either side refused anything or was left with contributions missing ancestors.
+///
+/// With `confirm`, a clean session is followed by a second one, and the command fails unless the
+/// heads the server sends at the start of that one cover every head this replica held when the
+/// first began: the server's own word that it holds everything this replica had.
+fn sync_remote(
+    s: &mut Store,
+    confirm: bool,
+    mut session: impl FnMut(&mut Store) -> Result<wire::Side>,
+) -> Result<ExitCode> {
+    let held: Vec<ContributionId> = s.graph().heads().collect();
+    let side = session(s)?;
+    let clean = report_session(&side);
+    println!("received {}, sent {}", side.report.added.len(), side.peer.added);
+    if !confirm || !clean {
+        return Ok(decide(clean));
+    }
+    let check = session(s)?;
+    if !report_session(&check) {
+        return Ok(decide(false));
+    }
+    let g = s.graph();
+    let covered = |h: &ContributionId| check.peer_heads.iter().any(|p| p == h || g.is_ancestor(h, p));
+    let missing = held.iter().filter(|h| !covered(h)).count();
+    if missing > 0 {
+        eprintln!("not confirmed: the server's heads don't cover {missing} of this replica's {} heads", held.len());
+        return Ok(decide(false));
+    }
+    println!("confirmed: the server holds all {} heads", held.len());
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Prints what a session refused or left unresolved, on either side; true if nothing was.
+fn report_session(side: &wire::Side) -> bool {
     let peer = &side.peer;
-    let code = decide(side.report.is_clean() && peer.rejected.is_empty() && peer.unresolved == 0);
     print_report(&side.report);
     for r in &peer.rejected {
         eprintln!("the server refused {}: {}", r.id.short(), r.reason);
@@ -751,8 +787,7 @@ fn sync_remote(side: wire::Side) -> Result<ExitCode> {
     if peer.unresolved > 0 {
         eprintln!("the server is missing ancestors of {} contributions", peer.unresolved);
     }
-    println!("received {}, sent {}", side.report.added.len(), peer.added);
-    Ok(code)
+    side.report.is_clean() && peer.rejected.is_empty() && peer.unresolved == 0
 }
 
 fn print_report(report: &ImportReport) {

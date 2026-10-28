@@ -8,6 +8,15 @@
 # from testing a throwaway Ground). It runs only the pinned binary in
 # <main>/.bracken-bin, never whatever `bracken` is on PATH: a broken or stray build
 # must not touch the team's Ground. Set BRACKEN_BIN to override deliberately.
+#
+# Once the team server is set up (scripts/team-server setup, which writes the main checkout's
+# .bracken-team), the main checkout's replica syncs with it, using the token of the identity in --as
+# or BRACKEN_AGENT:
+#   - a write (claim, artifact, relate, evidence, retract) is pushed, and bk fails unless the server
+#     then confirms its heads cover it (one retry). Don't report work done on a failed write: it is only local
+#     until a later sync pushes it.
+#   - a read pulls first, with a short timeout, and falls back to the local replica, saying so on
+#     stderr. With BK_PULL=required (scripts/merge) a read fails instead.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -24,4 +33,56 @@ if [ ! -x "$bin" ]; then
   echo "bk: the manager installs it (agent-team-kickoff skill, SKILL.md section 2.1)" >&2
   exit 1
 fi
+marker="$main/.bracken-team"
+[ -f "$marker" ] || exec "$bin" "$@"
+team=$(cat "$marker")
+url=$(cat "$team/url")
+
+# The command, and whose token: --as anywhere, else BRACKEN_AGENT.
+cmd='' who=${BRACKEN_AGENT:-}
+for ((i = 1; i <= $#; i++)); do
+  case "${!i}" in
+    --as) j=$((i + 1)); who=${!j:-}; i=$j ;;
+    --as=*) who=${!i#--as=} ;;
+    --dir) i=$((i + 1)) ;;
+    -h | --help) exec "$bin" "$@" ;;
+    -*) ;;
+    *) [ -n "$cmd" ] || cmd=${!i} ;;
+  esac
+done
+case "$cmd" in
+  claim | artifact | relate | evidence | retract) write=true ;;
+  log | show | heads | conflicts | accepted | cat | export) write=false ;;
+  *) exec "$bin" "$@" ;;
+esac
+token="$team/tokens/$who"
+[[ $who =~ ^[a-z0-9_-]{1,64}$ ]] && [ -f "$token" ] || token=
+fail() { echo "bk: $*" >&2; exit 1; }
+# sync_team <deadline> [--confirm]: the sync's last line of errors in $err, if it fails.
+sync_team() {
+  local out
+  out=$("$bin" sync "$url" --token-file "$token" --deadline "$1" "${@:2}" 2>&1 >/dev/null) && return
+  err=${out##*$'\n'}
+  return 1
+}
+
+if $write; then
+  [ -n "$token" ] || fail "no team token for '${who:-}' (pass --as <identity>), so nothing was written; the manager issues one with scripts/team-server token <identity>"
+  "$bin" "$@" || exit
+  # One retry, after 0.5 to 2 seconds, in case the server's sessions were all busy.
+  sync_team 60 --confirm || {
+    delay=$((RANDOM % 1500 + 500))
+    sleep "$((delay / 1000)).$(printf %03d $((delay % 1000)))"
+    sync_team 60 --confirm
+  } ||
+    fail "written to the local replica, but the team server didn't confirm it ($err). Don't report it done; retry with a read (bk heads), which pushes it"
+  exit 0
+fi
+if [ -z "$token" ]; then
+  err="no team token for '${who:-}'; set BRACKEN_AGENT to your identity"
+elif sync_team "$([ "${BK_PULL:-}" = required ] && echo 60 || echo 5)"; then
+  exec "$bin" "$@"
+fi
+[ "${BK_PULL:-}" != required ] || fail "can't pull from the team server, and this read must be current: $err"
+echo "bk: not pulled from the team server ($err); reading the local replica" >&2
 exec "$bin" "$@"

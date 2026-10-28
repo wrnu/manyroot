@@ -197,7 +197,8 @@ fn ground_checkpoint_refuses_more_than_a_pipe_of_unexpected_staged_lines() {
 
 /// merge must not hand the forge token to its children when the caller exports a variable named `token`:
 /// an assignment keeps an inherited export. The fake bracken reports every exported variable holding the
-/// (dummy) token, by name; it runs only once the token is set.
+/// (dummy) token, by name, on every call after merge's first (`heads`, its pull check), which comes
+/// before the token is set.
 #[test]
 fn merge_keeps_the_token_out_of_the_environment_when_the_caller_exports_token() {
     for scripts in SCRIPTS {
@@ -216,7 +217,7 @@ fn merge_keeps_the_token_out_of_the_environment_when_the_caller_exports_token() 
         let probe = tmp.path().join("probe.log");
         write_executable(
             &tmp.path().join("bracken"),
-            "#!/usr/bin/env bash\necho ran >>\"$PROBE_LOG\"\n\
+            "#!/usr/bin/env bash\n[ \"$1\" != heads ] || exit 0\necho ran >>\"$PROBE_LOG\"\n\
              for v in $(compgen -e); do [[ ${!v} != *DUMMY-TOKEN* ]] || echo \"exported: $v\"; done >>\"$PROBE_LOG\"\n\
              exit 1\n",
         );
@@ -241,6 +242,172 @@ fn merge_keeps_the_token_out_of_the_environment_when_the_caller_exports_token() 
         assert!(!stderr.contains("DUMMY-TOKEN") && !String::from_utf8_lossy(&out.stdout).contains("DUMMY-TOKEN"));
         let log = std::fs::read_to_string(&probe).unwrap_or_else(|_| panic!("{scripts}: bracken never ran: {stderr}"));
         assert_eq!(log, "ran\n", "{scripts}: the token reached bracken's environment");
+        let said = "team server: none set up (no .bracken-team); reading the local replica\n";
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with(said), "{scripts}: {:?}", out.stdout);
+    }
+}
+
+/// Network-sync step 3 end to end, on throwaway Grounds: `team-server` sets up, issues tokens and
+/// starts the server; alice writes in one replica and bob in another, through `bk`, and each sees
+/// the other's write. With the server stopped, a read falls back to the local replica, a write
+/// fails unconfirmed, and `merge` refuses to decide.
+///
+/// bracken runs through a wrapper that logs each `sync`'s arguments, fails one sync while the file
+/// `fail-once` exists, and holds back `serve` for 2 seconds while `slow-serve` exists (a slow load).
+#[test]
+fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
+    let real = env!("CARGO_BIN_EXE_bracken");
+    for scripts in SCRIPTS {
+        let copy = |name: &str| repo_root().join(scripts).join(name);
+        let files = [
+            ("scripts/bk", copy("bk")),
+            ("scripts/bk-evidence", copy("bk-evidence")),
+            ("scripts/team-server", copy("team-server")),
+            ("scripts/merge", copy("merge")),
+        ];
+        let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
+        let (tmp, a) = repo(&files, ".bracken/\n.bracken-team\n", |_| {});
+        let team = tmp.path().join("team");
+        // merge's tools; the gate's pull check comes before either is used.
+        std::fs::create_dir_all(tmp.path().join("stubs")).unwrap();
+        for tool in ["curl", "jq"] {
+            write_executable(&tmp.path().join("stubs").join(tool), "#!/bin/sh\nexit 1\n");
+        }
+        let path = format!("{}:{}", tmp.path().join("stubs").display(), std::env::var("PATH").unwrap());
+        let wrapper = tmp.path().join("bracken-logged");
+        write_executable(
+            &wrapper,
+            "#!/usr/bin/env bash\n\
+             if [ \"$1\" = sync ]; then\n  echo \"$*\" >>\"$T/sync.log\"\n\
+               if [ -e \"$T/fail-once\" ]; then rm -f \"$T/fail-once\"; echo refused >&2; exit 1; fi\nfi\n\
+             [ \"${3:-}\" != serve ] || [ ! -e \"$T/slow-serve\" ] || sleep 2\n\
+             exec \"$REAL_BRACKEN\" \"$@\"\n",
+        );
+        let syncs = || std::fs::read_to_string(tmp.path().join("sync.log")).unwrap_or_default();
+        // The wrapper execs the real binary: team-server checks the pid it stops is the server's.
+        let sh = |dir: &Path, program: &str, args: &[&str], agent: Option<&str>| {
+            let mut c = command(dir, program, args);
+            c.env("BRACKEN_BIN", &wrapper).env("T", tmp.path()).env("PATH", &path);
+            if let Some(agent) = agent {
+                c.env("BRACKEN_AGENT", agent);
+            }
+            c.output().unwrap()
+        };
+        let ok = |out: Output, what: &str| {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(out.status.success(), "{scripts}: {what} failed: {stderr}");
+            (String::from_utf8(out.stdout).unwrap(), stderr)
+        };
+        struct Stop<'a>(&'a dyn Fn());
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                (self.0)()
+            }
+        }
+        let stop = || {
+            sh(&a, "scripts/team-server", &["stop"], None);
+        };
+        let _stop = Stop(&stop);
+
+        ok(sh(&a, "scripts/bk", &["init", "--name", "team"], None), "init");
+        for who in ["alice", "bob", "carol", "manager"] {
+            ok(sh(&a, "scripts/bk", &["id", "new", who], None), "id new");
+        }
+        // Bob's replica: a clone of the repo with its own copy of the Ground and of bob's key.
+        let b = tmp.path().join("b");
+        assert!(run(tmp.path(), "git", &["clone", "-q", a.to_str().unwrap(), "b"]).status.success());
+        let bundle = tmp.path().join("ground.bundle");
+        ok(sh(&a, real, &["--dir", ".bracken", "export", bundle.to_str().unwrap()], None), "export");
+        ok(sh(&b, real, &["--dir", ".bracken", "join", bundle.to_str().unwrap()], None), "join");
+        std::fs::create_dir_all(b.join(".bracken/identities")).unwrap();
+        std::fs::copy(a.join(".bracken/identities/bob.json"), b.join(".bracken/identities/bob.json")).unwrap();
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+        ok(sh(&a, "scripts/team-server", &["setup", team.to_str().unwrap(), &port], None), "setup");
+        assert!(!team.join("seed.bundle").exists(), "{scripts}: setup left its seed bundle");
+        std::fs::copy(a.join(".bracken-team"), b.join(".bracken-team")).unwrap();
+        for who in ["alice", "bob", "manager"] {
+            ok(sh(&a, "scripts/team-server", &["token", who], None), "token");
+            let mode = std::fs::metadata(team.join("tokens").join(who)).unwrap().permissions();
+            assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777, 0o600, "{scripts}: token mode");
+        }
+        let (out, stderr) = ok(sh(&a, "scripts/team-server", &["start"], None), "start");
+        assert!(out.contains(&format!("listening on http://127.0.0.1:{port}")), "{scripts}: {out}");
+        assert!(stderr.is_empty(), "{scripts}: the first start said {stderr:?}");
+
+        // Writes push and confirm; stdout stays the new id alone.
+        let before = syncs().lines().count();
+        let (alice, _) = ok(sh(&a, "scripts/bk", &["claim", "from alice", "--as", "alice"], None), "alice's claim");
+        let new: Vec<String> = syncs().lines().skip(before).map(String::from).collect();
+        assert!(new.len() == 1 && new[0].contains(" --confirm"), "{scripts}: alice's write synced as {new:?}");
+        let (bob, _) = ok(sh(&b, "scripts/bk", &["claim", "from bob", "--as", "bob"], None), "bob's claim");
+        for id in [&alice, &bob] {
+            assert!(id.trim().len() == 64 && id.trim().bytes().all(|c| c.is_ascii_hexdigit()), "{scripts}: {id:?}");
+        }
+        // Each sees the other's: alice's replica learns bob's claim only by pulling.
+        let (shown, stderr) = ok(sh(&a, "scripts/bk", &["show", bob.trim()], Some("alice")), "alice reads");
+        assert!(shown.contains("from bob") && stderr.is_empty(), "{scripts}: {shown} {stderr}");
+        let (shown, _) = ok(sh(&b, "scripts/bk", &["show", alice.trim()], Some("bob")), "bob reads");
+        assert!(shown.contains("from alice"), "{scripts}: {shown}");
+        // bk-evidence's reads and its write go through the server too.
+        let evidence = [&alice[..12], "--as", "bob", "--any-head", "--", "/usr/bin/true"];
+        let (_, stderr) = ok(sh(&b, "scripts/bk-evidence", &evidence, None), "bk-evidence");
+        assert!(!stderr.contains("not pulled"), "{scripts}: bk-evidence's reads didn't pull: {stderr}");
+        let (shown, _) = ok(sh(&a, "scripts/bk", &["show", alice.trim()], Some("alice")), "alice reads evidence");
+        assert!(shown.contains("pass") && shown.contains("bob"), "{scripts}: {shown}");
+        // An identity without a token can't write: nothing is written.
+        let out = sh(&a, "scripts/bk", &["claim", "from carol", "--as", "carol"], None);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: carol wrote without a token");
+        let (log, _) = ok(sh(&a, "scripts/bk", &["log"], Some("alice")), "log");
+        assert!(!log.contains("from carol"), "{scripts}: {log}");
+
+        // A confirm that fails once is retried, and the write confirms.
+        std::fs::write(tmp.path().join("fail-once"), "").unwrap();
+        let before = syncs().lines().count();
+        ok(sh(&a, "scripts/bk", &["claim", "retried", "--as", "alice"], None), "retried claim");
+        let new: Vec<String> = syncs().lines().skip(before).map(String::from).collect();
+        assert!(new.len() == 2 && new.iter().all(|l| l.contains(" --confirm")), "{scripts}: {new:?}");
+
+        // A token for a new identity restarts the running server, so the identity can write at once.
+        ok(sh(&a, "scripts/bk", &["id", "new", "dave"], None), "id new dave");
+        let (out, _) = ok(sh(&a, "scripts/team-server", &["token", "dave"], None), "token dave");
+        assert!(out.contains("restarting the server"), "{scripts}: {out}");
+        ok(sh(&a, "scripts/bk", &["claim", "from dave", "--as", "dave"], None), "dave's claim");
+        ok(sh(&a, "scripts/bk", &["claim", "after dave", "--as", "alice"], None), "alice after dave");
+
+        // start returns only once the server answers, even after a stop and with a slow load.
+        ok(sh(&a, "scripts/team-server", &["stop"], None), "stop");
+        std::fs::write(tmp.path().join("slow-serve"), "").unwrap();
+        ok(sh(&a, "scripts/team-server", &["start"], None), "slow start");
+        std::fs::remove_file(tmp.path().join("slow-serve")).unwrap();
+        let mut heads = command(&a, "scripts/bk", &["heads"]);
+        heads
+            .env("BRACKEN_BIN", &wrapper)
+            .env("T", tmp.path())
+            .env("BRACKEN_AGENT", "alice")
+            .env("BK_PULL", "required");
+        ok(heads.output().unwrap(), "heads right after start");
+
+        // With the server up, merge gets past its pull (and stops later, at the missing origin).
+        let merge = ["1", &alice[..12], "--validator", "alice", "--min-passes", "1", "--dry-run"];
+        let out = sh(&a, "scripts/merge", &merge, None);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && !stderr.contains("team server"), "{scripts}: {stderr}");
+        let said = format!("team server: every read pulls from http://127.0.0.1:{port}\n");
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&said), "{scripts}: {:?}", out.stdout);
+
+        ok(sh(&a, "scripts/team-server", &["stop"], None), "stop");
+        let (shown, stderr) = ok(sh(&a, "scripts/bk", &["show", bob.trim()], Some("alice")), "offline read");
+        assert!(shown.contains("from bob"), "{scripts}: {shown}");
+        assert!(stderr.contains("not pulled from the team server"), "{scripts}: {stderr}");
+        let out = sh(&a, "scripts/bk", &["claim", "offline", "--as", "alice"], None);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: an unconfirmed write passed");
+        assert!(stderr.contains("didn't confirm"), "{scripts}: {stderr}");
+        let out = sh(&a, "scripts/merge", &merge, None);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(stderr.contains("can't pull from the team server"), "{scripts}: {stderr}");
     }
 }
 

@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# team-server: run the team's sync server on this machine (network-sync step 3), for the main
+# checkout's Ground.
+#
+#   team-server setup <dir> [port]   once: make <dir> (outside the repo) and a server replica in it
+#   team-server token <identity>     issue, or replace, an identity's token (restarts a running server)
+#   team-server start | stop
+#
+# <dir> holds everything, mode 0700: the server's own replica (ground/), the tokens (tokens/<identity>,
+# 0600, one per identity, which scripts/bk reads), their blake3 hashes (tokens.b3, which the server
+# reads), the allowlist of author keys, the first-seen log, the server's log and pid, and its URL.
+# setup records <dir> in the main checkout's .bracken-team (not committed): from then on scripts/bk
+# pushes and confirms every write, and scripts/merge refuses to decide without a pull.
+#
+# The server binds 127.0.0.1 only (the default port is 7391). It reads its replica, tokens and
+# allowlist when it starts, so token restarts a running server. start returns once the server is
+# listening and has answered a sync of the main checkout's replica. Nothing else writes its replica:
+# scripts/bk writes the main checkout's and syncs. A token is written once, to its 0600 file;
+# it's never printed, never in argv, and never in the Ground. Needs b3sum (cargo install --locked b3sum).
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
+marker="$main/.bracken-team"
+fail() { echo "team-server: $*" >&2; exit 1; }
+usage() { echo "usage: team-server setup <dir> [port] | token <identity> | start | stop" >&2; exit 2; }
+[ -x "$bin" ] || fail "no bracken at $bin"
+
+team_dir() {
+  [ -f "$marker" ] || fail "not set up: run team-server setup <dir> first"
+  dir=$(cat "$marker")
+  [ -d "$dir/ground" ] || fail "$dir/ground is missing; $marker points at a team directory that isn't there"
+}
+# The pid in server.pid, if that process is still this server.
+running_pid() {
+  local pid command
+  pid=$(cat "$dir/server.pid" 2>/dev/null) || return 1
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  command=$(ps -p "$pid" -o command= 2>/dev/null) || return 1
+  [[ $command == *" --dir $dir/ground serve "* ]] || return 1
+  echo "$pid"
+}
+# The identities the main checkout's Ground knows, as JSON.
+identities() { BRACKEN_DIR="$main/.bracken" "$bin" id list --json; }
+
+# Starts the server, and returns once it is listening and has answered a sync.
+start_server() {
+  local url known size tokens pid err
+  [ -s "$dir/tokens.b3" ] || fail "no tokens yet: team-server token <identity>"
+  url=$(cat "$dir/url")
+  # Every identity the main checkout knows may push; contributions are signed, so this is who
+  # may author, not who may connect (that's the tokens).
+  known=$(identities)
+  grep -oE '"agent": "[0-9a-f]{64}"' <<<"$known" | grep -oE '[0-9a-f]{64}' >"$dir/allow"
+  # Only what this run writes counts: the log keeps earlier runs' lines.
+  size=$(wc -c 2>/dev/null <"$dir/server.log" || echo 0)
+  # Limits from network-sync.md, "Memory, for choosing step 3's limits".
+  nohup "$bin" --dir "$dir/ground" serve --port "${url##*:}" --tokens "$dir/tokens.b3" --allow "$dir/allow" \
+    --first-seen "$dir/first-seen.jsonl" --batch-bytes 17825792 --id-budget 8388608 --max-sessions 16 \
+    </dev/null >>"$dir/server.log" 2>&1 &
+  pid=$!
+  echo "$pid" >"$dir/server.pid"
+  for _ in $(seq 300); do
+    [[ $(tail -c +$((size + 1)) "$dir/server.log") != *"listening on $url"* ]] || break
+    kill -0 "$pid" 2>/dev/null || fail "the server exited; see $dir/server.log"
+    sleep 0.1
+  done
+  [[ $(tail -c +$((size + 1)) "$dir/server.log") == *"listening on $url"* ]] || {
+    kill "$pid" 2>/dev/null || true
+    fail "the server didn't start listening within 30 seconds; see $dir/server.log"
+  }
+  # Up only once it answers: a sync of the main checkout's replica, as scripts/bk's would be.
+  tokens=("$dir"/tokens/*)
+  err=$(BRACKEN_DIR="$main/.bracken" "$bin" sync "$url" --token-file "${tokens[0]}" --deadline 30 2>&1 >/dev/null) ||
+    fail "the server is listening (pid $pid) but a sync with it failed: ${err##*$'\n'}"
+  echo "team-server: listening on $url (pid $pid)"
+}
+
+stop_server() {
+  local pid
+  pid=$(running_pid) || { echo "team-server: not running"; return 0; }
+  kill "$pid"
+  for _ in $(seq 50); do
+    kill -0 "$pid" 2>/dev/null || { echo "team-server: stopped"; return 0; }
+    sleep 0.1
+  done
+  fail "pid $pid didn't stop"
+}
+
+umask 077
+case "${1:-}" in
+  setup)
+    [ $# -ge 2 ] && [ $# -le 3 ] || usage
+    dir=$2 port=${3:-7391}
+    [[ $dir = /* ]] || fail "give <dir> as an absolute path"
+    [[ $port =~ ^[1-9][0-9]*$ ]] && [ "$port" -le 65535 ] || fail "'$port' isn't a port"
+    case "$dir/" in "$main"/*) fail "<dir> must be outside the repository" ;; esac
+    [ ! -f "$marker" ] || fail "already set up, in $(cat "$marker")"
+    [ ! -e "$dir/ground" ] || fail "$dir/ground already exists"
+    mkdir -p "$dir/tokens"
+    chmod 700 "$dir" "$dir/tokens"
+    "$bin" --dir "$main/.bracken" export "$dir/seed.bundle" >/dev/null
+    "$bin" --dir "$dir/ground" join "$dir/seed.bundle" >/dev/null
+    rm -f "$dir/seed.bundle"
+    printf 'http://127.0.0.1:%s\n' "$port" >"$dir/url"
+    printf '%s\n' "$dir" >"$marker"
+    echo "team-server: set up in $dir; issue tokens (team-server token <identity>), then team-server start"
+    ;;
+  token)
+    [ $# -eq 2 ] || usage
+    name=$2
+    team_dir
+    [[ $name =~ ^[a-z0-9_-]{1,64}$ ]] || fail "'$name' isn't an identity name"
+    command -v b3sum >/dev/null || fail "needs b3sum: cargo install --locked b3sum"
+    known=$(identities)
+    [[ $known == *"\"name\": \"$name\""* ]] || fail "no identity $name in the main checkout's Ground"
+    # 32 random bytes as hex, straight into the 0600 file.
+    od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"$dir/tokens/$name.new"
+    hash=$(b3sum --no-names <"$dir/tokens/$name.new")
+    mv "$dir/tokens/$name.new" "$dir/tokens/$name"
+    { grep -v "^$name " "$dir/tokens.b3" 2>/dev/null || true; echo "$name $hash"; } >"$dir/tokens.b3.new"
+    mv "$dir/tokens.b3.new" "$dir/tokens.b3"
+    echo "team-server: token for $name in $dir/tokens/$name"
+    # The server reads its tokens and allowlist only when it starts, so a running one restarts now:
+    # a token it doesn't know would let the identity write locally and block everyone's pushes.
+    if running_pid >/dev/null; then
+      echo "team-server: restarting the server, so it knows $name"
+      stop_server
+      start_server
+    fi
+    ;;
+  start)
+    [ $# -eq 1 ] || usage
+    team_dir
+    ! pid=$(running_pid) || fail "already running (pid $pid)"
+    start_server
+    ;;
+  stop)
+    [ $# -eq 1 ] || usage
+    team_dir
+    stop_server
+    ;;
+  *) usage ;;
+esac
