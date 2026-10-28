@@ -39,7 +39,7 @@ Build the **project profile**:
 | Shared resources | Things only one agent may use at a time | **the pinned `bracken` binary**, Ground checkpoint commits |
 | Things that break production | Footguns | "a change to encoding or validity rules can make every existing Ground unreadable" |
 | Remote | Where PRs and CI live | GitHub `owner/repo`, Forgejo `org/repo`, or `TODO(owner)`: no remote yet |
-| CI role | Observer (default) or gate | observer: runs on every PR, but merges are gated by the Ground (process section 10) |
+| CI role | Observer on every PR (default), manual, or gate | observer: runs on every PR, but merges are gated by the Ground (process section 10). Manual, when the forge's compute is too slow: the workflow runs only on `workflow_dispatch`, and the manager's counted test-table run on the exact head is the CI |
 | Agent harness | How threads, child tasks, messages and schedules work here (see Tool mapping) | T3 Code + Claude Code |
 | Models | Default model, a different-model reviewer, a strong security model, and which quota is largest | default A; reviewer B; security A at high effort |
 | Monitoring | Error monitor, crash reporting, where logs live | none yet |
@@ -78,7 +78,7 @@ Work on a branch, `agent-team-setup`, **in the main checkout**: the Ground must 
 Do these steps from the **main checkout**, not a worktree: it holds the live Ground. From now on, never switch the main checkout to a commit that lacks the committed `.bracken/` files; git would delete them from disk. All later branch work happens in worktrees.
 
 1. **Pin the binary into `.bracken-bin/`.** In the Bracken repo itself: `cargo install --locked --path crates/bracken --root .bracken-bin`. Elsewhere: install a released version the same way (`cargo install --locked bracken --version <v> --root .bracken-bin`, or from its source) and record the version. `scripts/bk` runs only this binary, never one on PATH. Agents never coordinate through a binary built from their own branch: a builder breaking the CLI must not break the team. Upgrading the pinned binary is a shared-resource action (section 6).
-2. **Install the scripts.** Copy `templates/bk`, `templates/bk-evidence`, `templates/merge` and `templates/ground-checkpoint` from this skill to `scripts/`, and `chmod +x` them. `bk` finds the main checkout from its own location, so it works from any worktree, and points `BRACKEN_DIR` at that checkout's `.bracken/`. `bk-evidence` runs a check and records its real exit code and output as evidence (process section 5). `merge` is the manager's merge step (process section 5, step 8); it expects an https forge whose API matches Forgejo's, a git credential helper for it, `curl` and `jq`. `ground-checkpoint` commits the Ground's files safely (process section 9.3). **Agents always run `scripts/bk`, never `bracken` directly.**
+2. **Install the scripts.** Copy `templates/bk`, `templates/bk-evidence`, `templates/merge`, `templates/ground-guards` and `templates/ground-checkpoint` from this skill to `scripts/`, and `chmod +x` them. `bk` finds the main checkout from its own location, so it works from any worktree, and points `BRACKEN_DIR` at that checkout's `.bracken/`. `bk-evidence` runs a check and records its real exit code and output as evidence (process section 5). `merge` is the manager's merge step (process section 5, step 8), and runs `ground-guards`, the checks on a head's committed Ground (process section 10); it expects an https forge whose API matches Forgejo's, a git credential helper for it, `curl` and `jq`. `ground-checkpoint` commits the Ground's files safely (process section 9.3). **Agents always run `scripts/bk`, never `bracken` directly.**
 3. **Commit the Ground, never the keys.** `.gitignore` must exclude `.bracken/identities/` (private keys), `.bracken/objects/**/.tmp-*` (writes in progress) and `.bracken-bin/`. Everything else under `.bracken/` is committed: `ground.json`, `objects/` and the public agent directory `agents/`. Contribution files are immutable and named by their hash, so git merges them without conflicts, and git is the Ground's durable record (section 9.3).
 4. **Create the Ground and identities:**
 
@@ -102,9 +102,9 @@ Create or update these files. If a file already exists, merge into it; don't ove
 | `.claude/skills/agent-team-kickoff/` | A copy of this skill, if the repo doesn't have one, so the process is versioned with the code. Later process changes go into that copy (process section 8). |
 | `docs/releases.md` | Release stages, the release path per change class, the owner's-go list, test report format, rollback steps. For protocol changes: how an existing Ground is migrated or why it doesn't need to be. |
 | `docs/README.md` | Index of docs. Stale docs move to `docs/archive/`. |
-| `scripts/bk`, `scripts/bk-evidence`, `scripts/merge`, `scripts/ground-checkpoint` | From `templates/`. |
+| `scripts/bk`, `scripts/bk-evidence`, `scripts/merge`, `scripts/ground-guards`, `scripts/ground-checkpoint` | From `templates/`. |
 | `.gitattributes` | `.bracken/** -text`, so git never converts the Ground's line endings. At the repo root: the Ground's allowlist rejects `.bracken/.gitattributes`. |
-| CI workflow | The guards in process section 10 that the project lacks, as an observer workflow. Propose deploy-related changes; don't make them without the owner's go. |
+| CI workflow | The guards in process section 10 that the project lacks, as an observer workflow; the Ground guards by calling `scripts/ground-guards`, not inline. Propose deploy-related changes; don't make them without the owner's go. |
 
 Also, if the harness supports it, add a worktree setup script that warms the build (`cargo fetch && cargo build --workspace`), so builders can test straight away.
 
@@ -125,7 +125,7 @@ Tick these off in the setup PR description:
 
 - [ ] Project profile complete; `TODO(owner)` items listed
 - [ ] Tool mapping filled for the harness
-- [ ] Pinned `bracken` binary installed; `scripts/bk`, `scripts/bk-evidence`, `scripts/merge` and `scripts/ground-checkpoint` installed; `.gitattributes` has `.bracken/** -text`; `.bracken/identities/` and `.bracken-bin/` ignored
+- [ ] Pinned `bracken` binary installed; `scripts/bk`, `scripts/bk-evidence`, `scripts/merge`, `scripts/ground-guards` and `scripts/ground-checkpoint` installed; `.gitattributes` has `.bracken/** -text`; `.bracken/identities/` and `.bracken-bin/` ignored
 - [ ] Ground created; identities `owner`, `manager`, `reviewer`, `security`, `triage` created
 - [ ] Goal and profile decisions contributed as claims
 - [ ] After the merge: main checkout back on `main` (`git checkout -B main origin/main`), first `scripts/ground-checkpoint` committed and pushed, and `git ls-files .bracken/identities` prints nothing
@@ -134,6 +134,6 @@ Tick these off in the setup PR description:
 - [ ] `AGENTS.md` trimmed and approved by the owner
 - [ ] Builder warm-build script on worktree creation
 - [ ] Default, reviewer and security models chosen and authenticated
-- [ ] CI observer workflow green on the setup PR; `main` protected against force-push and deletion, tested on a scratch branch (owner's go)
+- [ ] CI observer workflow green on the setup PR (or, for a manual CI role, one manual run); `main` protected against force-push and deletion, tested on a scratch branch (owner's go)
 - [ ] Monitoring and daily triage present or proposed
 - [ ] Manager started: manager claim and first plan contributed, harness-memory pointer added, owner briefed

@@ -13,8 +13,16 @@
 #   - a new file contains the value of a key in .bracken/identities/ written as
 #     hex, in any case (a re-encoded key, such as base64, isn't detected);
 #   - the Ground doesn't open;
-#   - what got staged isn't exactly the new files that were checked.
-# Pushing is a separate step.
+#   - what got staged isn't exactly the new files that were checked;
+#   - (on main, with an origin remote) origin's main, freshly fetched, has commits
+#     the local main doesn't and they fail scripts/ground-guards from the local
+#     main: no keys or stray files under .bracken/, the Ground append-only, the
+#     Ground opens, docs/vision.md matches it. Then don't pull them.
+# If origin can't be reached, it checks nothing there, says so, commits anyway (the
+# local files need no network) and names no commit to pull.
+# Pulling and pushing are separate steps: merge the commit it names as checked
+# (not a fresh `git pull`, which could bring in more), then push. That's the only
+# way to update the main checkout, after a merge too (process 9.3).
 #
 # Normally it runs on main. During the kickoff, `--setup` runs it on the setup
 # branch instead, with every other check, to commit the Ground's first files into
@@ -45,6 +53,21 @@ else
 fi
 git diff --cached --quiet || stop "something is already staged; commit or unstage it first"
 
+# What the next pull brings in is checked before anything is committed: a commit on origin's main
+# that skipped scripts/merge would otherwise land in the live Ground unchecked.
+pull=""
+if ! $setup && git remote get-url origin >/dev/null 2>&1; then
+  if ! git fetch -q origin +refs/heads/main:refs/remotes/origin/main; then
+    echo "ground-checkpoint: couldn't fetch origin's main, so checked nothing there; don't pull until a checkpoint can" >&2
+  elif pull=$(git rev-parse --verify refs/remotes/origin/main) && git merge-base --is-ancestor "$pull" HEAD; then
+    pull=""
+  else
+    "$here/ground-guards" HEAD "$pull" ||
+      stop "origin's main ($pull) fails the Ground guards above; don't pull it, and tell the owner if they name a key"
+  fi
+fi
+then_pull() { [ -z "$pull" ] || echo "ground-checkpoint: origin's main passes the Ground guards; pull exactly it with: git merge --no-edit $pull"; }
+
 tracked_bad=$(git ls-files -- .bracken | grep -E -v "$allowed" || true)
 [ -z "$tracked_bad" ] || stop "tracked files under .bracken/ that aren't Ground files (if any is a key, treat it as leaked and tell the owner):
 $tracked_bad"
@@ -54,7 +77,7 @@ edited=$(git diff --name-status -- .bracken)
 $edited"
 
 new=$(git ls-files --others --exclude-standard -- .bracken)
-[ -n "$new" ] || { echo "ground-checkpoint: nothing new"; exit 0; }
+[ -n "$new" ] || { echo "ground-checkpoint: nothing new"; then_pull; exit 0; }
 bad=$(printf '%s\n' "$new" | grep -E -v "$allowed" || true)
 [ -z "$bad" ] || stop "files under .bracken/ that aren't Ground files; nothing was committed:
 $bad"
@@ -90,4 +113,6 @@ $staged"
 fi
 
 git commit -q -m "ground: checkpoint $(date -u +%Y-%m-%dT%H:%MZ)"
-echo "ground-checkpoint: committed $(git rev-parse HEAD) ($(printf '%s\n' "$new" | wc -l | tr -d ' ') files); push it with: git push origin $branch"
+echo "ground-checkpoint: committed $(git rev-parse HEAD) ($(printf '%s\n' "$new" | wc -l | tr -d ' ') files)"
+then_pull
+echo "ground-checkpoint: push it with: git push origin $branch"

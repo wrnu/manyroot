@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# ground-guards: the checks on a commit's committed Ground that the test table doesn't make.
+#
+#   ground-guards <base> <head>
+#
+# Reads <head>'s committed files, never the working tree, so it can check a PR's head
+# without checking it out, from anywhere in the repository. Fails, saying which guard, if:
+#   1. a path in <head> is .bracken/ (or .bracken itself) in any case but not exactly
+#      that; or an entry under .bracken/ isn't a plain file (mode 100644: no symlink,
+#      gitlink or executable), or isn't one of the Ground's three file shapes (so no
+#      key, backup copy of the keys, stray file or .gitattributes); or an agents/*.json
+#      entry holds a private key. Treat any such file as leaked if it holds a key. Also
+#      if any path in <head> has a non-ASCII byte (a case-insensitive filesystem can fold
+#      one, such as a Kelvin sign for k, into .bracken), or a .gitattributes file was
+#      added, changed or removed since the merge base: checkout applies attributes to
+#      the Ground's files (eol=crlf breaks it), so a manager merges those by hand;
+#   2. a Ground file was deleted or changed since the merge base of <base> and <head>:
+#      the Ground is append-only, and editing a contribution (a finding, a failing
+#      piece of evidence) would change what the merge gate concludes. If that merge
+#      base is <head> itself, there's nothing to compare with, and it fails;
+#   3. the committed Ground doesn't open: opening it verifies every contribution's
+#      canonical encoding, hash, signature and causal parents. The copy it opens is
+#      the .bracken tree by its own id, so no attribute outside it (export-ignore in a
+#      root .gitattributes) applies, and guard 1 leaves none inside it; the copy must
+#      also hold exactly the files <head> committed;
+#   4. docs/vision.md differs from its latest artifact in the committed Ground
+#      (process section 1: each change to the file adds a new artifact in the same PR).
+# 3 and 4 run only when <head> has a Ground. Progress goes to stdout; a failure is the
+# last line starting "ground-guards:" on stderr, naming its guard. A guard that can't
+# check says so and fails.
+#
+# Runs the pinned bracken in <main>/.bracken-bin, like scripts/bk, or BRACKEN_BIN.
+# Used by scripts/merge (on a PR's head against main), scripts/ground-checkpoint (on
+# what main gained before it pulls) and the forge workflow's manual run.
+set -euo pipefail
+# Byte-wise matching, whatever the caller's locale: the path checks below mustn't depend on it.
+export LC_ALL=C
+
+[ $# -eq 2 ] || { echo "usage: ground-guards <base> <head>" >&2; exit 2; }
+fail() { echo "ground-guards: $*" >&2; exit 1; }
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
+# Pathspecs below are relative to the current directory: start from the top.
+top=$(git rev-parse --show-toplevel) || fail "not inside a git work tree"
+cd "$top"
+head=$(git rev-parse -q --verify "$2^{commit}") || fail "no commit $2"
+given=$(git rev-parse -q --verify "$1^{commit}") || fail "no commit $1"
+base=$(git merge-base "$given" "$head") || fail "Ground is append-only: no merge base of $1 and $2; can't check"
+
+# 1. Only Ground files under .bracken, as plain files, and no agent entry holding a private key.
+allowed='^\.bracken/(ground\.json|agents/[a-z0-9_-]{1,64}\.json|objects/[0-9a-f]{2}/[0-9a-f]{62})$'
+bad=()
+files=0
+while IFS= read -r -d '' entry; do
+  meta=${entry%%$'\t'*}
+  f=${entry#*$'\t'}
+  mode=${meta%% *}
+  if [[ $f == *[![:ascii:]]* ]]; then
+    bad+=("$f (a non-ASCII byte in the path, which a case-insensitive filesystem may fold into .bracken/)")
+    continue
+  fi
+  shopt -s nocasematch
+  near=false
+  if [[ $f == .bracken || $f == .bracken/* ]]; then near=true; fi
+  shopt -u nocasematch
+  $near || continue
+  if [[ $f != .bracken/* ]]; then
+    bad+=("$f (not a file under .bracken/, in that case)")
+  elif [ "$mode" != 100644 ]; then
+    bad+=("$f (mode $mode, not a plain file)")
+  elif ! [[ $f =~ $allowed ]]; then
+    bad+=("$f")
+  else
+    files=$((files + 1))
+  fi
+done < <(git ls-tree -r -z --full-tree "$head")
+keyed=$(git grep -l -e secret_key "$head" -- '.bracken/agents/*' | sed "s/^$head://" || true)
+[ ${#bad[@]} -eq 0 ] && [ -z "$keyed" ] ||
+  fail "only Ground files under .bracken: files under .bracken/ (or that a filesystem could put there) that aren't Ground files, or agent entries holding a private key (if any is a key, treat it as leaked and tell the owner):
+$(printf '%s\n' "${bad[@]}" "$keyed" | sed '/^$/d')"
+attributes=$(git diff --no-renames --name-status "$base" "$head" -- ':(glob,icase)**/.gitattributes')
+[ -z "$attributes" ] ||
+  fail "only Ground files under .bracken: .gitattributes changed since $base, and checkout applies attributes to the Ground's files; a manager merges attribute changes by hand, after checking what they do to .bracken/:
+$attributes"
+
+# 2. Append-only.
+[ "$base" != "$head" ] ||
+  fail "Ground is append-only: $head is where $1 already is, so there's nothing to compare it with; can't check"
+changed=$(git diff --no-renames --diff-filter=DMT --name-status "$base" "$head" -- .bracken)
+[ -z "$changed" ] || fail "Ground is append-only: Ground files were deleted or changed since $base:
+$changed"
+
+[ -n "$(git ls-tree --full-tree --name-only "$head" -- .bracken/ground.json)" ] ||
+  { echo "ground-guards: $head has no Ground; checks 1 and 2 pass"; exit 0; }
+[ -x "$bin" ] || fail "Ground opens: no bracken at $bin to open the Ground with (set BRACKEN_BIN); can't check"
+
+# 3. The Ground opens, from a private copy of what <head> committed.
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+mkdir "$tmp/.bracken"
+tree=$(git rev-parse -q --verify "$head:.bracken") && [ "$(git cat-file -t "$tree")" = tree ] ||
+  fail "Ground opens: .bracken in $head isn't a directory; can't check"
+GIT_ATTR_NOSYSTEM=1 git -c core.attributesFile=/dev/null -c core.autocrlf=false archive "$tree" | tar -x -C "$tmp/.bracken"
+copied=$(find "$tmp/.bracken" -type f | wc -l | tr -d ' ')
+[ "$copied" = "$files" ] ||
+  fail "Ground opens: the copy holds $copied files, but $head commits $files under .bracken/; can't check"
+g() { env -u BRACKEN_DIR -u BRACKEN_AGENT "$bin" --dir "$tmp/.bracken" "$@"; }
+count=$(g log | wc -l) || fail "Ground opens: the committed Ground doesn't open"
+echo "ground-guards: the Ground opens, $((count)) contributions"
+
+# 4. The vision document matches the Ground.
+doc=docs/vision.md
+if [ -n "$(git ls-tree --full-tree --name-only "$head" -- "$doc")" ]; then
+  # log prints "<id>  artifact  <author>  <name> (<n> bytes)" in causal order; the last match is the latest.
+  id=$(g log --kind artifact | { grep -v '(retracted)' || true; } | awk -v d="$doc" '$4 == d { id = $1 } END { print id }')
+  [ -n "$id" ] || fail "vision document: $doc isn't in the Ground; add it with scripts/bk artifact"
+  g cat "$id" >"$tmp/latest"
+  git cat-file blob "$head:$doc" | cmp -s - "$tmp/latest" ||
+    fail "vision document: $doc differs from its latest artifact in the Ground ($id); add the new version and supersede it"
+  echo "ground-guards: $doc matches artifact $id"
+fi
+echo "ground-guards: all guards pass at $head"

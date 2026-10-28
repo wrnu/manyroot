@@ -15,8 +15,13 @@
 #      written by the manager, which the manager related depends_on it (process 4.2);
 #   4. the forge PR is open, targets main, and its head is that sha;
 #   5. main's tip is an ancestor of the sha, or every file main changed since the
-#      branch point is under .bracken/, or under docs/ (not docs/vision.md) and
-#      untouched by the branch. Renames count as a deletion and an addition.
+#      branch point is under .bracken/, or is untouched by the branch and either
+#      under docs/ (not docs/vision.md) or a .md file under .claude/skills/ outside
+#      any templates/ directory: none of these can change what builds, tests or
+#      runs. Renames count as a deletion and an addition;
+#   6. scripts/ground-guards passes on the sha against main's tip: no keys or stray
+#      files under .bracken/, the Ground append-only, the Ground opens, and
+#      docs/vision.md matches it.
 # If all pass, it records manager evidence "merge gate @ <sha>" on the claim, then
 # squash-merges through the forge API with head_commit_id set to the sha, so the
 # forge refuses the merge if the branch moved after the check. --dry-run runs every
@@ -195,16 +200,28 @@ else
     case "$f" in
       .bracken/*) ;;
       docs/vision.md) echo "$f" ;;
-      docs/*) ! grep -qxF -- "$f" <<<"$ours" || echo "$f" ;;
+      .claude/skills/templates/* | .claude/skills/*/templates/*) echo "$f" ;;
+      docs/* | .claude/skills/*.md) ! grep -qxF -- "$f" <<<"$ours" || echo "$f" ;;
       *) echo "$f" ;;
     esac
   done)
   if [ -z "$bad" ]; then
-    main_case="main ($tip) is ahead of $sha only in .bracken/ and docs/ files the branch doesn't touch"
+    main_case="main ($tip) is ahead of $sha only in .bracken/, and docs/ or skill .md files the branch doesn't touch"
     check ok main "$main_case"
   else
     check FAIL main "main ($tip) is ahead of $sha with changes the verified head didn't test; merge main into the branch and verify again: $(printf "%s" "$bad" | tr "\n" " ")"
   fi
+fi
+
+# 6. The Ground guards, on what the head committed.
+if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  check FAIL guards "$sha isn't on the forge"
+elif guards=$(cd "$main" && "$here/ground-guards" "$tip" "$sha" 2>&1); then
+  guards_case=$(tail -1 <<<"$guards")
+  check ok guards "$guards_case"
+else
+  # The failure is the last ground-guards: line; earlier ones are guards that passed.
+  check FAIL guards "$( (grep '^ground-guards:' <<<"$guards" || tail -1 <<<"$guards") | tail -1)"
 fi
 
 [ "$failed" = 0 ] || fail "not merging PR #$pr: a check failed"
@@ -220,10 +237,11 @@ if $dry_run; then
   exit 0
 fi
 
-printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\nforge head: %s (PR #%s open against main)\nmain: %s\n' \
-  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" >"$details"
+printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\nforge head: %s (PR #%s open against main)\nmain: %s\nguards: %s\n' \
+  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" >"$details"
 id=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
   fail "couldn't record the merge-gate evidence; not merging"
 echo "recorded merge gate evidence $id"
 api POST "/pulls/$pr/merge" "$body" >/dev/null || fail "the forge refused the merge (if the head moved, it answers 409); the evidence $id stands"
 echo "merged PR #$pr at $sha"
+echo "update the main checkout only through scripts/ground-checkpoint and the sha it names, not git pull (process 9.3)"

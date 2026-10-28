@@ -6,7 +6,7 @@ Nothing is released yet. Every merge to `main` runs checks only and deploys noth
 
 | Stage | What it is | Status |
 |---|---|---|
-| `main` | Merged once the Ground's merge gate passed (CI observes, it doesn't gate) | In use |
+| `main` | Merged once the Ground's merge gate passed (CI runs only by hand and doesn't gate) | In use |
 | Tagged pre-release | A `v<version>-pre.<n>` tag on a `main` commit | `TODO(owner)` when there's something to hand out |
 | Published crates | `manyroot` and `bracken` on crates.io or the Forge cargo index, under `MIT OR Apache-2.0` | `TODO(owner)` |
 
@@ -43,7 +43,7 @@ For a change that can be seen or felt, the manager records evidence on the `pr` 
 The team coordinates through `.bracken-bin/bin/bracken`, built from `main`. After a merge that changes the CLI or library:
 
 ```sh
-# main checkout, on an up-to-date main, between merges
+# main checkout, on a main pulled through ground-checkpoint (process 9.3), between merges
 scripts/ground-checkpoint && git push origin main     # process section 9.3
 cargo install --locked --path crates/bracken --root .bracken-bin --force
 scripts/bk log > /dev/null && echo "new binary opens the Ground"

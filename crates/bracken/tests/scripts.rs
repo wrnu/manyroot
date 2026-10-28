@@ -243,3 +243,394 @@ fn merge_keeps_the_token_out_of_the_environment_when_the_caller_exports_token() 
         assert_eq!(log, "ran\n", "{scripts}: the token reached bracken's environment");
     }
 }
+
+/// Runs `scripts/merge --dry-run` for PR #1 against a local forge: a bare repository standing in for
+/// origin (through `insteadOf`) and a `curl` stub that answers with the PR. main holds a committed Ground;
+/// `on_branch` changes the PR's head and `on_main` what main gains after the branch point, each committed
+/// (`git add -A`, so a caller forces anything ignored in itself). The pr claim is by `builder` and passed
+/// by `val`, so the gate accepts it.
+fn merge_dry_run(scripts: &str, on_branch: impl FnOnce(&Path), on_main: impl FnOnce(&Path)) -> Output {
+    let file = |name: &str| repo_root().join(scripts).join(name);
+    let (merge, guards) = (file("merge"), file("ground-guards"));
+    let (tmp, dir) =
+        repo(&[("scripts/merge", &merge), ("scripts/ground-guards", &guards)], ".bracken/identities/\n", |_| {});
+    let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
+    let commit = |message: &str| {
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "--allow-empty", "-m", message]);
+    };
+    bk(&dir, &["init", "--name", "merge"]);
+    bk(&dir, &["id", "new", "builder"]);
+    bk(&dir, &["id", "new", "val"]);
+    bk(&dir, &["claim", "first", "--tag", "note", "--as", "val"]);
+    commit("ground");
+    git(&["switch", "-qc", "pr"]);
+    on_branch(&dir);
+    commit("the change");
+    let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
+    git(&["switch", "-q", "main"]);
+    on_main(&dir);
+    commit("main moves on");
+
+    let forge = tmp.path().join("forge.git");
+    git(&["init", "-q", "--bare", forge.to_str().unwrap()]);
+    git(&["push", "-q", forge.to_str().unwrap(), "main", "pr:refs/pull/1/head"]);
+    git(&["config", "remote.origin.url", "https://forge.example/o/r.git"]);
+    git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+    git(&["config", &format!("url.{}.insteadOf", forge.display()), "https://forge.example/o/r.git"]);
+    git(&["config", "credential.https://forge.example.helper", "!f() { echo username=t; echo password=DUMMY; }; f"]);
+    let claim = bk(&dir, &["claim", &format!("PR #1 pr @ {sha}: a change"), "--tag", "pr", "--as", "builder"]);
+    bk(&dir, &["evidence", &claim, "pass", "--method", "checked", "--as", "val"]);
+
+    std::fs::create_dir_all(tmp.path().join("stubs")).unwrap();
+    let pr =
+        format!(r#"{{"head":{{"sha":"{sha}"}},"state":"open","merged":false,"base":{{"ref":"main"}},"title":"t"}}"#);
+    write_executable(&tmp.path().join("stubs/curl"), &format!("#!/bin/sh\necho '{pr}'\n"));
+    let path = std::env::var("PATH").unwrap();
+    command(&dir, "scripts/merge", &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"])
+        .env("PATH", format!("{}:{path}", tmp.path().join("stubs").display()))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap()
+}
+
+/// The line `merge` printed for check `name`: `ok` or `FAIL`, then the check's name and detail.
+fn check_line(out: &Output, name: &str) -> String {
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout.lines().find(|l| l.split_whitespace().nth(1) == Some(name));
+    line.unwrap_or_else(|| panic!("no {name} check in: {stdout}\nstderr: {}", String::from_utf8_lossy(&out.stderr)))
+        .to_owned()
+}
+
+/// merge runs scripts/ground-guards on the PR's head: a clean head passes, and a head that commits a key
+/// under .bracken/identities/ or changes a committed Ground object is refused, saying which guard.
+#[test]
+fn merge_refuses_a_head_that_fails_the_ground_guards() {
+    for scripts in SCRIPTS {
+        let clean = merge_dry_run(scripts, |dir| std::fs::write(dir.join("code.txt"), "a change\n").unwrap(), |_| {});
+        let stderr = String::from_utf8_lossy(&clean.stderr);
+        assert!(clean.status.success(), "{scripts}: {}{stderr}", String::from_utf8_lossy(&clean.stdout));
+        assert!(check_line(&clean, "guards").starts_with("ok "), "{scripts}: {}", check_line(&clean, "guards"));
+
+        let key = merge_dry_run(
+            scripts,
+            |dir| {
+                std::fs::write(dir.join(".bracken/identities/leak.json"), "{\"secret_key\": \"00\"}\n").unwrap();
+                assert!(run(dir, "git", &["add", "-f", ".bracken/identities/leak.json"]).status.success());
+            },
+            |_| {},
+        );
+        let line = check_line(&key, "guards");
+        assert_eq!(key.status.code(), Some(1), "{scripts}: merged a head with a key");
+        assert!(line.starts_with("FAIL") && line.contains("only Ground files under .bracken"), "{scripts}: {line}");
+
+        let object = merge_dry_run(
+            scripts,
+            |dir| {
+                let objects = dir.join(".bracken/objects");
+                let shard = std::fs::read_dir(&objects).unwrap().next().unwrap().unwrap().path();
+                let file = std::fs::read_dir(shard).unwrap().next().unwrap().unwrap().path();
+                let mut bytes = std::fs::read(&file).unwrap();
+                bytes.push(b'x');
+                std::fs::write(&file, bytes).unwrap();
+            },
+            |_| {},
+        );
+        let line = check_line(&object, "guards");
+        assert_eq!(object.status.code(), Some(1), "{scripts}: merged a head that edits the Ground");
+        assert!(line.starts_with("FAIL") && line.contains("Ground is append-only"), "{scripts}: {line}");
+
+        // Guard 3 passes and says so before guard 4 fails: merge names guard 4.
+        let vision = merge_dry_run(
+            scripts,
+            |dir| {
+                std::fs::create_dir_all(dir.join("docs")).unwrap();
+                std::fs::write(dir.join("docs/vision.md"), "a vision with no artifact\n").unwrap();
+            },
+            |_| {},
+        );
+        let line = check_line(&vision, "guards");
+        assert_eq!(vision.status.code(), Some(1), "{scripts}: merged a vision document the Ground doesn't hold");
+        assert!(line.starts_with("FAIL") && line.contains("vision document"), "{scripts}: {line}");
+    }
+}
+
+/// main may be ahead of the verified head in .md files under .claude/skills/ that the branch doesn't
+/// touch, as in docs/: they can't change what builds or runs. Not in a templates/ directory (those are the
+/// scripts and files a kickoff copies into a repo), not in other files, and not in a file the branch changed.
+#[test]
+fn merge_lets_main_be_ahead_only_in_skill_docs_the_branch_leaves_alone() {
+    let write = |path: &'static str, text: &'static str| {
+        move |dir: &Path| {
+            let file = dir.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+    };
+    let code = write("code.txt", "a change\n");
+    for scripts in SCRIPTS {
+        for (main_file, branch_also, ok) in [
+            (".claude/skills/kick/process.md", None, true),
+            (".claude/skills/kick/deep/notes.md", None, true),
+            ("docs/guide.md", None, true),
+            (".claude/skills/kick/templates/AGENTS.md", None, false),
+            (".claude/skills/kick/templates/merge", None, false),
+            (".claude/skills/templates/x.md", None, false),
+            (".claude/skills/kick/run.sh", None, false),
+            (".claude/skills/kick/process.md", Some(".claude/skills/kick/process.md"), false),
+        ] {
+            let out = merge_dry_run(
+                scripts,
+                |dir| {
+                    code(dir);
+                    if let Some(f) = branch_also {
+                        write(f, "the branch's version\n")(dir);
+                    }
+                },
+                |dir| {
+                    let file = dir.join(main_file);
+                    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                    std::fs::write(file, "main's version\n").unwrap();
+                },
+            );
+            let line = check_line(&out, "main");
+            let case = format!("{scripts}: main ahead in {main_file}, branch also {branch_also:?}");
+            assert_eq!(line.starts_with("ok "), ok, "{case}: {line}");
+            assert_eq!(out.status.success(), ok, "{case}: {}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
+}
+
+/// Stages `contents` at `path` with `mode`, as git's index takes it, without the working tree: for a
+/// path in a case a case-insensitive filesystem would fold, or a symlink.
+fn stage(dir: &Path, mode: &str, path: &str, contents: &str) {
+    let blob = dir.join("../blob");
+    std::fs::write(&blob, contents).unwrap();
+    let oid = run(dir, "git", &["hash-object", "-w", blob.to_str().unwrap()]).stdout;
+    let entry = format!("{mode},{},{path}", String::from_utf8(oid).unwrap().trim());
+    let out = run(dir, "git", &["update-index", "--add", "--cacheinfo", &entry]);
+    assert!(out.status.success(), "staging {path}: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// The object path main's .gitattributes export-ignores, for a head to hide a file at.
+const HIDDEN: &str = ".bracken/objects/ab/cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+/// Runs `scripts/ground-guards <args>` from `cwd` inside the repository, in the C locale. main holds a
+/// committed Ground with docs/vision.md as its artifact, and a .gitattributes that keeps the Ground's
+/// files from conversion and export-ignores `HIDDEN`. Branch `pr` commits what `on_branch` stages.
+fn ground_guards(scripts: &str, cwd: &str, args: [&str; 2], on_branch: impl FnOnce(&Path)) -> Output {
+    let guards = repo_root().join(scripts).join("ground-guards");
+    let (_tmp, dir) = repo(&[("scripts/ground-guards", &guards)], ".bracken/identities/\n", |dir| {
+        std::fs::create_dir_all(dir.join("docs")).unwrap();
+        std::fs::write(dir.join("docs/vision.md"), "the vision\n").unwrap();
+        std::fs::write(dir.join(".gitattributes"), format!(".bracken/** -text\n{HIDDEN} export-ignore\n")).unwrap();
+    });
+    let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
+    bk(&dir, &["init", "--name", "guards"]);
+    bk(&dir, &["id", "new", "val"]);
+    bk(&dir, &["artifact", "docs/vision.md", "--as", "val"]);
+    git(&["config", "core.ignorecase", "false"]);
+    git(&["add", "-A"]);
+    git(&["commit", "-qm", "ground"]);
+    git(&["switch", "-qc", "pr"]);
+    on_branch(&dir);
+    git(&["commit", "-q", "--allow-empty", "-m", "the change"]);
+    command(&dir, dir.join("scripts/ground-guards").to_str().unwrap(), &args)
+        .current_dir(dir.join(cwd))
+        .env("LC_ALL", "C")
+        .env_remove("LANG")
+        .output()
+        .unwrap()
+}
+
+/// What a case stages on the branch.
+type Stager<'a> = Box<dyn FnOnce(&Path) + 'a>;
+
+/// ground-guards refuses each way a head can slip a key or a broken Ground past it, saying which guard: a
+/// file hidden from the copy it opens by export-ignore, attributes that would convert the Ground on
+/// checkout, a path with a non-ASCII byte (a Kelvin sign folds to k), a malformed object, a symlink or an
+/// executable, a .bracken/ path in another case, an agent entry holding a key, a vision document the Ground
+/// doesn't match, a head that is its own base, and an edited object when it's run from a subdirectory.
+#[test]
+fn ground_guards_refuse_each_way_a_head_can_hide_or_break_the_ground() {
+    let object = |name: char| format!(".bracken/objects/ab/{}", name.to_string().repeat(62));
+    let key = format!("{{\"secret_key\": \"{}\"}}\n", "0".repeat(64));
+    for scripts in SCRIPTS {
+        let cases: Vec<(&str, &str, [&str; 2], Stager, &str)> = vec![
+            ("clean", ".", ["main", "pr"], Box::new(|dir| stage(dir, "100644", "code.txt", "a change\n")), ""),
+            ("export-ignore", ".", ["main", "pr"], Box::new(|dir| stage(dir, "100644", HIDDEN, &key)), "Ground opens"),
+            (
+                "attributes converting the Ground",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| {
+                    stage(dir, "100644", ".gitattributes", ".bracken/** -text\n.bracken/objects/** text eol=crlf\n")
+                }),
+                ".gitattributes changed",
+            ),
+            (
+                "a Kelvin sign for k",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| {
+                    stage(dir, "100644", &format!(".brac\u{212A}en/objects/ee/{}", "d".repeat(62)), "garbage\n")
+                }),
+                "a non-ASCII byte in the path",
+            ),
+            (
+                "malformed object",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| stage(dir, "100644", &object('d'), "not a contribution\n")),
+                "Ground opens: the committed Ground doesn't open",
+            ),
+            (
+                "symlink",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| stage(dir, "120000", &object('e'), "/etc/passwd")),
+                "mode 120000",
+            ),
+            (
+                "executable",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| stage(dir, "100755", &object('f'), "#!/bin/sh\n")),
+                "mode 100755",
+            ),
+            (
+                "other case",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| stage(dir, "100644", ".BRACKEN/identities/k.json", &key)),
+                ".BRACKEN/identities/k.json (not a file under .bracken/",
+            ),
+            (
+                "keyed agent entry",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| stage(dir, "100644", ".bracken/agents/x.json", &key)),
+                "only Ground files under .bracken",
+            ),
+            (
+                "vision mismatch",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| stage(dir, "100644", "docs/vision.md", "another vision\n")),
+                "vision document: docs/vision.md differs",
+            ),
+            (
+                "head is the base",
+                ".",
+                ["pr", "pr"],
+                Box::new(|dir| stage(dir, "100644", "code.txt", "a change\n")),
+                "nothing to compare it with; can't check",
+            ),
+            (
+                "from a subdirectory",
+                "docs",
+                ["main", "pr"],
+                Box::new(|dir| {
+                    let objects = dir.join(".bracken/objects");
+                    let shard = std::fs::read_dir(&objects).unwrap().next().unwrap().unwrap().path();
+                    let file = std::fs::read_dir(shard).unwrap().next().unwrap().unwrap().path();
+                    let mut bytes = std::fs::read(&file).unwrap();
+                    bytes.push(b'x');
+                    std::fs::write(&file, bytes).unwrap();
+                    assert!(run(dir, "git", &["add", "-A"]).status.success());
+                }),
+                "Ground is append-only",
+            ),
+        ];
+        for (case, cwd, args, on_branch, expected) in cases {
+            let out = ground_guards(scripts, cwd, args, on_branch);
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let case = format!("{scripts}, {case}");
+            if expected.is_empty() {
+                assert!(out.status.success(), "{case}: {stdout}{stderr}");
+                assert!(stdout.contains("all guards pass"), "{case}: {stdout}");
+                continue;
+            }
+            assert_eq!(out.status.code(), Some(1), "{case} passed: {stdout}{stderr}");
+            let last = stderr.lines().rfind(|l| l.starts_with("ground-guards:")).unwrap_or_default();
+            let failure = &stderr[stderr.find(last).unwrap_or_default()..];
+            assert!(failure.contains(expected), "{case}: expected {expected:?} in: {stderr}");
+        }
+    }
+}
+
+/// ground-checkpoint runs ground-guards on what origin's main gained before anything is pulled: it names a
+/// clean commit as checked, and stops on one that edits a committed Ground object. Offline, it still commits.
+#[test]
+fn ground_checkpoint_runs_the_ground_guards_on_what_it_would_pull() {
+    for scripts in SCRIPTS {
+        let file = |name: &str| repo_root().join(scripts).join(name);
+        let (checkpoint, guards) = (file("ground-checkpoint"), file("ground-guards"));
+        let files = [("scripts/ground-checkpoint", &checkpoint), ("scripts/ground-guards", &guards)];
+        let (tmp, dir) = repo(&files.map(|(to, from)| (to, from.as_path())), ".bracken/identities/\n", |_| {});
+        let git = |args: &[&str]| {
+            let out = run(&dir, "git", args);
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        bk(&dir, &["init", "--name", "checkpoint"]);
+        bk(&dir, &["id", "new", "val"]);
+        bk(&dir, &["claim", "first", "--tag", "note", "--as", "val"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "ground"]);
+        let forge = tmp.path().join("forge.git");
+        git(&["init", "-q", "--bare", forge.to_str().unwrap()]);
+        git(&["remote", "add", "origin", forge.to_str().unwrap()]);
+        git(&["push", "-q", "origin", "main"]);
+        // Origin's main gains a commit made elsewhere: `change` on a side branch, pushed as main.
+        let push_ahead = |change: &dyn Fn(&Path)| {
+            git(&["switch", "-qc", "side", "origin/main"]);
+            change(&dir);
+            git(&["add", "-A"]);
+            git(&["commit", "-qm", "elsewhere"]);
+            let sha = git(&["rev-parse", "HEAD"]);
+            git(&["push", "-q", "origin", "side:main"]);
+            git(&["switch", "-q", "main"]);
+            git(&["branch", "-qD", "side"]);
+            sha
+        };
+        let case = |what: &str| format!("{scripts}, {what}");
+
+        let clean = push_ahead(&|dir| std::fs::write(dir.join("code.txt"), "a change\n").unwrap());
+        let out = run(&dir, "scripts/ground-checkpoint", &[]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{}: {stdout}{}", case("clean"), String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains(&format!("git merge --no-edit {clean}")), "{}: {stdout}", case("clean"));
+        git(&["merge", "-q", "--no-edit", &clean]);
+
+        push_ahead(&|dir| {
+            let objects = dir.join(".bracken/objects");
+            let shard = std::fs::read_dir(&objects).unwrap().next().unwrap().unwrap().path();
+            let file = std::fs::read_dir(shard).unwrap().next().unwrap().unwrap().path();
+            let mut bytes = std::fs::read(&file).unwrap();
+            bytes.push(b'x');
+            std::fs::write(&file, bytes).unwrap();
+        });
+        let before = git(&["rev-parse", "HEAD"]);
+        let out = run(&dir, "scripts/ground-checkpoint", &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{}: {stderr}", case("edited object"));
+        assert!(
+            stderr.contains("Ground is append-only") && stderr.contains("fails the Ground guards"),
+            "{}: {stderr}",
+            case("edited object")
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("git merge"), "{}", case("edited object"));
+        assert_eq!(git(&["rev-parse", "HEAD"]), before, "{}: a commit was made", case("edited object"));
+
+        // With origin out of reach, the local Ground's new files are still committed, and nothing is named to pull.
+        git(&["remote", "set-url", "origin", tmp.path().join("gone.git").to_str().unwrap()]);
+        bk(&dir, &["claim", "offline", "--tag", "note", "--as", "val"]);
+        let out = run(&dir, "scripts/ground-checkpoint", &[]);
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "{}: {stdout}{stderr}", case("offline"));
+        assert!(stderr.contains("checked nothing there"), "{}: {stderr}", case("offline"));
+        assert!(stdout.contains("committed") && !stdout.contains("git merge"), "{}: {stdout}", case("offline"));
+        assert_ne!(git(&["rev-parse", "HEAD"]), before, "{}: nothing was committed", case("offline"));
+    }
+}

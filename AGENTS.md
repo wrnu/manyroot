@@ -18,7 +18,7 @@
 
 ## Tests
 
-Run all three before every `pr` claim. CI runs the same.
+Run all three before every `pr` claim. This table is the CI: the forge's workflow runs only by hand, and the manager's counted run of the table on the exact head is what a merge waits for (decision `20a06f9b815e`, [docs/development.md](docs/development.md)).
 
 | Package | Test | Lint | Format |
 |---|---|---|---|
