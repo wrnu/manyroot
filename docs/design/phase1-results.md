@@ -1,38 +1,57 @@
-# Phase 1 experiment: calibration and pilot results
+# Phase 1 experiment: calibration, pilot and replicates
 
 Results of steps 8 and 9 of [the first Phase 1 experiment](phase1-experiment.md),
-run on 2026-10-28. The design's measures, caps and modes are defined there; this
-page gives the numbers.
+and of the two replicates after the pilot (option A below), all run on
+2026-10-28. The design's measures, caps and modes are defined there; this page
+gives the numbers.
 
-**This is one replicate per mode. It supports no claim that one mode beats
-another** (design section 4, What this can't show). Model runs vary, so one run
-per mode calibrates use and checks the harness. Only three or more replicates
-per mode, with the mode order randomized, can separate the modes from luck. The
-patterns below are worth testing, not conclusions.
+**Three replicates per mode, with one model, one prompt and a toy task.** The
+replicates show which differences between the modes recur in every run and
+which don't ([Three replicates](#three-replicates)). They are consistent
+directions, not proven effects: with three runs per mode, no significance test
+is strong (the smallest two-sided permutation p-value for three runs against
+three is 0.1). And `stacklib` is a toy, so a difference here is evidence about
+the coordination mechanisms, not about real software (design section 4, What
+this can't show).
 
 ## Summary
 
-- **The harness held.** In the pilot, all 240 turns passed the gate. There
-  were no sandbox denials, unreadable usage, crashes, turn errors, rate-limit
-  waits or cap events, and no mode stopped early.
-- **Use:** 23.5 million tokens, 0.62 million of them output, and 17 minutes
-  for the 10-agent pilot of all three modes. That is below the re-estimate of
-  27 to 47 million tokens and 30 to 45 minutes, and well inside the owner's
-  caps of 75 million tokens, 5 million output and 3 hours.
-- **The soft stop works.** Every pilot turn ended with its `result` event, so
-  all output is real: 2,600 tokens a turn on average, against the 30,000
-  ceiling that step 8 had to count.
-- **Final quality:** Bracken and CRDT ended with all 30 functions correct; Git
-  with 16 correct and 14 wrong.
+- **The harness held.** All 720 turns of the nine measured runs passed the
+  gate and ended with a `result` event. There were no sandbox denials,
+  unreadable usage, crashes, turn errors, rate-limit waits or cap events, and
+  no mode stopped early. One run in replicate 2 was stopped by a false alarm in
+  the separate watcher, not the harness, and was run again (below).
+- **Use per replicate:** 23.5, 24.0 and 23.4 million tokens; 0.62, 0.65 and
+  0.67 million output; 17, 19 and 20 minutes. That is steady from run to run.
+- **Consistent across the three replicates:**
+  - Bracken used about three times CRDT's tokens and four times Git's, and
+    had the fewest improvements per token.
+  - CRDT alone broke the library, 32 to 47 times per run, and always repaired
+    it to 30 of 30.
+  - Git alone had failed integrations, 5 to 11 per run.
+  - Bracken and CRDT spent 52 to 66% of their output on duplicated work,
+    against Git's 27 to 29%.
+- **Not consistent:** Git's final quality, which was 16, 16 and 30 correct.
+- **The pilot (replicate 1)**, which the sections up to
+  [Three replicates](#three-replicates) describe:
+  - **Use:** 23.5 million tokens, 0.62 million of them output, and 17 minutes
+    for the 10-agent pilot of all three modes. That is below the re-estimate
+    of 27 to 47 million tokens and 30 to 45 minutes, and well inside the
+    owner's caps of 75 million tokens, 5 million output and 3 hours.
+  - **The soft stop works.** Every pilot turn ended with its `result` event,
+    so all output is real: 2,600 tokens a turn on average, against the 30,000
+    ceiling that step 8 had to count.
+  - **Final quality:** Bracken and CRDT ended with all 30 functions correct;
+    Git with 16 correct and 14 wrong.
 
 ## Setup
 
-| | Calibration (step 8) | Pilot (step 9) |
+| | Calibration (step 8) | Pilot (step 9, replicate 1) |
 |---|---|---|
 | Model | Claude Opus 5.5, medium effort, after a Claude Haiku 5.5 shakedown | Claude Opus 5.5, medium effort |
 | Agents x turns per mode | 2 x 2 | 10 x 8 |
 | Harness | Main `d83ce6b`, Claude Code 2.1.311 pinned | Main `cfbdb7a` (with the soft stop at the tool-call cap and per-mode run caps), Claude Code 2.1.311 pinned |
-| Mode order, drawn at random | Opus: git, Bracken, CRDT | Bracken, CRDT, git |
+| Mode order, drawn at random | Opus: Git, Bracken, CRDT | Bracken, CRDT, Git |
 | Plan | Ground `8ce4b1f7b4d9` | Ground `3dba55e644d4` |
 | Reports | Ground `eb60e66777b3` (Haiku), `c59e23bd4be6` (Opus) | Ground `c0487eedf593`; per mode `d38c31096b44`, `5c54a75c8346`, `1078cc6bb654` |
 
@@ -41,7 +60,7 @@ as the driver counts it and would have stopped the driver at the pilot-wide
 caps, or on unreadable usage. It never fired. Run directories and transcripts
 stay on the machine that ran them and aren't committed.
 
-## The six measures (pilot)
+## The six measures (pilot, replicate 1)
 
 | Measure | Bracken | CRDT | Git |
 |---|---|---|---|
@@ -108,7 +127,8 @@ In the pilot:
 - The real output averaged 2,589 tokens a turn, against the 30,000 ceiling.
   Without the soft stop, the pilot would have counted up to 7.2 million output
   (5.4 million under the per-agent caps). That is over the owner's 5 million
-  output cap, and each agent would have stopped after 6 of its 8 turns.
+  output cap, and an agent whose every turn reached the call cap would have
+  stopped after 6 of its 8 turns (120 of the 240 turns reached it).
 
 ## The `--max-budget-usd` re-check
 
@@ -134,10 +154,12 @@ The calibration showed that the cap decided each turn's end. That led to the
 soft stop, and to the decision that the pilot's caps are pilot-wide, with each
 mode's run capped at a third (decision `ea053c2c4d48`).
 
-## Patterns worth testing
+## Patterns the pilot suggested
 
-These come from one run per mode. Each is a question for the replicates, not
-a finding.
+These came from the pilot alone, as questions for the replicates.
+[Three replicates](#three-replicates) answers them: all held except Git's
+final quality and CRDT's lead in net improvements per token, which Git took in
+replicate 3. Whether the task is too easy stays open.
 
 - **CRDT's churn and breakage.** CRDT made the most graded snapshots (67) and
   the most gross improvements (+135). It also made the most regressions (-91),
@@ -166,10 +188,100 @@ a finding.
   that don't (per token, time, breakage) carry the comparison. A harder task,
   or fewer turns, would test that.
 
+## Three replicates
+
+The owner chose option A below (approval `fca648d64ce6`): two more replicates
+of the pilot, each with its own plan and drawn mode order, the same harness
+(`cfbdb7a`), binaries, prompts, commands and caps.
+
+| | Replicate 1 (the pilot) | Replicate 2 | Replicate 3 |
+|---|---|---|---|
+| Mode order | Bracken, CRDT, Git | Git, Bracken, CRDT | Bracken, Git, CRDT |
+| Plan | Ground `3dba55e644d4` | Ground `658f0ab4eec6` | Ground `c1c6960425ef` |
+| Report | Ground `c0487eedf593` | Ground `9e6d47ff7c1c` | Ground `bd61ba5fd6cf` |
+| Tokens, output | 23.46 M, 0.62 M | 24.00 M, 0.65 M | 23.44 M, 0.67 M |
+| Wall-clock | 17.2 minutes | 18.6 minutes | 19.9 minutes |
+| Turns with a `result` event | 240 of 240 | 240 of 240 | 240 of 240 |
+
+The combined report is Ground `283a1af6619a`. In replicate 2, the watcher
+outside the harness stopped the first Bracken run during turn 7 (57 of its 80
+turns had ended), on a false
+alarm: it read a usage row the driver was still writing (Ground
+`c1c112cf9315`). The usage file was intact and the harness had no fault. That
+run is left out of the measures. Bracken was run again in a new directory
+with the watcher fixed, and the stopped run's 11.9 million tokens and 0.27
+million output counted toward replicate 2's caps (35.9 million and 0.92
+million in all, of 75 and 5 million).
+
+### The six measures across the replicates
+
+Mean over the three replicates, with the lowest and highest run in brackets.
+
+| Measure | Bracken | CRDT | Git |
+|---|---|---|---|
+| Tokens | 14.7 M [14.6 to 14.9] | 5.1 M [5.0 to 5.3] | 3.8 M [3.6 to 4.0] |
+| Output | 350,000 [334,000 to 375,000] | 183,000 [177,000 to 195,000] | 113,000 [102,000 to 122,000] |
+| **1. Improvements**: net | 39.7 [36 to 42], no losses | 44 [44 to 44]: +137, -93 | 34.7 [30 to 44], no losses |
+| per million tokens | 2.69 [2.44 to 2.88] | 8.64 [8.30 to 8.85] | 9.11 [7.55 to 11.47] |
+| per million output tokens | 113 [108 to 120] | 240 [225 to 248] | 308 [246 to 385] |
+| **2. Duplicated work**: deliveries | 293 [274 to 323] | 268 [217 to 307] | 111 [95 to 140] |
+| duplicated: visible, blind | 218 [193 to 247], 37 [32 to 40] | 236 [181 to 277], 0 | 78 [57 to 110], 2.7 [0 to 8] |
+| share of output tokens | 55% [52 to 61] | 65% [65 to 66] | 27% [27 to 29] |
+| **3. Overhead**: tokens, integrate | 3% [2 to 3.5] | 16% [15 to 16] | 26% [23 to 27] |
+| tokens, validate | 25% [24 to 26] | 8% [8 to 9] | 10% [9 to 11] |
+| time, integrate | 0.6% [0.4 to 0.8] | 0.7% [0.4 to 1.0] | 7% [2.6 to 14] |
+| failed integrations | 0 | 0 | 9 [5 to 11] |
+| **4. Useful discoveries** | 291 [273 to 319] | 93 [79 to 103] | 111 [95 to 140] |
+| integrated: count, median time | 156 [140 to 183], 88 s [75 to 97] | 93 [79 to 103], at once | 68 [57 to 75], 29 s [15 to 46] |
+| taken up, median time | 29 s [23 to 35] | 0.7 s [0.4 to 1.1] | 5.9 s [2.3 to 12.5] |
+| **5. Incompatible contributions**: broken in library | 0 | 38 [32 to 47], across 6 to 7 changes | 0 |
+| modules broken | 0 | 3.7 [2 to 5] | 0 |
+| semantic-conflict events | 0 | n/a | 0 |
+| **6. Final quality**: correct of 30 | 30, 30, 30 | 30, 30, 30 | 16, 16, 30 (14, 14 and 0 wrong) |
+
+One bug report, in Bracken in replicate 2, was the only one in nine runs. The
+other useful discoveries are deliveries that passed the grader standalone.
+
+### What three replicates support, and what they don't
+
+They support these as consistent directions: over the three runs, each
+mode's range on the measure doesn't overlap the others'.
+
+- **Bracken costs more.** It used 2.8 to 3.0 times CRDT's tokens and 3.7 to
+  4.1 times Git's, and 1.7 to 2.1 times CRDT's output and 2.7 to 3.4 times
+  Git's. It had the fewest improvements per token. The extra goes into model
+  calls, a context that grows with the Ground (up to 70,000 tokens in one call
+  in the pilot), and validation (a quarter of its tokens).
+- **CRDT breaks and repairs.** Only CRDT broke the library, 32 to 47 times per
+  run, with up to 5 changes after which a module didn't parse. It ended at 30
+  of 30 every time. Its net improvements were the same, 44, in all three runs.
+- **Git pays at the gate.** Only Git had failed integrations (5 to 11). It
+  spent the largest share of tokens integrating (23 to 27%), and it had the
+  fewest duplicated deliveries (27 to 29% of output).
+- **Bracken and CRDT duplicate work.** They spent 52 to 66% of their output
+  on deliveries another agent had already made correctly.
+- **Bracken integrates slowest.** Its median discovery took 75 to 97 seconds
+  and 10 to 15 turns to be integrated, because it needs a non-author's pass.
+  CRDT's are integrated as they're written, and Git's took 15 to 46 seconds.
+
+They don't support:
+
+- **Git's final quality.** It ended with 14 of 30 wrong in replicates 1 and 2
+  and with all 30 correct in replicate 3. The pilot's pattern didn't hold.
+- **Git's improvements per token against CRDT's.** Git's range (7.55 to
+  11.47) contains CRDT's (8.30 to 8.85).
+- **Anything beyond this setup.** All agents are one model with one prompt,
+  the task is a toy, and the final quality saturates: Bracken and CRDT reached
+  30 of 30 in every run. A harder task, fewer turns or more agents would test
+  whether the costs above buy anything that this task can't show.
+
 ## Options for the next runs
 
 Each option needs the owner's own go (approval `3418fe14b8ed` covered the pilot
-only). Estimates scale from the pilot's measured use.
+only). Estimates scale from the pilot's measured use. The owner chose option A
+(approval `fca648d64ce6`), and it ran as [Three replicates](#three-replicates)
+describes, at 23.4 to 24.0 million tokens per replicate. B and C remain
+options.
 
 | Option | What | Expected use | Caps it would need |
 |---|---|---|---|

@@ -9,9 +9,11 @@
 > agents spends the owner's quota, so the manager tells the owner before each
 > real run, with its expected use.
 >
-> **Results:** the calibration (step 8) and the 10-agent pilot (step 9) ran on
-> 2026-10-28; their numbers are in [phase1-results.md](phase1-results.md). It
-> is one replicate per mode, so it supports no claim about the modes.
+> **Results:** the calibration (step 8), the 10-agent pilot (step 9) and two
+> more replicates ran on 2026-10-28; their numbers are in
+> [phase1-results.md](phase1-results.md). Three replicates per mode show
+> consistent directions, with one model, one prompt and a toy task, not
+> proven effects.
 
 [vision.md](../vision.md) asks for the same tasks, model budget and test
 environment under three modes (Git branches and pull requests, CRDT shared
@@ -1228,8 +1230,8 @@ The owner accepted all eight recommendations of the first draft (decision
 
 ## 9. After the pilot
 
-The pilot's results, and the options for replicates and scale with their
-expected use and caps, are in [phase1-results.md](phase1-results.md).
+The pilot's and the replicates' results, and the remaining options for scale
+with their expected use and caps, are in [phase1-results.md](phase1-results.md).
 
 - **Replicates**: three or more per mode, with the mode order randomized,
   before claiming that one mode beats another.
