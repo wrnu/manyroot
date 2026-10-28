@@ -10,6 +10,7 @@
 | [design/network-sync.md](design/network-sync.md) | Network sync design, decided in part (2026-10-27): syncing Grounds over a network, and what it retires from the process |
 | [design/phase1-experiment.md](design/phase1-experiment.md) | Proposal (2026-10-27): the first Phase 1 experiment, 10 agents under Git, CRDT and Bracken modes: task, setup, driver, metrics, cost, build steps |
 | [design/phase1-results.md](design/phase1-results.md) | Results (2026-10-28): the Phase 1 calibration, the 10-agent pilot and its two replicates, the six measures per mode with their spread, use, what three replicates support, and the options for scale |
+| [design/phase1-bracken-lessons.md](design/phase1-bracken-lessons.md) | Design analysis (2026-10-28): why Bracken mode duplicated work, integrated slowly and read so much in Phase 1, what is Bracken's and what the experiment's, and ranked changes to Bracken |
 | [releases.md](releases.md) | Release stages, the owner's-go list, pinned-binary upgrades, migrations, rollback |
 
 Stale docs move to `archive/`. Knowledge that isn't documentation (decisions, gotchas, tasks, the plan, weekly metrics) lives in the Ground: `scripts/bk log --tag <tag> --current`.
