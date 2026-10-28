@@ -18,6 +18,7 @@ use bracken_experiment::claude::{Caps, ClaudeBackend, ClaudeConfig, Expect, Pin,
 use bracken_experiment::driver::{Backend, CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
 use bracken_experiment::mode::mode_named;
 use bracken_experiment::plan::{PlanInputs, report};
+use bracken_experiment::proxy::Attempt;
 use bracken_experiment::sandbox::{Git, Sandbox, WorkerPaths, resolved};
 
 const FAKE_AUTH: &str = "fake-auth-value-not-a-secret-0123456789";
@@ -254,9 +255,15 @@ fn the_agent_profile_refuses_each_forbidden_access() {
     want.sort();
     let want: Vec<(&str, &str)> = want.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     assert_verdicts(&r, &want);
-    // Only the allowed CONNECT reached the stand-in for the LLM proxy.
+    // Only the allowed CONNECT reached the stand-in for the LLM proxy. The proxy records a tunnel
+    // once it has closed, which can be just after the probe has exited.
+    let start = Instant::now();
+    let tunnelled = |a: &Attempt| a.allowed && a.target == format!("{HOST}:443");
+    while !backend.proxy_attempts().iter().any(tunnelled) {
+        assert!(start.elapsed() < EARLY, "{:?}", backend.proxy_attempts());
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let attempts = backend.proxy_attempts();
-    assert!(attempts.iter().any(|a| a.allowed && a.target == format!("{HOST}:443")), "{attempts:?}");
     assert!(attempts.iter().filter(|a| a.allowed).all(|a| a.target == format!("{HOST}:443")), "{attempts:?}");
 }
 
@@ -954,13 +961,16 @@ fn killing_the_driver_mid_turn_leaves_no_agent_process_and_no_request() {
         std::thread::sleep(Duration::from_millis(50));
     }
     let pid: u32 = std::fs::read_to_string(log.with_extension("pid")).expect("pid").trim().parse().expect("a pid");
-    let transcript = std::fs::read_to_string(dir.join("claude/transcripts/agent-0-1.jsonl")).expect("transcript");
-    let port: u16 = transcript
-        .split("http://127.0.0.1:")
-        .nth(1)
-        .and_then(|r| r.split('"').next())
-        .and_then(|p| p.parse().ok())
-        .expect("the proxy's port");
+    // The driver writes the transcript as it reads the stream, so the env line may lag the fake.
+    let port = || -> Option<u16> {
+        let transcript = std::fs::read_to_string(dir.join("claude/transcripts/agent-0-1.jsonl")).ok()?;
+        transcript.split("http://127.0.0.1:").nth(1)?.split('"').next()?.parse().ok()
+    };
+    while port().is_none() {
+        assert!(start.elapsed() < Duration::from_secs(60), "no proxy port in the transcript");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let port = port().expect("the proxy's port");
 
     driver.kill().expect("killing the driver");
     driver.wait().expect("reaped");
@@ -1025,6 +1035,20 @@ fn the_proxy_tunnels_only_to_the_routing_host() {
     assert_eq!(tunnel.read(&mut buf).expect("closed, not timed out"), 0, "closed");
 }
 
+/// Task `f0afdabe05b5`: a refusal is counted before its client sees the 403, so a count read right
+/// after the reply never misses it.
+#[test]
+fn a_refusal_is_counted_before_its_client_sees_it() {
+    use bracken_experiment::proxy::{Proxy, Route};
+    let route = Route { host: HOST.into(), port: 443, connect: None };
+    let proxy = Proxy::start(route, Duration::from_secs(120)).expect("proxy");
+    for i in 1..=50 {
+        let (reply, _) = connect_through(proxy.port(), "CONNECT example.com:443 HTTP/1.1\r\n\r\n");
+        assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+        assert_eq!(proxy.attempts().len(), i, "refusal {i} was counted before its reply");
+    }
+}
+
 #[test]
 fn routing_takes_only_the_routing_entries_and_never_shows_the_value() {
     let tmp = tempfile::tempdir().expect("a temp dir");
@@ -1078,6 +1102,12 @@ fn real_claude_code_reaches_init_and_first_request() {
     );
     assert!(s.usage().iter().any(|r| r["gate"] == true), "the gate passed");
     assert!(!t.contains(FAKE_AUTH), "no auth value in the transcript");
+    // A tunnel is recorded once it closes, and the stand-in records a connection once it has read it.
+    let start = Instant::now();
+    while backend.proxy_attempts().is_empty() || s.endpoint.connections().is_empty() {
+        assert!(start.elapsed() < EARLY, "no tunnel or no connection recorded");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let attempts = backend.proxy_attempts();
     println!("proxy attempts: {attempts:?}");
     assert!(!attempts.is_empty() && attempts.iter().all(|a| a.allowed && a.target == format!("{HOST}:443")));
