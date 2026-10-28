@@ -417,3 +417,23 @@ fn a_sync_session_that_never_ends_by_itself_is_stopped_at_its_deadline() {
     assert!(started.elapsed() < std::time::Duration::from_secs(60), "{:?}", started.elapsed());
     reader.join().expect("the peer");
 }
+
+/// The `accepted` tool shows what counts, by the same rule: a fail later replaced by the same validator's
+/// pass counts, and an artifact related only by someone else, or to no spec, doesn't (finding `6792b444895d`).
+#[test]
+fn the_accepted_tool_shows_exactly_what_counts() {
+    let mut g = Ground::new();
+    g.implement("x-abs", "x", "abs", "a", 0);
+    g.verdict("x-abs", "validator-0", "fail");
+    g.verdict("x-abs", "validator-0", "pass");
+    g.push("y-abs", "artifact", "y", json!({"name": "abs", "text": "def abs 1 : a\n"}));
+    g.push("rel-z", "relation", "z", json!({"kind": "implements", "from": "y-abs", "to": "spec-abs"}));
+    g.verdict("y-abs", "validator-1", "pass");
+    let counted = g.snapshot().counted();
+    let rows = counted.as_array().expect("a list");
+    assert_eq!(rows.len(), 1, "{counted}");
+    assert_eq!((rows[0]["function"].as_str(), rows[0]["id"].as_str()), (Some("abs"), Some("x-abs")));
+    assert_eq!(rows[0]["passes"], 1);
+    let integrated = g.snapshot().integrated();
+    assert_eq!(integrated.keys().copied().collect::<Vec<_>>(), vec!["abs"], "the same pick as the integrated library");
+}

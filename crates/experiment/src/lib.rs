@@ -29,6 +29,7 @@ pub mod metrics;
 pub mod mock;
 pub mod mode;
 pub mod plan;
+pub mod prompts;
 pub mod proxy;
 pub mod sandbox;
 pub mod shim;

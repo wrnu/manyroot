@@ -137,6 +137,7 @@ impl Setup {
             dir: self.dir.join("claude"),
             shim: bin(),
             prompt: script.to_string(),
+            turns: 8,
             tools: tools(),
             upstream: Some(self.endpoint.addr),
         })
@@ -403,21 +404,33 @@ fn git_modes_worker_profiles_run_git_and_still_no_shell() {
     let st = stores();
     let fake = fake();
     let binary = git_binary().expect("git");
-    let git = Git { exec_path: binary.parent().expect("an exec path").to_path_buf(), binary: binary.clone() };
+    let git = Git::of(&binary).expect("git's exec path");
+    // The exec path, not the binary's own folder: a tool beside the binary that isn't a git helper stays out.
+    // Where the folder holds nothing else (Homebrew, most Linux), there is nothing to refuse.
+    let beside = std::fs::read_dir(binary.parent().expect("a folder"))
+        .expect("the binary's folder")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| {
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("git");
+            !name.starts_with("git") && p.is_file() && !p.starts_with(&git.exec_path)
+        });
     let helper = git.exec_path.join("git-upload-pack");
     for hub in [false, true] {
         let store = if hub { &st.hub } else { &st.copy };
         let paths = WorkerPaths { store, worker: &fake, bracken: &bracken(), git: Some(&git), sockets: &[] };
         let sandbox = if hub { Sandbox::hub(&paths) } else { Sandbox::tools(&paths) }.expect("profile");
-        let spec = json!({"exec": [binary, helper, "/bin/sh", "/bin/bash"], "write": [st.other.join("new")]});
+        let mut exec = vec![binary.clone(), helper.clone(), "/bin/sh".into(), "/bin/bash".into()];
+        exec.extend(beside.clone());
+        let spec = json!({"exec": exec, "write": [st.other.join("new")]});
         let r = probe_under(&sandbox, &spec);
-        let want = [
+        let mut want = vec![
             (format!("exec:{}", binary.display()), "allowed"),
             (format!("exec:{}", helper.display()), "allowed"),
             ("exec:/bin/sh".to_string(), "denied"),
             ("exec:/bin/bash".to_string(), "denied"),
             (format!("write:{}", st.other.join("new").display()), "denied"),
         ];
+        want.extend(beside.iter().map(|b| (format!("exec:{}", b.display()), "denied")));
         let want: Vec<(&str, &str)> = want.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         assert_verdicts(&r, &want);
     }
@@ -683,11 +696,14 @@ fn token_caps_act_while_a_turn_streams() {
 #[test]
 fn the_run_time_cap_stops_the_run() {
     let s = Setup::new();
-    let caps = Caps { run_time: Duration::from_secs(2), turn_time: LONG_TURN, ..caps() };
+    // Long enough that the first turn starts after the run's setup, so the check while a turn streams
+    // is the one that acts, not the check before each turn.
+    let caps = Caps { run_time: Duration::from_secs(10), turn_time: LONG_TURN, ..caps() };
     let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), caps.clone());
     let start = Instant::now();
     let err = s.run(&backend, 2, 2).expect_err("the run stops");
     assert!(err.contains("time cap") && start.elapsed() < EARLY, "{err}");
+    assert!(s.transcript("agent-0", 1).is_some(), "the cap acted while a turn ran, not before one started");
 
     // The driver names the cap, so the report measures the run if the plan expects that stop, and not otherwise.
     let usage = s.dir.join("claude/usage.jsonl");
@@ -818,7 +834,7 @@ fn killing_the_driver_mid_turn_leaves_no_agent_process_and_no_request() {
         .arg("run")
         .arg("--dir")
         .arg(&dir)
-        .args(["--agents", "1", "--turns", "1", "--claude-version", "2.1.311"])
+        .args(["--mode", "bracken", "--agents", "1", "--turns", "1", "--claude-version", "2.1.311"])
         .arg("--claude")
         .arg(fake())
         .arg("--settings")

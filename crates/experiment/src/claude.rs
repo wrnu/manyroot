@@ -49,8 +49,8 @@ pub const ROUTING_KEYS: [&str; 3] =
 pub const RUN_TOKEN_CAP: &str = "the run's token cap is reached";
 pub const RUN_TIME_CAP: &str = "the run's time cap is reached";
 
-/// The message that starts each turn; the plan hashes it.
-pub const TURN_MESSAGE: &str = "This is turn {turn} of yours. You are {name}.";
+/// The message that starts each turn, the same in every mode ([`crate::prompts::turn_message`]); the plan hashes it.
+pub const TURN_MESSAGE: &str = "This is your turn {turn} of {turns}. You are {name}. Start by reading your notes.";
 
 /// The MCP server name the shim is registered under: its tools are `mcp__experiment__<tool>`.
 pub const SERVER: &str = "experiment";
@@ -245,8 +245,10 @@ pub struct ClaudeConfig {
     pub dir: PathBuf,
     /// The `bracken-experiment` binary: the shim and the guard.
     pub shim: PathBuf,
-    /// The base system prompt.
+    /// The system prompt: [`crate::prompts::system_prompt`] in a real run.
     pub prompt: String,
+    /// Each agent's turns in the run, for the turn message.
+    pub turns: u32,
     /// The mode's tool names and the core's, as the driver serves them.
     pub tools: Vec<String>,
     /// Tests only: where the forwarding proxy connects instead of resolving the routing host.
@@ -536,7 +538,7 @@ impl ClaudeBackend {
     fn play(&self, name: &str, turn: u32, socket: &Path) -> Result<End, String> {
         let turn_dir =
             self.cfg.pin.check().and_then(|()| self.turn_config(name, socket)).map_err(|e| self.halting(e))?;
-        let message = TURN_MESSAGE.replace("{turn}", &turn.to_string()).replace("{name}", name);
+        let message = crate::prompts::turn_message(turn, self.cfg.turns, name);
         let mut cmd = self.command(name, &turn_dir, socket, &message)?;
         let path = self.cfg.dir.join("transcripts").join(format!("{name}-{turn}.jsonl"));
         let mut transcript = Transcript::create(&path, self.cfg.routing.secret())?;

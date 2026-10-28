@@ -52,7 +52,7 @@ pub struct PlanInputs {
     pub harness_commit: String,
     /// The backend's caps (step 6), as it states them.
     pub caps: Value,
-    /// blake3 of the base system prompt agents are given; empty for the mock.
+    /// blake3 of the system prompt agents are given, the base and the mode's section; empty for the mock.
     pub system_prompt: String,
     /// The backend's usage rows: relative to the run directory, or absolute.
     pub usage: String,

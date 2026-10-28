@@ -70,6 +70,25 @@ pub struct Git {
     pub exec_path: PathBuf,
 }
 
+impl Git {
+    /// `binary` (by absolute path) and the directory it runs its helpers from, as `git --exec-path`
+    /// says, resolved. Not the folder of the resolved binary: with Xcode's git, that is a `bin` of
+    /// over a hundred tools (note `bb68a9908903`).
+    pub fn of(binary: &Path) -> Result<Git, String> {
+        let out = Command::new(binary)
+            .arg("--exec-path")
+            .env_clear()
+            .output()
+            .map_err(|e| format!("asking git for its exec path: {e}"))?;
+        let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || dir.is_empty() {
+            return Err("git gave no exec path".into());
+        }
+        let exec_path = std::fs::canonicalize(&dir).map_err(|e| format!("resolving git's exec path {dir}: {e}"))?;
+        Ok(Git { binary: binary.to_path_buf(), exec_path })
+    }
+}
+
 /// What an agent's Claude Code may touch.
 pub struct AgentPaths<'a> {
     /// The pinned binary.

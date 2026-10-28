@@ -61,7 +61,7 @@ impl Mode for CrdtMode {
         vec![
             tool(
                 "read",
-                "Read a file of your copy of the shared document, with line numbers",
+                "Read a file of your copy of the shared document, with line numbers. NOTES.md is where agents talk to each other: everyone can read it with read",
                 json!({"file": readable, "start": line, "count": line}),
                 &["file"],
             ),

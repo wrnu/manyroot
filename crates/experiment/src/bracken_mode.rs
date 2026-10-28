@@ -54,23 +54,33 @@ impl Mode for BrackenMode {
         vec![
             tool(
                 "log",
-                "Contributions in your replica, in causal order, as JSON",
+                "Contributions in your replica (your copy of the shared record), oldest first, as JSON; filter by kind or tag. With current, leave out what was retracted and what its own author superseded",
                 json!({"kind": {"type": "string", "enum": KINDS}, "tag": text, "current": {"type": "boolean"}}),
                 &[],
             ),
-            tool("show", "One contribution with its assessment and referrers", json!({"id": id}), &["id"]),
-            tool("heads", "The causal heads of your replica", json!({}), &[]),
-            tool("conflicts", "Open divergences and contradictions", json!({}), &[]),
             tool(
-                "accepted",
-                "The accepted layer: contributions with enough independent passes",
-                json!({"min_passes": {"type": "integer", "minimum": 1, "maximum": 5}}),
+                "show",
+                "One contribution, with the evidence on it and the relations that point to it",
+                json!({"id": id}),
+                &["id"],
+            ),
+            tool("heads", "The newest contributions in your replica: those nothing later builds on", json!({}), &[]),
+            tool(
+                "conflicts",
+                "Contributions that disagree: claims that contradict each other, and rival successors to one claim",
+                json!({}),
                 &[],
             ),
-            tool("cat", "An artifact's content", json!({"id": id}), &["id"]),
+            tool(
+                "accepted",
+                "What counts in your replica, per function: the implementation its author related to the current spec claim that has a pass from someone else and no one else's latest verdict a fail; the one with most passes wins",
+                json!({}),
+                &[],
+            ),
+            tool("cat", "The text of an artifact", json!({"id": id}), &["id"]),
             tool(
                 "claim",
-                "Contribute a claim",
+                "Contribute a claim: a statement, with optional tags and claims of yours it replaces. Claims are where agents talk to each other: everyone can read them with log",
                 json!({"statement": text, "tags": {"type": "array", "items": text}, "supersedes": {"type": "array", "items": id}}),
                 &["statement"],
             ),
@@ -82,20 +92,25 @@ impl Mode for BrackenMode {
             ),
             tool(
                 "relate",
-                "Relate two contributions",
+                "Link two contributions: from is the subject, kind how it relates to to, for example an artifact implements a spec claim",
                 json!({"from": id, "kind": {"type": "string", "enum": RELATIONS}, "to": id, "note": text}),
                 &["from", "kind", "to"],
             ),
             tool(
                 "evidence",
-                "Record a pass or fail on a contribution",
+                "Record your pass or fail verdict on a contribution; method says how you judged it, details what you found. A later verdict of yours replaces your earlier one",
                 json!({"target": id, "verdict": {"type": "string", "enum": VERDICTS}, "method": text, "details": text}),
                 &["target", "verdict", "method"],
             ),
-            tool("retract", "Retract one of your contributions", json!({"target": id, "reason": text}), &["target"]),
+            tool(
+                "retract",
+                "Withdraw one of your contributions, with a reason; it then no longer counts",
+                json!({"target": id, "reason": text}),
+                &["target"],
+            ),
             tool(
                 "check",
-                "Run an implementation artifact on the public cases, with calls resolved in your replica's working library",
+                "Run an implementation artifact on its function's public cases; calls to other functions use what counts in your replica, else your own latest implementation, else anyone's",
                 json!({"id": id}),
                 &["id"],
             ),
@@ -152,10 +167,6 @@ pub fn plan(name: &str, args: &Args, identity: &str) -> Result<Plan, String> {
         "show" => read(vec![s("show"), s("--json"), s("--"), s(args.id("id")?)]),
         "heads" => read(vec![s("heads"), s("--json")]),
         "conflicts" => read(vec![s("conflicts"), s("--json")]),
-        "accepted" => {
-            let n = args.int_opt("min_passes", 1..=5)?.unwrap_or(1);
-            read(vec![s("accepted"), s("--json"), opt("min-passes", n)])
-        }
         "cat" => Plan { json: false, ..read(vec![s("cat"), s("--"), s(args.id("id")?)]) },
         "claim" => {
             let mut head = vec![s("claim")];
@@ -189,7 +200,6 @@ fn allowed(name: &str) -> &'static [&'static str] {
     match name {
         "log" => &["kind", "tag", "current"],
         "show" | "cat" | "check" => &["id"],
-        "accepted" => &["min_passes"],
         "claim" => &["statement", "tags", "supersedes"],
         "artifact" => &["function", "content"],
         "relate" => &["from", "kind", "to", "note"],
@@ -346,6 +356,12 @@ impl Store for BrackenStore {
     }
 
     fn tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        if name == "accepted" {
+            // The harness's own count, not real Bracken's `accepted`, so the tool shows what counts
+            // (decision `5e8df6996a2e`; finding `6792b444895d`).
+            Args::new(args, allowed("accepted"))?;
+            return Ok(self.state()?.counted());
+        }
         if name == "check" {
             let id = Args::new(args, allowed("check"))?.id("id")?.to_string();
             return self.check(&id);
@@ -745,6 +761,18 @@ impl Snapshot {
             }
         }
         best.into_iter().map(|(s, (_, _, e))| (s, e)).collect()
+    }
+
+    /// What counts, per function, as the `accepted` tool shows it: the fixed rule's pick.
+    pub fn counted(&self) -> Value {
+        let rows: Vec<Value> = self
+            .pick()
+            .into_iter()
+            .map(|(function, e)| {
+                json!({"function": function, "id": e.id, "author": e.author, "passes": self.passes(e).unwrap_or(0)})
+            })
+            .collect();
+        Value::Array(rows)
     }
 
     /// The integrated library: the fixed rule's pick, and nothing else.
