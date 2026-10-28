@@ -14,8 +14,8 @@
 # instead: it merges that commit into HEAD in a scratch worktree, runs the command there (in the
 # same subdirectory), removes the worktree, and records --method "<command> @ <HEAD sha> on <main
 # sha>". The pr claim stays on HEAD. scripts/merge accepts main ahead of the head in any path when
-# the manager's pass names this head and a main that main's tip has moved past only in .bracken/
-# and docs. It refuses, recording nothing, if the merge conflicts: then merge main into the branch.
+# the manager's pass of scripts/test-table names this head and a main that main's tip has moved past
+# only in .bracken/ and docs. It refuses, recording nothing, if the merge conflicts: then merge main into the branch.
 #
 # It refuses, recording nothing, when:
 #   - it isn't run inside a git checkout;
@@ -91,7 +91,10 @@ if [ -n "$on" ]; then
   fi
   merged=$(git -C "$scratch/tree" rev-parse HEAD)
   # The caller's subdirectory, from where it runs (with -C the prefix would always be empty).
-  run_dir="$scratch/tree/$(git rev-parse --show-prefix)"
+  prefix=$(git rev-parse --show-prefix)
+  run_dir="$scratch/tree/$prefix"
+  [ -d "$run_dir" ] ||
+    fail "the merge with $onto has no ${prefix%/}/, the directory this was run from: run it from the checkout's top (nothing run)"
 fi
 kind=$(cd "$run_dir" && type -t "$1" || true)
 case "$kind" in

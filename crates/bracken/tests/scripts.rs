@@ -424,6 +424,8 @@ fn merge_dry_run(scripts: &str, on_branch: impl FnOnce(&Path), on_main: impl FnO
 #[derive(Clone, Copy)]
 struct Tested<'a> {
     who: &'a str,
+    /// The command in the method: `scripts/test-table` unless a case says otherwise.
+    command: &'a str,
     /// main's rev at the end, or a 40-hex sha taken as it is.
     rev: &'a str,
     /// The PR's head if None.
@@ -434,7 +436,7 @@ struct Tested<'a> {
 }
 
 fn tested<'a>(who: &'a str, rev: &'a str) -> Tested<'a> {
-    Tested { who, rev, head: None, verdict: "pass", retracted: false }
+    Tested { who, rev, command: "scripts/test-table", head: None, verdict: "pass", retracted: false }
 }
 
 /// The same, with `at_base` committed in the branch point, and `tested` recorded on the claim.
@@ -496,7 +498,7 @@ fn merge_dry_run_command(
         } else {
             String::from_utf8(run(&dir, "git", &["rev-parse", t.rev]).stdout).unwrap().trim().to_owned()
         };
-        let method = format!("cargo test @ {} on {on}", t.head.unwrap_or(&sha));
+        let method = format!("{} @ {} on {on}", t.command, t.head.unwrap_or(&sha));
         let id = bk(&dir, &["evidence", &claim, t.verdict, "--method", &method, "--as", t.who]);
         if t.retracted {
             bk(&dir, &["retract", &id, "--as", t.who]);
@@ -910,9 +912,10 @@ fn commit_all(dir: &Path, message: &str) {
     assert!(run(dir, "git", &["commit", "-qm", message]).status.success());
 }
 
-/// main may be ahead of the head in code once the manager has tested the merge: a pass naming the head
-/// and a main sha ('@ <head> on <main>', as bk-evidence --on records it) that main's tip has moved past
-/// only in .bracken/ and docs. Evidence on an older main that main has since moved past in code is refused,
+/// main may be ahead of the head in code once the manager has tested the merge: a pass of the whole
+/// table naming the head and a main sha ('scripts/test-table @ <head> on <main>', as bk-evidence --on
+/// records it) that main's tip has moved past only in .bracken/ and docs. A pass of part of the table
+/// (cargo fmt --check alone, or cargo test) doesn't count (task 0e67e870e14e). Evidence on an older main that main has since moved past in code is refused,
 /// naming that sha, as are no such evidence, evidence by anyone but the manager, and evidence on another head.
 #[test]
 fn merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge() {
@@ -993,12 +996,15 @@ fn merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge() {
             ("a manager fail", Some(Tested { verdict: "fail", ..manager })),
             ("a retracted manager pass", Some(Tested { retracted: true, ..manager })),
             ("a main sha this checkout lacks", Some(Tested { rev: unknown.as_str(), ..manager })),
+            ("a pass of cargo fmt --check alone", Some(Tested { command: "cargo fmt --check", ..manager })),
+            ("a pass of cargo test alone", Some(Tested { command: "cargo test --workspace", ..manager })),
+            ("test-table by another path", Some(Tested { command: "./scripts/test-table", ..manager })),
         ] {
             let out = merge_dry_run_on(scripts, |_| {}, code, lib, evidence);
             let line = check_line(&out, "main");
             assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
             assert!(
-                line.starts_with("FAIL") && line.contains("bk-evidence --on origin/main"),
+                line.starts_with("FAIL") && line.contains("bk-evidence --on origin/main -- scripts/test-table"),
                 "{}: {line}",
                 case(what)
             );
@@ -1018,6 +1024,8 @@ fn bk_evidence_on_main_tests_the_merge_and_names_both_shas() {
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
+        put(&dir, "old/f.txt", "main removes this later\n");
+        commit_all(&dir, "old");
         git(&["switch", "-qc", "pr"]);
         put(&dir, "a.txt", "the branch\n");
         put(&dir, "sub/c.txt", "in a subdirectory\n");
@@ -1069,6 +1077,22 @@ fn bk_evidence_on_main_tests_the_merge_and_names_both_shas() {
             run(&dir, "scripts/bk-evidence", &[&claim[..12], "--as", "val", "--", "/bin/sh", "-c", "test -f b.txt"]);
         assert_eq!(out.status.code(), Some(1), "{script}: b.txt isn't on the head");
 
+        // Run from a subdirectory the merge removes: refused, naming it (8d2751ea2383).
+        git(&["switch", "-q", "main"]);
+        git(&["rm", "-q", "-r", "old"]);
+        commit_all(&dir, "main drops old/");
+        git(&["switch", "-q", "pr"]);
+        let before = bk(&dir, &["log", "--kind", "evidence", "--json"]);
+        let ls = ["--as", "val", "--on", "main", "--", "/bin/ls"];
+        let out = command(&dir, "../scripts/bk-evidence", &[&[&claim[..12]][..], &ls].concat())
+            .current_dir(dir.join("old"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{script}: {stderr}");
+        assert!(stderr.contains("has no old/, the directory this was run from"), "{script}: {stderr}");
+        assert_eq!(bk(&dir, &["log", "--kind", "evidence", "--json"]), before, "{script}: recorded evidence");
+
         // A head that conflicts with main: nothing run, nothing recorded, no worktree left.
         git(&["switch", "-q", "main"]);
         put(&dir, "a.txt", "main's own a\n");
@@ -1104,5 +1128,55 @@ fn merge_clears_the_attributes_checked_variable_for_ground_guards() {
         let line = check_line(&out, "guards");
         assert!(line.starts_with("ok "), "{scripts}: {line}");
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// test-table runs exactly the table, in order, from the checkout's top, and stops at the first
+/// failure with its exit status non-zero. A `cargo` stub logs each call, and a `ground-guards` stub its
+/// arguments.
+#[test]
+fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
+    for scripts in SCRIPTS {
+        let table = repo_root().join(scripts).join("test-table");
+        let (tmp, dir) = repo(&[("scripts/test-table", &table)], ".bracken/\n", |dir| {
+            write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\necho \"ground-guards $*\" >>\"$LOG\"\n");
+            std::fs::create_dir_all(dir.join("sub")).unwrap();
+            std::fs::write(dir.join("sub/.keep"), "").unwrap();
+        });
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(
+            &stubs.join("cargo"),
+            "#!/bin/sh\necho \"cargo $*\" >>\"$LOG\"\ncase \"$*\" in *\"$FAIL_ON\"*) [ -n \"$FAIL_ON\" ] && exit 3 ;; esac\nexit 0\n",
+        );
+        let log = tmp.path().join("log");
+        let table_run = |fail_on: &str| {
+            let _ = std::fs::remove_file(&log);
+            let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+            let out = command(&dir.join("sub"), "../scripts/test-table", &[])
+                .env("PATH", path)
+                .env("LOG", &log)
+                .env("FAIL_ON", fail_on)
+                .output()
+                .unwrap();
+            (out, std::fs::read_to_string(&log).unwrap_or_default())
+        };
+
+        let (out, calls) = table_run("");
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            calls,
+            "cargo fmt --check\n\
+             cargo clippy --locked --all-targets -- -D warnings\n\
+             cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings\n\
+             cargo test --locked --workspace\n\
+             ground-guards origin/main HEAD\n",
+            "{scripts}"
+        );
+
+        let (out, calls) = table_run("--target x86_64");
+        assert!(!out.status.success(), "{scripts}: a failing step passed");
+        assert_eq!(calls.lines().count(), 3, "{scripts}: went on after a failure: {calls}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("failed: cargo clippy"), "{scripts}");
     }
 }
