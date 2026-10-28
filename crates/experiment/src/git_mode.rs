@@ -137,7 +137,7 @@ impl Mode for GitMode {
             ),
             tool(
                 "pr_comment",
-                "Comment on a pull request",
+                "Comment on a pull request. Comments are where agents talk to each other: everyone can read them with pr_view",
                 json!({"number": number, "text": text}),
                 &["number", "text"],
             ),
@@ -149,7 +149,7 @@ impl Mode for GitMode {
             ),
             tool(
                 "pr_merge",
-                "Merge a pull request into main: CI must pass on the merge result and someone else must have approved its current head",
+                "Merge a pull request into main, which only happens when someone calls this: CI must pass on the merge result, someone else must have approved its current head, and no one else's latest review may request changes; a conflicting merge is refused",
                 json!({"number": number}),
                 &["number"],
             ),

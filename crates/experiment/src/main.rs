@@ -51,10 +51,12 @@ enum Cmd {
     },
     /// Wait for standard input to close, then kill this process's group.
     Guard,
-    /// Run Bracken mode with Claude Code into a new directory, every worker sandboxed.
+    /// Run one mode with Claude Code into a new directory, every worker sandboxed.
     Run {
         #[arg(long)]
         dir: PathBuf,
+        #[arg(long, value_parser = ["bracken", "git", "crdt"])]
+        mode: String,
         #[arg(long, default_value_t = 10)]
         agents: usize,
         #[arg(long, default_value_t = 8)]
@@ -68,8 +70,9 @@ enum Cmd {
         /// The Claude Code settings file holding the routing entries; read for them alone.
         #[arg(long)]
         settings: PathBuf,
+        /// Tests only: a system prompt file in place of the reviewed prompts built into the binary.
         #[arg(long)]
-        prompt_file: PathBuf,
+        prompt_file: Option<PathBuf>,
         #[arg(long, default_value = "claude-opus-5-5")]
         model: String,
         /// The bracken binary; defaults to the one next to this executable.
@@ -114,8 +117,19 @@ fn main() {
         }
         Cmd::Shim { socket } => bracken_experiment::shim::run(&socket),
         Cmd::Guard => bracken_experiment::claude::guard(),
-        Cmd::Run { dir, agents, turns, claude, claude_version, settings, prompt_file, model, bracken } => {
-            claude_run(ClaudeRun { dir, agents, turns, claude, claude_version, settings, prompt_file, model, bracken })
+        Cmd::Run { dir, mode, agents, turns, claude, claude_version, settings, prompt_file, model, bracken } => {
+            claude_run(ClaudeRun {
+                dir,
+                mode,
+                agents,
+                turns,
+                claude,
+                claude_version,
+                settings,
+                prompt_file,
+                model,
+                bracken,
+            })
         }
         Cmd::MockRun { dir, mode, agents, turns, seed, bracken, sandbox } => {
             mock_run(dir, &mode, agents, turns, seed, bracken, sandbox)
@@ -130,12 +144,13 @@ fn main() {
 
 struct ClaudeRun {
     dir: PathBuf,
+    mode: String,
     agents: usize,
     turns: u32,
     claude: PathBuf,
     claude_version: String,
     settings: PathBuf,
-    prompt_file: PathBuf,
+    prompt_file: Option<PathBuf>,
     model: String,
     bracken: Option<PathBuf>,
 }
@@ -145,9 +160,15 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
     let bracken = std::fs::canonicalize(a.bracken.unwrap_or_else(|| me.with_file_name("bracken")))
         .map_err(|e| format!("no bracken: {e}"))?;
     bracken_demo::safety::refuse_git_checkout(&a.dir, false, &bracken_demo::safety::DEMO).map_err(|e| e.to_string())?;
-    let mode = mode_named("bracken").ok_or("no Bracken mode")?;
+    let mode = mode_named(&a.mode).ok_or("no such mode")?;
     let tools = mode.tools().into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect();
-    let prompt = std::fs::read_to_string(&a.prompt_file).map_err(|e| format!("reading the prompt: {e}"))?;
+    let prompt = match &a.prompt_file {
+        Some(file) => std::fs::read_to_string(file).map_err(|e| format!("reading the prompt: {e}"))?,
+        None => bracken_experiment::prompts::system_prompt(mode.name())?,
+    };
+    if a.prompt_file.is_some() {
+        println!("the system prompt is from --prompt-file, not the reviewed prompts; the plan hashes it");
+    }
     let (expect, caps) = (Expect::pinned_2_1_311(&a.model), Caps::pilot());
     let plan = PlanInputs {
         model: expect.model.clone(),
@@ -170,13 +191,14 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
         dir: a.dir.join("claude"),
         shim: me.clone(),
         prompt,
+        turns: a.turns,
         tools,
         upstream: None,
     })?;
     let root = a.dir.join("run");
     let cfg = RunConfig {
         root,
-        mode: "bracken",
+        mode: mode.name(),
         agents: a.agents,
         turns: a.turns,
         worker_bin: me,
@@ -225,11 +247,18 @@ fn mock_run(
         sandbox,
     };
     let usage = Some(cfg.root.join("usage.jsonl"));
-    let outcome = run(&cfg, &MockBackend { seed, wrong_rate: 0.15, shim: None, usage })?;
+    // Through the shim, as Claude Code reaches the driver.
+    let outcome = run(&cfg, &MockBackend { seed, wrong_rate: 0.15, shim: Some(cfg.worker_bin.clone()), usage })?;
     for (module, text) in &outcome.modules {
         println!("# module {module}\n{text}");
     }
     println!("events: {}", outcome.events.display());
+    // A mock turn that errs is a harness or mock fault, never a model's choice: fail the run (finding `373915eadd42`).
+    let log = std::fs::read_to_string(&outcome.events).map_err(|e| format!("reading the event log: {e}"))?;
+    let errors = log.lines().filter(|l| l.contains("\"event\":\"turn_error\"")).count();
+    if errors > 0 {
+        return Err(format!("{errors} turns ended in an error; see {}", outcome.events.display()));
+    }
     Ok(())
 }
 

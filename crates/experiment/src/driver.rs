@@ -198,9 +198,8 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
 
     let sockets = root.join("sockets");
     // Only Git mode's workers may run git: its binary and the helpers in its exec path.
-    let git = match (mode.name(), cfg.git.parent()) {
-        ("git", Some(exec_path)) => Some(Git { binary: cfg.git.clone(), exec_path: exec_path.to_path_buf() }),
-        ("git", None) => return Err("git's binary has no directory".into()),
+    let git = match mode.name() {
+        "git" if cfg.sandbox => Some(Git::of(&cfg.git)?),
         _ => None,
     };
     let profile = |dir: &Path, sockets: &[PathBuf], hub: bool| -> Result<Option<Sandbox>, String> {
