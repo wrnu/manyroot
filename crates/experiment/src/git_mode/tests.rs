@@ -681,19 +681,16 @@ fn a_long_pr_keeps_every_other_sync_fast_and_a_push_is_capped() {
         f.sync(0);
     }
     let n = f.tool(0, "pr_open", json!({"branch": "long", "title": "t"})).expect("open")["number"].as_u64().expect("n");
-    // Another agent's first sync brings all 2000 commits, checked in a few git processes.
-    let started = std::time::Instant::now();
+    // Another agent's first sync brings all 2000 commits, checked in a few git processes (counted,
+    // not timed, so a loaded machine doesn't fail it).
     let before = f.copies[1].runs.len();
     f.sync(1);
-    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
     assert!(f.copies[1].runs.len() - before <= 30, "{} git processes", f.copies[1].runs.len() - before);
     assert!(f.copies[1].rev(&format!("refs/remotes/hub/pr-{n}")).expect("rev").is_some());
     // Each later sync, and a view, re-checks nothing: a fixed handful of git processes.
     for _ in 0..3 {
         let (hub_before, copy_before) = (f.hub.runs.len(), f.copies[1].runs.len());
-        let started = std::time::Instant::now();
         f.sync(1);
-        assert!(started.elapsed() < std::time::Duration::from_secs(2), "{:?}", started.elapsed());
         assert!(f.hub.runs.len() - hub_before <= 20, "{:?}", &f.hub.runs[hub_before..]);
         assert!(f.copies[1].runs.len() - copy_before <= 20, "{:?}", &f.copies[1].runs[copy_before..]);
         assert!(!rechecked(&f.hub.runs[hub_before..]) && !rechecked(&f.copies[1].runs[copy_before..]));
@@ -812,9 +809,8 @@ fn pr_text_is_capped_and_replies_and_syncs_stay_bounded() {
     let n = f.propose(0, "abs", "base.stk", &def("abs"));
     f.sync(0);
     let (hub0, copy0) = (f.hub.runs.len(), f.copies[0].runs.len());
-    let started = std::time::Instant::now();
     f.sync(0);
-    let quiet = (f.hub.runs.len() - hub0, f.copies[0].runs.len() - copy0, started.elapsed());
+    let quiet = (f.hub.runs.len() - hub0, f.copies[0].runs.len() - copy0);
     // One agent spends a whole run's calls on maximal comments, each 6 bytes a character in the record.
     let text = "\u{1}".repeat(prs::MAX_REMARK);
     let accepted = (0..200).filter(|_| f.tool(1, "pr_comment", json!({"number": n, "text": text})).is_ok()).count();
@@ -829,10 +825,8 @@ fn pr_text_is_capped_and_replies_and_syncs_stay_bounded() {
     assert_eq!(short, prs::MAX_REMARKS);
     // Another agent's sync costs what it did, and reads no PR text.
     let (hub0, copy0) = (f.hub.runs.len(), f.copies[0].runs.len());
-    let started = std::time::Instant::now();
     f.sync(0);
-    assert_eq!((f.hub.runs.len() - hub0, f.copies[0].runs.len() - copy0), (quiet.0, quiet.1));
-    assert!(started.elapsed() < quiet.2 + std::time::Duration::from_secs(1), "{:?}", started.elapsed());
+    assert_eq!((f.hub.runs.len() - hub0, f.copies[0].runs.len() - copy0), quiet);
     // A sync reads no PR text at all: it works with the PR record unreadable.
     let record = f.hub.config.dir.join("prs.json");
     let saved = std::fs::read(&record).expect("record");

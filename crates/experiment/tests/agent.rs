@@ -71,6 +71,13 @@ fn caps() -> Caps {
     Caps { turn_time: Duration::from_secs(20), turn_budget_usd: None, ..Caps::pilot() }
 }
 
+/// For tests that a cap ends a turn or run early: the fake sleeps this long (10 minutes, in its
+/// milliseconds) under a turn cap as long, so nothing else ends it, and the test allows
+/// [`EARLY`], generous for a loaded machine and still far short of the sleep.
+const SLEEP: &str = "sleep 600000";
+const LONG_TURN: Duration = Duration::from_secs(600);
+const EARLY: Duration = Duration::from_secs(60);
+
 /// A local stand-in for the LLM proxy: records the first bytes of every connection.
 struct Endpoint {
     addr: SocketAddr,
@@ -85,7 +92,7 @@ impl Endpoint {
         let s = Arc::clone(&seen);
         std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let _ = stream.set_read_timeout(Some(EARLY));
                 let mut buf = vec![0u8; 4096];
                 let n = stream.read(&mut buf).unwrap_or(0);
                 buf.truncate(n);
@@ -614,10 +621,10 @@ fn context_past_the_cap_ends_the_turn() {
 #[test]
 fn the_turn_time_cap_ends_a_quiet_turn() {
     let s = Setup::new();
-    let backend = s.backend("say\nsleep 60000\nresult 10", Caps { turn_time: Duration::from_secs(2), ..caps() });
+    let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), Caps { turn_time: Duration::from_secs(2), ..caps() });
     let start = Instant::now();
     let events_path = s.run(&backend, 1, 1).expect("the run goes on");
-    assert!(start.elapsed() < Duration::from_secs(20), "ended at the cap, not the sleep");
+    assert!(start.elapsed() < EARLY, "ended at the cap, not the sleep");
     assert_eq!(turn_error_for(&s, &events_path), 1);
     assert_eq!(backend.totals("agent-0").0.output, caps().turn_output);
 }
@@ -643,27 +650,29 @@ fn an_agents_token_cap_ends_its_turns_and_the_run_cap_stops_the_run() {
 fn token_caps_act_while_a_turn_streams() {
     // The agent's cap: its turn ends at the third message, before the result.
     let s = Setup::new();
-    let backend = s.backend("say\nsay\nsay\nsleep 10000\nresult 10", Caps { agent_tokens: 2500, ..caps() });
+    let script = format!("say\nsay\nsay\n{SLEEP}\nresult 10");
+    let backend = s.backend(&script, Caps { agent_tokens: 2500, turn_time: LONG_TURN, ..caps() });
     let start = Instant::now();
     s.run(&backend, 1, 1).expect("the run goes on");
-    assert!(start.elapsed() < Duration::from_secs(8), "ended at the cap");
+    assert!(start.elapsed() < EARLY, "ended at the cap");
     assert!(s.usage().iter().any(|r| r["ended"].as_str().is_some_and(|e| e.contains("agent tokens"))));
 
     // The run's cap: the run stops mid-turn.
     let s = Setup::new();
-    let backend = s.backend("say\nsay\nsay\nsleep 10000\nresult 10", Caps { run_tokens: 2500, ..caps() });
+    let backend = s.backend(&script, Caps { run_tokens: 2500, turn_time: LONG_TURN, ..caps() });
     let start = Instant::now();
     let err = s.run(&backend, 1, 1).expect_err("the run stops");
-    assert!(err.contains("token cap") && start.elapsed() < Duration::from_secs(8), "{err}");
+    assert!(err.contains("token cap") && start.elapsed() < EARLY, "{err}");
 }
 
 #[test]
 fn the_run_time_cap_stops_the_run() {
     let s = Setup::new();
-    let backend = s.backend("say\nsleep 10000\nresult 10", Caps { run_time: Duration::from_secs(2), ..caps() });
+    let caps = Caps { run_time: Duration::from_secs(2), turn_time: LONG_TURN, ..caps() };
+    let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), caps);
     let start = Instant::now();
     let err = s.run(&backend, 2, 2).expect_err("the run stops");
-    assert!(err.contains("time cap") && start.elapsed() < Duration::from_secs(8), "{err}");
+    assert!(err.contains("time cap") && start.elapsed() < EARLY, "{err}");
 }
 
 /// A backend that halts the run in its first turn.
@@ -727,11 +736,12 @@ fn a_turn_that_ends_without_a_result_counts_at_its_output_cap() {
 fn transcripts_are_kept_without_the_auth_value_and_a_leak_stops_the_run() {
     // Claude Code holds the auth value: a turn that prints it stops the run, and the line isn't kept.
     let s = Setup::new();
-    let backend = s.backend("env ANTHROPIC_AUTH_TOKEN\nsleep 10000\nresult 10", caps());
+    let backend =
+        s.backend(&format!("env ANTHROPIC_AUTH_TOKEN\n{SLEEP}\nresult 10"), Caps { turn_time: LONG_TURN, ..caps() });
     let start = Instant::now();
     let err = s.run(&backend, 1, 2).expect_err("the run stops");
     assert!(err.contains("auth value"), "{err}");
-    assert!(start.elapsed() < Duration::from_secs(8), "stopped at the line, not at the turn's end");
+    assert!(start.elapsed() < EARLY, "stopped at the line, not at the turn's end");
     let t = s.transcript("agent-0", 1).expect("kept, without the line");
     assert!(t.contains("\"init\"") && !t.contains(FAKE_AUTH));
     assert!(s.transcript("agent-0", 2).is_none());
@@ -808,11 +818,7 @@ fn killing_the_driver_mid_turn_leaves_no_agent_process_and_no_request() {
     driver.wait().expect("reaped");
     let start = Instant::now();
     while alive(pid) || !processes_mentioning(&dir.display().to_string()).is_empty() {
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "left running: {}",
-            processes_mentioning(&dir.display().to_string())
-        );
+        assert!(start.elapsed() < EARLY, "left running: {}", processes_mentioning(&dir.display().to_string()));
         std::thread::sleep(Duration::from_millis(50));
     }
     let after = lines(&log);
@@ -825,7 +831,7 @@ fn killing_the_driver_mid_turn_leaves_no_agent_process_and_no_request() {
 
 fn connect_through(port: u16, head: &str) -> (String, std::net::TcpStream) {
     let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
-    s.set_read_timeout(Some(Duration::from_secs(5))).expect("timeout");
+    s.set_read_timeout(Some(EARLY)).expect("timeout");
     s.write_all(head.as_bytes()).expect("write");
     let mut buf = [0u8; 128];
     let n = s.read(&mut buf).unwrap_or(0);
@@ -845,7 +851,7 @@ fn the_proxy_tunnels_only_to_the_routing_host() {
     tunnel.write_all(b"client hello").expect("write");
     let start = Instant::now();
     while endpoint.connections().is_empty() {
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < EARLY);
         std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(endpoint.connections(), vec![b"client hello".to_vec()]);

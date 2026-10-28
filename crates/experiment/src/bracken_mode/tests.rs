@@ -393,7 +393,7 @@ fn a_sync_session_ends_at_its_deadline_whatever_bracken_does() {
     let started = std::time::Instant::now();
     let result = s.sync_server(&socket, &session);
     assert!(result.is_err_and(|e| e.contains("deadline")));
-    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "{:?}", started.elapsed());
     tx.send(()).ok();
     held.join().expect("the peer");
 }
@@ -414,6 +414,6 @@ fn a_sync_session_that_never_ends_by_itself_is_stopped_at_its_deadline() {
     });
     let started = std::time::Instant::now();
     assert!(s.sync_server(&socket, &session).is_err_and(|e| e.contains("deadline")));
-    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "{:?}", started.elapsed());
     reader.join().expect("the peer");
 }

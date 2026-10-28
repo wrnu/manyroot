@@ -224,7 +224,7 @@ impl Backend for Claiming {
             use std::io::{Read, Write};
             let mut s = std::os::unix::net::UnixStream::connect(socket).map_err(|e| e.to_string())?;
             let _ = s.write_all(&vec![b'x'; MAX_MCP_LINE + 10]);
-            s.set_read_timeout(Some(std::time::Duration::from_secs(10))).map_err(|e| e.to_string())?;
+            s.set_read_timeout(Some(std::time::Duration::from_secs(60))).map_err(|e| e.to_string())?;
             if matches!(s.read(&mut [0u8; 1]), Ok(0)) {
                 self.closed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             }

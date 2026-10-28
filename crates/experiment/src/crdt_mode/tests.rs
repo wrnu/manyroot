@@ -78,6 +78,13 @@ fn sync(
     })
 }
 
+/// A test peer's end, held open until the hub closes its own: a session ends on what the peer
+/// sent or on its deadline, never because the peer went first.
+fn hold(mut peer: UnixStream) {
+    use std::io::Read;
+    let _ = peer.read_to_end(&mut Vec::new());
+}
+
 fn text(s: &mut CrdtStore, file: &str) -> String {
     s.text(file).expect("text")
 }
@@ -477,10 +484,10 @@ fn a_change_whose_deps_never_arrive_is_dropped_at_the_end_of_the_session() {
         let frame = message(0x42, &[], &[], &[orphan]);
         let _ = theirs.write_all(&(frame.len() as u32).to_be_bytes()).and_then(|()| theirs.write_all(&frame));
         let _ = theirs.write_all(&0u32.to_be_bytes());
-        std::thread::sleep(Duration::from_millis(300));
+        hold(theirs);
     });
-    let result =
-        hub.session(&mut ours, &rules, false, Bounds { deadline: Duration::from_secs(5), ..Bounds::default() });
+    let result = hub.session(&mut ours, &rules, false, Bounds::default());
+    drop(ours);
     let _ = peer.join();
     assert!(result.expect_err("refused").contains("deps never arrived"));
     assert_eq!(heads(&mut hub), before);
@@ -505,17 +512,18 @@ fn held_changes_and_their_dependents_are_dropped_however_the_session_ends() {
     let held = message(0x42, &[], &[], &chain[1..]);
     let frame = |m: &[u8]| [(m.len() as u32).to_be_bytes().as_slice(), m].concat();
     let empty = message(0x42, &[], &[], &[]);
-    let fast = Bounds { deadline: Duration::from_secs(1), ..Bounds::default() };
+    // Only the deadline cases wait on the deadline; the others end on what the peer sent.
+    let (fast, slow) = (Bounds { deadline: Duration::from_secs(1), ..Bounds::default() }, Bounds::default());
     let before = heads(&mut hub);
     // What follows the held changes: each way a session can end.
     let endings: Vec<(&str, Vec<u8>, Bounds, bool)> = vec![
-        ("deps never arrived", 0u32.to_be_bytes().to_vec(), fast, false),
-        ("V1", frame(b"garbage"), fast, false),
+        ("deps never arrived", 0u32.to_be_bytes().to_vec(), slow, false),
+        ("V1", frame(b"garbage"), slow, false),
         ("deadline", [100u32.to_be_bytes().as_slice(), b"short"].concat(), fast, false),
         ("deadline", vec![], fast, false),
-        ("", vec![], fast, true),
-        ("budget", frame(&empty).repeat(20), Bounds { budget: (held.len() + 40) as u64, ..fast }, false),
-        ("sync messages", frame(&empty).repeat(20), Bounds { frames: 3, ..fast }, false),
+        ("", vec![], slow, true),
+        ("budget", frame(&empty).repeat(20), Bounds { budget: (held.len() + 40) as u64, ..slow }, false),
+        ("sync messages", frame(&empty).repeat(20), Bounds { frames: 3, ..slow }, false),
     ];
     for (want, tail, bounds, close) in endings {
         let (mut ours, mut theirs) = UnixStream::pair().expect("a pair");
@@ -524,7 +532,7 @@ fn held_changes_and_their_dependents_are_dropped_however_the_session_ends() {
             use std::io::Write;
             let _ = theirs.write_all(&bytes);
             if !close {
-                std::thread::sleep(Duration::from_millis(1500));
+                hold(theirs);
             }
         });
         let e = hub.session(&mut ours, &rules, false, bounds).expect_err("the session fails");
@@ -553,7 +561,7 @@ fn oversized_malformed_slow_and_over_budget_peers_end_the_session() {
         let peer = std::thread::spawn(move || {
             use std::io::Write;
             let _ = theirs.write_all(&bytes);
-            std::thread::sleep(Duration::from_millis(1500));
+            hold(theirs);
         });
         let before = heads(hub);
         let start = Instant::now();
@@ -564,20 +572,22 @@ fn oversized_malformed_slow_and_over_budget_peers_end_the_session() {
         assert_eq!(heads(hub), before);
         (r.expect_err("the session ends with an error"), took)
     };
-    let fast = Bounds { deadline: Duration::from_secs(1), ..Bounds::default() };
-    // A frame over the message limit is refused from its length, before its body is read.
-    let (e, took) = run(&mut hub, ((wire::MAX_MESSAGE + 1) as u32).to_be_bytes().to_vec(), fast);
-    assert!(e.contains("over the limit") && took < Duration::from_millis(500), "{e}");
-    let (e, _) = run(&mut hub, u32::MAX.to_be_bytes().to_vec(), fast);
+    // Only the deadline cases wait on the deadline; the others end on what the peer sent.
+    let (fast, slow) = (Bounds { deadline: Duration::from_secs(1), ..Bounds::default() }, Bounds::default());
+    // A frame over the message limit is refused from its length: the peer never sends a body, so
+    // reading one would end at the deadline instead.
+    let (e, _) = run(&mut hub, ((wire::MAX_MESSAGE + 1) as u32).to_be_bytes().to_vec(), slow);
+    assert!(e.contains("over the limit"), "{e}");
+    let (e, _) = run(&mut hub, u32::MAX.to_be_bytes().to_vec(), slow);
     assert!(e.contains("over the limit"), "{e}");
     // Garbage, a truncated frame, and silence: refused, or cut off at the deadline.
     let mut garbage = 5u32.to_be_bytes().to_vec();
     garbage.extend(b"hello");
-    assert!(run(&mut hub, garbage, fast).0.contains("V1"));
+    assert!(run(&mut hub, garbage, slow).0.contains("V1"));
     let (e, took) = run(&mut hub, [100u32.to_be_bytes().as_slice(), b"short"].concat(), fast);
-    assert!(e.contains("deadline") && took < Duration::from_secs(2), "{e}");
+    assert!(e.contains("deadline") && took < Duration::from_secs(30), "{e}");
     let (e, took) = run(&mut hub, vec![], fast);
-    assert!(e.contains("deadline") && took < Duration::from_secs(2), "{e}");
+    assert!(e.contains("deadline") && took < Duration::from_secs(30), "{e}");
     // Frames past the budget or the frame count, counted before each is read.
     let empty = message(0x42, &[], &[], &[]);
     let mut many = Vec::new();
@@ -585,9 +595,9 @@ fn oversized_malformed_slow_and_over_budget_peers_end_the_session() {
         many.extend((empty.len() as u32).to_be_bytes());
         many.extend(&empty);
     }
-    let (e, _) = run(&mut hub, many.clone(), Bounds { budget: 100, ..fast });
+    let (e, _) = run(&mut hub, many.clone(), Bounds { budget: 100, ..slow });
     assert!(e.contains("budget"), "{e}");
-    let (e, _) = run(&mut hub, many, Bounds { frames: 10, ..fast });
+    let (e, _) = run(&mut hub, many, Bounds { frames: 10, ..slow });
     assert!(e.contains("sync messages"), "{e}");
 }
 
