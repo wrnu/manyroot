@@ -266,8 +266,11 @@ created new; and the rename replaces whatever is at the object's path, a
 symlink included, rather than writing through it.
 
 **Limits of step 2:** the server reads its replica once, at startup, so it
-must be the replica's only writer while it runs (step 3 decides how
-`scripts/bk` and the server share the team's Ground). A stdio peer that stops
+must be the replica's only writer while it runs. (Step 3 gives the server
+its own replica, outside the repo; `scripts/bk` writes the main checkout's
+and syncs. `bracken sync --confirm` runs a second session and checks that
+the heads the server sends at its start cover every head this replica held
+when the first began.) A stdio peer that stops
 reading holds the session's process until the deadline. Sixteen sessions at
 the full id budget could hold several GiB, which is acceptable only behind
 credentials on one machine. A local process can still keep all 64
@@ -485,7 +488,7 @@ Same outcome; the recommendation needs one relation.
 | 0 | Supersession rule and its tests (independent of sync; task `e8a78fc1b51a`) | protocol | Yes (decision 4) |
 | 1 | Sync messages and session state machine in `manyroot`, with no I/O; `bracken sync` between two local directories uses it. (The iterative `is_retracted` is already PR #8.) | protocol (wire format in protocol.md), library | Yes (wire format) |
 | 2 | `bracken serve` (HTTP and `--stdio`), allowlist, quotas, first-seen log; `bracken sync <url>`. Tested on localhost against throwaway Grounds. **Built**: [As built in step 2](#as-built-in-step-2) | cli, storage | No |
-| 3 | Every reader's pinned binary includes PR #8 (done); then run the team server and its off-host backup; `scripts/bk` confirms pushes and the gate fails closed; per-machine keys; checkpoints continue | merge-gate tooling, process | Yes (decision 2, still open; 3) |
+| 3 | Every reader's pinned binary includes PR #8 (done); then run the team server and its off-host backup; `scripts/bk` confirms pushes and the gate fails closed; per-machine keys; checkpoints continue. **Built, on the owner's machine, without the off-host backup** (task `c03e893d04eb`): `scripts/team-server`, `bracken sync --confirm`, and [Team server](../development.md#team-server) | merge-gate tooling, process | Yes (decision 2, still open; 3) |
 | 4 | Once the off-host backup exists, retire manual checkpoints; update the skill | process, merge-gate tooling | Yes (decision 6) |
 | 5 | Agent-key session auth; membership as contributions (Stewards) | protocol, crypto | Yes |
 | 6 | Peer-to-peer discovery; range reconciliation with selective replication (Canopy) | protocol | Yes |

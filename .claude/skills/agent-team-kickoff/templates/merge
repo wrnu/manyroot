@@ -33,6 +33,8 @@
 # The forge token comes from git's credential helper for the origin host. It is
 # kept in a shell variable and reaches curl only as a header read from a file
 # descriptor: never argv, a URL, the environment, git -c, or any output.
+# With the team server set up (scripts/team-server), every read pulls from it first, and the
+# gate refuses if it can't.
 # Needs curl and jq.
 set -euo pipefail
 # Never trace or auto-export (both can be inherited through SHELLOPTS): the token is in a
@@ -74,7 +76,15 @@ for tool in curl jq; do command -v "$tool" >/dev/null || fail "needs $tool"; don
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
-bk() { "$here/bk" "$@"; }
+# With a team server set up, the gate decides only on a replica that has just pulled from it
+# (network-sync.md section 5): every read below must pull, with no fallback to the local replica.
+bk() { BK_PULL=required BRACKEN_AGENT=${agent:-manager} "$here/bk" "$@"; }
+bk heads >/dev/null || fail "can't pull from the team server, so the gate won't decide on a replica that may be behind"
+if [ -f "$main/.bracken-team" ]; then
+  echo "team server: every read pulls from $(cat "$(cat "$main/.bracken-team")/url")"
+else
+  echo "team server: none set up (no .bracken-team); reading the local replica"
+fi
 
 origin=$(git -C "$main" config --get remote.origin.url)
 # Not printed: an origin URL can carry a password.

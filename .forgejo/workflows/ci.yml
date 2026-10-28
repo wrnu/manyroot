@@ -38,6 +38,8 @@ jobs:
       - name: Toolchain
         run: |
           rustup component add clippy rustfmt
+          # scripts/team-server hashes tokens with b3sum; its test runs it.
+          cargo install --locked b3sum --version 1.8.7
           cargo --version
       - name: Format
         run: cargo fmt --check

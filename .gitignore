@@ -8,3 +8,6 @@
 
 # The pinned team binary (a build artifact)
 .bracken-bin/
+
+# Where this machine's team server keeps its files (scripts/team-server setup)
+.bracken-team

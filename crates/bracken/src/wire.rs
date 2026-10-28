@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use manyroot::sync::{Limits, Message, Rejected, Session};
-use manyroot::{Contribution, Graph, GroundId, ImportReport};
+use manyroot::{Contribution, ContributionId, Graph, GroundId, ImportReport};
 
 /// Bytes a frame adds before its message.
 pub const FRAME_PREFIX: u64 = 4;
@@ -87,6 +87,8 @@ pub struct Side {
     pub report: ImportReport,
     /// The peer's results, summed: what it added and refused of what this side sent.
     pub peer: PeerTally,
+    /// The heads the peer sent when the session opened.
+    pub peer_heads: Vec<ContributionId>,
 }
 
 #[derive(Debug, Default)]
@@ -107,6 +109,7 @@ impl Side {
             id_bytes: 0,
             report: ImportReport::default(),
             peer: PeerTally::default(),
+            peer_heads: Vec::new(),
         }
     }
 
@@ -182,6 +185,9 @@ impl Side {
                 if self.id_bytes > self.bounds.id_budget {
                     let reason = format!("the session's {}-byte budget for id lists is spent", self.bounds.id_budget);
                     return Err(Refused::new(413, reason).into());
+                }
+                if let Message::Heads { heads } = &message {
+                    self.peer_heads.extend(heads.iter().copied());
                 }
             }
             Message::Result { added, rejected, unresolved, .. } => {

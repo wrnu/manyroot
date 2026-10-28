@@ -30,7 +30,7 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 
 ## The Ground
 
-- Always run `scripts/bk … --as <your identity>`.
+- Always run `scripts/bk … --as <your identity>`, with `BRACKEN_AGENT=<your identity>` set, so reads pull from the team server. A write that `scripts/bk` fails to confirm isn't done (process section 4.3).
 - At the start of every task, read `scripts/bk log --tag decision --current` and `scripts/bk show <task id>`. `--current` leaves out retracted entries and those their own author superseded; one someone else superseded stays, marked.
 - Check a claim with `scripts/bk show <id>` before acting on it. A `note` is a lead, not a fact.
 - Contribute what others would need **as you learn it**, not at the end.

@@ -887,3 +887,49 @@ fn sync_exec_keeps_the_program_in_brackens_process_group_so_it_can_use_the_termi
     assert_eq!(pgids.len(), 2, "{text:?}");
     assert_eq!(pgids[0], pgids[1], "the program is in bracken's process group");
 }
+
+/// `sync --confirm` confirms only on the server's own heads, sent at the start of a second session:
+/// a server that holds everything confirms; one whose second session reaches a replica lacking this
+/// replica's heads doesn't, even though both sessions were clean.
+#[test]
+fn sync_confirm_needs_the_servers_heads_to_cover_this_replica() {
+    let g = grounds();
+    claim(&g.a, "alice", "to confirm");
+    let mut args: Vec<String> = vec!["sync".into(), "--confirm".into(), "--exec".into(), BIN.into(), "--dir".into()];
+    args.push(g.b.to_str().unwrap().into());
+    args.extend(g.serve_args(&[]));
+    args.push("--stdio".into());
+    let out = cmd(&g.a).args(&args).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout(&out).ends_with("confirmed: the server holds all 1 heads"), "{}", stdout(&out));
+
+    // A "server" whose second session reaches c, a replica that never got the new claim.
+    let c = g.tmp.join("c");
+    ok(&c, &["join", g.tmp.join("seed.mrb").to_str().unwrap()]);
+    claim(&g.a, "alice", "not on c");
+    let (allow, _, seen) = g.config();
+    let script = g.tmp.join("two-servers");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nif [ -e {n} ]; then dir={c}; else : >{n}; dir={b}; fi\n\
+             exec {bin} --dir \"$dir\" serve --allow {allow} --first-seen {seen} --stdio\n",
+            n = g.tmp.join("served-once").display(),
+            c = c.display(),
+            b = g.b.display(),
+            bin = BIN,
+            allow = allow.display(),
+            seen = seen.display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let out = cmd(&g.a).args(["sync", "--confirm", "--exec", script.to_str().unwrap()]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("not confirmed: the server's heads don't cover 1 of this replica's 1 heads"), "{stderr}");
+
+    // --confirm needs a server.
+    let out = run(&g.a, &["sync", "--confirm", g.b.to_str().unwrap()]);
+    assert!(!out.status.success());
+}

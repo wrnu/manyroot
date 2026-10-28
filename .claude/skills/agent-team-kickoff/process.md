@@ -101,6 +101,17 @@ CI is not part of the gate (section 10). Where it runs on every PR, its result i
 
 A new head supersedes the old one, and that clears *all* of the old head's contradictions, fixed or not. So the next review round's brief lists every confirmed finding, and the reviewer must check each one against the new head. Anything still unfixed gets re-filed against the new head.
 
+### 4.3 The team server
+
+Optionally, a sync server on the owner's machine holds the team's Ground, so replicas elsewhere (other machines, later) stay current within seconds. The manager runs it with `scripts/team-server`. The main checkout's `.bracken/` stays a full replica, and checkpoints (9.3) carry on as before. Once it's set up:
+
+- **Every agent sets `BRACKEN_AGENT=<its identity>`** in its environment, so that `scripts/bk` can find its token. The manager issues one token per identity with `scripts/team-server token <identity>`. The token stays in a private file outside the repo; agents never see or pass it.
+- **A write confirms.** After each write, `scripts/bk` pushes and checks that the server's heads cover it. If they don't, it fails, and the work isn't done: the contribution is only local until a later sync pushes it (any `scripts/bk` read does). Never report a write that failed.
+- **Reads pull first** and fall back to the local replica if the server is down, saying so on stderr.
+- **The merge gate fails closed.** `scripts/merge` requires every read to pull. With the server down, it refuses to decide.
+
+The manager starts the server after each restart of the machine. Issuing a token restarts a running server, since it reads its tokens and allowlist only when it starts. The repo's values (where the server's files live, the port) are in `docs/development.md`. Reaching the server from another machine, and any off-host backup, need the owner's go.
+
 ## 5. A change, step by step
 
 1. **Task:** the manager contributes a `task` claim holding the brief, then launches the builder with that id. One task, one worktree, one branch, one PR.
