@@ -343,12 +343,13 @@ fn a_crdt_mode_mock_run_goes_end_to_end_through_the_shim() {
         // A sync at the start and end of every turn, and the mock's own.
         assert_eq!(log.iter().filter(|e| e["agent"] == agent && e["event"] == "sync").count(), 9, "{agent}");
     }
-    // Every agent's edits reached the hub. Agents overlap on functions, and a later definition
-    // replaces an earlier one, so there's one line per function written.
+    // Every agent's edits reached the hub. Counted by name: two agents appending the same
+    // function at once both keep their line when the CRDT merges them, and the copy stays until
+    // an agent next writes that function, so a name may have more than one line.
     let defs: Vec<&str> =
         outcome.modules.iter().flat_map(|(_, text)| text.lines()).filter(|l| l.starts_with("def ")).collect();
     let names: std::collections::BTreeSet<&str> = defs.iter().filter_map(|l| l.split_whitespace().nth(1)).collect();
-    assert!(names.len() >= 4 && names.len() == defs.len(), "{defs:?}");
+    assert!(names.len() >= 4, "{defs:?}");
     // The hub's copy of the document is the only store any other store's data came from.
     let hub = dir.path().join("run/hub/doc.automerge");
     assert!(hub.exists());
