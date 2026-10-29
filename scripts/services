@@ -12,16 +12,17 @@
 # Both run at load and are restarted whenever they exit with a failure; a clean exit (team-server run
 # finding a server already running, say) ends the retries rather than logging every 10 seconds. Their output goes under the team directory (launchd-*.log beside
 # server.log), never the repository. A server team-server start left running is stopped first, so there is
-# never a second one; the gap is a second or two. Re-running install replaces both agents. The view is on
-# 127.0.0.1, or with --netbird on this machine's NetBird address instead (decision 917816c72975): its IP
-# and name as `netbird status` gives them, refused unless NetBird is connected and the IP is in NetBird's
-# 100.64.0.0/10. No other address can be given (finding bbd29eb576fc). --dry-run prints both plists and
-# changes nothing.
+# never a second one; the gap is a second or two. Re-running install replaces both agents. The view is
+# on 127.0.0.1, and with --netbird on this machine's NetBird address as well, one process listening on
+# both (decisions 917816c72975 and 5863740ca157): the NetBird IP and name as `netbird status` gives them,
+# refused unless its one Management line says Connected and the IP is in NetBird's 100.64.0.0/10, written
+# without leading zeros. No other address can be given (finding bbd29eb576fc). --dry-run prints both
+# plists and changes nothing.
 #
 # uninstall boots both out and deletes exactly the two plist files, nothing else: the Ground, the
 # tokens and the logs stay. The server is then down until scripts/team-server start.
 #
-# status says, for each, whether launchd has it loaded (and its pid) and whether its port answers.
+# status says, for each, whether launchd has it loaded (and its pid) and what listens at each address.
 #
 # No secret goes in a plist, an argument or a plist's environment: scripts/bk and scripts/team-server
 # find the tokens in the team directory themselves. The plists are 0644. Run it from the main checkout:
@@ -35,6 +36,7 @@ marker="$main/.bracken-team"
 agents="$HOME/Library/LaunchAgents"
 server=jx.rs.bracken.team-server
 view=jx.rs.bracken.view
+labels=("$server" "$view")
 fail() { echo "services: $*" >&2; exit 1; }
 usage() {
   echo "usage: services install [--view-port <port>] [--netbird] [--dry-run] | uninstall | status" >&2
@@ -43,28 +45,50 @@ usage() {
 
 domain="gui/$(id -u)"
 loaded() { launchctl print "$domain/$1" >/dev/null 2>&1; }
-# The pid launchd reports for a loaded agent, if it is running.
-agent_pid() { launchctl print "$domain/$1" 2>/dev/null | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p' | head -1; }
-# answers <host> <port>: whether something accepts a connection there.
-answers() { (exec 3<>"/dev/tcp/$1/$2") 2>/dev/null; }
-# The pid listening on port $1, if lsof can tell.
-listener() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1; }
+# The pid launchd reports for a loaded agent, if it is running; nothing, and success, if it isn't loaded
+# (launchctl print fails then, and under pipefail that would end the script).
+agent_pid() {
+  { launchctl print "$domain/$1" 2>/dev/null || true; } | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p' | head -1
+}
+# The pid listening on port $1 (at address $2, if given), if lsof can tell.
+listener() { lsof -nP -iTCP"${2:+@$2}":"$1" -sTCP:LISTEN -t 2>/dev/null | head -1; }
+# The pid listening on port $1 at a wildcard address (0.0.0.0 or ::, which lsof shows as *:<port>), if any.
+wildcard_holder() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN -Fpn 2>/dev/null |
+    awk -v want="n*:$1" '/^p/ { pid = substr($0, 2) } $0 == want { print pid; exit }'
+}
+# Every pid listening on port $1 at any address, wildcards (0.0.0.0, ::) included.
+listeners() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | sort -u; }
+# listening_as <label> <host> <port>: whether that launchd agent's own process listens at host:port.
+# A listen check, not a connection: this Mac can't reach its own NetBird IP over NetBird's userspace
+# interface, and a connection could be answered by some other program.
+listening_as() {
+  local pid
+  pid=$(agent_pid "$1")
+  [ -n "$pid" ] && lsof -nP -a -p "$pid" -iTCP@"$2":"$3" -sTCP:LISTEN -t >/dev/null 2>&1
+}
 team() {
   [ -f "$marker" ] || fail "no team server set up ($marker is missing): scripts/team-server setup first"
   cat "$marker"
 }
-# The view's port in an installed plist, else the default.
 # Whether pid $1 is the team server of team directory $2, as team-server's running_pid tells.
 is_server() { [[ $(ps -p "$1" -o command= 2>/dev/null) == *" --dir $2/ground serve "* ]]; }
-# The view's address in an installed plist: its --bind, else 127.0.0.1.
-view_host() {
-  local flag
-  flag=$(plutil -extract ProgramArguments.5 raw "$agents/$view.plist" 2>/dev/null) || flag=''
-  if [ "$flag" = --bind ]; then plutil -extract ProgramArguments.6 raw "$agents/$view.plist"; else echo 127.0.0.1; fi
+# The view's addresses in its installed plist ($1, the label), one a line: each --bind, else 127.0.0.1.
+view_hosts() {
+  local i=5 flag found=''
+  while flag=$(plutil -extract "ProgramArguments.$i" raw "$agents/$1.plist" 2>/dev/null); do
+    if [ "$flag" = --bind ]; then
+      plutil -extract "ProgramArguments.$((i + 1))" raw "$agents/$1.plist"
+      found=1
+    fi
+    i=$((i + 1))
+  done
+  [ -n "$found" ] || echo 127.0.0.1
 }
+# A view's port in its installed plist ($1, the label), else the default.
 view_port() {
   local port
-  port=$(plutil -extract ProgramArguments.4 raw "$agents/$view.plist" 2>/dev/null) || port=7392
+  port=$(plutil -extract ProgramArguments.4 raw "$agents/$1.plist" 2>/dev/null) || port=7392
   echo "$port"
 }
 # $1 escaped for XML text. The replacements are quoted: bash 5.2 reads a bare & in one as the match.
@@ -73,13 +97,18 @@ netbird_address() {
   local out ip fqdn a b c d
   command -v netbird >/dev/null || fail "--netbird: no netbird command"
   out=$(netbird status 2>&1) || fail "--netbird: netbird status failed: ${out##*$'\n'}"
-  grep -qx 'Management: Connected' <<<"$out" || fail "--netbird: NetBird isn't connected"
+  # Exactly one Management line, and it says Connected (finding 81e8ef2f49f6).
+  [ "$(grep '^Management:' <<<"$out")" = 'Management: Connected' ] || fail "--netbird: NetBird isn't connected"
   ip=$(sed -n 's#^NetBird IP: \([0-9.]*\)/[0-9]*$#\1#p' <<<"$out")
   fqdn=$(sed -n 's/^FQDN: \(.*\)$/\1/p' <<<"$out")
   IFS=. read -r a b c d <<<"$ip"
-  # 100.64.0.0/10: 100.64.x.x to 100.127.x.x, NetBird's (CGNAT) range, and nothing on a LAN.
-  [[ $ip =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ] &&
+  # 100.64.0.0/10: 100.64.x.x to 100.127.x.x, NetBird's (CGNAT) range, and nothing on a LAN. Octets are
+  # plain decimal with no leading zero, which some parsers read as octal (finding 81e8ef2f49f6).
+  local octet='(0|[1-9][0-9]{0,2})'
+  [[ $ip =~ ^$octet\.$octet\.$octet\.$octet$ ]] && [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ] &&
     [ "$c" -le 255 ] && [ "$d" -le 255 ] || fail "--netbird: '$ip' isn't a NetBird address (100.64.0.0/10)"
+  # The four octets as checked, so the address bound is the one tested.
+  ip="$a.$b.$c.$d"
   [[ $fqdn =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ ]] ||
     fail "--netbird: '$fqdn' isn't a host name"
   echo "$ip $fqdn"
@@ -152,10 +181,15 @@ install() {
   url=$(cat "$dir/url")
   local view_args=(/bin/bash "$here/bk" view --port "$port")
   if $netbird; then
-    "$bin" view --help | grep -q -- '--bind' || fail "this bracken's view has no --bind yet (task 23116f4ca9b9); leave out --netbird for 127.0.0.1"
+    # One view on both addresses needs a --bind that repeats (decision 5863740ca157); its help says so.
+    # The help is read whole first: `| grep -q` under pipefail can fail when grep stops reading early.
+    local help
+    help=$("$bin" view --help) || fail "$bin view --help failed"
+    [[ $help == *'at most one loopback'* ]] ||
+      fail "this bracken's view can't listen on two addresses yet (decision 5863740ca157); leave out --netbird for 127.0.0.1"
     read -r ip fqdn <<<"$(netbird_address)"
     [ -n "$ip" ] || exit 1
-    view_args+=(--bind "$ip" --host "$fqdn")
+    view_args+=(--bind 127.0.0.1 --bind "$ip" --host "$fqdn")
   fi
   local server_plist view_plist
   server_plist=$(plist "$server" "$dir/launchd-team-server.log" /bin/bash "$here/team-server" run)
@@ -169,12 +203,18 @@ install() {
   if pid=$(listener "${url##*:}") && [ -n "$pid" ] && ! is_server "$pid" "$dir"; then
     fail "port ${url##*:} is taken (pid $pid), not by the team server; stop that by its pid first"
   fi
-  # The view's port must be free, or held by the view this replaces. Someone else's is theirs to stop.
-  if ! loaded "$view" && pid=$(listener "$port") && [ -n "$pid" ]; then
-    fail "port $port is taken (pid $pid), not by the launchd view; stop that by its pid, or pass --view-port"
-  fi
+  # The view's port must be free at every address, or held only by the launchd view this replaces.
+  # Anything else on it, at any address, is someone's to stop: a view run by hand, or a server on 0.0.0.0
+  # or [::] that a per-address check misses (finding a67053e1e3d2), and that would answer in the view's
+  # place on every other address.
+  local ours
+  ours=$(agent_pid "$view")
+  for pid in $(listeners "$port"); do
+    [ "$pid" = "$ours" ] ||
+      fail "port $port is taken (pid $pid), not by the launchd view; stop that by its pid, or pass --view-port"
+  done
   mkdir -p "$agents"
-  for label in "$server" "$view"; do
+  for label in "${labels[@]}"; do
     ! loaded "$label" || launchctl bootout "$domain/$label"
   done
   # A server team-server start left running: stopped now, so launchd's isn't a second one.
@@ -185,18 +225,22 @@ install() {
   launchctl bootstrap "$domain" "$agents/$server.plist"
   launchctl bootstrap "$domain" "$agents/$view.plist"
   "$here/team-server" check
-  for _ in $(seq 100); do
-    answers "${ip:-127.0.0.1}" "$port" && break
-    sleep 0.1
+  # The view's own process listening at each of its addresses.
+  local at
+  for at in 127.0.0.1 ${ip:+"$ip"}; do
+    for _ in $(seq 100); do
+      listening_as "$view" "$at" "$port" && break
+      sleep 0.1
+    done
+    listening_as "$view" "$at" "$port" || fail "$view isn't listening on $at:$port; see $dir/launchd-view.log"
   done
-  answers "${ip:-127.0.0.1}" "$port" || fail "the view isn't listening on ${ip:-127.0.0.1}:$port; see $dir/launchd-view.log"
-  echo "services: installed $server ($url) and $view (http://${fqdn:-127.0.0.1}:$port)"
+  echo "services: installed $server ($url) and $view (http://127.0.0.1:$port${fqdn:+ and http://$fqdn:$port})"
 }
 
 uninstall() {
   local label
   [ $# -eq 0 ] || usage
-  for label in "$server" "$view"; do
+  for label in "${labels[@]}"; do
     if loaded "$label"; then
       launchctl bootout "$domain/$label"
       echo "services: unloaded $label"
@@ -210,26 +254,33 @@ uninstall() {
 }
 
 status() {
-  local dir port host label pid state
+  local dir port hosts_of host label pid state
   [ $# -eq 0 ] || usage
   dir=$(team)
-  port=$(cut -d: -f3 <"$dir/url")
-  for label in "$server" "$view"; do
-    host=127.0.0.1
-    [ "$label" = "$server" ] || { port=$(view_port); host=$(view_host); }
+  for label in "${labels[@]}"; do
+    if [ "$label" = "$server" ]; then
+      port=$(cut -d: -f3 <"$dir/url")
+      hosts_of=127.0.0.1
+    else
+      port=$(view_port "$label")
+      hosts_of=$(view_hosts "$label")
+    fi
     if loaded "$label"; then
       pid=$(agent_pid "$label")
       state="loaded${pid:+, pid $pid}"
     else
       state="not loaded"
     fi
-    if answers "$host" "$port"; then
-      state+=", listening on $host:$port"
-      pid=$(listener "$port")
-      [ -z "$pid" ] || state+=" (pid $pid)"
-    else
-      state+=", nothing on $host:$port"
-    fi
+    for host in $hosts_of; do
+      pid=$(listener "$port" "$host")
+      if [ -n "$pid" ]; then
+        state+=", listening on $host:$port (pid $pid)"
+      elif pid=$(wildcard_holder "$port") && [ -n "$pid" ]; then
+        state+=", nothing on $host:$port, held by pid $pid on *:$port"
+      else
+        state+=", nothing on $host:$port"
+      fi
+    done
     echo "$label: $state"
   done
 }

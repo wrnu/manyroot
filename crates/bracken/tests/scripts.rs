@@ -1202,7 +1202,8 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
 /// `services` (owner decision `6fed6a4c8af0`), without touching this machine's launchd: `launchctl`
 /// is a stub that logs its calls and has nothing loaded, and HOME is a throwaway directory. The dry
 /// run prints two valid plists that keep alive what scripts/team-server run and scripts/bk view start,
-/// log under the team directory, and hold no token; it writes nothing. uninstall removes exactly the
+/// log under the team directory, and hold no token; it writes nothing. With --netbird the one view
+/// listens on 127.0.0.1 and the NetBird address (decision 5863740ca157). uninstall removes exactly the
 /// two plists, and only them.
 #[test]
 fn services_dry_run_holds_no_secret_and_uninstall_removes_only_its_plists() {
@@ -1235,6 +1236,10 @@ fn services_dry_run_holds_no_secret_and_uninstall_removes_only_its_plists() {
         assert!(!text.contains(secret) && !text.to_lowercase().contains("token"), "{scripts}: {text}");
         let plists: Vec<&str> = text.split("\n# ").collect();
         assert_eq!(plists.len(), 2, "{scripts}: {text}");
+        assert!(
+            !text.contains("view-local") && !text.contains("--bind"),
+            "{scripts}: without --netbird, the view on 127.0.0.1 only: {text}"
+        );
         for (plist, label, args) in [
             (plists[0], "jx.rs.bracken.team-server", vec!["team-server", "run"]),
             (plists[1], "jx.rs.bracken.view", vec!["bk", "view", "--port", "7399"]),
@@ -1271,7 +1276,7 @@ fn services_dry_run_holds_no_secret_and_uninstall_removes_only_its_plists() {
         write_executable(
             &viewer,
             "#!/bin/sh
-[ \"$1 $2\" = 'view --help' ] && echo '      --bind <IP>'\nexit 0\n",
+[ \"$1 $2\" = 'view --help' ] && echo '      --bind <IP>  Repeatable: at most one loopback and one other'\nexit 0\n",
         );
         let netbird = |management: &str, ip: &str, fqdn: &str| {
             let status =
@@ -1285,14 +1290,35 @@ fn services_dry_run_holds_no_secret_and_uninstall_removes_only_its_plists() {
         let out = netbird("Connected", "100.74.240.73", "warren-mbp.jx.rs");
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
-        let bound = "<string>--bind</string>\n    <string>100.74.240.73</string>\n    <string>--host</string>\n    <string>warren-mbp.jx.rs</string>";
-        assert!(text.contains(bound), "{scripts}: {text}");
+        // One view, one process, on both: 127.0.0.1 and the NetBird IP, with the name for the NetBird one.
+        let plists: Vec<&str> = text.split("\n# ").collect();
+        assert_eq!(plists.len(), 2, "{scripts}: one view agent: {text}");
+        assert!(!text.contains("view-local"), "{scripts}: {text}");
+        let both = "<string>view</string>\n    <string>--port</string>\n    <string>7392</string>\n    <string>--bind</string>\n    <string>127.0.0.1</string>\n    <string>--bind</string>\n    <string>100.74.240.73</string>\n    <string>--host</string>\n    <string>warren-mbp.jx.rs</string>\n  </array>";
+        assert!(
+            plists[1].contains("<string>jx.rs.bracken.view</string>") && plists[1].contains(both),
+            "{scripts}: {text}"
+        );
+        if std::path::Path::new("/usr/bin/plutil").exists() {
+            let file = tmp.path().join("view-netbird.plist");
+            std::fs::write(&file, &plists[1][plists[1].find("<?xml").expect("a plist")..]).unwrap();
+            let lint = Command::new("/usr/bin/plutil").arg("-lint").arg(&file).output().unwrap();
+            assert!(lint.status.success(), "{scripts}: {}", String::from_utf8_lossy(&lint.stdout));
+        }
+        assert!(!home.join("Library").exists(), "{scripts}: the dry run wrote something");
         for (management, ip, fqdn, why) in [
             ("Disconnected", "100.74.240.73", "warren-mbp.jx.rs", "isn't connected"),
             ("Connected", "192.168.1.20", "warren-mbp.jx.rs", "isn't a NetBird address"),
             ("Connected", "100.128.0.1", "warren-mbp.jx.rs", "isn't a NetBird address"),
             ("Connected", "100.63.255.1", "warren-mbp.jx.rs", "isn't a NetBird address"),
             ("Connected", "100.74.240.300", "warren-mbp.jx.rs", "isn't a NetBird address"),
+            // Leading zeros, which an inet_aton-style parser reads as octal (finding 81e8ef2f49f6).
+            ("Connected", "100.064.000.001", "warren-mbp.jx.rs", "isn't a NetBird address"),
+            ("Connected", "100.74.240.073", "warren-mbp.jx.rs", "isn't a NetBird address"),
+            // Exactly one Management line, and it says Connected.
+            ("Disconnected\nManagement: Connected", "100.74.240.73", "warren-mbp.jx.rs", "isn't connected"),
+            ("Connected\nManagement: Disconnected", "100.74.240.73", "warren-mbp.jx.rs", "isn't connected"),
+            ("Connected (cached)", "100.74.240.73", "warren-mbp.jx.rs", "isn't connected"),
             ("Connected", "100.74.240.73", "evil host; rm", "isn't a host name"),
         ] {
             let out = netbird(management, ip, fqdn);
@@ -1300,16 +1326,60 @@ fn services_dry_run_holds_no_secret_and_uninstall_removes_only_its_plists() {
             assert!(!out.status.success() && stderr.contains(why), "{scripts}: {ip} {fqdn}: {stderr}");
             assert!(out.stdout.is_empty(), "{scripts}: printed a plist for {ip}");
         }
-        // And only with a view that can bind.
+        // The real view (through the test's wrapper) can listen on two addresses, so --netbird goes ahead.
         let mut c = command(&dir, "scripts/services", &["install", "--dry-run", "--netbird"]);
         c.env("HOME", &home).env("PATH", &path).env("T", tmp.path());
         netbird("Connected", "100.74.240.73", "warren-mbp.jx.rs");
         let out = c.output().unwrap();
         let bindless =
             std::process::Command::new(env!("CARGO_BIN_EXE_bracken")).args(["view", "--help"]).output().unwrap();
-        if !String::from_utf8_lossy(&bindless.stdout).contains("--bind") {
-            assert!(!out.status.success(), "{scripts}: --netbird with a view that can't bind");
+        // services tells a view that can listen on two addresses by this phrase in its help.
+        assert!(
+            String::from_utf8_lossy(&bindless.stdout).contains("at most one loopback"),
+            "{scripts}: bracken view's --bind help lost the phrase services checks for"
+        );
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        // A view from before decision 5863740ca157, whose --bind doesn't repeat: --netbird refuses.
+        let single = tmp.path().join("bracken-single-bind");
+        write_executable(&single, "#!/bin/sh\n[ \"$1 $2\" = 'view --help' ] && echo '      --bind <IP>'\nexit 0\n");
+        let mut c = command(&dir, "scripts/services", &["install", "--dry-run", "--netbird"]);
+        c.env("HOME", &home).env("PATH", &path).env("T", tmp.path()).env("BRACKEN_BIN", &single);
+        let out = c.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains("two addresses"), "{scripts}: {stderr}");
+
+        // A foreign server on the view's port at a wildcard address (finding a67053e1e3d2): lsof lists it
+        // for the port, but not for 127.0.0.1:P or the NetBird IP, as the real lsof does. Install refuses,
+        // naming it, and changes nothing, with --netbird or without.
+        write_executable(
+            &stubs.join("lsof"),
+            "#!/bin/sh\ncase \" $* \" in *' -iTCP:7399 '*) echo 4242 ;; esac\nexit 0\n",
+        );
+        for netbird_flag in [&[][..], &["--netbird"]] {
+            let args: Vec<&str> = ["install", "--view-port", "7399"].iter().chain(netbird_flag).copied().collect();
+            let mut c = command(&dir, "scripts/services", &args);
+            c.env("HOME", &home).env("PATH", &path).env("T", tmp.path()).env("BRACKEN_BIN", &viewer);
+            let out = c.output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{scripts} {netbird_flag:?}: a wildcard holder wasn't refused: {stderr}");
+            assert!(stderr.contains("port 7399 is taken (pid 4242)"), "{scripts} {netbird_flag:?}: {stderr}");
+            assert!(!home.join("Library").exists(), "{scripts}: refused, but wrote something");
+            let calls = std::fs::read_to_string(tmp.path().join("launchctl.log")).unwrap_or_default();
+            assert!(!calls.contains("bootstrap") && !calls.contains("bootout"), "{scripts}: {calls}");
         }
+        // status names a wildcard holder blocking the view's address, as real lsof's -F output gives it.
+        write_executable(
+            &stubs.join("lsof"),
+            "#!/bin/sh\ncase \" $* \" in *' -iTCP:7392 '*-Fpn*) printf 'p4242\\nf3\\nn*:7392\\n' ;; esac\nexit 0\n",
+        );
+        let out = services(&["status"]);
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            text.contains("jx.rs.bracken.view: not loaded, nothing on 127.0.0.1:7392, held by pid 4242 on *:7392"),
+            "{scripts}: {text}"
+        );
+        std::fs::remove_file(stubs.join("lsof")).unwrap();
 
         let agents = home.join("Library/LaunchAgents");
         std::fs::create_dir_all(&agents).unwrap();

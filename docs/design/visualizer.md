@@ -205,16 +205,25 @@ replica. Every endpoint is a GET; there's no write path. Responses carry
 connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, and the
 server checks `Host` is `127.0.0.1:<port>` or `localhost:<port>` (against DNS rebinding).
 
-By default it listens on 127.0.0.1 only. `--bind <ip>` names one other address instead. Owner decision
+By default it listens on 127.0.0.1 only. `--bind <ip>` names the address instead. Owner decision
 917816c72975 (2026-10-29) allows this machine's NetBird IP, so the owner can read the team Ground's view
 from their own network. It narrows 09f29f6c727b's loopback-only rule for that one case.
-- Bound that way, anyone who can reach the address can read the whole Ground: there's no login, and the
-  server prints a warning saying so when it starts.
+
+`--bind` repeats, so one process can listen on both loopback and NetBird (decision 5863740ca157). It
+takes at most one loopback address and one other, all at the same port, sharing one snapshot and one
+cache. Each listener has its own budget of 64 connections and 16 event streams, so clients on one can't
+lock out the other (finding 6e1807aa762f).
+- Off loopback, anyone who can reach the address can read the whole Ground: there's no login, and the
+  server prints a warning saying so for each such listener when it starts.
 - It refuses to bind every interface (`0.0.0.0`, `::`), a multicast address or a broadcast address.
-- It answers only to the Host `<ip>:<port>` (`[<ip>]:<port>` for IPv6) and to names given with
-  `--host <name>`, as `<name>:<port>`. `localhost` counts only on a loopback address. Every other Host
-  gets a 403.
-- Everything else is unchanged: GET only, the same headers, no CORS, and the same bounds.
+  IPv4-mapped forms count as the IPv4 address they are.
+- Host rules are per listener. Every other Host gets a 403.
+  - The loopback listener answers to `127.0.0.1:<port>` (or `[::1]:<port>`) and `localhost:<port>`.
+  - The other listener answers to its own `<ip>:<port>` and to the names given with `--host <name>`, as
+    `<name>:<port>`. With only one listener, the names are its.
+- Everything else is unchanged: GET only, the same headers, no CORS.
+- **For step 5 (demo-harness):** `--runs` must be refused when any listener is off loopback. Experiment
+  run directories hold more than the Ground, and the decision covers only the Ground's view.
 
 ### 1.8 `GET /api/trust`: who validates whom (step 4)
 

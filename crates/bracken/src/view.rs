@@ -1,5 +1,5 @@
-//! `bracken view`: a read-only web view of one replica, served on 127.0.0.1, or on one other address
-//! named with `--bind` (decision 917816c72975).
+//! `bracken view`: a read-only web view of one replica, served on 127.0.0.1, or on the addresses named
+//! with `--bind`: at most one loopback and one other (decisions 917816c72975 and 5863740ca157).
 //!
 //! The page and its scripts are embedded in the binary. The JSON API is the shapes of
 //! docs/design/visualizer.md section 1, built from the same library calls and field names as the
@@ -64,7 +64,8 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
     ("/fonts/OFL.txt", "text/plain; charset=utf-8", include_bytes!("../assets/view/fonts/OFL.txt")),
 ];
 
-/// The most connections served at once, and of those, event streams; more are refused.
+/// The most connections each listener serves at once, and of those, event streams; more are refused.
+/// Each listener has its own, so a NetBird peer can't use up the loopback listener's (finding 6e1807aa762f).
 const MAX_CONNECTIONS: usize = 64;
 const MAX_STREAMS: usize = 16;
 const MAX_HEADERS: usize = 32;
@@ -214,14 +215,10 @@ type Past = (Graph, Vec<ContributionId>);
 
 struct Viewer {
     dir: PathBuf,
-    /// The Host values this view answers to, lowercase, each with its port (section 1.7).
-    hosts: Vec<String>,
     policy: Policy,
     /// The latest snapshot and its generation, which the watcher bumps; streams wait on `changed`.
     current: Mutex<(u64, Arc<Snapshot>)>,
     changed: Condvar,
-    connections: AtomicUsize,
-    streams: AtomicUsize,
     /// The graphs `?as_of=` built last, by the hash of the set they hold.
     past: Mutex<Vec<(blake3::Hash, Arc<Past>)>>,
     /// Slots for building `?as_of=` graphs, [`PAST_BUILDS`] of them.
@@ -232,28 +229,43 @@ struct Viewer {
     reread_delay: Duration,
 }
 
-/// Where a view listens and what it answers to: exactly one address (127.0.0.1 unless `--bind` names
-/// another) and its port, and the names given with `--host`.
+/// Where a view listens and what it answers to: the addresses (127.0.0.1 unless `--bind` names others:
+/// at most one loopback and one other, decision 5863740ca157), one port for all, and the names given
+/// with `--host`.
 pub struct Bind {
-    pub ip: IpAddr,
+    pub ips: Vec<IpAddr>,
     pub port: u16,
     pub names: Vec<String>,
 }
 
 impl Bind {
     /// Refuses what would reach more than one host or interface: an unspecified address (every
-    /// interface), a multicast or broadcast one; and a name that isn't a plain host name. Returns the
-    /// address to bind, canonical: an IPv4-mapped IPv6 address (`::ffff:0.0.0.0`) is checked, bound
-    /// and shown as the IPv4 address it is (finding e20de255980d), since on a dual-stack socket
-    /// `::ffff:0.0.0.0` is every IPv4 interface.
-    fn check(&self) -> Result<IpAddr> {
-        let ip = self.ip.to_canonical();
-        if ip.is_unspecified() {
-            bail!("--bind {ip} would listen on every interface; name one address (decision 917816c72975)");
+    /// interface), a multicast or broadcast one, more than one loopback or more than one other address;
+    /// and a name that isn't a plain host name. Returns the addresses to bind, canonical and loopback
+    /// first: an IPv4-mapped IPv6 address (`::ffff:0.0.0.0`) is checked, bound and shown as the IPv4
+    /// address it is (finding e20de255980d), since on a dual-stack socket `::ffff:0.0.0.0` is every IPv4
+    /// interface.
+    fn check(&self) -> Result<Vec<IpAddr>> {
+        let mut ips: Vec<IpAddr> = Vec::new();
+        for ip in self.ips.iter().map(IpAddr::to_canonical) {
+            if ip.is_unspecified() {
+                bail!("--bind {ip} would listen on every interface; name one address (decision 917816c72975)");
+            }
+            if ip.is_multicast() || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()) {
+                bail!("--bind {ip} is a multicast or broadcast address; name one address of this machine");
+            }
+            if let Some(other) = ips.iter().find(|o| o.is_loopback() == ip.is_loopback()) {
+                let which = if ip.is_loopback() { "loopback" } else { "non-loopback" };
+                bail!(
+                    "--bind {ip}: a view listens on at most one {which} address, and {other} is one (decision 5863740ca157)"
+                );
+            }
+            ips.push(ip);
         }
-        if ip.is_multicast() || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()) {
-            bail!("--bind {ip} is a multicast or broadcast address; name one address of this machine");
+        if ips.is_empty() {
+            bail!("--bind: no address to listen on");
         }
+        ips.sort_by_key(|ip| !ip.is_loopback());
         for name in &self.names {
             let plain = !name.is_empty()
                 && name.split('.').all(|label| {
@@ -266,7 +278,13 @@ impl Bind {
                 bail!("--host {name:?} isn't a host name: letters, digits, '-' and '.', with no port");
             }
         }
-        Ok(ip)
+        Ok(ips)
+    }
+
+    /// The names a listener on `ip` answers to: the `--host` names belong to the non-loopback listener,
+    /// or to the only one there is.
+    fn names_on(&self, ip: IpAddr, ips: &[IpAddr]) -> &[String] {
+        if !ip.is_loopback() || ips.iter().all(IpAddr::is_loopback) { &self.names } else { &[] }
     }
 }
 
@@ -305,59 +323,59 @@ fn reach_warning(ip: IpAddr, port: u16) -> Option<String> {
     })
 }
 
-/// Listens on the one address `bind` names, at its port (0 for any free port), prints the URL on
-/// stdout, and serves the replica in `dir` until the process ends. Bound anywhere but loopback, it
-/// warns on stderr that anyone on that network can read the whole Ground: there's no login.
+/// One listener's own rules and budget: the Host values it answers to, and its connections and event
+/// streams under way, at most [`MAX_CONNECTIONS`] and [`MAX_STREAMS`].
+struct Listener {
+    hosts: Vec<String>,
+    connections: AtomicUsize,
+    streams: AtomicUsize,
+}
+
+impl Listener {
+    fn new(hosts: Vec<String>) -> Listener {
+        Listener { hosts, connections: AtomicUsize::new(0), streams: AtomicUsize::new(0) }
+    }
+}
+
+/// Listens on each address `bind` names, all at one port (0 for any free port, the first listener's),
+/// prints each URL on stdout, loopback first, and serves the replica in `dir` until the process ends.
+/// Every listener shares one snapshot and as_of cache. Each has its own Host rules and its own budget of
+/// connections and event streams, so one listener's clients can't lock out another's (finding
+/// 6e1807aa762f). For each listener off loopback it warns on stderr that anyone on that network can read
+/// the whole Ground: there's no login.
 pub fn serve(dir: &Path, policy: Policy, bind: &Bind) -> Result<()> {
-    let ip = bind.check()?;
-    let listener = TcpListener::bind((ip, bind.port)).with_context(|| format!("listening on {ip}"))?;
-    let port = listener.local_addr()?.port();
-    let at = host_port(ip, port);
-    let hosts = hosts(ip, port, &bind.names);
-    let dir = dir.to_owned();
-    let first = signature(&dir)?;
-    let snapshot = Snapshot::new(Store::open(&dir)?, &policy, None, first)?;
-    let reread_delay = std::env::var("BRACKEN_VIEW_REREAD_DELAY_MS")
-        .ok()
-        .and_then(|ms| ms.parse().ok())
-        .map_or(Duration::ZERO, Duration::from_millis)
-        .min(MAX_REREAD_DELAY);
-    let viewer = Arc::new(Viewer {
-        dir,
-        hosts,
-        policy,
-        current: Mutex::new((0, Arc::new(snapshot))),
-        changed: Condvar::new(),
-        connections: AtomicUsize::new(0),
-        streams: AtomicUsize::new(0),
-        past: Mutex::new(Vec::new()),
-        building: Slots::new(PAST_BUILDS),
-        reread_delay,
-    });
+    let ips = bind.check()?;
+    let mut port = bind.port;
+    let mut sockets: Vec<(IpAddr, TcpListener)> = Vec::new();
+    for &ip in &ips {
+        let socket = TcpListener::bind((ip, port)).with_context(|| format!("listening on {}", host_port(ip, port)))?;
+        port = socket.local_addr()?.port();
+        sockets.push((ip, socket));
+    }
+    let mut listeners: Vec<(IpAddr, TcpListener, Arc<Listener>)> = sockets
+        .into_iter()
+        .map(|(ip, socket)| (ip, socket, Arc::new(Listener::new(hosts(ip, port, bind.names_on(ip, &ips))))))
+        .collect();
+    let viewer = Arc::new(Viewer::new(dir, policy)?);
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "view at http://{at}/")?;
+    for (ip, ..) in &listeners {
+        writeln!(stdout, "view at http://{}/", host_port(*ip, port))?;
+    }
     stdout.flush()?;
     drop(stdout);
-    if let Some(warning) = reach_warning(ip, port) {
-        eprintln!("{warning}");
+    for (ip, ..) in &listeners {
+        if let Some(warning) = reach_warning(*ip, port) {
+            eprintln!("{warning}");
+        }
     }
     let watcher = Arc::clone(&viewer);
     std::thread::spawn(move || watcher.watch());
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        if viewer.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            viewer.connections.fetch_sub(1, Ordering::SeqCst);
-            let _ = respond(&stream, &error(503, "too many connections"));
-            continue;
-        }
+    let (_, last, last_on) = listeners.pop().expect("check gives at least one address");
+    for (_, socket, on) in listeners {
         let viewer = Arc::clone(&viewer);
-        std::thread::spawn(move || {
-            // Given back even if the handler panics.
-            let _slot = Release(&viewer.connections);
-            viewer.connection(&stream);
-            linger(&stream);
-        });
+        std::thread::spawn(move || viewer.accept(&socket, &on));
     }
+    viewer.accept(&last, &last_on);
     Ok(())
 }
 
@@ -509,7 +527,49 @@ impl Viewer {
         }
     }
 
-    fn connection(&self, stream: &TcpStream) {
+    /// The replica in `dir` read once, for listeners to serve.
+    fn new(dir: &Path, policy: Policy) -> Result<Viewer> {
+        let dir = dir.to_owned();
+        let first = signature(&dir)?;
+        let snapshot = Snapshot::new(Store::open(&dir)?, &policy, None, first)?;
+        let reread_delay = std::env::var("BRACKEN_VIEW_REREAD_DELAY_MS")
+            .ok()
+            .and_then(|ms| ms.parse().ok())
+            .map_or(Duration::ZERO, Duration::from_millis)
+            .min(MAX_REREAD_DELAY);
+        Ok(Viewer {
+            dir,
+            policy,
+            current: Mutex::new((0, Arc::new(snapshot))),
+            changed: Condvar::new(),
+            past: Mutex::new(Vec::new()),
+            building: Slots::new(PAST_BUILDS),
+            reread_delay,
+        })
+    }
+
+    /// Serves one listener's connections, each on its own thread, within that listener's own budget.
+    fn accept(self: &Arc<Self>, socket: &TcpListener, on: &Arc<Listener>) {
+        for stream in socket.incoming() {
+            let Ok(stream) = stream else { continue };
+            if on.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+                on.connections.fetch_sub(1, Ordering::SeqCst);
+                let _ = respond(&stream, &error(503, "too many connections"));
+                continue;
+            }
+            let (viewer, on) = (Arc::clone(self), Arc::clone(on));
+            std::thread::spawn(move || {
+                // Given back even if the handler panics.
+                let _slot = Release(&on.connections);
+                viewer.connection(&stream, &on);
+                linger(&stream);
+            });
+        }
+    }
+
+    /// One request, answered only if its Host is one of the listener's own.
+    fn connection(&self, stream: &TcpStream, on: &Listener) {
+        let hosts_on = &on.hosts;
         let request = match read_request(stream) {
             Ok(r) => r,
             Err(refused) => {
@@ -517,9 +577,9 @@ impl Viewer {
                 return;
             }
         };
-        // Against DNS rebinding: see `serve`.
-        if !request.host.as_ref().is_some_and(|h| self.hosts.contains(&h.to_ascii_lowercase())) {
-            let _ = respond(stream, &error(403, format!("this view answers only to http://{}/", self.hosts[0])));
+        // Against DNS rebinding, per listener: see `hosts`.
+        if !request.host.as_ref().is_some_and(|h| hosts_on.contains(&h.to_ascii_lowercase())) {
+            let _ = respond(stream, &error(403, format!("this view answers only to http://{}/", hosts_on[0])));
             return;
         }
         if request.method != "GET" {
@@ -542,7 +602,7 @@ impl Viewer {
             return;
         }
         if request.path == "/api/events" {
-            self.events(stream, request.query.get("since").map(String::as_str));
+            self.events(stream, request.query.get("since").map(String::as_str), &on.streams);
             return;
         }
         let _ = respond(stream, &self.route(&request));
@@ -858,13 +918,13 @@ impl Viewer {
     /// Section 1.6: a `contributions` event whenever the replica gains anything, and a `ping` every
     /// [`PING`]. With `since`, the first event carries what arrived after that cursor, and its
     /// `status_changed` is `null`: the stream can't know what the page saw, so it refetches.
-    fn events(&self, stream: &TcpStream, since: Option<&str>) {
-        if self.streams.fetch_add(1, Ordering::SeqCst) >= MAX_STREAMS {
-            self.streams.fetch_sub(1, Ordering::SeqCst);
+    fn events(&self, stream: &TcpStream, since: Option<&str>, streams: &AtomicUsize) {
+        if streams.fetch_add(1, Ordering::SeqCst) >= MAX_STREAMS {
+            streams.fetch_sub(1, Ordering::SeqCst);
             let _ = respond(stream, &error(503, "too many event streams"));
             return;
         }
-        let _slot = Release(&self.streams);
+        let _slot = Release(streams);
         let (mut generation, mut last) = self.snapshot();
         let mut cursor = listing::cursor(last.graph());
         let mut first = None;
@@ -1267,15 +1327,89 @@ mod tests {
         s.parse().expect("a test address")
     }
 
+    /// Sends a GET and returns the status line's code once the response head has arrived.
+    fn status_of(port: u16, path: &str) -> u16 {
+        use std::io::Read;
+        let mut s = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(20))).expect("timeout");
+        write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n").expect("write");
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") && s.read(&mut byte).expect("read") == 1 {
+            head.push(byte[0]);
+        }
+        let line = String::from_utf8_lossy(&head);
+        line.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or_else(|| panic!("{line:?}"))
+    }
+
+    /// Finding 6e1807aa762f: each listener has its own budget. Two listeners on 127.0.0.1 (which only a
+    /// test can set up; `Bind::check` allows one loopback address) serve one replica. Listener A's event
+    /// streams and then its connections are used up, and A refuses more with 503, while B still serves.
+    #[test]
+    fn a_full_listener_doesnt_lock_out_the_other() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let dir = tmp.path().join("g");
+        Store::init(&dir, "budget").expect("a Ground");
+        let viewer = Arc::new(Viewer::new(&dir, Policy::default()).expect("a viewer"));
+        let mut ports = Vec::new();
+        for _ in 0..2 {
+            let socket = TcpListener::bind(("127.0.0.1", 0)).expect("a listener");
+            let port = socket.local_addr().expect("its address").port();
+            let on = Arc::new(Listener::new(hosts(ip("127.0.0.1"), port, &[])));
+            let viewer = Arc::clone(&viewer);
+            std::thread::spawn(move || viewer.accept(&socket, &on));
+            ports.push(port);
+        }
+        let (a, b) = (ports[0], ports[1]);
+        let mut held = Vec::new();
+        // A's event streams, every one: each keeps its connection open.
+        for _ in 0..MAX_STREAMS {
+            let mut s = TcpStream::connect(("127.0.0.1", a)).expect("connect");
+            write!(s, "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{a}\r\n\r\n").expect("write");
+            let mut first = [0u8; 12];
+            std::io::Read::read_exact(&mut s, &mut first).expect("a stream's head");
+            assert_eq!(&first, b"HTTP/1.1 200");
+            held.push(s);
+        }
+        assert_eq!(status_of(a, "/api/events"), 503, "A's streams are used up");
+        assert_eq!(status_of(b, "/api/events"), 200, "B's aren't");
+        // The rest of A's connections, idle: each holds its slot until its head times out.
+        for _ in MAX_STREAMS..MAX_CONNECTIONS {
+            held.push(TcpStream::connect(("127.0.0.1", a)).expect("connect"));
+        }
+        assert_eq!(status_of(a, "/api/ground"), 503, "A's connections are used up");
+        assert_eq!(status_of(b, "/api/ground"), 200, "B still serves");
+        drop(held);
+    }
+
     #[test]
     fn mapped_addresses_are_checked_as_the_ipv4_they_are() {
-        let bind = |s: &str| Bind { ip: ip(s), port: 0, names: Vec::new() }.check();
+        let bind = |s: &str| Bind { ips: vec![ip(s)], port: 0, names: Vec::new() }.check().map(|ips| ips[0]);
         for refused in ["::ffff:0.0.0.0", "::ffff:0:0", "::ffff:224.0.0.1", "::ffff:255.255.255.255"] {
             assert!(bind(refused).is_err(), "{refused}");
         }
         assert_eq!(bind("::ffff:127.0.0.1").expect("loopback"), ip("127.0.0.1"));
         assert_eq!(bind("::ffff:100.74.240.73").expect("unicast"), ip("100.74.240.73"));
         assert_eq!(bind("::1").expect("loopback"), ip("::1"));
+    }
+
+    #[test]
+    fn one_loopback_and_one_other_address_at_most_with_the_names_off_loopback() {
+        let bind = |ips: &[&str]| Bind { ips: ips.iter().map(|s| ip(s)).collect(), port: 0, names: vec!["n".into()] };
+        let both = bind(&["100.74.240.73", "127.0.0.1"]);
+        let ips = both.check().expect("one of each");
+        assert_eq!(ips, [ip("127.0.0.1"), ip("100.74.240.73")], "loopback first");
+        assert!(both.names_on(ips[0], &ips).is_empty(), "no --host names on loopback beside another listener");
+        assert_eq!(both.names_on(ips[1], &ips), ["n"]);
+        let alone = bind(&["127.0.0.1"]);
+        assert_eq!(alone.names_on(ip("127.0.0.1"), &alone.check().expect("one")), ["n"], "the only listener has them");
+        for refused in
+            [&["127.0.0.1", "::1"][..], &["100.74.240.73", "100.74.240.74"], &["127.0.0.1", "::ffff:127.0.0.1"]]
+        {
+            assert!(bind(refused).check().is_err(), "{refused:?}");
+        }
+        assert!(bind(&["127.0.0.1", "0.0.0.0"]).check().is_err(), "every refusal applies to each address");
+        assert!(bind(&[]).check().is_err());
     }
 
     #[test]
