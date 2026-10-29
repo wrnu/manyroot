@@ -2197,6 +2197,89 @@ fn drain(mut from: impl std::io::Read + Send + 'static) -> std::thread::JoinHand
     })
 }
 
+/// verify-seq under test, stopped on every exit path: dropped, as a failed assertion unwinds, it kills what
+/// is left of it, so nothing outlives the test and later finds the real boat on PATH once the stubs'
+/// directory is gone (task 1a85a68533d7). verify-seq's jobs run in process groups of their own (`set -m`),
+/// so it kills, with SIGKILL: verify-seq's group while it is unreaped or still has members, every process
+/// descended from it while it is unreaped, and each stub process recorded in `pids` that is still a
+/// `sleep 600`, with its group. Never this test's own group.
+struct Stopped {
+    child: std::process::Child,
+    pids: PathBuf,
+    reaped: bool,
+}
+
+impl Stopped {
+    /// Waits up to `limit` for verify-seq to exit, reaping it.
+    fn wait(&mut self, limit: std::time::Duration) -> Option<std::process::ExitStatus> {
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                self.reaped = true;
+                return Some(status);
+            }
+            if started.elapsed() >= limit {
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
+    fn stop(&mut self) {
+        let ps = Command::new("/bin/ps").args(["-A", "-o", "pid=,ppid=,pgid=,args="]).output();
+        let ps = ps.map(|o| String::from_utf8_lossy(&o.stdout).into_owned()).unwrap_or_default();
+        let rows: Vec<(u32, u32, u32, String)> = ps
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let mut n = || f.next()?.parse::<u32>().ok();
+                let (pid, ppid, pgid) = (n()?, n()?, n()?);
+                Some((pid, ppid, pgid, l.split_whitespace().skip(3).collect::<Vec<_>>().join(" ")))
+            })
+            .collect();
+        let own = rows.iter().find(|r| r.0 == std::process::id()).map(|r| r.2);
+        let id = self.child.id();
+        let mut targets: Vec<String> = Vec::new();
+        if !self.reaped || rows.iter().any(|r| r.2 == id) {
+            targets.push(format!("-{id}"));
+        }
+        let mut tree = if self.reaped { Vec::new() } else { vec![id] };
+        let mut i = 0;
+        while i < tree.len() {
+            let children: Vec<u32> =
+                rows.iter().filter(|r| r.1 == tree[i] && !tree.contains(&r.0)).map(|r| r.0).collect();
+            tree.extend(children);
+            i += 1;
+        }
+        let recorded = std::fs::read_to_string(&self.pids).unwrap_or_default();
+        for r in &rows {
+            let stub = recorded.lines().any(|p| p.trim() == r.0.to_string()) && r.3 == "sleep 600";
+            if stub || tree.contains(&r.0) {
+                targets.push(r.0.to_string());
+                if Some(r.2) != own {
+                    targets.push(format!("-{}", r.2));
+                }
+            }
+        }
+        targets.sort();
+        targets.dedup();
+        for target in targets {
+            let _ =
+                Command::new("/bin/kill").args(["-KILL", "--", &target]).stderr(std::process::Stdio::null()).status();
+        }
+        if !self.reaped {
+            let _ = self.child.wait();
+            self.reaped = true;
+        }
+    }
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// Two split runs under `verify-seq -j 2`, then a Ctrl-C to its group or, with `term`, SIGINT ignored
 /// and a SIGTERM to `verify-seq` only.
 fn verify_seq_interrupted(term: bool) {
@@ -2273,9 +2356,10 @@ fn verify_seq_interrupted(term: bool) {
             .env("TMPDIR", tmp.path())
             .env_remove("ON");
         std::os::unix::process::CommandExt::process_group(&mut c, 0);
-        let mut child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let mut child = Stopped { child, pids: t.join("pids"), reaped: false };
         // Read as it comes, so a full pipe can't hold verify-seq up before the runs start (note a3d37148ea05).
-        let (stdout, stderr) = (drain(child.stdout.take().unwrap()), drain(child.stderr.take().unwrap()));
+        let (stdout, stderr) = (drain(child.child.stdout.take().unwrap()), drain(child.child.stderr.take().unwrap()));
         let text = |stdout: std::thread::JoinHandle<Vec<u8>>, stderr: std::thread::JoinHandle<Vec<u8>>| {
             let (o, e) = (stdout.join().unwrap(), stderr.join().unwrap());
             format!("{}{}", String::from_utf8_lossy(&o), String::from_utf8_lossy(&e))
@@ -2284,29 +2368,38 @@ fn verify_seq_interrupted(term: bool) {
         // verify-seq ending first fails at once with what it said.
         let started = std::time::Instant::now();
         while count("box-") < 2 || count("here-") < 2 {
-            if let Some(status) = child.try_wait().unwrap() {
+            if let Some(status) = child.wait(std::time::Duration::ZERO) {
+                // Stopped first: what's left would hold the output open.
+                child.stop();
                 panic!("{scripts}: verify-seq ended ({status}) before both runs started: {}", text(stdout, stderr));
             }
             assert!(started.elapsed() < std::time::Duration::from_secs(480), "{scripts}: the runs never started");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        let target = if term { child.id().to_string() } else { format!("-{}", child.id()) };
+        let id = child.child.id();
+        let target = if term { id.to_string() } else { format!("-{id}") };
         let signal = if term { "-TERM" } else { "-INT" };
         assert!(Command::new("/bin/kill").args([signal, "--", &target]).status().unwrap().success());
         let interrupted = std::time::Instant::now();
-        let status = child.wait().unwrap();
+        let status = child.wait(std::time::Duration::from_secs(120));
         let took = interrupted.elapsed();
-        let text = text(stdout, stderr);
-        assert_eq!(status.code(), Some(130), "{scripts}: {text}");
-        assert!(took < std::time::Duration::from_secs(120), "{scripts}: took {took:?} to stop: {text}");
-        assert_eq!(count("live-"), 0, "{scripts}: a box was left: {text}");
+        // What's still running is noted before anything left is stopped, which would hold the output open.
         let pids = std::fs::read_to_string(t.join("pids")).unwrap();
+        let mut left = Vec::new();
         for pid in pids.lines() {
             let alive =
                 Command::new("/bin/kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().unwrap();
             let what = Command::new("/bin/ps").args(["-o", "pid,ppid,pgid,args", "-p", pid]).output().unwrap();
-            assert!(!alive.success(), "{scripts}: left running: {}: {text}", String::from_utf8_lossy(&what.stdout));
+            if alive.success() {
+                left.push(String::from_utf8_lossy(&what.stdout).into_owned());
+            }
         }
+        child.stop();
+        let text = text(stdout, stderr);
+        let status = status.unwrap_or_else(|| panic!("{scripts}: took over {took:?} to stop: {text}"));
+        assert_eq!(status.code(), Some(130), "{scripts}: {text}");
+        assert_eq!(count("live-"), 0, "{scripts}: a box was left: {text}");
+        assert!(left.is_empty(), "{scripts}: left running: {left:?}: {text}");
         let evidence = bk(&dir, &["log", "--kind", "evidence", "--json"]);
         assert_eq!(evidence, "[]", "{scripts}: recorded evidence for an interrupted run: {text}");
         let worktrees = git(&["worktree", "list"]);
