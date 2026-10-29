@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>The Loom · Bracken</title>
+    <link rel="stylesheet" href="css/visualizer.css" />
+    <link rel="stylesheet" href="css/loom.css" />
+  </head>
+  <body class="loom-page">
+    <header class="masthead">
+      <h1>The Loom <span class="ground-name" id="ground-name"></span></h1>
+      <span class="synthetic" id="data-note"></span>
+      <nav aria-label="Views">
+        <a href="loom.html" aria-current="page">Loom</a>
+        <a href="root.html">Root</a>
+        <a href="language.html">Language</a>
+      </nav>
+    </header>
+
+    <main class="loom" id="loom">
+      <section class="gauge" aria-label="Time: drag the surface to replay">
+        <canvas id="gauge-canvas"></canvas>
+        <div class="surface-handle" id="surface" role="slider" tabindex="0" aria-label="Replay to" aria-valuemin="0" aria-valuemax="1000" aria-valuenow="1000">
+          <span class="surface-time num" id="surface-time"></span>
+        </div>
+        <div class="flag" id="flag" aria-hidden="true"><span class="sc">you left here</span></div>
+      </section>
+
+      <section class="window" id="window" aria-label="Contributions, by agent and in causal order">
+        <div class="agents" id="agents"></div>
+        <canvas id="loom-canvas" role="img" aria-label="The Ground's contributions woven by agent"></canvas>
+        <div class="labels" id="labels" aria-hidden="true"></div>
+        <svg class="tether" id="tether" aria-hidden="true"></svg>
+        <div class="hover-label" id="hover-label" hidden></div>
+      </section>
+
+      <aside class="side" id="side" aria-live="polite">
+        <p class="side-hint">Hover a knot to light its ancestry. Click it for its label.</p>
+      </aside>
+    </main>
+
+    <footer class="controls" aria-label="Replay and view">
+      <button type="button" id="play" aria-pressed="false">Grow</button>
+      <label class="sc speed">pace
+        <select id="speed">
+          <option value="0.5">slow</option>
+          <option value="1" selected>steady</option>
+          <option value="3">quick</option>
+        </select>
+      </label>
+      <span class="divider" aria-hidden="true"></span>
+      <div class="segmented" role="group" aria-label="Vertical axis">
+        <button type="button" id="axis-time" aria-pressed="true">Authors' clocks</button>
+        <button type="button" id="axis-causal" aria-pressed="false">Causal steps</button>
+      </div>
+      <span class="divider" aria-hidden="true"></span>
+      <div class="segmented" role="group" aria-label="Ground">
+        <button type="button" data-size="sample" aria-pressed="true">Sample, 37</button>
+        <button type="button" data-size="1000" aria-pressed="false">1,000</button>
+        <button type="button" data-size="50000" aria-pressed="false">50,000</button>
+      </div>
+      <div class="key" id="key" aria-label="Key"></div>
+    </footer>
+
+    <script src="sample-data.js"></script>
+    <script src="js/common.js"></script>
+    <script src="js/synthetic.js"></script>
+    <script src="js/loom.js"></script>
+  </body>
+</html>

@@ -1,0 +1,296 @@
+/* The Ground visualizer's visual language: Soil (dark, the primary) and Herbarium (light). */
+
+@font-face {
+  font-family: "Alegreya";
+  src: url("../fonts/alegreya.woff2") format("woff2");
+  font-weight: 400 900;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Alegreya";
+  src: url("../fonts/alegreya-italic.woff2") format("woff2");
+  font-weight: 400 900;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Alegreya Sans SC";
+  src: url("../fonts/alegreya-sans-sc-medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* Soil: a root window at night. Loam ground, pale roots, pigments from the plants above. */
+:root,
+[data-theme="soil"] {
+  color-scheme: dark;
+  --ground: #17130f;
+  --ground-raised: #201a14;
+  --ground-deep: #110e0b;
+  --stratum: #2e261e;
+  --stratum-line: #3b3128;
+  --root: #ece5d6;
+  --root-dim: #b0a490;
+  --root-faint: #948876;
+  --hypha: rgba(236, 229, 214, 0.16);
+  --hypha-strong: rgba(236, 229, 214, 0.55);
+  --accepted: #96d46f;
+  --accepted-glow: rgba(150, 212, 111, 0.28);
+  --rejected: #e0703f;
+  --pending: #ece5d6;
+  --superseded: #8c7f6b;
+  --retracted: #6b6156;
+  --pass: #96d46f;
+  --fail: #e0703f;
+  --focus: #f1cf63;
+  --shadow: 0 10px 30px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.35);
+  /* Agent inks: each thread's pigment. Twelve, then they repeat with a dash. */
+  --ink-0: #e6c14f; /* pollen */
+  --ink-1: #a394ea; /* iris */
+  --ink-2: #5cbcae; /* frond */
+  --ink-3: #d39257; /* bracken */
+  --ink-4: #7fb0ec; /* forget-me-not */
+  --ink-5: #d690c2; /* heather */
+  --ink-6: #b3b664; /* moss */
+  --ink-7: #e58c8c; /* rosehip */
+  --ink-8: #c9c0ad; /* birch */
+  --ink-9: #8f74c4; /* elderberry */
+  --ink-10: #e5a64a; /* saffron */
+  --ink-11: #6fa0a8; /* sedge */
+}
+
+/* Herbarium: a mounted specimen sheet in daylight. Cool mount board, leaf-black ink, pressed pigments. */
+[data-theme="herbarium"] {
+  color-scheme: light;
+  --ground: #eceee7;
+  --ground-raised: #f6f7f2;
+  --ground-deep: #e1e4db;
+  --stratum: #dde1d5;
+  --stratum-line: #c9cfbf;
+  --root: #20251c;
+  --root-dim: #4f5747;
+  --root-faint: #5f6756;
+  --hypha: rgba(32, 37, 28, 0.15);
+  --hypha-strong: rgba(32, 37, 28, 0.6);
+  --accepted: #3c7a26;
+  --accepted-glow: rgba(60, 122, 38, 0.2);
+  --rejected: #b0461f;
+  --pending: #20251c;
+  --superseded: #8a8270;
+  --retracted: #9a9486;
+  --pass: #3c7a26;
+  --fail: #b0461f;
+  --focus: #8a5a00;
+  --shadow: 0 8px 24px rgba(40, 46, 34, 0.14), 0 1px 3px rgba(40, 46, 34, 0.12);
+  --ink-0: #9a7408;
+  --ink-1: #5b48b8;
+  --ink-2: #1d7f72;
+  --ink-3: #9a5320;
+  --ink-4: #2e66ae;
+  --ink-5: #9b4785;
+  --ink-6: #6a6d17;
+  --ink-7: #b23d3d;
+  --ink-8: #6c6452;
+  --ink-9: #5e3e95;
+  --ink-10: #a8650b;
+  --ink-11: #2f6b74;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--ground);
+  color: var(--root);
+  font-family: "Alegreya", "Iowan Old Style", Charter, Georgia, serif;
+  font-size: 17px;
+  line-height: 1.45;
+  font-variant-numeric: oldstyle-nums proportional-nums;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--accepted-glow);
+  color: var(--root);
+}
+
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 3px;
+  border-radius: 2px;
+}
+
+a {
+  color: inherit;
+  text-decoration-color: var(--root-faint);
+  text-underline-offset: 0.2em;
+  text-decoration-thickness: 1px;
+}
+a:hover {
+  text-decoration-color: var(--root);
+}
+
+/* Labels: the specimen label's small caps. */
+.sc {
+  font-family: "Alegreya Sans SC", "Alegreya", sans-serif;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  font-variant-numeric: lining-nums tabular-nums;
+}
+
+/* Ids, times and counts are data, so they're tabular. */
+.id,
+.num {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.8em;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+.statement {
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+
+/* Scrollbars, in the soil. */
+* {
+  scrollbar-color: var(--stratum-line) transparent;
+  scrollbar-width: thin;
+}
+
+/* ---- Shared chrome ---- */
+
+.masthead {
+  display: flex;
+  align-items: baseline;
+  gap: 1.25rem;
+  padding: 1.1rem 1.5rem 0.9rem;
+  border-bottom: 1px solid var(--stratum-line);
+  background: var(--ground);
+  position: relative;
+  z-index: 3;
+}
+.masthead h1 {
+  margin: 0;
+  font-weight: 600;
+  font-size: 1.55rem;
+  letter-spacing: -0.01em;
+}
+.masthead h1 .ground-name {
+  font-style: italic;
+  font-weight: 400;
+  color: var(--root-dim);
+}
+.masthead nav {
+  display: flex;
+  gap: 1.1rem;
+  margin-left: auto;
+  font-size: 0.95rem;
+}
+.masthead nav a[aria-current="page"] {
+  text-decoration: none;
+  color: var(--root);
+  border-bottom: 1px solid var(--accepted);
+}
+.masthead nav a:not([aria-current]) {
+  color: var(--root-dim);
+  text-decoration: none;
+}
+
+.synthetic {
+  color: var(--root-faint);
+  font-size: 0.82rem;
+}
+
+button,
+select {
+  font: inherit;
+  color: var(--root);
+  background: var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-radius: 999px;
+  padding: 0.28rem 0.85rem;
+  cursor: pointer;
+}
+button:hover,
+select:hover {
+  border-color: var(--root-faint);
+}
+button[aria-pressed="true"] {
+  border-color: var(--accepted);
+  color: var(--root);
+  box-shadow: inset 0 0 0 1px var(--accepted-glow);
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* The specimen label: the side panel's card, the one container the language allows. */
+.label-card {
+  background: var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+  box-shadow: var(--shadow);
+  padding: 1rem 1.15rem 1.1rem;
+}
+.label-card .kind {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--root-dim);
+  font-size: 0.85rem;
+}
+.label-card .statement {
+  margin: 0.55rem 0 0.7rem;
+  font-size: 1.12rem;
+  line-height: 1.38;
+}
+.label-card dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.15rem 0.9rem;
+  margin: 0;
+  font-size: 0.88rem;
+}
+.label-card dt {
+  color: var(--root-faint);
+}
+.label-card dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .masthead {
+    flex-wrap: wrap;
+    gap: 0.4rem 1rem;
+    padding: 0.8rem 1rem;
+  }
+  .masthead h1 {
+    font-size: 1.25rem;
+  }
+  .masthead .synthetic {
+    display: none;
+  }
+  .masthead nav {
+    margin-left: 0;
+    width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}
