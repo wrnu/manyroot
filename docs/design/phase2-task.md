@@ -623,6 +623,52 @@ ends a turn.
 **The full mock run:** 10 agents and 8 turns in each mode, sandboxed, with
 no turn errors. The reports are recorded as evidence on the step's PR.
 
+## Calibration as measured
+
+Task `bb821dfc153c`, owner approval `a0e3b33bba1b`, report `95792fab29ce`,
+2026-10-29. Opus 5.5 ran the Phase 2 task with 2 agents and 2 turns in each
+mode, run as Phase 1's step 8 was: the pinned Claude Code, the LLM proxy,
+the sandbox and the caps, with a fail-closed watcher beside each mode. The
+drawn order was crdt, Bracken, git. It was clean: every turn passed the gate,
+with no turn error, sandbox denial or rate-limit wait, and a checkpoint for
+every turn.
+
+Every turn reached the 25-call soft stop and then ended with its own
+`result` event. So, unlike Phase 1's calibration, output is measured, not
+counted at the 30,000 ceiling.
+
+| Per agent-turn | crdt | Bracken | git |
+|---|---|---|---|
+| All tokens | 108,000 | 169,000 | 148,000 |
+| Cache reads | 91,000 | 134,000 | 130,000 |
+| Cache writes | 12,700 | 31,700 | 13,600 |
+| Output | 4,650 | 3,900 | 4,750 |
+| Model calls | 11.5 | 8.3 | 13.8 |
+| Largest context of one call | 16,300 | 43,600 | 16,900 |
+
+The three modes counted 1.70 million tokens in all, 53,000 of them output,
+and took 98 to 142 seconds each. Tokens per agent-turn fall inside
+candidate A's estimate above (about 125,000 to 200,000 with the fixes),
+crdt below it. Output is below the estimate.
+
+**The 10-agent, 8-turn pilot, re-estimated** against today's caps. The
+input side runs from flat to doubled by turn 8. Phase 1's pilot grew
+Bracken's input per turn about 1.7 times over its calibration.
+
+| Cap | Re-estimate | Within it? |
+|---|---|---|
+| Per agent, 3 M tokens | Bracken 1.35 to 2.7 M | Yes |
+| Per agent, 180,000 output | 31,000 to 38,000 | Yes |
+| Per mode, 25 M tokens | Bracken 13.5 to 26.8 M, git 11.8 to 23.3 M, crdt 8.7 to 17.0 M | Bracken may reach it at the top |
+| Per mode, 1,666,666 output | 0.31 to 0.38 M | Yes |
+| Per replicate, 75 M tokens | 34 to 67 M | Yes |
+| Per replicate, 5 M output | about 1.1 M | Yes |
+| Per replicate, 3 hours | about 20 to 30 minutes | Yes |
+
+So only Bracken's per-mode share is at risk, and only if its input per turn
+nearly doubles. A Bracken run that reaches the cap stops, and its report is
+measured from what exists.
+
 ## What this can't settle
 
 The token estimates scale Phase 1's measurements and are not measured. The
