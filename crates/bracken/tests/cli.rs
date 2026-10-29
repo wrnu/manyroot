@@ -435,6 +435,12 @@ fn evidence_run_records_the_commands_result() {
     assert!(details.starts_with("exit 3\n") && details.ends_with("line 100\n[2Kbad"), "{details}");
     assert_eq!(details.lines().count(), 41, "the exit and the last 40 lines: {details}");
 
+    // Both streams go into the details in the order the command wrote them (note 4a2c53c065a9).
+    let script = "for i in $(seq 1 20); do echo out $i; echo err $i >&2; done";
+    let mixed = run(&["evidence", &c, "--run", "--as", "val", "--", "sh", "-c", script]);
+    let want: String = (1..=20).map(|i| format!("\nout {i}\nerr {i}")).collect();
+    assert_eq!(body(&mixed)["details"].as_str(), Some(format!("exit 0{want}").as_str()));
+
     // Without --run, the target and verdict may still come after `--`, out of reach of option parsing.
     let after = bracken(dir, &["evidence", "--method=-m", "--as", "val", "--", &c, "pass"]);
     assert_eq!(json(dir, &["show", &after, "--json"])["body"]["method"], "-m");
