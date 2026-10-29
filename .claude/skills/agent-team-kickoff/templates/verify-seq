@@ -38,6 +38,27 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+# Free space where the runs' worktrees and builds go (process 11f1ac552f26): a warning below 50 GB, and
+# a refusal below 20 GB, since a run that fills the disk fails every agent's build. VERIFY_SEQ_WARN_GB
+# and VERIFY_SEQ_MIN_GB move the limits; VERIFY_SEQ_MIN_GB=0 runs whatever the space.
+warn_gb=${VERIFY_SEQ_WARN_GB:-50}
+min_gb=${VERIFY_SEQ_MIN_GB:-20}
+[[ $warn_gb =~ ^[0-9]+$ && $min_gb =~ ^[0-9]+$ ]] || { echo "verify-seq: VERIFY_SEQ_WARN_GB and VERIFY_SEQ_MIN_GB take whole GB" >&2; exit 2; }
+free_kb=$(df -Pk "${TMPDIR:-/tmp}" | awk 'NR == 2 { print $4 }')
+if [[ $free_kb =~ ^[0-9]+$ ]]; then
+  free_gb=$((free_kb / 1048576))
+  if [ "$free_gb" -lt "$min_gb" ]; then
+    echo "verify-seq: only $free_gb GB free, below $min_gb GB; run scripts/cleanup --apply, or set VERIFY_SEQ_MIN_GB=0 to run anyway" >&2
+    exit 1
+  elif [ "$free_gb" -lt "$warn_gb" ]; then
+    echo "verify-seq: warning: only $free_gb GB free, below $warn_gb GB; scripts/cleanup lists what it can free" >&2
+  fi
+elif [ "$min_gb" -gt 0 ]; then
+  echo "verify-seq: couldn't read the free space (df); set VERIFY_SEQ_MIN_GB=0 to run anyway" >&2
+  exit 1
+fi
+
 [ $# -ge 1 ] || usage
 [ "$jobs" -eq 1 ] || [ ${#table[@]} -eq 2 ] || { echo "verify-seq: -j 2 needs --split: local runs would compete" >&2; exit 2; }
 

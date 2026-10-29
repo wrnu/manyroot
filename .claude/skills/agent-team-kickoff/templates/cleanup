@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# cleanup: frees the disk the team's checkouts and scratch fill (owner process 11f1ac552f26).
+#
+#   cleanup [--apply]
+#
+# A dry run by default: it lists what it would do and why, and changes nothing. --apply acts. It runs
+# unattended (the manager's daily T3 task, and scripts/merge after each merge): no prompts, exit 0 when
+# there's nothing to do or everything it tried worked, 1 if an action failed, and a summary line last.
+#
+# It looks only at:
+#   - this repo's git worktrees under T3's ~/.t3/worktrees/<main checkout's name> or under $TMPDIR:
+#       t3-<id> (delegated children's and the owner's threads') and those under $TMPDIR (review and verify
+#       checkouts) are removed with git worktree remove;
+#       the others under T3's root (builders') have their target/ removed once their branch is merged into
+#       origin/main (not with cargo clean, which also clears a build dir that may be shared);
+#   - the entries of $TMPDIR/bracken-scratch (the team's scratch root, one entry per task), removed.
+# Each action needs what it acts on to be clean (no uncommitted files and no commits only it holds),
+# unused (no process has a file open in it: lsof) and idle for 2 hours. With --apply, a worktree action
+# also needs git fetch --prune origin to work first, so origin/main and the remote branches are current;
+# the dry run fetches nothing and judges by the refs as they stand.
+#
+# It never touches the main checkout, .bracken/, ~/bracken-runs, a worktree holding ignored files under
+# .bracken/ (an identity's key), other repos, or anything outside those places. Each line it prints says
+# what it does or why not; "won't touch" lines (dirty, outside its places) are for the manager's weekly
+# look.
+set -uo pipefail
+
+usage() { echo "usage: cleanup [--apply]" >&2; exit 2; }
+apply=false
+case "${1:-}" in
+  --apply) apply=true ;;
+  "") ;;
+  *) usage ;;
+esac
+[ $# -le 1 ] || usage
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# On its own line: a failing rev-parse inside dirname's argument would leave main as "." (finding
+# 740976a60693), the caller's directory, which may be another repo.
+common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir) && [ -n "$common" ] ||
+  { echo "cleanup: $here isn't in a git checkout; nothing done" >&2; exit 1; }
+real() { (cd "$1" 2>/dev/null && pwd -P); }
+main=$(real "$(dirname "$common")") || exit 1
+cd "$main" || exit 1
+# git status mustn't refresh a worktree's index: that would make every worktree look just used.
+export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0
+min_age=120 # minutes
+now=$(date +%s)
+# T3 names its worktrees folder after the main checkout's: ~/.t3/worktrees/bracken here.
+t3_root=$(real "$HOME/.t3/worktrees/$(basename "$main")") || t3_root=""
+tmp_root=$(real "${TMPDIR:-/tmp}") || tmp_root=""
+runs=$(real "$HOME/bracken-runs") || runs=""
+scratch="${TMPDIR:-/tmp}/bracken-scratch"
+
+acted=0 kept=0 untouched=0 failed=0 freed=0
+
+# $1 is $2 or inside it.
+inside() { [ -n "$2" ] && { [ "$1" = "$2" ] || [[ $1 == "$2"/* ]]; }; }
+# The main checkout, its Ground and ~/bracken-runs, and anything holding them.
+forbidden() {
+  inside "$1" "$main/.bracken" || inside "$1" "$runs" || inside "$runs" "$1" || inside "$main" "$1"
+}
+show() { [[ $1 == "$HOME"/* ]] && echo "~${1#"$HOME"}" || echo "$1"; }
+gb() { awk -v k="$1" 'BEGIN { printf "%.1f GB", k / 1048576 }'; }
+kb() { du -sk "$1" 2>/dev/null | awk '{ k += $1 } END { print k + 0 }'; }
+say() { printf '%-12s %s: %s\n' "$1" "$(show "$2")" "$3"; }
+keep() { kept=$((kept + 1)); say keep "$1" "$2"; }
+untouched() { untouched=$((untouched + 1)); say "won't touch" "$1" "$2"; }
+mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+
+# Every open file of every process this user can see, one "pid path" line each; a process's working
+# directory counts. Without lsof, Linux's /proc says the same. Nothing is in use only if one of them
+# answered: each lists at least its own process. lsof prints a backslash in a name as \\ and other
+# unprintable bytes as escapes, so names are compared in its form (finding 786ebd4a2970).
+escaped=false
+if command -v lsof >/dev/null; then
+  escaped=true
+  open=$(lsof -n -P -w -Fpn 2>/dev/null | awk '/^p/ { p = substr($0, 2) } /^n\// { print p " " substr($0, 2) }')
+elif [ -d /proc/self/fd ]; then
+  open=$(find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%p %l\n' 2>/dev/null |
+    sed -E 's|^/proc/([0-9]+)/[^ ]* |\1 |')
+else
+  open=""
+fi
+plain() { local LC_ALL=C; [[ $1 != *[![:print:]]* ]]; }
+in_use() {
+  local pid d=$1
+  [ -n "$open" ] || { echo "unknown (lsof gave nothing)"; return 0; }
+  # A newline or other unprintable byte can't be matched reliably in either listing: count it in use.
+  plain "$d" || { echo "unknown (its name has unprintable characters)"; return 0; }
+  ! $escaped || d=${d//\\/\\\\}
+  # Through the environment: awk -v would unescape the backslashes.
+  pid=$(D=$d awk '{ n = substr($0, index($0, " ") + 1); d = ENVIRON["D"] }
+    n == d || index(n, d "/") == 1 { print $1; exit }' <<<"$open")
+  [ -n "$pid" ] || return 1
+  echo "pid $pid ($(ps -o comm= -p "$pid" 2>/dev/null | sed 's|.*/||'))"
+}
+
+# Minutes since a worktree was last used: its directory, target/, and its HEAD, index and reflog.
+idle() {
+  local gitdir newest=0 t f
+  gitdir=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)
+  for f in "$1" "$1/target" "$gitdir/HEAD" "$gitdir/index" "$gitdir/logs/HEAD"; do
+    # A symlink's own time says nothing about use, and what it points at may be anyone's.
+    [ ! -L "$f" ] || continue
+    t=$(mtime "$f") || continue
+    [ "${t:-0}" -le "$newest" ] || newest=$t
+  done
+  echo $(((now - newest) / 60))
+}
+
+# The branch's changes are all in origin/main: it has commits of its own, and merging it into origin/main
+# changes nothing (a squash merge leaves it no ancestor of main). A new branch with nothing of its own isn't.
+merged() {
+  local tip tree
+  tip=$(git rev-parse -q --verify "refs/heads/$1^{commit}") || return 1
+  [ -n "$(git rev-list -n 1 "origin/main..$tip")" ] || return 1
+  tree=$(git merge-tree --write-tree origin/main "$tip" 2>/dev/null | head -1) || return 1
+  [ "$tree" = "$(git rev-parse 'origin/main^{tree}')" ]
+}
+
+if $apply; then echo "cleanup: applying"; else echo "cleanup: dry run; nothing changes without --apply"; fi
+
+# Only --apply fetches: a dry run changes no ref (finding 41df1ea1240c).
+fetched=true
+if ! $apply; then
+  echo "cleanup: judging by origin's refs as last fetched; --apply fetches first"
+elif ! git fetch --prune --quiet origin </dev/null >/dev/null 2>&1; then
+  fetched=false
+  echo "cleanup: git fetch --prune origin failed, so no worktree is removed or cleaned this time"
+fi
+
+worktree() {
+  local wt=$1 branch=$2 locked=$3 p name kind n user why size
+  p=$(real "$wt") || { say prune "$wt" "its directory is gone; git worktree prune drops it"; return; }
+  [ "$p" != "$main" ] || return 0
+  kind=""
+  if inside "$p" "$t3_root" && name=${p#"$t3_root"/} && [[ $name != */* ]] && [ "$p" != "$t3_root" ]; then
+    if [[ $name == t3-* ]]; then kind=child; else kind=builder; fi
+  elif inside "$p" "$tmp_root" && [ "$p" != "$tmp_root" ]; then
+    kind=temp
+  fi
+  if [ -z "$kind" ]; then untouched "$p" "outside the places it cleans"; return; fi
+  if forbidden "$p"; then untouched "$p" "holds or is inside the main checkout, .bracken/ or ~/bracken-runs"; return; fi
+  if [ "$locked" = true ]; then untouched "$p" "locked"; return; fi
+  $fetched || { keep "$p" "not checked: git fetch failed"; return; }
+  # A deleted branch leaves HEAD naming no commit, and every file looks staged.
+  if ! git -C "$p" rev-parse -q --verify 'HEAD^{commit}' >/dev/null; then
+    untouched "$p" "its branch is gone: HEAD names no commit (for the manager)"
+    return
+  fi
+  if ! n=$(git -C "$p" status --porcelain 2>/dev/null | wc -l); then untouched "$p" "git status failed"; return; fi
+  if [ "$n" -gt 0 ]; then untouched "$p" "dirty: $((n)) uncommitted files (for the manager)"; return; fi
+  n=$(git -C "$p" log --oneline HEAD --not --branches --remotes 2>/dev/null | wc -l)
+  if [ "$n" -gt 0 ]; then untouched "$p" "$((n)) commits on no branch or remote (for the manager)"; return; fi
+  if [ -n "$(git -C "$p" status --porcelain --ignored -- .bracken 2>/dev/null)" ]; then
+    untouched "$p" "ignored files under .bracken/, perhaps an identity's key (for the manager)"
+    return
+  fi
+  if user=$(in_use "$p"); then keep "$p" "in use by $user"; return; fi
+  n=$(idle "$p")
+  if [ "$n" -lt "$min_age" ]; then keep "$p" "used $n min ago"; return; fi
+
+  if [ "$kind" != builder ]; then
+    why="clean, unused, idle $((n / 60)) h"
+    [ "$kind" = child ] && why="T3 worktree, $why" || why="scratch checkout, $why"
+    size=$(kb "$p")
+    say remove "$p" "$why ($(gb "$size"))"
+    acted=$((acted + 1))
+    $apply || { freed=$((freed + size)); return; }
+    if git worktree remove "$p" </dev/null 2>&1 | sed 's/^/  /'; then
+      freed=$((freed + size))
+    else
+      failed=$((failed + 1))
+      say failed "$p" "git worktree remove refused it"
+    fi
+    return
+  fi
+  if [ -z "$branch" ]; then keep "$p" "builder's worktree on no branch"; return; fi
+  if ! merged "$branch"; then keep "$p" "branch $branch isn't merged into origin/main"; return; fi
+  # The worktree's own target/, removed directly: cargo clean follows CARGO_TARGET_DIR, build.target-dir
+  # and build.build-dir, any of which may be shared (findings 1fac2c0f426c, a3cb4a1ac00d).
+  if [ -L "$p/target" ]; then untouched "$p" "target/ is a symlink; not followed"; return; fi
+  if [ ! -d "$p/target" ]; then keep "$p" "branch $branch is merged; no target/ to clean"; return; fi
+  if [ "$(real "$p/target")" != "$p/target" ]; then untouched "$p" "target/ resolves outside it"; return; fi
+  if [ ! -f "$p/Cargo.toml" ]; then untouched "$p" "has target/ but no Cargo.toml"; return; fi
+  size=$(kb "$p/target")
+  say "clean" "$p" "remove target/: branch $branch is merged into origin/main, nothing running, idle $((n / 60)) h ($(gb "$size"))"
+  acted=$((acted + 1))
+  $apply || { freed=$((freed + size)); return; }
+  if rm -rf -- "$p/target"; then
+    freed=$((freed + size))
+  else
+    failed=$((failed + 1))
+    freed=$((freed + size - $(kb "$p/target")))
+    say failed "$p" "couldn't remove all of target/"
+  fi
+}
+
+# git worktree list --porcelain: a block per worktree, "worktree <path>" first, then "branch refs/heads/<b>"
+# or "detached", and "locked" or "prunable" when they apply.
+wt="" branch="" locked=false
+while IFS= read -r line <&3; do
+  case $line in
+    "worktree "*)
+      [ -z "$wt" ] || worktree "$wt" "$branch" "$locked"
+      wt=${line#worktree } branch="" locked=false ;;
+    "branch refs/heads/"*) branch=${line#branch refs/heads/} ;;
+    locked | "locked "*) locked=true ;;
+  esac
+done 3< <(git worktree list --porcelain)
+[ -z "$wt" ] || worktree "$wt" "$branch" "$locked"
+! $apply || git worktree prune
+
+# The scratch root's entries. A checkout of this repo there was handled above; any other git checkout
+# is left alone, since only git worktree remove (or its owner) should take it.
+if [ -L "$scratch" ]; then
+  untouched "$scratch" "a symlink; the scratch root must be a directory"
+elif [ -d "$scratch" ]; then
+  root=$(real "$scratch")
+  for e in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+    [ -e "$e" ] || [ -L "$e" ] || continue
+    if forbidden "$e"; then untouched "$e" "holds .bracken/ or ~/bracken-runs"; continue; fi
+    if [ -n "$(find "$e" -name .git -print 2>/dev/null | head -1)" ]; then
+      untouched "$e" "holds a git checkout; remove it with git worktree remove (for the manager)"
+      continue
+    fi
+    if user=$(in_use "$e"); then keep "$e" "in use by $user"; continue; fi
+    if [ -n "$(find "$e" -mmin -"$min_age" -print 2>/dev/null | head -1)" ]; then
+      keep "$e" "changed in the last $((min_age / 60)) h"
+      continue
+    fi
+    size=$(kb "$e")
+    say clear "$e" "scratch, unused, unchanged for $((min_age / 60)) h ($(gb "${size:-0}"))"
+    acted=$((acted + 1))
+    $apply || { freed=$((freed + ${size:-0})); continue; }
+    if rm -rf -- "$e"; then
+      freed=$((freed + ${size:-0}))
+    else
+      failed=$((failed + 1))
+      say failed "$e" "couldn't remove all of it"
+    fi
+  done
+fi
+
+free=$(df -Pk "$main" | awk 'NR == 2 { print $4 }')
+if [ "$acted" = 0 ]; then
+  summary="nothing to do"
+elif $apply; then
+  summary="$acted done, freed $(gb "$freed")"
+else
+  summary="$acted to do with --apply, freeing about $(gb "$freed")"
+fi
+[ "$failed" = 0 ] || summary="$summary; $failed failed"
+echo "cleanup: $summary; $kept kept, $untouched won't touch; $(gb "${free:-0}") free"
+[ "$failed" = 0 ]

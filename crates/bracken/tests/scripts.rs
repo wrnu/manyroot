@@ -20,7 +20,10 @@ fn command(dir: &Path, program: &str, args: &[&str]) -> Command {
         .env("BRACKEN_BIN", dir.join("../bracken"))
         .env("REAL_BRACKEN", env!("CARGO_BIN_EXE_bracken"))
         .env_remove("BRACKEN_DIR")
-        .env_remove("BRACKEN_AGENT");
+        .env_remove("BRACKEN_AGENT")
+        // verify-seq's free-space floor would make these tests depend on the machine's disk.
+        .env("VERIFY_SEQ_MIN_GB", "0")
+        .env_remove("VERIFY_SEQ_WARN_GB");
     command
 }
 
@@ -2273,5 +2276,228 @@ fn verify_seq_interrupted(term: bool) {
         assert_eq!(evidence, "[]", "{scripts}: recorded evidence for an interrupted run: {text}");
         let worktrees = git(&["worktree", "list"]);
         assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
+    }
+}
+
+/// Sets the modification time of `path` and everything under it, not following symlinks.
+fn set_mtimes(path: &Path, when: std::time::SystemTime) {
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    if meta.is_symlink() {
+        return;
+    }
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            set_mtimes(&entry.unwrap().path(), when);
+        }
+    }
+    std::fs::File::open(path).unwrap().set_modified(when).unwrap();
+}
+
+/// cleanup (owner process 11f1ac552f26) on stubbed worktrees, with HOME and TMPDIR throwaway directories
+/// and a stub cargo that logs any call. Of this repo's worktrees, it removes only the clean, unused ones
+/// idle 2 hours under T3's root (t3-<id>) or TMPDIR, and removes target/ only in a builder's worktree
+/// whose branch is squash-merged into origin/main; it clears only idle scratch entries. A dirty, in-use,
+/// young, unmerged, key-holding or outside worktree stays, each with its reason. The dry run changes
+/// nothing, and both runs end with a summary and exit 0.
+#[test]
+fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_run_changes_nothing() {
+    for scripts in SCRIPTS {
+        let cleanup = repo_root().join(scripts).join("cleanup");
+        let (tmp, dir) = repo(&[("scripts/cleanup", &cleanup)], ".bracken/\n/target\n", |dir| {
+            std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        });
+        let t = tmp.path();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = run(dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let origin = t.join("origin.git");
+        git(t, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "-u", "origin", "main"]);
+
+        let (home, tmpdir) = (t.join("home"), t.join("tmpdir"));
+        let t3 = home.join(".t3/worktrees/repo");
+        let scratch = tmpdir.join("bracken-scratch");
+        std::fs::create_dir_all(home.join("bracken-runs/run1")).unwrap();
+        let add = |path: &Path, branch: Option<&str>| {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let path = path.to_str().unwrap();
+            match branch {
+                Some(b) => git(&dir, &["worktree", "add", "-q", "-b", b, path]),
+                None => git(&dir, &["worktree", "add", "-q", "--detach", path]),
+            }
+        };
+        let commit = |path: &Path, file: &str| {
+            std::fs::write(path.join(file), file).unwrap();
+            git(path, &["add", file]);
+            git(path, &["commit", "-qm", file]);
+        };
+        for name in ["t3-clean", "t3-dirty", "t3-busy", "t3-key"] {
+            add(&t3.join(name), None);
+        }
+        std::fs::write(t3.join("t3-dirty/wip"), "work").unwrap();
+        std::fs::create_dir_all(t3.join("t3-key/.bracken/identities")).unwrap();
+        std::fs::write(t3.join("t3-key/.bracken/identities/k"), "key").unwrap();
+        for branch in ["merged", "unmerged", "linked"] {
+            add(&t3.join(branch), Some(branch));
+            commit(&t3.join(branch), branch);
+        }
+        for branch in ["merged", "unmerged"] {
+            std::fs::create_dir_all(t3.join(branch).join("target/debug")).unwrap();
+            std::fs::write(t3.join(branch).join("target/debug/big"), "build").unwrap();
+        }
+        // A shared build dir behind a symlinked target/: never followed (finding a3cb4a1ac00d).
+        let shared = t.join("shared-target");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("other-build"), "build").unwrap();
+        std::os::unix::fs::symlink(&shared, t3.join("linked/target")).unwrap();
+        // The forge squash-merges "merged" and "linked": main gets their changes, not their commits.
+        for branch in ["merged", "linked"] {
+            git(&dir, &["merge", "-q", "--squash", branch]);
+            git(&dir, &["commit", "-qm", &format!("{branch} (#1)")]);
+        }
+        git(&dir, &["push", "-q", "origin", "main"]);
+        add(&scratch.join("task1/tree"), None);
+        add(&t.join("elsewhere/tree"), None);
+        // In use, with a backslash in its name, which awk -v would have unescaped (finding 786ebd4a2970).
+        add(&tmpdir.join("b\\s"), None);
+        // On origin only: the dry run mustn't fetch it (finding 41df1ea1240c).
+        git(&origin, &["branch", "extra", "main"]);
+        std::fs::create_dir_all(scratch.join("old/deep")).unwrap();
+        std::fs::write(scratch.join("old/deep/file"), "x").unwrap();
+
+        // Everything so far was last used 3 hours ago; what follows is new.
+        set_mtimes(t, std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 3600));
+        add(&t3.join("t3-young"), None);
+        std::fs::create_dir_all(scratch.join("new")).unwrap();
+        std::fs::write(scratch.join("new/file"), "x").unwrap();
+
+        let stubs = t.join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(&stubs.join("cargo"), "#!/bin/sh\necho \"$PWD|$*\" >>\"$LOG\"\n");
+        let log = t.join("cargo.log");
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let busy = t3.join("t3-busy");
+        let mut sleeper = Command::new("sleep").arg("120").current_dir(&busy).spawn().unwrap();
+        let mut slashed = Command::new("sleep").arg("120").current_dir(tmpdir.join("b\\s")).spawn().unwrap();
+        let refs = || String::from_utf8(run(&dir, "git", &["for-each-ref"]).stdout).unwrap();
+        let refs_before = refs();
+        let cleanup = |args: &[&str]| {
+            let out = command(&dir, "scripts/cleanup", args)
+                .env("HOME", &home)
+                .env("TMPDIR", &tmpdir)
+                .env("PATH", &path)
+                .env("LOG", &log)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(out.status.success(), "{scripts}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+            stdout
+        };
+        let line = |out: &str, path: &str| {
+            out.lines()
+                .find(|l| l.contains(&format!("{path}:")))
+                .unwrap_or_else(|| panic!("{scripts}: no line for {path}: {out}"))
+                .to_owned()
+        };
+        let worktrees = || String::from_utf8(run(&dir, "git", &["worktree", "list"]).stdout).unwrap();
+        let before = worktrees();
+
+        let dry = cleanup(&[]);
+        let expect = [
+            ("/t3-clean", "remove"),
+            ("/task1/tree", "remove"),
+            ("/merged", "clean"),
+            ("/linked", "won't touch"),
+            ("bracken-scratch/old", "clear"),
+            ("/t3-dirty", "won't touch"),
+            ("/t3-key", "won't touch"),
+            ("elsewhere/tree", "won't touch"),
+            ("/t3-busy", "keep"),
+            ("b\\s", "keep"),
+            ("/t3-young", "keep"),
+            ("/unmerged", "keep"),
+            ("bracken-scratch/new", "keep"),
+        ];
+        for (path, verb) in expect {
+            assert!(line(&dry, path).starts_with(verb), "{scripts}: {path} should be {verb}: {dry}");
+        }
+        assert!(line(&dry, "/t3-dirty").contains("dirty"), "{scripts}: {dry}");
+        assert!(line(&dry, "/t3-busy").contains("in use by pid"), "{scripts}: {dry}");
+        assert!(line(&dry, "/unmerged").contains("isn't merged"), "{scripts}: {dry}");
+        assert!(line(&dry, "elsewhere/tree").contains("outside"), "{scripts}: {dry}");
+        assert!(dry.lines().last().unwrap().contains("4 to do with --apply"), "{scripts}: {dry}");
+        assert_eq!(worktrees(), before, "{scripts}: the dry run changed the worktrees");
+        assert!(!log.exists(), "{scripts}: the dry run ran cargo");
+        assert_eq!(refs(), refs_before, "{scripts}: the dry run changed the refs");
+        assert!(line(&dry, "b\\s").contains("in use by pid"), "{scripts}: {dry}");
+        assert!(scratch.join("old/deep/file").exists() && t3.join("t3-clean").exists(), "{scripts}");
+
+        let applied = cleanup(&["--apply"]);
+        for s in [&mut sleeper, &mut slashed] {
+            s.kill().unwrap();
+            s.wait().unwrap();
+        }
+        assert!(refs().contains("refs/remotes/origin/extra"), "{scripts}: --apply didn't fetch");
+        assert!(applied.lines().last().unwrap().contains("4 done"), "{scripts}: {applied}");
+        let after = worktrees();
+        for gone in ["t3-clean", "task1/tree"] {
+            assert!(!after.contains(gone), "{scripts}: {gone} is still a worktree: {after}");
+        }
+        assert!(!t3.join("t3-clean").exists() && !scratch.join("old").exists(), "{scripts}: {applied}");
+        for stays in ["t3-dirty", "t3-busy", "t3-key", "t3-young", "/merged", "unmerged", "/linked", "elsewhere/tree"] {
+            assert!(after.contains(stays), "{scripts}: {stays} was removed: {applied}");
+        }
+        // git worktree list quotes a backslash, so look for the directory itself.
+        assert!(line(&applied, "b\\s").starts_with("keep") && tmpdir.join("b\\s/Cargo.toml").exists(), "{scripts}");
+        assert!(t3.join("t3-dirty/wip").exists() && t3.join("t3-key/.bracken/identities/k").exists());
+        assert!(scratch.join("new/file").exists() && home.join("bracken-runs/run1").exists(), "{scripts}");
+        // target/ is removed directly, never through cargo, and a symlinked one isn't followed.
+        assert!(!log.exists(), "{scripts}: cargo ran: {applied}");
+        assert!(!t3.join("merged/target").exists() && t3.join("unmerged/target/debug/big").exists(), "{scripts}");
+        assert!(line(&applied, "/linked").contains("symlink") && shared.join("other-build").exists(), "{scripts}");
+    }
+}
+
+/// verify-seq checks the free space before any run: below VERIFY_SEQ_MIN_GB it refuses, and below
+/// VERIFY_SEQ_WARN_GB it warns and carries on (here to its usage, given no heads).
+#[test]
+fn verify_seq_refuses_below_the_free_space_floor_and_warns_below_the_warning() {
+    for scripts in SCRIPTS {
+        let seq = repo_root().join(scripts).join("verify-seq");
+        let (_tmp, dir) = repo(&[("scripts/verify-seq", &seq)], ".bracken/\n", |_| {});
+        let huge = "999999999";
+        let out = command(&dir, "scripts/verify-seq", &["abc123:0"]).env("VERIFY_SEQ_MIN_GB", huge).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(stderr.contains("GB free, below 999999999 GB") && stderr.contains("cleanup"), "{scripts}: {stderr}");
+        let out = command(&dir, "scripts/verify-seq", &[])
+            .env("VERIFY_SEQ_MIN_GB", "0")
+            .env("VERIFY_SEQ_WARN_GB", huge)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{scripts}: {stderr}");
+        assert!(stderr.contains("warning: only") && stderr.contains("usage"), "{scripts}: {stderr}");
+    }
+}
+
+/// Finding 740976a60693: a copy of cleanup outside any git checkout, run from inside another repo, refuses
+/// at once instead of taking the caller's directory for its main checkout.
+#[test]
+fn cleanup_outside_a_checkout_refuses_rather_than_cleaning_the_callers_repo() {
+    for scripts in SCRIPTS {
+        let (tmp, dir) = repo(&[], ".bracken/\n", |_| {});
+        let loose = tmp.path().join("loose");
+        std::fs::create_dir_all(&loose).unwrap();
+        std::fs::copy(repo_root().join(scripts).join("cleanup"), loose.join("cleanup")).unwrap();
+        let out = command(&dir, loose.join("cleanup").to_str().unwrap(), &[])
+            .env("GIT_CEILING_DIRECTORIES", tmp.path())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(out.stdout.is_empty() && stderr.contains("isn't in a git checkout"), "{scripts}: {stderr}");
     }
 }
