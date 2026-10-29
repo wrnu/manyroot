@@ -21,6 +21,7 @@ mod listing;
 mod remote;
 mod serve;
 mod terminal;
+mod view;
 mod wire;
 
 /// `println!`, through [`write_stdout`]. Shadows the standard macro in this file.
@@ -270,6 +271,15 @@ enum Command {
         #[command(flatten)]
         bounds: BoundsArgs,
     },
+    /// Serve a read-only web view of this replica on 127.0.0.1, with its JSON API, until stopped.
+    View {
+        /// Port on 127.0.0.1; 0 picks a free one. The URL is printed on stdout.
+        #[arg(long, default_value_t = 0)]
+        port: u16,
+        /// The policy every status in the view is under.
+        #[command(flatten)]
+        policy: PolicyArgs,
+    },
     /// Write every contribution to a bundle file ("-" for stdout).
     Export { file: PathBuf },
     /// Import contributions from a bundle file ("-" for stdin).
@@ -501,16 +511,12 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let policy = policy.build(&names)?;
             let g = s.graph();
             let c = g.get(&resolve(&s, &id)?).expect("resolved ids exist");
-            let assessment = policy.assess(g, &c.id());
-            let referrers: Vec<&Contribution> = g.referrers(&c.id()).collect();
-            let intents = live_intents(g, &CurrentView::new(g, &g.topo_order()), &c.id(), now_ms());
             if out.json {
-                let mut v = contribution_json(g, &names, c);
-                v["assessment"] = json!(assessment);
-                v["referrers"] = referrers.iter().map(|r| contribution_json(g, &names, r)).collect();
-                v["intents"] = intents.iter().map(|i| intent_json(g, &names, i, now_ms())).collect();
-                print_json(&v);
+                print_json(&show_json(g, &names, &policy, c, now_ms()));
             } else {
+                let assessment = policy.assess(g, &c.id());
+                let referrers: Vec<&Contribution> = g.referrers(&c.id()).collect();
+                let intents = live_intents(g, &CurrentView::new(g, &g.topo_order()), &c.id(), now_ms());
                 print_show(g, &names, c, assessment.as_ref(), &referrers);
                 if !intents.is_empty() {
                     println!();
@@ -553,20 +559,10 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let names = Names::load(&s)?;
             let policy = policy.build(&names)?;
             let g = s.graph();
-            let e = policy.evaluate(g);
             if out.json {
-                let accepted: Vec<Value> = e
-                    .accepted
-                    .iter()
-                    .map(|a| {
-                        let mut v = contribution_json(g, &names, g.get(&a.id).expect("assessed ids exist"));
-                        v["assessment"] = json!(a);
-                        v
-                    })
-                    .collect();
-                let conflicts: Vec<Value> = e.conflicts.iter().map(|c| json!(c)).collect();
-                print_json(&json!({"accepted": accepted, "conflicts": conflicts}));
+                print_json(&accepted_json(g, &names, &policy));
             } else {
+                let e = policy.evaluate(g);
                 if e.accepted.is_empty() {
                     println!("nothing is accepted under this policy");
                 }
@@ -580,6 +576,11 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             }
         }
         Command::Status { all, policy, out } => print_status(&s, all, &policy, out.json)?,
+        Command::View { port, policy } => {
+            // Validators by name from the public agent directory: the view never reads identities.
+            let policy = policy.build(&view::public_names(&s)?)?;
+            view::serve(s.dir(), policy, port)?;
+        }
         Command::Intend { id, duration } => {
             let who = signer(&s, agent)?;
             let target = resolve(&s, &id)?;
@@ -833,13 +834,14 @@ fn own_claim(s: &Store, names: &Names, who: &Identity, prefix: &str) -> Result<C
 /// `all`, then the current claims with neither. A contribution implements a claim through a current
 /// `implements` relation from it to the claim, whoever wrote the relation, and whatever kind of
 /// contribution it is.
-fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Result<()> {
-    let names = Names::load(s)?;
-    let policy = policy.build(&names)?;
-    let g = s.graph();
+/// Each claim `status` lists, with what implements it and its live intents.
+type StatusRow<'a> = (&'a Contribution, Vec<(&'a Contribution, Assessment)>, Vec<Intent<'a>>);
+
+/// What `status` lists: the claims something implements or intends to, those with something waiting
+/// first, and (with `all`) the current claims nothing implements.
+fn status_rows<'a>(g: &'a Graph, policy: &Policy, all: bool, now: u64) -> (Vec<StatusRow<'a>>, Vec<&'a Contribution>) {
     let order = g.topo_order();
     let view = CurrentView::new(g, &order);
-    let now = now_ms();
     let rank = |status: Status| match status {
         Status::Pending => 0,
         Status::Accepted => 1,
@@ -847,9 +849,7 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
         Status::Rejected => 3,
         Status::Retracted => 4,
     };
-    // Each claim, with what implements it and its live intents.
-    type Row<'a> = (&'a Contribution, Vec<(&'a Contribution, Assessment)>, Vec<Intent<'a>>);
-    let mut implemented: Vec<Row> = Vec::new();
+    let mut implemented: Vec<StatusRow> = Vec::new();
     let mut unimplemented: Vec<&Contribution> = Vec::new();
     for id in &order {
         let c = g.get(id).expect("ordered ids exist");
@@ -883,34 +883,50 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
     }
     // Claims with something waiting first; otherwise in causal order (the sort is stable).
     implemented.sort_by_key(|(_, rows, _)| rows.iter().all(|(_, a)| a.status != Status::Pending));
+    (implemented, unimplemented)
+}
 
-    let age_ms = |c: &Contribution| now.saturating_sub(c.content().timestamp_ms);
-    // Distinct validators with a counted pass, as the policy counts them: one validator passing twice is one.
-    let independent =
-        |a: &Assessment| a.passes.iter().filter_map(|e| g.get(e)).map(|e| e.author()).collect::<HashSet<_>>().len();
+/// Distinct validators with a counted pass, as the policy counts them: one validator passing twice is one.
+fn independent_passes(g: &Graph, a: &Assessment) -> usize {
+    a.passes.iter().filter_map(|e| g.get(e)).map(|e| e.author()).collect::<HashSet<_>>().len()
+}
+
+/// `status --json`.
+fn status_json(g: &Graph, names: &Names, policy: &Policy, all: bool, now: u64) -> Value {
+    let (implemented, unimplemented) = status_rows(g, policy, all, now);
+    let claims: Vec<Value> = implemented
+        .iter()
+        .map(|(c, rows, intents)| {
+            let by: Vec<Value> = rows
+                .iter()
+                .map(|(i, a)| {
+                    let mut v = contribution_json(g, names, i);
+                    v["assessment"] = json!(a);
+                    v["waiting"] = json!(a.status == Status::Pending);
+                    v["independent_passes"] = json!(independent_passes(g, a));
+                    v["age_ms"] = json!(now.saturating_sub(i.content().timestamp_ms));
+                    v
+                })
+                .collect();
+            let intents: Vec<Value> = intents.iter().map(|i| intent_json(g, names, i, now)).collect();
+            json!({"claim": contribution_json(g, names, c), "implemented_by": by, "intents": intents})
+        })
+        .collect();
+    let unimplemented: Vec<Value> = unimplemented.iter().map(|c| contribution_json(g, names, c)).collect();
+    json!({"min_passes": policy.min_passes, "claims": claims, "unimplemented": unimplemented})
+}
+
+fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Result<()> {
+    let names = Names::load(s)?;
+    let policy = policy.build(&names)?;
+    let g = s.graph();
+    let now = now_ms();
     if json_out {
-        let claims: Vec<Value> = implemented
-            .iter()
-            .map(|(c, rows, intents)| {
-                let by: Vec<Value> = rows
-                    .iter()
-                    .map(|(i, a)| {
-                        let mut v = contribution_json(g, &names, i);
-                        v["assessment"] = json!(a);
-                        v["waiting"] = json!(a.status == Status::Pending);
-                        v["independent_passes"] = json!(independent(a));
-                        v["age_ms"] = json!(age_ms(i));
-                        v
-                    })
-                    .collect();
-                let intents: Vec<Value> = intents.iter().map(|i| intent_json(g, &names, i, now)).collect();
-                json!({"claim": contribution_json(g, &names, c), "implemented_by": by, "intents": intents})
-            })
-            .collect();
-        let unimplemented: Vec<Value> = unimplemented.iter().map(|c| contribution_json(g, &names, c)).collect();
-        print_json(&json!({"min_passes": policy.min_passes, "claims": claims, "unimplemented": unimplemented}));
+        print_json(&status_json(g, &names, &policy, all, now));
         return Ok(());
     }
+    let (implemented, unimplemented) = status_rows(g, &policy, all, now);
+    let age_ms = |c: &Contribution| now.saturating_sub(c.content().timestamp_ms);
     if implemented.is_empty() {
         println!("no current claim is implemented by anything, or has a live intent");
     }
@@ -937,7 +953,7 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
                 i.body().kind(),
                 names.display(&i.author()),
                 age(age_ms(i)),
-                independent(a),
+                independent_passes(g, a),
                 policy.min_passes,
                 summary(g, i)
             );
@@ -1284,6 +1300,32 @@ fn contribution_json(g: &Graph, names: &Names, c: &Contribution) -> Value {
         "retracted": g.is_retracted(&c.id()),
         "body": body_json(c.body()),
     })
+}
+
+/// `show --json`: the contribution, its assessment, everything referring to it, and its live intents.
+fn show_json(g: &Graph, names: &Names, policy: &Policy, c: &Contribution, now: u64) -> Value {
+    let mut v = contribution_json(g, names, c);
+    v["assessment"] = json!(policy.assess(g, &c.id()));
+    v["referrers"] = g.referrers(&c.id()).map(|r| contribution_json(g, names, r)).collect();
+    let intents = live_intents(g, &CurrentView::new(g, &g.topo_order()), &c.id(), now);
+    v["intents"] = intents.iter().map(|i| intent_json(g, names, i, now)).collect();
+    v
+}
+
+/// `accepted --json`: the accepted layer under `policy`, and its conflicts.
+fn accepted_json(g: &Graph, names: &Names, policy: &Policy) -> Value {
+    let e = policy.evaluate(g);
+    let accepted: Vec<Value> = e
+        .accepted
+        .iter()
+        .map(|a| {
+            let mut v = contribution_json(g, names, g.get(&a.id).expect("assessed ids exist"));
+            v["assessment"] = json!(a);
+            v
+        })
+        .collect();
+    let conflicts: Vec<Value> = e.conflicts.iter().map(|c| json!(c)).collect();
+    json!({"accepted": accepted, "conflicts": conflicts})
 }
 
 fn print_show(

@@ -465,7 +465,7 @@ pub fn serve_http(intake: Intake, tokens: Tokens, port: u16) -> Result<()> {
 /// Closes a connection after its response without losing the response: closing a socket with
 /// unread input (a pipelined request, an unread body) resets it, and the peer may then drop the
 /// response. So this half-closes, and discards a bounded amount of input first.
-fn linger(stream: &TcpStream) {
+pub fn linger(stream: &TcpStream) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
     let mut input = Timed::new(stream, Instant::now() + Duration::from_secs(1), None);
     let _ = io::copy(&mut (&mut input).take(1 << 20), &mut io::sink());
@@ -500,11 +500,12 @@ fn respond(stream: &TcpStream, response: Result<Reply, Refused>) -> io::Result<(
     stream.flush()
 }
 
-fn reason_phrase(status: u16) -> &'static str {
+pub fn reason_phrase(status: u16) -> &'static str {
     match status {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         408 => "Request Timeout",
