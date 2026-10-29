@@ -96,8 +96,10 @@ bracken import ground.mrb            # add a bundle to an existing replica
 claim tagged `intent` and `until:<RFC 3339 time>`, related to the contribution it's about by a
 `refines` relation from the same author; `bracken intend <id> [--for 1h]` writes both. `status`
 and `show` list an intent as live until it expires, its author retracts it, or its author relates
-something that `implements` the contribution. Like every timestamp, the expiry is advisory: it's
-the author's clock, so readers treat it as a hint, not a lock.
+something that `implements` the contribution. Retracting that relation makes the intent live again.
+A claim tagged `intent` without an expiry, or without a `refines` relation from its author, is an
+ordinary claim. Like every timestamp, the expiry is advisory: it's the author's clock, so readers
+treat it as a hint, not a lock.
 
 The protocol is specified in [docs/protocol.md](docs/protocol.md). The long-term vision, principles
 and roadmap are in [docs/vision.md](docs/vision.md).

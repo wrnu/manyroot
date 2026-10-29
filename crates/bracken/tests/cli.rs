@@ -1001,7 +1001,7 @@ fn intents_show_who_is_working_on_a_claim_until_they_expire_or_deliver() {
     let v = json(dir, &["status", "--all", "--json"]);
     let unimplemented: Vec<&str> =
         v["unimplemented"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
-    for i in [&alice, &old, &mallory] {
+    for i in [&alice, &old] {
         assert!(!unimplemented.contains(&i.as_str()), "intent {i} listed as a claim: {unimplemented:?}");
     }
 
@@ -1009,6 +1009,64 @@ fn intents_show_who_is_working_on_a_claim_until_they_expire_or_deliver() {
     let log = bracken(dir, &["log", "--json"]);
     assert!(bracken_fails(dir, &["intend", "ffffffffffff", "--as", "alice"]).contains("no matching contribution"));
     assert!(bracken_fails(dir, &["intend", &spec, "--for", "soon", "--as", "alice"]).contains("soon"));
+    assert_eq!(bracken(dir, &["log", "--json"]), log, "a failed intend wrote something");
+}
+
+/// Delivery ends an intent through the author's own implements relation: retracting that relation makes
+/// the intent live again, but someone else retracting the contribution it relates doesn't. A claim tagged
+/// `intent` without an expiry, or without a refines relation by its author, is an ordinary claim. An
+/// expiry past what RFC 3339 can write is an error that writes nothing.
+#[test]
+fn delivery_and_intent_shape_are_the_authors_own() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "intent"]);
+    for who in ["alice", "bob", "carol", "dave", "erin", "frank"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let spec = bracken(dir, &["claim", "spec: parse dates", "--as", "alice"]);
+    let live = |dir: &Path| -> Vec<String> {
+        let shown = json(dir, &["show", &spec, "--json"]);
+        shown["intents"].as_array().unwrap().iter().map(|i| i["author_name"].as_str().unwrap().to_owned()).collect()
+    };
+    std::fs::write(dir.join("f"), "x").unwrap();
+
+    // bob delivers bob's own artifact, then retracts the delivery: live again.
+    bracken(dir, &["intend", &spec, "--as", "bob"]);
+    let art = bracken(dir, &["artifact", "f", "--name", "bob.rs", "--as", "bob"]);
+    let delivery = bracken(dir, &["relate", &art, "implements", &spec, "--as", "bob"]);
+    assert_eq!(live(dir), Vec::<String>::new());
+    bracken(dir, &["retract", &delivery, "--as", "bob"]);
+    assert_eq!(live(dir), ["bob"]);
+
+    // carol delivers dave's artifact; dave retracting it doesn't revive carol's intent.
+    bracken(dir, &["intend", &spec, "--as", "carol"]);
+    let daves = bracken(dir, &["artifact", "f", "--name", "dave.rs", "--as", "dave"]);
+    bracken(dir, &["relate", &daves, "implements", &spec, "--as", "carol"]);
+    bracken(dir, &["retract", &daves, "--as", "dave"]);
+    assert_eq!(live(dir), ["bob"], "someone else's retraction revived carol's intent");
+    let text = bracken(dir, &["status"]);
+    assert!(text.lines().filter(|l| l.trim_start().starts_with("intent")).count() == 1, "{text}");
+
+    // Tagged intent but not an intent: no expiry; an expiry but no refines; refines by someone else.
+    let no_until = bracken(dir, &["claim", "intent: someday", "--tag", "intent", "--as", "erin"]);
+    bracken(dir, &["relate", &no_until, "refines", &spec, "--as", "erin"]);
+    let until = "until:2999-01-01T00:00:00Z";
+    let no_refines = bracken(dir, &["claim", "intent: alone", "--tag", "intent", "--tag", until, "--as", "erin"]);
+    let others = bracken(dir, &["claim", "intent: theirs", "--tag", "intent", "--tag", until, "--as", "frank"]);
+    bracken(dir, &["relate", &others, "refines", &spec, "--as", "erin"]);
+    let v = json(dir, &["status", "--all", "--json"]);
+    let unimplemented: Vec<&str> =
+        v["unimplemented"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    for c in [&no_until, &no_refines, &others] {
+        assert!(unimplemented.contains(&c.as_str()), "{c} hidden as an intent: {v}");
+    }
+    assert_eq!(live(dir), ["bob"]);
+
+    // Past the year 9999: an error, not a panic, and nothing written.
+    let log = bracken(dir, &["log", "--json"]);
+    let err = bracken_fails(dir, &["intend", &spec, "--for", "9000y", "--as", "alice"]);
+    assert!(err.contains("year 9999") && !err.contains("panicked"), "{err}");
     assert_eq!(bracken(dir, &["log", "--json"]), log, "a failed intend wrote something");
 }
 
