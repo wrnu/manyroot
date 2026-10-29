@@ -74,12 +74,16 @@ remote() {
   # In the box: the tools it lacks, HEAD checked out with origin/main beside it, then this script.
   # It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
   # programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both.
-  # The git-core PPA has the current git.
+  # The git-core PPA has the current git. Their output shows only if they fail.
   # shellcheck disable=SC2016 # expanded in the box
   local inner='set -eu
 sudo=; [ "$(id -u)" -eq 0 ] || sudo=sudo
-$sudo add-apt-repository -y ppa:git-core/ppa >/dev/null 2>&1
-$sudo apt-get install -y -qq git b3sum >/dev/null 2>&1
+setup() {
+  log=$(mktemp)
+  "$@" >"$log" 2>&1 || { rc=$?; echo "test-table: box setup failed (exit $rc): $*" >&2; cat "$log" >&2; exit "$rc"; }
+}
+setup $sudo add-apt-repository -y ppa:git-core/ppa
+setup $sudo apt-get install -y -qq git b3sum
 git init -q tree
 cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
