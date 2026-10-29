@@ -5,6 +5,8 @@
 #   team-server setup <dir> [port]   once: make <dir> (outside the repo) and a server replica in it
 #   team-server token <identity>     issue, or replace, an identity's token (restarts a running server)
 #   team-server start | stop
+#   team-server run                  the server in the foreground, for launchd (scripts/services)
+#   team-server check                wait until the server listens and answers a sync
 #
 # <dir> holds everything, mode 0700: the server's own replica (ground/), the tokens (tokens/<identity>,
 # 0600, one per identity, which scripts/bk reads), their blake3 hashes (tokens.b3, which the server
@@ -17,6 +19,10 @@
 # listening and has answered a sync of the main checkout's replica. Nothing else writes its replica:
 # scripts/bk writes the main checkout's and syncs. A token is written once, to its 0600 file;
 # it's never printed, never in argv, and never in the Ground. Needs b3sum (cargo install --locked b3sum).
+#
+# Once scripts/services install has made the server a launchd agent, launchd keeps it running: start
+# and stop refuse (stopping it would only restart it; scripts/services uninstall stops it), and token
+# restarts it through launchd.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -24,7 +30,16 @@ main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-d
 bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
 marker="$main/.bracken-team"
 fail() { echo "team-server: $*" >&2; exit 1; }
-usage() { echo "usage: team-server setup <dir> [port] | token <identity> | start | stop" >&2; exit 2; }
+usage() { echo "usage: team-server setup <dir> [port] | token <identity> | start | stop | run | check" >&2; exit 2; }
+# The launchd agent scripts/services installs, and whether it is loaded for this checkout (its working
+# directory is the main checkout; another repository's agent, or a test's, isn't this one).
+label=jx.rs.bracken.team-server
+managed() {
+  command -v launchctl >/dev/null || return 1
+  launchctl print "gui/$(id -u)/$label" 2>/dev/null | awk -v want="$main" '
+    { sub(/^[ \t]+/, "") } index($0, "working directory = ") == 1 && substr($0, 21) == want { found = 1 }
+    END { exit !found }'
+}
 [ -x "$bin" ] || fail "no bracken at $bin"
 
 team_dir() {
@@ -44,37 +59,53 @@ running_pid() {
 # The identities the main checkout's Ground knows, as JSON.
 identities() { BRACKEN_DIR="$main/.bracken" "$bin" id list --json; }
 
-# Starts the server, and returns once it is listening and has answered a sync.
-start_server() {
-  local url known size tokens pid err
+# The serve command in $serve, its allowlist written, its URL in $url.
+prepare() {
+  local known
   [ -s "$dir/tokens.b3" ] || fail "no tokens yet: team-server token <identity>"
   url=$(cat "$dir/url")
   # Every identity the main checkout knows may push; contributions are signed, so this is who
   # may author, not who may connect (that's the tokens).
   known=$(identities)
   grep -oE '"agent": "[0-9a-f]{64}"' <<<"$known" | grep -oE '[0-9a-f]{64}' >"$dir/allow"
-  # Only what this run writes counts: the log keeps earlier runs' lines.
-  size=$(wc -c 2>/dev/null <"$dir/server.log" || echo 0)
   # Limits from network-sync.md, "Memory, for choosing step 3's limits".
-  nohup "$bin" --dir "$dir/ground" serve --port "${url##*:}" --tokens "$dir/tokens.b3" --allow "$dir/allow" \
-    --first-seen "$dir/first-seen.jsonl" --batch-bytes 17825792 --id-budget 8388608 --max-sessions 16 \
-    </dev/null >>"$dir/server.log" 2>&1 &
-  pid=$!
-  echo "$pid" >"$dir/server.pid"
+  serve=("$bin" --dir "$dir/ground" serve --port "${url##*:}" --tokens "$dir/tokens.b3" --allow "$dir/allow"
+    --first-seen "$dir/first-seen.jsonl" --batch-bytes 17825792 --id-budget 8388608 --max-sessions 16)
+}
+
+# Waits up to 30 seconds for a server other than pid $1 (if given) that is running, listening and has
+# answered a sync of the main checkout's replica, as scripts/bk's would; says which, or why not.
+await_up() {
+  local old=${1:-} pid='' tokens err
+  url=$(cat "$dir/url")
   for _ in $(seq 300); do
-    [[ $(tail -c +$((size + 1)) "$dir/server.log") != *"listening on $url"* ]] || break
-    kill -0 "$pid" 2>/dev/null || fail "the server exited; see $dir/server.log"
+    pid=$(running_pid) && [ "$pid" != "$old" ] && (exec 3<>"/dev/tcp/127.0.0.1/${url##*:}") 2>/dev/null && break
+    pid=''
     sleep 0.1
   done
-  [[ $(tail -c +$((size + 1)) "$dir/server.log") == *"listening on $url"* ]] || {
-    kill "$pid" 2>/dev/null || true
-    fail "the server didn't start listening within 30 seconds; see $dir/server.log"
-  }
-  # Up only once it answers: a sync of the main checkout's replica, as scripts/bk's would be.
+  [ -n "$pid" ] || { echo "team-server: no server listening on $url within 30 seconds; see $dir/server.log" >&2; return 1; }
   tokens=("$dir"/tokens/*)
-  err=$(BRACKEN_DIR="$main/.bracken" "$bin" sync "$url" --token-file "${tokens[0]}" --deadline 30 2>&1 >/dev/null) ||
-    fail "the server is listening (pid $pid) but a sync with it failed: ${err##*$'\n'}"
+  err=$(BRACKEN_DIR="$main/.bracken" "$bin" sync "$url" --token-file "${tokens[0]}" --deadline 30 2>&1 >/dev/null) || {
+    echo "team-server: the server is listening (pid $pid) but a sync with it failed: ${err##*$'\n'}" >&2
+    return 1
+  }
   echo "team-server: listening on $url (pid $pid)"
+}
+
+# Starts the server, and returns once it is listening and has answered a sync.
+start_server() {
+  local pid
+  prepare
+  nohup "${serve[@]}" </dev/null >>"$dir/server.log" 2>&1 &
+  pid=$!
+  echo "$pid" >"$dir/server.pid"
+  # A server that exits at once (its port taken, say) fails here rather than after the wait.
+  sleep 0.2
+  kill -0 "$pid" 2>/dev/null || fail "the server exited; see $dir/server.log"
+  await_up || {
+    kill "$pid" 2>/dev/null || true
+    exit 1
+  }
 }
 
 stop_server() {
@@ -124,7 +155,12 @@ case "${1:-}" in
     echo "team-server: token for $name in $dir/tokens/$name"
     # The server reads its tokens and allowlist only when it starts, so a running one restarts now:
     # a token it doesn't know would let the identity write locally and block everyone's pushes.
-    if running_pid >/dev/null; then
+    if managed; then
+      echo "team-server: restarting the server through launchd, so it knows $name"
+      old=$(running_pid || true)
+      launchctl kickstart -k "gui/$(id -u)/$label"
+      await_up "$old" || exit 1
+    elif running_pid >/dev/null; then
       echo "team-server: restarting the server, so it knows $name"
       stop_server
       start_server
@@ -133,13 +169,34 @@ case "${1:-}" in
   start)
     [ $# -eq 1 ] || usage
     team_dir
+    ! managed || fail "launchd runs the server ($label), and restarts it itself; scripts/services status says how it is"
     ! pid=$(running_pid) || fail "already running (pid $pid)"
     start_server
     ;;
   stop)
     [ $# -eq 1 ] || usage
     team_dir
+    ! managed || fail "launchd runs the server ($label) and would restart it; scripts/services uninstall stops it"
     stop_server
+    ;;
+  run)
+    # launchd's: the server in the foreground, as this process, logging where start's does.
+    [ $# -eq 1 ] || usage
+    team_dir
+    # A clean exit: launchd (KeepAlive, SuccessfulExit false) then stops retrying, rather than logging
+    # this every 10 seconds while the other server runs.
+    if pid=$(running_pid); then
+      echo "team-server: already running (pid $pid); not starting another" >&2
+      exit 0
+    fi
+    prepare
+    echo "$$" >"$dir/server.pid"
+    exec "${serve[@]}" </dev/null >>"$dir/server.log" 2>&1
+    ;;
+  check)
+    [ $# -eq 1 ] || usage
+    team_dir
+    await_up || exit 1
     ;;
   *) usage ;;
 esac

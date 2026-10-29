@@ -396,7 +396,25 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         let said = format!("team server: every read pulls from http://127.0.0.1:{port}\n");
         assert!(String::from_utf8_lossy(&out.stdout).contains(&said), "{scripts}: {:?}", out.stdout);
 
-        ok(sh(&a, "scripts/team-server", &["stop"], None), "stop");
+        // run, launchd's way: the server in the foreground, as the process itself. check waits for it to
+        // answer, start sees it running, and stop stops it by the pid run wrote.
+        ok(sh(&a, "scripts/team-server", &["stop"], None), "stop before run");
+        let mut foreground = command(&a, "scripts/team-server", &["run"]);
+        foreground.env("BRACKEN_BIN", &wrapper).env("T", tmp.path()).env("PATH", &path);
+        let mut foreground = foreground.spawn().unwrap();
+        // Reaped as it exits, as launchd would, so stop doesn't wait on a zombie.
+        let foreground = std::thread::spawn(move || foreground.wait().unwrap());
+        let (out, _) = ok(sh(&a, "scripts/team-server", &["check"], None), "check");
+        assert!(out.contains(&format!("listening on http://127.0.0.1:{port}")), "{scripts}: {out}");
+        let out = sh(&a, "scripts/team-server", &["start"], None);
+        assert!(!out.status.success(), "{scripts}: start beside run");
+        // A second run beside it exits cleanly, so launchd stops retrying.
+        let out = sh(&a, "scripts/team-server", &["run"], None);
+        assert!(out.status.success(), "{scripts}: a second run failed");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("already running"), "{scripts}");
+        ok(sh(&a, "scripts/team-server", &["stop"], None), "stop run");
+        assert!(!foreground.join().unwrap().success(), "{scripts}: run's server ended by its signal");
+
         let (shown, stderr) = ok(sh(&a, "scripts/bk", &["show", bob.trim()], Some("alice")), "offline read");
         assert!(shown.contains("from bob"), "{scripts}: {shown}");
         assert!(stderr.contains("not pulled from the team server"), "{scripts}: {stderr}");
@@ -1178,5 +1196,132 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
         assert!(!out.status.success(), "{scripts}: a failing step passed");
         assert_eq!(calls.lines().count(), 3, "{scripts}: went on after a failure: {calls}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("failed: cargo clippy"), "{scripts}");
+    }
+}
+
+/// `services` (owner decision `6fed6a4c8af0`), without touching this machine's launchd: `launchctl`
+/// is a stub that logs its calls and has nothing loaded, and HOME is a throwaway directory. The dry
+/// run prints two valid plists that keep alive what scripts/team-server run and scripts/bk view start,
+/// log under the team directory, and hold no token; it writes nothing. uninstall removes exactly the
+/// two plists, and only them.
+#[test]
+fn services_dry_run_holds_no_secret_and_uninstall_removes_only_its_plists() {
+    for scripts in SCRIPTS {
+        let copy = |name: &str| repo_root().join(scripts).join(name);
+        let files = [("scripts/services", copy("services")), ("scripts/team-server", copy("team-server"))];
+        let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
+        let (tmp, dir) = repo(&files, ".bracken/\n.bracken-team\n", |_| {});
+        // A team directory as team-server setup leaves it, with a token whose value must never show.
+        let team = tmp.path().join("team & <co>");
+        std::fs::create_dir_all(team.join("tokens")).unwrap();
+        std::fs::write(team.join("url"), "http://127.0.0.1:7391\n").unwrap();
+        let secret = "5ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7e75ec7";
+        std::fs::write(team.join("tokens/alice"), secret).unwrap();
+        std::fs::write(dir.join(".bracken-team"), format!("{}\n", team.display())).unwrap();
+        let home = tmp.path().join("home");
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(&stubs.join("launchctl"), "#!/bin/sh\necho \"$*\" >>\"$T/launchctl.log\"\nexit 1\n");
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let services = |args: &[&str]| {
+            let mut c = command(&dir, "scripts/services", args);
+            c.env("HOME", &home).env("PATH", &path).env("T", tmp.path()).env("BRACKEN_TOKEN", secret);
+            c.output().unwrap()
+        };
+
+        let out = services(&["install", "--dry-run", "--view-port", "7399"]);
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(!text.contains(secret) && !text.to_lowercase().contains("token"), "{scripts}: {text}");
+        let plists: Vec<&str> = text.split("\n# ").collect();
+        assert_eq!(plists.len(), 2, "{scripts}: {text}");
+        for (plist, label, args) in [
+            (plists[0], "jx.rs.bracken.team-server", vec!["team-server", "run"]),
+            (plists[1], "jx.rs.bracken.view", vec!["bk", "view", "--port", "7399"]),
+        ] {
+            let body = &plist[plist.find("<?xml").expect("a plist")..];
+            assert!(body.contains(&format!("<string>{label}</string>")), "{scripts}: {body}");
+            for a in args {
+                assert!(body.contains(a), "{scripts}: {label} lacks {a}");
+            }
+            let keep_alive = "<key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>";
+            for key in ["<key>RunAtLoad</key>\n  <true/>", keep_alive] {
+                assert!(body.contains(key), "{scripts}: {label} lacks {key}");
+            }
+            assert!(
+                body.contains("team &amp; &lt;co&gt;/launchd-"),
+                "{scripts}: logs under the team directory, escaped"
+            );
+            if std::path::Path::new("/usr/bin/plutil").exists() {
+                let file = tmp.path().join(format!("{label}.plist"));
+                std::fs::write(&file, body).unwrap();
+                let lint = Command::new("/usr/bin/plutil").arg("-lint").arg(&file).output().unwrap();
+                assert!(lint.status.success(), "{scripts}: {}", String::from_utf8_lossy(&lint.stdout));
+            }
+        }
+        assert!(!home.join("Library").exists(), "{scripts}: the dry run wrote something");
+
+        // No address can be named (finding bbd29eb576fc): --netbird alone moves the view, to the address
+        // `netbird status` gives, and only a connected NetBird address in 100.64.0.0/10.
+        for old in [&["--bind", "192.168.1.20", "--host", "x"][..], &["--bind", "100.74.240.73"]] {
+            let args: Vec<&str> = ["install", "--dry-run"].iter().chain(old).copied().collect();
+            assert_eq!(services(&args).status.code(), Some(2), "{scripts}: {old:?} taken");
+        }
+        let viewer = tmp.path().join("bracken-with-bind");
+        write_executable(
+            &viewer,
+            "#!/bin/sh
+[ \"$1 $2\" = 'view --help' ] && echo '      --bind <IP>'\nexit 0\n",
+        );
+        let netbird = |management: &str, ip: &str, fqdn: &str| {
+            let status =
+                format!("Management: {management}\nFQDN: {fqdn}\nNetBird IP: {ip}/16\nPeers count: 3/4 Connected\n");
+            std::fs::write(tmp.path().join("netbird-status"), status).unwrap();
+            let mut c = command(&dir, "scripts/services", &["install", "--dry-run", "--netbird"]);
+            c.env("HOME", &home).env("PATH", &path).env("T", tmp.path()).env("BRACKEN_BIN", &viewer);
+            c.output().unwrap()
+        };
+        write_executable(&stubs.join("netbird"), "#!/bin/sh\n[ \"$1\" = status ] && cat \"$T/netbird-status\"\n");
+        let out = netbird("Connected", "100.74.240.73", "warren-mbp.jx.rs");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        let bound = "<string>--bind</string>\n    <string>100.74.240.73</string>\n    <string>--host</string>\n    <string>warren-mbp.jx.rs</string>";
+        assert!(text.contains(bound), "{scripts}: {text}");
+        for (management, ip, fqdn, why) in [
+            ("Disconnected", "100.74.240.73", "warren-mbp.jx.rs", "isn't connected"),
+            ("Connected", "192.168.1.20", "warren-mbp.jx.rs", "isn't a NetBird address"),
+            ("Connected", "100.128.0.1", "warren-mbp.jx.rs", "isn't a NetBird address"),
+            ("Connected", "100.63.255.1", "warren-mbp.jx.rs", "isn't a NetBird address"),
+            ("Connected", "100.74.240.300", "warren-mbp.jx.rs", "isn't a NetBird address"),
+            ("Connected", "100.74.240.73", "evil host; rm", "isn't a host name"),
+        ] {
+            let out = netbird(management, ip, fqdn);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success() && stderr.contains(why), "{scripts}: {ip} {fqdn}: {stderr}");
+            assert!(out.stdout.is_empty(), "{scripts}: printed a plist for {ip}");
+        }
+        // And only with a view that can bind.
+        let mut c = command(&dir, "scripts/services", &["install", "--dry-run", "--netbird"]);
+        c.env("HOME", &home).env("PATH", &path).env("T", tmp.path());
+        netbird("Connected", "100.74.240.73", "warren-mbp.jx.rs");
+        let out = c.output().unwrap();
+        let bindless =
+            std::process::Command::new(env!("CARGO_BIN_EXE_bracken")).args(["view", "--help"]).output().unwrap();
+        if !String::from_utf8_lossy(&bindless.stdout).contains("--bind") {
+            assert!(!out.status.success(), "{scripts}: --netbird with a view that can't bind");
+        }
+
+        let agents = home.join("Library/LaunchAgents");
+        std::fs::create_dir_all(&agents).unwrap();
+        for name in ["jx.rs.bracken.team-server.plist", "jx.rs.bracken.view.plist", "someone.else.plist"] {
+            std::fs::write(agents.join(name), "x").unwrap();
+        }
+        let out = services(&["uninstall"]);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        let left: Vec<_> = std::fs::read_dir(&agents).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, ["someone.else.plist"], "{scripts}");
+        assert!(team.join("tokens/alice").exists() && team.join("url").exists(), "{scripts}: uninstall kept the rest");
+        let calls = std::fs::read_to_string(tmp.path().join("launchctl.log")).unwrap_or_default();
+        assert!(!calls.contains("bootout"), "{scripts}: nothing was loaded, so nothing booted out: {calls}");
     }
 }
