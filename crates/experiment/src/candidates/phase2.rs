@@ -512,3 +512,30 @@ pub(super) const REVISIONS: &[Revision] = &[
         ),
     },
 ];
+
+/// An interacting pair left unsettled: the programs an agent writes when it takes one change's obvious fix
+/// for the contract once both of the pair's changes apply, which are wrong with the other (a test in
+/// `tests/phase2.rs` shows it).
+pub struct Unsettled {
+    pub pair: [Change; 2],
+    pub programs: &'static [(&'static str, &'static str)],
+}
+
+pub const UNSETTLED: &[Unsettled] = &[
+    // cut-signed's obvious fix moves none just past cut's range, which none-wide rules out.
+    Unsettled {
+        pair: [Change::CutSigned, Change::NoneWide],
+        programs: &[
+            ("cut", "a b - -1000 < -1001 a b - 1000 > -1001 a b - ? ?"),
+            ("pos", "a 0 > a -1001 ?"),
+            ("isnone", "a -1001 ="),
+            ("either", "a -1001 = b a ?"),
+            ("plus", "a -1001 = -1001 b -1001 = -1001 a b + ? ?"),
+        ],
+    },
+    // rank-wide's obvious fix reads only the sign, which can't say ismore-far's margin.
+    Unsettled {
+        pair: [Change::RankWide, Change::IsMoreFar],
+        programs: &[("rank", "a b < -1 a b > 1 0 ? ?"), ("ismore", "a 2 >")],
+    },
+];

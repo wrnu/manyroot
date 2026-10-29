@@ -110,8 +110,10 @@ pub const DEFINITIONS: &[(&str, &str)] = &[
          under the change requests released before it; a function is correct when it is right in the library. \
          Final: correct at the last checkpoint. Time to correct: per function correct at the last, the turn of \
          the first checkpoint from which it is correct at every one. Recovery per wave: of the checkpoints \
-         after the wave's release, how many until its targets, every function defined in terms of them, \
-         directly or not, and their open contracts' members are all correct (never, if not by the last). \
+         after the wave's release, how many until those of its functions that were correct at the checkpoint \
+         before it are all correct again (never, if not by the last; n/a if none was), beside how many those \
+         are; its functions are its targets, every function defined in terms of them, directly or not, and \
+         their open contracts' members. \
          Breakage: a function correct at one checkpoint and wrong at the next, after a wave if one was \
          released between them. Tokens per correct function: the run's tokens over the final count.",
     ),
@@ -184,10 +186,10 @@ fn stop_cap(records: &Records) -> Option<&str> {
 }
 
 /// Why `records` can't be measured, if they can't (findings `9fe5861f0b22`, `244614b1c7fe`): a log cut
-/// short or with a gap, a stop the plan doesn't `expect`, a snapshot or record that failed, or a turn
-/// without usage that didn't fail before the model ran. Any of these would make a number wrong without
-/// saying so.
-pub fn incomplete(records: &Records, expect: &[String]) -> Option<String> {
+/// short or with a gap, a stop the plan doesn't `expect`, a snapshot or record that failed, a turn
+/// without usage that didn't fail before the model ran, or, for a `task` with waves, a turn without its
+/// checkpoint (finding `bf3fde3cf637`). Any of these would make a number wrong without saying so.
+pub fn incomplete(records: &Records, expect: &[String], task: Task) -> Option<String> {
     let events = &records.events;
     if let Some((i, e)) = events.iter().enumerate().find(|(i, e)| e.seq != *i as u64) {
         return Some(format!("the log skips from seq {i} to {}", e.seq));
@@ -217,6 +219,19 @@ pub fn incomplete(records: &Records, expect: &[String]) -> Option<String> {
         .collect();
     // A turn that failed before or instead of playing (a failed sync, a spent budget) used no tokens:
     // the backend writes a row whenever Claude Code ran.
+    if !task.waves().is_empty() {
+        let checked: BTreeSet<u64> =
+            events.iter().filter(|e| e.event == "checkpoint").map(|e| u(&e.data["turn"])).collect();
+        let mut started: BTreeSet<u64> =
+            events.iter().filter(|e| e.event == "turn_start").map(|e| u(&e.data["turn"])).collect();
+        // The turn a stop cut short ends without one.
+        if expected.is_some() {
+            started.pop_last();
+        }
+        if let Some(turn) = started.difference(&checked).next() {
+            return Some(format!("turn {turn} has no checkpoint"));
+        }
+    }
     let unplayed: BTreeSet<(&str, u64)> = events
         .iter()
         .filter(|e| e.event == "turn_error" && e.data["step"] == "play")
@@ -354,7 +369,8 @@ pub struct Recovery {
     pub wave: u64,
     /// The functions that must be correct again.
     pub functions: u64,
-    /// Checkpoints after the release until they all are, counting that one; none if never.
+    /// Checkpoints after the release until they all are, counting that one; none if never, or if there
+    /// are none (`functions` is 0: nothing to recover).
     pub checkpoints: Option<u64>,
 }
 
@@ -915,7 +931,7 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
     }
     quality.missing += quality.total - last.len() as u64;
 
-    let checkpoints = checkpoints(&a, events, tokens);
+    let checkpoints = checkpoints(&a, events, tokens)?;
     Ok(Measures {
         stopped: stop_cap(records).map(str::to_string),
         mode,
@@ -955,12 +971,13 @@ fn changed_by(task: Task, wave: usize) -> BTreeSet<&'static str> {
 }
 
 /// Phase 2's ranking measures, if the log has checkpoints.
-fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Option<Checkpoints> {
+fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Result<Option<Checkpoints>, String> {
     let task = a.hidden.task();
     let mut graded: Vec<(u32, u64, BTreeSet<&'static str>)> = Vec::new();
     let mut turns = Vec::new();
     for e in events.iter().filter(|e| e.event == "checkpoint") {
-        let modules: Vec<(String, String)> = serde_json::from_value(e.data["modules"].clone()).ok()?;
+        let modules: Vec<(String, String)> =
+            serde_json::from_value(e.data["modules"].clone()).map_err(|e| format!("a bad checkpoint: {e}"))?;
         let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
         let grades = grade(&library, a.version_at(e.seq), a.hidden);
         let correct: BTreeSet<&'static str> = grades.iter().filter(|g| g.in_library).map(|g| g.name).collect();
@@ -970,7 +987,7 @@ fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Option<Checkpoint
         turns.push(Checkpoint { turn, waves, correct: correct.len() as u64, standalone });
         graded.push((turn, e.seq, correct));
     }
-    let last = &graded.last()?.2;
+    let Some((_, _, last)) = graded.last() else { return Ok(None) };
     let mut correct_from = BTreeMap::new();
     for f in last {
         let from = graded.iter().rposition(|(_, _, c)| !c.contains(f)).map_or(0, |k| k + 1);
@@ -982,9 +999,16 @@ fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Option<Checkpoint
         .iter()
         .enumerate()
         .map(|(k, (r, _))| {
-            let set = changed_by(task, k + 1);
+            // Correct again: those of the wave's functions that were correct at the checkpoint before it.
+            let before = graded.iter().rev().find(|(_, seq, _)| seq < r).map(|(_, _, c)| c);
+            let set: BTreeSet<&str> =
+                changed_by(task, k + 1).into_iter().filter(|f| before.is_some_and(|c| c.contains(f))).collect();
             let after = graded.iter().filter(|(_, seq, _)| seq > r);
-            let checkpoints = after.enumerate().find(|(_, (_, _, c))| set.is_subset(c)).map(|(n, _)| n as u64 + 1);
+            let checkpoints = after
+                .enumerate()
+                .find(|(_, (_, _, c))| set.is_subset(c))
+                .map(|(n, _)| n as u64 + 1)
+                .filter(|_| !set.is_empty());
             Recovery { wave: k as u64 + 1, functions: set.len() as u64, checkpoints }
         })
         .collect();
@@ -1001,7 +1025,7 @@ fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Option<Checkpoint
     let total = task.specs().len() as u64;
     let correct = last.len() as u64;
     let tokens_per_correct = (correct > 0).then(|| tokens as f64 / correct as f64);
-    Some(Checkpoints {
+    Ok(Some(Checkpoints {
         turns,
         correct,
         total,
@@ -1010,7 +1034,7 @@ fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Option<Checkpoint
         recovery,
         breakage,
         tokens_per_correct,
-    })
+    }))
 }
 
 /// The log read for the measures: the analysis, the mode, and every delivery, judged.
@@ -1184,7 +1208,11 @@ pub fn table(runs: &[Measures]) -> String {
                         let r: Vec<String> = c
                             .recovery
                             .iter()
-                            .map(|r| r.checkpoints.map_or("never".into(), |n| n.to_string()))
+                            .map(|r| match (r.functions, r.checkpoints) {
+                                (0, _) => "n/a (of 0)".to_string(),
+                                (k, None) => format!("never (of {k})"),
+                                (k, Some(n)) => format!("{n} (of {k})"),
+                            })
                             .collect();
                         r.join(", ")
                     })

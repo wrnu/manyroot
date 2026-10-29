@@ -202,7 +202,7 @@ pub fn report(dir: &Path, usage: Option<&Path>) -> Result<Report, String> {
     let usage_path = usage.map_or_else(|| dir.join(&plan.inputs.usage), Path::to_path_buf);
     let usage = std::fs::read_to_string(&usage_path).map_err(|e| format!("reading {}: {e}", usage_path.display()))?;
     let records = Records::parse(&events, &usage)?;
-    if let Some(why) = incomplete(&records, &plan.inputs.expected_stops) {
+    if let Some(why) = incomplete(&records, &plan.inputs.expected_stops, plan.inputs.task) {
         return Err(format!("{}: not measured: {why}", dir.display()));
     }
     let logged = records.events.iter().find(|e| e.event == "setup").and_then(|e| e.data["plan"].as_str());

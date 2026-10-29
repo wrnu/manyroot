@@ -54,9 +54,18 @@ fn a_mock_run_goes_end_to_end_through_the_shim() {
         plan: PlanInputs::default(),
         sandbox: false,
     };
-    let outcome =
-        run(&cfg, &MockBackend { task: Task::Phase1, seed: 3, wrong_rate: 0.0, shim: Some(bin()), usage: None })
-            .expect("the run");
+    let outcome = run(
+        &cfg,
+        &MockBackend {
+            task: Task::Phase1,
+            seed: 3,
+            wrong_rate: 0.0,
+            shim: Some(bin()),
+            usage: None,
+            ..MockBackend::default()
+        },
+    )
+    .expect("the run");
 
     // The change requests went out once 40% of the 9 turns were used.
     assert_eq!(outcome.released_after, Some(4));
@@ -209,9 +218,19 @@ fn a_run_refuses_a_directory_that_exists() {
         plan: PlanInputs::default(),
         sandbox: false,
     };
-    let err = run(&cfg, &MockBackend { task: Task::Phase1, seed: 1, wrong_rate: 0.0, shim: None, usage: None })
-        .err()
-        .expect("refused");
+    let err = run(
+        &cfg,
+        &MockBackend {
+            task: Task::Phase1,
+            seed: 1,
+            wrong_rate: 0.0,
+            shim: None,
+            usage: None,
+            ..MockBackend::default()
+        },
+    )
+    .err()
+    .expect("refused");
     assert!(err.contains("already exists"));
 }
 
@@ -353,9 +372,18 @@ fn a_crdt_mode_mock_run_goes_end_to_end_through_the_shim() {
         plan: PlanInputs::default(),
         sandbox: false,
     };
-    let outcome =
-        run(&cfg, &MockBackend { task: Task::Phase1, seed: 5, wrong_rate: 0.0, shim: Some(bin()), usage: None })
-            .expect("the run");
+    let outcome = run(
+        &cfg,
+        &MockBackend {
+            task: Task::Phase1,
+            seed: 5,
+            wrong_rate: 0.0,
+            shim: Some(bin()),
+            usage: None,
+            ..MockBackend::default()
+        },
+    )
+    .expect("the run");
     assert_eq!(outcome.released_after, Some(4));
     let log = events(&outcome.events);
     assert!(!log.iter().any(|e| e["event"] == "turn_error"), "no turn failed: {log:?}");
@@ -484,9 +512,18 @@ fn only_git_started(dir: &Path) -> usize {
 fn a_git_mode_mock_run_goes_end_to_end_through_the_shim() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let cfg = RunConfig { mode: "git", trace: true, ..config(dir.path(), 3, 4) };
-    let outcome =
-        run(&cfg, &MockBackend { task: Task::Phase1, seed: 3, wrong_rate: 0.0, shim: Some(bin()), usage: None })
-            .expect("the run");
+    let outcome = run(
+        &cfg,
+        &MockBackend {
+            task: Task::Phase1,
+            seed: 3,
+            wrong_rate: 0.0,
+            shim: Some(bin()),
+            usage: None,
+            ..MockBackend::default()
+        },
+    )
+    .expect("the run");
     let log = events(&outcome.events);
     let seqs: Vec<u64> = log.iter().map(|e| e["seq"].as_u64().expect("seq")).collect();
     assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "one writer, no gaps");

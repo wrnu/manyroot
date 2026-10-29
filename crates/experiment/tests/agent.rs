@@ -399,6 +399,7 @@ fn syncs_both_ways_sandboxed(mode: &'static str) {
         wrong_rate: 0.0,
         shim: Some(bin()),
         usage: None,
+        ..bracken_experiment::mock::MockBackend::default()
     };
     let outcome = run(&cfg, &backend).unwrap_or_else(|e| panic!("{mode}: the run: {e}"));
     let log = events(&outcome.events);

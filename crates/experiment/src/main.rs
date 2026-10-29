@@ -306,7 +306,14 @@ fn mock_run(
     let (seed, task) = (cfg.plan.backend_seed, cfg.plan.task);
     let usage = Some(cfg.root.join("usage.jsonl"));
     // Through the shim, as Claude Code reaches the driver.
-    let mock = MockBackend { task, seed, wrong_rate: 0.15, shim: Some(cfg.worker_bin.clone()), usage };
+    let mock = MockBackend {
+        task,
+        seed,
+        wrong_rate: 0.15,
+        shim: Some(cfg.worker_bin.clone()),
+        usage,
+        ..MockBackend::default()
+    };
     let outcome = run(&cfg, &mock)?;
     for (module, text) in &outcome.modules {
         println!("# module {module}\n{text}");
