@@ -18,7 +18,9 @@
 #      counts only if the head is docs-only by scripts/code-scope (everything it changed since main
 #      is *.md outside crates/); one that reuses an earlier pass ('tree <key> reuses <id>') counts
 #      only if <id> is a current manager pass of the whole table on a pr claim of the same PR with the
-#      same key (owner decision 642a47c04a10). Any other such pass fails this check;
+#      same key (owner decision 642a47c04a10). Any other such pass fails this check. Here and in 5,
+#      'scripts/test-table --split' (the whole table in a box plus the macOS-only tests on the Mac,
+#      owner decision 01a2d668b67e) counts as scripts/test-table; --remote alone doesn't;
 #   5. main's tip is an ancestor of the sha, or every file main changed since the
 #      branch point is under .bracken/, or is untouched by the branch and either
 #      under docs/ (not docs/vision.md) or a .md file under .claude/skills/ outside
@@ -213,14 +215,14 @@ tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no o
 # each; the main and key are empty for a pass without --on, the suffix ' docs-only', ' reuses <id>' or empty.
 tables=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
   and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
-  | .body.method | capture("^scripts/test-table @ (?<h>[0-9a-f]{40})( on (?<m>[0-9a-f]{40})( tree (?<k>[0-9a-f]{40,64}))?)?(?<x> docs-only| reuses [0-9a-f]{64})?$")?
+  | .body.method | capture("^scripts/test-table( --split)? @ (?<h>[0-9a-f]{40})( on (?<m>[0-9a-f]{40})( tree (?<k>[0-9a-f]{40,64}))?)?(?<x> docs-only| reuses [0-9a-f]{64})?$")?
   | select(.h == $sha) | [.m // "", .k // "", .x // ""] | @tsv] | unique | .[]' <<<"$shown")
 # Whether <id> is a current manager pass of the whole table, with key <key>, on a pr claim of this PR.
 reuses_a_pass() {
   local about target
   about=$(bk show "$1" --json 2>/dev/null) || return 1
   jq -e --arg k "$2" '.kind == "evidence" and .retracted == false and .author_name == "manager"
-    and .body.verdict == "pass" and (.body.method | test("^scripts/test-table @ [0-9a-f]{40} on [0-9a-f]{40} tree " + $k + "$"))' \
+    and .body.verdict == "pass" and (.body.method | test("^scripts/test-table( --split)? @ [0-9a-f]{40} on [0-9a-f]{40} tree " + $k + "$"))' \
     <<<"$about" >/dev/null || return 1
   target=$(jq -r .body.target <<<"$about")
   bk show "$target" --json 2>/dev/null | jq -e --arg pr "PR #$pr " '(.body.statement // "") | startswith($pr)' >/dev/null

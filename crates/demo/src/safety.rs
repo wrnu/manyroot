@@ -641,65 +641,6 @@ mod tests {
         mode(&dir, 0o700);
     }
 
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_temporary_directory_whose_acl_lets_others_rename_entries_is_refused() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = real(&tmp).join("t");
-        std::fs::create_dir(&dir).unwrap();
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let chmod =
-            |args: &[&str]| assert!(Command::new("/bin/chmod").args(args).arg(&dir).status().unwrap().success());
-
-        refuse_shared(&dir).unwrap();
-        chmod(&["+a", "everyone deny delete_child"]);
-        refuse_shared(&dir).unwrap();
-        for perm in ["add_file", "add_subdirectory", "delete_child", "writesecurity"] {
-            chmod(&["-N"]);
-            chmod(&["+a", &format!("everyone allow list,{perm}")]);
-            let refused = refuse_shared(&dir).unwrap_err().to_string();
-            assert!(refused.contains(&format!("has an ACL entry allowing {perm}")), "{perm}: {refused}");
-        }
-        // Read only, but inherited: the run's directory and its keys would get it.
-        chmod(&["-N"]);
-        chmod(&[
-            "+a",
-            "everyone allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit",
-        ]);
-        let refused = refuse_shared(&dir).unwrap_err().to_string();
-        assert!(refused.contains("has an ACL entry that new files inherit"), "{refused}");
-        chmod(&["-N"]);
-        refuse_shared(&dir).unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_run_directory_that_inherits_an_acl_entry_is_refused_and_removed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let base = real(&tmp).join("base");
-        std::fs::create_dir(&base).unwrap();
-        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let chmod =
-            |args: &[&str]| assert!(Command::new("/bin/chmod").args(args).arg(&base).status().unwrap().success());
-
-        // A clean base: the run directory, and a key made in it, carry no ACL entry.
-        let (temp, root) = run_dir_in(&base, false, &DEMO).unwrap();
-        let key = root.join("agent-0/.bracken/identities/agent-0.json");
-        std::fs::create_dir_all(key.parent().unwrap()).unwrap();
-        std::fs::write(&key, "secret").unwrap();
-        assert!(acl::entries(&root).unwrap().is_empty());
-        assert!(acl::entries(&key).unwrap().is_empty(), "the key has an ACL entry");
-        drop(temp);
-
-        // An inherited entry that refuse_shared would refuse, made here to test the check
-        // after creation on its own.
-        chmod(&["+a", "everyone allow list,search,read,file_inherit,directory_inherit"]);
-        let refused = run_dir_in(&base, false, &DEMO).unwrap_err().to_string();
-        assert!(refused.contains("got an ACL entry from"), "{refused}");
-        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0, "the refused directory is removed");
-        chmod(&["-N"]);
-    }
-
     /// Replaces directory `name` in `parent` with a symlink to `to`, keeping it as `<name>.moved`.
     fn swap_for_symlink(parent: &Path, name: &std::ffi::OsStr, to: &Path) {
         let path = parent.join(name);
@@ -803,5 +744,69 @@ mod tests {
         }
         assert_eq!(std::fs::read_dir(&victims).unwrap().count(), N, "nothing new in victims");
         assert!(written.is_empty(), "nothing written into victims: {written:?}");
+    }
+
+    /// The tests that need macOS, for its ACLs: `scripts/test-table --split` runs them on the Mac by this
+    /// module's name (owner decision `01a2d668b67e`).
+    #[cfg(target_os = "macos")]
+    mod macos_only {
+        use super::*;
+
+        #[test]
+        fn a_temporary_directory_whose_acl_lets_others_rename_entries_is_refused() {
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = real(&tmp).join("t");
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let chmod =
+                |args: &[&str]| assert!(Command::new("/bin/chmod").args(args).arg(&dir).status().unwrap().success());
+
+            refuse_shared(&dir).unwrap();
+            chmod(&["+a", "everyone deny delete_child"]);
+            refuse_shared(&dir).unwrap();
+            for perm in ["add_file", "add_subdirectory", "delete_child", "writesecurity"] {
+                chmod(&["-N"]);
+                chmod(&["+a", &format!("everyone allow list,{perm}")]);
+                let refused = refuse_shared(&dir).unwrap_err().to_string();
+                assert!(refused.contains(&format!("has an ACL entry allowing {perm}")), "{perm}: {refused}");
+            }
+            // Read only, but inherited: the run's directory and its keys would get it.
+            chmod(&["-N"]);
+            chmod(&[
+                "+a",
+                "everyone allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit",
+            ]);
+            let refused = refuse_shared(&dir).unwrap_err().to_string();
+            assert!(refused.contains("has an ACL entry that new files inherit"), "{refused}");
+            chmod(&["-N"]);
+            refuse_shared(&dir).unwrap();
+        }
+
+        #[test]
+        fn a_run_directory_that_inherits_an_acl_entry_is_refused_and_removed() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = real(&tmp).join("base");
+            std::fs::create_dir(&base).unwrap();
+            std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let chmod =
+                |args: &[&str]| assert!(Command::new("/bin/chmod").args(args).arg(&base).status().unwrap().success());
+
+            // A clean base: the run directory, and a key made in it, carry no ACL entry.
+            let (temp, root) = run_dir_in(&base, false, &DEMO).unwrap();
+            let key = root.join("agent-0/.bracken/identities/agent-0.json");
+            std::fs::create_dir_all(key.parent().unwrap()).unwrap();
+            std::fs::write(&key, "secret").unwrap();
+            assert!(acl::entries(&root).unwrap().is_empty());
+            assert!(acl::entries(&key).unwrap().is_empty(), "the key has an ACL entry");
+            drop(temp);
+
+            // An inherited entry that refuse_shared would refuse, made here to test the check
+            // after creation on its own.
+            chmod(&["+a", "everyone allow list,search,read,file_inherit,directory_inherit"]);
+            let refused = run_dir_in(&base, false, &DEMO).unwrap_err().to_string();
+            assert!(refused.contains("got an ACL entry from"), "{refused}");
+            assert_eq!(std::fs::read_dir(&base).unwrap().count(), 0, "the refused directory is removed");
+            chmod(&["-N"]);
+        }
     }
 }

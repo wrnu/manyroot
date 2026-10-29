@@ -2,7 +2,7 @@
 # verify-seq: the manager's counted runs of the test table, one PR head at a time, so the runs
 # don't compete for the machine.
 #
-#   [ON=origin/main] verify-seq <pr claim>:<sha> ...
+#   [ON=origin/main] verify-seq [--split [-j 2]] <pr claim>:<sha> ...
 #
 # For each pair, in a scratch worktree at <sha> (removed afterwards if the run left it clean), this
 # checkout's bk-evidence records a run of scripts/test-table on <claim> as manager, and the last two
@@ -12,20 +12,96 @@
 # guards run, and the evidence cites that pass (owner decision 642a47c04a10). So re-verifying after
 # main moved only in docs or the Ground costs the guards alone. The main checkout's
 # .git/verify-seq.sh calls this one.
+#
+# --split runs scripts/test-table --split instead (owner decision 01a2d668b67e): the whole table in a
+# boat box and the macOS-only tests here, one evidence per PR. With it, -j 2 runs two PRs at once, a
+# box each (the trial allows 2 boxes), and prints each one's lines when it ends. Without --split the
+# runs share this machine, so -j is refused.
+#
+# A Ctrl-C or SIGTERM stops every running run, each box deleted, and records no evidence for them;
+# it exits 130.
 set -uo pipefail
 
+usage() { echo "usage: [ON=<main>] verify-seq [--split [-j 2]] <pr claim>:<sha> ..." >&2; exit 2; }
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 cd "$main" || exit 1
-[ $# -ge 1 ] || { echo "usage: [ON=<main>] verify-seq <pr claim>:<sha> ..." >&2; exit 2; }
-for pair in "$@"; do
-  claim=${pair%%:*} h=${pair#*:}
-  v="${TMPDIR:-/tmp}/verify-$h"
+table=(scripts/test-table)
+jobs=1
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --split) table=(scripts/test-table --split); shift ;;
+    -j) [ $# -ge 2 ] && [[ $2 =~ ^[12]$ ]] || { echo "verify-seq: -j takes 1 or 2 (the trial's boxes)" >&2; exit 2; }
+      jobs=$2; shift 2 ;;
+    --) shift; break ;;
+    -*) usage ;;
+    *) break ;;
+  esac
+done
+[ $# -ge 1 ] || usage
+[ "$jobs" -eq 1 ] || [ ${#table[@]} -eq 2 ] || { echo "verify-seq: -j 2 needs --split: local runs would compete" >&2; exit 2; }
+
+# One pair, start to end, its lines printed together. Its run's output goes to a file, not a pipe:
+# a reader killed by a Ctrl-C would kill the run's cleanup with SIGPIPE. The job outlives a signal
+# until its run has stopped: a SIGTERM would otherwise end it at once, before the run's cleanup, and
+# verify-seq would exit with the run's boxes still up. bk-evidence runs in this shell, not a subshell,
+# which would take SIGTERM's default again. A signal before bk-evidence starts stops it starting
+# (note fa805ecf517e); one as it starts reaches it too, through the job's group.
+verify() {
+  local claim=${1%%:*} h=${1#*:} stopped=false
+  local v="${TMPDIR:-/tmp}/verify-$h"
+  trap 'stopped=true' INT TERM
   echo "== $claim @ ${h:0:7}"
-  git worktree add -q --detach "$v" "$h" || { echo "worktree add failed"; continue; }
-  (
-    cd "$v" && "$here/bk-evidence" "$claim" --as manager ${ON:+--on "$ON" --reuse} -- scripts/test-table 2>&1 | tail -2
-  )
+  git worktree add -q --detach "$v" "$h" || { echo "worktree add failed"; return; }
+  cd "$v" || return
+  if $stopped; then
+    cd "$main" && git worktree remove "$v"
+    echo "interrupted before the run; nothing recorded"
+    return
+  fi
+  "$here/bk-evidence" "$claim" --as manager ${ON:+--on "$ON" --reuse} -- "${table[@]}" >"$logs/$claim.out" 2>&1
+  cd "$main" || return
+  tail -n 2 "$logs/$claim.out"
   if [ -z "$(git -C "$v" status --porcelain)" ]; then git worktree remove "$v" && echo "removed $v"; else echo "LEFT $v (dirty)"; fi
+}
+
+# Up to $jobs pairs at a time, each a job with job control (set -m): its own process group, and
+# SIGINT not ignored, as a plain background job's is (finding 87cfdf4680c7). A Ctrl-C here is passed
+# to each running job's group as SIGINT, and SIGTERM as SIGTERM, so a verify-seq started with SIGINT
+# ignored still stops on SIGTERM (note c1468539ea94): test-table stops its box, which is deleted, and
+# its tests, and bk-evidence records nothing. Then this stops, starting no more. The jobs come from
+# jobs -p, which holds a job from its fork, before its pid is saved: a signal between the two still
+# reaches it, since a trap runs only between commands.
+logs=$(mktemp -d)
+pids=()
+interrupted=false
+stop_jobs() {
+  local pid
+  interrupted=true
+  echo "verify-seq: interrupted ($1): stopping the runs; nothing is recorded for them" >&2
+  for pid in $(jobs -p); do kill -"$1" -- "-$pid" 2>/dev/null || true; done
+}
+trap 'stop_jobs INT' INT
+trap 'stop_jobs TERM' TERM
+trap 'rm -rf -- "$logs"' EXIT
+while [ $# -gt 0 ] && ! $interrupted; do
+  batch=("$@")
+  batch=("${batch[@]:0:$jobs}")
+  shift "${#batch[@]}"
+  pids=()
+  for k in "${!batch[@]}"; do
+    # A signal before this fork starts no more; one after it reaches this job through jobs -p.
+    $interrupted && break
+    set -m
+    verify "${batch[$k]}" >"$logs/$k" 2>&1 &
+    pids+=($!)
+    set +m
+  done
+  for k in "${!pids[@]}"; do
+    # A signal's trap interrupts wait: wait again until the job has ended.
+    while kill -0 "${pids[$k]}" 2>/dev/null; do wait "${pids[$k]}" 2>/dev/null; done
+    cat "$logs/$k"
+  done
 done
 git worktree prune
+! $interrupted || exit 130
