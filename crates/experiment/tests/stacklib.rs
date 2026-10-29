@@ -528,3 +528,24 @@ fn phase_one_is_graded_as_its_runs_were() {
         assert_eq!(h.finalize().to_hex().to_string(), want, "seed {seed}");
     }
 }
+
+/// The diagnostic's parse (decision `a8ba06399068` point 3): copies identical to a name's first definition,
+/// in any module and however spaced, count as one; a copy that differs still makes it a duplicate, as does a
+/// later identical copy after one that differs. The grader's parse counts every copy as a duplicate.
+#[test]
+fn identical_copies_collapse_only_for_the_diagnostic() {
+    let modules = [
+        ("base", "def same 1 : a 1 +\ndef differs 1 : a"),
+        ("order", "def same 1 :  a   1 +  # a copy\ndef differs 1 : a 1 +\ndef late 1 : a"),
+        ("arith", "def same 1 : a 1 +\ndef differs 1 : a\ndef late 1 : 0\ndef late 1 : a\ndef other 2 : a b +"),
+        ("more", "def other 1 : a"),
+    ];
+    let collapsed = Library::parse_collapsing_identical(modules);
+    assert!(collapsed.get("same").is_some(), "three identical copies are one definition");
+    fn dups(l: &Library) -> Vec<&str> {
+        l.duplicates.iter().map(String::as_str).collect()
+    }
+    assert_eq!(dups(&collapsed), ["differs", "late", "other"], "a copy that differs, even by arity, is a duplicate");
+    let graded = Library::parse(modules);
+    assert_eq!(dups(&graded), ["differs", "late", "other", "same"], "the grader's rule is unchanged");
+}

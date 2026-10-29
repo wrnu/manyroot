@@ -110,12 +110,16 @@ pub const DEFINITIONS: &[(&str, &str)] = &[
          under the change requests released before it; a function is correct when it is right in the library. \
          Final: correct at the last checkpoint. Time to correct: per function correct at the last, the turn of \
          the first checkpoint from which it is correct at every one. Recovery per wave: of the checkpoints \
-         after the wave's release, how many until those of its functions that were correct at the checkpoint \
-         before it are all correct again (never, if not by the last; n/a if none was), beside how many those \
+         after the wave's release, how many until those of its functions that were correct in the hub when \
+         the wave went out (its last snapshot before the release, graded under the specs in force before it, \
+         the same in every mode) are all correct again (never, if not by the last; n/a if none was), beside how many those \
          are; its functions are its targets, every function defined in terms of them, directly or not, and \
          their open contracts' members. \
          Breakage: a function correct at one checkpoint and wrong at the next, after a wave if one was \
-         released between them. Tokens per correct function: the run's tokens over the final count.",
+         released between them. Tokens per correct function: the run's tokens over the final count. \
+         Beside them, never in the ranking, a diagnostic for CRDT mode (decision a8ba06399068): its \
+         checkpoints regraded with identical copies of a definition (same name, arity and code) collapsed to \
+         one, while copies that differ still count as duplicates; n/a in Git and Bracken modes.",
     ),
 ];
 
@@ -353,6 +357,11 @@ pub struct Checkpoints {
     pub recovery: Vec<Recovery>,
     pub breakage: Breakage,
     pub tokens_per_correct: Option<f64>,
+    /// A diagnostic, never in the ranking (decision `a8ba06399068` point 3): CRDT mode's checkpoints
+    /// graded with identical copies of a definition collapsed to one, per checkpoint (turn, correct).
+    /// None in the other modes, whose shared state can't hold copies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub crdt_identical_collapsed: Option<Vec<(u32, u64)>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -614,6 +623,14 @@ impl Analysis<'_> {
 
     fn snap_before(&self, seq: u64) -> Option<&Snap> {
         self.snaps.iter().rev().find(|s| s.at.seq < seq)
+    }
+
+    /// The hub as release `k` found it: the last snapshot before the release. The driver snapshots the hub
+    /// whenever it changes, while it holds it, so this is the hub when the wave went out, at the same point
+    /// in every mode. Not the snapshot logged after the release: in Bracken mode the release itself drops
+    /// the implementations of the specs it supersedes from the accepted layer, which is what recovery measures.
+    fn at_release(&self, k: usize) -> Option<&Snap> {
+        self.snap_before(self.releases[k].0)
     }
 
     /// Whether `def` is a correct definition of `function` under `version`: standalone, and for an open
@@ -932,7 +949,7 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
     }
     quality.missing += quality.total - last.len() as u64;
 
-    let checkpoints = checkpoints(&a, events, tokens)?;
+    let checkpoints = checkpoints(&a, &mode, events, tokens)?;
     Ok(Measures {
         stopped: stop_cap(records).map(str::to_string),
         mode,
@@ -971,18 +988,24 @@ fn changed_by(task: Task, wave: usize) -> BTreeSet<&'static str> {
     }
 }
 
-/// Phase 2's ranking measures, if the log has checkpoints.
-fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Result<Option<Checkpoints>, String> {
+/// Phase 2's ranking measures, if the log has checkpoints, and for CRDT mode the diagnostic beside them.
+fn checkpoints(a: &Analysis, mode: &str, events: &[Event], tokens: u64) -> Result<Option<Checkpoints>, String> {
     let task = a.hidden.task();
     let mut graded: Vec<(u32, u64, BTreeSet<&'static str>)> = Vec::new();
     let mut turns = Vec::new();
+    let mut collapsed = Vec::new();
     for e in events.iter().filter(|e| e.event == "checkpoint") {
         let modules: Vec<(String, String)> =
             serde_json::from_value(e.data["modules"].clone()).map_err(|e| format!("a bad checkpoint: {e}"))?;
-        let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
+        let pairs = || modules.iter().map(|(m, t)| (m.as_str(), t.as_str()));
+        let library = Library::parse(pairs());
         let grades = grade(&library, a.version_at(e.seq), a.hidden);
         let correct: BTreeSet<&'static str> = grades.iter().filter(|g| g.in_library).map(|g| g.name).collect();
         let turn = u(&e.data["turn"]) as u32;
+        if mode == "crdt" {
+            let regraded = grade(&Library::parse_collapsing_identical(pairs()), a.version_at(e.seq), a.hidden);
+            collapsed.push((turn, regraded.iter().filter(|g| g.in_library).count() as u64));
+        }
         let waves = a.releases.iter().filter(|(r, _)| *r < e.seq).count() as u64;
         let standalone = grades.iter().filter(|g| g.standalone).count() as u64;
         turns.push(Checkpoint { turn, waves, correct: correct.len() as u64, standalone });
@@ -1000,10 +1023,13 @@ fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Result<Option<Che
         .iter()
         .enumerate()
         .map(|(k, (r, _))| {
-            // Correct again: those of the wave's functions that were correct at the checkpoint before it.
-            let before = graded.iter().rev().find(|(_, seq, _)| seq < r).map(|(_, _, c)| c);
-            let set: BTreeSet<&str> =
-                changed_by(task, k + 1).into_iter().filter(|f| before.is_some_and(|c| c.contains(f))).collect();
+            // Correct again: those of the wave's functions that were correct in the hub when the wave went
+            // out, under the specs in force before it (decision `a8ba06399068` point 4): the same point in
+            // every mode, whatever turn each agent is on, not the last checkpoint before it.
+            let before: BTreeSet<&'static str> = a.at_release(k).map_or_else(BTreeSet::new, |s| {
+                grade(&s.library, a.version_at(*r), a.hidden).iter().filter(|g| g.in_library).map(|g| g.name).collect()
+            });
+            let set: BTreeSet<&str> = changed_by(task, k + 1).into_iter().filter(|f| before.contains(f)).collect();
             let after = graded.iter().filter(|(_, seq, _)| seq > r);
             let checkpoints = after
                 .enumerate()
@@ -1035,6 +1061,7 @@ fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Result<Option<Che
         recovery,
         breakage,
         tokens_per_correct,
+        crdt_identical_collapsed: (mode == "crdt").then_some(collapsed),
     }))
 }
 
@@ -1224,6 +1251,16 @@ pub fn table(runs: &[Measures]) -> String {
                 Box::new(move |m| cp(m, &|c| format!("{}, {}", c.breakage.after_wave, c.breakage.other))),
             ),
             ("  tokens per correct function", Box::new(move |m| cp(m, &|c| f(c.tokens_per_correct)))),
+            (
+                "Diagnostic, not ranked: CRDT, identical copies collapsed (turn: correct)",
+                Box::new(move |m| {
+                    cp(m, &|c| {
+                        c.crdt_identical_collapsed.as_ref().map_or("n/a".into(), |turns| {
+                            turns.iter().map(|(t, n)| format!("{t}: {n}")).collect::<Vec<_>>().join(", ")
+                        })
+                    })
+                }),
+            ),
             ("Per-delivery diagnostics, per mode only, not comparable across modes:", Box::new(|_| String::new())),
         ];
         ranked.extend(rows);

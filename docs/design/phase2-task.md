@@ -495,9 +495,17 @@ every mode:
 - **Time to correct:** per function correct at the last checkpoint, the
   turn of the first checkpoint from which it is correct at every one.
 - **Recovery per wave:** of the checkpoints after the wave's release, how
-  many pass until the wave's functions that were correct at the checkpoint
-  before it are all correct again, or never if not by the last. If none
-  was correct before it, there is nothing to recover and it reads n/a.
+  many pass until the wave's functions that were correct in the hub when
+  the wave went out are all correct again, or never if not by the last.
+  If none was correct then, there is nothing to recover and it reads n/a.
+  "When the wave went out" is the hub's last snapshot before the release,
+  graded under the specs in force before it: the same point in every mode,
+  with no turn barrier (decision `a8ba06399068` point 4, task
+  `81b0ce075a56`). Before, it was the last checkpoint before the release,
+  which can be a turn stale when agents are on different turns. It isn't
+  the snapshot logged after the release: in Bracken mode the release
+  itself drops the implementations of the specs it supersedes from the
+  accepted layer, and that loss is part of what the wave has to recover.
   The report prints the count beside each wave: `2 (of 5)`, `never (of 5)`,
   `n/a (of 0)`. A wave's functions are its targets, every function defined
   in terms of them (directly or not) and their open contracts' members.
@@ -507,6 +515,14 @@ every mode:
   It counts as after a wave if a wave went out between the two, else as
   other: the semantic-conflict signal.
 - **Tokens per correct function:** the run's tokens over the final count.
+- **Beside the ranking, never in it: CRDT with identical copies
+  collapsed** (decision `a8ba06399068` point 3, task `81b0ce075a56`). The
+  grader counts a name defined more than once as missing, in every mode,
+  and that rule stays. Only CRDT's shared document can hold several copies
+  of a definition, so the report also prints CRDT's checkpoints regraded
+  with copies identical to the first (same name, arity and code, in any
+  module) counted as one; copies that differ still count as duplicates.
+  It's labelled a diagnostic and reads n/a for Git and Bracken.
 
 These are the report's ranking rows.
 
