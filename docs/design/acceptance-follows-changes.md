@@ -32,11 +32,20 @@ that accepts it was recorded.
   - `implements`: an artifact realizes a claim.
   - `refines`: a narrower claim rests on the broader one.
 
-  A relation counts only if its author is `X`'s author or the author of a
-  claim `X` implements. So a stranger's relation can't force re-checks. In the
-  experiment, an artifact's `implements` is its author's, and the setter
-  writes the specs' `depends_on`, as the author of the spec claims. Content is
-  never parsed: a dependency exists only if a relation says so.
+  A relation counts according to the node `N` it leaves, at every step of
+  the walk, not only at `X` (security note `9769ab37127d`):
+  - an `implements` relation counts only if `N`'s author wrote it;
+  - a `depends_on` or `refines` relation counts only if its author is `N`'s
+    author, or the author of a claim that `N` implements through such an
+    `implements`.
+
+  So a stranger can't make `X` implement their own claim, and a third
+  party's edge out of someone else's node drops out of the chain, while
+  their edges out of their own claims count. A stranger's relation can't
+  force a re-check. In the experiment, an artifact's `implements` is its
+  author's, and the setter writes the specs' `depends_on` as the author of
+  the spec claims. Content is never parsed: a dependency exists only if a
+  relation says so.
 - **What changed means.** A contribution `Y` in the closure is *changed* if
   either of these holds:
   - `Y` has a current supersessor under the protocol's supersession rule (a
@@ -50,6 +59,11 @@ that accepts it was recorded.
   fewer than `min_passes` distinct counted passes come after every change in
   its closure. The assessment lists the changes, so a reader sees what to
   re-check against.
+
+Supersession comes first (review `433005735918`, security `5c1e7b364f8a`). A
+`needs_recheck` replacement still supersedes the version it retired, which
+stays `superseded` and out of the accepted layer. Superseded work is
+`superseded`, not work to recheck.
 
 Today's statuses keep their meaning: `retracted`, `rejected`, `accepted`,
 `pending`, `superseded`. `needs_recheck` only ever replaces `accepted`, and
@@ -65,7 +79,9 @@ The cost of one evaluation, for `A` accepted subjects, closures of at most
 - **The closures:** one walk each, `O(A·k)`. They can be shared, since most
   subjects reach the same few claims.
 - **"After":** one descendant walk per change, `O(C·N)`, then a constant-time
-  lookup per pair of pass and change.
+  lookup per pair of pass and change. As built, this is a single sweep in
+  causal order carrying 64 changes at a time, `O(N·C/64)`, shared by every
+  subject (see [As built](#as-built)).
 - **At the pilot's size,** about 1,000 contributions, 90 specs with 139
   dependency edges, and 12 changes: a few thousand steps, small next to the
   topological order every evaluation already computes.
@@ -175,10 +191,54 @@ this note left open:
 3. **In the experiment, the setter states the dependencies** from the task's
    structure (way 1).
 4. **A dependency relation counts only if its author is the subject's author
-   or the author of the claim the subject implements.**
+   or the author of the claim the subject implements.** The manager's answer
+   for the build (`5d2fc3a65d90`, from security note `9769ab37127d`) applies
+   this at every node of the walk, and counts only `implements` relations by
+   the node's own author. [The rule](#the-rule) states it so.
 
 It is off by default (`Policy::follow_changes`, CLI `--follow-changes`), and
 this team's merge gate is unchanged. The class is library and CLI
 (`manyroot::validation`), not protocol. It has an independent review because
 `docs/protocol.md`'s *Acceptance* section gains the opt-in rule. Its use in
 Bracken mode goes through the neutrality review.
+
+## As built
+
+Task `cdfe62a33a9d`:
+- **Library.** `Policy::follow_changes`, `Status::NeedsRecheck` and
+  `Assessment::changes` are in `manyroot::validation`, with
+  `validation::dependencies` for the closure. `Policy::assessor` shares the
+  work between subjects, and `evaluate` and `status` use one. Once per
+  assessor:
+  - each node's direct dependencies and changes;
+  - which changes each pass had seen (one causal sweep);
+  - which changes each node reaches (one walk over strongly connected
+    components).
+
+  The first version asked `is_ancestor` per pair of pass and change, and a
+  stranger could make that cubic (finding `73252cef945e`: 11.7 s at 1,200
+  contributions). Now a subject costs its passes times the number of changes
+  divided by 64. Tests bound both shapes: one subject with many passes and
+  changes, and many subjects on a long chain. Tests are in
+  `crates/manyroot/tests/follow_changes.rs`. They include both of security's
+  cases (a stranger's `implements` onto their own claim, and a third author's
+  `depends_on` mid-chain). With the option off, the fixture Ground's
+  assessments and accepted layer are compared with
+  `tests/fixtures/ground-v1-acceptance.json`, recorded with the code before
+  this change (`44da9245`).
+- **CLI.** `--follow-changes` on `show`, `accepted` and `status`. `show`
+  prints the changes. In `status`'s review queue (task `f1c8478d1012`, PR
+  #77), `needs_recheck` work stands as `recheck`. It ranks with the waiting
+  and ready work, before blocked, rejected and accepted work. It is also
+  listed for every validator's pass except its author's, including the
+  validators who passed it before the change, since their earlier passes
+  don't speak to the change.
+- **Bracken mode.** Only Phase 2 tasks (the ones with waves) use it, so
+  Phase 1 runs read as before. The setter states each spec's `depends_on`
+  when it publishes the task, and states them again for the new spec claims
+  at each release. The harness's pick and the `accepted`, `status` and `show`
+  tools read with `--follow-changes`.
+- **Not added.** The pilot replay as a regression case: it needs the pilot's
+  Ground, which isn't in the repo. A mode test covers the same path instead.
+  It passes an implementation of `toward`, then wave 1 changes `sign`. The
+  implementation then needs a recheck, and a new pass clears it.

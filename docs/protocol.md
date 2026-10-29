@@ -234,6 +234,34 @@ was not written by `X`'s author, and its author is in `validators` (if
 An accepted subject is reported as `superseded` if an accepted subject
 supersedes it.
 
+**Following changes (opt-in).** A policy may set `follow_changes` (off by
+default; decision `2b91a9541aba`). Under it, a subject that would be
+`accepted` is `needs_recheck` instead when something in its *dependency
+closure* changed after its passes. A `needs_recheck` subject is not in the
+policy's accepted layer.
+
+- **The closure** is everything other than `X` reachable from it along non-retracted
+  `depends_on`, `implements` and `refines` relations, from `from` to `to`,
+  that count at the node `N` they leave:
+  - an `implements` relation counts if `N`'s author wrote it;
+  - a `depends_on` or `refines` relation counts if its author is `N`'s
+    author, or the author of a claim that `N` implements through such an
+    `implements`.
+- **A change** to a contribution in the closure is either a non-retracted
+  `supersedes` relation by its author whose replacement is not retracted,
+  or a retraction of it.
+- **After its passes:** `X` is `needs_recheck` when fewer than `min_passes`
+  distinct authors of counted passes have every change among their pass's
+  ancestors.
+- **Supersession comes first.** A replacement that is `needs_recheck` still
+  supersedes, as an `accepted` one does. So the version it retired stays
+  `superseded` and doesn't return to the accepted layer, and a superseded
+  subject is `superseded`, never `needs_recheck`.
+
+Nothing new is written or replicated: the rule reads relations, retractions
+and parents that exist already. Without `follow_changes`, every status is as
+above.
+
 ## Conflicts
 
 Conflicts are computed over a set of *live* subjects. For open conflicts,

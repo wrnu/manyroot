@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use manyroot::store::{self, GroundInfo};
-use manyroot::validation::{open_conflicts, open_supersessors};
+use manyroot::validation::{Assessor, open_conflicts, open_supersessors};
 use manyroot::*;
 use serde_json::{Value, json};
 
@@ -69,6 +69,11 @@ struct PolicyArgs {
     /// Only count evidence from these agents (local name or public key). Repeatable.
     #[arg(long = "validator", value_name = "AGENT")]
     validators: Vec<String>,
+    /// Acceptance follows changes: an accepted contribution whose dependencies (through depends_on,
+    /// implements and refines relations that count) were superseded or retracted after its passes shows
+    /// as needs_recheck, and is out of the accepted layer until a pass that has seen them.
+    #[arg(long)]
+    follow_changes: bool,
 }
 
 #[derive(Subcommand)]
@@ -974,10 +979,12 @@ fn own_claim(s: &Store, names: &Names, who: &Identity, prefix: &str) -> Result<C
 
 /// Where one piece of work stands in the review queue: the policy's status, with a rejection
 /// whose fails all name what they need (`depends_on` relations from the fail evidence, by its
-/// author) told apart as blocked, or ready once all of that is accepted.
+/// author) told apart as blocked, or ready once all of that is accepted. Under `--follow-changes`,
+/// accepted work whose dependencies changed after its passes needs a recheck.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Standing {
     Waiting,
+    Recheck,
     Ready,
     Blocked,
     Rejected,
@@ -990,6 +997,7 @@ impl Standing {
     fn label(self) -> &'static str {
         match self {
             Standing::Waiting => "waiting",
+            Standing::Recheck => "recheck",
             Standing::Ready => "ready",
             Standing::Blocked => "blocked",
             Standing::Rejected => "rejected",
@@ -1002,7 +1010,7 @@ impl Standing {
     /// Queue order: what needs an independent pass first, accepted work last.
     fn rank(self) -> u8 {
         match self {
-            Standing::Waiting | Standing::Ready => 0,
+            Standing::Waiting | Standing::Recheck | Standing::Ready => 0,
             Standing::Blocked => 1,
             Standing::Rejected => 2,
             Standing::Superseded => 3,
@@ -1038,7 +1046,7 @@ fn fail_needs(g: &Graph, view: &CurrentView, evidence: &ContributionId) -> Vec<C
 struct Judge<'a> {
     g: &'a Graph,
     view: &'a CurrentView,
-    policy: &'a Policy,
+    assessor: Assessor<'a>,
     /// Each contribution's place in causal order.
     position: HashMap<ContributionId, usize>,
     accepted: HashMap<ContributionId, bool>,
@@ -1050,7 +1058,8 @@ struct Judge<'a> {
 impl<'a> Judge<'a> {
     fn new(g: &'a Graph, view: &'a CurrentView, policy: &'a Policy, order: &[ContributionId]) -> Self {
         let position = order.iter().enumerate().map(|(n, id)| (*id, n)).collect();
-        Judge { g, view, policy, position, accepted: HashMap::new(), met: HashMap::new(), assessed: 0 }
+        let assessor = policy.assessor(g);
+        Judge { g, view, assessor, position, accepted: HashMap::new(), met: HashMap::new(), assessed: 0 }
     }
 
     fn accepted(&mut self, id: &ContributionId) -> bool {
@@ -1058,7 +1067,7 @@ impl<'a> Judge<'a> {
             return known;
         }
         self.assessed += 1;
-        let yes = self.policy.assess(self.g, id).is_some_and(|a| a.status == Status::Accepted);
+        let yes = self.assessor.assess(id).is_some_and(|a| a.status == Status::Accepted);
         self.accepted.insert(*id, yes);
         yes
     }
@@ -1110,6 +1119,7 @@ impl<'a> Judge<'a> {
     fn standing(&mut self, a: &Assessment) -> (Standing, Vec<ContributionId>) {
         let plain = match a.status {
             Status::Pending => Standing::Waiting,
+            Status::NeedsRecheck => Standing::Recheck,
             Status::Accepted => Standing::Accepted,
             Status::Superseded => Standing::Superseded,
             Status::Retracted => Standing::Retracted,
@@ -1174,7 +1184,7 @@ fn status_rows<'a>(g: &'a Graph, policy: &Policy, all: bool, now: u64) -> (Vec<S
         let mut rows: Vec<Work> = by
             .iter()
             .filter_map(|i| {
-                let assessment = policy.assess(g, i)?;
+                let assessment = judge.assessor.assess(i)?;
                 let (standing, blocked_on) = judge.standing(&assessment);
                 Some(Work { claim: c, work: g.get(i).expect("related ids exist"), assessment, standing, blocked_on })
             })
@@ -1192,6 +1202,11 @@ fn status_rows<'a>(g: &'a Graph, policy: &Policy, all: bool, now: u64) -> (Vec<S
     // Claims with something needing a pass first; otherwise in causal order (the sort is stable).
     implemented.sort_by_key(|(_, rows, _)| !rows.iter().any(|w| w.standing.needs_a_pass()));
     (implemented, unimplemented)
+}
+
+/// Whether work with this status needs a pass: its first, or one after a change it depends on.
+fn needs_pass(status: Status) -> bool {
+    matches!(status, Status::Pending | Status::NeedsRecheck)
 }
 
 /// Distinct validators with a counted pass, as the policy counts them: one validator passing twice is one.
@@ -1215,7 +1230,12 @@ fn queue<'a>(g: &'a Graph, rows: &'a [StatusRow<'a>], me: Option<AgentId>) -> Qu
     let Some(me) = me else {
         return Queue { yours: Vec::new(), contradictions: Vec::new(), for_your_pass: Vec::new(), rest: all };
     };
-    let passed_by_me = |w: &Work| w.assessment.passes.iter().any(|e| g.get(e).is_some_and(|e| e.author() == me));
+    // A pass from before a change doesn't speak to it, so recheck work waits for anyone's pass, its earlier
+    // validators' included.
+    let passed_by_me = |w: &Work| {
+        w.standing != Standing::Recheck
+            && w.assessment.passes.iter().any(|e| g.get(e).is_some_and(|e| e.author() == me))
+    };
     let (yours, others): (Vec<&Work>, Vec<&Work>) = all.into_iter().partition(|w| w.work.author() == me);
     let (for_your_pass, rest) = others.into_iter().partition(|w| w.standing.needs_a_pass() && !passed_by_me(w));
     let order = g.topo_order();
@@ -1265,7 +1285,7 @@ fn caller(names: &Names, agent: Option<&str>) -> (Option<AgentId>, Option<String
 fn work_json(g: &Graph, names: &Names, w: &Work, now: u64) -> Value {
     let mut v = contribution_json(g, names, w.work);
     v["assessment"] = json!(w.assessment);
-    v["waiting"] = json!(w.assessment.status == Status::Pending);
+    v["waiting"] = json!(needs_pass(w.assessment.status));
     v["standing"] = json!(w.standing.label());
     v["blocked_on"] = json!(w.blocked_on);
     v["independent_passes"] = json!(independent_passes(g, &w.assessment));
@@ -1688,7 +1708,7 @@ impl PolicyArgs {
         } else {
             Some(self.validators.iter().map(|v| names.resolve(v)).collect::<Result<BTreeSet<_>>>()?)
         };
-        Ok(Policy { min_passes: self.min_passes, validators })
+        Ok(Policy { min_passes: self.min_passes, validators, follow_changes: self.follow_changes })
     }
 }
 
@@ -1845,6 +1865,10 @@ fn print_show(
             let by: Vec<String> = a.superseded_by.iter().map(|i| i.short()).collect();
             println!("replaced  by {}", by.join(" "));
         }
+        if !a.changes.is_empty() {
+            let by: Vec<String> = a.changes.iter().map(|i| i.short()).collect();
+            println!("changed   by {} (a pass that has seen them clears it)", by.join(" "));
+        }
     }
     println!();
     // Text other agents wrote: each of its lines starts "| ", so none can pass for a line of this listing,
@@ -1964,7 +1988,7 @@ mod tests {
             let fail = add(&mut g, &p, fail);
             add(&mut g, &p, relate(fail, RelationKind::DependsOn, need, String::new()));
         }
-        let policy = Policy { min_passes: 1, validators: None };
+        let policy = Policy::default();
         let start = std::time::Instant::now();
         let (rows, _) = status_rows(&g, &policy, false, ts);
         let works: Vec<&Work> = rows.iter().filter(|(c, _, _)| c.id() == goal).flat_map(|(_, ws, _)| ws).collect();
