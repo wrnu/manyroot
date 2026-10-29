@@ -2,7 +2,9 @@
 
 Status: design spike (visualizer step 1, task d37adc267995, under decision 09f29f6c727b). This document
 holds the JSON the views need (published first, so the server in step 2 can match it), the visual
-language, and the mockups in [visualizer/](visualizer/). Nothing here is production code.
+language, and the mockups in [visualizer/](visualizer/). Nothing here is production code. The real Loom
+(step 3, task 3efd86e31c2b) is `bracken view`'s page, in `crates/bracken/assets/view/`; section 3.1 says
+where it differs from the mockup.
 
 ## 1. The JSON the views need
 
@@ -63,7 +65,9 @@ order (`topo_order` restricted to what's new since the cursor). Without `since`,
   "depth":   [0, 1, 2],
   "tags":    [["auth"], [], []],
   "refs":    ["<64 hex>"],
-  "retracted": [5, 17]
+  "retracted": [5, 17],
+  "failed":  [2],
+  "retracts": [[4, 2]]
 }
 ```
 
@@ -80,7 +84,13 @@ order (`topo_order` restricted to what's new since the cursor). Without `since`,
 - `retracted` lists the positions (in this response, or by id in `refs` terms as above) that a
   retraction, here or earlier, now targets. The page also learns of retractions from the `retract`
   contributions themselves; this list saves it resolving their targets.
-- Size: about 140 bytes a contribution, 7 MB for 50,000. That is the one big read; everything after it is
+- `failed` lists the positions of this response's evidence whose verdict is `fail` (added in step 3): the
+  Loom draws passing and failing evidence differently, and the verdict is otherwise only in the text.
+- `retracts` pairs each retraction in this response with its target's position, in the same terms
+  (added in step 3). With it the page works out what's retracted itself, as `Graph::all_retracted`
+  does, so a delta can take a retraction back (a retraction of a retraction) and the page still equals a
+  fresh load, and it can say what was retracted at any cursor. `retracted` stays for other readers.
+- Size: about 120 bytes a contribution, 5.9 MB for 50,000 (measured). That is the one big read; everything after it is
   incremental.
 
 ### 1.3 `GET /api/status`: where every subject stands now
@@ -165,6 +175,8 @@ unique prefix of at least 8 digits; an unknown or ambiguous one is a 404 with
 - `statement` in these short entries is the first line, cut to 200 characters; the side panel fetches
   the full text from 1.4. Each short entry also carries its `timestamp_ms`, so the view can replay the
   claim's life without another request.
+- An unknown or malformed cursor in `?as_of=` (or in `?since=` anywhere) is a 400 with
+  `{"error": "..."}`, as is any parameter a page doesn't take: the server never ignores one.
 - `?as_of=<cursor>` answers as the replica stood at that cursor: only contributions the cursor has seen,
   and every `assessment`, `status`, `counted` and intent end worked out over them. The Root view's replay
   scrubs through the cursors of the claim's own events. (The mockup approximates this from evidence
@@ -306,7 +318,8 @@ Text outside the subset (other scripts, emoji) falls back to system fonts, glyph
 The 1,000 and 50,000 Grounds in the mockup are generated in the page (`js/synthetic.js`, deterministic)
 and labelled synthetic. Measured in headless Chrome on the builder's Mac, a full redraw takes about
 25 ms at 50,000 and 3 ms at 1,000: one canvas, with no DOM element per knot. Hovering at 50,000 costs
-about 35 ms a move, because it walks the whole ancestry; production should cache that walk.
+about 35 ms a move, because it walks the whole ancestry; production should cache that walk. (The real
+view in section 3.1 does: about 9 ms a redraw and 8 ms a hover at 50,000.)
 The real Root view is one claim, so it's small at any Ground size; a claim with many implementations
 spreads its roots wider.
 
@@ -335,6 +348,70 @@ spreads its roots wider.
 | Herbarium | 1,000 | 50,000 |
 |---|---|---|
 | ![](visualizer/shots/loom-herbarium.webp) | ![](visualizer/shots/loom-1000.webp) | ![](visualizer/shots/loom-50000.webp) |
+
+#### In `bracken view` (step 3)
+
+The Loom is `bracken view`'s page (`crates/bracken/assets/view/`: `index.html`, `common.js`, `loom.js`, the
+two stylesheets and the fonts, embedded in the binary). It's the mockup on the live replica, with these
+differences:
+
+- **Data.** It reads `/api/ground`, `/api/graph` (all pages of it) and `/api/status` once, then applies
+  each `/api/events` delta: new contributions append in causal order, `refs` name what it already holds,
+  and a new author index refetches `/api/ground`. A delta that names something it doesn't hold reloads the
+  graph. `status_changed` (or `null`) refetches `/api/status`. When the stream drops, the page reconnects
+  with its latest cursor. Text is fetched only to be shown: all of it for a Ground up to 3,000
+  contributions (`/api/contributions`, a page at a time), otherwise one `/api/contribution/<id>` per
+  label, hover or lineage entry, four at a time. Clicking a knot fills its label from
+  `/api/contribution/<id>`.
+- **Behind now.** Scrubbed back, the page shows retractions as they stood at the surface, worked out from
+  `retracts` over the knots at or above it. It doesn't show statuses as they stood: a status is the
+  policy over the Ground at that cursor (who counts, self-evidence, supersessions), and the page would
+  have to copy the policy to get it right. `/api/status?as_of=` (option b) would be exact, but a past
+  graph takes 9 to 46 s to build at 50,000 on a debug build, too slow for a scrubber. So behind now,
+  knots draw neutral (no blooms), the masthead says "scrubbed back: retractions as they stood, status
+  only now", and a knot's label gives its status and evidence marked "now". The label's lineage lists
+  only what was there at the surface, and a selected knot written after it is withheld ("not written
+  yet at this point") until the scrubber passes it again. The cut is by the axis:
+  on authors' clocks, a skewed clock can put a knot above its parent.
+- **You left here.** The flag is the cursor the page had when the reader last left it (on `pagehide`, or
+  when the tab is hidden), kept in this browser's `localStorage` under `bracken-left:<ground id>` and
+  nowhere else. It marks the latest of that cursor's heads. **Back to where you left** scrubs to it. Concurrent work
+the reader hadn't seen can sit above that line: the flag is a place, not the exact set.
+- **Thread headings.** A prefix up to the first `-` that several agents share is dropped from the headings
+  (`builder-sync` heads its thread as `sync`), unless that would make two headings the same. Each heading
+  is as wide as its text (or its count), as long as it stays clear of its neighbours: two neighbours
+  split the space between them, and a short one leaves the rest to the other. So `demo-harness` and
+  `documentation` fit at 12 agents in 1440 px. The full name is on hover and in every label.
+- **Safety, beyond the mockup.** The element helpers make only the elements and set only the attributes
+  on an allowlist (`div`, `span`, `p`, … and `svg`, `g`, `path`, `circle`; `class`, `aria-*`, `title`,
+  the SVG geometry and paint attributes), and every attribute the page sets goes through them. Ground text is isolated (`unicode-bidi: isolate`, or `<bdi>` inside a
+  line of other words), so a direction mark in it can't reorder the words around it.
+- **Scale.** Every knot's place, and the spatial index for hit-testing (16 px cells), are worked out when
+  the geometry changes (size, axis, zoom, the Ground growing), not on hover or replay frames. Hover walks
+  the ancestry with typed-array marks, and a late knot's ancestry past 5,000 is drawn dense, as the
+  Ground is. Theme colours are read once per theme, not per knot.
+- **Not yet.** The label doesn't link to the Root view (step 4), and the masthead names only the Loom.
+
+Measured in headless Chrome (1440 × 900) on throwaway Grounds from `cargo run --example sample-ground`,
+against a debug build of the server:
+
+| Contributions | Full redraw, median (max) | Hover, median (max) | Grow, frame interval |
+|---|---|---|---|
+| 10 | 0.3 ms (0.5) | 0.5 ms (0.6) | 16.7 ms |
+| 1,000 | 1.9 ms (2.4) | 1.9 ms (4.1) | 16.7 ms |
+| 50,000 | 11.0 ms (19.6) | 9.3 ms (21.6) | 16.7 ms (max 18.4) |
+
+A full redraw here includes placing every knot and rebuilding the index, as a resize does. Hover counts
+the hit test, the ancestry walk and the redraw. At 50,000, the first draw comes 2.1 s after the page
+opens: one 5.9 MB `/api/graph`. These were measured with the machine under heavy load (load average
+over 200); on a quieter machine the first head gave 9.3 ms a redraw, 7.8 ms a hover and a first draw
+at 0.9 s.
+
+![The live Loom on a throwaway Ground of 10](visualizer/shots/view-10.webp)
+
+| 1,000, a knot's label open | 50,000 | 50,000 in Herbarium |
+|---|---|---|
+| ![](visualizer/shots/view-1000.webp) | ![](visualizer/shots/view-50000.webp) | ![](visualizer/shots/view-50000-herbarium.webp) |
 
 ### 3.2 The Root view ([visualizer/root.html](visualizer/root.html))
 
@@ -388,6 +465,7 @@ scale. It's drawn by the same code and tokens as the views.
 - **Production code for the Loom.** It can take `js/common.js` (knots, looks, safe text) and most of
   `js/loom.js` as they are. The parts to replace are data loading (fetch `/api/graph` once, then apply
   `/api/events` deltas through `refs`), and a spatial index that isn't rebuilt on every frame at 50,000.
+  Done in step 3: see section 3.1.
 - **Open choices for later steps:**
   - colour for more than twelve agents (today the inks repeat);
   - where the Trust constellation and the Tension map sit in this world. A first thought: pollinators

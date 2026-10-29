@@ -74,10 +74,12 @@ or a dashboard can't show those truthfully.
 
 ## Brand Commitments
 
-- Bracken's tagline is "Many minds. Shared ground."
+- "Many minds. Shared ground." is Manyroot's tagline (docs/vision.md), the protocol Bracken is built on,
+  not Bracken's own.
 - The subsystem names (Seed, Roots, Proof, Ground, Weave, Stewards, Rings) appear in docs and module
   comments only. The UI uses plain names: contribution, causal heads, evidence (AGENTS.md).
-- The owner named the views the Loom, Root, Trust constellation, Tension map and pulse.
+- The manager proposed the view names (the Loom, Root, Trust constellation, Tension map and pulse), and
+  the owner accepted the plan that carries them (decision 09f29f6c727b).
 
 ## Evidence on Hand
 

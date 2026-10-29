@@ -512,7 +512,8 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let g = s.graph();
             let c = g.get(&resolve(&s, &id)?).expect("resolved ids exist");
             if out.json {
-                print_json(&show_json(g, &names, &policy, c, now_ms()));
+                let view = CurrentView::new(g, &g.topo_order());
+                print_json(&show_json(g, &names, &policy, &view, c, now_ms()));
             } else {
                 let assessment = policy.assess(g, &c.id());
                 let referrers: Vec<&Contribution> = g.referrers(&c.id()).collect();
@@ -1303,11 +1304,12 @@ fn contribution_json(g: &Graph, names: &Names, c: &Contribution) -> Value {
 }
 
 /// `show --json`: the contribution, its assessment, everything referring to it, and its live intents.
-fn show_json(g: &Graph, names: &Names, policy: &Policy, c: &Contribution, now: u64) -> Value {
+/// `view` is the replica's current view, which a caller answering many requests works out once.
+fn show_json(g: &Graph, names: &Names, policy: &Policy, view: &CurrentView, c: &Contribution, now: u64) -> Value {
     let mut v = contribution_json(g, names, c);
     v["assessment"] = json!(policy.assess(g, &c.id()));
     v["referrers"] = g.referrers(&c.id()).map(|r| contribution_json(g, names, r)).collect();
-    let intents = live_intents(g, &CurrentView::new(g, &g.topo_order()), &c.id(), now);
+    let intents = live_intents(g, view, &c.id(), now);
     v["intents"] = intents.iter().map(|i| intent_json(g, names, i, now)).collect();
     v
 }

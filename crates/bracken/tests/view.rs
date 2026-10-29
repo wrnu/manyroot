@@ -227,8 +227,8 @@ fn every_endpoint_is_read_only_and_carries_the_csp() {
     let v = view(&dir);
     let gets = [
         "/".to_owned(),
-        "/app.js".to_owned(),
-        "/style.css".to_owned(),
+        "/loom.js".to_owned(),
+        "/loom.css".to_owned(),
         "/api/ground".to_owned(),
         "/api/graph".to_owned(),
         "/api/graph?since=&limit=1".to_owned(),
@@ -362,12 +362,13 @@ fn the_api_has_the_design_shapes() {
     let out = ok(&dir, &["artifact", big.to_str().unwrap(), "--name", "big.rs", "--implements", &claim, "--as", "bob"]);
     let (art, relation) = out.split_once('\n').unwrap();
     let pass = ok(&dir, &["evidence", art, "pass", "--method", "cargo test", "--as", "val"]);
+    let fail = ok(&dir, &["evidence", &rival, "fail", "--method", "review", "--as", "val"]);
     ok(&dir, &["evidence", art, "pass", "--method", "self", "--as", "bob"]);
     let live = ok(&dir, &["intend", &claim, "--as", "alice"]).lines().next().unwrap().to_owned();
     let done = ok(&dir, &["intend", &claim, "--as", "bob"]).lines().next().unwrap().to_owned();
     ok(&dir, &["relate", art, "implements", &claim, "--as", "bob"]);
     let gone = ok(&dir, &["intend", &claim, "--as", "val"]).lines().next().unwrap().to_owned();
-    ok(&dir, &["retract", &gone, "--as", "val"]);
+    let cut = ok(&dir, &["retract", &gone, "--as", "val"]);
     let refinement = ok(&dir, &["claim", "spec: parse ISO dates", "--as", "val"]);
     ok(&dir, &["relate", &refinement, "refines", &claim, "--as", "val"]);
     let v = view(&dir);
@@ -393,6 +394,8 @@ fn the_api_has_the_design_shapes() {
     assert_eq!(graph["tags"][at(&claim)], serde_json::json!(["spec"]));
     assert_eq!(graph["depth"][at(ids[0])], 0);
     assert!(graph["retracted"].as_array().unwrap().contains(&serde_json::json!(at(&gone))));
+    assert_eq!(graph["failed"], serde_json::json!([at(&fail)]), "failing evidence, so the page draws it");
+    assert_eq!(graph["retracts"], serde_json::json!([[at(&cut), at(&gone)]]), "each retraction and its target");
     for (i, parents) in graph["parents"].as_array().unwrap().iter().enumerate() {
         for p in parents.as_array().unwrap() {
             assert!((p.as_u64().unwrap() as usize) < i, "parents come first");
@@ -614,6 +617,103 @@ fn a_write_during_a_reread_still_shows() {
             assert!(Instant::now() < deadline, "round {round}: the view stayed at {have} of {want}");
             std::thread::sleep(Duration::from_millis(200));
         }
+    }
+}
+
+/// Every asset is served with the CSP and its media type: each file the binary embeds (the page, its
+/// scripts and styles, the fonts and their licence), and everything the page and its styles name.
+#[test]
+fn every_asset_is_served_with_the_csp() {
+    let dir = ground();
+    let v = view(&dir);
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/view");
+    let mut paths = vec!["/".to_owned()];
+    for (sub, prefix) in [("", "/"), ("fonts", "/fonts/")] {
+        for e in std::fs::read_dir(root.join(sub)).unwrap() {
+            let p = e.unwrap().path();
+            let name = p.file_name().unwrap().to_str().unwrap().to_owned();
+            if p.is_file() && name != "index.html" {
+                paths.push(format!("{prefix}{name}"));
+            }
+        }
+    }
+    // What the page and its styles load, so nothing it asks for is missing.
+    let page = String::from_utf8(v.get("/").body).unwrap();
+    let mut named: Vec<String> = Vec::new();
+    for attr in ["src=\"", "href=\""] {
+        for part in page.split(attr).skip(1) {
+            named.push(part.split('"').next().unwrap().to_owned());
+        }
+    }
+    for css in ["/visualizer.css", "/loom.css"] {
+        let text = String::from_utf8(v.get(css).body).unwrap();
+        for part in text.split("url(\"").skip(1) {
+            named.push(part.split('"').next().unwrap().to_owned());
+        }
+    }
+    named.retain(|n| !n.starts_with("data:"));
+    assert!(named.len() >= 7, "{named:?}");
+    for n in &named {
+        assert!(n.starts_with('/') && !n.starts_with("//"), "{n} isn't the view's own");
+        assert!(paths.contains(n), "{n} is named but not embedded");
+    }
+    let media = |p: &str| match p.rsplit('.').next().unwrap() {
+        "js" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "woff2" => "font/woff2",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "text/html; charset=utf-8",
+    };
+    for p in &paths {
+        let r = v.get(p);
+        assert_security_headers(p, &r);
+        assert_eq!(r.headers["content-type"], media(p), "{p}");
+        assert!(!r.body.is_empty(), "{p}");
+    }
+}
+
+/// Two agent entries that give one name to different keys: neither key is shown by that name, so one
+/// agent can't pass as another, and the name a key also has elsewhere still shows.
+#[test]
+fn a_name_two_keys_claim_names_neither() {
+    let dir = ground();
+    ok(&dir, &["claim", "spec", "--as", "alice"]);
+    ok(&dir, &["claim", "spec too", "--as", "val"]);
+    let val = std::fs::read_to_string(dir.join("agents/val.json")).unwrap();
+    let val: Value = serde_json::from_str(&val).unwrap();
+    let forged = serde_json::json!({"name": "alice", "agent": val["agent"]});
+    std::fs::write(dir.join("agents/mallory.json"), forged.to_string()).unwrap();
+    let v = view(&dir);
+    let names: Vec<Value> =
+        v.api("/api/ground")["agents"].as_array().unwrap().iter().map(|a| a["name"].clone()).collect();
+    assert_eq!(names, [Value::Null, serde_json::json!("val")]);
+}
+
+/// A key published under two names shows by the one the CLI picks, so the view and `log --json` agree.
+#[test]
+fn a_key_with_two_names_shows_as_the_cli_shows_it() {
+    let dir = ground();
+    ok(&dir, &["claim", "spec", "--as", "bob"]);
+    let bob = std::fs::read_to_string(dir.join("agents/bob.json")).unwrap();
+    let bob: Value = serde_json::from_str(&bob).unwrap();
+    std::fs::write(dir.join("agents/zed.json"), serde_json::json!({"name": "zed", "agent": bob["agent"]}).to_string())
+        .unwrap();
+    let cli = json(&dir, &["log", "--json"])[0]["author_name"].clone();
+    let v = view(&dir);
+    assert_eq!(v.api("/api/ground")["agents"][0]["name"], cli);
+    assert_eq!(cli, "zed");
+}
+
+/// `BRACKEN_VIEW_REREAD_DELAY_MS` is capped: a huge value still lets a write show within a few polls.
+#[test]
+fn the_reread_delay_is_capped() {
+    let dir = ground();
+    let v = view_with(&dir, &[("BRACKEN_VIEW_REREAD_DELAY_MS", "600000")]);
+    ok(&dir, &["claim", "spec", "--as", "alice"]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while v.api("/api/ground")["contributions"] != 1 {
+        assert!(Instant::now() < deadline, "the write didn't show: the delay isn't capped");
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
