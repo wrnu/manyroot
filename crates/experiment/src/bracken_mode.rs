@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 use crate::args::Args;
 use crate::lang::{Library, parse_module};
 use crate::mode::{Mode, Session, Store, StoreConfig, ToolSpec, is_within};
-use crate::task::{CHANGES, MODULES, SPECS, Version, change_tag, check, spec_named, task_text};
+use crate::task::{Task, Version, change_tag};
 
 /// The media type of an implementation artifact.
 pub const MEDIA_TYPE: &str = "text/x-stacklib";
@@ -49,7 +49,7 @@ impl Mode for BrackenMode {
         "bracken"
     }
 
-    fn tools(&self) -> Vec<ToolSpec> {
+    fn tools(&self, _task: Task) -> Vec<ToolSpec> {
         let id = json!({"type": "string", "description": "A contribution id: 12 to 64 hex digits"});
         let text = json!({"type": "string"});
         vec![
@@ -142,7 +142,7 @@ fn opt(name: &str, value: impl std::fmt::Display) -> String {
 /// is checked by its rule (unless the test-only unchecked args are given), and
 /// lands after `--` or inside one `--option=value` argument, never anywhere it
 /// could be read as an option.
-pub fn plan(name: &str, args: &Args, identity: &str) -> Result<Plan, String> {
+pub fn plan(name: &str, args: &Args, identity: &str, task: Task) -> Result<Plan, String> {
     let read = |argv: Vec<String>| Plan { argv, stdin: None, file: None, json: true };
     let write = |mut head: Vec<String>, tail: Vec<String>| {
         head.insert(1, opt("as", identity));
@@ -176,7 +176,7 @@ pub fn plan(name: &str, args: &Args, identity: &str) -> Result<Plan, String> {
             write(head, vec![s(args.text("statement")?)])
         }
         "artifact" => {
-            let function = args.spec_name("function")?;
+            let function = args.spec_name("function", task)?;
             let content = args.text("content")?;
             let head = vec![s("artifact"), opt("name", function), opt("media-type", MEDIA_TYPE)];
             Plan { file: Some(s(content)), ..write(head, vec![]) }
@@ -271,7 +271,7 @@ impl BrackenStore {
 
     fn state(&mut self) -> Result<Snapshot, String> {
         let current = self.json(&["log", "--json", "--current"])?;
-        Snapshot::new(&current, &self.saved("setter.txt")?, self.config.accept_rule)
+        Snapshot::new(&current, &self.saved("setter.txt")?, self.config.accept_rule, self.config.task)
     }
 
     /// A key this store saved at setup.
@@ -304,9 +304,9 @@ impl BrackenStore {
             opt("as", &me),
             "--tag=task".into(),
             "--".into(),
-            task_text(Version::ORIGINAL),
+            self.config.task.task_text(Version::ORIGINAL),
         ])?;
-        for s in SPECS {
+        for s in self.config.task.specs() {
             let statement = format!("Implement {}.", s.description);
             let spec = self.write(vec![
                 "claim".into(),
@@ -372,11 +372,12 @@ impl Store for BrackenStore {
         }
         let args = Args::new(args, allowed(name))?;
         if name == "artifact"
-            && let Some(problem) = artifact_problem(args.spec_name("function")?, args.text("content")?)
+            && let Some(problem) =
+                artifact_problem(self.config.task, args.spec_name("function", self.config.task)?, args.text("content")?)
         {
             return Err(problem);
         }
-        let plan = plan(name, &args, &self.config.identity)?;
+        let plan = plan(name, &args, &self.config.identity, self.config.task)?;
         self.execute(plan)
     }
 
@@ -474,7 +475,7 @@ impl Store for BrackenStore {
         let me = self.config.identity.clone();
         let task = state.tagged("task").first().map(|e| e.id.clone()).ok_or("no task claim")?;
         let mut released = Vec::new();
-        for c in CHANGES {
+        for c in self.config.task.changes() {
             let old = state.spec_claim(c.target).ok_or_else(|| format!("no spec claim for {}", c.target))?;
             self.write(vec![
                 "claim".into(),
@@ -509,18 +510,34 @@ impl Store for BrackenStore {
 
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String> {
         let state = self.state()?;
-        Ok(modules_of(&state.integrated()))
+        Ok(modules_of(self.config.task, &state.integrated()))
     }
 
     fn record(&mut self, tool: &str, args: &Value, _result: &Value) -> Result<Value, String> {
+        let task = self.config.task;
         let of = |function: &str, text: &str| {
-            let defs = crate::metrics::definitions(&[("artifact".into(), text.into())]);
+            let defs = crate::metrics::definitions(task, &[("artifact".into(), text.into())]);
             defs.get(function).map(|d| vec![(function.to_string(), d.clone())]).unwrap_or_default()
         };
-        match tool {
+        // A task with open contracts: the calls that can change which of this agent's own implementations of a
+        // member are current also record them, the agent's working copy of the contracts (decision `979e5085a1e7`).
+        let members = |me: &mut BrackenStore| -> Result<Option<Value>, String> {
+            if task.contracts().is_empty() || !["artifact", "relate", "claim", "retract"].contains(&tool) {
+                return Ok(None);
+            }
+            let (state, key) = (me.state()?, me.saved("key.txt")?);
+            let own: Vec<_> = state
+                .own_implementations(&key)
+                .into_iter()
+                .filter(|(f, _)| task.contract_of(f).is_some())
+                .flat_map(|(f, text)| of(f, &text))
+                .collect();
+            Ok(Some(json!(own)))
+        };
+        let mut record = match tool {
             "artifact" => {
                 let function = args["function"].as_str().unwrap_or_default();
-                Ok(json!({ "writes": of(function, args["content"].as_str().unwrap_or_default()) }))
+                json!({ "writes": of(function, args["content"].as_str().unwrap_or_default()) })
             }
             // A non-author's fail on an implementation: a counted fail, which keeps it out (decision `5e8df6996a2e`).
             "evidence" if args["verdict"] == "fail" => {
@@ -532,16 +549,23 @@ impl Store for BrackenStore {
                     }
                     _ => Vec::new(),
                 };
-                Ok(json!({ "blocks": blocks }))
+                json!({ "blocks": blocks })
             }
-            _ => Ok(Value::Null),
+            _ => Value::Null,
+        };
+        if let Some(own) = members(self)? {
+            if record.is_null() {
+                record = json!({});
+            }
+            record["members"] = own;
         }
+        Ok(record)
     }
 }
 
 impl BrackenStore {
     fn tools_known(&self, name: &str) -> bool {
-        BrackenMode.tools().iter().any(|t| t.name == name)
+        BrackenMode.tools(self.config.task).iter().any(|t| t.name == name)
     }
 
     fn execute(&mut self, mut plan: Plan) -> Result<Value, String> {
@@ -566,17 +590,18 @@ impl BrackenStore {
             return Err("check takes an artifact".into());
         }
         let function = artifact.body["name"].as_str().unwrap_or_default().to_string();
-        let spec = spec_named(&function).ok_or("the artifact doesn't name a task function")?;
+        let task = self.config.task;
+        let spec = task.spec_named(&function).ok_or("the artifact doesn't name a task function")?;
         let text = artifact.body["text"].as_str().unwrap_or_default().to_string();
-        if let Some(problem) = artifact_problem(spec.name, &text) {
+        if let Some(problem) = artifact_problem(task, spec.name, &text) {
             return Ok(json!({ "function": spec.name, "ok": false, "details": problem }));
         }
         let me = self.saved("key.txt")?;
         let mut programs = state.working(&me);
         programs.insert(spec.name, text);
-        let modules = modules_of(&programs);
+        let modules = modules_of(task, &programs);
         let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
-        let result = check(&library, spec.name, state.version())?;
+        let result = task.check(&library, spec.name, state.version())?;
         Ok(json!({ "function": spec.name, "ok": result.ok(), "details": result.details() }))
     }
 }
@@ -585,11 +610,12 @@ impl BrackenStore {
 pub type Programs = BTreeMap<&'static str, String>;
 
 /// Module texts for `programs`: each artifact's text in its function's module.
-pub fn modules_of(programs: &Programs) -> Vec<(String, String)> {
-    MODULES
+pub fn modules_of(task: Task, programs: &Programs) -> Vec<(String, String)> {
+    task.modules()
         .iter()
         .map(|&m| {
-            let text: String = SPECS
+            let text: String = task
+                .specs()
                 .iter()
                 .filter(|s| s.module == m)
                 .filter_map(|s| programs.get(s.name))
@@ -604,7 +630,7 @@ pub fn modules_of(programs: &Programs) -> Vec<(String, String)> {
 /// fit [`MAX_ARTIFACT_BYTES`], define `function` once, and name every helper
 /// starting with `function` (no spec name starts another, so a helper is never
 /// a task function and never collides with another function's helpers).
-pub fn artifact_problem(function: &str, text: &str) -> Option<String> {
+pub fn artifact_problem(task: Task, function: &str, text: &str) -> Option<String> {
     if text.len() > MAX_ARTIFACT_BYTES {
         return Some(format!("an implementation holds at most {MAX_ARTIFACT_BYTES} bytes, not {}", text.len()));
     }
@@ -617,7 +643,7 @@ pub fn artifact_problem(function: &str, text: &str) -> Option<String> {
         if !names.insert(d.name.as_str()) {
             return Some(format!("`{}` is defined more than once", d.name));
         }
-        if d.name != function && (spec_named(&d.name).is_some() || !d.name.starts_with(function)) {
+        if d.name != function && (task.spec_named(&d.name).is_some() || !d.name.starts_with(function)) {
             return Some(format!(
                 "helper `{}` must be named starting with `{function}`, and not be a task function",
                 d.name
@@ -707,6 +733,7 @@ pub struct Snapshot {
     /// For each target id, each validator's latest current verdict.
     verdicts: BTreeMap<String, BTreeMap<String, String>>,
     rule: AcceptRule,
+    task: Task,
 }
 
 /// One implementation of a current spec.
@@ -716,7 +743,7 @@ struct Implementation<'a> {
 }
 
 impl Snapshot {
-    pub fn new(current: &Value, setter: &str, rule: AcceptRule) -> Result<Snapshot, String> {
+    pub fn new(current: &Value, setter: &str, rule: AcceptRule, task: Task) -> Result<Snapshot, String> {
         let rows = current.as_array().ok_or("log --json is not a list")?;
         let current: Vec<Entry> = rows
             .iter()
@@ -737,7 +764,7 @@ impl Snapshot {
             // Causal order: a later verdict by the same validator replaces its earlier one.
             verdicts.entry(target.to_string()).or_default().insert(e.author.clone(), verdict.to_string());
         }
-        Ok(Snapshot { current, setter: setter.to_string(), verdicts, rule })
+        Ok(Snapshot { current, setter: setter.to_string(), verdicts, rule, task })
     }
 
     /// The setter's current claims tagged `tag`.
@@ -762,14 +789,18 @@ impl Snapshot {
     /// The change requests this replica has seen.
     pub fn version(&self) -> Version {
         let tags: Vec<&str> = self.tagged("change").iter().flat_map(|e| e.tags()).collect();
-        CHANGES.iter().filter(|c| tags.contains(&change_tag(c.change))).fold(Version::ORIGINAL, |v, c| v.with(c.change))
+        let task = self.task;
+        task.changes()
+            .iter()
+            .filter(|c| tags.contains(&change_tag(c.change)))
+            .fold(Version::ORIGINAL, |v, c| v.with(c.change))
     }
 
     /// Current artifacts that implement a current spec, related by their own
     /// author, and hold that function's definition by the artifact rules.
     fn implementations(&self) -> Vec<Implementation<'_>> {
         let specs: BTreeMap<String, &'static str> =
-            SPECS.iter().filter_map(|s| self.spec_claim(s.name).map(|id| (id, s.name))).collect();
+            self.task.specs().iter().filter_map(|s| self.spec_claim(s.name).map(|id| (id, s.name))).collect();
         let by_id: BTreeMap<&str, &Entry> = self.current.iter().map(|e| (e.id.as_str(), e)).collect();
         let mut out = Vec::new();
         for r in self.current.iter().filter(|e| e.kind == "relation" && e.body["kind"] == "implements") {
@@ -778,7 +809,7 @@ impl Snapshot {
             if artifact.kind == "artifact"
                 && artifact.author == r.author
                 && artifact.body["name"] == spec
-                && artifact_problem(spec, artifact.body["text"].as_str().unwrap_or_default()).is_none()
+                && artifact_problem(self.task, spec, artifact.body["text"].as_str().unwrap_or_default()).is_none()
                 && !out.iter().any(|i: &Implementation| i.entry.id == artifact.id)
             {
                 out.push(Implementation { spec, entry: artifact });
@@ -847,10 +878,21 @@ impl Snapshot {
     /// for each spec, the fixed rule's pick; else the latest current
     /// implementation by `me` (a public key); else the latest current one by anyone.
     pub fn working(&self, me: &str) -> Programs {
+        self.working_of(me)
+    }
+
+    /// The current implementations by `me` (a public key), in causal order, as `(function, text)`.
+    pub fn own_implementations(&self, me: &str) -> Vec<(&'static str, String)> {
+        let mut own: Vec<_> = self.implementations().into_iter().filter(|i| i.entry.author == me).collect();
+        own.sort_by_key(|i| i.entry.index);
+        own.into_iter().map(|i| (i.spec, i.entry.body["text"].as_str().unwrap_or_default().to_string())).collect()
+    }
+
+    fn working_of(&self, me: &str) -> Programs {
         let picked = self.pick();
         let implementations = self.implementations();
         let mut out = Programs::new();
-        for s in SPECS {
+        for s in self.task.specs() {
             let latest = |mine: bool| {
                 implementations
                     .iter()

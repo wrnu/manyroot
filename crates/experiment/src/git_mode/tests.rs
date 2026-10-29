@@ -10,6 +10,7 @@ use crate::candidates::correct_programs;
 
 fn config(dir: &Path, name: &str) -> StoreConfig {
     StoreConfig {
+        task: Task::Phase1,
         dir: dir.join(name),
         bracken: PathBuf::from("/nonexistent/bracken"),
         git: crate::driver::git_binary().expect("git"),
@@ -100,8 +101,8 @@ fn only_git_started(trace: &str) {
 }
 
 fn def(name: &str) -> String {
-    let spec = crate::task::spec_named(name).expect("a spec");
-    format!("def {name} {} : {}", spec.arity, correct_programs(Version::ORIGINAL)[name])
+    let spec = Task::Phase1.spec_named(name).expect("a spec");
+    format!("def {name} {} : {}", spec.arity, correct_programs(Task::Phase1, Version::ORIGINAL)[name])
 }
 
 #[test]
@@ -197,7 +198,7 @@ fn only_the_setter_writes_tasks_md() {
     assert!(f.tool(0, "read", json!({"file": "TASKS.md"})).is_ok());
     // A copy whose worker went wrong commits TASKS.md anyway: CI refuses it.
     f.tool(0, "switch", json!({"branch": "tasks", "create": true})).expect("switch");
-    std::fs::write(f.copies[0].work().join(TASKS), tasks_md(Version::all())).expect("write");
+    std::fs::write(f.copies[0].work().join(TASKS), Task::Phase1.tasks_md(Task::Phase1.all())).expect("write");
     f.copies[0].git(&["commit", "--quiet", "--all", "--file=-"], Some(b"m")).expect("commit");
     f.sync(0);
     let n =
@@ -209,7 +210,7 @@ fn only_the_setter_writes_tasks_md() {
     f.hub.release_changes().expect("release");
     assert_eq!(f.copies[1].version_at("refs/remotes/hub/main").expect("version"), Version::ORIGINAL);
     f.sync(1);
-    assert_eq!(f.copies[1].version_at("refs/remotes/hub/main").expect("version"), Version::all());
+    assert_eq!(f.copies[1].version_at("refs/remotes/hub/main").expect("version"), Task::Phase1.all());
 }
 
 #[test]
@@ -341,7 +342,7 @@ fn is_free_text(slot: &str) -> bool {
 
 #[test]
 fn every_tool_slot_is_in_the_table() {
-    for t in GitMode.tools() {
+    for t in GitMode.tools(Task::Phase1) {
         let props = t.input_schema["properties"].as_object().expect("properties");
         for (key, schema) in props {
             if schema["type"] == "string" {

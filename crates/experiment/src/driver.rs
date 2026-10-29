@@ -198,6 +198,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         git: cfg.git.clone(),
         identity: identity.into(),
         trace: cfg.trace,
+        task: cfg.plan.task,
         accept_rule: cfg.plan.accept_rule,
     };
 
@@ -237,7 +238,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     let plan = blake3::hash(&plan).to_hex().to_string();
     events.log(None, "setup", json!({"mode": mode.name(), "agents": cfg.agents, "turns": cfg.turns, "plan": plan}));
 
-    let mut tools = mode.tools();
+    let mut tools = mode.tools(cfg.plan.task);
     tools.extend(core_tools());
     let run = Run {
         cfg,
@@ -497,8 +498,11 @@ impl Run<'_> {
         let args_text = args.to_string();
         let name = &self.names[i];
         // Bug reports, for the measures: private notes are no one else's to read.
-        let reports: Vec<(String, Vec<i64>)> =
-            if tool == "notes_write" { Vec::new() } else { strings(&args).flat_map(bug_reports).collect() };
+        let reports: Vec<(String, Vec<i64>)> = if tool == "notes_write" {
+            Vec::new()
+        } else {
+            strings(&args).flat_map(|t| bug_reports(self.cfg.plan.task, t)).collect()
+        };
         self.events.log(
             Some(name),
             "tool_call",

@@ -22,6 +22,7 @@ use bracken_experiment::mode::mode_named;
 use bracken_experiment::plan::{PlanInputs, report};
 use bracken_experiment::proxy::Attempt;
 use bracken_experiment::sandbox::{Git, Sandbox, WorkerPaths, resolved};
+use bracken_experiment::task::Task;
 
 const FAKE_AUTH: &str = "fake-auth-value-not-a-secret-0123456789";
 const HOST: &str = "llm.fake.invalid";
@@ -72,7 +73,7 @@ fn tools() -> Vec<String> {
 
 fn tools_of(mode: &str) -> Vec<String> {
     let mode = mode_named(mode).expect("a mode");
-    mode.tools().into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect()
+    mode.tools(Task::Phase1).into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect()
 }
 
 /// Caps small enough for tests to reach.
@@ -392,7 +393,13 @@ fn the_hub_profile_writes_no_copy_and_runs_no_shell() {
 fn syncs_both_ways_sandboxed(mode: &'static str) {
     let tmp = tempfile::tempdir().expect("a temp dir");
     let cfg = run_config(tmp.path().join("run"), mode, 2, 2, true);
-    let backend = bracken_experiment::mock::MockBackend { seed: 5, wrong_rate: 0.0, shim: Some(bin()), usage: None };
+    let backend = bracken_experiment::mock::MockBackend {
+        task: Task::Phase1,
+        seed: 5,
+        wrong_rate: 0.0,
+        shim: Some(bin()),
+        usage: None,
+    };
     let outcome = run(&cfg, &backend).unwrap_or_else(|e| panic!("{mode}: the run: {e}"));
     let log = events(&outcome.events);
     assert!(!log.iter().any(|e| e["event"] == "turn_error"), "{mode}: no turn failed: {log:?}");

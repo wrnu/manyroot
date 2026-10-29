@@ -17,7 +17,7 @@ use crate::driver::{RELEASE_AT, RunConfig, core_tools};
 use crate::grader::HiddenCases;
 use crate::metrics::{DEFINITIONS, Measures, Records, incomplete, measure};
 use crate::mode::Mode;
-use crate::task::{Version, task_text};
+use crate::task::{Task, Version};
 
 /// The rules each mode integrates by, as fixed before the run, besides Bracken mode's
 /// acceptance rule, which the run chooses ([`rules`]).
@@ -47,6 +47,9 @@ pub fn rules(accept: AcceptRule) -> Vec<(String, String)> {
 /// What the caller chooses for a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PlanInputs {
+    /// The task agents are given. A plan from before there were two names none: Phase 1's.
+    #[serde(default)]
+    pub task: Task,
     pub model: String,
     pub effort: String,
     /// The hidden cases' seed: never shown to an agent.
@@ -69,6 +72,7 @@ pub struct PlanInputs {
 impl Default for PlanInputs {
     fn default() -> PlanInputs {
         PlanInputs {
+            task: Task::Phase1,
             model: "mock".into(),
             effort: "none".into(),
             grader_seed: 1,
@@ -113,6 +117,8 @@ pub fn metrics_code() -> String {
         include_str!("metrics.rs"),
         include_str!("grader.rs"),
         include_str!("task.rs"),
+        include_str!("task/phase1.rs"),
+        include_str!("task/phase2.rs"),
         include_str!("lang.rs"),
         // The hidden cases' draws.
         include_str!("../../demo/src/rng.rs"),
@@ -128,12 +134,13 @@ impl Plan {
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
-        let mut tools = mode.tools();
+        let task = cfg.plan.task;
+        let mut tools = mode.tools(task);
         tools.extend(core_tools());
         let tools = serde_json::to_vec(&tools).expect("tool specs are plain JSON");
         let prompts = BTreeMap::from([
-            ("task-original".to_string(), hash(task_text(Version::ORIGINAL).as_bytes())),
-            ("task-changed".to_string(), hash(task_text(Version::all()).as_bytes())),
+            ("task-original".to_string(), hash(task.task_text(Version::ORIGINAL).as_bytes())),
+            ("task-changed".to_string(), hash(task.task_text(task.all()).as_bytes())),
             ("tools".to_string(), hash(&tools)),
             ("turn-message".to_string(), hash(TURN_MESSAGE.as_bytes())),
         ]);
@@ -193,6 +200,6 @@ pub fn report(dir: &Path, usage: Option<&Path>) -> Result<Report, String> {
     if logged != Some(plan_hash.as_str()) {
         return Err("plan.json isn't the plan the run logged at setup".into());
     }
-    let measures = measure(&records, &HiddenCases::new(plan.inputs.grader_seed))?;
+    let measures = measure(&records, &HiddenCases::new(plan.inputs.task, plan.inputs.grader_seed))?;
     Ok(Report { dir: dir.display().to_string(), plan: plan_hash, measures })
 }

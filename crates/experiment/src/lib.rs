@@ -11,6 +11,9 @@
 //! Step 5 measures a run: the [`plan`] fixed before it, and the six [`metrics`]
 //! over its records.
 //!
+//! A run chooses its task ([`task::Task`]): Phase 1's, or Phase 2's larger
+//! one with open contracts (`docs/design/phase2-task.md`).
+//!
 //! What an agent may see goes through [`task`] only: the language, the specs,
 //! the change requests, the public cases and the public check. [`grader`]
 //! holds the hidden cases and the scores, which no agent-facing tool may

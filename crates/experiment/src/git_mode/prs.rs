@@ -19,11 +19,10 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use super::{GitStore, MODULE_FILES, definitions};
+use super::{GitStore, definitions};
 use crate::args::{Args, is_commit};
 use crate::lang::Library;
 use crate::mode::Session;
-use crate::task::{SPECS, check};
 
 pub const VERDICTS: [&str; 2] = ["approve", "request_changes"];
 /// The most PRs one agent may have open at once (finding `f582d00f535f`).
@@ -242,7 +241,8 @@ fn run_ci(store: &mut GitStore, main: &str, head: &str) -> Result<Ci, String> {
     }
     let mut details = Vec::new();
     let changed = store.git(&["diff-tree", "-r", "--name-only", main, &tree], None)?;
-    for file in changed.lines().filter(|f| !MODULE_FILES.contains(f)) {
+    let task = store.config.task;
+    for file in changed.lines().filter(|f| !task.module_files().contains(f)) {
         details.push(format!("changes {}, which only the setter may", crate::args::short(file)));
     }
     let version = store.hub_version()?;
@@ -255,9 +255,9 @@ fn run_ci(store: &mut GitStore, main: &str, head: &str) -> Result<Ci, String> {
     for name in &new.duplicates {
         details.push(format!("`{name}` is defined more than once"));
     }
-    let (old_defs, new_defs) = (definitions(&before), definitions(&after));
-    let passes = |lib: &Library, name: &str| check(lib, name, version).is_ok_and(|c| c.ok());
-    for s in SPECS {
+    let (old_defs, new_defs) = (definitions(task, &before), definitions(task, &after));
+    let passes = |lib: &Library, name: &str| task.check(lib, name, version).is_ok_and(|c| c.ok());
+    for s in task.specs() {
         let (was, is) = (passes(&old, s.name), passes(&new, s.name));
         if was && !is {
             details.push(format!("`{}` passes on main and fails after the merge", s.name));
@@ -414,8 +414,9 @@ pub fn changed(store: &mut GitStore, number: i64) -> Result<Vec<(String, String)
     let p = Prs::load(&store.config.dir.clone())?.get(number)?.clone();
     let Some(head) = head_of(store, &p)? else { return Ok(Vec::new()) };
     let base = store.git(&["merge-base", "refs/heads/main", &head], None)?.trim().to_string();
-    let before = crate::metrics::definitions(&store.modules_at(&base)?);
-    let after = crate::metrics::definitions(&store.modules_at(&head)?);
+    let task = store.config.task;
+    let before = crate::metrics::definitions(task, &store.modules_at(&base)?);
+    let after = crate::metrics::definitions(task, &store.modules_at(&head)?);
     Ok(after.into_iter().filter(|(f, d)| before.get(f) != Some(d)).collect())
 }
 

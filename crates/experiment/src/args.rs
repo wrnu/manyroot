@@ -4,7 +4,7 @@
 
 use serde_json::{Map, Value};
 
-use crate::task::spec_named;
+use crate::task::Task;
 
 /// The most bytes of free text in one value: statements, notes, details, file contents.
 pub const MAX_TEXT: usize = 16 * 1024;
@@ -98,10 +98,10 @@ impl<'a> Args<'a> {
         }
     }
 
-    /// The name of one of the task's functions.
-    pub fn spec_name(&self, key: &str) -> Result<&'a str, String> {
+    /// The name of one of `task`'s functions.
+    pub fn spec_name(&self, key: &str, task: Task) -> Result<&'a str, String> {
         let v = self.str(key)?;
-        let check = spec_named(v).map(drop).ok_or_else(|| format!("{} is not a function of the task", short(v)));
+        let check = task.spec_named(v).map(drop).ok_or_else(|| format!("{} is not a function of the task", short(v)));
         self.ruled(key, v, check)
     }
 

@@ -16,7 +16,7 @@ use bracken_experiment::lang::Library;
 use bracken_experiment::mock::{Client, MockBackend};
 use bracken_experiment::mode::{Session, StoreConfig};
 use bracken_experiment::plan::PlanInputs;
-use bracken_experiment::task::{SPECS, Version};
+use bracken_experiment::task::{Task, Version};
 use bracken_experiment::worker::{Request, Worker};
 
 fn bin() -> PathBuf {
@@ -55,7 +55,8 @@ fn a_mock_run_goes_end_to_end_through_the_shim() {
         sandbox: false,
     };
     let outcome =
-        run(&cfg, &MockBackend { seed: 3, wrong_rate: 0.0, shim: Some(bin()), usage: None }).expect("the run");
+        run(&cfg, &MockBackend { task: Task::Phase1, seed: 3, wrong_rate: 0.0, shim: Some(bin()), usage: None })
+            .expect("the run");
 
     // The change requests went out once 40% of the 9 turns were used.
     assert_eq!(outcome.released_after, Some(4));
@@ -77,9 +78,10 @@ fn a_mock_run_goes_end_to_end_through_the_shim() {
     // The integrated library holds only functions the rule picked, and the mock wrote only correct programs.
     let library = Library::parse(outcome.modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
     assert!(library.broken.is_empty() && library.duplicates.is_empty());
-    let present: Vec<&str> = SPECS.iter().filter(|s| library.get(s.name).is_some()).map(|s| s.name).collect();
+    let present: Vec<&str> =
+        Task::Phase1.specs().iter().filter(|s| library.get(s.name).is_some()).map(|s| s.name).collect();
     assert!(!present.is_empty(), "something was accepted");
-    let grades = grade(&library, Version::all(), &HiddenCases::new(1));
+    let grades = grade(&library, Task::Phase1.all(), &HiddenCases::new(Task::Phase1, 1));
     for g in grades.iter().filter(|g| g.present) {
         assert!(g.standalone, "{} is a correct program", g.name);
     }
@@ -110,6 +112,7 @@ fn request(op: &str) -> Request {
 fn each_worker_writes_only_its_own_store() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let config = |name: &str, identity: &str| StoreConfig {
+        task: Task::Phase1,
         dir: dir.path().join(name),
         bracken: bracken(),
         git: git_binary().expect("git"),
@@ -179,7 +182,7 @@ fn the_shim_and_workers_refuse_to_start_with_any_environment() {
         .arg(dir.path())
         .arg("--bracken")
         .arg(bracken())
-        .args(["--git", "/nonexistent/git"])
+        .args(["--git", "/nonexistent/git", "--task", "phase1"])
         .env_clear()
         .env("HOME", "/")
         .stdin(Stdio::null())
@@ -206,7 +209,9 @@ fn a_run_refuses_a_directory_that_exists() {
         plan: PlanInputs::default(),
         sandbox: false,
     };
-    let err = run(&cfg, &MockBackend { seed: 1, wrong_rate: 0.0, shim: None, usage: None }).err().expect("refused");
+    let err = run(&cfg, &MockBackend { task: Task::Phase1, seed: 1, wrong_rate: 0.0, shim: None, usage: None })
+        .err()
+        .expect("refused");
     assert!(err.contains("already exists"));
 }
 
@@ -272,6 +277,7 @@ fn sync_moves_only_what_is_missing() {
         &bin(),
         "bracken",
         &StoreConfig {
+            task: Task::Phase1,
             dir: dir.path().join("hub"),
             bracken: bracken(),
             git: git_binary().expect("git"),
@@ -348,7 +354,8 @@ fn a_crdt_mode_mock_run_goes_end_to_end_through_the_shim() {
         sandbox: false,
     };
     let outcome =
-        run(&cfg, &MockBackend { seed: 5, wrong_rate: 0.0, shim: Some(bin()), usage: None }).expect("the run");
+        run(&cfg, &MockBackend { task: Task::Phase1, seed: 5, wrong_rate: 0.0, shim: Some(bin()), usage: None })
+            .expect("the run");
     assert_eq!(outcome.released_after, Some(4));
     let log = events(&outcome.events);
     assert!(!log.iter().any(|e| e["event"] == "turn_error"), "no turn failed: {log:?}");
@@ -368,14 +375,15 @@ fn a_crdt_mode_mock_run_goes_end_to_end_through_the_shim() {
     let hub = dir.path().join("run/hub/doc.automerge");
     assert!(hub.exists());
     let library = Library::parse(outcome.modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
-    let grades = grade(&library, Version::all(), &HiddenCases::new(1));
-    assert_eq!(grades.len(), SPECS.len());
+    let grades = grade(&library, Task::Phase1.all(), &HiddenCases::new(Task::Phase1, 1));
+    assert_eq!(grades.len(), Task::Phase1.specs().len());
 }
 
 #[test]
 fn one_agent_spending_its_hub_quota_leaves_anothers_sync_alone() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let config = |name: &str, identity: &str| StoreConfig {
+        task: Task::Phase1,
         dir: dir.path().join(name),
         bracken: bracken(),
         git: git_binary().expect("git"),
@@ -477,7 +485,8 @@ fn a_git_mode_mock_run_goes_end_to_end_through_the_shim() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let cfg = RunConfig { mode: "git", trace: true, ..config(dir.path(), 3, 4) };
     let outcome =
-        run(&cfg, &MockBackend { seed: 3, wrong_rate: 0.0, shim: Some(bin()), usage: None }).expect("the run");
+        run(&cfg, &MockBackend { task: Task::Phase1, seed: 3, wrong_rate: 0.0, shim: Some(bin()), usage: None })
+            .expect("the run");
     let log = events(&outcome.events);
     let seqs: Vec<u64> = log.iter().map(|e| e["seq"].as_u64().expect("seq")).collect();
     assert!(seqs.windows(2).all(|w| w[1] == w[0] + 1), "one writer, no gaps");
@@ -499,8 +508,8 @@ fn a_git_mode_mock_run_goes_end_to_end_through_the_shim() {
     // Main keeps what merged before the change requests, unlike a superseded Bracken spec: each
     // function is correct as of the original contract or the changed one.
     let (before, after) = (
-        grade(&library, Version::ORIGINAL, &HiddenCases::new(1)),
-        grade(&library, Version::all(), &HiddenCases::new(1)),
+        grade(&library, Version::ORIGINAL, &HiddenCases::new(Task::Phase1, 1)),
+        grade(&library, Task::Phase1.all(), &HiddenCases::new(Task::Phase1, 1)),
     );
     assert!(after.iter().filter(|g| g.present).count() >= 2, "PRs were merged");
     for (b, a) in before.iter().zip(&after).filter(|(_, a)| a.present) {
@@ -512,6 +521,7 @@ fn a_git_mode_mock_run_goes_end_to_end_through_the_shim() {
 
 fn git_store(dir: &Path, name: &str) -> StoreConfig {
     StoreConfig {
+        task: Task::Phase1,
         dir: dir.join(name),
         bracken: bracken(),
         git: git_binary().expect("git"),

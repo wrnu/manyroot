@@ -6,6 +6,11 @@
 > replicate and the toy task may not separate the modes
 > ([phase1-results.md](phase1-results.md)). No run is proposed here: each run
 > needs the owner's own go on its stated use.
+>
+> **Accepted, 2026-10-28** (decision `a4d8622c75d5`): Candidate A with
+> Candidate C's open contracts and interacting changes, without C's per-agent
+> release. Build task `b7c49e317b0e`; [Step 1 as built](#step-1-as-built)
+> records what the first build step settled.
 
 ## What the next task has to fix
 
@@ -293,6 +298,114 @@ reviewed harness change.
 
 Git's merge rule (`b29d5db02da8` point 6) and the sync model (point 5) stay
 as they are in every candidate.
+
+## Step 1 as built
+
+Build step 1 of the accepted task (task `b7c49e317b0e`) adds Phase 2's task
+beside Phase 1's. The change waves are step 2, so this task has no change
+requests yet.
+
+**A task selector.** `--task phase1` or `--task phase2` on `run` and
+`mock-run`, with Phase 1's as the default. The plan records the task, and a
+plan from before the selector reads as Phase 1's. Phase 1's task is its own
+file (`crates/experiment/src/task/phase1.rs`), moved unchanged. A test pins
+its task texts and each mode's tool list to the hashes in replicate 3's
+plans, so Phase 1 gives agents byte for byte what its runs were given, except
+for the wording of Bracken mode's `accepted` tool, which PR #55 changed along
+with the acceptance rule. The
+plan's measuring-code hash covers both tasks' files, so reporting a Phase 1
+run needs the build that ran it, as before.
+
+**The task** (`crates/experiment/src/task/phase2.rs`) has 90 functions in
+eight modules, one layer per module:
+
+| Layer | Modules | Functions |
+|---|---|---|
+| 0 | `base`, `logic` | 23 |
+| 1 | `order`, `step` | 23 |
+| 2 | `arith`, `range` | 24 |
+| 3 | `shape` | 10 |
+| 4 | `score` | 10 |
+
+Layers are numbered from 0, as in Phase 1: layer 0 needs only the language.
+So "above layer 1" in Candidate A means layers 2 to 4, and every function in
+them is defined in terms of two or three functions from at least two modules
+of lower layers. Layer 1's functions use layer 0's and, as in Phase 1, each
+other (`nearer` uses `dist`). Twelve functions call
+`clamp3`, so step 2 can change its signature for 10 to 15 callers. Function
+names are new where Phase 1's would make one name start another (`ne`,
+`negate`), because Bracken mode names an agent's helpers by prefix. As in
+Phase 1, each function has a reference implementation in Rust, two correct
+and two subtly wrong candidate programs, 60 public cases (13 for one input)
+and the same hidden cases.
+
+**Two open contracts,** each with five members in two modules:
+
+- `rank`: `rank(a, b)` says how `a` compares with `b`, and `isless`,
+  `issame`, `ismore` and `flip` read that value. The library chooses the
+  encoding.
+- `none`: `cut(a, b)` gives `a - b` or none, and `pos(a)` gives `a` or none.
+  `isnone`, `either` and `plus` recognise none. The library chooses a value
+  outside 0 to 4000.
+
+A member has no reference implementation, because no single answer is right.
+Thirteen properties grade the members instead, on inputs from −1000 to 1000
+as the specs state. Each property relates two to four members, as a round
+trip or as a producer against a consumer, for example
+`isless(flip(rank(a, b)))` is 1 exactly when `a > b`, and
+`either(cut(a, b), d)` is `a - b` when `a >= b` and `d` otherwise. One
+property checks the spec's "one none, the same everywhere" rule: the none from
+`cut` equals the none from `pos`, and lies outside 0 to 4000. A
+property holds for every consistent choice, so passing doesn't reveal any
+particular encoding. A test shows two different encodings both score in
+full, and that producers of one with consumers of the other fail every
+member. A member is graded by every property that calls it:
+
+- The hidden cases are the property's public cases, 2,000 seeded draws and
+  every combination of the range's edge values.
+- Standalone, calls to other members resolve in the library, never to an
+  oracle, since a member is right only together with its partners.
+- An agent's `check` of a member runs the public cases of its properties.
+  It reports the failing expression, such as
+  `isless(rank(2, 5)) gave 0, expected 1`.
+- A delivery of a member is judged by one rule (decision `979e5085a1e7`,
+  after findings `e36915fb7841`, `1d63e2d4c3a0`, `672eb5c533d8`). The member
+  is judged with the other members in the delivering agent's own working
+  copy at the moment the delivery becomes available to others. Members the
+  copy doesn't hold come from the integrated library. Each mode's working
+  copy is reconstructed from its records:
+
+  | Mode | When it becomes available | The working copy |
+  |---|---|---|
+  | Git | the commit | the branch's members at the commit, which a commit's record lists (open-contract tasks only) |
+  | Bracken | the agent's next sync | each member accepted at the hub; for the rest, any of the agent's own current implementations, which its records list after each artifact, relate, claim or retract (open-contract tasks only) |
+  | CRDT | the sync | the document after the sync: the hub's snapshot then |
+
+  Bracken's order is the one the agent's own `check` resolves calls in
+  (answer `88ae128c5fcd`): accepted first, then its own. An agent can hold
+  several current implementations of one member, so the delivery counts as
+  correct if it agrees with any one choice among them. What each mode's
+  logs didn't hold before, and why Bracken's order is accepted-first, is in
+  note `ddf2368aa636`. One table-driven metrics test runs every case in all
+  three modes: a whole contract at once, adapting after losing and keeping
+  the losing convention, a revision in a later turn, a contract split over
+  two turns, a same-turn rewrite, a release between delivery and verdict, a
+  mixed-convention contract, and a contract accepted from another agent
+  while this agent's other-convention one is pending. The last is wrong in
+  Bracken only, because in Git's branch and CRDT's document the agent's own
+  work is its copy, and its own check would pass there too.
+- A verdict that blocks a definition is judged under the specs in force at
+  the verdict (finding `440196ce733f`), and a member with its latest
+  delivery's working copy.
+- Phase 1's measures are unchanged. All 16 recorded Phase 1 runs measure
+  identically with main's metrics and this build's. A test measures Phase 1
+  mock logs made by main's build and gets main's measures to the byte. Phase
+  1's records gain nothing.
+- A bug report names a function with a reference, so it never names a
+  member.
+
+The mock runs Phase 2 in every mode (a test does, with 2 agents and 2 turns).
+The scripted moves and a full mock run of the larger task are step 3.
 
 ## What this can't settle
 

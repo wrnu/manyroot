@@ -19,6 +19,7 @@ use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_too
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_named};
 use bracken_experiment::plan::PlanInputs;
+use bracken_experiment::task::Task;
 
 #[derive(Parser)]
 #[command(name = "bracken-experiment", about = "The Phase 1 experiment's processes")]
@@ -41,6 +42,8 @@ enum Cmd {
         bracken: PathBuf,
         #[arg(long)]
         git: PathBuf,
+        #[arg(long, value_parser = TASKS)]
+        task: String,
         /// Record every command git starts in the store's git-trace.log (tests).
         #[arg(long)]
         trace: bool,
@@ -79,6 +82,9 @@ enum Cmd {
         prompt_file: Option<PathBuf>,
         #[arg(long, default_value = "claude-opus-5-5")]
         model: String,
+        /// The task agents are given: Phase 1's or Phase 2's.
+        #[arg(long, default_value = "phase1", value_parser = TASKS)]
+        task: String,
         /// The bracken binary; defaults to the one next to this executable.
         #[arg(long)]
         bracken: Option<PathBuf>,
@@ -98,6 +104,9 @@ enum Cmd {
         turns: u32,
         #[arg(long, default_value_t = 1)]
         seed: u64,
+        /// The task agents are given: Phase 1's or Phase 2's.
+        #[arg(long, default_value = "phase1", value_parser = TASKS)]
+        task: String,
         /// The bracken binary; defaults to the one next to this executable.
         #[arg(long)]
         bracken: Option<PathBuf>,
@@ -122,11 +131,12 @@ enum Cmd {
 
 fn main() {
     let result = match Cli::parse().command {
-        Cmd::Worker { mode, identity, store, bracken, git, trace, accept_rule } => {
+        Cmd::Worker { mode, identity, store, bracken, git, task, trace, accept_rule } => {
             let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
+            let task = task_named(&task);
             bracken_experiment::worker::serve(
                 &mode,
-                StoreConfig { dir: store, bracken, git, identity, trace, accept_rule },
+                StoreConfig { dir: store, bracken, git, identity, trace, accept_rule, task },
             )
         }
         Cmd::Shim { socket } => bracken_experiment::shim::run(&socket),
@@ -141,10 +151,12 @@ fn main() {
             settings,
             prompt_file,
             model,
+            task,
             bracken,
             accept_rule,
         } => claude_run(ClaudeRun {
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
+            task: task_named(&task),
             dir,
             mode,
             agents,
@@ -156,9 +168,10 @@ fn main() {
             model,
             bracken,
         }),
-        Cmd::MockRun { dir, mode, agents, turns, seed, bracken, sandbox, accept_rule } => {
+        Cmd::MockRun { dir, mode, agents, turns, seed, task, bracken, sandbox, accept_rule } => {
             let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
             let plan = PlanInputs {
+                task: task_named(&task),
                 backend_seed: seed,
                 harness_commit: harness_commit(),
                 accept_rule,
@@ -174,7 +187,16 @@ fn main() {
     }
 }
 
+/// The tasks `--task` takes.
+const TASKS: [&str; 2] = ["phase1", "phase2"];
+
+/// The task `name`, which the argument parser has checked is one of [`TASKS`].
+fn task_named(name: &str) -> Task {
+    Task::named(name).expect("the parser accepts only the tasks' names")
+}
+
 struct ClaudeRun {
+    task: Task,
     dir: PathBuf,
     mode: String,
     agents: usize,
@@ -194,7 +216,7 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
         .map_err(|e| format!("no bracken: {e}"))?;
     bracken_demo::safety::refuse_git_checkout(&a.dir, false, &bracken_demo::safety::DEMO).map_err(|e| e.to_string())?;
     let mode = mode_named(&a.mode).ok_or("no such mode")?;
-    let tools = mode.tools().into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect();
+    let tools = mode.tools(a.task).into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect();
     let prompt = match &a.prompt_file {
         Some(file) => std::fs::read_to_string(file).map_err(|e| format!("reading the prompt: {e}"))?,
         None => bracken_experiment::prompts::system_prompt(mode.name())?,
@@ -204,6 +226,7 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
     }
     let (expect, caps) = (Expect::pinned_2_1_311(&a.model), Caps::pilot());
     let plan = PlanInputs {
+        task: a.task,
         model: expect.model.clone(),
         effort: expect.effort.clone(),
         harness_commit: harness_commit(),
@@ -280,10 +303,11 @@ fn mock_run(
         plan,
         sandbox,
     };
-    let seed = cfg.plan.backend_seed;
+    let (seed, task) = (cfg.plan.backend_seed, cfg.plan.task);
     let usage = Some(cfg.root.join("usage.jsonl"));
     // Through the shim, as Claude Code reaches the driver.
-    let outcome = run(&cfg, &MockBackend { seed, wrong_rate: 0.15, shim: Some(cfg.worker_bin.clone()), usage })?;
+    let mock = MockBackend { task, seed, wrong_rate: 0.15, shim: Some(cfg.worker_bin.clone()), usage };
+    let outcome = run(&cfg, &mock)?;
     for (module, text) in &outcome.modules {
         println!("# module {module}\n{text}");
     }
