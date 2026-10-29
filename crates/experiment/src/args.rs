@@ -60,7 +60,7 @@ impl<'a> Args<'a> {
         self.str_opt(key)?.ok_or_else(|| format!("`{key}` is required"))
     }
 
-    /// A contribution id: 12 to 64 lowercase hex digits.
+    /// A contribution id: 8 to 64 lowercase hex digits (Bracken mode resolves a short one first).
     pub fn id(&self, key: &str) -> Result<&'a str, String> {
         let v = self.str(key)?;
         self.ruled(key, v, check_id(v))
@@ -172,10 +172,10 @@ impl<'a> Args<'a> {
 }
 
 pub fn check_id(v: &str) -> Result<(), String> {
-    if (12..=64).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    if (8..=64).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
         Ok(())
     } else {
-        Err(format!("{} is not an id (12 to 64 lowercase hex digits)", short(v)))
+        Err(format!("{} is not an id (8 to 64 lowercase hex digits)", short(v)))
     }
 }
 

@@ -338,7 +338,27 @@ starts from a fresh sync state.
 - **Tools:** the read commands (`log`, `show`, `heads`, `conflicts`,
   `accepted`, `cat`), `claim`, `artifact`, `relate`, `evidence`, `retract`,
   each run through the real `bracken` binary with `--json`, plus `check` on
-  an artifact. An implementation is an artifact named for its function,
+  an artifact. Under the one-pass rule two more show Bracken's own views
+  (task `541b6f3db130`): `status`, Bracken's status view as `bracken status`
+  prints it (per claim, what implements it: what waits for an independent
+  pass, listed first, and what is accepted, rejected or superseded, with
+  live intents), and `news`, an incremental log: `bracken log --since
+  <cursor> --compact`, one line per contribution that arrived since the
+  agent's last `news` call, by a cursor the harness keeps in each agent's
+  own store. A `news` page stops below the result bound (36,000
+  characters, measured JSON-escaped as the driver sends it, so the bound
+  never cuts it) and says how many more arrived; its cursor is the old
+  cursor's ids and the page's, so the next call starts after everything
+  shown and nothing is skipped or repeated (findings `f8b022bbf5fd`,
+  `36c77161816c`). A position file that can't be read is reported, not
+  taken as a fresh start. Id arguments take the first 8 or more
+  digits of an id when no other id in the agent's replica starts with
+  them, as Bracken's own prefix rule does (manyroot's `resolve_prefix`);
+  the harness resolves them to full ids before running anything, and
+  refuses an ambiguous or unknown one with a message saying so. A run under
+  Phase 1's rule gets Phase 1's tools exactly: no `status` or `news`, ids
+  of 12 digits or more, and Phase 1's descriptions; the plan's tool hash
+  records which. An implementation is an artifact named for its function,
   which its own author relates as `implements` the function's current spec
   claim. Its text must parse on its own, define the function once, and fit
   2000 bytes, so a module with every function at that size still fits the
@@ -370,7 +390,12 @@ starts from a fresh sync state.
   four module files by a fixed rule: for each current spec, the current
   (not retracted or superseded) implementations with at least one
   independent pass and no counted fail; if there are several, the earliest
-  in causal order. One independent pass accepts, as Bracken's default
+  in causal order. Under the one-pass rule a fail counts as Bracken's
+  default policy counts it (decision `d036bab456a9`): any fail from someone
+  other than the author that isn't retracted keeps the implementation out,
+  whatever that validator recorded later, and a validator lifts its fail by
+  retracting it. So the `status` view and the `accepted` tool agree on
+  fails. One independent pass accepts, as Bracken's default
   policy does, with no ranking by pass count (owner decision
   `a4d8622c75d5` point 2). If none, the function is missing (decision 7,
   section 8). Phase 1 ran with a different tie rule, the most passes first
@@ -378,10 +403,15 @@ starts from a fresh sync state.
   phase1-most-passes`) to reproduce Phase 1, and the plan states which rule
   a run used, in its hashed rules. The `accepted` tool lists, per function,
   the implementation that counts as accepted and the function's other
-  implementations as waiting, without pass counts. Verdicts count as decision
-  `5e8df6996a2e` says: each validator counts at most once per
-  implementation, by its latest current verdict, and the implementation's
-  author never counts. Passes are counted by validator, not by evidence
+  implementations as waiting, without pass counts. It is what counts, and
+  it differs from Bracken's `status` view only by the task's own rules: an
+  implementation counts only if its own author related it, to the setter's
+  current spec claim, by an artifact that keeps the artifact rules above,
+  and only the earliest accepted one counts, where `status` may show
+  several. Under Phase 1's rule verdicts count as decision `5e8df6996a2e`
+  says: each validator counts at most once per implementation, by its
+  latest current verdict. Under either rule the implementation's author
+  never counts. Passes are counted by validator, not by evidence
   contribution, so one validator recording the same pass again gains
   nothing (finding `40f448eb0951`). So one agent's fail keeps an
   implementation out, as in Bracken. That is Bracken's real semantics, and
@@ -608,7 +638,7 @@ it doesn't match:
 | Branch names | `^[a-z][a-z0-9-]{0,39}$`. The only refs the tools accept are those branches and `main`; no revision expressions (`HEAD~1`, `@{u}`, ranges) |
 | Commit ids | 40 hex digits, and must already exist |
 | PR numbers, line numbers, counts | Decimal integers in a fixed range |
-| Bracken ids | 12 to 64 hex digits, resolving to exactly one contribution |
+| Bracken ids | 8 to 64 hex digits (12 to 64 under Phase 1's rule), resolving to exactly one contribution in the agent's replica, which the harness then passes in full |
 | Relation kinds, choices | From a fixed list |
 | Tags | `^[a-z][a-z0-9-]{0,31}$`, at most 8 |
 | Agent names | From the roster |
@@ -698,14 +728,14 @@ Each turn's first message is the same in every mode: "This is your turn
 <t> of <n>. You are <name>. Start by reading your notes."
 
 The mode sections have one shape: the same four sentences in the same order,
-of 84 to 99 words. A test holds that shape, and holds that no prompt or tool
+of 84 to 99 words (Bracken's is 99). A test holds that shape, and holds that no prompt or tool
 description mentions the experiment, a measure or another mode.
 
 | Sentence | Git | CRDT | Bracken | Why it differs |
 |---|---|---|---|---|
 | 1. Where the task is | TASKS.md on the hub's main, written only by the setter | TASKS.md in the shared document, written only by the setter | The setter's task claim and one spec claim per function | Each mode states the task in its own native form (section 2). An agent can't start without knowing where to look |
 | 2. Where changes appear | A new version of TASKS.md on main; its last line lists the released changes | The same, in the shared document | A new spec claim superseding the old one, with a claim tagged change | The same release, in each mode's native form |
-| 3. What counts as integrated | Main on the hub: a PR gets there only when someone merges it with pr_merge, which needs passing checks, a non-author's approval of its head, and no one else's latest review asking for changes | The hub's copy of the document: every edit to a module file counts on reaching the hub, with no other step | At the hub: implementations their authors related to each function's current spec claim, with a non-author's pass and no one else's latest verdict a fail; the accepted tool lists them as of the agent's last sync | This is the difference under test. Each sentence states the mode's real rule (decisions `6b13e672e7d4`, `5e8df6996a2e`), names the step an agent must take where one exists (Git's pr_merge), and says where the agent can see the integrated state (main, the hub's document, the accepted tool, which shows exactly the harness's count). CRDT's is shortest because it has no gate |
+| 3. What counts as integrated | Main on the hub: a PR gets there only when someone merges it with pr_merge, which needs passing checks, a non-author's approval of its head, and no one else's latest review asking for changes | The hub's copy of the document: every edit to a module file counts on reaching the hub, with no other step | At the hub: implementations their authors related to each function's current spec claim, with a non-author's pass and no unretracted fail from anyone else; accepted lists them, and status shows what waits for a pass | This is the difference under test. Each sentence states the mode's real rule (decisions `6b13e672e7d4`, `5e8df6996a2e`), names the step an agent must take where one exists (Git's pr_merge), and says where the agent can see the integrated state (main, the hub's document, the accepted tool, which shows exactly the harness's count). Bracken's also names its status view, where work waiting for a pass is found, as Git agents find PRs waiting for review with pr_list (task `541b6f3db130`). CRDT's is shortest because it has no gate |
 | 4. How work moves | Only when you sync | Only when you sync | Only when you sync | Identical: every mode syncs with one hub (section 2) |
 
 Every tool result, in every mode, is bounded at 40,000 characters
@@ -715,6 +745,10 @@ longer result keeps its first 40,000 characters and ends with a note giving
 its full length and saying how to narrow the call (one file, function or
 item, a line range or a smaller count, where the tool takes one); the event
 log records the full length as `cut_from`. No result is cut silently.
+
+The base prompt tells every agent alike to sync before choosing what to
+work on (task `541b6f3db130`): a pass usually arrived a turn later in
+Phase 1. When the harness syncs doesn't change.
 
 What the three share word for word: the base prompt, the turn message, the
 core tools (`sync`, `notes_read`, `notes_write`), and the fourth sentence. The
@@ -727,7 +761,9 @@ words (258 over 18 tools), CRDT's 19.2 (77 over 4) and Bracken's 22.8 (273
 over 12). The extra words define Bracken's terms and parameters and give its
 check rule; models already know Git's vocabulary. The neutrality review
 judged the detail comparable, with no strategy beyond the integration step
-Git's prompt names too (evidence `e7e5868b02e8`).
+Git's prompt names too (evidence `e7e5868b02e8`). With `status`, `news`,
+short ids and the fail rule (task `541b6f3db130`), Bracken's are 25.4 words
+per tool (356 over 14).
 
 Each mode names its shared channel once, in one tool description, in the same
 sentence: "<it> is where agents talk to each other: everyone can read it

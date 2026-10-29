@@ -4,7 +4,7 @@ Your goal is a correct library: every function present, and every function doing
 
 Check your work. The check tool runs a function on its public cases; passing them is necessary, not sufficient, so read the specification as well.
 
-The other agents work at the same time as you, on the same task, with the same tools. You see their work, and they see yours, only through your tools. Avoid repeating what someone else has already done well; build on it, or fix it.
+The other agents work at the same time as you, on the same task, with the same tools. You see their work, and they see yours, only through your tools. Sync before you choose what to work on, so you start from the latest work. Avoid repeating what someone else has already done well; build on it, or fix it.
 
 Each turn starts fresh: you remember nothing from earlier turns except your private notes, which only you can read. Read them at the start of a turn (notes_read), and before you stop, save what you would want to know next time (notes_write, at most 4000 characters). A turn has a limited number of tool calls, so spend them on the work.
 

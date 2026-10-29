@@ -461,8 +461,8 @@ fn huge_modules_and_words_give_short_errors() {
 // Phase 1 stays reproducible.
 
 /// The task texts and tool lists Phase 1's runs were given, as their plans recorded them (replicate 3,
-/// 2026-10-28): the selector's Phase 1 is the task those runs ran, byte for byte, but for the wording of
-/// Bracken mode's `accepted` tool, which changed with the acceptance rule.
+/// 2026-10-28): the selector's Phase 1 is the task those runs ran, byte for byte, and Bracken mode's tools
+/// under Phase 1's acceptance rule are the ones those runs had.
 #[test]
 fn phase_one_gives_agents_what_its_runs_were_given() {
     use bracken_experiment::driver::core_tools;
@@ -484,15 +484,10 @@ fn phase_one_gives_agents_what_its_runs_were_given() {
         tools.extend(core_tools());
         assert_eq!(hash(&serde_json::to_vec(&tools).expect("JSON")), want, "{mode}'s tools");
     }
-    // Bracken mode's too, but for the one description PR #55 rewrote with the acceptance rule (decision
-    // `a4d8622c75d5` point 2), in every task.
-    let mut tools = mode_named("bracken").expect("a mode").tools(T);
+    // Bracken mode's too, under Phase 1's acceptance rule, which keeps Phase 1's tools (task `541b6f3db130`).
+    let phase1 = bracken_experiment::bracken_mode::AcceptRule::MostPasses;
+    let mut tools = bracken_experiment::mode::mode_under("bracken", phase1).expect("a mode").tools(T);
     tools.extend(core_tools());
-    let accepted = tools.iter_mut().find(|t| t.name == "accepted").expect("the accepted tool");
-    assert!(accepted.description.contains("(the earliest, if several) is accepted"), "{}", accepted.description);
-    accepted.description = "What counts in your replica, per function: the implementation its author related to the \
-        current spec claim that has a pass from someone else and no one else's latest verdict a fail; the one with most \
-        passes wins";
     assert_eq!(
         hash(&serde_json::to_vec(&tools).expect("JSON")),
         "9d5435906a3946ee4c02998f86241d1029d1b6d83f43fada8f488b07ddbb13e0",

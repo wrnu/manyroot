@@ -17,7 +17,7 @@ use bracken_experiment::claude::{
 };
 use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
 use bracken_experiment::mock::MockBackend;
-use bracken_experiment::mode::{StoreConfig, mode_named};
+use bracken_experiment::mode::{StoreConfig, mode_under};
 use bracken_experiment::plan::PlanInputs;
 use bracken_experiment::task::Task;
 
@@ -215,7 +215,7 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
     let bracken = std::fs::canonicalize(a.bracken.unwrap_or_else(|| me.with_file_name("bracken")))
         .map_err(|e| format!("no bracken: {e}"))?;
     bracken_demo::safety::refuse_git_checkout(&a.dir, false, &bracken_demo::safety::DEMO).map_err(|e| e.to_string())?;
-    let mode = mode_named(&a.mode).ok_or("no such mode")?;
+    let mode = mode_under(&a.mode, a.accept_rule).ok_or("no such mode")?;
     let tools = mode.tools(a.task).into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect();
     let prompt = match &a.prompt_file {
         Some(file) => std::fs::read_to_string(file).map_err(|e| format!("reading the prompt: {e}"))?,

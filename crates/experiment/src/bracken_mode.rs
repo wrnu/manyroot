@@ -29,12 +29,41 @@ const RELATIONS: [&str; 7] = ["supports", "contradicts", "depends_on", "refines"
 const VERDICTS: [&str; 2] = ["pass", "fail"];
 /// The largest implementation artifact: a module of the most specs any module has, each this size, still fits.
 pub const MAX_ARTIFACT_BYTES: usize = 2000;
+/// The most characters of one `news` page, JSON-escaped as the driver sends it: under
+/// [`crate::driver::MAX_RESULT_CHARS`] with room for the envelope and the closing line, so the
+/// result bound never cuts a page whose cursor has already moved past it.
+const NEWS_PAGE_CHARS: usize = 36_000;
 /// How long one sync session may take, in seconds, on either side.
 const SYNC_DEADLINE: u32 = 60;
 /// Bytes one side of a sync session may receive from the other.
 const SYNC_BUDGET: u64 = 32 * 1024 * 1024;
 
-pub struct BrackenMode;
+/// Bracken mode, with the tools of its accept rule: under the one-pass rule, Bracken's own status
+/// view, the incremental `news` log and ids of 8 digits (task `541b6f3db130`); under Phase 1's rule,
+/// Phase 1's tools exactly, so a Phase 1 run can be reproduced (the plan hashes the tools).
+pub struct BrackenMode {
+    pub rule: AcceptRule,
+}
+
+impl BrackenMode {
+    pub const ONE_PASS: BrackenMode = BrackenMode { rule: AcceptRule::OnePass };
+    pub const PHASE1: BrackenMode = BrackenMode { rule: AcceptRule::MostPasses };
+
+    pub fn under(rule: AcceptRule) -> &'static BrackenMode {
+        match rule {
+            AcceptRule::OnePass => &BrackenMode::ONE_PASS,
+            AcceptRule::MostPasses => &BrackenMode::PHASE1,
+        }
+    }
+}
+
+/// The fewest hex digits an id argument may have: Phase 1 took 12.
+fn min_id_digits(rule: AcceptRule) -> usize {
+    match rule {
+        AcceptRule::OnePass => 8,
+        AcceptRule::MostPasses => 12,
+    }
+}
 
 fn tool(name: &'static str, description: &'static str, properties: Value, required: &[&str]) -> ToolSpec {
     ToolSpec {
@@ -50,9 +79,14 @@ impl Mode for BrackenMode {
     }
 
     fn tools(&self, _task: Task) -> Vec<ToolSpec> {
-        let id = json!({"type": "string", "description": "A contribution id: 12 to 64 hex digits"});
+        let phase1 = self.rule == AcceptRule::MostPasses;
+        let id = if phase1 {
+            json!({"type": "string", "description": "A contribution id: 12 to 64 hex digits"})
+        } else {
+            json!({"type": "string", "description": "A contribution id, or the first 8 or more of its hex digits if no other id starts with them"})
+        };
         let text = json!({"type": "string"});
-        vec![
+        let mut tools = vec![
             tool(
                 "log",
                 "Contributions in your replica (your copy of the shared record), oldest first, as JSON; filter by kind or tag. With current, leave out what was retracted and what its own author superseded",
@@ -72,12 +106,22 @@ impl Mode for BrackenMode {
                 json!({}),
                 &[],
             ),
-            tool(
-                "accepted",
-                "What counts in your replica, per function: the implementation its author related to the current spec claim that has a pass from someone else and no one else's latest verdict a fail (the earliest, if several) is accepted; the function's other implementations are waiting",
-                json!({}),
-                &[],
-            ),
+            if phase1 {
+                tool(
+                    "accepted",
+                    // As Phase 1's runs were given it (their plans' tool hash; test `phase_one_gives_agents_what_its_runs_were_given`).
+                    "What counts in your replica, per function: the implementation its author related to the current spec claim that has a pass from someone else and no one else's latest verdict a fail; the one with most passes wins",
+                    json!({}),
+                    &[],
+                )
+            } else {
+                tool(
+                    "accepted",
+                    "What counts in your replica, per function: the implementation its author related to the current spec claim that has a pass from someone else and no fail from anyone else that they haven't retracted (the earliest, if several) is accepted; the function's other implementations are waiting",
+                    json!({}),
+                    &[],
+                )
+            },
             tool("cat", "The text of an artifact", json!({"id": id}), &["id"]),
             tool(
                 "claim",
@@ -99,7 +143,11 @@ impl Mode for BrackenMode {
             ),
             tool(
                 "evidence",
-                "Record your pass or fail verdict on a contribution; method says how you judged it, details what you found. A later verdict of yours replaces your earlier one",
+                if phase1 {
+                    "Record your pass or fail verdict on a contribution; method says how you judged it, details what you found. A later verdict of yours replaces your earlier one"
+                } else {
+                    "Record your pass or fail verdict on a contribution; method says how you judged it, details what you found. A fail of yours keeps an implementation from counting until you retract that fail; a later pass doesn't lift it"
+                },
                 json!({"target": id, "verdict": {"type": "string", "enum": VERDICTS}, "method": text, "details": text}),
                 &["target", "verdict", "method"],
             ),
@@ -115,7 +163,30 @@ impl Mode for BrackenMode {
                 json!({"id": id}),
                 &["id"],
             ),
-        ]
+        ];
+        if !phase1 {
+            let at =
+                |tools: &[ToolSpec], name: &str| tools.iter().position(|t| t.name == name).expect("a Phase 1 tool") + 1;
+            tools.insert(
+                at(&tools, "log"),
+                tool(
+                    "news",
+                    "Contributions that reached your replica since your last news call (all of them the first time), oldest first, one line each: short id, author, kind and tags, and the statement or name",
+                    json!({}),
+                    &[],
+                ),
+            );
+            tools.insert(
+                at(&tools, "accepted"),
+                tool(
+                    "status",
+                    "Each claim something implements, with its implementations: which wait for a pass from someone other than their author (claims with one waiting come first), and which are accepted, rejected or superseded; plus live intents",
+                    json!({}),
+                    &[],
+                ),
+            );
+        }
+        tools
     }
 
     fn open(&self, config: StoreConfig) -> Box<dyn Store> {
@@ -168,6 +239,8 @@ pub fn plan(name: &str, args: &Args, identity: &str, task: Task) -> Result<Plan,
         "show" => read(vec![s("show"), s("--json"), s("--"), s(args.id("id")?)]),
         "heads" => read(vec![s("heads"), s("--json")]),
         "conflicts" => read(vec![s("conflicts"), s("--json")]),
+        // Bracken's own view, as people read it: what waits for a pass comes first.
+        "status" => Plan { json: false, ..read(vec![s("status")]) },
         "cat" => Plan { json: false, ..read(vec![s("cat"), s("--"), s(args.id("id")?)]) },
         "claim" => {
             let mut head = vec![s("claim")];
@@ -357,6 +430,11 @@ impl Store for BrackenStore {
     }
 
     fn tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        let args = &self.resolve_ids(args)?;
+        if name == "news" && self.tools_known(name) {
+            Args::new(args, &[])?;
+            return self.news();
+        }
         if name == "accepted" {
             // The harness's own count, not real Bracken's `accepted`, so the tool shows what counts
             // (decision `5e8df6996a2e`; finding `6792b444895d`).
@@ -541,6 +619,7 @@ impl Store for BrackenStore {
             }
             // A non-author's fail on an implementation: a counted fail, which keeps it out (decision `5e8df6996a2e`).
             "evidence" if args["verdict"] == "fail" => {
+                let args = &self.resolve_ids(args)?;
                 let (state, me) = (self.state()?, self.saved("key.txt")?);
                 let target = args["target"].as_str().unwrap_or_default();
                 let blocks = match state.find(target) {
@@ -565,7 +644,90 @@ impl Store for BrackenStore {
 
 impl BrackenStore {
     fn tools_known(&self, name: &str) -> bool {
-        BrackenMode.tools(self.config.task).iter().any(|t| t.name == name)
+        BrackenMode::under(self.config.accept_rule).tools(self.config.task).iter().any(|t| t.name == name)
+    }
+
+    /// `args` with every id argument resolved to its full id in this replica, under the rule's
+    /// fewest digits (`min_id_digits`). A value that isn't lowercase hex is left for the argument rules.
+    fn resolve_ids(&mut self, args: &Value) -> Result<Value, String> {
+        let min = min_id_digits(self.config.accept_rule);
+        let mut out = args.clone();
+        let Some(map) = out.as_object_mut() else { return Ok(out) };
+        let mut ids: Option<Vec<String>> = None;
+        for key in ["id", "from", "to", "target", "supersedes"] {
+            let values: Vec<&mut Value> = match map.get_mut(key) {
+                Some(Value::Array(items)) => items.iter_mut().collect(),
+                Some(v @ Value::String(_)) => vec![v],
+                _ => continue,
+            };
+            for v in values {
+                let Some(prefix) = v.as_str().filter(|p| is_hex(p) && p.len() < 64) else { continue };
+                if ids.is_none() {
+                    let all = self.json(&["log", "--json"])?;
+                    let rows = all.as_array().ok_or("log --json is not a list")?;
+                    ids = Some(rows.iter().filter_map(|r| r["id"].as_str().map(str::to_string)).collect());
+                }
+                let known = ids.as_deref().expect("just listed");
+                *v = Value::String(resolve_id(prefix, known.iter().map(String::as_str), min)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `news` tool: what arrived since this agent's last call, by the cursor kept in its own
+    /// store, at most a page that fits a tool result whole; the rest stays for the next call.
+    fn news(&mut self) -> Result<Value, String> {
+        let file = self.config.dir.join("news-cursor.txt");
+        // No file yet: everything is new. A file that can't be read is said, not taken as a fresh start.
+        let cursor = match std::fs::read_to_string(&file) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(e) => return Err(format!("your news position couldn't be read ({}); use log instead", e.kind())),
+        };
+        let since = opt("since", cursor.trim());
+        let out = self.run(&["log".into(), since.clone(), "--compact".into()], None)?;
+        let text = String::from_utf8_lossy(&out).into_owned();
+        let mut lines: Vec<&str> = text.lines().collect();
+        let next = match lines.last().and_then(|l| l.strip_prefix("cursor: ")) {
+            Some(c) => c.trim().to_string(),
+            None => return Err("bracken log printed no cursor".into()),
+        };
+        lines.pop();
+        let mut shown = 0;
+        let mut size = 0;
+        for l in &lines {
+            // Measured as the driver sends it: JSON-escaped (a quote is two characters), then a newline's two.
+            let sent = serde_json::to_string(l).map_or(usize::MAX, |j| j.chars().count() - 2 + 2);
+            if size + sent > NEWS_PAGE_CHARS {
+                break;
+            }
+            size += sent;
+            shown += 1;
+        }
+        let (cursor, rest) = if shown == lines.len() {
+            (next, String::new())
+        } else {
+            // The old cursor and the page's own ids: what they and their ancestors cover is exactly what
+            // has been shown. Everything not shown comes later in causal order, so none of it is an
+            // ancestor of the page. The page alone wouldn't do: work the old cursor covered that the
+            // page doesn't descend from would be listed again (finding `f8b022bbf5fd`).
+            let all = self.json(&["log", &since, "--json"])?;
+            let rows = all["contributions"].as_array().ok_or("log --since --json has no contributions")?;
+            let page: Vec<&str> = rows.iter().take(shown).filter_map(|r| r["id"].as_str()).collect();
+            if page.len() != shown {
+                return Err("bracken log --json and --compact disagree".into());
+            }
+            let old = cursor.trim().split(',').filter(|c| !c.is_empty());
+            (
+                old.chain(page).collect::<Vec<_>>().join(","),
+                format!("\n{} more arrived: call news again for them.", lines.len() - shown),
+            )
+        };
+        std::fs::write(&file, &cursor).map_err(|e| format!("writing the news cursor: {e}"))?;
+        if shown == 0 && rest.is_empty() {
+            return Ok(json!({ "output": "Nothing new since your last news call." }));
+        }
+        Ok(json!({ "output": lines[..shown].join("\n") + &rest }))
     }
 
     fn execute(&mut self, mut plan: Plan) -> Result<Value, String> {
@@ -624,6 +786,30 @@ pub fn modules_of(task: Task, programs: &Programs) -> Vec<(String, String)> {
             (m.to_string(), text)
         })
         .collect()
+}
+
+fn is_hex(v: &str) -> bool {
+    !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// The one id among `ids` that starts with `prefix`, the rule manyroot's `resolve_prefix` applies,
+/// here with at least `min` digits: unambiguous, or an error saying why.
+pub fn resolve_id<'a>(prefix: &str, ids: impl Iterator<Item = &'a str>, min: usize) -> Result<String, String> {
+    let shown = crate::args::short(prefix);
+    if prefix.len() < min {
+        // Phase 1's tools refused a short id with Phase 1's words.
+        return Err(if min == 12 {
+            format!("{shown} is not an id (12 to 64 lowercase hex digits)")
+        } else {
+            format!("{shown} is too short: give at least {min} hex digits of an id")
+        });
+    }
+    let matches: Vec<&str> = ids.filter(|id| id.starts_with(prefix)).collect();
+    match matches.as_slice() {
+        [one] => Ok(one.to_string()),
+        [] => Err(format!("no contribution in your replica has an id starting {shown}")),
+        many => Err(format!("{} contributions have ids starting {shown}: give more digits", many.len())),
+    }
 }
 
 /// Why `text` can't implement `function`, if it can't: it must parse alone,
@@ -691,10 +877,10 @@ impl AcceptRule {
     pub fn text(self) -> &'static str {
         match self {
             AcceptRule::OnePass => {
-                "Decisions a4d8622c75d5 point 2 and 5e8df6996a2e (rule one-pass): for each current spec, the \
+                "Decisions a4d8622c75d5 point 2 and d036bab456a9 (rule one-pass): for each current spec, the \
                  current implementations its author related to it with at least one independent pass and no \
-                 counted fail, counting each validator once (its latest current verdict) and never the author; \
-                 the earliest in causal order."
+                 independent fail that isn't retracted, as Bracken's default policy counts them, never counting \
+                 the author; the earliest in causal order."
             }
             AcceptRule::MostPasses => {
                 "Decisions b29d5db02da8 point 7 and 5e8df6996a2e (rule phase1-most-passes): for each current \
@@ -732,6 +918,9 @@ pub struct Snapshot {
     setter: String,
     /// For each target id, each validator's latest current verdict.
     verdicts: BTreeMap<String, BTreeMap<String, String>>,
+    /// For each target id, the validators with a current (unretracted) pass, and with one with a fail.
+    passed: BTreeMap<String, std::collections::BTreeSet<String>>,
+    failed: BTreeMap<String, std::collections::BTreeSet<String>>,
     rule: AcceptRule,
     task: Task,
 }
@@ -757,14 +946,18 @@ impl Snapshot {
             })
             .collect();
         let mut verdicts: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        let (mut passed, mut failed) = (BTreeMap::new(), BTreeMap::new());
         for e in current.iter().filter(|e| e.kind == "evidence") {
             let (Some(target), Some(verdict)) = (e.body["target"].as_str(), e.body["verdict"].as_str()) else {
                 continue;
             };
             // Causal order: a later verdict by the same validator replaces its earlier one.
             verdicts.entry(target.to_string()).or_default().insert(e.author.clone(), verdict.to_string());
+            let all: &mut BTreeMap<String, std::collections::BTreeSet<String>> =
+                if verdict == "pass" { &mut passed } else { &mut failed };
+            all.entry(target.to_string()).or_default().insert(e.author.clone());
         }
-        Ok(Snapshot { current, setter: setter.to_string(), verdicts, rule, task })
+        Ok(Snapshot { current, setter: setter.to_string(), verdicts, passed, failed, rule, task })
     }
 
     /// The setter's current claims tagged `tag`.
@@ -818,10 +1011,18 @@ impl Snapshot {
         out
     }
 
-    /// Decision `5e8df6996a2e`: the independent passes on `entry`, counting
-    /// each validator once (its latest current verdict) and never the author;
-    /// none when there is no pass or a counted fail.
+    /// The independent passes on `entry`, counting each validator once and never the author; none
+    /// when there is no pass or a counted fail. Under the one-pass rule a fail counts as Bracken's
+    /// default policy counts it: any fail from a non-author that isn't retracted, whatever that
+    /// validator recorded later (decision `d036bab456a9`). Under Phase 1's rule, each validator's
+    /// latest current verdict (decision `5e8df6996a2e`).
     fn passes(&self, entry: &Entry) -> Option<usize> {
+        if self.rule == AcceptRule::OnePass {
+            let others = |m: &BTreeMap<String, std::collections::BTreeSet<String>>| {
+                m.get(&entry.id).map_or(0, |v| v.iter().filter(|a| **a != entry.author).count())
+            };
+            return (others(&self.failed) == 0).then(|| others(&self.passed)).filter(|&n| n > 0);
+        }
         let verdicts = self.verdicts.get(&entry.id)?;
         let counted = || verdicts.iter().filter(|(validator, _)| **validator != entry.author).map(|(_, v)| v.as_str());
         if counted().any(|v| v != "pass") {
