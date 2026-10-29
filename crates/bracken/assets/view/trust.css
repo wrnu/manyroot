@@ -1,0 +1,211 @@
+/* The Trust constellation: a meadow. Agents are flowers; pollen flies from validator to author. */
+
+.trust-page {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.meadow-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 22rem;
+  min-height: 0;
+}
+.meadow {
+  position: relative;
+  min-height: 0;
+  background:
+    radial-gradient(70% 60% at 50% 50%, var(--ground-raised), transparent 75%),
+    var(--ground);
+}
+.field {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* SVG text from the theme, with a halo so names read across the paths. */
+.field text {
+  fill: var(--root);
+  font-family: "Alegreya", serif;
+  font-size: 15px;
+  paint-order: stroke;
+  stroke: var(--ground);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+  unicode-bidi: isolate;
+}
+.field .count {
+  fill: var(--root-faint);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px;
+}
+.field .strand {
+  fill: none;
+  stroke-linecap: round;
+  pointer-events: stroke;
+  cursor: help;
+  transition: opacity 160ms ease-out;
+}
+.field .strand.pass {
+  stroke: var(--pass);
+}
+.field .strand.fail {
+  stroke: var(--fail);
+}
+.field .flower {
+  cursor: pointer;
+}
+.field .flower:focus-visible {
+  outline: none;
+}
+.field .flower:focus-visible .centre {
+  stroke: var(--focus);
+  stroke-width: 3px;
+}
+.field.lit .strand:not(.on),
+.field.lit .pollen:not(.on) {
+  opacity: 0.06;
+}
+.field.lit .flower:not(.on) {
+  opacity: 0.35;
+}
+.field.lit .strand.on {
+  opacity: 0.95;
+}
+
+/* Pollen drifting along a counted pass, from validator to author. The path is set through the CSSOM. */
+.field .pollen {
+  offset-rotate: 0deg;
+  animation: drift 4.2s linear infinite;
+  pointer-events: none;
+}
+@keyframes drift {
+  from {
+    offset-distance: 0%;
+  }
+  to {
+    offset-distance: 100%;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .field .pollen {
+    display: none;
+  }
+}
+
+.tip {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  max-width: 20rem;
+  background: var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+  box-shadow: var(--shadow);
+  padding: 0.45rem 0.65rem;
+  font-size: 0.86rem;
+  unicode-bidi: isolate;
+}
+
+.side {
+  border-left: 1px solid var(--stratum-line);
+  padding: 1.25rem 1.1rem;
+  overflow-y: auto;
+}
+.side .policy {
+  margin: 0 0 1rem;
+  color: var(--root-dim);
+  font-size: 0.8rem;
+}
+.side h2 {
+  font-size: 0.8rem;
+  margin: 0 0 0.5rem;
+  color: var(--root-faint);
+  font-weight: 500;
+}
+.pairs {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.88rem;
+}
+.pairs li {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.6rem;
+  padding: 0.3rem 0.4rem;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.pairs li:hover,
+.pairs li.on {
+  background: var(--ground-raised);
+}
+.pairs .who bdi {
+  font-style: italic;
+}
+.pairs .n {
+  color: var(--root-dim);
+  white-space: nowrap;
+}
+.pairs .empty {
+  color: var(--root-faint);
+  font-style: italic;
+  cursor: default;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1.25rem;
+  border-top: 1px solid var(--stratum-line);
+  background: var(--ground-raised);
+  font-size: 0.9rem;
+  flex-wrap: wrap;
+}
+.segmented {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+.key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  margin: 0 0 0 auto;
+  max-width: 46rem;
+  color: var(--root-dim);
+  font-size: 0.8rem;
+}
+.key > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+.swatch {
+  display: inline-block;
+  width: 18px;
+  height: 3px;
+  border-radius: 2px;
+}
+.swatch.pass {
+  background: var(--pass);
+}
+.swatch.fail {
+  background: var(--fail);
+}
+
+@media (max-width: 1000px) {
+  .meadow-wrap {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+  }
+  .side {
+    max-height: 30vh;
+    border-left: 0;
+    border-top: 1px solid var(--stratum-line);
+  }
+}

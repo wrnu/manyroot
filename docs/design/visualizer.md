@@ -216,6 +216,29 @@ from their own network. It narrows 09f29f6c727b's loopback-only rule for that on
   gets a 403.
 - Everything else is unchanged: GET only, the same headers, no CORS, and the same bounds.
 
+### 1.8 `GET /api/trust`: who validates whom (step 4)
+
+```json
+{
+  "policy": { "min_passes": 1, "validators": [] },
+  "edges": [
+    { "from": 2, "to": 0, "passes": 12, "fails": 1, "counted_passes": 10, "counted_fails": 1 }
+  ]
+}
+```
+
+- One edge per validator (`from`) and author (`to`), as indexes into `/api/ground`'s `agents`. It covers
+  every evidence contribution whose author is `from` and whose target's author is `to`, including
+  `from == to` (an agent checking its own work).
+- `passes` and `fails` count the evidence that stands, that is, evidence that isn't retracted.
+  `counted_passes` and `counted_fails` count the part the view's policy counted, meaning the evidence is in
+  its target's assessment `passes` or `fails` as `show --json` gives them. A test checks this against
+  `show --json` on a throwaway Ground.
+- It takes no parameters. Like every page, it's a GET over the replica as read. It's one pass over the
+  evidence, with what the policy counted gathered into sets first, so it stays linear however much
+  evidence one subject draws: about 65 ms on the 50,000 sample, debug build. (Looking each id up in its
+  target's lists instead took a second a request when 50,000 passes landed on one claim.)
+
 ## 2. The direction: soil and specimen
 
 The owner asked for organic and botanical (preference c60c03bca23d, 2026-10-28), with everything else the
@@ -449,6 +472,64 @@ One claim's life as a plant:
 | **Pending, a live intent (Herbarium)** | **Replayed to 14:42** |
 | ![](visualizer/shots/root-herbarium.webp) | ![](visualizer/shots/root-replay.webp) |
 
+#### In `bracken view` (step 4)
+
+`/root.html#<claim id>` serves the Root view, from `root.html`, `root.js` and `root.css`. A claim's label
+in the Loom opens it with **Follow this claim's life**, and **Show in the Loom** goes back.
+
+- **One response, drawn as given.** Everything on the stage comes from one `/api/root/<id>` response:
+  statuses, counted and uncounted evidence, retracted evidence, roots and claims, intents and how they
+  ended, supersessions that do or don't count. The page works none of it out. A retracted claim gets the
+  author's pruning cut across its stem. A superseded or retracted claim's flower is a dry, pressed bud.
+  A root whose `implements` link or artifact was retracted is dashed.
+- **Replay through `?as_of`.** The life is every contribution the response names: the claim, its
+  intents, its artifacts and their links, all evidence, refinements, rivals and lineage. Each one is a
+  stop. Stop k shows `/api/root/<id>?as_of=<the claim and every id up to stop k>`, so it's the replica
+  as it stood once those had arrived, worked out by the server. Stops are ordered by the authors' clocks,
+  but what each one shows is a causal cut, so a skewed clock can only reorder the stops. It can't make a
+  stop show something that hadn't happened. The story beside the stage, and the knots on the track, are
+  told from the same response as the stage. The steps after the one shown follow, faded, saying only
+  what happened, so no later status shows as if it were past. A cursor that would hold more than 200
+  ids keeps the claim and the latest ones, so a request head stays small. Retractions and supersedes relations have no ids in
+  `/api/root`, so they aren't stops of their own; the last stop, now, shows them. Replay fetches one
+  stop ahead. A past graph takes about 1.3 s to build at 50,000 on a release build, and 9 to 46 s on a
+  debug one.
+- **Live.** Shown as it is now, the view follows the event stream. Replayed, it stays on its stop.
+- **Spores.** Counted passes rise along their root through CSS motion paths, whose paths are set through
+  the CSSOM. The mockup used SVG `animateMotion` with an `href`, which the element allowlist doesn't
+  allow. Under reduced motion there are no spores.
+
+| Accepted, live | Replayed to step 6 of 10 | Rejected, with a rival (Herbarium) |
+|---|---|---|
+| ![](visualizer/shots/view-root-accepted.webp) | ![](visualizer/shots/view-root-replay.webp) | ![](visualizer/shots/view-root-herbarium.webp) |
+
+### 3.4 The Trust constellation (step 4)
+
+`/trust.html` shows who validates whom as a meadow.
+
+- **The botanical form: pollinators between flowers.** Each agent is a flower, in its ink, on a ring.
+  The flower grows with how much evidence it gave and got. Pollen flies from a validator to the author
+  whose work it checked: each pair's passes and fails are two strands, with fails bending wider, so a
+  pair that checked each other shows four. Each strand is as thick and as strong as its count. Pollen
+  drifts along a pair's counted passes, the one ambient motion here, as spores are in the Root view.
+  An agent that checked its own work wears a dashed ring, since no policy counts that.
+- **The toggle.** "All evidence that stands" or "Only what the policy counts", from `/api/trust`'s two
+  counts. The masthead and the side panel give the policy.
+- **At scale.** The strands are steeply weighted: thickness rises a little faster than the count, and
+  opacity with its square. Passes and fails are each scaled to their own largest. When every agent has
+  checked every other, as at 50,000, the busiest paths stand out and the rest recede, as the Loom's
+  bundles do. Pollen drifts only on the stronger half. Hovering or focusing a flower lights its strands
+  and fades the rest. Clicking a strand or a row pins one pair. The side panel lists every pair by
+  count, as text, for reading and for screen readers.
+- **Why not a matrix.** A 12 by 12 grid of numbers would be exact, but it's a dashboard, which the brief
+  rules out. The side panel already gives the exact numbers.
+
+| 1,000 | 50,000 | 50,000, hovering the manager |
+|---|---|---|
+| ![](visualizer/shots/view-trust-1000.webp) | ![](visualizer/shots/view-trust-50000.webp) | ![](visualizer/shots/view-trust-50000-hover.webp) |
+
+![The sample's Trust constellation, with a self-check (Herbarium)](visualizer/shots/view-trust-herbarium.webp)
+
 ### 3.3 The language sheet ([visualizer/language.html](visualizer/language.html))
 
 The language sheet shows the knots and their states, both palettes, the type and the rules for motion and
@@ -479,8 +560,8 @@ scale. It's drawn by the same code and tokens as the views.
   Done in step 3: see section 3.1.
 - **Open choices for later steps:**
   - colour for more than twelve agents (today the inks repeat);
-  - where the Trust constellation and the Tension map sit in this world. A first thought: pollinators
-    between flowers for who validates whom, and brambles at full scale for contradictions.
+  - where the Tension map sits in this world. A first thought: brambles at full scale for
+    contradictions. (The Trust constellation is done in step 4: pollinators between flowers, section 3.4.)
 
 ## 6. How the mockups were made
 
