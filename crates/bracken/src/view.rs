@@ -39,14 +39,21 @@ pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; 
                        connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; \
                        frame-ancestors 'none'";
 
-/// The embedded page, the Loom (docs/design/visualizer.md section 3.1): path, media type, content. The
-/// fonts are Alegreya and Alegreya Sans SC under the OFL, which travels with them.
+/// The embedded pages, the Loom, the Root view and the Trust constellation (docs/design/visualizer.md
+/// section 3): path, media type, content. The fonts are Alegreya and Alegreya Sans SC under the OFL,
+/// which travels with them.
 const ASSETS: &[(&str, &str, &[u8])] = &[
     ("/", "text/html; charset=utf-8", include_bytes!("../assets/view/index.html")),
     ("/common.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/common.js")),
     ("/loom.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/loom.js")),
     ("/visualizer.css", "text/css; charset=utf-8", include_bytes!("../assets/view/visualizer.css")),
     ("/loom.css", "text/css; charset=utf-8", include_bytes!("../assets/view/loom.css")),
+    ("/root.html", "text/html; charset=utf-8", include_bytes!("../assets/view/root.html")),
+    ("/root.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/root.js")),
+    ("/root.css", "text/css; charset=utf-8", include_bytes!("../assets/view/root.css")),
+    ("/trust.html", "text/html; charset=utf-8", include_bytes!("../assets/view/trust.html")),
+    ("/trust.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/trust.js")),
+    ("/trust.css", "text/css; charset=utf-8", include_bytes!("../assets/view/trust.css")),
     ("/fonts/alegreya.woff2", "font/woff2", include_bytes!("../assets/view/fonts/alegreya.woff2")),
     ("/fonts/alegreya-italic.woff2", "font/woff2", include_bytes!("../assets/view/fonts/alegreya-italic.woff2")),
     (
@@ -559,6 +566,7 @@ impl Viewer {
             "/api/status" => Ok(self.status_json(&snap)),
             "/api/conflicts" => Ok(json!(open_conflicts(snap.graph()))),
             "/api/intents" => Ok(intents_json(&snap)),
+            "/api/trust" => Ok(self.trust_json(&snap)),
             path => match (path.strip_prefix("/api/contribution/"), path.strip_prefix("/api/root/")) {
                 (Some(id), _) => self.contribution_json(&snap, id),
                 (_, Some(id)) => self.root_json(&snap, id, request.query.get("as_of").map(String::as_str)),
@@ -616,6 +624,46 @@ impl Viewer {
         let ids = fresh[..limit.map_or(fresh.len(), |n| n.min(fresh.len()))].to_vec();
         let cursor = if more { cursor_after(g, seen.unwrap_or_default(), &ids) } else { listing::cursor(g) };
         Ok(Page { ids, cursor, more })
+    }
+
+    /// Section 1.8: who validates whom. One edge per validator and author: the evidence the validator
+    /// wrote on the author's contributions that stands (isn't retracted), and of it, what the policy
+    /// counted (it's in the target's assessment, as `show --json` gives it). Agents are `/api/ground`'s
+    /// indexes.
+    fn trust_json(&self, snap: &Snapshot) -> Value {
+        let g = snap.graph();
+        // (validator, author) -> passes, fails, counted passes, counted fails
+        let mut edges: BTreeMap<(usize, usize), [u64; 4]> = BTreeMap::new();
+        // Evidence is only ever counted on its own target, so one set of each covers every assessment.
+        let counted_passes: HashSet<_> = snap.statuses.values().flat_map(|a| &a.passes).collect();
+        let counted_fails: HashSet<_> = snap.statuses.values().flat_map(|a| &a.fails).collect();
+        for id in &snap.order {
+            let c = g.get(id).expect("ordered ids exist");
+            let Body::Evidence { target, verdict, .. } = c.body() else { continue };
+            let Some(t) = g.get(target) else { continue };
+            if g.is_retracted(id) {
+                continue;
+            }
+            let key = (snap.agent_index[&c.author()], snap.agent_index[&t.author()]);
+            let e = edges.entry(key).or_default();
+            match verdict {
+                Verdict::Pass => {
+                    e[0] += 1;
+                    e[2] += u64::from(counted_passes.contains(id));
+                }
+                Verdict::Fail => {
+                    e[1] += 1;
+                    e[3] += u64::from(counted_fails.contains(id));
+                }
+            }
+        }
+        let edges: Vec<Value> = edges
+            .into_iter()
+            .map(|((from, to), [p, f, cp, cf])| {
+                json!({"from": from, "to": to, "passes": p, "fails": f, "counted_passes": cp, "counted_fails": cf})
+            })
+            .collect();
+        json!({"policy": self.policy_json(), "edges": edges})
     }
 
     /// Section 1.3.
@@ -1311,7 +1359,7 @@ mod tests {
         ];
         let mut scripts = 0;
         for (path, media_type, body) in ASSETS {
-            if !media_type.starts_with("text/javascript") && *path != "/" {
+            if !media_type.starts_with("text/javascript") && !media_type.starts_with("text/html") {
                 continue;
             }
             scripts += 1;
@@ -1334,7 +1382,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(scripts, 3, "the page and its two scripts");
+        assert_eq!(scripts, 7, "the three pages and their four scripts");
     }
 
     /// Computed property accesses that could build a sink's name or reach one on a DOM object: a string in
@@ -1357,18 +1405,23 @@ mod tests {
             "dataset",
         ];
         const KEYWORDS: [&str; 8] = ["return", "typeof", "case", "in", "of", "else", "yield", "await"];
-        let s: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let s: Vec<char> = text.chars().collect();
         let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
         let mut found = Vec::new();
         for i in 1..s.len() {
-            if s[i] != '[' || !(ident(s[i - 1]) || matches!(s[i - 1], ')' | ']')) {
+            if s[i] != '[' {
                 continue;
             }
-            let mut start = i;
+            // What comes before the bracket, past any whitespace (`el ['x']` is still an access).
+            let Some(before) = (0..i).rev().find(|&j| !s[j].is_whitespace()) else { continue };
+            if !(ident(s[before]) || matches!(s[before], ')' | ']')) {
+                continue;
+            }
+            let mut start = before + 1;
             while start > 0 && ident(s[start - 1]) {
                 start -= 1;
             }
-            let receiver: String = s[start..i].iter().collect();
+            let receiver: String = s[start..=before].iter().filter(|c| ident(**c)).collect();
             if KEYWORDS.contains(&receiver.as_str()) {
                 continue; // `return [a, b]` is an array, not an access
             }
@@ -1420,11 +1473,24 @@ mod tests {
 
     #[test]
     fn computed_access_is_caught() {
-        for bad in ["el['inner' + 'HTML'] = t", "x[\"on\" + e] = f", "document[k]", "a.style[p] = v", "n[`on${e}`]"] {
+        for bad in [
+            "el['inner' + 'HTML'] = t",
+            "x[\"on\" + e] = f",
+            "document[k]",
+            "a.style[p] = v",
+            "n[`on${e}`]",
+            "el ['inner']",
+        ] {
             assert!(!computed_access(bad).is_empty(), "{bad}");
         }
-        for fine in ["parents[i].push(p)", "B.KIND_WORD[kind[i]]", "return [a, b]", "f([\"a\", \"b\"])", "x = [\"a\"]"]
-        {
+        for fine in [
+            "parents[i].push(p)",
+            "B.KIND_WORD[kind[i]]",
+            "return [a, b]",
+            "f([\"a\", \"b\"])",
+            "x = [\"a\"]",
+            "for (const c of [\"a\"])",
+        ] {
             assert_eq!(computed_access(fine), Vec::<String>::new(), "{fine}");
         }
     }

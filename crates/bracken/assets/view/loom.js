@@ -400,7 +400,7 @@
       const width = Math.min(natural[a], 2 * Math.min(room(a - 1), room(a + 1)));
       el.style.left = `${colX[a]}px`;
       el.style.setProperty("--col", `${Math.max(32, width)}px`);
-      el.title = B.agentName(ground, a);
+      B.attr(el, "title", B.agentName(ground, a));
     }
     geom.key = "";
     draw();
@@ -995,7 +995,12 @@
         : [];
     // Behind now, only what was there at the surface: a knot's parents always were, its children may not be.
     const there = (list) => list.filter((j) => valueOf(j) <= state.surface);
-    side.replaceChildren(card, ...lineage("Woven onto", there(parents[i])), ...lineage("Built on by", there(children[i])));
+    // A claim's whole life, in the Root view. Ids are hex, so the address holds nothing else.
+    const toRoot =
+      kind[i] === "claim"
+        ? B.h("button", { type: "button", class: "open-root", on: { click: () => location.assign(`/root.html#${id}`) } }, "Follow this claim's life")
+        : null;
+    side.replaceChildren(...[card, toRoot].filter(Boolean), ...lineage("Woven onto", there(parents[i])), ...lineage("Built on by", there(children[i])));
   }
 
   // ---- The scrubber: drag the surface handle, or use the keys, to replay. It settles on a contribution. ----

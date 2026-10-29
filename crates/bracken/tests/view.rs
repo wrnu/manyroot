@@ -244,6 +244,9 @@ fn every_endpoint_is_read_only_and_carries_the_csp() {
     let gets = [
         "/".to_owned(),
         "/loom.js".to_owned(),
+        "/root.html".to_owned(),
+        "/trust.html".to_owned(),
+        "/api/trust".to_owned(),
         "/loom.css".to_owned(),
         "/api/ground".to_owned(),
         "/api/graph".to_owned(),
@@ -653,15 +656,17 @@ fn every_asset_is_served_with_the_csp() {
             }
         }
     }
-    // What the page and its styles load, so nothing it asks for is missing.
-    let page = String::from_utf8(v.get("/").body).unwrap();
+    // What the pages and their styles load, so nothing they ask for is missing.
     let mut named: Vec<String> = Vec::new();
-    for attr in ["src=\"", "href=\""] {
-        for part in page.split(attr).skip(1) {
-            named.push(part.split('"').next().unwrap().to_owned());
+    for page in ["/", "/root.html", "/trust.html"] {
+        let page = String::from_utf8(v.get(page).body).unwrap();
+        for attr in ["src=\"", "href=\""] {
+            for part in page.split(attr).skip(1) {
+                named.push(part.split('"').next().unwrap().to_owned());
+            }
         }
     }
-    for css in ["/visualizer.css", "/loom.css"] {
+    for css in ["/visualizer.css", "/loom.css", "/root.css", "/trust.css"] {
         let text = String::from_utf8(v.get(css).body).unwrap();
         for part in text.split("url(\"").skip(1) {
             named.push(part.split('"').next().unwrap().to_owned());
@@ -703,6 +708,78 @@ fn a_name_two_keys_claim_names_neither() {
     let names: Vec<Value> =
         v.api("/api/ground")["agents"].as_array().unwrap().iter().map(|a| a["name"].clone()).collect();
     assert_eq!(names, [Value::Null, serde_json::json!("val")]);
+}
+
+/// `/api/trust` counts as the CLI does: for every subject, `show --json`'s evidence that stands (by its
+/// author, on the subject's author) and the assessment's counted passes and fails, summed per pair.
+#[test]
+fn trust_agrees_with_show() {
+    let dir = ground();
+    ok(&dir, &["id", "new", "maya"]);
+    let claim = ok(&dir, &["claim", "spec", "--as", "alice"]);
+    let other = ok(&dir, &["claim", "another spec", "--as", "bob"]);
+    std::fs::write(dir.join("../f"), "fn main() {}").unwrap();
+    let art = ok(
+        &dir,
+        &["artifact", dir.join("../f").to_str().unwrap(), "--name", "main.rs", "--implements", &claim, "--as", "bob"],
+    );
+    let art = art.lines().next().unwrap().to_owned();
+    ok(&dir, &["evidence", &art, "pass", "--method", "cargo test", "--as", "val"]);
+    ok(&dir, &["evidence", &art, "pass", "--method", "self", "--as", "bob"]);
+    ok(&dir, &["evidence", &art, "fail", "--method", "review", "--as", "maya"]);
+    ok(&dir, &["evidence", &claim, "pass", "--method", "acceptance", "--as", "val"]);
+    ok(&dir, &["evidence", &other, "pass", "--method", "read it", "--as", "alice"]);
+    let withdrawn = ok(&dir, &["evidence", &other, "fail", "--method", "too hasty", "--as", "maya"]);
+    ok(&dir, &["retract", &withdrawn, "--as", "maya"]);
+    // Evidence on a relation counts toward the relation's author.
+    let link = ok(&dir, &["relate", &other, "refines", &claim, "--as", "alice"]);
+    ok(&dir, &["evidence", link.lines().next().unwrap(), "pass", "--method", "read both", "--as", "maya"]);
+    let v = view(&dir);
+
+    let agents: Vec<String> = v.api("/api/ground")["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["agent"].as_str().unwrap().to_owned())
+        .collect();
+    let mut want: BTreeMap<(String, String), [u64; 4]> = BTreeMap::new();
+    for c in json(&dir, &["log", "--json"]).as_array().unwrap() {
+        if !matches!(c["kind"].as_str(), Some("claim" | "artifact" | "relation")) {
+            continue;
+        }
+        let shown = json(&dir, &["show", c["id"].as_str().unwrap(), "--json"]);
+        // A subject `show --json` gives no assessment for counts nothing.
+        let counted = |list: &str, id: &Value| shown["assessment"][list].as_array().is_some_and(|l| l.contains(id));
+        for r in shown["referrers"].as_array().unwrap() {
+            if r["kind"] != "evidence" || r["retracted"] == true || r["body"]["target"] != c["id"] {
+                continue;
+            }
+            let e = want
+                .entry((r["author"].as_str().unwrap().to_owned(), c["author"].as_str().unwrap().to_owned()))
+                .or_default();
+            if r["body"]["verdict"] == "pass" {
+                e[0] += 1;
+                e[2] += u64::from(counted("passes", &r["id"]));
+            } else {
+                e[1] += 1;
+                e[3] += u64::from(counted("fails", &r["id"]));
+            }
+        }
+    }
+    let trust = v.api("/api/trust");
+    let have: BTreeMap<(String, String), [u64; 4]> = trust["edges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            let n = |k: &str| e[k].as_u64().unwrap();
+            let who = |k: &str| agents[e[k].as_u64().unwrap() as usize].clone();
+            ((who("from"), who("to")), [n("passes"), n("fails"), n("counted_passes"), n("counted_fails")])
+        })
+        .collect();
+    assert_eq!(have, want);
+    assert!(want.values().any(|e| e[0] > e[2]), "the sample has an uncounted pass (bob's own)");
+    assert!(want.values().any(|e| e[3] > 0) && want.len() >= 4, "{want:?}");
 }
 
 /// A key published under two names shows by the one the CLI picks, so the view and `log --json` agree.

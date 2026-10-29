@@ -11,11 +11,11 @@ const Bracken = (() => {
   // The only elements and attributes the views make and set. Anything else is refused, so no slip can
   // load, navigate, style or run something, whatever text reaches these helpers.
   const HTML_TAGS = new Set(["div", "span", "p", "article", "h2", "dl", "dt", "dd", "ul", "li", "bdi", "button"]);
-  const SVG_TAGS = new Set(["svg", "g", "path", "circle"]);
+  const SVG_TAGS = new Set(["svg", "g", "path", "circle", "rect", "text"]);
   const ATTRIBUTES = new Set([
     "class", "type", "title", "role", "aria-label", "aria-hidden", "aria-pressed", "aria-valuenow", "aria-valuetext",
     "d", "transform", "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-dasharray", "r", "width", "height",
-    "viewBox",
+    "viewBox", "x", "y", "cx", "cy", "text-anchor", "opacity", "tabindex",
   ]);
   function settable(name) {
     if (!ATTRIBUTES.has(name)) throw new Error(`the view sets no ${name} attribute`);
@@ -26,6 +26,15 @@ const Bracken = (() => {
     return tag;
   }
 
+  // The bidi embeddings, overrides and isolates (U+202A-202E, U+2066-2069). One left open in Ground text
+  // would carry past the end of its <bdi> in some browsers and reorder the words after it, so every
+  // string the helpers put in loses them. The marks (U+200E, U+200F) stay: they open nothing.
+  const BIDI_CONTROLS = new RegExp("[\\u202a-\\u202e\\u2066-\\u2069]", "g");
+  /** A value as page text: a string without bidi controls. */
+  function plain(value) {
+    return String(value).replace(BIDI_CONTROLS, "");
+  }
+
   /** Builds an element. Strings among `children` become text nodes, never markup. */
   function h(tag, attrs, ...children) {
     const el = document.createElement(makeable(HTML_TAGS, tag));
@@ -33,11 +42,11 @@ const Bracken = (() => {
       if (v === null || v === undefined || v === false) continue;
       if (k === "class") el.className = v;
       else if (k === "on") for (const [ev, fn] of Object.entries(v)) el.addEventListener(ev, fn);
-      else el.setAttribute(settable(k), v === true ? "" : String(v));
+      else el.setAttribute(settable(k), v === true ? "" : plain(v));
     }
     for (const c of children.flat(Infinity)) {
       if (c === null || c === undefined || c === false) continue;
-      el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+      el.append(c instanceof Node ? c : document.createTextNode(plain(c)));
     }
     return el;
   }
@@ -49,18 +58,18 @@ const Bracken = (() => {
     for (const [k, v] of Object.entries(attrs || {})) {
       if (v === null || v === undefined || v === false) continue;
       if (k === "on") for (const [ev, fn] of Object.entries(v)) el.addEventListener(ev, fn);
-      else el.setAttribute(settable(k), String(v));
+      else el.setAttribute(settable(k), plain(v));
     }
     for (const c of children.flat(Infinity)) {
       if (c === null || c === undefined || c === false) continue;
-      el.append(c instanceof Node ? c : document.createTextNode(String(c)));
+      el.append(c instanceof Node ? c : document.createTextNode(plain(c)));
     }
     return el;
   }
 
   /** Sets one attribute through the same refusal as h() and s(). */
   function attr(el, name, value) {
-    el.setAttribute(settable(name), String(value));
+    el.setAttribute(settable(name), plain(value));
     return el;
   }
 
@@ -70,7 +79,7 @@ const Bracken = (() => {
   }
 
   function text(el, value) {
-    el.textContent = value === null || value === undefined ? "" : String(value);
+    el.textContent = value === null || value === undefined ? "" : plain(value);
     return el;
   }
 
@@ -79,7 +88,7 @@ const Bracken = (() => {
 
   /** The first line of a statement, cut to `max` characters on a character boundary. */
   function firstLine(value, max = 160) {
-    const line = String(value || "").split(LINE_BREAK)[0];
+    const line = plain(value || "").split(LINE_BREAK)[0];
     const chars = Array.from(line);
     return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : line;
   }

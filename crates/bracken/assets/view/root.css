@@ -1,0 +1,259 @@
+/* Root: one claim's life as a plant. The soil line is the claim; below it, what implements it. */
+
+.root-page {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.stage-wrap {
+  position: relative;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 19rem;
+  background: var(--ground);
+}
+.stage {
+  width: 100%;
+  height: 100%;
+  display: block;
+  grid-column: 1;
+  grid-row: 1;
+}
+.title {
+  grid-column: 1;
+  grid-row: 1;
+  align-self: start;
+  justify-self: start;
+  position: relative;
+  z-index: 1;
+  max-width: 34rem;
+  padding: 1.4rem 1.75rem 0;
+  pointer-events: none;
+}
+.title .statement {
+  margin: 0;
+  font-weight: 500;
+  font-size: clamp(1.5rem, 2.4vw, 2.15rem);
+  line-height: 1.15;
+  letter-spacing: -0.012em;
+  text-wrap: balance;
+}
+.title .byline {
+  margin: 0.55rem 0 0;
+  color: var(--root-dim);
+  font-size: 0.95rem;
+}
+.title .verdict {
+  margin: 0.35rem 0 0;
+  font-size: 0.95rem;
+}
+.verdict .word {
+  font-weight: 600;
+}
+.verdict[data-status="accepted"] .word {
+  color: var(--accepted);
+}
+.verdict[data-status="rejected"] .word {
+  color: var(--rejected);
+}
+.verdict[data-status="pending"] .word {
+  color: var(--root);
+}
+
+/* The story: the same life as text, in order, for reading and for screen readers. */
+.story {
+  grid-column: 2;
+  grid-row: 1;
+  margin: 0;
+  padding: 1.3rem 1.1rem 1.5rem 1.4rem;
+  list-style: none;
+  overflow-y: auto;
+  border-left: 1px solid var(--stratum-line);
+  background: var(--ground);
+  font-size: 0.86rem;
+}
+.story li {
+  display: grid;
+  grid-template-columns: 2.9rem 18px 1fr;
+  gap: 0.45rem;
+  padding: 0.32rem 0;
+  align-items: start;
+  transition: opacity 300ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+.story li.later {
+  opacity: 0.22;
+}
+.story .when {
+  color: var(--root-faint);
+}
+.story .what {
+  overflow-wrap: anywhere;
+}
+.story .what .statement {
+  color: var(--root-dim);
+}
+
+/* SVG text and strokes, from the theme. */
+.stage text {
+  fill: var(--root);
+  font-family: "Alegreya", serif;
+  font-size: 14px;
+}
+.stage .dim {
+  fill: var(--root-dim);
+}
+.stage .faint {
+  fill: var(--root-faint);
+}
+.stage .sc {
+  font-family: "Alegreya Sans SC", sans-serif;
+  font-size: 12px;
+  letter-spacing: 0.06em;
+}
+.stage .italic {
+  font-style: italic;
+}
+.stage .halo {
+  paint-order: stroke;
+  stroke: var(--ground);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+.stage .air .halo {
+  stroke: var(--ground-raised);
+}
+.stage .appear {
+  animation: appear 520ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes appear {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.stage .bloom {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  animation: bloom 900ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes bloom {
+  from {
+    transform: scale(0.35) rotate(-8deg);
+    opacity: 0.2;
+  }
+}
+
+.life {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.65rem 1.25rem;
+  border-top: 1px solid var(--stratum-line);
+  background: var(--ground-raised);
+}
+.life-track {
+  position: relative;
+  flex: 1;
+  height: 34px;
+}
+.life-track canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.life-track input[type="range"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: ew-resize;
+}
+.life-track input[type="range"]::-webkit-slider-runnable-track {
+  height: 34px;
+  background: transparent;
+}
+.life-track input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 3px;
+  height: 34px;
+  background: var(--root);
+  border-radius: 2px;
+}
+.life-track input[type="range"]::-moz-range-thumb {
+  width: 3px;
+  height: 34px;
+  background: var(--root);
+  border: 0;
+  border-radius: 2px;
+}
+.asof {
+  min-width: 4.5rem;
+  color: var(--root-dim);
+}
+
+@media (max-width: 1000px) {
+  .stage-wrap {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+  }
+  .story {
+    grid-column: 1;
+    grid-row: 2;
+    max-height: 30vh;
+    border-left: 0;
+    border-top: 1px solid var(--stratum-line);
+  }
+}
+
+/* ---- The live view's additions ---- */
+
+/* A spore of a counted pass, rising along its root to the seed. The path is set through the CSSOM. */
+.stage .spore {
+  offset-rotate: 0deg;
+  animation: rise 3.6s linear infinite;
+}
+@keyframes rise {
+  from {
+    offset-distance: 100%;
+  }
+  to {
+    offset-distance: 0%;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .stage .spore {
+    display: none;
+  }
+}
+
+/* Ground text is isolated from the words around it (see loom.css). */
+.title .statement,
+.title .byline,
+.story .what .statement,
+.stage text {
+  unicode-bidi: isolate;
+}
+.title .statement {
+  white-space: pre-line;
+}
+.story li.step-now .when {
+  color: var(--focus);
+}
+.story .ended {
+  color: var(--root-faint);
+  font-style: italic;
+}
+.stage-wrap.waiting .stage {
+  opacity: 0.55;
+  transition: opacity 200ms ease-out;
+}
+.title .hint {
+  color: var(--root-faint);
+  font-style: italic;
+}

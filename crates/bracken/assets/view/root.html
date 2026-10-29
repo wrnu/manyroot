@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>Root · Bracken</title>
+    <link rel="stylesheet" href="/visualizer.css" />
+    <link rel="stylesheet" href="/root.css" />
+    <script src="/common.js" defer></script>
+    <script src="/root.js" defer></script>
+  </head>
+  <body class="root-page">
+    <header class="masthead">
+      <h1>Root <span class="ground-name" id="ground-name"></span></h1>
+      <span class="synthetic" id="data-note" role="status">Reading the claim…</span>
+      <nav aria-label="Views">
+        <a href="/">Loom</a>
+        <a href="/root.html" aria-current="page">Root</a>
+        <a href="/trust.html">Trust</a>
+      </nav>
+    </header>
+
+    <main class="stage-wrap">
+      <section class="title" aria-live="polite">
+        <h2 class="statement" id="statement"></h2>
+        <p class="byline" id="byline"></p>
+        <p class="verdict" id="verdict"></p>
+      </section>
+      <svg class="stage" id="stage" viewBox="0 0 1200 760" role="img" aria-labelledby="statement"></svg>
+      <ol class="story" id="story" aria-label="This claim's life, in order"></ol>
+    </main>
+
+    <footer class="life" aria-label="Replay this claim's life">
+      <button type="button" id="replay" aria-pressed="false" disabled>Replay its life</button>
+      <div class="life-track" id="track">
+        <canvas id="track-canvas" aria-hidden="true"></canvas>
+        <input type="range" id="asof" min="0" max="1" value="1" step="1" aria-label="As of" disabled />
+      </div>
+      <span class="asof num" id="asof-label"></span>
+      <button type="button" id="to-loom">Show in the Loom</button>
+    </footer>
+  </body>
+</html>

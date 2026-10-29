@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>Trust · Bracken</title>
+    <link rel="stylesheet" href="/visualizer.css" />
+    <link rel="stylesheet" href="/trust.css" />
+    <script src="/common.js" defer></script>
+    <script src="/trust.js" defer></script>
+  </head>
+  <body class="trust-page">
+    <header class="masthead">
+      <h1>Trust <span class="ground-name" id="ground-name"></span></h1>
+      <span class="synthetic" id="data-note" role="status">Reading the Ground…</span>
+      <nav aria-label="Views">
+        <a href="/">Loom</a>
+        <a href="/root.html">Root</a>
+        <a href="/trust.html" aria-current="page">Trust</a>
+      </nav>
+    </header>
+
+    <main class="meadow-wrap">
+      <section class="meadow" aria-label="Who validates whom">
+        <svg class="field" id="field" viewBox="0 0 1000 800" role="img" aria-label="Agents as flowers; pollen flies from each validator to the author whose work it checked"></svg>
+        <div class="tip" id="tip" hidden></div>
+      </section>
+      <aside class="side" aria-label="Every pair, by how much evidence">
+        <p class="policy sc" id="policy"></p>
+        <h2 class="sc">Who checked whom</h2>
+        <ul class="pairs" id="pairs"></ul>
+      </aside>
+    </main>
+
+    <footer class="controls" aria-label="Which evidence">
+      <div class="segmented" role="group" aria-label="Which evidence">
+        <button type="button" id="all" aria-pressed="true">All evidence that stands</button>
+        <button type="button" id="counted" aria-pressed="false">Only what the policy counts</button>
+      </div>
+      <p class="key">
+        <span><span class="swatch pass" aria-hidden="true"></span>passes</span>
+        <span><span class="swatch fail" aria-hidden="true"></span>fails</span>
+        <span>Pollen flies from the validator to the author whose work it checked. A dashed ring is an agent checking its own work, which no policy counts.</span>
+      </p>
+    </footer>
+  </body>
+</html>
