@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# code-scope: which changes can't alter what builds or tests, for scripts/test-table, bk-evidence
+# and merge (owner decision 642a47c04a10, task a40bde8af77d).
+#
+#   code-scope docs-only <base> <head>
+#   code-scope key <commit>
+#
+# Docs are the *.md files outside crates/: crates/ holds .md files the code compiles in (the
+# experiment's prompts), so those count as code. .bracken/ is the Ground.
+#
+# docs-only exits 0 when what <head> changed since its merge base with <base> is at least one path,
+# and every path is docs. Renames count as a deletion and an addition, so renaming or deleting a
+# file that isn't docs is a code change. It exits 1, naming the first such path, otherwise, and 2 on
+# an error (no such commit, say): only 0 means docs-only.
+#
+# key prints a hash of <commit>'s tree without .bracken/ and docs. Two trees with the same key
+# differ only in the Ground and docs, so they build and test alike; the Ground guards, which read
+# both, must still run.
+set -euo pipefail
+
+usage() {
+  echo "usage: code-scope docs-only <base> <head> | code-scope key <commit>" >&2
+  exit 2
+}
+
+docs() {
+  case "$1" in
+    crates/*) return 1 ;;
+    *.md) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+case "${1:-}" in
+  docs-only)
+    [ $# -eq 3 ] || usage
+    base=$(git merge-base "$2" "$3") || exit 2
+    changed=$(mktemp)
+    trap 'rm -f "$changed"' EXIT
+    git diff --no-renames --name-only -z "$base" "$3" >"$changed" || exit 2
+    any=false
+    while IFS= read -r -d '' path; do
+      any=true
+      docs "$path" || { echo "code-scope: not docs: $path"; exit 1; }
+    done <"$changed"
+    $any || { echo "code-scope: no change since $base"; exit 1; }
+    echo "code-scope: docs only since $base"
+    ;;
+  key)
+    [ $# -eq 2 ] || usage
+    tree=$(git rev-parse --verify -q "$2^{tree}") || { echo "code-scope: no commit $2" >&2; exit 2; }
+    listing=$(mktemp)
+    trap 'rm -f "$listing"' EXIT
+    git ls-tree -r -z --full-tree "$tree" >"$listing" || exit 2
+    # Each entry is '<mode> <type> <object>\t<path>'; only the path decides what's left out.
+    while IFS= read -r -d '' entry; do
+      path=${entry#*$'\t'}
+      case "$path" in .bracken/*) continue ;; esac
+      docs "$path" && continue
+      printf '%s\0' "$entry"
+    done <"$listing" | git hash-object --stdin
+    ;;
+  *) usage ;;
+esac

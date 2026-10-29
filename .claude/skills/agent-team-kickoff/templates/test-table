@@ -15,6 +15,12 @@
 # on a manager pass of exactly this command, run with bk-evidence --on, so a partial re-run after
 # main moves can't count. Another project replaces the commands with its own table.
 #
+# Docs-only (owner decision 642a47c04a10): when everything HEAD changed since it left origin/main is
+# docs, by scripts/code-scope (*.md outside crates/; a rename or deletion of anything else is code),
+# it runs only cargo fmt --check and the Ground guards, and says 'docs-only: skipped clippy and cargo
+# test', which bk-evidence then records in its method. Anything else, no origin/main, or no change
+# at all runs the whole table.
+#
 # Needs the x86_64-unknown-linux-gnu target (rustup target add x86_64-unknown-linux-gnu), and
 # timeout (gtimeout on macOS, from coreutils).
 #
@@ -113,6 +119,14 @@ step() {
   echo "test-table: $*"
   "$@" || fail "failed: $*"
 }
+if scope=$("$here/code-scope" docs-only origin/main HEAD 2>&1); then
+  echo "test-table: $scope"
+  step cargo fmt --check
+  echo "test-table: docs-only: skipped clippy and cargo test"
+  step scripts/ground-guards origin/main HEAD
+  echo "test-table: all passed at $(git rev-parse HEAD), docs-only"
+  exit 0
+fi
 step cargo fmt --check
 step cargo clippy --locked --all-targets -- -D warnings
 step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings

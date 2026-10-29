@@ -14,15 +14,22 @@
 #      every confirmed one (a pass) is deferred by the manager: a current task tagged deferred,
 #      written by the manager, which the manager related depends_on it (process 4.2);
 #   4. the forge PR is open, targets main, and its head is that sha;
+#   scope: a manager pass of scripts/test-table on the sha that bk-evidence labelled docs-only
+#      counts only if the head is docs-only by scripts/code-scope (everything it changed since main
+#      is *.md outside crates/); one that reuses an earlier pass ('tree <key> reuses <id>') counts
+#      only if <id> is a current manager pass of the whole table on a pr claim of the same PR with the
+#      same key (owner decision 642a47c04a10). Any other such pass fails this check;
 #   5. main's tip is an ancestor of the sha, or every file main changed since the
 #      branch point is under .bracken/, or is untouched by the branch and either
 #      under docs/ (not docs/vision.md) or a .md file under .claude/skills/ outside
 #      any templates/ directory: none of these can change what builds, tests or
 #      runs. Renames count as a deletion and an addition. Otherwise, main may be
 #      ahead in any path if a manager pass on the claim ran the whole test table on
-#      the merge ('scripts/test-table @ <sha> on <main sha>', from bk-evidence --on)
-#      with a main sha that main's tip has moved past only in those same paths. A pass
-#      of any other command with --on doesn't count: part of the table proves too little;
+#      the merge ('scripts/test-table @ <sha> on <main sha>', from bk-evidence --on, with
+#      ' tree <key>' and then ' docs-only' or ' reuses <id>' after it as bk-evidence now
+#      records them) with a main sha that main's tip has moved past only in those same
+#      paths. A pass of any other command with --on doesn't count: part of the table
+#      proves too little;
 #   6. scripts/ground-guards passes on the sha against main's tip: no keys or stray
 #      files under .bracken/, the Ground append-only, the Ground opens, and
 #      docs/vision.md matches it.
@@ -201,6 +208,43 @@ fi
 # 5. main.
 git -C "$main" fetch -q origin main "refs/pull/$pr/head" || fail "couldn't fetch main and PR #$pr from origin"
 tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no origin/main"
+
+# The manager's passes of scripts/test-table naming the sha, one '<main sha>\t<key>\t<suffix>' line
+# each; the main and key are empty for a pass without --on, the suffix ' docs-only', ' reuses <id>' or empty.
+tables=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
+  and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
+  | .body.method | capture("^scripts/test-table @ (?<h>[0-9a-f]{40})( on (?<m>[0-9a-f]{40})( tree (?<k>[0-9a-f]{40,64}))?)?(?<x> docs-only| reuses [0-9a-f]{64})?$")?
+  | select(.h == $sha) | [.m // "", .k // "", .x // ""] | @tsv] | unique | .[]' <<<"$shown")
+# Whether <id> is a current manager pass of the whole table, with key <key>, on a pr claim of this PR.
+reuses_a_pass() {
+  local about target
+  about=$(bk show "$1" --json 2>/dev/null) || return 1
+  jq -e --arg k "$2" '.kind == "evidence" and .retracted == false and .author_name == "manager"
+    and .body.verdict == "pass" and (.body.method | test("^scripts/test-table @ [0-9a-f]{40} on [0-9a-f]{40} tree " + $k + "$"))' \
+    <<<"$about" >/dev/null || return 1
+  target=$(jq -r .body.target <<<"$about")
+  bk show "$target" --json 2>/dev/null | jq -e --arg pr "PR #$pr " '(.body.statement // "") | startswith($pr)' >/dev/null
+}
+docs_only=false
+if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  check FAIL scope "$sha isn't on the forge"
+else
+  if scope=$(cd "$main" && "$here/code-scope" docs-only "$tip" "$sha" 2>&1); then docs_only=true; fi
+  scope=${scope#code-scope: }
+  wrong=()
+  while IFS=$'\t' read -r m k x; do
+    case "$x" in
+      " docs-only") $docs_only || wrong+=("a docs-only pass${m:+ on main $m} on a head that isn't docs-only ($scope)") ;;
+      " reuses "*) reuses_a_pass "${x# reuses }" "$k" ||
+        wrong+=("a pass reusing ${x# reuses }, which isn't a current manager pass of the whole table on PR #$pr with key ${k:-none}") ;;
+    esac
+  done <<<"$tables"
+  if [ ${#wrong[@]} -eq 0 ]; then
+    check ok scope "$($docs_only && echo "the head is docs-only" || echo "the head changes code"): $scope"
+  else
+    check FAIL scope "$(printf '%s; ' "${wrong[@]}")run the whole table: bk-evidence --on origin/main -- scripts/test-table"
+  fi
+fi
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
   check FAIL main "$sha isn't on the forge (fetched refs/pull/$pr/head)"
 elif git -C "$main" merge-base --is-ancestor "$tip" "$sha"; then
@@ -223,12 +267,14 @@ else
     done
   }
   bad=$(untested "$base")
-  # The main shas the manager's whole-table passes tested this head merged with
-  # ('scripts/test-table @ <sha> on <main sha>'). Any other command's --on pass is part of the table at most.
-  verified=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
-    and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
-    | .body.method | capture("^scripts/test-table @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40})$")? | select(.h == $sha) | .m]
-    | unique | .[]' <<<"$shown")
+  # The main shas the manager's test-table passes tested this head merged with ('scripts/test-table @
+  # <sha> on <main sha>'); a docs-only one only for a docs-only head, and the scope check vets a reused
+  # one. Any other command's --on pass is part of the table at most.
+  verified=$(while IFS=$'\t' read -r m _ x; do
+    [ -n "$m" ] || continue
+    [ "$x" != " docs-only" ] || $docs_only || continue
+    echo "$m"
+  done <<<"$tables" | sort -u)
   on=""
   # m must hold the branch point, or the tested merge added nothing and m..tip can hide a change
   # main made and reverted after m (finding e82a2f2c7ff5); then m..tip is exactly what the test lacked.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bk-evidence: run a check and record its real result as evidence on a pr claim.
 #
-#   bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] [--on <main>] -- <command> [args...]
+#   bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] [--on <main> [--reuse]] -- <command> [args...]
 #
 # Runs the command in the current checkout, streaming its output, and records
 # evidence on <claim> through scripts/bk: `pass` if it exits 0, otherwise `fail`,
@@ -13,9 +13,21 @@
 # With --on <main> (a commit, such as origin/main), it tests the tree the merge will produce
 # instead: it merges that commit into HEAD in a scratch worktree, runs the command there (in the
 # same subdirectory), removes the worktree, and records --method "<command> @ <HEAD sha> on <main
-# sha>". The pr claim stays on HEAD. scripts/merge accepts main ahead of the head in any path when
-# the manager's pass of scripts/test-table names this head and a main that main's tip has moved past
-# only in .bracken/ and docs. It refuses, recording nothing, if the merge conflicts: then merge main into the branch.
+# sha> tree <key>", where the key is scripts/code-scope's for the merged tree (its hash without
+# .bracken/ and docs). The pr claim stays on HEAD. scripts/merge accepts main ahead of the head in
+# any path when the manager's pass of scripts/test-table names this head and a main that main's tip
+# has moved past only in .bracken/ and docs. It refuses, recording nothing, if the merge conflicts:
+# then merge main into the branch.
+#
+# With --reuse (only with --on, and only for exactly scripts/test-table): if this identity already
+# has a pass of the whole table, not docs-only and not itself reused, on a pr claim of the same PR,
+# whose merged tree had the same key, the table isn't run again. Only the Ground guards run
+# (scripts/ground-guards <main> HEAD, in the merged tree), and the method ends "tree <key> reuses
+# <that evidence's id>" (owner decision 642a47c04a10). So a re-verification after main moved only in
+# docs or the Ground costs the guards alone. Needs jq.
+#
+# When the command is scripts/test-table and it printed 'test-table: docs-only: skipped clippy and
+# cargo test', the method ends " docs-only", so the gate can tell that run from the whole table.
 #
 # It refuses, recording nothing, when:
 #   - it isn't run inside a git checkout;
@@ -42,7 +54,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] [--on <main>] -- <command> [args...]" >&2
+  echo "usage: bk-evidence <claim> [--as <identity>] [--lines N] [--any-head] [--on <main> [--reuse]] -- <command> [args...]" >&2
   exit 2
 }
 fail() { echo "bk-evidence: $*" >&2; exit 1; }
@@ -54,12 +66,14 @@ agent=${BRACKEN_AGENT:-}
 lines=40
 any_head=false
 on=
+reuse=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --as) [ $# -ge 2 ] || usage; agent=$2; shift 2 ;;
     --lines) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || usage; lines=$2; shift 2 ;;
     --any-head) any_head=true; shift ;;
     --on) [ $# -ge 2 ] || usage; on=$2; shift 2 ;;
+    --reuse) reuse=true; shift ;;
     --) shift; break ;;
     *) usage ;;
   esac
@@ -67,6 +81,11 @@ done
 [ $# -ge 1 ] || usage
 [[ $claim =~ ^[0-9a-f]{12,64}$ ]] || fail "'$claim' isn't a claim id (12 to 64 hex characters)"
 [ -n "$agent" ] || fail "no identity: pass --as <identity> or set BRACKEN_AGENT"
+if $reuse; then
+  [ -n "$on" ] || fail "--reuse needs --on: only a merged tree has a key to reuse"
+  [ $# -eq 1 ] && [ "$1" = scripts/test-table ] || fail "--reuse is only for exactly scripts/test-table"
+  command -v jq >/dev/null || fail "--reuse needs jq"
+fi
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 top=$(git rev-parse --show-toplevel 2>/dev/null) || fail "$PWD is not inside a git checkout"
@@ -90,6 +109,7 @@ if [ -n "$on" ]; then
     fail "$sha doesn't merge cleanly with $onto: merge main into the branch, then test that head (nothing run). git said: $(tail -n 3 <<<"$err")"
   fi
   merged=$(git -C "$scratch/tree" rev-parse HEAD)
+  key=$(cd "$top" && "$here/code-scope" key "$merged") || fail "couldn't take the merged tree's key (nothing run)"
   # The caller's subdirectory, from where it runs (with -C the prefix would always be empty).
   prefix=$(git rev-parse --show-prefix)
   run_dir="$scratch/tree/$prefix"
@@ -130,15 +150,41 @@ else
     fail "claim $claim doesn't start 'PR #<n> <branch> @ $sha:', so it isn't the pr claim for HEAD; record on the current pr claim, or pass --any-head for a claim that isn't a pr claim"
 fi
 
+# With --reuse, an earlier pass of the whole table by this identity, on a pr claim of the same PR, of
+# a merged tree with this key. Its method ends exactly "tree <key>": a docs-only or reused pass doesn't count.
+command=("$@")
+reused=
+if $reuse; then
+  [[ $statement =~ \"statement\":\ \"PR\ \#([0-9]+)\  ]] || fail "couldn't read the PR number from $claim"
+  pr=${BASH_REMATCH[1]}
+  prs=$(BRACKEN_AGENT=$agent "$here/bk" log --tag pr --json)
+  passes=$(BRACKEN_AGENT=$agent "$here/bk" log --kind evidence --author "$agent" --json)
+  reused=$(printf '%s\n%s\n' "$prs" "$passes" | jq -rs --arg pr "PR #$pr " --arg key "$key" '
+    (.[0] | map(select((.body.statement // "") | startswith($pr)) | .id)) as $claims
+    | [.[1][] | select(.retracted == false and .body.verdict == "pass" and (.body.target as $t | $claims | index($t))
+        and (.body.method | test("^scripts/test-table @ [0-9a-f]{40} on [0-9a-f]{40} tree " + $key + "$")))]
+    | .[0].id // empty')
+  if [ -n "$reused" ]; then
+    echo "bk-evidence: this merged tree's key $key already passed the whole table for PR #$pr: evidence $reused; running only the Ground guards" >&2
+    command=(scripts/ground-guards "$onto" HEAD)
+  fi
+fi
+
 # mktemp makes each file private (0600) without changing the umask the command runs with.
 out=$(mktemp)
 kept=$(mktemp)
 details=$(mktemp)
 trap 'rm -f "$out" "$kept" "$details"; remove_scratch' EXIT
 set +e
-(cd "$run_dir" && "$@") 2>&1 | tee "$out"
+(cd "$run_dir" && "${command[@]}") 2>&1 | tee "$out"
 code=${PIPESTATUS[0]}
 set -e
+# Read before $out is cut to its tail below: the line comes early in the table's output.
+docs_only=false
+if [ -z "$reused" ] && [ $# -eq 1 ] && [ "$1" = scripts/test-table ] &&
+  grep -qx 'test-table: docs-only: skipped clippy and cargo test' "$out"; then
+  docs_only=true
+fi
 
 after=$(git -C "$top" rev-parse HEAD)
 [ "$after" = "$sha" ] || fail "the command moved HEAD from $sha to $after; nothing recorded (exit $code)"
@@ -167,7 +213,9 @@ fi
     LC_ALL=C sed $'s/\xc2[\x80-\x9f]//g' || true
 } >"$details"
 method="$(printf '%q ' "$@")@ $sha"
-[ -z "$on" ] || method="$method on $onto"
+[ -z "$on" ] || method="$method on $onto tree $key"
+[ -z "$reused" ] || method="$method reuses $reused"
+! $docs_only || method="$method docs-only"
 if id=$("$here/bk" evidence "$claim" "$verdict" --method "$method" --details-file "$details" --as "$agent"); then
   echo "bk-evidence: recorded $verdict $id (exit $code)" >&2
   exit "$code"
