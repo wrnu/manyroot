@@ -55,7 +55,8 @@ how much of the subscription one run uses.
   of the rest cache reads) and 30 to 45 minutes for one 10-agent pilot of
   all three modes on Claude Opus 5.5. The owner's go caps the whole pilot
   at 75 million tokens, 5 million output and 3 hours, which the driver
-  enforces as a third per mode; the output bound at the ceiling is above
+  enforces as a third per mode (with a raised share, the run order keeps the
+  total: section 5, the caps); the output bound at the ceiling is above
   5 million, so a mode would stop at its cap first. The calibration run measured it (1.36 million tokens counted, about
   5 minutes; section 5). One
   pilot calibrates; claims need three replicates. No money is spent beyond
@@ -1058,6 +1059,29 @@ report is written from what exists. With the soft stop, real output is
 expected well below the ceiling: the visible part was under 600 tokens a
 turn. If it isn't, the manager goes back to the owner rather than raising a
 cap.
+
+A run can take one mode's token cap in place of the 25 million, as
+`run --mode-token-cap <mode>=<tokens>` (the manager's note `2018c9beceff`).
+The value applies only to a run of the named mode, and it can lower the cap
+as well as raise it. The run's plan records the caps in effect, so the
+plan's hash changes with it. Without it, every run's caps are as above. The
+flag refuses a value above 75 million, the whole replicate's tokens.
+
+The owner sets a mode's share with the go for a replicate. For Phase 2's
+replicate 1 (approval `1316798b18f9`), Bracken's share is 30 million, and
+git's and crdt's are 25 million each, so the shares add up to more than the
+replicate's 75 million. No part of the harness adds up tokens across a
+replicate's runs. So the run order keeps the total (decision
+`c90a34c1ca38`):
+
+- The first two modes in the drawn order run at their shares.
+- The last mode runs with `--mode-token-cap <mode>=<cap>`, where the cap is
+  the smaller of its share and 75 million minus the tokens the first two
+  runs counted (their reports' totals).
+- The last run's plan records that cap, so a replicate can't pass 75 million.
+
+The expected use is about 40 million, so the last cap shouldn't bind in
+practice.
 
 Output tokens are what weigh most against usage limits; cache reads are most
 of the total but the cheapest part.
