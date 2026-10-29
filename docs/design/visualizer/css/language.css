@@ -1,0 +1,164 @@
+/* The language sheet: a specimen sheet for the visualizer's own parts. */
+
+.language-page {
+  min-height: 100vh;
+}
+.sheet {
+  max-width: 68rem;
+  margin: 0 auto;
+  padding: 2.5rem 1.75rem 5rem;
+}
+.sheet section {
+  margin-top: 3.5rem;
+}
+.sheet h2 {
+  font-size: 1.6rem;
+  font-weight: 500;
+  margin: 0 0 1.1rem;
+  letter-spacing: -0.01em;
+}
+.sheet h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin: 1.6rem 0 0.6rem;
+}
+.sheet h3.sc {
+  font-size: 0.85rem;
+  color: var(--root-dim);
+  font-weight: 500;
+}
+.thesis {
+  margin-top: 0;
+}
+.lede {
+  font-size: clamp(1.25rem, 2vw, 1.6rem);
+  line-height: 1.4;
+  max-width: 44rem;
+  font-style: italic;
+  margin: 0;
+}
+.note {
+  color: var(--root-dim);
+  font-size: 0.9rem;
+  font-weight: 400;
+  font-style: normal;
+}
+
+.knots {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2.25rem 2.75rem;
+}
+.knot {
+  display: grid;
+  justify-items: start;
+  gap: 0.35rem;
+  max-width: 12rem;
+}
+.knot svg {
+  overflow: visible;
+}
+.knot .name {
+  font-weight: 600;
+}
+.knot .meaning {
+  color: var(--root-dim);
+  font-size: 0.88rem;
+  line-height: 1.35;
+}
+
+.palettes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+}
+.palette {
+  background: var(--ground);
+  color: var(--root);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+  padding: 1.2rem 1.3rem 1.4rem;
+}
+.palette h3 {
+  margin-top: 0;
+}
+.swatches,
+.inks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+  margin-top: 0.9rem;
+}
+.swatch {
+  display: grid;
+  gap: 0.2rem;
+  width: 5.6rem;
+  font-size: 0.75rem;
+}
+.swatch .chip {
+  height: 2.4rem;
+  border-radius: 2px;
+  border: 1px solid var(--stratum-line);
+}
+.swatch .val {
+  color: var(--root-faint);
+}
+.inks .ink {
+  display: grid;
+  justify-items: center;
+  gap: 0.15rem;
+  width: 3.6rem;
+  font-size: 0.72rem;
+  color: var(--root-dim);
+}
+.inks .ink .strand {
+  width: 3px;
+  height: 2.2rem;
+  border-radius: 2px;
+}
+
+.type {
+  display: grid;
+  gap: 1.6rem;
+}
+.specimen-statement {
+  font-size: 2.1rem;
+  line-height: 1.15;
+  margin: 0;
+}
+.specimen-label {
+  font-size: 1.15rem;
+  margin: 0;
+}
+.specimen-id {
+  font-size: 1.05rem;
+  margin: 0;
+}
+
+.rules {
+  padding-left: 1.1rem;
+  max-width: 46rem;
+}
+.rules li {
+  margin: 0.5rem 0;
+}
+
+.scale {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 2rem;
+}
+.scale h3 {
+  margin-top: 0;
+}
+.scale p {
+  margin: 0;
+  color: var(--root-dim);
+}
+
+@media (max-width: 860px) {
+  .palettes,
+  .scale {
+    grid-template-columns: 1fr;
+  }
+}

@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>Root · Bracken</title>
+    <link rel="stylesheet" href="css/visualizer.css" />
+    <link rel="stylesheet" href="css/root.css" />
+  </head>
+  <body class="root-page">
+    <header class="masthead">
+      <h1>Root <span class="ground-name" id="ground-name"></span></h1>
+      <label class="claim-pick sc">claim
+        <select id="claim-pick" aria-label="Which claim"></select>
+      </label>
+      <nav aria-label="Views">
+        <a href="loom.html">Loom</a>
+        <a href="root.html" aria-current="page">Root</a>
+        <a href="language.html">Language</a>
+      </nav>
+    </header>
+
+    <main class="stage-wrap">
+      <section class="title" aria-live="polite">
+        <h2 class="statement" id="statement"></h2>
+        <p class="byline" id="byline"></p>
+        <p class="verdict" id="verdict"></p>
+      </section>
+      <svg class="stage" id="stage" viewBox="0 0 1200 760" role="img" aria-labelledby="statement"></svg>
+      <ol class="story" id="story" aria-label="This claim's life, in order"></ol>
+    </main>
+
+    <footer class="life" aria-label="Replay this claim's life">
+      <button type="button" id="replay" aria-pressed="false">Replay its life</button>
+      <div class="life-track" id="track">
+        <canvas id="track-canvas" aria-hidden="true"></canvas>
+        <input type="range" id="asof" min="0" max="1000" value="1000" aria-label="As of" />
+      </div>
+      <span class="asof num" id="asof-label"></span>
+      <span class="synthetic" id="data-note"></span>
+    </footer>
+
+    <script src="sample-data.js"></script>
+    <script src="js/common.js"></script>
+    <script src="js/root.js"></script>
+  </body>
+</html>

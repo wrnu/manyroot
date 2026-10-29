@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>Visual language · Bracken</title>
+    <link rel="stylesheet" href="css/visualizer.css" />
+    <link rel="stylesheet" href="css/language.css" />
+  </head>
+  <body class="language-page">
+    <header class="masthead">
+      <h1>The visual language <span class="ground-name">soil and specimen</span></h1>
+      <nav aria-label="Views">
+        <a href="loom.html">Loom</a>
+        <a href="root.html">Root</a>
+        <a href="language.html" aria-current="page">Language</a>
+      </nav>
+    </header>
+
+    <main class="sheet">
+      <section class="thesis">
+        <p class="lede">
+          A Ground is a root system. Each agent is a root growing down through time. Each contribution is a knot on
+          its author's root, and the hyphae between roots are the causal links that wove the work together. Acceptance
+          is a flower: it opens when the policy's passes arrive, and not before.
+        </p>
+      </section>
+
+      <section aria-labelledby="h-knots">
+        <h2 id="h-knots">Knots: one shape for each kind</h2>
+        <div class="knots" id="knots"></div>
+        <h3 class="sc">States of a subject (claim or artifact)</h3>
+        <div class="knots states" id="states"></div>
+      </section>
+
+      <section aria-labelledby="h-palette">
+        <h2 id="h-palette">Palette</h2>
+        <div class="palettes">
+          <div class="palette" data-theme="soil">
+            <h3>Soil <span class="note">dark, the primary</span></h3>
+            <p class="note">A root window at night: loam, pale roots, the plants' own pigments.</p>
+            <div class="swatches" data-swatches></div>
+            <div class="inks" data-inks></div>
+          </div>
+          <div class="palette" data-theme="herbarium">
+            <h3>Herbarium <span class="note">light, the alternative</span></h3>
+            <p class="note">A mounted specimen in daylight: cool board, leaf-black ink, pressed pigments.</p>
+            <div class="swatches" data-swatches></div>
+            <div class="inks" data-inks></div>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="h-type">
+        <h2 id="h-type">Type</h2>
+        <div class="type">
+          <div>
+            <p class="specimen-statement statement">Revoking a session ends it everywhere within a minute</p>
+            <p class="note">Statements: Alegreya Italic. Every statement is someone's words, so it's set like a collector's note.</p>
+          </div>
+          <div>
+            <p class="specimen-label sc">manager · task · accepted</p>
+            <p class="note">Labels: Alegreya Sans SC, the specimen label's small capitals, with lining figures.</p>
+          </div>
+          <div>
+            <p class="specimen-id id">35ea98d84b90fb45850cb2473dadf54a</p>
+            <p class="note">Ids, times and counts: the system's monospace, with tabular figures. They're data, not decoration.</p>
+          </div>
+        </div>
+      </section>
+
+      <section aria-labelledby="h-motion">
+        <h2 id="h-motion">Motion</h2>
+        <ul class="rules">
+          <li><strong>Growth is the only motion.</strong> Replaying, roots lengthen down the window and each new knot swells from a quarter of its size (420 ms, ease-out). Accepting, the flower opens (900 ms). Passes rise up their root to the seed as slow spores.</li>
+          <li><strong>Nothing moves on its own except the spores</strong>, which are the live flow of evidence into acceptance. Hover lights things; it never animates them.</li>
+          <li><strong>Reduced motion:</strong> no swelling, blooming or spores. Replay moves in whole steps (a tenth of the history, or one event of a claim's life) with no tween, and switching the axis cuts instead of morphing.</li>
+        </ul>
+      </section>
+
+      <section aria-labelledby="h-scale">
+        <h2 id="h-scale">At 10, 1,000 and 50,000</h2>
+        <div class="scale">
+          <div>
+            <h3>10 to about 100</h3>
+            <p>Every knot is drawn at full size. Every claim and artifact carries its label, tied to it by a stitch. Every hypha is drawn.</p>
+          </div>
+          <div>
+            <h3>About 1,000</h3>
+            <p>Knots shrink to fit, and labels give way to hover. Hyphae fade to hairlines, and the hovered knot's ancestry is lit in its authors' inks.</p>
+          </div>
+          <div>
+            <h3>50,000</h3>
+            <p>Knots go. Each root's girth shows how busy it was. Hyphae bundle per pair of agents per band, weighted so the paths the work really takes stand out. Only settled outcomes stay as points: accepted in green, rejected in rust. Zoom brings the knots back.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <script src="js/common.js"></script>
+    <script src="js/language.js"></script>
+  </body>
+</html>

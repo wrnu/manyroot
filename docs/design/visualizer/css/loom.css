@@ -1,0 +1,295 @@
+/* The Loom: a root window. The soil surface is "now"; roots grow down through time. */
+
+.loom-page {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.loom {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) 21rem;
+  min-height: 0;
+  position: relative;
+}
+
+/* ---- The core sample: time, and the scrubber ---- */
+.gauge {
+  position: relative;
+  border-right: 1px solid var(--stratum-line);
+  background: var(--ground-deep);
+  cursor: ns-resize;
+  touch-action: none;
+}
+.gauge canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.surface-handle {
+  position: absolute;
+  left: 0;
+  right: -10px;
+  height: 0;
+  border-top: 2px solid var(--root);
+  z-index: 2;
+}
+.surface-handle::before {
+  /* the grip: a small sprouting tab */
+  content: "";
+  position: absolute;
+  right: -1px;
+  top: -8px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50% 50% 50% 0;
+  background: var(--accepted);
+  transform: rotate(-45deg);
+  box-shadow: var(--shadow);
+}
+.surface-handle:focus-visible {
+  outline: none;
+  border-top-color: var(--focus);
+}
+.surface-time {
+  position: absolute;
+  left: 6px;
+  top: 4px;
+  color: var(--root);
+  background: var(--ground-deep);
+  padding: 0 3px;
+}
+.flag {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 0;
+  border-top: 1px dashed var(--focus);
+  pointer-events: none;
+  z-index: 1;
+}
+.flag span {
+  position: absolute;
+  left: 6px;
+  top: -1.25rem;
+  font-size: 0.7rem;
+  color: var(--focus);
+}
+
+/* ---- The window: agents' roots in the soil ---- */
+.window {
+  position: relative;
+  overflow: hidden;
+  background:
+    radial-gradient(120% 60% at 50% -10%, var(--ground-raised), transparent 60%),
+    var(--ground);
+}
+.window canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.agents {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 64px;
+  border-bottom: 1px solid var(--stratum-line);
+  background: linear-gradient(to bottom, var(--ground-raised), var(--ground));
+  z-index: 2;
+}
+.agent {
+  position: absolute;
+  top: 10px;
+  transform: translateX(-50%);
+  text-align: center;
+  white-space: nowrap;
+  font-size: 0.86rem;
+  line-height: 1.15;
+  max-width: var(--col, 9rem);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.agent .count {
+  display: block;
+  color: var(--root-faint);
+  font-size: 0.72rem;
+}
+.agent::after {
+  /* the seed each root grows from */
+  content: "";
+  display: block;
+  width: 8px;
+  height: 11px;
+  margin: 4px auto 0;
+  border-radius: 50%;
+  background: var(--agent-ink);
+}
+
+.labels {
+  position: absolute;
+  inset: 64px 0 0 0;
+  pointer-events: none;
+  z-index: 1;
+}
+.knot-label {
+  position: absolute;
+  max-width: 15rem;
+  font-size: 0.8rem;
+  line-height: 1.2;
+  color: var(--root-dim);
+  /* a halo of soil, so a label reads across the hyphae behind it */
+  text-shadow: 0 0 3px var(--ground), 0 0 3px var(--ground), 0 0 6px var(--ground);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-style: italic;
+}
+.knot-label::before {
+  /* the stitch: every label is tied to its knot */
+  content: "";
+  display: inline-block;
+  width: 10px;
+  height: 1px;
+  margin-right: 4px;
+  vertical-align: middle;
+  background: var(--root-faint);
+}
+.knot-label.dim {
+  opacity: 0.18;
+}
+.tether {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 3;
+}
+.hover-label {
+  position: absolute;
+  z-index: 4;
+  max-width: 22rem;
+  pointer-events: none;
+  background: var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+  box-shadow: var(--shadow);
+  padding: 0.45rem 0.65rem 0.5rem;
+  font-size: 0.85rem;
+  line-height: 1.3;
+}
+.hover-label .who {
+  color: var(--root-dim);
+  font-size: 0.75rem;
+}
+.hover-label .what {
+  font-style: italic;
+  overflow-wrap: anywhere;
+}
+
+/* ---- The side: the specimen label ---- */
+.side {
+  border-left: 1px solid var(--stratum-line);
+  padding: 1.25rem 1.1rem;
+  overflow-y: auto;
+  background: var(--ground);
+}
+.side-hint {
+  color: var(--root-faint);
+  font-style: italic;
+  margin: 0.25rem 0 0;
+}
+.side h2 {
+  font-size: 0.8rem;
+  margin: 1.6rem 0 0.5rem;
+  color: var(--root-faint);
+  font-weight: 500;
+}
+.side .lineage {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  font-size: 0.85rem;
+}
+.side .lineage li {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 0.4rem;
+  align-items: start;
+  padding: 0.2rem 0;
+}
+.side .lineage .statement {
+  color: var(--root-dim);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.side .open-root {
+  display: inline-block;
+  margin-top: 0.9rem;
+}
+
+/* ---- Controls ---- */
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.6rem 1.25rem;
+  border-top: 1px solid var(--stratum-line);
+  background: var(--ground-raised);
+  font-size: 0.9rem;
+  flex-wrap: wrap;
+}
+.controls .divider {
+  width: 1px;
+  height: 1.3rem;
+  background: var(--stratum-line);
+}
+.segmented {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+.speed {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+  color: var(--root-dim);
+  font-size: 0.82rem;
+}
+.key {
+  display: flex;
+  gap: 0.85rem;
+  margin-left: auto;
+  color: var(--root-dim);
+  font-size: 0.8rem;
+  flex-wrap: wrap;
+}
+.key span {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+@media (max-width: 1100px) {
+  .loom {
+    grid-template-columns: 72px minmax(0, 1fr);
+  }
+  .side {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: min(21rem, 90vw);
+    max-height: 45%;
+    border: 1px solid var(--stratum-line);
+    box-shadow: var(--shadow);
+  }
+  .side:has(.side-hint) {
+    display: none;
+  }
+}
