@@ -333,4 +333,8 @@ id=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$det
 echo "recorded merge gate evidence $id"
 api POST "/pulls/$pr/merge" "$body" >/dev/null || fail "the forge refused the merge (if the head moved, it answers 409); the evidence $id stands"
 echo "merged PR #$pr at $sha"
+# Free what finished work left behind (process 11f1ac552f26). The merge stands whatever cleanup does.
+if [ -x "$here/cleanup" ]; then
+  "$here/cleanup" --apply </dev/null 2>&1 | sed 's/^/  /' || echo "merge: cleanup failed (the merge stands); run scripts/cleanup to see why"
+fi
 echo "update the main checkout only through scripts/ground-checkpoint and the sha it names, not git pull (process 9.3)"
