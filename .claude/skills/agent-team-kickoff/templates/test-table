@@ -3,6 +3,7 @@
 #
 #   test-table
 #   test-table --remote
+#   test-table --split
 #
 # Runs, from the top of the checkout it lives in, stopping at the first that fails:
 #   cargo fmt --check
@@ -34,6 +35,15 @@
 # printed the box's id, a box still listed in any state when this exits (or any box, if boat can't
 # list them) is deleted by id. A Ctrl-C before boat prints the id leaves the deletion to boat run
 # alone. In the box, the guards use the bracken cargo just built.
+#
+# --split is the manager's counted run (owner decision 01a2d668b67e): the whole table in one box, as
+# --remote runs it, and at the same time, here, only the tests that need macOS, which Linux skips:
+# every test in a 'mod macos_only' (cargo test --workspace -- macos_only::). It passes only if both
+# pass. Which tests need macOS comes from the code: the box also lists the tests Linux has and
+# ignores, this Mac lists its own, and any test that runs here but is missing or ignored on Linux
+# must be in a macos_only module, or the run fails naming it, so no test is skipped on both sides.
+# It ends with the last lines of both parts. A docs-only head (below) runs locally, with no box. A
+# Ctrl-C or a failure here stops the box, and the box is deleted as --remote deletes it.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -41,7 +51,24 @@ cd "$(git -C "$here" rev-parse --show-toplevel)"
 fail() { echo "test-table: $*" >&2; exit 1; }
 timeout=$(command -v timeout || command -v gtimeout) || fail "needs timeout (on macOS, gtimeout from coreutils)"
 
-# The table in one boat box, for HEAD.
+# Whether box $1 may still exist: listed in any state, or boat can't say. --all, because plain list
+# shows only running boxes, and one left stopped, pending, stopping or in error keeps its data.
+box_left() {
+  local listing
+  ! listing=$(boat list --all --json 2>/dev/null) || grep -qE "\"id\": *\"$1\"" <<<"$listing"
+}
+# Deletes box $1 if boat left it, and says so if it's still there.
+delete_box() {
+  box_left "$1" || return 0
+  echo "test-table: deleting box $1" >&2
+  # It fails with "not found" if boat had deleted it after all; the check after says which.
+  boat delete --yes "$1" >/dev/null 2>&1 || true
+  ! box_left "$1" || echo "test-table: box $1 may be left; see boat list --all, and delete it: boat delete --yes $1" >&2
+}
+# The box boat announced ("bx_… ready") in output file $1, not any id the box's own output mentions.
+box_in() { grep -oE '^bx_[a-z0-9]+ ready' "$1" 2>/dev/null | head -1 | cut -d' ' -f1 || true; }
+
+# The table in one boat box, for HEAD; $1, if given, runs in the box after it.
 remote() {
   local rc line
   command -v boat >/dev/null || fail "--remote needs boat (reference ea41264b3c38)"
@@ -50,27 +77,12 @@ remote() {
   # tmp, out and box are globals: the EXIT trap runs after this function has returned.
   tmp=$(mktemp -d)
   out="$tmp/box.out"
-  box=''
-  # Whether the box may still exist: listed in any state, or boat can't say. --all, because plain
-  # list shows only running boxes, and one left stopped, pending, stopping or in error keeps its data.
-  # shellcheck disable=SC2329 # run by cleanup
-  left() {
-    local listing
-    ! listing=$(boat list --all --json 2>/dev/null) || grep -qE "\"id\": *\"$box\"" <<<"$listing"
-  }
-  # Every way out deletes the box if boat left one, and the bundle. The id is the one boat announces
-  # ("bx_… ready"), not any id the box's own output mentions.
+  # Every way out deletes the box if boat left one, and the bundle.
   # shellcheck disable=SC2329 # run by the EXIT trap
   cleanup() {
-    if [ -z "$box" ] && [ -f "$out" ]; then
-      box=$(grep -oE '^bx_[a-z0-9]+ ready' "$out" | head -1 | cut -d' ' -f1 || true)
-    fi
-    if [ -n "$box" ] && left; then
-      echo "test-table: deleting box $box" >&2
-      # It fails with "not found" if boat had deleted it after all; the check after says which.
-      boat delete --yes "$box" >/dev/null 2>&1 || true
-      ! left || echo "test-table: box $box may be left; see boat list --all, and delete it: boat delete --yes $box" >&2
-    fi
+    local box
+    box=$(box_in "$out")
+    [ -z "$box" ] || delete_box "$box"
     rm -rf -- "$tmp"
   }
   trap cleanup EXIT
@@ -95,6 +107,8 @@ cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
 git checkout -q tested
 BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table'
+  inner="$inner${1:+
+$1}"
   set +e
   # tee -i: a Ctrl-C must not stop the copy before boat has printed the box it's deleting.
   boat run --no-env --push "$tmp/push" --type default --timeout 2400 -- bash -c "$inner" 2>&1 | tee -i "$out"
@@ -109,10 +123,171 @@ BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table'
   echo "test-table: all passed at $(git rev-parse HEAD), in a box"
 }
 
+# The tests a 'cargo test -- --list' printed, as sorted '<test binary>|<test>' lines: the binary is the
+# crate-type name cargo runs (target/.../deps/<name>-<hash>), or doc:<crate> for doc tests.
+tests_listed() {
+  awk '
+    /Running .*deps\/[A-Za-z0-9_]+-[0-9a-f]+\)/ { t = $0; sub(/.*deps\//, "", t); sub(/-[0-9a-f]+\).*/, "", t); next }
+    /Doc-tests / { t = $0; sub(/.*Doc-tests /, "doc:", t); next }
+    /: test$/ && t != "" { n = $0; sub(/: test$/, "", n); print t "|" n }
+  ' | LC_ALL=C sort -u
+}
+
+# Stops the process group of job $1, if it still runs: SIGINT, which boat takes as a Ctrl-C and
+# deletes its box, and the tests' part passes on to timeout; 15 s on, SIGTERM; then SIGKILL, so nothing that
+# ignores or outlives a signal holds the run open.
+stop_group() {
+  local sig
+  for sig in INT TERM KILL; do
+    kill -0 "$1" 2>/dev/null || break
+    kill -"$sig" -- "-$1" 2>/dev/null || true
+    for _ in $(seq 75); do
+      kill -0 "$1" 2>/dev/null || break
+      sleep 0.2
+    done
+  done
+  wait "$1" 2>/dev/null || true
+}
+
+# Passes a SIGINT or SIGTERM on to this shell's jobs as SIGTERM: a background job starts with SIGINT
+# ignored, and timeout keeps it so, but it takes SIGTERM and signals its group. jobs -p holds a job
+# from its fork, before $! is saved, so a signal between the two still reaches it. stopping keeps
+# timeout's pid for stop_parts (finding a9acfeadbe06).
+stopping=false
+pass_on() {
+  local j
+  stopping=true
+  for j in $(jobs -p); do kill -TERM "$j" 2>/dev/null || true; done
+}
+
+# Runs the rest under timeout for at most $1 s, as a job: timeout runs it in a process group of its
+# own, which it signals whole at the limit or on a SIGTERM (SIGKILL 30 s on), so a test program that
+# hangs ends with everything cargo started (finding c7d17b82e315). That group is out of reach of a
+# signal to this part's, so the part's traps pass it on (pass_on). wait, which a signal interrupts at
+# once, gives the exit even if bash has already reaped timeout (note fa805ecf517e); after a signal it
+# waits again while timeout runs. timeout's pid is in a file while it runs, and after a stop, for
+# stop_parts to kill what in its group ignored the SIGTERM.
+bounded() {
+  local t rc=0 limit=$1
+  shift
+  "$timeout" -k 30 "$limit" "$@" &
+  t=$!
+  echo "$t" >"$split_tmp/timeout.pid"
+  wait "$t" || rc=$?
+  while [ "$rc" -gt 128 ] && kill -0 "$t" 2>/dev/null; do
+    rc=0
+    wait "$t" || rc=$?
+  done
+  $stopping || : >"$split_tmp/timeout.pid"
+  return "$rc"
+}
+
+# The macOS-only tests here, then this Mac's lists of the tests it has and ignores, each bounded.
+here_part() {
+  trap pass_on INT TERM
+  bounded "$here_limit" cargo test --locked --workspace -- macos_only:: > >(tee -i "$split_tmp/here") 2>&1 || exit
+  bounded 300 cargo test --locked --workspace -- --list >"$split_tmp/mac-all.out" 2>&1 || exit
+  bounded 300 cargo test --locked --workspace -- --list --ignored >"$split_tmp/mac-ignored.out" 2>&1 || exit
+  tests_listed <"$split_tmp/mac-all.out" >"$split_tmp/mac-all"
+  tests_listed <"$split_tmp/mac-ignored.out" >"$split_tmp/mac-ignored"
+}
+
+# The whole table in a box and the macOS-only tests here, at once.
+split() {
+  local rc=0 here_rc=0 escaped
+  command -v boat >/dev/null || fail "--split needs boat (reference ea41264b3c38)"
+  [ -z "$(git status --porcelain)" ] || fail "--split tests HEAD: commit or set aside the changes first"
+  git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
+  # split_tmp, box_job and here_job are globals: the EXIT trap runs after this function has returned.
+  split_tmp=$(mktemp -d)
+  # The tests here end by 1800 s, as the local table's do. TEST_TABLE_HERE_LIMIT can only shorten it
+  # (for a test of the bound), never lengthen it.
+  here_limit=${TEST_TABLE_HERE_LIMIT:-1800}
+  [[ $here_limit =~ ^[1-9][0-9]*$ ]] && [ "$here_limit" -le 1800 ] ||
+    fail "TEST_TABLE_HERE_LIMIT must be 1 to 1800 seconds, not '$here_limit'"
+  box_job='' here_job=''
+  # Each list ends with a line saying it was whole; under pipefail a failed cargo fails the box, and a
+  # list without its end line fails the run, so a list cut short can't hide a test.
+  # shellcheck disable=SC2016 # expanded in the box
+  local lists='set -o pipefail
+echo "test-table: the tests Linux has, and those it ignores"
+cargo test --locked --workspace -- --list 2>&1 | sed "s/^/LIST all /"
+echo "LIST end all"
+cargo test --locked --workspace -- --list --ignored 2>&1 | sed "s/^/LIST ignored /"
+echo "LIST end ignored"'
+  # Stops both parts on every way out, then deletes the box by id if boat left it: a killed box part
+  # can't. Both run as jobs with job control (set -m): each in its own process group, with SIGINT
+  # not ignored, as a plain background job's would be (finding 87cfdf4680c7), and this shell waits
+  # on them with wait, which a signal interrupts at once.
+  # shellcheck disable=SC2329 # run by the EXIT trap
+  stop_parts() {
+    local box job here_stopped=false t
+    # jobs -p: each part from its fork, before its pid is saved, as a signal between the two needs.
+    for job in $(jobs -p); do
+      if [ "$job" = "$box_job" ]; then
+        echo "test-table: stopping the box" >&2
+      else
+        echo "test-table: stopping the tests here" >&2
+        here_stopped=true
+      fi
+      stop_group "$job"
+    done
+    # timeout's own group, only if the tests here were stopped while it ran and something in it
+    # outlived them: only SIGKILL is sure. Never after they ended by themselves, when the group is
+    # gone and its id could be another process's.
+    t=$(cat "$split_tmp/timeout.pid" 2>/dev/null || true)
+    if $here_stopped && [ -n "$t" ] && kill -0 -- "-$t" 2>/dev/null; then
+      kill -KILL -- "-$t" 2>/dev/null || true
+    fi
+    box=$(box_in "$split_tmp/box")
+    [ -z "$box" ] || delete_box "$box"
+    rm -rf -- "$split_tmp"
+  }
+  trap stop_parts EXIT
+  trap 'exit 130' INT TERM
+  echo "test-table: the whole table in a box (output at the end), and here the macOS-only tests"
+  set -m
+  (remote "$lists") >"$split_tmp/box" 2>&1 &
+  box_job=$!
+  (here_part) &
+  here_job=$!
+  set +m
+  wait "$here_job" || here_rc=$?
+  here_job=''
+  if [ "$here_rc" -ne 0 ]; then
+    echo "test-table: the macOS-only tests here failed (exit $here_rc)" >&2
+    exit "$here_rc"
+  fi
+  wait "$box_job" || rc=$?
+  box_job=''
+  sed -n 's/^LIST all //p' "$split_tmp/box" | tests_listed >"$split_tmp/linux-all"
+  sed -n 's/^LIST ignored //p' "$split_tmp/box" | tests_listed >"$split_tmp/linux-ignored"
+  echo "== the box, last lines"
+  grep -v '^LIST ' "$split_tmp/box" | tail -n 15
+  echo "== here, last lines"
+  grep -E '^test result: |^test-table: ' "$split_tmp/here" | grep -v ' 0 passed;' | tail -n 8 || true
+  [ "$rc" -eq 0 ] || { echo "test-table: the box's table exited $rc" >&2; exit "$rc"; }
+  { grep -qx 'LIST end all' "$split_tmp/box" && grep -qx 'LIST end ignored' "$split_tmp/box"; } ||
+    fail "the box's test lists didn't finish, so which tests need macOS is unknown"
+  [ -s "$split_tmp/linux-all" ] || fail "the box listed no tests, so which tests need macOS is unknown"
+  # Runs here but is missing on Linux, or ignored there and not here: it must be one of the tests run here.
+  escaped=$({
+    LC_ALL=C comm -23 "$split_tmp/mac-all" "$split_tmp/linux-all"
+    LC_ALL=C comm -23 "$split_tmp/linux-ignored" "$split_tmp/mac-ignored" | LC_ALL=C comm -12 - "$split_tmp/mac-all"
+  } | grep -v '^[^|]*|.*macos_only::' || true)
+  [ -z "$escaped" ] ||
+    fail "these run on this Mac but not on Linux, and aren't in a macos_only module, so neither part runs them: $(tr '\n' ' ' <<<"$escaped")"
+  echo "test-table: all passed at $(git rev-parse HEAD): the whole table in a box, and the macOS-only tests here"
+}
+
 case "${1:-}" in
   '') ;;
   --remote) remote; exit 0 ;;
-  *) fail "usage: test-table [--remote]" ;;
+  --split)
+    # A docs-only head runs the local docs-only table below: nothing for a box to do.
+    "$here/code-scope" docs-only origin/main HEAD >/dev/null 2>&1 || { split; exit 0; }
+    ;;
+  *) fail "usage: test-table [--remote | --split]" ;;
 esac
 
 step() {

@@ -19,15 +19,19 @@
 # has moved past only in .bracken/ and docs. It refuses, recording nothing, if the merge conflicts:
 # then merge main into the branch.
 #
-# With --reuse (only with --on, and only for exactly scripts/test-table): if this identity already
-# has a pass of the whole table, not docs-only and not itself reused, on a pr claim of the same PR,
+# With --reuse (only with --on, and only for exactly scripts/test-table or scripts/test-table --split,
+# the split counted run: the whole table in a box plus the macOS-only tests here, which counts as the
+# whole table): if this identity already has a pass of the whole table, in either form, not docs-only
+# and not itself reused, on a pr claim of the same PR,
 # whose merged tree had the same key, the table isn't run again. Only the Ground guards run
 # (scripts/ground-guards <main> HEAD, in the merged tree), and the method ends "tree <key> reuses
 # <that evidence's id>" (owner decision 642a47c04a10). So a re-verification after main moved only in
 # docs or the Ground costs the guards alone. Needs jq.
 #
-# When the command is scripts/test-table and it printed 'test-table: docs-only: skipped clippy and
+# When the command is scripts/test-table (or with --split) and it printed 'test-table: docs-only: skipped clippy and
 # cargo test', the method ends " docs-only", so the gate can tell that run from the whole table.
+#
+# It records nothing, and exits 130, if it gets SIGINT or SIGTERM while the command runs.
 #
 # It refuses, recording nothing, when:
 #   - it isn't run inside a git checkout;
@@ -81,9 +85,11 @@ done
 [ $# -ge 1 ] || usage
 [[ $claim =~ ^[0-9a-f]{12,64}$ ]] || fail "'$claim' isn't a claim id (12 to 64 hex characters)"
 [ -n "$agent" ] || fail "no identity: pass --as <identity> or set BRACKEN_AGENT"
+# Whether the command is the whole table: scripts/test-table, or its split form.
+table_run() { [ "$*" = scripts/test-table ] || { [ $# -eq 2 ] && [ "$*" = "scripts/test-table --split" ]; }; }
 if $reuse; then
   [ -n "$on" ] || fail "--reuse needs --on: only a merged tree has a key to reuse"
-  [ $# -eq 1 ] && [ "$1" = scripts/test-table ] || fail "--reuse is only for exactly scripts/test-table"
+  table_run "$@" || fail "--reuse is only for exactly scripts/test-table or scripts/test-table --split"
   command -v jq >/dev/null || fail "--reuse needs jq"
 fi
 
@@ -162,7 +168,7 @@ if $reuse; then
   reused=$(printf '%s\n%s\n' "$prs" "$passes" | jq -rs --arg pr "PR #$pr " --arg key "$key" '
     (.[0] | map(select((.body.statement // "") | startswith($pr)) | .id)) as $claims
     | [.[1][] | select(.retracted == false and .body.verdict == "pass" and (.body.target as $t | $claims | index($t))
-        and (.body.method | test("^scripts/test-table @ [0-9a-f]{40} on [0-9a-f]{40} tree " + $key + "$")))]
+        and (.body.method | test("^scripts/test-table( --split)? @ [0-9a-f]{40} on [0-9a-f]{40} tree " + $key + "$")))]
     | .[0].id // empty')
   if [ -n "$reused" ]; then
     echo "bk-evidence: this merged tree's key $key already passed the whole table for PR #$pr: evidence $reused; running only the Ground guards" >&2
@@ -175,13 +181,24 @@ out=$(mktemp)
 kept=$(mktemp)
 details=$(mktemp)
 trap 'rm -f "$out" "$kept" "$details"; remove_scratch' EXIT
+# An interrupted run records nothing: SIGINT or SIGTERM while the command runs (finding 87cfdf4680c7).
+# Neither side of the pipe may stop before the command has: the copy ignores SIGINT and SIGTERM while
+# the command still writes, as its cleanup does, or the command dies of SIGPIPE before cleaning up;
+# the subshell traps both, so it waits for the command, which gets their default back.
+interrupted=false
+trap 'interrupted=true' INT TERM
 set +e
-(cd "$run_dir" && "${command[@]}") 2>&1 | tee "$out"
+(trap : INT TERM; cd "$run_dir" && "${command[@]}") 2>&1 | (trap '' INT TERM; exec tee "$out")
 code=${PIPESTATUS[0]}
 set -e
+trap - INT TERM
+if $interrupted; then
+  echo "bk-evidence: interrupted (the command exited $code); nothing recorded" >&2
+  exit 130
+fi
 # Read before $out is cut to its tail below: the line comes early in the table's output.
 docs_only=false
-if [ -z "$reused" ] && [ $# -eq 1 ] && [ "$1" = scripts/test-table ] &&
+if [ -z "$reused" ] && table_run "$@" &&
   grep -qx 'test-table: docs-only: skipped clippy and cargo test' "$out"; then
   docs_only=true
 fi

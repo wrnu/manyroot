@@ -539,44 +539,6 @@ fn runs_refuse_a_shared_temporary_directory_that_isnt_sticky() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
-#[cfg(target_os = "macos")]
-#[test]
-fn runs_refuse_a_temporary_directory_shared_through_an_acl() {
-    use std::os::unix::fs::PermissionsExt;
-    let tmp = tempfile::tempdir().unwrap();
-    let shared = tmp.path().join("acl");
-    std::fs::create_dir(&shared).unwrap();
-    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let grant = Command::new("/bin/chmod")
-        .args(["+a", "everyone allow add_file,add_subdirectory,delete_child"])
-        .arg(&shared)
-        .status()
-        .unwrap();
-    assert!(grant.success());
-    let out = demo_command(&["--agents", "2", "--rounds", "1"]).env("TMPDIR", &shared).output().unwrap();
-    assert!(!out.status.success(), "ran in a TMPDIR others can rename entries in");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("has an ACL entry allowing add_file"), "{stderr}");
-    assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
-}
-
-#[cfg(target_os = "macos")]
-#[test]
-fn runs_refuse_a_temporary_directory_whose_acl_new_files_inherit() {
-    use std::os::unix::fs::PermissionsExt;
-    let tmp = tempfile::tempdir().unwrap();
-    let shared = tmp.path().join("acl");
-    std::fs::create_dir(&shared).unwrap();
-    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let read = "everyone allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit";
-    assert!(Command::new("/bin/chmod").args(["+a", read]).arg(&shared).status().unwrap().success());
-    let out = demo_command(&["--agents", "2", "--rounds", "1"]).env("TMPDIR", &shared).output().unwrap();
-    assert!(!out.status.success(), "ran where others can read the run's keys");
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("has an ACL entry that new files inherit"), "{stderr}");
-    assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
-}
-
 #[test]
 fn checks_leave_out_heartbeats() {
     let tmp = tempfile::tempdir().unwrap();
@@ -593,4 +555,47 @@ fn checks_leave_out_heartbeats() {
     assert_eq!(r["work"]["checks"], checks.len());
     assert_eq!(r["work"]["passes"], passes);
     assert_eq!(r["work"]["checks"], r["work"]["passes"].as_u64().unwrap() + r["work"]["fails"].as_u64().unwrap());
+}
+
+/// The tests that need macOS, for its ACLs: `scripts/test-table --split` runs them on the Mac by this
+/// module's name (owner decision `01a2d668b67e`).
+#[cfg(target_os = "macos")]
+mod macos_only {
+    use super::*;
+
+    #[test]
+    fn runs_refuse_a_temporary_directory_shared_through_an_acl() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("acl");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let grant = Command::new("/bin/chmod")
+            .args(["+a", "everyone allow add_file,add_subdirectory,delete_child"])
+            .arg(&shared)
+            .status()
+            .unwrap();
+        assert!(grant.success());
+        let out = demo_command(&["--agents", "2", "--rounds", "1"]).env("TMPDIR", &shared).output().unwrap();
+        assert!(!out.status.success(), "ran in a TMPDIR others can rename entries in");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("has an ACL entry allowing add_file"), "{stderr}");
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn runs_refuse_a_temporary_directory_whose_acl_new_files_inherit() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = tmp.path().join("acl");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let read = "everyone allow list,search,read,readattr,readextattr,readsecurity,file_inherit,directory_inherit";
+        assert!(Command::new("/bin/chmod").args(["+a", read]).arg(&shared).status().unwrap().success());
+        let out = demo_command(&["--agents", "2", "--rounds", "1"]).env("TMPDIR", &shared).output().unwrap();
+        assert!(!out.status.success(), "ran where others can read the run's keys");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("has an ACL entry that new files inherit"), "{stderr}");
+        assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
+    }
 }

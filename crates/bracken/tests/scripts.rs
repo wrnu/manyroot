@@ -1471,23 +1471,27 @@ fn test_table_remote_runs_one_box_and_leaves_none_behind() {
         assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the box was left");
         assert!(!tmp.path().join("left").exists());
 
-        // Interrupted mid-run (Ctrl-C reaches the whole process group): the box is deleted too.
+        // Interrupted mid-run (Ctrl-C reaches the whole process group): the box is deleted too, without
+        // waiting for the box's 10 minutes. The bounds count from the interrupt and leave headroom for a
+        // loaded machine (note 300ac9b6a423: a load average near 300 broke a 25 s bound on the whole run).
         std::fs::remove_file(tmp.path().join("deleted")).unwrap();
         std::fs::remove_file(tmp.path().join("ready")).unwrap();
         std::fs::write(tmp.path().join("left"), "running").unwrap();
-        let mut child = remote("0", "30");
+        let mut child = remote("0", "600");
         std::os::unix::process::CommandExt::process_group(&mut child, 0);
         let mut child = child.spawn().unwrap();
         let started = std::time::Instant::now();
         while !tmp.path().join("ready").exists() {
-            assert!(started.elapsed() < std::time::Duration::from_secs(20), "{scripts}: boat never ran");
+            assert!(started.elapsed() < std::time::Duration::from_secs(180), "{scripts}: boat never ran");
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let group = format!("-{}", child.id());
         assert!(Command::new("/bin/kill").args(["-INT", "--", &group]).status().unwrap().success());
+        let interrupted = std::time::Instant::now();
         let status = child.wait().unwrap();
         assert!(!status.success(), "{scripts}: an interrupted run passed");
-        assert!(started.elapsed() < std::time::Duration::from_secs(25), "{scripts}: waited for the box");
+        let after = interrupted.elapsed();
+        assert!(after < std::time::Duration::from_secs(120), "{scripts}: waited {after:?} for the box");
         assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the interrupted box was left");
 
         // A dirty tree: refused, no box.
@@ -1656,7 +1660,29 @@ fn bk_evidence_reuses_a_whole_table_pass_of_the_same_merged_tree_on_the_same_pr(
         assert_eq!(ran, "table\n", "{script}: reused a docs-only pass");
         assert!(!method.contains("docs-only") && !method.contains("reuses"), "{script}: {method}");
 
-        // --reuse only with --on, and only for exactly scripts/test-table.
+        // The split counted run is the whole table too: its pass is recorded under its own command, and a
+        // later run of either form on the same tree reuses it (owner decision 01a2d668b67e).
+        let tip = switch_main(&|| put(&dir, "lib.txt", "split code\n"));
+        let _ = std::fs::remove_file(&log);
+        let args = [&claim[..12], "--as", "val", "--on", "main", "--reuse", "--", "scripts/test-table", "--split"];
+        let out = command(&dir, "scripts/bk-evidence", &args).env("LOG", &log).output().unwrap();
+        assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "table\n", "{script}");
+        let evidence: serde_json::Value =
+            serde_json::from_str(&bk(&dir, &["log", "--kind", "evidence", "--json"])).unwrap();
+        let last = evidence.as_array().unwrap().last().unwrap().clone();
+        let split = last["id"].as_str().unwrap().to_owned();
+        let method = last["body"]["method"].as_str().unwrap().to_owned();
+        assert!(
+            method.starts_with(&format!("scripts/test-table --split @ {head} on {tip} tree ")),
+            "{script}: {method}"
+        );
+        let tip = switch_main(&|| put(&dir, "docs/split.md", "a doc\n"));
+        let (ran, _, method) = record(&claim, false);
+        assert_eq!(ran, format!("guards {tip} HEAD\n"), "{script}: didn't reuse the split pass");
+        assert!(method.ends_with(&format!(" reuses {split}")), "{script}: {method}");
+
+        // --reuse only with --on, and only for exactly scripts/test-table (or with --split).
         for args in [
             &[&claim[..12], "--as", "val", "--reuse", "--", "scripts/test-table"][..],
             &[&claim[..12], "--as", "val", "--on", "main", "--reuse", "--", "scripts/test-table", "--remote"],
@@ -1772,5 +1798,467 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
             let worktrees = String::from_utf8(run(&dir, "git", &["worktree", "list"]).stdout).unwrap();
             assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
         }
+    }
+}
+
+/// `test-table --split` (owner decision `01a2d668b67e`), with a stub `boat` and `cargo`: the whole table in
+/// one box, as --remote runs it, and here only `cargo test --workspace -- macos_only::`; it passes only if
+/// both do, and ends with both parts' last lines. Which tests need macOS comes from the code: a test that
+/// runs here but is missing or ignored on Linux, by the two sides' `--list`s, must be in a macos_only module.
+/// A failure here stops the box and deletes it; a docs-only head uses no box.
+#[test]
+fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
+    for scripts in SCRIPTS {
+        let file = |name: &str| repo_root().join(scripts).join(name);
+        let (table, scope) = (file("test-table"), file("code-scope"));
+        let files = [("scripts/test-table", table.as_path()), ("scripts/code-scope", scope.as_path())];
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\necho \"ground-guards $*\" >>\"$LOG\"\n");
+            put(dir, "code.txt", "code\n");
+        });
+        let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?}");
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(&["switch", "-qc", "pr"]);
+        put(&dir, "code.txt", "a change\n");
+        commit_all(&dir, "code");
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        // boat run: as in the --remote test, then the box's lists ($T/linux), then $SLEEP seconds and $EXIT.
+        write_executable(
+            &stubs.join("boat"),
+            "#!/bin/bash\n\
+             case \"$1\" in\n\
+             run) printf '%s\\n' \"$@\" >\"$T/args\"\n\
+               echo 'bx_stub01 ready in 1.0s'; touch \"$T/ready\"; echo 'test-table: all passed at x, in a box'\n\
+               [ ! -e \"$T/linux\" ] || cat \"$T/linux\"\n\
+               sleep \"${SLEEP:-0}\"\n\
+               echo \"exit $EXIT · 5m 00s · default · \\$0.0030 · bx_stub01 deleted\"; exit \"$EXIT\" ;;\n\
+             list) if [ -e \"$T/left\" ]; then echo '{\"sandboxes\":[{\"id\": \"bx_stub01\"}]}'; else echo '{\"sandboxes\":[]}'; fi ;;\n\
+             delete) echo \"$*\" >>\"$T/deleted\"; rm -f \"$T/left\" ;;\n\
+             esac\n",
+        );
+        // cargo: logs its arguments; prints this Mac's lists ($T/mac-all, $T/mac-ignored) for --list, or
+        // with $HANG_LIST hangs in them; the filtered run waits for the box to start, then passes, or fails
+        // with $FAIL_HERE. With $HANG its child hangs; with $SURVIVE it leaves a process in timeout's group;
+        // with $IGNORE_TERM its child ignores SIGTERM.
+        write_executable(
+            &stubs.join("cargo"),
+            "#!/bin/bash\necho \"cargo $*\" >>\"$LOG\"\n\
+             if [ -n \"$HANG_LIST\" ] && [[ $* == *--list* ]]; then touch \"$T/listing\"; sleep 600 & echo $! >>\"$T/pids\"; wait; fi\n\
+             case \"$*\" in\n\
+             *'--list --ignored'*) cat \"$T/mac-ignored\" ;;\n\
+             *--list*) cat \"$T/mac-all\" ;;\n\
+             *macos_only::*) while [ ! -e \"$T/ready\" ]; do sleep 0.1; done\n\
+               if [ -n \"$HANG\" ]; then sleep 600 & echo $! >>\"$T/pids\"; wait; fi\n\
+               if [ -n \"$IGNORE_TERM\" ]; then (trap '' TERM; exec sleep 600) & echo $! >>\"$T/pids\"; touch \"$T/ignoring\"; wait; fi\n\
+               if [ -n \"$SURVIVE\" ]; then sleep 60 >/dev/null 2>&1 & echo $! >\"$T/survivor\"; fi\n\
+               echo 'test result: ok. 1 passed; 0 failed; 0 ignored'; [ -z \"$FAIL_HERE\" ] || exit \"$FAIL_HERE\" ;;\n\
+             esac\n",
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let log = tmp.path().join("log");
+        let t = |name: &str| tmp.path().join(name);
+        let read = |name: &str| std::fs::read_to_string(t(name)).unwrap_or_default();
+        // A list as cargo prints it: a binary's Running line, then its tests.
+        let list = |prefix: &str, tests: &[&str]| {
+            let mut s = format!("{prefix}     Running tests/agent.rs (target/debug/deps/agent-0123abcd)\n");
+            for name in tests {
+                s.push_str(&format!("{prefix}{name}: test\n"));
+            }
+            s
+        };
+        let both = ["plain", "macos_only::sandboxed"];
+        let setup = |mac_all: &[&str], mac_ign: &[&str], linux_all: &[&str], linux_ign: &[&str]| {
+            for name in ["args", "deleted", "ready", "left", "linux"] {
+                let _ = std::fs::remove_file(t(name));
+            }
+            let _ = std::fs::remove_file(&log);
+            std::fs::write(t("mac-all"), list("", mac_all)).unwrap();
+            std::fs::write(t("mac-ignored"), list("", mac_ign)).unwrap();
+            let linux = list("LIST all ", linux_all)
+                + "LIST end all\n"
+                + &list("LIST ignored ", linux_ign)
+                + "LIST end ignored\n";
+            std::fs::write(t("linux"), linux).unwrap();
+        };
+        // Fails, rather than hangs, if the run outlasts 120 s: it then stops its process group. With
+        // `stop_on`, a Ctrl-C goes to the run's group once that file exists.
+        let split_with = |exit: &str, sleep: &str, fail_here: &str, env: &[(&str, &str)], stop_on: Option<&str>| {
+            let mut c = command(&dir, "scripts/test-table", &["--split"]);
+            c.env("PATH", &path).env("T", tmp.path()).env("LOG", &log).env("EXIT", exit).env("SLEEP", sleep);
+            c.env("FAIL_HERE", fail_here).env("TEST_TABLE_HERE_LIMIT", "3");
+            for name in ["HANG", "HANG_LIST", "SURVIVE", "IGNORE_TERM"] {
+                c.env(name, env.iter().find(|(n, _)| *n == name).map_or("", |(_, v)| *v));
+            }
+            // Files, not pipes: a process the run left behind would hold a pipe open, and reading it would hang.
+            let (out_file, err_file) = (t("run.out"), t("run.err"));
+            c.stdout(std::fs::File::create(&out_file).unwrap()).stderr(std::fs::File::create(&err_file).unwrap());
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            let mut child = c.spawn().unwrap();
+            let started = std::time::Instant::now();
+            let mut stopped = false;
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
+                if !stopped && stop_on.is_some_and(|name| t(name).exists()) {
+                    let group = format!("-{}", child.id());
+                    assert!(Command::new("/bin/kill").args(["-INT", "--", &group]).status().unwrap().success());
+                    stopped = true;
+                }
+                if started.elapsed() > std::time::Duration::from_secs(120) {
+                    let _ = Command::new("/bin/kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+                    panic!("{scripts}: the run didn't end within 120 s: {}", read("run.err"));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            };
+            Output { status, stdout: std::fs::read(&out_file).unwrap(), stderr: std::fs::read(&err_file).unwrap() }
+        };
+        let split = |exit: &str, sleep: &str, fail_here: &str| split_with(exit, sleep, fail_here, &[], None);
+        let none_left = |what: &str| {
+            for pid in read("pids").lines() {
+                let alive =
+                    Command::new("/bin/kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().unwrap();
+                assert!(!alive.success(), "{scripts}: {what}: process {pid} was left running");
+            }
+        };
+        let text =
+            |out: &Output| format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+
+        // Both pass, and Linux ignores exactly the macos_only test. A process left in timeout's group by
+        // tests that ended by themselves is not killed: the group's id could be another's by then.
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        let out = split_with("0", "0", "", &[("SURVIVE", "1")], None);
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        let survivor = read("survivor");
+        let alive = Command::new("/bin/kill").args(["-0", survivor.trim()]).status().unwrap();
+        let _ = Command::new("/bin/kill").args([survivor.trim()]).status();
+        assert!(alive.success(), "{scripts}: a passing run killed {survivor} in timeout's old group");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("== the box, last lines") && stdout.contains("== here, last lines"), "{scripts}");
+        assert!(stdout.contains("exit 0 · 5m 00s") && stdout.contains("test result: ok. 1 passed"), "{scripts}");
+        assert!(stdout.contains("the whole table in a box, and the macOS-only tests here"), "{scripts}");
+        assert!(!stdout.contains("LIST "), "{scripts}: printed the box's lists");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert!(calls.lines().any(|l| l == "cargo test --locked --workspace -- macos_only::"), "{scripts}: {calls}");
+        assert!(
+            !calls.contains("clippy") && !calls.contains("ground-guards"),
+            "{scripts}: the box runs those: {calls}"
+        );
+        let args = read("args");
+        assert!(args.lines().any(|a| a == "--no-env") && !args.contains("--env"), "{scripts}: {args}");
+
+        // A test that runs here but not on Linux, outside macos_only, is named, whichever way Linux skips it.
+        for (what, mac_all, linux_all, linux_ign) in [
+            (
+                "compiled out on Linux",
+                &["plain", "acl", "macos_only::sandboxed"][..],
+                &both[..],
+                &["macos_only::sandboxed"][..],
+            ),
+            ("ignored only on Linux", &both[..], &both[..], &["plain", "macos_only::sandboxed"][..]),
+        ] {
+            setup(mac_all, &[], linux_all, linux_ign);
+            let out = split("0", "0", "");
+            let escaped = if mac_all.contains(&"acl") { "agent|acl" } else { "agent|plain" };
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {what}: {}", text(&out));
+            assert!(text(&out).contains("neither part runs them") && text(&out).contains(escaped), "{scripts}: {what}");
+        }
+
+        // The box fails: so does the run, with its exit.
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        let out = split("3", "0", "");
+        assert_eq!(out.status.code(), Some(3), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("the box's table exited 3"), "{scripts}");
+
+        // The box lists nothing, or a list stops short of its end line (a list command that failed): which
+        // tests need macOS is unknown, so it fails, even though a test ignored only on Linux could hide there.
+        setup(&both, &[], &both, &[]);
+        std::fs::write(t("linux"), "").unwrap();
+        let out = split("0", "0", "");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("lists didn't finish"), "{scripts}: {}", text(&out));
+        setup(&both, &[], &both, &[]);
+        let cut = list("LIST all ", &both) + "LIST end all\n" + &list("LIST ignored ", &[]);
+        std::fs::write(t("linux"), cut).unwrap();
+        let out = split("0", "0", "");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("lists didn't finish"), "{scripts}: {}", text(&out));
+
+        // The tests here fail while the box runs (its 10 minutes): the box is stopped and deleted at once.
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        std::fs::write(t("left"), "running").unwrap();
+        let started = std::time::Instant::now();
+        let out = split("0", "600", "4");
+        let took = started.elapsed();
+        assert_eq!(out.status.code(), Some(4), "{scripts}: {}", text(&out));
+        assert!(took < std::time::Duration::from_secs(180), "{scripts}: waited {took:?} for the box");
+        assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the box was left: {}", text(&out));
+
+        // A test program here that hangs (cargo's child, which outlives cargo) ends at the bound, here 3 s,
+        // with nothing left running, and the box is stopped and deleted (finding c7d17b82e315).
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        std::fs::write(t("left"), "running").unwrap();
+        let _ = std::fs::remove_file(t("pids"));
+        let started = std::time::Instant::now();
+        let out = split_with("0", "600", "", &[("HANG", "1")], None);
+        let took = started.elapsed();
+        assert_eq!(out.status.code(), Some(124), "{scripts}: {}", text(&out));
+        assert!(took < std::time::Duration::from_secs(120), "{scripts}: took {took:?}: {}", text(&out));
+        none_left("the hung test");
+        assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the box was left: {}", text(&out));
+
+        // A Ctrl-C while this Mac lists its tests stops the list too: nothing outlives the run.
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        std::fs::write(t("left"), "running").unwrap();
+        for name in ["pids", "listing"] {
+            let _ = std::fs::remove_file(t(name));
+        }
+        let started = std::time::Instant::now();
+        let out = split_with("0", "600", "", &[("HANG_LIST", "1")], Some("listing"));
+        let took = started.elapsed();
+        assert_eq!(out.status.code(), Some(130), "{scripts}: {}", text(&out));
+        assert!(took < std::time::Duration::from_secs(120), "{scripts}: took {took:?}: {}", text(&out));
+        none_left("the hung list");
+        assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the box was left: {}", text(&out));
+
+        // A Ctrl-C while a test here ignores SIGTERM: test-table still kills it, by timeout's group, as it
+        // exits (finding a9acfeadbe06).
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        std::fs::write(t("left"), "running").unwrap();
+        for name in ["pids", "ignoring"] {
+            let _ = std::fs::remove_file(t(name));
+        }
+        let started = std::time::Instant::now();
+        let out = split_with("0", "600", "", &[("IGNORE_TERM", "1")], Some("ignoring"));
+        let took = started.elapsed();
+        assert_eq!(out.status.code(), Some(130), "{scripts}: {}", text(&out));
+        assert!(took < std::time::Duration::from_secs(120), "{scripts}: took {took:?}: {}", text(&out));
+        none_left("the test ignoring SIGTERM");
+        assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the box was left: {}", text(&out));
+
+        // Tests here that fail fast, timeout reaped before test-table waits on it (a delay put in on
+        // purpose): the run still fails with their exit, not a pass (note fa805ecf517e).
+        let script = std::fs::read_to_string(dir.join("scripts/test-table")).unwrap();
+        let fork = "  t=$!\n  echo \"$t\" >\"$split_tmp/timeout.pid\"\n";
+        assert_eq!(script.matches(fork).count(), 1, "{scripts}: the delay has nowhere to go");
+        std::fs::write(
+            dir.join("scripts/test-table"),
+            script.replace(fork, &format!("  t=$!\n  sleep 1\n{}", &fork[9..])),
+        )
+        .unwrap();
+        commit_all(&dir, "a delay after the fork");
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        let out = split("0", "0", "4");
+        assert_eq!(out.status.code(), Some(4), "{scripts}: a failure here passed: {}", text(&out));
+
+        // A docs-only head: the local docs-only table, no box.
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        git(&["switch", "-qc", "docs", "refs/remotes/origin/main"]);
+        put(&dir, "docs/guide.md", "a guide\n");
+        commit_all(&dir, "docs only");
+        let out = split("0", "0", "");
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert!(read("args").is_empty(), "{scripts}: a box for a docs-only head");
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            "cargo fmt --check\nground-guards origin/main HEAD\n",
+            "{scripts}"
+        );
+    }
+}
+
+/// The split counted run counts as the whole table: merge takes a manager pass of
+/// `scripts/test-table --split` on the merge, main ahead in code, as it takes `scripts/test-table`'s;
+/// a pass of `--remote` alone doesn't count.
+#[test]
+fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
+    let code = |dir: &Path| put(dir, "code.txt", "a change\n");
+    let lib = |dir: &Path| put(dir, "lib.rs", "main's code\n");
+    for scripts in SCRIPTS {
+        let tree = " tree 4444444444444444444444444444444444444444";
+        for (command, suffix, ok) in [
+            ("scripts/test-table --split", tree, true),
+            ("scripts/test-table --split", "", true),
+            ("scripts/test-table --remote", tree, false),
+        ] {
+            let pass = Tested { command, suffix, ..tested("manager", "main") };
+            let out = merge_dry_run_on(scripts, |_| {}, code, lib, Some(pass));
+            let line = check_line(&out, "main");
+            assert_eq!(out.status.success(), ok, "{scripts}: {command}{suffix}: {line}");
+        }
+    }
+}
+
+/// verify-seq --split runs the split counted run, and with -j 2 two PRs at once, each its own evidence; -j
+/// takes at most 2 (the trial's boxes) and only with --split. A stub bk-evidence logs when each starts and ends.
+#[test]
+fn verify_seq_runs_two_split_runs_at_once() {
+    for scripts in SCRIPTS {
+        let seq = repo_root().join(scripts).join("verify-seq");
+        let (tmp, dir) = repo(&[("scripts/verify-seq", &seq)], ".bracken/\n", |dir| {
+            write_executable(
+                &dir.join("scripts/bk-evidence"),
+                "#!/bin/sh\necho \"start $1 $*\" >>\"$LOG\"\nsleep 2\necho \"end $1\" >>\"$LOG\"\n",
+            );
+        });
+        let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?}");
+        let sha = |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
+        let first = sha("HEAD");
+        put(&dir, "b.txt", "b\n");
+        commit_all(&dir, "b");
+        let second = sha("HEAD");
+        git(&["switch", "-q", "--detach", "HEAD"]);
+        let log = tmp.path().join("log");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let seq_run = |args: &[&str]| {
+            let _ = std::fs::remove_file(&log);
+            let mut c = command(&dir.join("scripts"), "./verify-seq", args);
+            c.env("LOG", &log).env("TMPDIR", &scratch).env("ON", "origin/main");
+            c.output().unwrap()
+        };
+        let (a, b) = (format!("aaa111:{first}"), format!("bbb222:{second}"));
+        let out = seq_run(&["--split", "-j", "2", &a, &b]);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        let lines = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = lines.lines().collect();
+        assert_eq!(lines.len(), 4, "{scripts}: {lines:?}");
+        assert!(lines[..2].iter().all(|l| l.starts_with("start ")), "{scripts}: one after the other: {lines:?}");
+        for claim in ["aaa111", "bbb222"] {
+            let want =
+                format!("start {claim} {claim} --as manager --on origin/main --reuse -- scripts/test-table --split");
+            assert!(lines.contains(&want.as_str()), "{scripts}: {lines:?}");
+        }
+        let worktrees = String::from_utf8(run(&dir, "git", &["worktree", "list"]).stdout).unwrap();
+        assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
+        for args in [&["-j", "2", &a][..], &["--split", "-j", "3", &a]] {
+            let out = seq_run(args);
+            assert_eq!(out.status.code(), Some(2), "{scripts}: {args:?}");
+            assert!(!log.exists(), "{scripts}: ran with {args:?}");
+        }
+    }
+}
+
+/// Finding `87cfdf4680c7`: a Ctrl-C during `verify-seq --split -j 2` stops both runs. A stub `boat` and
+/// `cargo` stand in for the box and the tests here, each running 10 minutes: once both boxes and both
+/// local runs have started, SIGINT goes to verify-seq's process group, as a terminal's Ctrl-C would. Both
+/// boxes are deleted, no stub process is left, no evidence is recorded, no worktree is left, and it exits 130.
+#[test]
+fn verify_seq_ctrl_c_under_two_jobs_deletes_both_boxes_and_records_nothing() {
+    verify_seq_interrupted(false);
+}
+
+/// Note `c1468539ea94`: a `verify-seq` started with SIGINT ignored, as a plain background job is, still
+/// stops on a SIGTERM sent to it alone. It passes SIGTERM on as SIGTERM, and every part ends with nothing
+/// left, as on a Ctrl-C.
+#[test]
+fn verify_seq_sigterm_with_sigint_ignored_still_stops_both_runs() {
+    verify_seq_interrupted(true);
+}
+
+/// Two split runs under `verify-seq -j 2`, then a Ctrl-C to its group or, with `term`, SIGINT ignored
+/// and a SIGTERM to `verify-seq` only.
+fn verify_seq_interrupted(term: bool) {
+    for scripts in SCRIPTS {
+        let file = |name: &str| repo_root().join(scripts).join(name);
+        let names = ["verify-seq", "bk-evidence", "test-table", "code-scope"];
+        let copies: Vec<(String, PathBuf)> = names.iter().map(|n| (format!("scripts/{n}"), file(n))).collect();
+        let files: Vec<(&str, &Path)> = copies.iter().map(|(to, from)| (to.as_str(), from.as_path())).collect();
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\nexit 0\n");
+            put(dir, "code.txt", "code\n");
+        });
+        let git = |args: &[&str]| {
+            let out = run(&dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        bk(&dir, &["init", "--name", "ctrl-c"]);
+        bk(&dir, &["id", "new", "manager"]);
+        let mut pairs = Vec::new();
+        for (n, branch) in ["one", "two"].iter().enumerate() {
+            git(&["switch", "-q", "-c", branch, "main"]);
+            put(&dir, "code.txt", &format!("change {branch}\n"));
+            commit_all(&dir, branch);
+            let sha = git(&["rev-parse", "HEAD"]);
+            let claim = bk(
+                &dir,
+                &["claim", &format!("PR #{} {branch} @ {sha}: a change", n + 1), "--tag", "pr", "--as", "manager"],
+            );
+            pairs.push(format!("{}:{sha}", &claim[..12]));
+        }
+        git(&["switch", "-q", "main"]);
+        let t = tmp.path().join("t");
+        std::fs::create_dir_all(&t).unwrap();
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        // boat run: a box per run, live while $T/live-<id> exists, which an interrupt deletes as boat does;
+        // its sleep's pid goes to $T/pids. list and delete as boat's, over the live files.
+        write_executable(
+            &stubs.join("boat"),
+            "#!/bin/bash\n\
+             case \"$1\" in\n\
+             run) id=bx_s$$; echo \"$id ready in 1.0s\"; touch \"$T/live-$id\" \"$T/box-$id\"\n\
+               sleep 600 & s=$!; echo $s >>\"$T/pids\"\n\
+               trap 'kill $s; echo \"interrupted: deleting $id\"; rm -f \"$T/live-$id\"; exit 130' INT TERM\n\
+               wait $s; exit 0 ;;\n\
+             list) printf '{\"sandboxes\":['; for f in \"$T\"/live-*; do [ -e \"$f\" ] && printf '{\"id\": \"%s\"}' \"${f##*/live-}\"; done; echo ']}' ;;\n\
+             delete) echo \"$*\" >>\"$T/deleted\"; rm -f \"$T/live-$3\" ;;\n\
+             esac\n",
+        );
+        // cargo: the tests here run 10 minutes; their pid goes to $T/pids.
+        write_executable(
+            &stubs.join("cargo"),
+            "#!/bin/bash\necho $$ >>\"$T/pids\"; touch \"$T/here-$$\"\nexec sleep 600\n",
+        );
+        let count = |prefix: &str| {
+            std::fs::read_dir(&t)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().starts_with(prefix))
+                .count()
+        };
+        let mut args = vec!["--split", "-j", "2"];
+        args.extend(pairs.iter().map(String::as_str));
+        let mut c = if term {
+            let mut wrapped = vec!["-c", "trap '' INT; exec scripts/verify-seq \"$@\"", "verify-seq"];
+            wrapped.extend(&args);
+            command(&dir, "bash", &wrapped)
+        } else {
+            command(&dir, "scripts/verify-seq", &args)
+        };
+        c.env("PATH", format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()))
+            .env("T", &t)
+            .env("TMPDIR", tmp.path())
+            .env_remove("ON");
+        std::os::unix::process::CommandExt::process_group(&mut c, 0);
+        let child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let started = std::time::Instant::now();
+        while count("box-") < 2 || count("here-") < 2 {
+            assert!(started.elapsed() < std::time::Duration::from_secs(180), "{scripts}: the runs never started");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let target = if term { child.id().to_string() } else { format!("-{}", child.id()) };
+        let signal = if term { "-TERM" } else { "-INT" };
+        assert!(Command::new("/bin/kill").args([signal, "--", &target]).status().unwrap().success());
+        let interrupted = std::time::Instant::now();
+        let out = child.wait_with_output().unwrap();
+        let took = interrupted.elapsed();
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(130), "{scripts}: {text}");
+        assert!(took < std::time::Duration::from_secs(120), "{scripts}: took {took:?} to stop: {text}");
+        assert_eq!(count("live-"), 0, "{scripts}: a box was left: {text}");
+        let pids = std::fs::read_to_string(t.join("pids")).unwrap();
+        for pid in pids.lines() {
+            let alive =
+                Command::new("/bin/kill").args(["-0", pid]).stderr(std::process::Stdio::null()).status().unwrap();
+            let what = Command::new("/bin/ps").args(["-o", "pid,ppid,pgid,args", "-p", pid]).output().unwrap();
+            assert!(!alive.success(), "{scripts}: left running: {}: {text}", String::from_utf8_lossy(&what.stdout));
+        }
+        let evidence = bk(&dir, &["log", "--kind", "evidence", "--json"]);
+        assert_eq!(evidence, "[]", "{scripts}: recorded evidence for an interrupted run: {text}");
+        let worktrees = git(&["worktree", "list"]);
+        assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
     }
 }
