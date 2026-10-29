@@ -157,12 +157,22 @@ impl Mode for BrackenMode {
                 json!({"target": id, "reason": text}),
                 &["target"],
             ),
-            tool(
-                "check",
-                "Run an implementation artifact on its function's public cases; calls to other functions use what counts in your replica, else your own latest implementation, else anyone's",
-                json!({"id": id}),
-                &["id"],
-            ),
+            if phase1 {
+                tool(
+                    "check",
+                    "Run an implementation artifact on its function's public cases; calls to other functions use what counts in your replica, else your own latest implementation, else anyone's",
+                    json!({"id": id}),
+                    &["id"],
+                )
+            } else {
+                // Verify and record in one step (owner decision f3405c284180, change B).
+                tool(
+                    "check",
+                    "Run an implementation artifact on its function's public cases; calls to other functions use what counts in your replica, else your own latest implementation, else anyone's. With record, the result also goes in as your evidence on it in the same call: pass or fail, method check, details what the check found",
+                    json!({"id": id, "record": {"type": "boolean"}}),
+                    &["id"],
+                )
+            },
         ];
         if !phase1 {
             let at =
@@ -442,8 +452,13 @@ impl Store for BrackenStore {
             return Ok(self.state()?.counted());
         }
         if name == "check" {
-            let id = Args::new(args, allowed("check"))?.id("id")?.to_string();
-            return self.check(&id);
+            // Phase 1's check took only an id, as its runs were given it.
+            let keys: &[&str] =
+                if self.config.accept_rule == AcceptRule::MostPasses { &["id"] } else { &["id", "record"] };
+            let args = Args::new(args, keys)?;
+            let (id, record) = (args.id("id")?.to_string(), args.bool_opt("record")?);
+            let result = self.check(&id)?;
+            return if record { self.record_check(&id, result) } else { Ok(result) };
         }
         if !self.tools_known(name) {
             return Err(format!("no tool {}", crate::args::short(name)));
@@ -591,7 +606,7 @@ impl Store for BrackenStore {
         Ok(modules_of(self.config.task, &state.integrated()))
     }
 
-    fn record(&mut self, tool: &str, args: &Value, _result: &Value) -> Result<Value, String> {
+    fn record(&mut self, tool: &str, args: &Value, result: &Value) -> Result<Value, String> {
         let task = self.config.task;
         let of = |function: &str, text: &str| {
             let defs = crate::metrics::definitions(task, &[("artifact".into(), text.into())]);
@@ -603,10 +618,14 @@ impl Store for BrackenStore {
                 json!({ "writes": of(function, args["content"].as_str().unwrap_or_default()) })
             }
             // A non-author's fail on an implementation: a counted fail, which keeps it out (decision `5e8df6996a2e`).
-            "evidence" if args["verdict"] == "fail" => {
+            // A check that recorded a fail is one too.
+            "evidence" | "check"
+                if (tool == "evidence" && args["verdict"] == "fail")
+                    || (tool == "check" && result["evidence"]["verdict"] == "fail") =>
+            {
                 let args = &self.resolve_ids(args)?;
                 let (state, me) = (self.state()?, self.saved("key.txt")?);
-                let target = args["target"].as_str().unwrap_or_default();
+                let target = args[if tool == "check" { "id" } else { "target" }].as_str().unwrap_or_default();
                 let blocks = match state.find(target) {
                     Some(e) if e.kind == "artifact" && e.author != me => {
                         of(e.body["name"].as_str().unwrap_or_default(), e.body["text"].as_str().unwrap_or_default())
@@ -755,6 +774,27 @@ impl BrackenStore {
             let text = String::from_utf8_lossy(&out).into_owned();
             Ok(json!({ "output": text }))
         }
+    }
+
+    /// Records `result`, the check of artifact `id`, as this agent's evidence on it, through the same
+    /// command and argument rules as the evidence tool. The method is "check" and the details are what
+    /// the check found, cut to the evidence tool's limit. Returns the result with the evidence's id.
+    fn record_check(&mut self, id: &str, mut result: Value) -> Result<Value, String> {
+        let verdict = if result["ok"] == true { "pass" } else { "fail" };
+        let mut details = result["details"].as_str().unwrap_or_default().replace('\0', "");
+        if details.len() > crate::args::MAX_TEXT {
+            let mut cut = crate::args::MAX_TEXT;
+            while !details.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            details.truncate(cut);
+        }
+        let args = json!({ "target": id, "verdict": verdict, "method": "check", "details": details });
+        let plan = plan("evidence", &Args::new(&args, allowed("evidence"))?, &self.config.identity, self.config.task)?;
+        let out = self.execute(plan)?;
+        let evidence = out["output"].as_str().unwrap_or_default().trim().to_string();
+        result["evidence"] = json!({ "verdict": verdict, "id": evidence });
+        Ok(result)
     }
 
     /// The public check of artifact `id`, against the working library of this replica.
