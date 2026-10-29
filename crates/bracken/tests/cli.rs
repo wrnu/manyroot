@@ -1512,14 +1512,15 @@ fn a_strangers_implements_doesnt_make_blocked_work_ready() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();
     bracken(dir, &["init", "--name", "stranger"]);
-    for who in ["builder", "reviewer", "other", "stranger"] {
+    for who in ["builder", "reviewer", "other", "stranger", "third"] {
         bracken(dir, &["id", "new", who]);
     }
     let task = bracken(dir, &["claim", "a task", "--as", "other"]);
     let work = bracken(dir, &["claim", "the work", "--as", "builder"]);
     bracken(dir, &["relate", &work, "implements", &task, "--as", "builder"]);
     let need = bracken(dir, &["claim", "what it needs", "--as", "other"]);
-    let x = bracken(dir, &["claim", "unrelated, accepted", "--as", "other"]);
+    // By a third author: neither the stranger nor the need's author wrote the relation's source.
+    let x = bracken(dir, &["claim", "unrelated, accepted", "--as", "third"]);
     let policy = ["--validator", "reviewer"];
     bracken(dir, &["evidence", &x, "pass", "--method", "m", "--as", "reviewer"]);
     bracken(dir, &["evidence", &work, "fail", "--method", "m", "--depends-on", &need, "--as", "reviewer"]);
@@ -1532,7 +1533,8 @@ fn a_strangers_implements_doesnt_make_blocked_work_ready() {
     assert!(line().starts_with("blocked "), "{}", line());
     bracken(dir, &["relate", &x, "implements", &need, "--as", "stranger"]);
     assert!(line().starts_with("blocked "), "a stranger's relation: {}", line());
-    // The need's own author relating it does count.
+    // The need's own author relating it does count, though they didn't write x: the queue trusts the
+    // target's author too (Trusted::SOURCE_OR_TARGET).
     bracken(dir, &["relate", &x, "implements", &need, "--as", "other"]);
     assert!(line().starts_with("ready "), "{}", line());
 }
