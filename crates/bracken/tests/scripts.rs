@@ -39,13 +39,16 @@ fn bk(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stdout).unwrap().trim().to_owned()
 }
 
-/// A git repository holding `scripts/bk` and the given `bk-evidence`, with a Ground and identity `val`.
+/// A git repository holding `scripts/bk`, the given `bk-evidence` and the `code-scope` beside it, with a
+/// Ground and identity `val`.
 ///
 /// `scripts/bk` runs bracken through a pipe that fails when its reader stops early, as an
 /// older bracken or a `printf | grep -q` did: the scripts must not depend on how the writer
 /// takes a closed pipe.
 fn workspace(bk_evidence: &Path) -> (tempfile::TempDir, PathBuf, String) {
-    let (tmp, dir) = repo(&[("scripts/bk-evidence", bk_evidence)], ".bracken/\n", |_| {});
+    let scope = bk_evidence.with_file_name("code-scope");
+    let (tmp, dir) =
+        repo(&[("scripts/bk-evidence", bk_evidence), ("scripts/code-scope", &scope)], ".bracken/\n", |_| {});
     let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
     bk(&dir, &["init", "--name", "scripts"]);
     bk(&dir, &["id", "new", "val"]);
@@ -451,10 +454,12 @@ struct Tested<'a> {
     verdict: &'a str,
     /// Retracted by `who` afterwards.
     retracted: bool,
+    /// After the main sha in the method: ' tree <key> docs-only', say.
+    suffix: &'a str,
 }
 
 fn tested<'a>(who: &'a str, rev: &'a str) -> Tested<'a> {
-    Tested { who, rev, command: "scripts/test-table", head: None, verdict: "pass", retracted: false }
+    Tested { who, rev, command: "scripts/test-table", head: None, verdict: "pass", retracted: false, suffix: "" }
 }
 
 /// The same, with `at_base` committed in the branch point, and `tested` recorded on the claim.
@@ -478,9 +483,10 @@ fn merge_dry_run_command(
     tested: Option<Tested>,
 ) -> (tempfile::TempDir, PathBuf, Command) {
     let file = |name: &str| repo_root().join(scripts).join(name);
-    let (merge, guards) = (file("merge"), file("ground-guards"));
-    let (tmp, dir) =
-        repo(&[("scripts/merge", &merge), ("scripts/ground-guards", &guards)], ".bracken/identities/\n", |_| {});
+    let (merge, guards, scope) = (file("merge"), file("ground-guards"), file("code-scope"));
+    let files = [("scripts/merge", &merge), ("scripts/ground-guards", &guards), ("scripts/code-scope", &scope)];
+    let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
+    let (tmp, dir) = repo(&files, ".bracken/identities/\n", |_| {});
     let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
     let commit = |message: &str| {
         git(&["add", "-A"]);
@@ -516,7 +522,7 @@ fn merge_dry_run_command(
         } else {
             String::from_utf8(run(&dir, "git", &["rev-parse", t.rev]).stdout).unwrap().trim().to_owned()
         };
-        let method = format!("{} @ {} on {on}", t.command, t.head.unwrap_or(&sha));
+        let method = format!("{} @ {} on {on}{}", t.command, t.head.unwrap_or(&sha), t.suffix);
         let id = bk(&dir, &["evidence", &claim, t.verdict, "--method", &method, "--as", t.who]);
         if t.retracted {
             bk(&dir, &["retract", &id, "--as", t.who]);
@@ -1063,7 +1069,7 @@ fn bk_evidence_on_main_tests_the_merge_and_names_both_shas() {
         let out = run(&dir, "scripts/bk-evidence", &[&[&claim[..12]][..], &both].concat());
         assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
         let evidence = bk(&dir, &["log", "--kind", "evidence", "--json"]);
-        assert!(evidence.contains(&format!("@ {head} on {tip}\"")), "{script}: {evidence}");
+        assert!(evidence.contains(&format!("@ {head} on {tip} tree ")), "{script}: {evidence}");
         assert_eq!(
             git(&["worktree", "list", "--porcelain"]).matches("worktree ").count(),
             1,
@@ -1155,8 +1161,10 @@ fn merge_clears_the_attributes_checked_variable_for_ground_guards() {
 #[test]
 fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
     for scripts in SCRIPTS {
-        let table = repo_root().join(scripts).join("test-table");
-        let (tmp, dir) = repo(&[("scripts/test-table", &table)], ".bracken/\n", |dir| {
+        let (table, scope) =
+            (repo_root().join(scripts).join("test-table"), repo_root().join(scripts).join("code-scope"));
+        let files = [("scripts/test-table", table.as_path()), ("scripts/code-scope", scope.as_path())];
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
             write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\necho \"ground-guards $*\" >>\"$LOG\"\n");
             std::fs::create_dir_all(dir.join("sub")).unwrap();
             std::fs::write(dir.join("sub/.keep"), "").unwrap();
@@ -1488,5 +1496,281 @@ fn test_table_remote_runs_one_box_and_leaves_none_behind() {
         let out = remote("0", "0").output().unwrap();
         assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("commit"), "{scripts}");
         assert!(read("args").is_empty(), "{scripts}: a box for a dirty tree");
+    }
+}
+
+/// test-table on a docs-only change (owner decision 642a47c04a10): when everything the head changed since
+/// it left origin/main is *.md outside crates/, only fmt and the Ground guards run, and it says so. A change
+/// that also touches code, renames or deletes a file that isn't docs, touches a .md under crates/ (the
+/// code compiles some in), or changes nothing runs the whole table.
+#[test]
+fn test_table_skips_clippy_and_cargo_test_only_for_a_docs_only_change() {
+    let full = "cargo fmt --check\n\
+                cargo clippy --locked --all-targets -- -D warnings\n\
+                cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings\n\
+                cargo test --locked --workspace\n\
+                ground-guards origin/main HEAD\n";
+    let docs = "cargo fmt --check\nground-guards origin/main HEAD\n";
+    let git = |dir: &Path, args: &[&str]| assert!(run(dir, "git", args).status.success(), "git {args:?}");
+    type Change = fn(&Path);
+    let cases: [(&str, Change, &str); 7] = [
+        ("a doc", |d| put(d, "docs/guide.md", "more\n"), docs),
+        ("a new top-level doc", |d| put(d, "NOTES.md", "new\n"), docs),
+        (
+            "a doc and code",
+            |d| {
+                put(d, "docs/guide.md", "more\n");
+                put(d, "code.txt", "more\n")
+            },
+            full,
+        ),
+        ("code renamed to a doc", |d| assert!(run(d, "git", &["mv", "code.txt", "code.md"]).status.success()), full),
+        ("code deleted", |d| assert!(run(d, "git", &["rm", "-q", "code.txt"]).status.success()), full),
+        ("a .md under crates/", |d| put(d, "crates/p/prompt.md", "changed\n"), full),
+        ("no change", |_| {}, full),
+    ];
+    for scripts in SCRIPTS {
+        let file = |name: &str| repo_root().join(scripts).join(name);
+        let (table, scope) = (file("test-table"), file("code-scope"));
+        for (case, change, want) in cases {
+            let files = [("scripts/test-table", table.as_path()), ("scripts/code-scope", scope.as_path())];
+            let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+                write_executable(
+                    &dir.join("scripts/ground-guards"),
+                    "#!/bin/sh\necho \"ground-guards $*\" >>\"$LOG\"\n",
+                );
+                put(dir, "code.txt", "code\n");
+                put(dir, "docs/guide.md", "a guide\n");
+                put(dir, "crates/p/prompt.md", "a prompt\n");
+            });
+            git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+            git(&dir, &["switch", "-qc", "pr"]);
+            change(&dir);
+            git(&dir, &["add", "-A"]);
+            git(&dir, &["commit", "-q", "--allow-empty", "-m", case]);
+            let stubs = tmp.path().join("stubs");
+            std::fs::create_dir_all(&stubs).unwrap();
+            write_executable(&stubs.join("cargo"), "#!/bin/sh\necho \"cargo $*\" >>\"$LOG\"\n");
+            let log = tmp.path().join("log");
+            let out = command(&dir, "scripts/test-table", &[])
+                .env("PATH", format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap()))
+                .env("LOG", &log)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success(), "{scripts}: {case}: {}", String::from_utf8_lossy(&out.stderr));
+            assert_eq!(std::fs::read_to_string(&log).unwrap(), want, "{scripts}: {case}: {stdout}");
+            let said = stdout.lines().any(|l| l == "test-table: docs-only: skipped clippy and cargo test");
+            assert_eq!(said, want == docs, "{scripts}: {case}: {stdout}");
+        }
+    }
+}
+
+/// bk-evidence --on records the merged tree's key, and with --reuse a repeated tree runs only the Ground
+/// guards (owner decision 642a47c04a10): after main moves only in docs and the Ground, the earlier pass of
+/// the whole table on the same PR is cited, not rerun. After main moves in code it runs again. Neither
+/// another PR's pass nor a docs-only one is reused, and a docs-only run is labelled in the method.
+#[test]
+fn bk_evidence_reuses_a_whole_table_pass_of_the_same_merged_tree_on_the_same_pr() {
+    for scripts in SCRIPTS {
+        let script = format!("{scripts}/bk-evidence");
+        let (tmp, dir, _) = workspace(&repo_root().join(&script));
+        let git = |args: &[&str]| {
+            let out = run(&dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        write_executable(
+            &dir.join("scripts/test-table"),
+            "#!/bin/sh\necho table >>\"$LOG\"\n\
+             [ -z \"$DOCS\" ] || echo 'test-table: docs-only: skipped clippy and cargo test'\n",
+        );
+        write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\necho \"guards $*\" >>\"$LOG\"\n");
+        put(&dir, "lib.txt", "code\n");
+        commit_all(&dir, "stubs");
+        git(&["switch", "-qc", "pr"]);
+        put(&dir, "a.txt", "the branch\n");
+        commit_all(&dir, "branch");
+        let head = git(&["rev-parse", "HEAD"]);
+        let claim = bk(&dir, &["claim", &format!("PR #1 pr @ {head}: a change"), "--tag", "pr", "--as", "val"]);
+        let other = bk(&dir, &["claim", &format!("PR #2 pr @ {head}: another"), "--tag", "pr", "--as", "val"]);
+        let log = tmp.path().join("log");
+        let record = |claim: &str, docs: bool| {
+            let _ = std::fs::remove_file(&log);
+            let args = [&claim[..12], "--as", "val", "--on", "main", "--reuse", "--", "scripts/test-table"];
+            let mut c = command(&dir, "scripts/bk-evidence", &args);
+            c.env("LOG", &log);
+            if docs {
+                c.env("DOCS", "1");
+            }
+            let out = c.output().unwrap();
+            assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+            let ran = std::fs::read_to_string(&log).unwrap();
+            let evidence: serde_json::Value =
+                serde_json::from_str(&bk(&dir, &["log", "--kind", "evidence", "--json"])).unwrap();
+            let last = evidence.as_array().unwrap().last().unwrap().clone();
+            (ran, last["id"].as_str().unwrap().to_owned(), last["body"]["method"].as_str().unwrap().to_owned())
+        };
+        let switch_main = |change: &dyn Fn()| {
+            git(&["switch", "-q", "main"]);
+            change();
+            git(&["add", "-A"]);
+            git(&["commit", "-qm", "main moves"]);
+            let tip = git(&["rev-parse", "HEAD"]);
+            git(&["switch", "-q", "pr"]);
+            tip
+        };
+
+        // The first run: the whole table, with the key in the method.
+        let tip = git(&["rev-parse", "main"]);
+        let (ran, first, method) = record(&claim, false);
+        assert_eq!(ran, "table\n", "{script}");
+        let key = method.strip_prefix(&format!("scripts/test-table @ {head} on {tip} tree ")).unwrap_or_else(|| {
+            panic!("{script}: {method}");
+        });
+        assert!(key.len() == 40 && key.bytes().all(|b| b.is_ascii_hexdigit()), "{script}: {method}");
+
+        // main moves in docs and the Ground only (a file under .bracken/, as a checkpoint commits): the same
+        // key, so only the guards run, citing the first pass.
+        let tip = switch_main(&|| {
+            put(&dir, "docs/guide.md", "a guide\n");
+            put(&dir, ".bracken/checkpoint.txt", "a checkpoint\n");
+            git(&["add", "-f", ".bracken/checkpoint.txt"]);
+        });
+        let (ran, _, method) = record(&claim, false);
+        assert_eq!(ran, format!("guards {tip} HEAD\n"), "{script}");
+        assert_eq!(method, format!("scripts/test-table @ {head} on {tip} tree {key} reuses {first}"), "{script}");
+
+        // main moves in code: a new key, so the whole table runs.
+        let tip = switch_main(&|| put(&dir, "lib.txt", "new code\n"));
+        let (ran, _, method) = record(&claim, false);
+        assert_eq!(ran, "table\n", "{script}");
+        assert!(method.starts_with(&format!("scripts/test-table @ {head} on {tip} tree ")), "{script}: {method}");
+        assert!(!method.contains(key) && !method.contains("reuses"), "{script}: {method}");
+
+        // PR #1's pass isn't PR #2's; a docs-only run is labelled, and isn't reused either.
+        let (ran, _, method) = record(&other, true);
+        assert_eq!(ran, "table\n", "{script}: reused another PR's pass");
+        assert!(method.ends_with(" docs-only"), "{script}: {method}");
+        let (ran, _, method) = record(&other, false);
+        assert_eq!(ran, "table\n", "{script}: reused a docs-only pass");
+        assert!(!method.contains("docs-only") && !method.contains("reuses"), "{script}: {method}");
+
+        // --reuse only with --on, and only for exactly scripts/test-table.
+        for args in [
+            &[&claim[..12], "--as", "val", "--reuse", "--", "scripts/test-table"][..],
+            &[&claim[..12], "--as", "val", "--on", "main", "--reuse", "--", "scripts/test-table", "--remote"],
+            &[&claim[..12], "--as", "val", "--on", "main", "--reuse", "--", "/usr/bin/true"],
+        ] {
+            let out = run(&dir, "scripts/bk-evidence", args);
+            assert_eq!(out.status.code(), Some(1), "{script}: {args:?}");
+            assert!(String::from_utf8_lossy(&out.stderr).contains("--reuse"), "{script}: {args:?}");
+        }
+    }
+}
+
+/// merge checks the two shortcuts with main's code-scope: a manager pass labelled docs-only counts only
+/// on a docs-only head, and one that reuses an earlier pass only when that pass is the manager's, of the
+/// whole table, on this PR, with the same key. Either fails the scope check otherwise.
+#[test]
+fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds() {
+    let code = |dir: &Path| put(dir, "code.txt", "a change\n");
+    let doc = |dir: &Path| put(dir, "docs/guide.md", "a guide\n");
+    let lib = |dir: &Path| put(dir, "lib.rs", "main's code\n");
+    fn docs_only(rev: &str) -> Tested<'_> {
+        Tested { suffix: " tree 1111111111111111111111111111111111111111 docs-only", ..tested("manager", rev) }
+    }
+    for scripts in SCRIPTS {
+        let case = |what: &str| format!("{scripts}: {what}");
+
+        // A docs-only pass on a docs-only head, main an ancestor and then ahead in code: both pass.
+        for (what, on_main) in [("docs head", (|_| {}) as fn(&Path)), ("docs head, main ahead in code", lib)] {
+            let out = merge_dry_run_on(scripts, |_| {}, doc, on_main, Some(docs_only("main")));
+            assert!(out.status.success(), "{}: {}", case(what), String::from_utf8_lossy(&out.stdout));
+            assert!(check_line(&out, "scope").contains("the head is docs-only"), "{}", case(what));
+        }
+
+        // A docs-only pass on a head that changes code fails, ahead or not, naming the path.
+        for (what, on_main) in [("code head", (|_| {}) as fn(&Path)), ("code head, main ahead in code", lib)] {
+            let out = merge_dry_run_on(scripts, |_| {}, code, on_main, Some(docs_only("main")));
+            let line = check_line(&out, "scope");
+            assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
+            assert!(line.starts_with("FAIL") && line.contains("code.txt"), "{}: {line}", case(what));
+        }
+
+        // A reused pass, main ahead in code: it counts when it cites the manager's whole-table pass on this
+        // PR with the same key; not when the cited pass is someone else's, docs-only, another key's, or
+        // on another PR.
+        let key = "2".repeat(40);
+        let earlier = |head: &str, main: &str, k: &str| format!("scripts/test-table @ {head} on {main} tree {k}");
+        for (what, who, other_pr, cited_suffix, cited_key, ok) in [
+            ("the manager's pass", "manager", false, "", key.as_str(), true),
+            ("val's pass", "val", false, "", key.as_str(), false),
+            ("a docs-only pass", "manager", false, " docs-only", key.as_str(), false),
+            ("another key's pass", "manager", false, "", "3333333333333333333333333333333333333333", false),
+            ("a pass on another PR", "manager", true, "", key.as_str(), false),
+        ] {
+            let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, |_| {}, code, lib, None);
+            let rev =
+                |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
+            let (head, tip) = (rev("pr"), rev("main"));
+            let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+            let claim = prs[0]["id"].as_str().unwrap().to_owned();
+            let target = if other_pr {
+                bk(&dir, &["claim", &format!("PR #2 other @ {head}: another"), "--tag", "pr", "--as", "builder"])
+            } else {
+                claim.clone()
+            };
+            let cited_method = format!("{}{cited_suffix}", earlier(&"a".repeat(40), &"b".repeat(40), cited_key));
+            let cited = bk(&dir, &["evidence", &target, "pass", "--method", &cited_method, "--as", who]);
+            let method = format!("{} reuses {cited}", earlier(&head, &tip, &key));
+            bk(&dir, &["evidence", &claim, "pass", "--method", &method, "--as", "manager"]);
+            let out = merge.output().unwrap();
+            let line = check_line(&out, "scope");
+            assert_eq!(out.status.success(), ok, "{}: {line}", case(what));
+            assert_eq!(line.starts_with("ok "), ok, "{}: {line}", case(what));
+            if ok {
+                assert!(check_line(&out, "main").starts_with("ok "), "{}", case(what));
+            } else {
+                assert!(line.contains(&format!("reusing {cited}")), "{}: {line}", case(what));
+            }
+        }
+    }
+}
+
+/// verify-seq runs each head in a scratch worktree of the main checkout, through the bk-evidence beside it,
+/// as manager; with ON set it tests the merge with ON and asks to reuse a pass of the same tree. The
+/// worktree is gone afterwards. A stub bk-evidence logs where it ran and its arguments.
+#[test]
+fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
+    for scripts in SCRIPTS {
+        let seq = repo_root().join(scripts).join("verify-seq");
+        let (tmp, dir) = repo(&[("scripts/verify-seq", &seq)], ".bracken/\n", |dir| {
+            write_executable(&dir.join("scripts/bk-evidence"), "#!/bin/sh\necho \"$PWD|$*\" >>\"$LOG\"\n");
+        });
+        let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
+        let log = tmp.path().join("log");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        for (on, args) in [
+            (Some("origin/main"), "abc123 --as manager --on origin/main --reuse -- scripts/test-table"),
+            (None, "abc123 --as manager -- scripts/test-table"),
+        ] {
+            let _ = std::fs::remove_file(&log);
+            let mut c = command(&dir.join("scripts"), "./verify-seq", &[&format!("abc123:{sha}")]);
+            c.env("LOG", &log).env("TMPDIR", &scratch).env_remove("ON");
+            if let Some(on) = on {
+                c.env("ON", on);
+            }
+            let out = c.output().unwrap();
+            assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+            let line = std::fs::read_to_string(&log).unwrap();
+            let (cwd, got) = line.trim_end().split_once('|').unwrap();
+            assert!(cwd.ends_with(&format!("verify-{sha}")), "{scripts}: ran in {cwd}");
+            assert_eq!(got, args, "{scripts}");
+            assert!(String::from_utf8_lossy(&out.stdout).contains("removed"), "{scripts}");
+            let worktrees = String::from_utf8(run(&dir, "git", &["worktree", "list"]).stdout).unwrap();
+            assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
+        }
     }
 }

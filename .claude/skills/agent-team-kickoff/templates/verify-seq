@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# verify-seq: the manager's counted runs of the test table, one PR head at a time, so the runs
+# don't compete for the machine.
+#
+#   [ON=origin/main] verify-seq <pr claim>:<sha> ...
+#
+# For each pair, in a scratch worktree at <sha> (removed afterwards if the run left it clean), this
+# checkout's bk-evidence records a run of scripts/test-table on <claim> as manager, and the last two
+# lines of its output show here. With ON set, it tests the merge with ON (bk-evidence --on "$ON") and
+# passes --reuse: when the merged tree's key (scripts/code-scope: the tree without .bracken/ and docs)
+# already has the manager's pass of the whole table on a pr claim of the same PR, only the Ground
+# guards run, and the evidence cites that pass (owner decision 642a47c04a10). So re-verifying after
+# main moved only in docs or the Ground costs the guards alone. The main checkout's
+# .git/verify-seq.sh calls this one.
+set -uo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+cd "$main" || exit 1
+[ $# -ge 1 ] || { echo "usage: [ON=<main>] verify-seq <pr claim>:<sha> ..." >&2; exit 2; }
+for pair in "$@"; do
+  claim=${pair%%:*} h=${pair#*:}
+  v="${TMPDIR:-/tmp}/verify-$h"
+  echo "== $claim @ ${h:0:7}"
+  git worktree add -q --detach "$v" "$h" || { echo "worktree add failed"; continue; }
+  (
+    cd "$v" && "$here/bk-evidence" "$claim" --as manager ${ON:+--on "$ON" --reuse} -- scripts/test-table 2>&1 | tail -2
+  )
+  if [ -z "$(git -C "$v" status --porcelain)" ]; then git worktree remove "$v" && echo "removed $v"; else echo "LEFT $v (dirty)"; fi
+done
+git worktree prune
