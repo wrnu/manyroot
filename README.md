@@ -68,10 +68,15 @@ bracken conflicts                    # divergences and contradictions
 bracken show $REQ --json             # every read command supports --json
 ```
 
-`bracken view [--port N]` serves a read-only web view of the replica on 127.0.0.1 only, with its JSON API
+`bracken view [--port N]` serves a read-only web view of the replica on 127.0.0.1, with its JSON API
 under `/api/` (the shapes are in [docs/design/visualizer.md](docs/design/visualizer.md)) and new work
 announced on `/api/events`. It never writes, reads no identity, and sends Ground text only as JSON, under
-a Content-Security-Policy that allows no inline script.
+a Content-Security-Policy that allows no inline script. `--bind <ip>` serves on that one address instead,
+such as this machine's NetBird IP (owner decision 917816c72975). Then anyone who can reach that network
+can read the whole Ground: there's no login, and it says so when it starts. It never binds every interface
+(`0.0.0.0`, `::`), a multicast or a broadcast address. It answers only to the Host `<ip>:<port>` and any
+names given with `--host <name>`, e.g. `bracken view --bind 100.74.240.73 --port 8740 --host
+warren-mbp.jx.rs`.
 
 Moving contributions between replicas:
 

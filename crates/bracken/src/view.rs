@@ -1,4 +1,5 @@
-//! `bracken view`: a read-only web view of one replica, served on 127.0.0.1 only.
+//! `bracken view`: a read-only web view of one replica, served on 127.0.0.1, or on one other address
+//! named with `--bind` (decision 917816c72975).
 //!
 //! The page and its scripts are embedded in the binary. The JSON API is the shapes of
 //! docs/design/visualizer.md section 1, built from the same library calls and field names as the
@@ -12,13 +13,13 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use manyroot::validation::open_conflicts;
 use manyroot::{AgentEntry, Store};
 use manyroot::{
@@ -206,7 +207,8 @@ type Past = (Graph, Vec<ContributionId>);
 
 struct Viewer {
     dir: PathBuf,
-    port: u16,
+    /// The Host values this view answers to, lowercase, each with its port (section 1.7).
+    hosts: Vec<String>,
     policy: Policy,
     /// The latest snapshot and its generation, which the watcher bumps; streams wait on `changed`.
     current: Mutex<(u64, Arc<Snapshot>)>,
@@ -223,11 +225,88 @@ struct Viewer {
     reread_delay: Duration,
 }
 
-/// Listens on 127.0.0.1 only, at `port` (0 for any free port), prints the URL on stdout, and serves
-/// the replica in `dir` until the process ends.
-pub fn serve(dir: &Path, policy: Policy, port: u16) -> Result<()> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).context("listening on 127.0.0.1")?;
+/// Where a view listens and what it answers to: exactly one address (127.0.0.1 unless `--bind` names
+/// another) and its port, and the names given with `--host`.
+pub struct Bind {
+    pub ip: IpAddr,
+    pub port: u16,
+    pub names: Vec<String>,
+}
+
+impl Bind {
+    /// Refuses what would reach more than one host or interface: an unspecified address (every
+    /// interface), a multicast or broadcast one; and a name that isn't a plain host name. Returns the
+    /// address to bind, canonical: an IPv4-mapped IPv6 address (`::ffff:0.0.0.0`) is checked, bound
+    /// and shown as the IPv4 address it is (finding e20de255980d), since on a dual-stack socket
+    /// `::ffff:0.0.0.0` is every IPv4 interface.
+    fn check(&self) -> Result<IpAddr> {
+        let ip = self.ip.to_canonical();
+        if ip.is_unspecified() {
+            bail!("--bind {ip} would listen on every interface; name one address (decision 917816c72975)");
+        }
+        if ip.is_multicast() || matches!(ip, IpAddr::V4(v4) if v4.is_broadcast()) {
+            bail!("--bind {ip} is a multicast or broadcast address; name one address of this machine");
+        }
+        for name in &self.names {
+            let plain = !name.is_empty()
+                && name.split('.').all(|label| {
+                    !label.is_empty()
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                });
+            if !plain {
+                bail!("--host {name:?} isn't a host name: letters, digits, '-' and '.', with no port");
+            }
+        }
+        Ok(ip)
+    }
+}
+
+/// `ip:port` as a URL and a Host header write it: `[ip]:port` for IPv6.
+fn host_port(ip: IpAddr, port: u16) -> String {
+    match ip {
+        IpAddr::V4(ip) => format!("{ip}:{port}"),
+        IpAddr::V6(ip) => format!("[{ip}]:{port}"),
+    }
+}
+
+/// The Host values a view answers to, lowercase. Against DNS rebinding: a page from another site
+/// that resolves its own name to this address sends its own name as the Host, so only the address
+/// itself, `localhost` on loopback, and the names given are answered. A browser leaves out `:80`.
+fn hosts(ip: IpAddr, port: u16, names: &[String]) -> Vec<String> {
+    let mut hosts = vec![host_port(ip, port)];
+    if ip.is_loopback() {
+        hosts.push(format!("localhost:{port}"));
+    }
+    for name in names {
+        hosts.push(format!("{}:{port}", name.to_ascii_lowercase()));
+        if port == 80 {
+            hosts.push(name.to_ascii_lowercase());
+        }
+    }
+    hosts
+}
+
+/// The warning printed on start when the view is reachable from a network, not only this machine.
+fn reach_warning(ip: IpAddr, port: u16) -> Option<String> {
+    (!ip.is_loopback()).then(|| {
+        format!(
+            "bracken view: warning: listening on {}, so anyone who can reach that network can read this whole Ground; there is no login",
+            host_port(ip, port)
+        )
+    })
+}
+
+/// Listens on the one address `bind` names, at its port (0 for any free port), prints the URL on
+/// stdout, and serves the replica in `dir` until the process ends. Bound anywhere but loopback, it
+/// warns on stderr that anyone on that network can read the whole Ground: there's no login.
+pub fn serve(dir: &Path, policy: Policy, bind: &Bind) -> Result<()> {
+    let ip = bind.check()?;
+    let listener = TcpListener::bind((ip, bind.port)).with_context(|| format!("listening on {ip}"))?;
     let port = listener.local_addr()?.port();
+    let at = host_port(ip, port);
+    let hosts = hosts(ip, port, &bind.names);
     let dir = dir.to_owned();
     let first = signature(&dir)?;
     let snapshot = Snapshot::new(Store::open(&dir)?, &policy, None, first)?;
@@ -238,7 +317,7 @@ pub fn serve(dir: &Path, policy: Policy, port: u16) -> Result<()> {
         .min(MAX_REREAD_DELAY);
     let viewer = Arc::new(Viewer {
         dir,
-        port,
+        hosts,
         policy,
         current: Mutex::new((0, Arc::new(snapshot))),
         changed: Condvar::new(),
@@ -249,9 +328,12 @@ pub fn serve(dir: &Path, policy: Policy, port: u16) -> Result<()> {
         reread_delay,
     });
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "view at http://127.0.0.1:{port}/")?;
+    writeln!(stdout, "view at http://{at}/")?;
     stdout.flush()?;
     drop(stdout);
+    if let Some(warning) = reach_warning(ip, port) {
+        eprintln!("{warning}");
+    }
     let watcher = Arc::clone(&viewer);
     std::thread::spawn(move || watcher.watch());
     for stream in listener.incoming() {
@@ -428,11 +510,9 @@ impl Viewer {
                 return;
             }
         };
-        let ours = [format!("127.0.0.1:{}", self.port), format!("localhost:{}", self.port)];
-        // Against DNS rebinding: a page from another site that resolves its own name to 127.0.0.1
-        // sends its own name as the Host.
-        if !request.host.as_ref().is_some_and(|h| ours.contains(&h.to_ascii_lowercase())) {
-            let _ = respond(stream, &error(403, format!("this view answers only to http://{}/", ours[0])));
+        // Against DNS rebinding: see `serve`.
+        if !request.host.as_ref().is_some_and(|h| self.hosts.contains(&h.to_ascii_lowercase())) {
+            let _ = respond(stream, &error(403, format!("this view answers only to http://{}/", self.hosts[0])));
             return;
         }
         if request.method != "GET" {
@@ -1134,6 +1214,37 @@ fn cut_bytes(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().expect("a test address")
+    }
+
+    #[test]
+    fn mapped_addresses_are_checked_as_the_ipv4_they_are() {
+        let bind = |s: &str| Bind { ip: ip(s), port: 0, names: Vec::new() }.check();
+        for refused in ["::ffff:0.0.0.0", "::ffff:0:0", "::ffff:224.0.0.1", "::ffff:255.255.255.255"] {
+            assert!(bind(refused).is_err(), "{refused}");
+        }
+        assert_eq!(bind("::ffff:127.0.0.1").expect("loopback"), ip("127.0.0.1"));
+        assert_eq!(bind("::ffff:100.74.240.73").expect("unicast"), ip("100.74.240.73"));
+        assert_eq!(bind("::1").expect("loopback"), ip("::1"));
+    }
+
+    #[test]
+    fn off_loopback_there_is_no_localhost_and_a_warning() {
+        let names = vec!["Warren-MBP.jx.rs".to_owned()];
+        assert_eq!(hosts(ip("100.74.240.73"), 8740, &names), ["100.74.240.73:8740", "warren-mbp.jx.rs:8740"]);
+        assert_eq!(hosts(ip("127.0.0.1"), 8740, &[]), ["127.0.0.1:8740", "localhost:8740"]);
+        assert_eq!(
+            hosts(ip("::1"), 80, &names),
+            ["[::1]:80", "localhost:80", "warren-mbp.jx.rs:80", "warren-mbp.jx.rs"]
+        );
+        let warning = reach_warning(ip("100.74.240.73"), 8740).expect("off loopback");
+        assert!(warning.contains("100.74.240.73:8740") && warning.contains("anyone") && warning.contains("no login"));
+        for loopback in ["127.0.0.1", "::1"] {
+            assert_eq!(reach_warning(ip(loopback), 8740), None, "{loopback}");
+        }
+    }
 
     #[test]
     fn json_bytes_escapes_markup_without_changing_the_value() {

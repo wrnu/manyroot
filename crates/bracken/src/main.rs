@@ -273,9 +273,18 @@ enum Command {
     },
     /// Serve a read-only web view of this replica on 127.0.0.1, with its JSON API, until stopped.
     View {
-        /// Port on 127.0.0.1; 0 picks a free one. The URL is printed on stdout.
+        /// Port; 0 picks a free one. The URL is printed on stdout.
         #[arg(long, default_value_t = 0)]
         port: u16,
+        /// The one address to listen on, instead of 127.0.0.1, e.g. this machine's NetBird IP. Anyone who
+        /// can reach it can read the whole Ground: there's no login. Never every interface, multicast or
+        /// broadcast.
+        #[arg(long, value_name = "IP", default_value = "127.0.0.1")]
+        bind: std::net::IpAddr,
+        /// A name this view also answers to, as the Host a browser sends (e.g. warren-mbp.jx.rs).
+        /// Repeatable. Every other Host is refused.
+        #[arg(long = "host", value_name = "NAME")]
+        hosts: Vec<String>,
         /// The policy every status in the view is under.
         #[command(flatten)]
         policy: PolicyArgs,
@@ -577,10 +586,10 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             }
         }
         Command::Status { all, policy, out } => print_status(&s, all, &policy, out.json)?,
-        Command::View { port, policy } => {
+        Command::View { port, bind, hosts, policy } => {
             // Validators by name from the public agent directory: the view never reads identities.
             let policy = policy.build(&view::public_names(&s)?)?;
-            view::serve(s.dir(), policy, port)?;
+            view::serve(s.dir(), policy, &view::Bind { ip: bind, port, names: hosts })?;
         }
         Command::Intend { id, duration } => {
             let who = signer(&s, agent)?;
