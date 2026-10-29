@@ -450,6 +450,87 @@ fn a_wave_with_nothing_correct_before_it_has_no_recovery() {
     assert!(table(std::slice::from_ref(&c)).contains("| never (of 34) "));
 }
 
+/// Task `81b0ce075a56` (decision `a8ba06399068` point 4): recovery's "before" is the hub when the wave went
+/// out, its last snapshot before the release graded under the specs before it, not the last checkpoint.
+/// Here the checkpoint before wave 1 holds only max2, which no wave changes, but a sync then lands the whole
+/// library, so all 34 of wave 1's functions were correct when it went out. The snapshot logged after the
+/// release, which here drops them as Bracken's accepted layer does for superseded specs, isn't the before.
+#[test]
+fn recovery_counts_from_the_hub_when_the_wave_went_out() {
+    let t = Task::Phase2;
+    let hidden = HiddenCases::new(t, 1);
+    let text = |programs: &crate::candidates::Programs| -> Vec<(String, String)> {
+        crate::candidates::modules(t, programs).into_iter().map(|(m, s)| (m.to_string(), s)).collect()
+    };
+    let original = correct_programs(t, Version::ORIGINAL);
+    let max2: crate::candidates::Programs =
+        original.iter().filter(|(f, _)| **f == "max2").map(|(f, p)| (*f, *p)).collect();
+    let mut log = Log::new("git");
+    log.snap(1, None, &[]);
+    log.ev(2, None, "snapshot", json!({"after": "sync", "modules": text(&max2)}));
+    log.ev(3, None, "checkpoint", json!({"turn": 1, "modules": text(&max2)}));
+    log.ev(4, None, "snapshot", json!({"after": "sync", "modules": text(&original)}));
+    log.ev(5, None, "changes_released", json!({"wave": 1}));
+    log.ev(6, None, "snapshot", json!({"after": "release", "modules": text(&max2)}));
+    let wave1 = text(&correct_programs(t, t.after_wave(1)));
+    log.ev(7, None, "snapshot", json!({"after": "sync", "modules": wave1}));
+    log.ev(8, None, "checkpoint", json!({"turn": 2, "modules": wave1}));
+    log.turn_usage("agent-0", 1, 1_000, 10);
+    let c = measure(&log.records(), &hidden).expect("measures").checkpoints.expect("checkpoints");
+    assert_eq!(c.recovery, [Recovery { wave: 1, functions: 34, checkpoints: Some(1) }]);
+}
+
+/// Decision `a8ba06399068` point 3: beside the ranking, never in it, CRDT mode's checkpoints regraded with
+/// identical copies collapsed. Here the document holds the whole original library plus a second, identical
+/// copy of max2 and a different copy of mix. The ranking grades it as the grader does, with neither (nor
+/// anything calling them); the diagnostic as the library with only the different copy of mix: max2 and its
+/// callers count again, mix and its callers don't. Git's log of the same checkpoint has no diagnostic: n/a.
+#[test]
+fn crdt_has_a_diagnostic_with_identical_copies_collapsed_beside_the_ranking() {
+    let t = Task::Phase2;
+    let hidden = HiddenCases::new(t, 1);
+    let mut modules: Vec<(String, String)> = crate::candidates::modules(t, &correct_programs(t, Version::ORIGINAL))
+        .into_iter()
+        .map(|(m, s)| (m.to_string(), s))
+        .collect();
+    let line = |f: &str| {
+        modules.iter().flat_map(|(_, s)| s.lines()).find(|l| l.starts_with(&format!("def {f} "))).map(str::to_string)
+    };
+    let (max2, mix) = (line("max2").expect("max2"), line("mix").expect("mix"));
+    let other_mix = format!("{} 0 +", mix);
+    let base = modules.clone();
+    modules.push(("copies".to_string(), format!("{max2}\n{other_mix}\n")));
+    let correct = |extra: &str| {
+        let mut m = base.clone();
+        m.push(("copies".to_string(), extra.to_string()));
+        let library = Library::parse(m.iter().map(|(a, b)| (a.as_str(), b.as_str())));
+        grade(&library, Version::ORIGINAL, &hidden).iter().filter(|g| g.in_library).count() as u64
+    };
+    let (ranked, collapsed) = (correct(&format!("{max2}\n{other_mix}\n")), correct(&format!("{other_mix}\n")));
+    assert!(ranked < collapsed && collapsed < 90, "{ranked}, {collapsed}");
+    let log_of = |mode: &str| {
+        let mut log = Log::new(mode);
+        log.snap(1, None, &[]);
+        log.ev(2, None, "checkpoint", json!({"turn": 1, "modules": modules}));
+        log.turn_usage("agent-0", 1, 1_000, 10);
+        measure(&log.records(), &hidden).expect("measures")
+    };
+    let crdt = log_of("crdt");
+    let c = crdt.checkpoints.clone().expect("checkpoints");
+    assert_eq!((c.turns[0].correct, c.correct), (ranked, ranked), "the ranking keeps the grader's rule");
+    assert_eq!(c.crdt_identical_collapsed, Some(vec![(1, collapsed)]));
+    let git = log_of("git");
+    assert_eq!(git.checkpoints.clone().expect("checkpoints").crdt_identical_collapsed, None);
+    let t = table(&[crdt, git]);
+    let row = t.lines().find(|l| l.starts_with("| Diagnostic, not ranked: CRDT")).expect("the row");
+    let cells: Vec<&str> = row.split('|').map(str::trim).collect();
+    assert_eq!(cells[2..4], [format!("1: {collapsed}").as_str(), "n/a"], "{t}");
+    let rank = t.lines().position(|l| l.starts_with("| Ranking: checkpoints")).expect("ranking");
+    let per_delivery = t.lines().position(|l| l.starts_with("| Per-delivery diagnostics")).expect("diagnostics");
+    let here = t.lines().position(|l| l == row).expect("row");
+    assert!(rank < here && here < per_delivery, "printed beside the ranking, after it: {t}");
+}
+
 /// Finding `bf3fde3cf637`: Phase 2 ranks by checkpoints, so a turn without one, or one that can't be read,
 /// can't be measured.
 #[test]
@@ -990,11 +1071,18 @@ fn checkpoint_log(mode: &str) -> Log {
     wave1.insert("weigh", original["weigh"]); // weigh-subtracts left undone, so judge stays wrong too
     wave1.insert("total", candidates(t, "total").wrong[0]); // a breakage no wave explains
     let mut log = Log::new(mode);
+    // The hub as the driver snapshots it, each time it changes: each checkpoint reads the same library.
+    let hub = |log: &mut Log, ms, programs| {
+        log.ev(ms, None, "snapshot", json!({"after": "sync", "modules": text(programs)}));
+    };
     log.snap(1, None, &[]);
+    hub(&mut log, 2, &without_mix);
     log.ev(2, None, "checkpoint", json!({"turn": 1, "modules": text(&without_mix)}));
+    hub(&mut log, 3, &original);
     log.ev(3, None, "checkpoint", json!({"turn": 2, "modules": text(&original)}));
     log.ev(4, None, "changes_released", json!({"wave": 1}));
     log.ev(5, None, "checkpoint", json!({"turn": 3, "modules": text(&original)}));
+    hub(&mut log, 6, &wave1);
     log.ev(6, None, "checkpoint", json!({"turn": 4, "modules": text(&wave1)}));
     log.turn_usage("agent-0", 1, 900_000, 1_000);
     log

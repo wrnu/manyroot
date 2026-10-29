@@ -283,6 +283,12 @@ fn a_wave_goes_out_at_its_boundary_while_another_agent_ends_a_turn() {
 ///   it learns of a wave only once it merges main in. Turn 1: abs; turn 2: dec; turn 3: diff, while the old
 ///   abs fails under wave 2 (a breakage after it); turn 4: sign and sq, mended and merged, and lt, while abs's
 ///   rewrite can't merge.
+///
+/// Recovery's "before" is the hub when each wave went out, its last snapshot before the release, graded
+/// under the specs before it (decision `a8ba06399068` point 4); played in lockstep, that's the library the
+/// checkpoint just before it read. In Bracken mode the release of wave 2 then drops abs from the accepted
+/// layer (its spec is superseded): the snapshot logged after the release holds only dec, but abs was in
+/// the hub when the wave went out, so it is still one function to recover.
 #[test]
 fn scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -300,7 +306,8 @@ fn scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode() {
                 rows: [(1, 0, 2), (2, 1, 4), (3, 2, 6), (4, 2, 8)],
                 from: &[("abs", 1), ("add3", 3), ("dec", 2), ("diff", 3), ("le", 4), ("lt", 4), ("sign", 1), ("sq", 2)],
                 median: 2.5,
-                // Wave 1 changes sign, correct before it; wave 2, abs. Each is rewritten by the next checkpoint.
+                // Wave 1 changes sign, in the hub when it went out; wave 2, abs. Each is rewritten by the next
+                // checkpoint.
                 recovery: [(1, Some(1)), (1, Some(1))],
                 breakage: (0, 0),
             },
@@ -311,7 +318,8 @@ fn scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode() {
                 rows: [(1, 0, 1), (2, 1, 2), (3, 2, 5), (4, 2, 7)],
                 from: &[("abs", 1), ("add3", 4), ("dec", 2), ("diff", 3), ("lt", 4), ("sign", 3), ("sq", 3)],
                 median: 3.0,
-                // sign wasn't in the library before wave 1, so it has nothing to recover: n/a.
+                // sign wasn't in the hub when wave 1 went out, so it has nothing to recover: n/a. abs was when
+                // wave 2 did, though the release then drops it from the accepted layer.
                 recovery: [(0, None), (1, Some(1))],
                 breakage: (0, 0),
             },
@@ -322,6 +330,7 @@ fn scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode() {
                 rows: [(1, 0, 1), (2, 1, 2), (3, 2, 2), (4, 2, 5)],
                 from: &[("dec", 2), ("diff", 3), ("lt", 4), ("sign", 4), ("sq", 4)],
                 median: 4.0,
+                // abs, in main when wave 2 went out, never merges its rewrite.
                 recovery: [(0, None), (1, None)],
                 breakage: (1, 0),
             },

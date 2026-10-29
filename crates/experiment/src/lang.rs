@@ -192,6 +192,17 @@ pub struct Library {
 impl Library {
     /// Parses `(module name, text)` pairs. Calls are resolved by name across all of them.
     pub fn parse<'a>(modules: impl IntoIterator<Item = (&'a str, &'a str)>) -> Library {
+        Library::parse_with(modules, false)
+    }
+
+    /// As [`Library::parse`], except that copies of a definition identical to the first (the same name,
+    /// arity and code, in any module) count as one definition. A copy that differs still makes the name a
+    /// duplicate. Only for a diagnostic (decision `a8ba06399068` point 3): the grader's rule is `parse`'s.
+    pub fn parse_collapsing_identical<'a>(modules: impl IntoIterator<Item = (&'a str, &'a str)>) -> Library {
+        Library::parse_with(modules, true)
+    }
+
+    fn parse_with<'a>(modules: impl IntoIterator<Item = (&'a str, &'a str)>, collapse: bool) -> Library {
         let mut library = Library::default();
         for (module, text) in modules {
             match parse_module(module, text) {
@@ -200,10 +211,13 @@ impl Library {
                         if library.duplicates.contains(&def.name) {
                             continue;
                         }
-                        if library.defs.remove(&def.name).is_some() {
-                            library.duplicates.insert(def.name);
-                        } else {
-                            library.defs.insert(def.name.clone(), def);
+                        match library.defs.get(&def.name) {
+                            Some(kept) if collapse && kept.arity == def.arity && kept.body == def.body => {}
+                            Some(_) => {
+                                library.defs.remove(&def.name);
+                                library.duplicates.insert(def.name);
+                            }
+                            None => drop(library.defs.insert(def.name.clone(), def)),
                         }
                     }
                 }
