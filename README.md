@@ -68,6 +68,11 @@ bracken conflicts                    # divergences and contradictions
 bracken show $REQ --json             # every read command supports --json
 ```
 
+`bracken view [--port N]` serves a read-only web view of the replica on 127.0.0.1 only, with its JSON API
+under `/api/` (the shapes are in [docs/design/visualizer.md](docs/design/visualizer.md)) and new work
+announced on `/api/events`. It never writes, reads no identity, and sends Ground text only as JSON, under
+a Content-Security-Policy that allows no inline script.
+
 Moving contributions between replicas:
 
 ```sh
