@@ -31,9 +31,24 @@ fn run(dir: &Path, program: &str, args: &[&str]) -> Output {
     command(dir, program, args).output().unwrap()
 }
 
+/// Writes an executable through a child `sh`, so this test process never holds it open for writing. A
+/// parallel test's fork would inherit such a descriptor until its exec, and running the file meanwhile
+/// fails with ETXTBSY, "Text file busy" (task aa2ac61f8dd4).
 fn write_executable(path: &Path, contents: &str) {
-    std::fs::write(path, contents).unwrap();
+    let mut sh = Command::new("sh")
+        .args(["-c", "cat >\"$0\"", path.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut sh.stdin.take().unwrap(), contents.as_bytes()).unwrap();
+    assert!(sh.wait().unwrap().success(), "couldn't write {path:?}");
     std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+}
+
+/// Copies a file with `cp`, for the same reason as [`write_executable`]: `std::fs::copy` would hold the
+/// copy open for writing in this process.
+fn copy_executable(from: &Path, to: &Path) {
+    assert!(Command::new("cp").arg(from).arg(to).status().unwrap().success(), "cp {from:?} {to:?}");
 }
 
 fn bk(dir: &Path, args: &[&str]) -> String {
@@ -67,9 +82,9 @@ fn repo(files: &[(&str, &Path)], gitignore: &str, setup: impl FnOnce(&Path)) -> 
         "#!/usr/bin/env bash\nset -o pipefail\n\"$REAL_BRACKEN\" \"$@\" | cat\n",
     );
     std::fs::create_dir_all(dir.join("scripts")).unwrap();
-    std::fs::copy(repo_root().join("scripts/bk"), dir.join("scripts/bk")).unwrap();
+    copy_executable(&repo_root().join("scripts/bk"), &dir.join("scripts/bk"));
     for (to, from) in files {
-        std::fs::copy(from, dir.join(to)).unwrap();
+        copy_executable(from, &dir.join(to));
     }
     std::fs::write(dir.join(".gitignore"), gitignore).unwrap();
     setup(&dir);
@@ -2173,6 +2188,15 @@ fn verify_seq_sigterm_with_sigint_ignored_still_stops_both_runs() {
     verify_seq_interrupted(true);
 }
 
+/// Reads `from` to its end on a thread of its own.
+fn drain(mut from: impl std::io::Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut all = Vec::new();
+        from.read_to_end(&mut all).unwrap();
+        all
+    })
+}
+
 /// Two split runs under `verify-seq -j 2`, then a Ctrl-C to its group or, with `term`, SIGINT ignored
 /// and a SIGTERM to `verify-seq` only.
 fn verify_seq_interrupted(term: bool) {
@@ -2249,20 +2273,31 @@ fn verify_seq_interrupted(term: bool) {
             .env("TMPDIR", tmp.path())
             .env_remove("ON");
         std::os::unix::process::CommandExt::process_group(&mut c, 0);
-        let child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let mut child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        // Read as it comes, so a full pipe can't hold verify-seq up before the runs start (note a3d37148ea05).
+        let (stdout, stderr) = (drain(child.stdout.take().unwrap()), drain(child.stderr.take().unwrap()));
+        let text = |stdout: std::thread::JoinHandle<Vec<u8>>, stderr: std::thread::JoinHandle<Vec<u8>>| {
+            let (o, e) = (stdout.join().unwrap(), stderr.join().unwrap());
+            format!("{}{}", String::from_utf8_lossy(&o), String::from_utf8_lossy(&e))
+        };
+        // A loaded machine can take minutes to start both; the limit stays below the stubs' 10 minutes, and
+        // verify-seq ending first fails at once with what it said.
         let started = std::time::Instant::now();
         while count("box-") < 2 || count("here-") < 2 {
-            assert!(started.elapsed() < std::time::Duration::from_secs(180), "{scripts}: the runs never started");
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("{scripts}: verify-seq ended ({status}) before both runs started: {}", text(stdout, stderr));
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(480), "{scripts}: the runs never started");
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let target = if term { child.id().to_string() } else { format!("-{}", child.id()) };
         let signal = if term { "-TERM" } else { "-INT" };
         assert!(Command::new("/bin/kill").args([signal, "--", &target]).status().unwrap().success());
         let interrupted = std::time::Instant::now();
-        let out = child.wait_with_output().unwrap();
+        let status = child.wait().unwrap();
         let took = interrupted.elapsed();
-        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        assert_eq!(out.status.code(), Some(130), "{scripts}: {text}");
+        let text = text(stdout, stderr);
+        assert_eq!(status.code(), Some(130), "{scripts}: {text}");
         assert!(took < std::time::Duration::from_secs(120), "{scripts}: took {took:?} to stop: {text}");
         assert_eq!(count("live-"), 0, "{scripts}: a box was left: {text}");
         let pids = std::fs::read_to_string(t.join("pids")).unwrap();
@@ -2491,7 +2526,7 @@ fn cleanup_outside_a_checkout_refuses_rather_than_cleaning_the_callers_repo() {
         let (tmp, dir) = repo(&[], ".bracken/\n", |_| {});
         let loose = tmp.path().join("loose");
         std::fs::create_dir_all(&loose).unwrap();
-        std::fs::copy(repo_root().join(scripts).join("cleanup"), loose.join("cleanup")).unwrap();
+        copy_executable(&repo_root().join(scripts).join("cleanup"), &loose.join("cleanup"));
         let out = command(&dir, loose.join("cleanup").to_str().unwrap(), &[])
             .env("GIT_CEILING_DIRECTORIES", tmp.path())
             .output()
