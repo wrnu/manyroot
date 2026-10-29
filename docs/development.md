@@ -74,9 +74,9 @@ Network-sync step 3 (task `c03e893d04eb`, owner approval `f0f7caf53376`): the te
 
 Owner decision `25c1e3543e76` (task `489bfeb6b5af`, reference `ea41264b3c38`): the test table can run in a boat.dev box, a fresh Linux x86_64 machine, instead of on the owner's machine. It's a trial.
 
-**When to use it.** Run `scripts/test-table --remote` instead of a local `cargo test` (or a local `scripts/test-table`) whenever the machine is loaded: several builders or reviewers testing at once, or a long build already running. It's also the only place the Linux tests actually run (gotcha `2c9aebd6d370`). On an idle machine the local table is faster. A remote run counts as a test run like any other: record it with `"$main/scripts/bk-evidence" <pr> --as <you> -- scripts/test-table --remote`.
+**When to use it.** Run `scripts/test-table --remote` instead of a local `cargo test` (or a local `scripts/test-table`) whenever the machine is loaded: several builders or reviewers testing at once, or a long build already running. It's also the only place the Linux tests actually run (gotcha `2c9aebd6d370`). On an idle machine the local table is faster. Record a remote run like any test run: `"$main/scripts/bk-evidence" <pr> --as <you> -- scripts/test-table --remote`. But it is never the counted merge-gate run (manager decision `52c4eb7d2425`): on Linux it skips the experiment's macOS-only sandbox tests (about 30 in `crates/experiment/tests/agent.rs`), so the manager's counted run stays local on the Mac (decision `20a06f9b815e`). A remote pass is builder or extra evidence only.
 
-**The trial's limits.** At most 2 boxes at a time across the whole team, 75 box starts a day and 25 hours of compute; `boat limits` shows what's left. So keep **at most one box of your own running**, and delete it the moment you're done with it (the owner's preference): never leave one idle. `boat run` does that for you. A full table on a default box (4 vCPU, 8 GB) takes about 5 minutes from a cold build and costs a third of a cent (5m 19s, $0.0032, for PR #68).
+**The trial's limits.** At most 2 boxes at a time across the whole team, 75 box starts a day and 25 hours of compute; `boat limits` shows what's left. So keep **at most one box of your own running**, and delete it the moment you're done with it (the owner's preference): never leave one idle. `boat run` does that for you. A full table on a default box (4 vCPU, 8 GB) takes 4½ to 5½ minutes from a cold build and costs about a third of a cent: 4m 28s and $0.0027 on PR #68 at `4e1c0a6` (evidence `8492a0dcfa0d`), 5m 19s and $0.0032 on its earlier head `8e67dc7`.
 
 ### `scripts/test-table --remote`
 
@@ -111,7 +111,7 @@ A box is Ubuntu 24.04 (x86_64) with Rust 1.97 (cargo, clippy, rustfmt), cc, git 
 | The Ground guards | a `bracken` binary | `BRACKEN_BIN="$PWD/target/debug/bracken"`, built by the table's `cargo test` |
 | The table's Linux-target clippy | the `x86_64-unknown-linux-gnu` target | Native in the box |
 
-`--remote` installs the PPA's git and `b3sum` in every box; anything a future test needs goes in its inner script too, and in this table. On Linux, the experiment's sandboxed tests are skipped with a printed reason (`needs macOS sandbox-exec`): `sandbox-exec` exists only on macOS, and they still run there. The workspace builds dependencies at `opt-level = 2` even in debug (`Cargo.toml`), which made the demo's adversary tests three times faster; without it they alone took 13 minutes in a box.
+`--remote` installs the PPA's git and `b3sum` in every box, quietly unless that fails: then it prints the failing command, its exit and its output, and stops; anything a future test needs goes in its inner script too, and in this table. On Linux, the experiment's sandboxed tests are skipped with a printed reason (`needs macOS sandbox-exec`): `sandbox-exec` exists only on macOS, and they still run there. The workspace builds dependencies at `opt-level = 2` even in debug (`Cargo.toml`), which made the demo's adversary tests three times faster; without it they alone took 13 minutes in a box.
 
 ## Forge commands
 
