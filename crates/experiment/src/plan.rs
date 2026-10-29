@@ -11,6 +11,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::bracken_mode::AcceptRule;
 use crate::claude::TURN_MESSAGE;
 use crate::driver::{RELEASE_AT, RunConfig, core_tools};
 use crate::grader::HiddenCases;
@@ -18,14 +19,9 @@ use crate::metrics::{DEFINITIONS, Measures, Records, incomplete, measure};
 use crate::mode::Mode;
 use crate::task::{Version, task_text};
 
-/// The rules each mode integrates by, as fixed before the run.
+/// The rules each mode integrates by, as fixed before the run, besides Bracken mode's
+/// acceptance rule, which the run chooses ([`rules`]).
 pub const RULES: &[(&str, &str)] = &[
-    (
-        "bracken-materialization",
-        "Decisions b29d5db02da8 point 7 and 5e8df6996a2e: for each current spec, the current implementations with \
-         at least one independent pass and no counted fail, counting each validator once (its latest current \
-         verdict) and never the author; the most passes first, then causal order.",
-    ),
     (
         "bracken-check",
         "Answer 88ae128c5fcd: check resolves calls in the agent's replica: the artifact under check for its own \
@@ -40,6 +36,13 @@ pub const RULES: &[(&str, &str)] = &[
          agent merges, --no-ff, made by the hub, and a conflicting merge is refused.",
     ),
 ];
+
+/// Every rule a run integrates by: Bracken mode's acceptance rule as the run chose it, then [`RULES`].
+pub fn rules(accept: AcceptRule) -> Vec<(String, String)> {
+    let mut out = vec![("bracken-materialization".to_string(), accept.text().to_string())];
+    out.extend(RULES.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    out
+}
 
 /// What the caller chooses for a run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +61,9 @@ pub struct PlanInputs {
     pub usage: String,
     /// The stops the run may end with and still be measured: the backend's own caps.
     pub expected_stops: Vec<String>,
+    /// Bracken mode's rule for which implementation counts.
+    #[serde(default = "AcceptRule::before_selectable")]
+    pub accept_rule: AcceptRule,
 }
 
 impl Default for PlanInputs {
@@ -72,6 +78,7 @@ impl Default for PlanInputs {
             system_prompt: String::new(),
             usage: "usage.jsonl".into(),
             expected_stops: Vec::new(),
+            accept_rule: AcceptRule::default(),
         }
     }
 }
@@ -142,7 +149,7 @@ impl Plan {
             git,
             metrics_code: metrics_code(),
             prompts,
-            rules: pairs(RULES),
+            rules: rules(cfg.plan.accept_rule),
             definitions: pairs(DEFINITIONS),
         }
     }

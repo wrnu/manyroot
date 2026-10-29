@@ -367,9 +367,16 @@ starts from a fresh sync state.
 - **Integrated state:** the accepted layer at the hub, materialized into the
   four module files by a fixed rule: for each current spec, the current
   (not retracted or superseded) implementations with at least one
-  independent pass and no counted fail; if there are several, the one with
-  the most passes, then the earliest in causal order. If none, the function
-  is missing (decision 7, section 8). Verdicts count as decision
+  independent pass and no counted fail; if there are several, the earliest
+  in causal order. One independent pass accepts, as Bracken's default
+  policy does, with no ranking by pass count (owner decision
+  `a4d8622c75d5` point 2). If none, the function is missing (decision 7,
+  section 8). Phase 1 ran with a different tie rule, the most passes first
+  and then the earliest; a run can still choose it (`--accept-rule
+  phase1-most-passes`) to reproduce Phase 1, and the plan states which rule
+  a run used, in its hashed rules. The `accepted` tool lists, per function,
+  the implementation that counts as accepted and the function's other
+  implementations as waiting, without pass counts. Verdicts count as decision
   `5e8df6996a2e` says: each validator counts at most once per
   implementation, by its latest current verdict, and the implementation's
   author never counts. Passes are counted by validator, not by evidence
@@ -1233,7 +1240,10 @@ The owner accepted all eight recommendations of the first draft (decision
    than the author.
 7. **Bracken's materialization rule:** current implementations with at
    least one independent pass, most passes first, then causal order, fixed
-   in the plan before the run.
+   in the plan before the run. Changed after Phase 1 by owner decision
+   `a4d8622c75d5` point 2: one independent pass accepts, and rivals resolve
+   by causal order alone (section 2, Mode 3); Phase 1's rule stays
+   selectable to reproduce Phase 1.
 8. **Quota and replicates:** the calibration run (done: 1.36 million tokens
    counted, about 5 minutes) first, then the pilot on its re-estimated use
    (27 to 47 million tokens, 7.2 million output at the ceiling; capped at 75

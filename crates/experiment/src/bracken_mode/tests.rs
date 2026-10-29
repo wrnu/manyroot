@@ -72,8 +72,14 @@ fn is_free_text(tool: &str, slot: &str) -> bool {
 }
 
 fn store(dir: PathBuf, bracken: PathBuf) -> BrackenStore {
-    let config =
-        StoreConfig { dir, bracken, git: PathBuf::from("/nonexistent/git"), identity: "me".into(), trace: false };
+    let config = StoreConfig {
+        dir,
+        bracken,
+        git: PathBuf::from("/nonexistent/git"),
+        identity: "me".into(),
+        trace: false,
+        accept_rule: Default::default(),
+    };
     BrackenStore { config, runs: 0, files: 0 }
 }
 
@@ -200,21 +206,59 @@ impl Ground {
     }
 
     fn snapshot(&self) -> Snapshot {
-        Snapshot::new(&json!(self.rows), "setter").expect("a snapshot")
+        self.snapshot_under(AcceptRule::OnePass)
+    }
+
+    fn snapshot_under(&self, rule: AcceptRule) -> Snapshot {
+        Snapshot::new(&json!(self.rows), "setter", rule).expect("a snapshot")
     }
 }
 
-#[test]
-fn the_rule_takes_most_passes_then_earliest() {
+/// Rivals: a1 with one pass, then a2 and a3 with two each; s1 and s2 with one each.
+fn rivals() -> Ground {
     let mut g = Ground::new();
     g.implement("a1", "x", "abs", "a", 1);
     g.implement("a2", "y", "abs", "a 0 < a neg a ?", 2);
     g.implement("a3", "z", "abs", "a a", 2);
     g.implement("s1", "x", "sq", "a a *", 1);
     g.implement("s2", "y", "sq", "a dup *", 1);
-    let out = g.snapshot().integrated();
+    g
+}
+
+#[test]
+fn rivals_with_passes_resolve_by_causal_order_alone() {
+    let out = rivals().snapshot().integrated();
+    assert_eq!(out["abs"], "def abs 1 : a\n", "the earliest with a pass, not the one with most");
+    assert_eq!(out["sq"], "def sq 1 : a a *\n");
+}
+
+#[test]
+fn phase1s_rule_takes_most_passes_then_earliest() {
+    let out = rivals().snapshot_under(AcceptRule::MostPasses).integrated();
     assert_eq!(out["abs"], "def abs 1 : a 0 < a neg a ?\n", "most passes, then the earlier of a2 and a3");
     assert_eq!(out["sq"], "def sq 1 : a a *\n", "a tie goes to the earliest");
+}
+
+#[test]
+fn one_independent_pass_accepts_and_a_later_independent_fail_takes_it_back() {
+    let mut g = Ground::new();
+    g.implement("a1", "x", "abs", "a 0 < a neg a ?", 0);
+    assert!(g.snapshot().integrated().is_empty(), "no pass yet");
+    // The author's own pass doesn't count.
+    g.verdict("a1", "x", "pass");
+    assert!(g.snapshot().integrated().is_empty(), "the author's own pass");
+    // One pass from someone else accepts it.
+    g.verdict("a1", "validator-0", "pass");
+    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
+    // A later independent fail takes it back, even beside the pass.
+    g.verdict("a1", "validator-1", "fail");
+    assert!(g.snapshot().integrated().is_empty(), "un-accepted by the fail");
+    // A later rival with a pass counts while a1 is out; a1 counts again, as the earlier, once
+    // that validator's latest verdict is a pass.
+    g.implement("a2", "y", "abs", "a", 1);
+    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a\n");
+    g.verdict("a1", "validator-1", "pass");
+    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
 }
 
 #[test]
@@ -290,13 +334,15 @@ fn each_validator_counts_once_with_its_latest_verdict_and_never_the_author() {
         g.verdict("a1", "validator-0", "pass");
     }
     g.implement("a2", "y", "abs", "a 0 < a neg a ?", 2);
-    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
+    // Pass counts show only under Phase 1's rule, which ranks by them.
+    let phase1 = |g: &Ground| g.snapshot_under(AcceptRule::MostPasses).integrated();
+    assert_eq!(phase1(&g)["abs"], "def abs 1 : a 0 < a neg a ?\n");
     // A validator's later fail replaces its pass, and a counted fail keeps it out.
     g.verdict("a2", "validator-1", "fail");
-    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a\n");
+    assert_eq!(phase1(&g)["abs"], "def abs 1 : a\n");
     // Its later pass replaces the fail again.
     g.verdict("a2", "validator-1", "pass");
-    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
+    assert_eq!(phase1(&g)["abs"], "def abs 1 : a 0 < a neg a ?\n");
     // The author's own verdicts never count, pass or fail.
     g.implement("s1", "x", "sq", "a a *", 0);
     g.verdict("s1", "x", "pass");
@@ -429,11 +475,25 @@ fn the_accepted_tool_shows_exactly_what_counts() {
     g.push("y-abs", "artifact", "y", json!({"name": "abs", "text": "def abs 1 : a\n"}));
     g.push("rel-z", "relation", "z", json!({"kind": "implements", "from": "y-abs", "to": "spec-abs"}));
     g.verdict("y-abs", "validator-1", "pass");
+    // A later rival by w with a pass, and an implementation by v with none.
+    g.implement("w-abs", "w", "abs", "a a", 1);
+    g.implement("v-sq", "v", "sq", "a a *", 0);
     let counted = g.snapshot().counted();
-    let rows = counted.as_array().expect("a list");
-    assert_eq!(rows.len(), 1, "{counted}");
-    assert_eq!((rows[0]["function"].as_str(), rows[0]["id"].as_str()), (Some("abs"), Some("x-abs")));
-    assert_eq!(rows[0]["passes"], 1);
+    let rows: Vec<(&str, &str, &str)> = counted
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|r| {
+            (r["function"].as_str().unwrap_or(""), r["id"].as_str().unwrap_or(""), r["status"].as_str().unwrap_or(""))
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [("abs", "x-abs", "accepted"), ("abs", "w-abs", "waiting"), ("sq", "v-sq", "waiting")],
+        "{counted}"
+    );
+    assert!(counted.as_array().expect("a list").iter().all(|r| r.get("passes").is_none()), "no pass counts");
     let integrated = g.snapshot().integrated();
-    assert_eq!(integrated.keys().copied().collect::<Vec<_>>(), vec!["abs"], "the same pick as the integrated library");
+    assert_eq!(integrated["abs"], "def abs 1 : a\n", "the same pick as the integrated library");
+    assert_eq!(integrated.len(), 1);
 }

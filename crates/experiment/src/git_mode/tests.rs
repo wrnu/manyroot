@@ -15,6 +15,7 @@ fn config(dir: &Path, name: &str) -> StoreConfig {
         git: crate::driver::git_binary().expect("git"),
         identity: name.into(),
         trace: true,
+        accept_rule: Default::default(),
     }
 }
 

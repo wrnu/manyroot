@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::args::Args;
@@ -73,7 +74,7 @@ impl Mode for BrackenMode {
             ),
             tool(
                 "accepted",
-                "What counts in your replica, per function: the implementation its author related to the current spec claim that has a pass from someone else and no one else's latest verdict a fail; the one with most passes wins",
+                "What counts in your replica, per function: the implementation its author related to the current spec claim that has a pass from someone else and no one else's latest verdict a fail (the earliest, if several) is accepted; the function's other implementations are waiting",
                 json!({}),
                 &[],
             ),
@@ -270,7 +271,7 @@ impl BrackenStore {
 
     fn state(&mut self) -> Result<Snapshot, String> {
         let current = self.json(&["log", "--json", "--current"])?;
-        Snapshot::new(&current, &self.saved("setter.txt")?)
+        Snapshot::new(&current, &self.saved("setter.txt")?, self.config.accept_rule)
     }
 
     /// A key this store saved at setup.
@@ -626,6 +627,59 @@ pub fn artifact_problem(function: &str, text: &str) -> Option<String> {
     (!names.contains(function)).then(|| format!("it doesn't define `{function}`"))
 }
 
+/// Which implementation counts for a function, among those with an independent pass and no
+/// independent latest fail. The plan records the rule a run used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AcceptRule {
+    /// Decision `a4d8622c75d5` point 2, as Bracken's default: one independent pass accepts, and
+    /// among several the earliest in causal order counts.
+    #[default]
+    #[serde(rename = "one-pass")]
+    OnePass,
+    /// Phase 1's rule (decisions `b29d5db02da8` point 7, `5e8df6996a2e`): the one with the most
+    /// passes counts, then the earliest. Kept to reproduce Phase 1.
+    #[serde(rename = "phase1-most-passes")]
+    MostPasses,
+}
+
+impl AcceptRule {
+    pub const NAMES: [&str; 2] = ["one-pass", "phase1-most-passes"];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AcceptRule::OnePass => "one-pass",
+            AcceptRule::MostPasses => "phase1-most-passes",
+        }
+    }
+
+    pub fn named(name: &str) -> Option<AcceptRule> {
+        [AcceptRule::OnePass, AcceptRule::MostPasses].into_iter().find(|r| r.name() == name)
+    }
+
+    /// Plans written before the rule was selectable used Phase 1's.
+    pub fn before_selectable() -> AcceptRule {
+        AcceptRule::MostPasses
+    }
+
+    /// The rule as the plan states it.
+    pub fn text(self) -> &'static str {
+        match self {
+            AcceptRule::OnePass => {
+                "Decisions a4d8622c75d5 point 2 and 5e8df6996a2e (rule one-pass): for each current spec, the \
+                 current implementations its author related to it with at least one independent pass and no \
+                 counted fail, counting each validator once (its latest current verdict) and never the author; \
+                 the earliest in causal order."
+            }
+            AcceptRule::MostPasses => {
+                "Decisions b29d5db02da8 point 7 and 5e8df6996a2e (rule phase1-most-passes): for each current \
+                 spec, the current implementations with at least one independent pass and no counted fail, \
+                 counting each validator once (its latest current verdict) and never the author; the most \
+                 passes first, then causal order."
+            }
+        }
+    }
+}
+
 /// One row of `bracken log --json`.
 #[derive(Debug, Clone)]
 pub struct Entry {
@@ -652,6 +706,7 @@ pub struct Snapshot {
     setter: String,
     /// For each target id, each validator's latest current verdict.
     verdicts: BTreeMap<String, BTreeMap<String, String>>,
+    rule: AcceptRule,
 }
 
 /// One implementation of a current spec.
@@ -661,7 +716,7 @@ struct Implementation<'a> {
 }
 
 impl Snapshot {
-    pub fn new(current: &Value, setter: &str) -> Result<Snapshot, String> {
+    pub fn new(current: &Value, setter: &str, rule: AcceptRule) -> Result<Snapshot, String> {
         let rows = current.as_array().ok_or("log --json is not a list")?;
         let current: Vec<Entry> = rows
             .iter()
@@ -682,7 +737,7 @@ impl Snapshot {
             // Causal order: a later verdict by the same validator replaces its earlier one.
             verdicts.entry(target.to_string()).or_default().insert(e.author.clone(), verdict.to_string());
         }
-        Ok(Snapshot { current, setter: setter.to_string(), verdicts })
+        Ok(Snapshot { current, setter: setter.to_string(), verdicts, rule })
     }
 
     /// The setter's current claims tagged `tag`.
@@ -744,17 +799,19 @@ impl Snapshot {
         Some(counted().count()).filter(|&n| n > 0)
     }
 
-    /// The fixed rule (decision `b29d5db02da8` point 7, counted per
-    /// `5e8df6996a2e`): for each current spec, the current implementations
-    /// with at least one independent pass and no counted fail; the one with
-    /// the most passes, then the earliest in causal order. None: missing.
+    /// The fixed rule ([`AcceptRule`], counted per `5e8df6996a2e`): for each
+    /// current spec, the current implementations with at least one independent
+    /// pass and no counted fail; the earliest in causal order, or under Phase 1's
+    /// rule the one with the most passes, then the earliest. None: missing.
     fn pick(&self) -> BTreeMap<&'static str, &Entry> {
         let mut best: BTreeMap<&'static str, (usize, usize, &Entry)> = BTreeMap::new();
         for i in self.implementations() {
             let Some(passes) = self.passes(i.entry) else { continue };
-            let better = match best.get(i.spec) {
-                None => true,
-                Some(&(p, index, _)) => passes > p || (passes == p && i.entry.index < index),
+            let earlier = |index: usize| i.entry.index < index;
+            let better = match (best.get(i.spec), self.rule) {
+                (None, _) => true,
+                (Some(&(_, index, _)), AcceptRule::OnePass) => earlier(index),
+                (Some(&(p, index, _)), AcceptRule::MostPasses) => passes > p || (passes == p && earlier(index)),
             };
             if better {
                 best.insert(i.spec, (passes, i.entry.index, i.entry));
@@ -763,13 +820,19 @@ impl Snapshot {
         best.into_iter().map(|(s, (_, _, e))| (s, e)).collect()
     }
 
-    /// What counts, per function, as the `accepted` tool shows it: the fixed rule's pick.
+    /// What the `accepted` tool shows: per function, the fixed rule's pick as accepted and the
+    /// function's other current implementations as waiting, with no pass counts (decision
+    /// `a4d8622c75d5` point 2).
     pub fn counted(&self) -> Value {
-        let rows: Vec<Value> = self
-            .pick()
+        let picked = self.pick();
+        let mut implementations = self.implementations();
+        implementations.sort_by_key(|i| (i.spec, i.entry.index));
+        let rows: Vec<Value> = implementations
             .into_iter()
-            .map(|(function, e)| {
-                json!({"function": function, "id": e.id, "author": e.author, "passes": self.passes(e).unwrap_or(0)})
+            .map(|i| {
+                let status =
+                    if picked.get(i.spec).is_some_and(|e| e.id == i.entry.id) { "accepted" } else { "waiting" };
+                json!({"function": i.spec, "id": i.entry.id, "author": i.entry.author, "status": status})
             })
             .collect();
         Value::Array(rows)
