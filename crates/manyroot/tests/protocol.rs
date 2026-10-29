@@ -262,7 +262,7 @@ fn acceptance_requires_independent_evidence() {
     let fail = add(&mut g, &carol, evidence(work, Verdict::Fail));
     assert_eq!(status(&g, &policy), Status::Rejected);
 
-    let only_bob = Policy { min_passes: 1, validators: Some([bob.agent_id()].into()) };
+    let only_bob = Policy { min_passes: 1, validators: Some([bob.agent_id()].into()), ..Policy::default() };
     assert_eq!(status(&g, &only_bob), Status::Accepted, "carol's evidence is not counted under this policy");
 
     add(&mut g, &carol, Body::Retract { target: fail, reason: "flaky runner".into() });

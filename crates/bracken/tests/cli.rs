@@ -1218,6 +1218,85 @@ fn show_conflicts_and_accepted_escape_other_agents_text() {
     assert_eq!(v["body"]["statement"].as_str(), Some(hostile("a").as_str()), "--json keeps the text");
 }
 
+/// Decision `2b91a9541aba`: with --follow-changes, an accepted implementation whose spec's dependency was
+/// superseded after its pass shows as needing a recheck in show, accepted and status; without it, nothing
+/// changes; a pass that has seen the change clears it.
+#[test]
+fn follow_changes_asks_for_a_recheck_after_a_dependency_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "follow"]);
+    for who in ["setter", "writer", "val"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let spec = bracken(dir, &["claim", "spec: dist is the distance", "--as", "setter"]);
+    let helper = bracken(dir, &["claim", "spec: abs is the magnitude", "--as", "setter"]);
+    bracken(dir, &["relate", &spec, "depends_on", &helper, "--as", "setter"]);
+    std::fs::write(dir.join("f"), "dist").unwrap();
+    let work = bracken(dir, &["artifact", "f", "--name", "dist", "--as", "writer"]);
+    bracken(dir, &["relate", &work, "implements", &spec, "--as", "writer"]);
+    bracken(dir, &["evidence", &work, "pass", "--method", "review", "--as", "val"]);
+    // Other work, which the change doesn't touch.
+    let other = bracken(dir, &["claim", "spec: neg flips the sign", "--as", "setter"]);
+    std::fs::write(dir.join("g"), "neg").unwrap();
+    let neg = bracken(dir, &["artifact", "g", "--name", "neg", "--as", "writer"]);
+    bracken(dir, &["relate", &neg, "implements", &other, "--as", "writer"]);
+    bracken(dir, &["evidence", &neg, "pass", "--method", "review", "--as", "val"]);
+    bracken(dir, &["claim", "spec: abs saturates", "--supersedes", &helper, "--as", "setter"]);
+
+    let show = |flags: &[&str]| json(dir, &[&["show", &work, "--json"], flags].concat())["assessment"].clone();
+    assert_eq!(show(&[])["status"], "accepted");
+    assert!(show(&[]).get("changes").is_none(), "off by default, the output is as before");
+    let a = show(&["--follow-changes"]);
+    assert_eq!(a["status"], "needs_recheck");
+    assert_eq!(a["changes"].as_array().map(Vec::len), Some(1));
+    let text = bracken(dir, &["show", &work, "--follow-changes"]);
+    assert!(text.contains("status    needs_recheck") && text.contains("changed   by"), "{text}");
+
+    let accepted = |flags: &[&str]| -> Vec<String> {
+        json(dir, &[&["accepted", "--json"], flags].concat())["accepted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(accepted(&[]).contains(&work));
+    assert!(!accepted(&["--follow-changes"]).contains(&work), "out of the accepted layer");
+
+    let status = bracken(dir, &["status", "--follow-changes"]);
+    let row = status.lines().find(|l| l.contains(&work[..8])).unwrap_or_else(|| panic!("{status}"));
+    assert!(row.trim_start().starts_with("recheck"), "{status}");
+    let s = json(dir, &["status", "--follow-changes", "--json"]);
+    let rows: Vec<&Value> =
+        s["claims"].as_array().unwrap().iter().flat_map(|c| c["implemented_by"].as_array().unwrap()).collect();
+    let row = rows.iter().find(|r| r["id"] == work.as_str()).unwrap();
+    assert_eq!(
+        (&row["waiting"], &row["standing"]),
+        (&serde_json::json!(true), &serde_json::json!("recheck")),
+        "it needs a pass, as waiting work does"
+    );
+    // In the review queue it comes with the work needing a pass, before accepted work, and waits for its
+    // earlier validator's pass too.
+    let queue: Vec<(String, String)> = s["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|q| (q["work"].as_str().unwrap().to_string(), q["standing"].as_str().unwrap().to_string()))
+        .collect();
+    assert_eq!(queue, [(work.clone(), "recheck".to_string()), (neg.clone(), "accepted".to_string())]);
+    let mine = json(dir, &["status", "--follow-changes", "--json", "--as", "val"]);
+    assert_eq!(mine["for_your_pass"][0]["work"], work.as_str(), "{mine}");
+    assert_eq!(mine["for_your_pass"].as_array().map(Vec::len), Some(1));
+    let plain = bracken(dir, &["status"]);
+    assert!(plain.lines().any(|l| l.contains(&work[..8]) && l.trim_start().starts_with("accepted")), "{plain}");
+
+    // A pass that has seen the change clears it.
+    bracken(dir, &["evidence", &work, "pass", "--method", "review again", "--as", "val"]);
+    assert_eq!(show(&["--follow-changes"])["status"], "accepted");
+    assert!(accepted(&["--follow-changes"]).contains(&work));
+}
+
 /// `status` is a review queue: what needs an independent pass first, oldest first, then blocked work,
 /// rejected work, and accepted work last, one short line each. A fail that names what it needs with
 /// `evidence --depends-on` shows its work blocked while any of that is unaccepted, then ready. Nothing

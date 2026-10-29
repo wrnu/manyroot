@@ -77,9 +77,12 @@ fn store(dir: PathBuf, bracken: PathBuf) -> BrackenStore {
 }
 
 fn store_as(dir: PathBuf, bracken: PathBuf, identity: &str, accept_rule: AcceptRule) -> BrackenStore {
+    store_for(dir, bracken, identity, accept_rule, Task::Phase1)
+}
+
+fn store_for(dir: PathBuf, bracken: PathBuf, identity: &str, accept_rule: AcceptRule, task: Task) -> BrackenStore {
     let git = PathBuf::from("/nonexistent/git");
-    let config =
-        StoreConfig { task: Task::Phase1, dir, bracken, git, identity: identity.into(), trace: false, accept_rule };
+    let config = StoreConfig { task, dir, bracken, git, identity: identity.into(), trace: false, accept_rule };
     BrackenStore { config, runs: 0, files: 0 }
 }
 
@@ -95,16 +98,20 @@ fn endless_writer(dir: &std::path::Path) -> PathBuf {
 
 /// A hub stating the task, and agents a and b joined to it, each in its own directory under `root`.
 fn ground_of(root: &std::path::Path, rule: AcceptRule) -> (BrackenStore, BrackenStore, BrackenStore) {
+    ground_for(root, rule, Task::Phase1)
+}
+
+fn ground_for(root: &std::path::Path, rule: AcceptRule, task: Task) -> (BrackenStore, BrackenStore, BrackenStore) {
     let at = |name: &str| {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).expect("a store dir");
         dir
     };
-    let mut hub = store_as(at("hub"), bracken_bin(), "setter", rule);
+    let mut hub = store_for(at("hub"), bracken_bin(), "setter", rule, task);
     hub.setup(None).expect("the hub");
     let bundle = hub.export().expect("the hub's bundle");
     let join = |name: &str| {
-        let mut s = store_as(at(name), bracken_bin(), name, rule);
+        let mut s = store_for(at(name), bracken_bin(), name, rule, task);
         s.setup(Some(&bundle)).expect("a copy");
         s
     };
@@ -627,6 +634,67 @@ fn the_status_view_agrees_with_accepted_and_differs_only_by_the_tasks_rules() {
     b.tool("evidence", &json!({"target": inc, "verdict": "pass", "method": "ran it"})).expect("a pass");
     assert!(status_of(&mut b, &inc).expect("listed").starts_with("accepted"));
     assert_eq!(accepted_of(&mut b, &inc), None, "not an implementation the task counts");
+}
+
+/// The setter's `depends_on` relations, from its claims to its claims.
+fn setters_depends_on(s: &mut BrackenStore) -> Vec<(String, String)> {
+    let state = s.snapshot().expect("state");
+    let log = s.json(&["log", "--json", "--current", "--kind=relation"]).expect("log");
+    let mut out: Vec<(String, String)> = log
+        .as_array()
+        .expect("a list")
+        .iter()
+        .filter(|r| r["body"]["kind"] == "depends_on" && r["author"].as_str() == Some(state.setter.as_str()))
+        .map(|r| {
+            (r["body"]["from"].as_str().unwrap_or("").to_string(), r["body"]["to"].as_str().unwrap_or("").to_string())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Decision `2b91a9541aba`: in Phase 2 the setter states each spec's dependencies (what it is defined in
+/// terms of and its contract partners) and renews them at each release; Phase 1's setter states none.
+/// An implementation passed before a wave changed a spec its own spec depends on needs a recheck: out of
+/// the accepted tool's count and the integrated library, shown as such in status, until a new pass.
+#[test]
+fn acceptance_follows_the_waves_through_the_setters_dependencies() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (mut hub1, _, _) = ground_of(&dir.path().join("p1"), AcceptRule::OnePass);
+    assert!(setters_depends_on(&mut hub1).is_empty(), "Phase 1's task reads as its runs did");
+
+    let t = Task::Phase2;
+    let (mut hub, mut a, mut b) = ground_for(&dir.path().join("p2"), AcceptRule::OnePass, t);
+    let edges: usize = t.specs().iter().map(|s| spec_dependencies(t, s.name).len()).sum();
+    assert_eq!(setters_depends_on(&mut hub).len(), edges);
+    assert_eq!(edges, 139, "99 calls and 40 contract partners");
+    let state = hub.snapshot().expect("state");
+    let (toward, sign) = (state.spec_claim("toward").expect("spec"), state.spec_claim("sign").expect("spec"));
+    assert!(setters_depends_on(&mut hub).contains(&(toward.clone(), sign.clone())), "toward is defined by sign");
+
+    let program = crate::candidates::correct_programs(t, Version::ORIGINAL)["toward"];
+    let id = made(&mut a, "artifact", json!({"function": "toward", "content": format!("def toward 2 : {program}")}));
+    a.tool("relate", &json!({"from": id, "kind": "implements", "to": toward})).expect("relate");
+    carry(&mut a, &mut b);
+    b.tool("evidence", &json!({"target": id, "verdict": "pass", "method": "ran it"})).expect("a pass");
+    assert_eq!(accepted_of(&mut b, &id).as_deref(), Some("accepted"));
+
+    // Wave 1 changes sign: the setter's new sign spec, and toward's spec now depending on it too.
+    assert!(t.wave_changes(1).any(|c| c.target == "sign"));
+    hub.release_changes(1).expect("wave 1");
+    let new_sign = hub.snapshot().expect("state").spec_claim("sign").expect("spec");
+    assert_ne!(new_sign, sign);
+    assert!(setters_depends_on(&mut hub).contains(&(toward.clone(), new_sign)), "renewed at the release");
+    carry(&mut hub, &mut b);
+    assert_eq!(accepted_of(&mut b, &id).as_deref(), Some("recheck"));
+    assert!(!b.state().expect("state").integrated().contains_key("toward"), "out of the integrated library");
+    assert!(status_of(&mut b, &id).expect("listed").starts_with("recheck"));
+    let shown = b.tool("show", &json!({"id": id})).expect("show").to_string();
+    assert!(shown.contains("needs_recheck"), "{shown}");
+
+    // A pass that has seen the change clears it.
+    b.tool("evidence", &json!({"target": id, "verdict": "pass", "method": "ran it under wave 1"})).expect("a pass");
+    assert_eq!(accepted_of(&mut b, &id).as_deref(), Some("accepted"));
 }
 
 /// Owner decision f3405c284180, change B: in Phase 2, check can record its result as the caller's evidence

@@ -78,7 +78,7 @@ impl Mode for BrackenMode {
         "bracken"
     }
 
-    fn tools(&self, _task: Task) -> Vec<ToolSpec> {
+    fn tools(&self, task: Task) -> Vec<ToolSpec> {
         let phase1 = self.rule == AcceptRule::MostPasses;
         let id = if phase1 {
             json!({"type": "string", "description": "A contribution id: 12 to 64 hex digits"})
@@ -111,6 +111,13 @@ impl Mode for BrackenMode {
                     "accepted",
                     // As Phase 1's runs were given it (their plans' tool hash; test `phase_one_gives_agents_what_its_runs_were_given`).
                     "What counts in your replica, per function: the implementation its author related to the current spec claim that has a pass from someone else and no one else's latest verdict a fail; the one with most passes wins",
+                    json!({}),
+                    &[],
+                )
+            } else if follows_changes(task) {
+                tool(
+                    "accepted",
+                    "What counts in your replica, per function: the implementation its author related to the current spec claim that has a pass from someone else and no fail from anyone else that they haven't retracted (the earliest, if several) is accepted. One whose spec, or a spec it depends on, changed after its passes needs a recheck: a new pass from someone who has seen the change. The function's other implementations are waiting",
                     json!({}),
                     &[],
                 )
@@ -220,6 +227,24 @@ pub struct Plan {
     pub json: bool,
 }
 
+/// Whether acceptance follows changes in this task (decision `2b91a9541aba`): Phase 2's, whose waves change
+/// specs that others are defined in terms of. Phase 1 reads as its runs did.
+pub fn follows_changes(task: Task) -> bool {
+    !task.waves().is_empty()
+}
+
+/// The specs `function`'s spec depends on, as the setter states them: what it is defined in terms of, and
+/// its open contract's other members.
+fn spec_dependencies(task: Task, function: &str) -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = task.defined_by(function).to_vec();
+    if let Some(c) = task.contract_of(function) {
+        out.extend(c.members.iter().copied().filter(|m| *m != function));
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
 fn opt(name: &str, value: impl std::fmt::Display) -> String {
     format!("--{name}={value}")
 }
@@ -264,13 +289,26 @@ pub fn plan(name: &str, args: &Args, identity: &str, task: Task) -> Result<Plan,
             }
             read(argv)
         }
-        "show" => read(vec![s("show"), s("--json"), s("--"), s(args.id("id")?)]),
+        "show" => {
+            let mut argv = vec![s("show"), s("--json")];
+            if follows_changes(task) {
+                argv.push(s("--follow-changes"));
+            }
+            argv.extend([s("--"), s(args.id("id")?)]);
+            read(argv)
+        }
         "heads" => read(vec![s("heads"), s("--json")]),
         "conflicts" => read(vec![s("conflicts"), s("--json")]),
         // Bracken's own view, as people read it, from where this agent stands: its own work, contradictions
-        // of its claims and work waiting for its pass first, one short line each, at most bracken's default
-        // number of lines.
-        "status" => Plan { json: false, ..read(vec![s("status"), opt("as", identity)]) },
+        // of its claims and work waiting for its pass (or a recheck, in Phase 2) first, one short line each, at
+        // most bracken's default number of lines.
+        "status" => {
+            let mut argv = vec![s("status"), opt("as", identity)];
+            if follows_changes(task) {
+                argv.push(s("--follow-changes"));
+            }
+            Plan { json: false, ..read(argv) }
+        }
         "cat" => Plan { json: false, ..read(vec![s("cat"), s("--"), s(args.id("id")?)]) },
         "claim" => {
             let mut head = vec![s("claim")];
@@ -373,9 +411,30 @@ impl BrackenStore {
         Ok(path)
     }
 
-    fn state(&mut self) -> Result<Snapshot, String> {
+    /// The replica as `log --current` has it, without Bracken's recheck assessment: for what doesn't pick.
+    fn snapshot(&mut self) -> Result<Snapshot, String> {
         let current = self.json(&["log", "--json", "--current"])?;
         Snapshot::new(&current, &self.saved("setter.txt")?, self.config.accept_rule, self.config.task)
+    }
+
+    /// The replica, with what Bracken assesses as needing a recheck when acceptance follows changes: for
+    /// the pick (`accepted`, `check`'s library, the integrated library).
+    fn state(&mut self) -> Result<Snapshot, String> {
+        let snapshot = self.snapshot()?;
+        if !follows_changes(self.config.task) || self.config.accept_rule != AcceptRule::OnePass {
+            return Ok(snapshot);
+        }
+        // Bracken's own assessment, under its default policy with acceptance following changes.
+        let status = self.json(&["status", "--json", "--follow-changes"])?;
+        let recheck = status["claims"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|c| c["implemented_by"].as_array().into_iter().flatten())
+            .filter(|i| i["assessment"]["status"] == "needs_recheck")
+            .filter_map(|i| i["id"].as_str().map(str::to_string))
+            .collect();
+        Ok(snapshot.with_recheck(recheck))
     }
 
     /// A key this store saved at setup.
@@ -410,6 +469,7 @@ impl BrackenStore {
             "--".into(),
             self.config.task.task_text(Version::ORIGINAL),
         ])?;
+        let mut specs: BTreeMap<&'static str, String> = BTreeMap::new();
         for s in self.config.task.specs() {
             let statement = format!("Implement {}.", s.description);
             let spec = self.write(vec![
@@ -425,12 +485,41 @@ impl BrackenStore {
                 opt("as", &me),
                 "--note=".into(),
                 "--".into(),
-                spec,
+                spec.clone(),
                 "refines".into(),
                 task.clone(),
             ])?;
+            specs.insert(s.name, spec);
+        }
+        if follows_changes(self.config.task) {
+            let edges: Vec<(String, String)> = self
+                .config
+                .task
+                .specs()
+                .iter()
+                .flat_map(|s| spec_dependencies(self.config.task, s.name).into_iter().map(move |d| (s.name, d)))
+                .map(|(from, to)| (specs[from].clone(), specs[to].clone()))
+                .collect();
+            self.depends_on(&edges)?;
         }
         Ok(json!({ "task": task }))
+    }
+
+    /// The setter relates each `(from, to)` with `depends_on`, so acceptance follows a change to `to`.
+    fn depends_on(&mut self, edges: &[(String, String)]) -> Result<(), String> {
+        let me = self.config.identity.clone();
+        for (from, to) in edges {
+            self.write(vec![
+                "relate".into(),
+                opt("as", &me),
+                "--note=".into(),
+                "--".into(),
+                from.clone(),
+                "depends_on".into(),
+                to.clone(),
+            ])?;
+        }
+        Ok(())
     }
 }
 
@@ -589,7 +678,7 @@ impl Store for BrackenStore {
     }
 
     fn release_changes(&mut self, wave: usize) -> Result<Value, String> {
-        let state = self.state()?;
+        let state = self.snapshot()?;
         let me = self.config.identity.clone();
         let task = state.tagged("task").first().map(|e| e.id.clone()).ok_or("no task claim")?;
         let mut released = Vec::new();
@@ -623,6 +712,25 @@ impl Store for BrackenStore {
             ])?;
             released.push(change_tag(c.change));
         }
+        if follows_changes(self.config.task) {
+            // The new specs depend on what theirs did, and what depended on the old ones depends on the new.
+            let state = self.snapshot()?;
+            let t = self.config.task;
+            let claim = |f: &str| state.spec_claim(f).ok_or_else(|| format!("no spec claim for {f}"));
+            let changed: Vec<&'static str> = t.wave_changes(wave).map(|c| c.target).collect();
+            let mut edges: Vec<(String, String)> = Vec::new();
+            for f in &changed {
+                for d in spec_dependencies(t, f) {
+                    edges.push((claim(f)?, claim(d)?));
+                }
+                for s in t.specs().iter().filter(|s| spec_dependencies(t, s.name).contains(f)) {
+                    edges.push((claim(s.name)?, claim(f)?));
+                }
+            }
+            edges.sort();
+            edges.dedup();
+            self.depends_on(&edges)?;
+        }
         Ok(json!({ "released": released }))
     }
 
@@ -649,7 +757,7 @@ impl Store for BrackenStore {
                     || (tool == "check" && result["evidence"]["verdict"] == "fail") =>
             {
                 let args = &self.resolve_ids(args)?;
-                let (state, me) = (self.state()?, self.saved("key.txt")?);
+                let (state, me) = (self.snapshot()?, self.saved("key.txt")?);
                 let target = args[if tool == "check" { "id" } else { "target" }].as_str().unwrap_or_default();
                 let blocks = match state.find(target) {
                     Some(e) if e.kind == "artifact" && e.author != me => {
@@ -687,7 +795,7 @@ impl BrackenStore {
     /// pairs in causal order: its working copy of the contracts.
     pub fn members(&mut self) -> Result<Value, String> {
         let task = self.config.task;
-        let (state, key) = (self.state()?, self.saved("key.txt")?);
+        let (state, key) = (self.snapshot()?, self.saved("key.txt")?);
         let own: Vec<_> = state
             .own_implementations(&key)
             .into_iter()
@@ -1004,6 +1112,9 @@ pub struct Snapshot {
     /// For each target id, the validators with a current (unretracted) pass, and with one with a fail.
     passed: BTreeMap<String, std::collections::BTreeSet<String>>,
     failed: BTreeMap<String, std::collections::BTreeSet<String>>,
+    /// Implementations Bracken assesses as needing a recheck (decision `2b91a9541aba`): their passes no
+    /// longer count until a pass that has seen what changed.
+    recheck: std::collections::BTreeSet<String>,
     rule: AcceptRule,
     task: Task,
 }
@@ -1040,7 +1151,14 @@ impl Snapshot {
                 if verdict == "pass" { &mut passed } else { &mut failed };
             all.entry(target.to_string()).or_default().insert(e.author.clone());
         }
-        Ok(Snapshot { current, setter: setter.to_string(), verdicts, passed, failed, rule, task })
+        let recheck = std::collections::BTreeSet::new();
+        Ok(Snapshot { current, setter: setter.to_string(), verdicts, passed, failed, recheck, rule, task })
+    }
+
+    /// This snapshot, with `ids` as needing a recheck.
+    pub fn with_recheck(mut self, ids: std::collections::BTreeSet<String>) -> Snapshot {
+        self.recheck = ids;
+        self
     }
 
     /// The setter's current claims tagged `tag`.
@@ -1100,6 +1218,9 @@ impl Snapshot {
     /// validator recorded later (decision `d036bab456a9`). Under Phase 1's rule, each validator's
     /// latest current verdict (decision `5e8df6996a2e`).
     fn passes(&self, entry: &Entry) -> Option<usize> {
+        if self.recheck.contains(&entry.id) {
+            return None;
+        }
         if self.rule == AcceptRule::OnePass {
             let others = |m: &BTreeMap<String, std::collections::BTreeSet<String>>| {
                 m.get(&entry.id).map_or(0, |v| v.iter().filter(|a| **a != entry.author).count())
@@ -1145,8 +1266,13 @@ impl Snapshot {
         let rows: Vec<Value> = implementations
             .into_iter()
             .map(|i| {
-                let status =
-                    if picked.get(i.spec).is_some_and(|e| e.id == i.entry.id) { "accepted" } else { "waiting" };
+                let status = if picked.get(i.spec).is_some_and(|e| e.id == i.entry.id) {
+                    "accepted"
+                } else if self.recheck.contains(&i.entry.id) {
+                    "recheck"
+                } else {
+                    "waiting"
+                };
                 json!({"function": i.spec, "id": i.entry.id, "author": i.entry.author, "status": status})
             })
             .collect();
