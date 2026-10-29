@@ -212,6 +212,29 @@ const FIXED: [&str; 17] = [
     "advice.detachedHead=false",
 ];
 
+/// The first git whose fetch from a bundle checks objects as `fetch.fsckObjects` asks: older ones take a
+/// malformed object a push brings in (note `107842fc89e0`: Ubuntu's 2.43 does).
+pub const MIN_GIT: (u32, u32) = (2, 46);
+
+/// Refuses a git older than [`MIN_GIT`], from what `git version` printed, and one it can't read.
+pub fn fsck_on_bundle_fetch(version: &str) -> Result<(), String> {
+    let said = version.trim();
+    let number = said.strip_prefix("git version ").and_then(|v| v.split_whitespace().next());
+    let mut parts = number.into_iter().flat_map(|n| n.split('.')).map(|p| p.parse::<u32>().ok());
+    let (major, minor) = match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor),
+        _ => return Err(format!("can't read the git version from {:?}", crate::args::short(said))),
+    };
+    if (major, minor) < MIN_GIT {
+        return Err(format!(
+            "{said} is too old for the Git mode's hub: before {}.{}, a fetch from a bundle doesn't check its \
+             objects, so the hub would take malformed ones. Run with git {}.{} or later.",
+            MIN_GIT.0, MIN_GIT.1, MIN_GIT.0, MIN_GIT.1
+        ));
+    }
+    Ok(())
+}
+
 /// What a git command printed.
 pub struct Output {
     pub ok: bool,
@@ -651,6 +674,7 @@ impl GitStore {
     fn setup_hub(&mut self) -> Result<Value, String> {
         std::fs::create_dir_all(self.bare()).map_err(|e| format!("creating the hub: {e}"))?;
         self.git(&["init", "--quiet", "--bare"], None)?;
+        fsck_on_bundle_fetch(&self.git(&["version"], None)?)?;
         let tasks = self.config.task.tasks_md(Version::ORIGINAL);
         let commit = self.commit_files(None, &[(TASKS, tasks.as_str())], "The task")?;
         self.git(&["update-ref", "refs/heads/main", &commit], None)?;

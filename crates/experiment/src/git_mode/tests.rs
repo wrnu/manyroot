@@ -282,6 +282,23 @@ fn objects_that_fail_fsck_are_refused() {
     assert!(f.hub.rev("refs/agents/agent-a/bad").expect("rev").is_none());
 }
 
+/// Note `107842fc89e0`: the hub refuses a git whose bundle fetch doesn't fsck, and says why.
+#[test]
+fn the_hub_refuses_a_git_too_old_to_check_a_bundle_fetch() {
+    for ok in ["git version 2.46.0", "git version 2.54.0 (Apple Git-157)", "git version 2.56.1\n", "git version 3.0"] {
+        assert_eq!(fsck_on_bundle_fetch(ok), Ok(()), "{ok}");
+    }
+    for old in ["git version 2.43.0", "git version 2.45.2", "git version 1.99.9"] {
+        let e = fsck_on_bundle_fetch(old).expect_err(old);
+        assert!(e.contains(old) && e.contains("2.46 or later"), "{e}");
+    }
+    for unread in ["", "git version", "git version two", "hg version 2.50"] {
+        assert!(fsck_on_bundle_fetch(unread).expect_err(unread).contains("can't read the git version"));
+    }
+    // This machine's git passes, so the hub sets up.
+    let _ = Fixture::new(&["agent-a"]);
+}
+
 // The argument rules.
 
 /// Values an agent might try to smuggle into a command line (finding `455e12da3ecb` among them).

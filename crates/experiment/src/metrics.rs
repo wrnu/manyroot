@@ -222,13 +222,14 @@ pub fn incomplete(records: &Records, expect: &[String], task: Task) -> Option<St
     if !task.waves().is_empty() {
         let checked: BTreeSet<u64> =
             events.iter().filter(|e| e.event == "checkpoint").map(|e| u(&e.data["turn"])).collect();
-        let mut started: BTreeSet<u64> =
+        let started: BTreeSet<u64> =
             events.iter().filter(|e| e.event == "turn_start").map(|e| u(&e.data["turn"])).collect();
-        // The turn a stop cut short ends without one.
-        if expected.is_some() {
-            started.pop_last();
-        }
-        if let Some(turn) = started.difference(&checked).next() {
+        let agents = events.iter().find(|e| e.event == "setup").map_or(0, |e| u(&e.data["agents"]));
+        let ended = |turn: u64| events.iter().filter(|e| e.event == "turn_end" && u(&e.data["turn"]) == turn).count();
+        // A checkpoint follows a turn's last end, so a turn that a stop cut short, which some agent never
+        // ended, has none: any such turn, under a stop the plan expects (reviews `45e1d3a1411d`, `243145a557ea`).
+        let cut_short = |turn: u64| expected.is_some() && (ended(turn) as u64) < agents;
+        if let Some(turn) = started.difference(&checked).find(|t| !cut_short(**t)) {
             return Some(format!("turn {turn} has no checkpoint"));
         }
     }

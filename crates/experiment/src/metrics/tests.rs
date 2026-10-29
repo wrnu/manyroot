@@ -463,16 +463,60 @@ fn a_phase2_turn_without_a_readable_checkpoint_is_refused() {
     log.ev(5, Some("a"), "turn_end", json!({"turn": 2})).ev(6, None, "integrated", json!({}));
     log.turn_usage("a", 1, 10, 1).turn_usage("a", 2, 10, 1);
     assert_eq!(incomplete(&log.records(), &[], p2).as_deref(), Some("turn 2 has no checkpoint"));
-    // The turn an expected stop cut short has none.
+    // An expected stop excuses only a turn it cut short: this one ended, so its checkpoint is missing.
     let cap = crate::claude::RUN_TOKEN_CAP;
     log.events.pop();
     log.ev(6, None, "run_stopped", json!({"cap": cap}));
-    assert_eq!(incomplete(&log.records(), &[cap.to_string()], p2), None);
+    assert_eq!(incomplete(&log.records(), &[cap.to_string()], p2).as_deref(), Some("turn 2 has no checkpoint"));
     // A checkpoint that isn't a module list is an error, as a bad snapshot is.
     let mut bad = Log::new("git");
     bad.ev(1, None, "checkpoint", json!({"turn": 1, "modules": "not modules"}));
     let error = measure(&bad.records(), &HiddenCases::new(p2, 1)).expect_err("refused");
     assert!(error.contains("a bad checkpoint"), "{error}");
+}
+
+/// Reviews `45e1d3a1411d` and `243145a557ea`: an expected stop can catch the agents spread over several
+/// turns. Each turn it cut short, one that some agent never ended, has no checkpoint and needs none.
+#[test]
+fn an_expected_stop_excuses_every_turn_it_cut_short() {
+    let cap = crate::claude::RUN_TOKEN_CAP;
+    let expected = [cap.to_string()];
+    // Three agents: all end turn 1; turn 2 is ended by a and b only; turn 3, by a only. Then the cap stops c
+    // in turn 2 and b in turn 3.
+    let spread = |checkpoint_2: bool, c_ends_2: bool| {
+        let mut log = Log::new("git");
+        log.events[0] =
+            json!({"seq": 0, "ms": 0, "agent": null, "event": "setup", "data": {"mode": "git", "agents": 3}})
+                .to_string();
+        let mut ms = 1;
+        let mut step = |log: &mut Log, agent: Option<&str>, event: &str, data: Value| {
+            log.ev(ms, agent, event, data);
+            ms += 1;
+        };
+        for (turn, agents, ends) in [(1, "abc", "abc"), (2, "abc", if c_ends_2 { "abc" } else { "ab" }), (3, "ab", "a")]
+        {
+            for a in agents.chars().map(String::from) {
+                step(&mut log, Some(&a), "turn_start", json!({"turn": turn}));
+                log.turn_usage(&a, turn, 10, 1);
+            }
+            for a in ends.chars().map(String::from) {
+                step(&mut log, Some(&a), "turn_end", json!({"turn": turn}));
+            }
+            if turn == 1 || (turn == 2 && checkpoint_2) {
+                step(&mut log, None, "checkpoint", json!({"turn": turn, "modules": []}));
+            }
+        }
+        step(&mut log, None, "run_stopped", json!({"cap": cap}));
+        log
+    };
+    let p2 = Task::Phase2;
+    assert_eq!(incomplete(&spread(false, false).records(), &expected, p2), None, "turns 2 and 3 were cut short");
+    assert_eq!(incomplete(&spread(true, true).records(), &expected, p2), None);
+    // Turn 2 ended for everyone, so its checkpoint should be there.
+    let missing = spread(false, true);
+    assert_eq!(incomplete(&missing.records(), &expected, p2).as_deref(), Some("turn 2 has no checkpoint"));
+    // A stop the plan doesn't expect excuses nothing.
+    assert!(incomplete(&spread(false, false).records(), &[], p2).expect("refused").contains("not by a stop"));
 }
 
 // Open contracts: a member is judged with the delivering agent's working copy (decision `979e5085a1e7`).

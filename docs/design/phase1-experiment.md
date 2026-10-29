@@ -505,7 +505,9 @@ its fixed namespaces; every other ref, or a gitfile, a directory or any
 other payload, is refused before git reads it as a repository, so the hub
 never starts `git-upload-pack` (task `d0f9eefc612c`). With
 `transfer.fsckObjects` and `fetch.fsckObjects` on, a malformed object is
-refused too. A bundle is fetched, with no ref written, into a quarantine
+refused too. Git before 2.46 doesn't apply them to a fetch from a bundle
+(Ubuntu's 2.43 doesn't, note `107842fc89e0`), so the hub refuses such a git
+at setup. A bundle is fetched, with no ref written, into a quarantine
 object directory (git's `GIT_OBJECT_DIRECTORY`, with the store's own
 objects as an alternate). A push may bring at most 500 commits the hub
 doesn't have, counted before any tree is read. Its objects join the store

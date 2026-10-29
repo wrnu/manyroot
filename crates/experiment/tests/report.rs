@@ -33,9 +33,15 @@ fn mock_run_of(dir: &Path, mode: &'static str, task: Task, agents: usize, turns:
 
 /// A run of `backend` (its task, its moves), which records usage under the run's directory.
 fn mock_run_with(dir: &Path, mode: &'static str, agents: usize, turns: u32, backend: MockBackend) -> PathBuf {
-    let task = backend.task;
+    let cfg = config(dir, mode, backend.task, agents, turns);
+    run(&cfg, &MockBackend { usage: Some(cfg.root.join("usage.jsonl")), ..backend }).expect("the run");
+    cfg.root
+}
+
+/// A mock run's configuration, into `dir`'s directory for the mode and task.
+fn config(dir: &Path, mode: &'static str, task: Task, agents: usize, turns: u32) -> RunConfig {
     let root = dir.join(format!("{mode}-{}", task.name()));
-    let cfg = RunConfig {
+    RunConfig {
         root: root.clone(),
         mode,
         agents,
@@ -48,9 +54,7 @@ fn mock_run_with(dir: &Path, mode: &'static str, agents: usize, turns: u32, back
         turn_limit: TURN_LIMIT,
         plan: PlanInputs { task, grader_seed: 7, ..PlanInputs::default() },
         sandbox: false,
-    };
-    run(&cfg, &MockBackend { usage: Some(root.join("usage.jsonl")), ..backend }).expect("the run");
-    root
+    }
 }
 
 /// The task selector end to end: a Phase 2 run gives its agents Phase 2's task in every mode, its plan says
@@ -109,6 +113,77 @@ fn a_phase_two_mock_run_of_each_mode_is_graded_as_phase_two_and_releases_both_wa
         assert_eq!(c.recovery.len(), 2);
         assert!(table(std::slice::from_ref(&m)).contains("Ranking: checkpoints"));
     }
+}
+
+/// Note `5b5757358523`: a release on another agent's thread can't fall between a checkpoint's read of the
+/// hub and its entry. Agent 1 ends turn 1 last, so it takes checkpoint 1, and pauses between the read and the
+/// entry. Meanwhile agent 0 plays turn 2, whose end makes wave 1 due. The release waits for the checkpoint's
+/// entry, so the checkpoint is graded under the specs it was read under: no wave.
+#[test]
+fn a_release_waits_for_a_checkpoint_between_its_read_and_its_entry() {
+    use bracken_experiment::driver::Backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct Interleave {
+        mock: MockBackend,
+        second_turn: AtomicBool,
+        paused: AtomicBool,
+    }
+    fn wait_for(flag: &AtomicBool) {
+        let start = Instant::now();
+        while !flag.load(Ordering::SeqCst) {
+            assert!(start.elapsed() < Duration::from_secs(120), "the interleaving never happened");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    impl Backend for Interleave {
+        fn turn(&self, agent: usize, name: &str, turn: u32, socket: &Path) -> Result<(), String> {
+            match (agent, turn) {
+                // Agent 1 ends turn 1 only once agent 0 has started turn 2.
+                (1, 1) => wait_for(&self.second_turn),
+                // Agent 0 plays turn 2, and asks for the release, while checkpoint 1 is paused.
+                (0, 2) => {
+                    self.second_turn.store(true, Ordering::SeqCst);
+                    wait_for(&self.paused);
+                }
+                _ => {}
+            }
+            self.mock.turn(agent, name, turn, socket)
+        }
+
+        fn checkpoint_read(&self, turn: u32) {
+            if turn == 1 {
+                self.paused.store(true, Ordering::SeqCst);
+                // Time enough for agent 0's turn 2 and the release, if the hub let them through.
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = config(dir.path(), "crdt", Task::Phase2, 2, 4);
+    let mock = MockBackend {
+        task: Task::Phase2,
+        moves: bracken_experiment::mock::Moves::PLAIN,
+        usage: Some(cfg.root.join("usage.jsonl")),
+        ..MockBackend::default()
+    };
+    run(&cfg, &Interleave { mock, second_turn: AtomicBool::new(false), paused: AtomicBool::new(false) })
+        .expect("the run");
+    let events: Vec<Value> = std::fs::read_to_string(cfg.root.join("events.jsonl"))
+        .expect("events")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json"))
+        .collect();
+    let seq = |event: &str, key: &str, value: u64| {
+        events.iter().find(|e| e["event"] == event && e["data"][key] == value).and_then(|e| e["seq"].as_u64())
+    };
+    let (checkpoint, release) = (seq("checkpoint", "turn", 1), seq("changes_released", "wave", 1));
+    assert!(checkpoint.is_some() && release.is_some());
+    assert!(checkpoint < release, "checkpoint 1 at {checkpoint:?}, wave 1 at {release:?}");
+    let c = report(&cfg.root, None).expect("the report").measures.checkpoints.expect("checkpoints");
+    assert_eq!(c.turns[0].waves, 0, "graded under the specs it was read under");
 }
 
 /// Task `07cb4ada01ea`: the scripted moves' checkpoint measures, checked by hand per mode. Two agents, four
