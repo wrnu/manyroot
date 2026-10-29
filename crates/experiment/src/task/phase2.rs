@@ -5,8 +5,15 @@
 //! several, and twelve functions call `clamp3`. Two open contracts, `rank` and
 //! `none`, leave a convention to the library: their members are right when
 //! they agree with each other, whatever the library chose.
+//!
+//! Twelve change requests come in two waves ([`WAVES`]). `clamp3` changes its
+//! inputs' order in each, so its twelve callers must follow twice. Two pairs
+//! interact through an open contract: `cut` turning signed and none moving
+//! outside -4000 to 4000, and `rank` taking inputs near the 64-bit limits
+//! while `ismore` asks whether `a` is more than 2 above `b`. Each pair's
+//! obvious fixes conflict unless the library settles a new convention.
 
-use super::{Caller, Contract, Probe, Property, Spec, Version, spec};
+use super::{CONTRACT_RANGE, Caller, Change, ChangeRequest, Contract, Probe, Property, Spec, Version, Wave, spec};
 
 /// The language, as the task states it to agents.
 pub(super) const LANGUAGE: &str = "A library is eight modules of definitions, one per line: \
@@ -147,6 +154,135 @@ pub(super) const SPECS: &[Spec] = &[
     spec("verdict", "score", 4, 3, "verdict(x, p, r): and(flag(x, p, r), within(x, p, r))"),
 ];
 
+pub(super) const CHANGES: &[ChangeRequest] = &[
+    // Wave 1.
+    ChangeRequest {
+        change: Change::ClampOrder,
+        target: "clamp3",
+        description: "clamp3(lo, hi, x): min2(max2(x, lo), hi)",
+        text: "clamp3 now takes its inputs as (lo, hi, x) instead of (x, lo, hi). Every function that calls it must \
+               pass them in the new order. Other descriptions still write clamp3(x, lo, hi) for the value.",
+    },
+    ChangeRequest {
+        change: Change::SignOfZero,
+        target: "sign",
+        description: "sign(a): -1 if a < 0, else 1",
+        text: "sign(0) is now 1: sign returns -1 for negative inputs and 1 for all others. Functions defined in \
+               terms of sign follow it.",
+    },
+    ChangeRequest {
+        change: Change::BetweenExclusive,
+        target: "between",
+        description: "between(x, lo, hi): 1 if lo <= x < hi, else 0",
+        text: "between now excludes hi: it is 1 if lo <= x < hi. Functions defined in terms of between follow it.",
+    },
+    ChangeRequest {
+        change: Change::CutSigned,
+        target: "cut",
+        description: "cut(a, b): a - b if a - b is from -1000 to 1000, else none, for a and b from -1000 to 1000. \
+                      Open contract none: none is one value of the library's choice outside -1000 to 4000, the \
+                      same everywhere, that isnone, either and plus recognise",
+        text: "cut now gives negative differences too: a - b whenever it is from -1000 to 1000, and none only \
+               beyond that. So none must lie outside -1000 to 4000, and every function of open contract none \
+               must agree on it.",
+    },
+    ChangeRequest {
+        change: Change::NoneWide,
+        target: "isnone",
+        description: "isnone(x): 1 if x is none, else 0 (open contract none). none must lie outside -4000 to 4000",
+        text: "none must now lie outside -4000 to 4000, not only outside 0 to 4000. Every function of open \
+               contract none must agree on the new value.",
+    },
+    ChangeRequest {
+        change: Change::WeighSubtracts,
+        target: "weigh",
+        description: "weigh(a, b, c): gap(a, b, c) - count3(a, b, c)",
+        text: "weigh now subtracts count3 instead of adding it. Functions defined in terms of weigh follow it.",
+    },
+    // Wave 2.
+    ChangeRequest {
+        change: Change::ClampHiFirst,
+        target: "clamp3",
+        description: "clamp3(hi, lo, x): min2(max2(x, lo), hi)",
+        text: "clamp3 now takes its inputs as (hi, lo, x). Every function that calls it must pass them in the new \
+               order. Other descriptions still write clamp3(x, lo, hi) for the value.",
+    },
+    ChangeRequest {
+        change: Change::RankWide,
+        target: "rank",
+        description: "rank(a, b): a value that says how a compares with b, for a and b from -9000000000000000000 to \
+                      9000000000000000000. Open contract rank: the library chooses how the value says it, and \
+                      isless, issame, ismore and flip read it that way",
+        text: "rank now takes any a and b from -9000000000000000000 to 9000000000000000000, not only -1000 to \
+               1000. Every function of open contract rank must still read its value right.",
+    },
+    ChangeRequest {
+        change: Change::IsMoreFar,
+        target: "ismore",
+        description: "ismore(t): for t = rank(a, b), 1 if a > b + 2, else 0 (open contract rank)",
+        text: "ismore now says whether a is more than 2 above b, not just above it. rank's value must say enough \
+               for that, and every function of open contract rank must agree on it.",
+    },
+    ChangeRequest {
+        change: Change::NearerTies,
+        target: "nearer",
+        description: "nearer(x, p, q): p if dist(x, p) < dist(x, q), else q",
+        text: "nearer now breaks ties toward q: it returns p only if p is strictly nearer to x. Functions defined \
+               in terms of nearer follow it.",
+    },
+    ChangeRequest {
+        change: Change::AbsSaturates,
+        target: "abs",
+        description: "abs(a): the absolute value of a, except that abs of the most negative integer is the most \
+                      positive one",
+        text: "abs no longer wraps: abs(-9223372036854775808) is now 9223372036854775807. Functions defined in \
+               terms of abs follow it.",
+    },
+    ChangeRequest {
+        change: Change::MixSubtracts,
+        target: "mix",
+        description: "mix(a, b): tilt(a, b) - clip(a, b)",
+        text: "mix now subtracts clip instead of adding it.",
+    },
+];
+
+/// At 30% and 60% of the turns: with 8 turns, after turns 2 and 5.
+pub(super) const WAVES: &[Wave] = &[
+    Wave {
+        share: 0.3,
+        changes: &[
+            Change::ClampOrder,
+            Change::SignOfZero,
+            Change::BetweenExclusive,
+            Change::CutSigned,
+            Change::NoneWide,
+            Change::WeighSubtracts,
+        ],
+    },
+    Wave {
+        share: 0.6,
+        changes: &[
+            Change::ClampHiFirst,
+            Change::RankWide,
+            Change::IsMoreFar,
+            Change::NearerTies,
+            Change::AbsSaturates,
+            Change::MixSubtracts,
+        ],
+    },
+];
+
+/// clamp3's inputs for the value min2(max2(x, lo), hi), in the order `version` gives them.
+pub(super) fn clamp_args(version: Version, x: i64, lo: i64, hi: i64) -> [i64; 3] {
+    if version.has(Change::ClampHiFirst) {
+        [hi, lo, x]
+    } else if version.has(Change::ClampOrder) {
+        [lo, hi, x]
+    } else {
+        [x, lo, hi]
+    }
+}
+
 /// The specs each spec's description is written in terms of.
 pub(super) fn defined_by(name: &str) -> &'static [&'static str] {
     match name {
@@ -203,13 +339,24 @@ pub(super) fn defined_by(name: &str) -> &'static [&'static str] {
 /// The reference implementation of `name` under `version`, if it is a spec
 /// with that many inputs and not an open contract's member; `r` evaluates a
 /// callee's reference.
-pub(super) fn reference(name: &str, args: &[i64], _version: Version, r: &dyn Fn(&str, &[i64]) -> i64) -> Option<i64> {
+pub(super) fn reference(name: &str, args: &[i64], version: Version, r: &dyn Fn(&str, &[i64]) -> i64) -> Option<i64> {
     let bit = |b: bool| i64::from(b);
     let a = || args[0];
     let b = || args[1];
     let c = || args[2];
+    let has = |change| version.has(change);
+    // The value clamp3(x, lo, hi) of the other descriptions, whatever order clamp3 takes its inputs in.
+    let clamp = |x, lo, hi| r("clamp3", &clamp_args(version, x, lo, hi));
     Some(match (name, args.len()) {
+        ("abs", 1) if has(Change::AbsSaturates) => a().saturating_abs(),
         ("abs", 1) => a().wrapping_abs(),
+        ("sign", 1) if has(Change::SignOfZero) => {
+            if a() < 0 {
+                -1
+            } else {
+                1
+            }
+        }
         ("sign", 1) => a().signum(),
         ("max2", 2) => a().max(b()),
         ("min2", 2) => a().min(b()),
@@ -232,7 +379,17 @@ pub(super) fn reference(name: &str, args: &[i64], _version: Version, r: &dyn Fn(
         ("or", 2) => bit(a() != 0 || b() != 0),
         ("xor", 2) => bit((a() != 0) != (b() != 0)),
         ("truth", 1) => bit(a() != 0),
-        ("clamp3", 3) => r("min2", &[r("max2", &[a(), b()]), c()]),
+        ("clamp3", 3) => {
+            // The inverse of clamp_args.
+            let (x, lo, hi) = if has(Change::ClampHiFirst) {
+                (c(), b(), a())
+            } else if has(Change::ClampOrder) {
+                (c(), a(), b())
+            } else {
+                (a(), b(), c())
+            };
+            r("min2", &[r("max2", &[x, lo]), hi])
+        }
         ("median3", 3) => {
             let mut v = [a(), b(), c()];
             v.sort_unstable();
@@ -240,6 +397,7 @@ pub(super) fn reference(name: &str, args: &[i64], _version: Version, r: &dyn Fn(
         }
         ("max3", 3) => a().max(b()).max(c()),
         ("min3", 3) => a().min(b()).min(c()),
+        ("between", 3) if has(Change::BetweenExclusive) => bit(b() <= a() && a() < c()),
         ("between", 3) => bit(b() <= a() && a() <= c()),
         ("cmp", 2) => match a().cmp(&b()) {
             std::cmp::Ordering::Less => -1,
@@ -248,11 +406,8 @@ pub(super) fn reference(name: &str, args: &[i64], _version: Version, r: &dyn Fn(
         },
         ("dist", 2) => r("abs", &[a().wrapping_sub(b())]),
         ("nearer", 3) => {
-            if r("dist", &[a(), b()]) <= r("dist", &[a(), c()]) {
-                b()
-            } else {
-                c()
-            }
+            let (p, q) = (r("dist", &[a(), b()]), r("dist", &[a(), c()]));
+            if p < q || (p == q && !has(Change::NearerTies)) { b() } else { c() }
         }
         ("spread3", 3) => r("max3", args).wrapping_sub(r("min3", args)),
         ("outside", 3) => bit(a() < b() || a() > c()),
@@ -272,7 +427,7 @@ pub(super) fn reference(name: &str, args: &[i64], _version: Version, r: &dyn Fn(
         ("shrink", 1) => r("abs", &[a()]).wrapping_sub(1),
         ("energy", 2) => r("sq", &[a()]).wrapping_add(r("dist", args)),
         ("mulsign", 2) => r("abs", &[a()]).wrapping_mul(r("cmp", &[b(), 0])),
-        ("clampsq", 3) => r("clamp3", &[r("sq", &[a()]), b(), c()]),
+        ("clampsq", 3) => clamp(r("sq", &[a()]), b(), c()),
         ("path3", 3) => {
             if r("eq", &[a(), c()]) == 1 {
                 0
@@ -280,38 +435,40 @@ pub(super) fn reference(name: &str, args: &[i64], _version: Version, r: &dyn Fn(
                 r("dist", &[a(), b()]).wrapping_add(r("dist", &[b(), c()]))
             }
         }
-        ("pull", 3) => r("clamp3", &[r("toward", &[a(), b()]), r("opp", &[c()]), c()]),
+        ("pull", 3) => clamp(r("toward", &[a(), b()]), r("opp", &[c()]), c()),
         ("band", 3) => r("between", args).wrapping_mul(r("sign", &[a()])),
-        ("clip", 2) => r("clamp3", &[a(), 0, r("max2", &[b(), 0])]),
+        ("clip", 2) => clamp(a(), 0, r("max2", &[b(), 0])),
         ("relax", 2) => r("max2", &[r("relu", &[a()]), r("relu", &[b()])]),
         ("gap", 3) => r("spread3", args).wrapping_mul(r("sign", &[b()])),
         ("rise", 2) => r("relu", &[r("diff", &[b(), a()])]),
-        ("fit", 3) => r("clamp3", &[a(), r("min2", &[b(), c()]), r("max2", &[b(), c()])]),
+        ("fit", 3) => clamp(a(), r("min2", &[b(), c()]), r("max2", &[b(), c()])),
         ("inband", 3) => r("and", &[r("between", args), r("neq", &[b(), c()])]),
-        ("pinned", 3) => r("neq", &[r("clamp3", args), a()]),
+        ("pinned", 3) => r("neq", &[clamp(a(), b(), c()), a()]),
         ("span", 2) => r("inc", &[r("dist", args)]),
         ("within", 3) => r("le", &[r("dist", &[a(), b()]), c()]),
         ("snap", 3) => r("nearer", &[r("relu", &[a()]), b(), c()]),
         ("count3", 3) => r("add3", &[r("truth", &[a()]), r("truth", &[b()]), r("truth", &[c()])]),
-        ("safe", 3) => r("clamp3", args).wrapping_mul(r("ge", &[c(), b()])),
-        ("trim", 2) => r("sign", &[a()]).wrapping_mul(r("clamp3", &[r("abs", &[a()]), 0, b()])),
+        ("safe", 3) => clamp(a(), b(), c()).wrapping_mul(r("ge", &[c(), b()])),
+        ("trim", 2) => r("sign", &[a()]).wrapping_mul(clamp(r("abs", &[a()]), 0, b())),
         ("spot", 3) => r("within", args).wrapping_mul(r("energy", &[a(), b()])),
-        ("cap", 3) => r("clampsq", args).wrapping_sub(r("clamp3", args)),
+        ("cap", 3) => r("clampsq", args).wrapping_sub(clamp(a(), b(), c())),
         ("tilt", 2) => r("mulsign", args).wrapping_add(r("cmp", args)),
         ("route", 3) => r("path3", args).wrapping_add(r("spread3", args)),
-        ("box", 3) => r("fit", args).wrapping_sub(r("clamp3", args)),
+        ("box", 3) => r("fit", args).wrapping_sub(clamp(a(), b(), c())),
         ("lift", 2) => r("relax", args).wrapping_add(r("span", args)),
         ("press", 3) => r("trim", &[r("pull", args), c()]),
+        ("weigh", 3) if has(Change::WeighSubtracts) => r("gap", args).wrapping_sub(r("count3", args)),
         ("weigh", 3) => r("gap", args).wrapping_add(r("count3", args)),
-        ("hold", 3) => r("clamp3", &[r("snap", args), b(), c()]),
+        ("hold", 3) => clamp(r("snap", args), b(), c()),
         ("flag", 3) => r("or", &[r("pinned", args), r("band", args)]),
         ("total", 2) => r("lift", args).wrapping_add(r("energy", args)),
-        ("grade", 3) => r("clamp3", &[r("route", args), b(), c()]),
+        ("grade", 3) => clamp(r("route", args), b(), c()),
         ("judge", 3) => r("max2", &[r("weigh", args), r("flag", args)]),
         ("rate", 3) => r("spot", args).wrapping_add(r("dist", &[a(), b()])),
-        ("tune", 3) => r("press", args).wrapping_add(r("clamp3", &[b(), r("opp", &[c()]), c()])),
+        ("tune", 3) => r("press", args).wrapping_add(clamp(b(), r("opp", &[c()]), c())),
         ("settle", 3) => r("hold", args).wrapping_add(r("pinned", args)),
         ("peak", 3) => r("max3", &[r("cap", args), r("box", args), c()]),
+        ("mix", 2) if has(Change::MixSubtracts) => r("tilt", args).wrapping_sub(r("clip", args)),
         ("mix", 2) => r("tilt", args).wrapping_add(r("clip", args)),
         ("index", 3) => r("box", args).wrapping_add(r("safe", args)),
         ("verdict", 3) => r("and", &[r("flag", args), r("within", args)]),
@@ -324,23 +481,54 @@ fn holds(expr: String, want: bool, got: Result<i64, String>) -> Probe {
     Probe { expr, got, want: i64::from(want) }
 }
 
+/// The widest inputs rank takes once [`Change::RankWide`] applies.
+const WIDE: i64 = 9_000_000_000_000_000_000;
+
+/// The inputs a rank property compares on case `x`: from -1000 to 1000, or across the wide range once
+/// [`Change::RankWide`] applies; for odd `x[2]`, within 3 of each other, so `ismore`'s margin is tested.
+fn rank_inputs(x: &[i64], version: Version) -> (i64, i64) {
+    let (scale, range) =
+        if version.has(Change::RankWide) { (WIDE / CONTRACT_RANGE, WIDE) } else { (1, CONTRACT_RANGE) };
+    let a = x[0] * scale;
+    let b = if x[2].rem_euclid(2) == 0 { x[1] * scale } else { (a + x[1].rem_euclid(7) - 3).clamp(-range, range) };
+    (a, b)
+}
+
 /// `reader(rank(a, b))`, or `reader(flip(rank(a, b)))`, with the library's functions.
-fn read_rank(call: &mut Caller<'_>, x: &[i64], flipped: bool, reader: &str) -> Probe {
-    let inner = format!("rank({}, {})", x[0], x[1]);
+fn read_rank(call: &mut Caller<'_>, x: &[i64], version: Version, flipped: bool, reader: &str) -> Probe {
+    let (a, b) = rank_inputs(x, version);
+    let inner = format!("rank({a}, {b})");
     let expr = if flipped { format!("{reader}(flip({inner}))") } else { format!("{reader}({inner})") };
     let got = (|| {
-        let t = call("rank", &x[..2])?;
+        let t = call("rank", &[a, b])?;
         let t = if flipped { call("flip", &[t])? } else { t };
         call(reader, &[t])
     })();
     // Flipped, rank(a, b) reads as rank(b, a).
-    let (a, b) = if flipped { (x[1], x[0]) } else { (x[0], x[1]) };
+    let (a, b) = if flipped { (b, a) } else { (a, b) };
+    let margin = if version.has(Change::IsMoreFar) { 2 } else { 0 };
     let want = match reader {
         "isless" => a < b,
         "issame" => a == b,
-        _ => a > b,
+        _ => a > b.saturating_add(margin),
     };
     holds(expr, want, got)
+}
+
+/// Whether `cut(a, b)` is a value rather than none.
+fn cut_valid(a: i64, b: i64, version: Version) -> bool {
+    if version.has(Change::CutSigned) { (a - b).abs() <= CONTRACT_RANGE } else { a >= b }
+}
+
+/// None lies outside `none_floor(version)..=4000`.
+fn none_floor(version: Version) -> i64 {
+    if version.has(Change::NoneWide) {
+        -4000
+    } else if version.has(Change::CutSigned) {
+        -CONTRACT_RANGE
+    } else {
+        0
+    }
 }
 
 /// What `either(x, d)` must give, where `x` is none unless `valid`.
@@ -353,23 +541,35 @@ pub(super) const CONTRACTS: &[Contract] = &[
         name: "rank",
         members: &["rank", "flip", "isless", "issame", "ismore"],
         properties: &[
-            Property { arity: 2, calls: &["rank", "isless"], eval: |call, x| read_rank(call, x, false, "isless") },
-            Property { arity: 2, calls: &["rank", "issame"], eval: |call, x| read_rank(call, x, false, "issame") },
-            Property { arity: 2, calls: &["rank", "ismore"], eval: |call, x| read_rank(call, x, false, "ismore") },
             Property {
-                arity: 2,
+                arity: 3,
+                calls: &["rank", "isless"],
+                eval: |call, x, v| read_rank(call, x, v, false, "isless"),
+            },
+            Property {
+                arity: 3,
+                calls: &["rank", "issame"],
+                eval: |call, x, v| read_rank(call, x, v, false, "issame"),
+            },
+            Property {
+                arity: 3,
+                calls: &["rank", "ismore"],
+                eval: |call, x, v| read_rank(call, x, v, false, "ismore"),
+            },
+            Property {
+                arity: 3,
                 calls: &["rank", "flip", "isless"],
-                eval: |call, x| read_rank(call, x, true, "isless"),
+                eval: |call, x, v| read_rank(call, x, v, true, "isless"),
             },
             Property {
-                arity: 2,
+                arity: 3,
                 calls: &["rank", "flip", "issame"],
-                eval: |call, x| read_rank(call, x, true, "issame"),
+                eval: |call, x, v| read_rank(call, x, v, true, "issame"),
             },
             Property {
-                arity: 2,
+                arity: 3,
                 calls: &["rank", "flip", "ismore"],
-                eval: |call, x| read_rank(call, x, true, "ismore"),
+                eval: |call, x, v| read_rank(call, x, v, true, "ismore"),
             },
         ],
     },
@@ -377,81 +577,85 @@ pub(super) const CONTRACTS: &[Contract] = &[
         name: "none",
         members: &["cut", "pos", "isnone", "either", "plus"],
         properties: &[
-            // One none, the same everywhere and outside 0 to 4000: both producers' nones are one value.
+            // One none, the same everywhere and where the specs put it: both producers' nones are one value.
             Property {
                 arity: 2,
                 calls: &["cut", "pos"],
-                eval: |call, x| {
-                    let (lo, hi) = if x[1] == 0 { (-1, 0) } else { (-x[1].abs(), x[1].abs()) };
+                eval: |call, x, v| {
+                    // a - b is below -1000, so none under every version.
+                    let (lo, hi) = (-CONTRACT_RANGE, x[1].abs().max(1));
                     let p = -x[0].abs();
+                    let floor = none_floor(v);
                     let got = (|| {
-                        let (u, v) = (call("cut", &[lo, hi])?, call("pos", &[p])?);
-                        Ok(i64::from(u == v && !(0..=4000).contains(&u)))
+                        let (u, w) = (call("cut", &[lo, hi])?, call("pos", &[p])?);
+                        Ok(i64::from(u == w && !(floor..=4000).contains(&u)))
                     })();
-                    let expr = format!("cut({lo}, {hi}) and pos({p}) being one none outside 0 to 4000");
+                    let expr = format!("cut({lo}, {hi}) and pos({p}) being one none outside {floor} to 4000");
                     holds(expr, true, got)
                 },
             },
             Property {
                 arity: 2,
                 calls: &["cut", "isnone"],
-                eval: |call, x| {
+                eval: |call, x, v| {
                     let (a, b) = (x[0], x[1]);
-                    let got = call("cut", &[a, b]).and_then(|v| call("isnone", &[v]));
-                    holds(format!("isnone(cut({a}, {b}))"), a < b, got)
+                    let got = call("cut", &[a, b]).and_then(|t| call("isnone", &[t]));
+                    holds(format!("isnone(cut({a}, {b}))"), !cut_valid(a, b, v), got)
                 },
             },
             Property {
                 arity: 3,
                 calls: &["cut", "either"],
-                eval: |call, x| {
+                eval: |call, x, v| {
                     let (a, b, d) = (x[0], x[1], x[2]);
-                    let got = call("cut", &[a, b]).and_then(|v| call("either", &[v, d]));
-                    Probe { expr: format!("either(cut({a}, {b}), {d})"), got, want: either_want(a >= b, a - b, d) }
+                    let got = call("cut", &[a, b]).and_then(|t| call("either", &[t, d]));
+                    let want = either_want(cut_valid(a, b, v), a - b, d);
+                    Probe { expr: format!("either(cut({a}, {b}), {d})"), got, want }
                 },
             },
             Property {
                 arity: 1,
                 calls: &["pos", "isnone"],
-                eval: |call, x| {
+                eval: |call, x, _| {
                     let a = x[0];
-                    let got = call("pos", &[a]).and_then(|v| call("isnone", &[v]));
+                    let got = call("pos", &[a]).and_then(|t| call("isnone", &[t]));
                     holds(format!("isnone(pos({a}))"), a <= 0, got)
                 },
             },
             Property {
                 arity: 2,
                 calls: &["pos", "either"],
-                eval: |call, x| {
+                eval: |call, x, _| {
                     let (a, d) = (x[0], x[1]);
-                    let got = call("pos", &[a]).and_then(|v| call("either", &[v, d]));
+                    let got = call("pos", &[a]).and_then(|t| call("either", &[t, d]));
                     Probe { expr: format!("either(pos({a}), {d})"), got, want: either_want(a > 0, a, d) }
                 },
             },
             Property {
                 arity: 2,
                 calls: &["pos", "cut", "plus", "isnone"],
-                eval: |call, x| {
+                eval: |call, x, v| {
                     let (a, b) = (x[0], x[1]);
                     let got = (|| {
                         let (p, q) = (call("pos", &[a])?, call("cut", &[a, b])?);
                         let sum = call("plus", &[p, q])?;
                         call("isnone", &[sum])
                     })();
-                    holds(format!("isnone(plus(pos({a}), cut({a}, {b})))"), !(a > 0 && a >= b), got)
+                    let want = !(a > 0 && cut_valid(a, b, v));
+                    holds(format!("isnone(plus(pos({a}), cut({a}, {b})))"), want, got)
                 },
             },
             Property {
                 arity: 3,
                 calls: &["cut", "pos", "plus", "either"],
-                eval: |call, x| {
+                eval: |call, x, v| {
                     let (a, b, d) = (x[0], x[1], x[2]);
                     let got = (|| {
                         let (p, q) = (call("cut", &[a, b])?, call("pos", &[b])?);
                         let sum = call("plus", &[p, q])?;
                         call("either", &[sum, d])
                     })();
-                    let want = either_want(a >= b && b > 0, a, d);
+                    let want = either_want(cut_valid(a, b, v) && b > 0, a, d);
                     Probe { expr: format!("either(plus(cut({a}, {b}), pos({b})), {d})"), got, want }
                 },
             },

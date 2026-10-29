@@ -302,8 +302,8 @@ as they are in every candidate.
 ## Step 1 as built
 
 Build step 1 of the accepted task (task `b7c49e317b0e`) adds Phase 2's task
-beside Phase 1's. The change waves are step 2, so this task has no change
-requests yet.
+beside Phase 1's. The change waves are step 2's, in
+[Step 2 as built](#step-2-as-built).
 
 **A task selector.** `--task phase1` or `--task phase2` on `run` and
 `mock-run`, with Phase 1's as the default. The plan records the task, and a
@@ -406,6 +406,161 @@ member. A member is graded by every property that calls it:
 
 The mock runs Phase 2 in every mode (a test does, with 2 agents and 2 turns).
 The scripted moves and a full mock run of the larger task are step 3.
+
+## Step 2 as built
+
+Build step 2 (task `8d4ee9d1f345`) adds Phase 2's change requests and their
+release, with no model calls. Phase 1 keeps its single release exactly as
+it ran.
+
+**Two waves of six,** at 30% and 60% of the turns. A wave goes out once
+`share × turns` turns are used, rounded to the nearest turn with halves up,
+the same way in every mode: with 8 turns, after turns 2 and 5. Wave 2
+changes what wave 1 changed (`clamp3`'s inputs, twice).
+
+| Wave | Tag | Spec (module, layer) | Kind | Under the change |
+|---|---|---|---|---|
+| 1 | `clamp-order` | `clamp3` (order, 1) | signature | `clamp3(lo, hi, x)` |
+| 1 | `sign-of-zero` | `sign` (base, 0) | behaviour | `sign(0)` is 1 |
+| 1 | `between-exclusive` | `between` (order, 1) | behaviour | `lo <= x < hi` |
+| 1 | `cut-signed` | `cut` (arith, 2) | interacting, with `none-wide` | `a - b` whenever it is from −1000 to 1000, so none lies outside −1000 to 4000 |
+| 1 | `none-wide` | `isnone` (range, 2) | interacting, with `cut-signed` | none lies outside −4000 to 4000 |
+| 1 | `weigh-subtracts` | `weigh` (shape, 3) | behaviour | `gap − count3` |
+| 2 | `clamp-hi-first` | `clamp3` (order, 1) | signature | `clamp3(hi, lo, x)` |
+| 2 | `rank-wide` | `rank` (order, 1) | interacting, with `ismore-far` | inputs from −9×10¹⁸ to 9×10¹⁸ |
+| 2 | `ismore-far` | `ismore` (step, 1) | interacting, with `rank-wide` | 1 if `a > b + 2` |
+| 2 | `nearer-ties` | `nearer` (order, 1) | behaviour | ties go to `q` |
+| 2 | `abs-saturates` | `abs` (base, 0) | behaviour | `abs(min)` is the largest integer |
+| 2 | `mix-subtracts` | `mix` (score, 4) | behaviour | `tilt − clip` |
+
+- **Both signature changes are `clamp3`'s.** Of the 90 functions, only
+  `clamp3` has 10 to 15 callers (12; the next most called has 6), so both
+  waves change its inputs' order and its twelve callers must follow each
+  time. The other descriptions still write `clamp3(x, lo, hi)` for the
+  value, as the change texts say, so a caller's contract never changes.
+- **Two interacting pairs, one per wave.** Each change alone has an
+  obvious fix that breaks the other:
+  - `cut-signed` makes −1, the obvious none, a difference. Its obvious fix
+    moves none just past cut's range (−1001, say), which `none-wide` rules
+    out. `none-wide`'s obvious fix moves none far out but leaves `cut`
+    unsigned. Only a library that agrees on both, such as none at −5000,
+    is right.
+  - `rank-wide` makes `a - b` overflow. Its obvious fix reads only the sign
+    (`-1`, `0`, `1`), which can't say whether `a` is more than 2 above `b`.
+    `ismore-far`'s obvious fix reads `a - b > 2`. The library must settle a
+    value that keeps the distance up to 3 without overflowing, such as
+    `±3` beyond 2 apart, `±1` within 2, and 0.
+
+  A test plays each obvious fix and shows it right alone and wrong with its
+  partner, while the settled convention is right under both.
+- **The properties follow the specs in force.** The none properties take
+  `cut`'s new validity and none's new range; the one-none property calls
+  `cut(-1000, m)`, which is none under every version. Rank properties take
+  three inputs. Once `rank-wide` applies, `a` and `b` span the wide range,
+  and for half the cases `b` is within 3 of `a`, so `ismore`'s margin is
+  tested. Public cases stay small, so `a - b`, which only overflows on wide
+  inputs, passes the public check and fails hidden cases.
+- **Each change has** its spec's new description, a version-aware
+  reference, two correct and two subtly wrong candidates for its target
+  (the last passes the public check), the updates the correct library
+  needs, and the same public and hidden cases. Hidden cases stay
+  grader-only.
+
+**The release.** The driver releases each wave to all agents at once, at
+the same point in every mode: when `turn × agents` agent-turns are used. A
+wave due after turn 0 goes out before anyone plays. Phase 2's
+`changes_released` event names its wave. Phase 1's event names none,
+since it has one release, after 40% of the agent-turns as before. Each
+mode's `release_changes` takes the wave:
+
+- Bracken writes that wave's change claims, each with a spec claim that
+  supersedes the current one.
+- Git and CRDT write `TASKS.md` at the version after that wave, listing
+  every change released so far.
+
+The plan records the turns after which the waves go out (`waves`), and
+the task text's hash after wave 1. A Phase 1 plan has neither.
+
+**Phase 2 ranks the modes at checkpoints** (owner decision
+`288a16ce8cb2`). A checkpoint is the end of a turn index, once every agent
+has finished that turn. The driver then logs the hub's integrated library
+as it is at that moment: Git's main, Bracken's accepted layer, CRDT's hub
+document. Phase 1's logs gain nothing. Each checkpoint is graded with the
+same grader in every mode, under the change requests released before it.
+A function counts as correct when it is right in the library; the
+standalone count is kept beside it. From the checkpoints, the same in
+every mode:
+
+- **Final quality:** the functions correct at the last checkpoint.
+- **Time to correct:** per function correct at the last checkpoint, the
+  turn of the first checkpoint from which it is correct at every one.
+- **Recovery per wave:** of the checkpoints after the wave's release, how
+  many pass until all of the wave's functions are correct, or never if
+  not by the last. Those functions are its targets, every function defined
+  in terms of them (directly or not) and their open contracts' members.
+- **Breakage:** a function correct at one checkpoint and wrong at the next.
+  It counts as after a wave if a wave went out between the two, else as
+  other: the semantic-conflict signal.
+- **Tokens per correct function:** the run's tokens over the final count.
+
+These are the report's ranking rows.
+
+**Why checkpoints** (decision `288a16ce8cb2`). Judging individual
+deliveries needs each mode's working copy and specs at the moment of each
+delivery. Four review rounds of PR #62 (findings `06c729ef956b`,
+`a3535d9c71b7`, `0b115f0c0ec0`) showed those points differ by mode in
+ways that keep shifting credit between modes when a wave lands mid-turn,
+which is routine with no barrier between turns. Grading the shared state
+at one moment, the same for every mode, needs no such reconstruction.
+
+**Per-delivery measures are per-mode diagnostics.** Discovery,
+duplication and semantic conflicts are still reported below the ranking
+rows, labelled as per mode only. They are not comparable across modes and
+never rank them. They judge each delivery by the rule the four review
+rounds settled (decisions `979e5085a1e7` and `5d049d7e4996`, findings
+`06c729ef956b`, `a3535d9c71b7` and `0b115f0c0ec0`):
+
+- **One judging point per delivery:** the delivering agent's last sync
+  before it. For CRDT that is the sync before the one that delivered it.
+  The specs come from that point, and so does the hub part of the working
+  copy: the hub as that sync left it.
+- **Each mode's copy of the other members:**
+  - Git: the branch's members at the commit, over main as of that sync.
+  - CRDT: the agent's own edits that the sync delivered, over the hub at
+    its sync before.
+  - Bracken: each member accepted at the hub, else any of the agent's own
+    current implementations from its records before the sync that makes
+    the delivery available. So a batch of artifacts delivered at one sync
+    stays together (finding `e36915fb7841`).
+- **Verdicts:** judged under the specs as of the verdict-giver's last sync.
+- **Phase 1:** keeps the specs in force at each point, as its runs were
+  measured.
+
+A test checks, for every delivery in every case of the rule's table, that
+the specs and the hub come from the same point. Bracken's store records an
+agent's own members after every sync too (note `6b8e8ce21f94`), since a
+release that supersedes a member's spec makes the agent's implementations
+of it no longer current at its next sync and no tool call records that. A
+store-level test plays artifacts, relates, syncs and both waves against a
+real hub. Past 256 combinations of an agent's current implementations, the
+search keeps the newest.
+
+The rule's remaining differences between modes, without any wave:
+
+- An unmerged Git branch is judged on its own content. Keeping the losing
+  convention on it scores right and adapting one member to the winner's
+  scores wrong, the reverse of Bracken and CRDT.
+- Another agent's accepted member, against this agent's pending whole
+  contract in the other convention, scores wrong in Bracken only.
+- A contract split over two commits is judged per commit in Git, while
+  Bracken and CRDT deliver it whole at one sync.
+
+These are why the diagnostics don't rank the modes. Phase 1's measures are
+as recorded: its headline stays per delivery, its logs are byte-identical
+to main's, and it gets no checkpoint table.
+
+The mock agents still write only what step 1's mock writes. Scripted
+moves for the waves and the contracts, and a full mock run, are step 3.
 
 ## What this can't settle
 

@@ -196,7 +196,7 @@ pub fn grade_function(library: &Library, name: &str, version: Version, hidden: &
         if task.contract_of(name).is_some() {
             for (index, property) in task.properties_of(name) {
                 for case in hidden.of_property(index) {
-                    if let Some(failure) = task.probe(property, case, library, calls).failure() {
+                    if let Some(failure) = task.probe(property, case, library, calls, version).failure() {
                         note.get_or_insert(format!("{how}: {failure}"));
                         return false;
                     }

@@ -439,7 +439,8 @@ fn name_of(d: &str) -> String {
     d.split_whitespace().nth(1).expect("a def line").to_string()
 }
 
-/// One step of a scenario, played as each mode logs it.
+/// One step of a scenario, played as each mode logs it. As in a run, where every turn starts with a sync, an
+/// agent sees others' work only once it has synced.
 #[derive(Clone)]
 enum Step {
     /// An agent writes definitions: one Git commit, Bracken artifacts, CRDT edits to its document.
@@ -450,7 +451,9 @@ enum Step {
     Integrate(&'static str),
     /// Git: the agent merges main into its branch. Bracken and CRDT have nothing to do.
     Adopt(&'static str),
-    Release,
+    /// The driver releases a wave. In Bracken it supersedes the spec claims of the wave's targets, so the
+    /// hub's accepted implementations of them stop counting at once, and an agent's own at its next sync.
+    Release(usize),
     /// An agent's verdict blocks definitions.
     Block(&'static str, Vec<String>),
 }
@@ -464,6 +467,9 @@ fn play(mode: &str, steps: &[Step]) -> Log {
     // Git: each agent's branch; Bracken: its own current implementations; CRDT: its document and unsynced edits.
     let mut copy: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
     let mut edits: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+    // Bracken: the targets of every change released so far, and how many of them each agent has synced.
+    let mut superseded: Vec<&str> = Vec::new();
+    let mut synced_upto: BTreeMap<&str, usize> = BTreeMap::new();
     let defs = |m: &BTreeMap<String, String>| m.values().cloned().collect::<Vec<_>>();
     log.snap(ms, None, &[]);
     for step in steps {
@@ -498,7 +504,15 @@ fn play(mode: &str, steps: &[Step]) -> Log {
                 _ => edits.entry(agent).or_default().extend(ds.iter().map(|d| (name_of(d), d.clone()))),
             },
             Sync(agent) => {
-                log.sync(ms, agent);
+                if mode == "bracken" {
+                    // The store records the agent's own current members after every sync.
+                    let from = synced_upto.insert(agent, superseded.len()).unwrap_or(0);
+                    let own = copy.entry(agent).or_default();
+                    own.retain(|(f, _)| !superseded[from..].contains(&f.as_str()));
+                    log.ev(ms, Some(agent), "sync", json!({"record": {"members": own}}));
+                } else {
+                    log.sync(ms, agent);
+                }
                 if mode == "crdt" {
                     hub.extend(edits.remove(agent).unwrap_or_default());
                     log.snap(ms + 1, Some(agent), &defs(&hub));
@@ -518,7 +532,15 @@ fn play(mode: &str, steps: &[Step]) -> Log {
                     copy.insert(agent, hub.clone().into_iter().collect());
                 }
             }
-            Release => drop(log.ev(ms, None, "changes_released", json!({}))),
+            Release(wave) => {
+                log.ev(ms, None, "changes_released", json!({"wave": wave}));
+                let targets: Vec<&str> = Task::Phase2.wave_changes(*wave).map(|c| c.target).collect();
+                if mode == "bracken" {
+                    hub.retain(|f, _| !targets.contains(&f.as_str()));
+                    log.ev(ms + 1, None, "snapshot", json!({"after": "release", "modules": [["base", defs(&hub).iter().map(|d| format!("{d}\n")).collect::<String>()]]}));
+                }
+                superseded.extend(targets);
+            }
             Block(agent, ds) => {
                 let blocks: Vec<_> = ds.iter().map(|d| json!([name_of(d), d])).collect();
                 log.result(ms, agent, "evidence", true, json!({"blocks": blocks}));
@@ -539,6 +561,8 @@ fn every_contract_case_is_judged_by_the_agents_working_copy_in_every_mode() {
     let adapted = phase2("isless", "a 0 < 0 +");
     let kept = phase2("isless", "a 5 = 0 +");
     let revised = phase2("isless", "0 a >");
+    let after_wave_2 = correct_programs(Task::Phase2, Task::Phase2.after_wave(2));
+    let wide: Vec<String> = ["rank", "ismore"].iter().map(|f| phase2(f, after_wave_2[f])).collect();
     let lost = |isless: &String| {
         vec![
             Write("a", other.clone()),
@@ -575,24 +599,157 @@ fn every_contract_case_is_judged_by_the_agents_working_copy_in_every_mode() {
             0,
         ),
         (
-            "a release between delivery and verdict: Phase 2 has no change requests yet, so the block of a correct \
-             member is a semantic conflict",
-            vec![Write("a", canonical.clone()), Sync("a"), Release, Block("b", vec![canonical[2].clone()])],
+            "wave 1 between delivery and verdict: it doesn't change rank, so the block of a correct member is a \
+             semantic conflict",
+            vec![Write("a", canonical.clone()), Sync("a"), Release(1), Block("b", vec![canonical[2].clone()])],
             [5, 5, 5],
             1,
+        ),
+        (
+            "wave 2 between delivery and a verdict whose giver has synced it in (decision 5d049d7e4996): \
+             rank-wide and ismore-far make a - b and its readers wrong, so blocking ismore is no conflict",
+            vec![
+                Write("a", canonical.clone()),
+                Sync("a"),
+                Release(1),
+                Release(2),
+                Sync("b"),
+                Block("b", vec![canonical[4].clone()]),
+            ],
+            [5, 5, 5],
+            0,
+        ),
+        (
+            "wave 2 before a verdict whose giver hasn't synced since: it judges by the specs it can see, the \
+             original, so blocking a correct ismore is a semantic conflict",
+            vec![
+                Write("a", canonical.clone()),
+                Sync("a"),
+                Release(1),
+                Release(2),
+                Block("b", vec![canonical[4].clone()]),
+            ],
+            [5, 5, 5],
+            1,
+        ),
+        (
+            "wave 1 between delivery and the sync that makes it available: it changes no rank member",
+            vec![Write("a", canonical.clone()), Release(1), Sync("a")],
+            [5, 5, 5],
+            0,
+        ),
+        // Finding a3535d9c71b7's three probes. The agent wrote before its sync took in the waves, so every
+        // mode judges under the specs it could see then, the original.
+        (
+            "probe 1: write, wave 1, wave 2, sync: the same in every mode",
+            vec![Write("a", canonical.clone()), Release(1), Release(2), Sync("a")],
+            [5, 5, 5],
+            0,
+        ),
+        (
+            "probe 2: another agent's contract accepted, this agent's in the other convention written, both waves, \
+             sync: as with no wave (Bracken's copy holds the accepted one, as in the case without a wave)",
+            vec![
+                Write("b", canonical.clone()),
+                Sync("b"),
+                Integrate("b"),
+                Sync("a"),
+                Write("a", other.clone()),
+                Release(1),
+                Release(2),
+                Sync("a"),
+            ],
+            [10, 5, 10],
+            0,
+        ),
+        (
+            "probe 3: a contract split around both waves, one sync: Git judges each commit's branch (rank and flip \
+             lack readers at the first), Bracken and CRDT deliver the whole contract at the sync",
+            vec![
+                Write("a", canonical[..3].to_vec()),
+                Release(1),
+                Release(2),
+                Write("a", canonical[3..].to_vec()),
+                Sync("a"),
+            ],
+            [3, 5, 5],
+            0,
+        ),
+        (
+            "partners accepted from another agent, then both waves, then this agent's sync: Bracken takes the hub \
+             as its last sync left it, before the waves dropped them, as Git takes main as of that sync",
+            vec![
+                Write("b", canonical.clone()),
+                Sync("b"),
+                Integrate("b"),
+                Sync("a"),
+                Write("a", vec![revised.clone()]),
+                Release(1),
+                Release(2),
+                Sync("a"),
+            ],
+            [6, 6, 6],
+            0,
+        ),
+        (
+            "finding 0b115f0c0ec0: partners accepted and synced, then both waves mid-turn, then a write before \
+             the next sync: judged under the specs and the hub the agent's last sync gave it, in every mode",
+            vec![
+                Write("b", canonical.clone()),
+                Sync("b"),
+                Integrate("b"),
+                Sync("a"),
+                Release(1),
+                Release(2),
+                Write("a", vec![revised.clone()]),
+                Sync("a"),
+            ],
+            [6, 6, 6],
+            0,
+        ),
+        (
+            "a write after a sync took in wave 2: judged under wave 2 in every mode, where of a - b's contract only \
+             issame is still right",
+            vec![Release(1), Release(2), Sync("a"), Write("a", canonical.clone()), Sync("a")],
+            [1, 1, 1],
+            0,
+        ),
+        (
+            "the contract redone once a sync brings wave 2: the new rank and ismore are right in every mode",
+            vec![
+                Write("a", canonical.clone()),
+                Sync("a"),
+                Release(1),
+                Release(2),
+                Sync("a"),
+                Write("a", wide.clone()),
+                Sync("a"),
+            ],
+            [7, 7, 7],
+            0,
         ),
         ("a mixed-convention contract stays wrong", vec![Write("a", mixed.clone()), Sync("a")], [0, 0, 0], 0),
         (
             "another agent's contract accepted, this agent's in the other convention pending: wrong in Bracken, \
              where the accepted one is in the copy; right in Git's branch and CRDT's document, as each check says",
-            vec![Write("b", canonical.clone()), Sync("b"), Integrate("b"), Write("a", other.clone()), Sync("a")],
+            vec![
+                Write("b", canonical.clone()),
+                Sync("b"),
+                Integrate("b"),
+                Sync("a"),
+                Write("a", other.clone()),
+                Sync("a"),
+            ],
             [10, 5, 10],
             0,
         ),
     ];
     for (name, steps, want, conflicts) in cases {
         for (k, mode) in ["git", "bracken", "crdt"].into_iter().enumerate() {
-            let m = measure(&play(mode, &steps).records(), &HiddenCases::new(Task::Phase2, 1)).expect("measures");
+            let records = play(mode, &steps).records();
+            let hidden = HiddenCases::new(Task::Phase2, 1);
+            assert_one_judging_point(&records, &hidden, &format!("{mode}: {name}"));
+            let m = measure(&records, &hidden).expect("measures");
             assert_eq!(m.discovery.discoveries, want[k], "{mode}: {name}");
             let want_conflicts = (mode != "crdt").then_some(conflicts);
             assert_eq!(m.incompatible.semantic_conflicts, want_conflicts, "{mode}: {name}");
@@ -601,9 +758,26 @@ fn every_contract_case_is_judged_by_the_agents_working_copy_in_every_mode() {
 }
 
 /// Finding `440196ce733f`: a verdict is judged under the version in force when it is given, as before open
-/// contracts, even for a definition delivered before the change requests were released.
+/// contracts, even for a definition delivered before the change requests were released. Phase 1 keeps that;
+/// Phase 2 refines it (decision `5d049d7e4996`): the version as of the verdict-giver's last sync before it.
 #[test]
 fn a_verdict_after_the_release_judges_under_the_released_specs() {
+    let sign = phase2("sign", correct_programs(Task::Phase2, Version::ORIGINAL)["sign"]);
+    let phase2_log = |giver_synced: bool| {
+        let mut log = Log::new("bracken");
+        log.snap(10, None, &[]);
+        log.write(20, "a", 1, &sign);
+        log.ev(30, None, "changes_released", json!({"wave": 1}));
+        if giver_synced {
+            log.sync(35, "b");
+        }
+        log.result(40, "b", "evidence", true, json!({"blocks": [["sign", sign.clone()]]}));
+        let records = log.records();
+        measure(&records, &HiddenCases::new(Task::Phase2, 1)).expect("measures").incompatible.semantic_conflicts
+    };
+    assert_eq!(phase2_log(true), Some(0), "b synced wave 1 in, where sign(0) = 0 is wrong");
+    assert_eq!(phase2_log(false), Some(1), "b hasn't, so it blocks a sign right under the specs it sees");
+
     let mut log = Log::new("bracken");
     log.snap(10, None, &[]);
     log.write(20, "a", 1, &right("sign"));
@@ -617,4 +791,163 @@ fn a_verdict_after_the_release_judges_under_the_released_specs() {
     log.write(20, "a", 1, &right("sign"));
     log.result(40, "b", "evidence", true, json!({"blocks": [["sign", right("sign")]]}));
     assert_eq!(log.measure().incompatible.semantic_conflicts, Some(1));
+}
+
+/// Each delivery and verdict is judged under the specs in force at it, across both waves: wave 2 changes
+/// clamp3's order again, so wave 1's clamp3 is right between the waves and wrong after.
+#[test]
+fn deliveries_and_verdicts_are_judged_under_each_waves_specs() {
+    use Step::*;
+    let t = Task::Phase2;
+    let clamp3 = |wave: usize| phase2("clamp3", correct_programs(t, t.after_wave(wave))["clamp3"]);
+    let (original, first, second) = (clamp3(0), clamp3(1), clamp3(2));
+    assert!(original != first && first != second);
+    let steps = vec![
+        Write("a", vec![original.clone()]), // right
+        Sync("a"),
+        Release(1),
+        Write("b", vec![first.clone()]), // right
+        Sync("b"),
+        // A fail on the original clamp3 is right once wave 1 is out: no semantic conflict.
+        Block("b", vec![original.clone()]),
+        Write("a", vec![phase2("clamp3", "a b max2@ dup c < swap c ?")]), // the original order, so wrong
+        Sync("a"),
+        Release(2),
+        Write("b", vec![second.clone()]), // right
+        Sync("b"),
+        Write("a", vec![first.clone()]), // wave 1's order, so wrong
+        Sync("a"),
+        // A fail on wave 1's clamp3 after wave 2: no conflict either.
+        Block("b", vec![first.clone()]),
+    ];
+    for mode in ["git", "bracken", "crdt"] {
+        let m = measure(&play(mode, &steps).records(), &HiddenCases::new(t, 1)).expect("measures");
+        assert_eq!(m.discovery.discoveries, 3, "{mode}");
+        assert_eq!(m.incompatible.semantic_conflicts, (mode != "crdt").then_some(0), "{mode}");
+    }
+    // The same fail before wave 1 blocks a right definition: a semantic conflict.
+    let early = vec![Write("a", vec![original.clone()]), Sync("a"), Block("b", vec![original])];
+    let m = measure(&play("bracken", &early).records(), &HiddenCases::new(t, 1)).expect("measures");
+    assert_eq!(m.incompatible.semantic_conflicts, Some(1));
+}
+
+/// Note 6b8e8ce21f94 point 1: past [`MAX_CHOICES`] combinations, the search keeps the newest ones. Here
+/// isless's copy holds five implementations of each of four members, 625 combinations, and only the newest
+/// of each is right; oldest first, the cap would stop at combination 256 and never reach it.
+#[test]
+fn the_combination_cap_keeps_the_newest_implementations() {
+    use Step::*;
+    let canonical = rank_contract(false);
+    let mut steps = Vec::new();
+    for k in 0..4 {
+        let stale = ["rank", "flip", "issame", "ismore"].iter().map(|f| phase2(f, &format!("{}", 100 + k))).collect();
+        steps.push(Write("a", stale));
+    }
+    let others: Vec<String> = canonical.iter().filter(|d| name_of(d) != "isless").cloned().collect();
+    steps.push(Write("a", others));
+    steps.push(Write("a", vec![canonical[2].clone()]));
+    steps.push(Sync("a"));
+    assert_eq!(name_of(&canonical[2]), "isless");
+    let m = measure(&play("bracken", &steps).records(), &HiddenCases::new(Task::Phase2, 1)).expect("measures");
+    assert_eq!(m.discovery.discoveries, 5, "the four newest members, and isless with them");
+}
+
+/// Finding `0b115f0c0ec0`: every delivery is judged at one point, the agent's last sync before it (decision
+/// `5d049d7e4996`). The specs it is judged under and the hub its working copy falls back on both come from
+/// that point, so no wave lies between them.
+fn assert_one_judging_point(records: &Records, hidden: &HiddenCases, case: &str) {
+    let (a, _, deliveries) = analyse(records, hidden).expect("an analysis");
+    for d in &deliveries {
+        assert_eq!(d.version, a.version_seen(d.seen, d.at.seq), "{case}: {} at {}", d.function, d.at.seq);
+        if hidden.task().contract_of(&d.function).is_none() {
+            continue;
+        }
+        let base = d.copy.base.expect("a hub snapshot");
+        assert_eq!(Some(base), a.hub_seen(&d.agent, d.seen), "{case}: {}'s hub is from its judging point", d.function);
+        // That snapshot is the hub's state at the judging point: the one its sync took, or the last before it
+        // with none after it and before the point (a snapshot is logged only when the hub changes).
+        let at = d.seen.unwrap_or(0);
+        let taken = a.snaps[base].at.seq;
+        let later = a.snaps.get(base + 1).map_or(u64::MAX, |s| s.at.seq);
+        assert!(taken > at || later > at, "{case}: {}'s hub is older than its judging point", d.function);
+        if hidden.task().waves().is_empty() {
+            continue;
+        }
+        assert_eq!(d.version, d.seen.map_or(Version::ORIGINAL, |p| a.version_at(p)), "{case}: {}", d.function);
+    }
+}
+
+/// The checkpoints a scenario logs, the same in every mode: Phase 2's ranking measures grade only them.
+fn checkpoint_log(mode: &str) -> Log {
+    let t = Task::Phase2;
+    let text = |programs: &crate::candidates::Programs| -> Vec<(String, String)> {
+        crate::candidates::modules(t, programs).into_iter().map(|(m, s)| (m.to_string(), s)).collect()
+    };
+    let original = correct_programs(t, Version::ORIGINAL);
+    let mut without_mix = original.clone();
+    without_mix.remove("mix");
+    let mut wave1 = correct_programs(t, t.after_wave(1));
+    wave1.insert("weigh", original["weigh"]); // weigh-subtracts left undone, so judge stays wrong too
+    wave1.insert("total", candidates(t, "total").wrong[0]); // a breakage no wave explains
+    let mut log = Log::new(mode);
+    log.snap(1, None, &[]);
+    log.ev(2, None, "checkpoint", json!({"turn": 1, "modules": text(&without_mix)}));
+    log.ev(3, None, "checkpoint", json!({"turn": 2, "modules": text(&original)}));
+    log.ev(4, None, "changes_released", json!({"wave": 1}));
+    log.ev(5, None, "checkpoint", json!({"turn": 3, "modules": text(&original)}));
+    log.ev(6, None, "checkpoint", json!({"turn": 4, "modules": text(&wave1)}));
+    log.turn_usage("agent-0", 1, 900_000, 1_000);
+    log
+}
+
+/// Decision `288a16ce8cb2`'s measures on a hand-checked scenario, through every mode's log alike:
+/// - turn 1: all of the original library but `mix` (89 of 90);
+/// - turn 2: all of it (90);
+/// - wave 1, then turn 3: the same library, now wrong for 21 functions under wave 1 (69);
+/// - turn 4: wave 1's library, except that `weigh` is left undone, so `judge`, which calls it, is wrong in
+///   the library though right standalone, and `total` breaks for no wave (87 in library, 88 standalone).
+#[test]
+fn checkpoints_rank_every_mode_alike_from_its_shared_library() {
+    let t = Task::Phase2;
+    let hidden = HiddenCases::new(t, 1);
+    let original =
+        Library::parse(crate::candidates::correct_library(t, Version::ORIGINAL).iter().map(|(m, s)| (*m, s.as_str())));
+    let broken_by_wave1: BTreeSet<_> =
+        grade(&original, t.after_wave(1), &hidden).into_iter().filter(|g| !g.in_library).map(|g| g.name).collect();
+    assert_eq!(broken_by_wave1.len(), 21);
+    assert!(
+        broken_by_wave1.contains("clamp3") && broken_by_wave1.contains("weigh") && broken_by_wave1.contains("judge")
+    );
+    assert!(broken_by_wave1.is_subset(&changed_by(t, 1)), "a wave breaks only what it changes");
+    assert_eq!(changed_by(t, 1).len(), 34);
+    for mode in ["git", "bracken", "crdt"] {
+        let m = measure(&checkpoint_log(mode).records(), &hidden).expect("measures");
+        let c = m.checkpoints.expect("checkpoints");
+        let rows: Vec<(u32, u64, u64, u64)> =
+            c.turns.iter().map(|k| (k.turn, k.waves, k.correct, k.standalone)).collect();
+        assert_eq!(rows, [(1, 0, 89, 89), (2, 0, 90, 90), (3, 1, 69, 69), (4, 1, 87, 88)], "{mode}");
+        assert_eq!((c.correct, c.total), (87, 90), "{mode}: final quality is the last checkpoint");
+        // Correct at every checkpoint: from turn 1; mix, from turn 2; fixed after wave 1 (clamp3), from turn 4.
+        assert_eq!(c.correct_from["max2"], 1);
+        assert_eq!(c.correct_from["mix"], 2);
+        assert_eq!(c.correct_from["clamp3"], 4, "{mode}: a function fixed after the wave");
+        assert!(!c.correct_from.contains_key("weigh") && !c.correct_from.contains_key("total"));
+        assert_eq!(c.correct_from.values().filter(|t| **t == 4).count(), 19, "the 21, less weigh and judge");
+        assert_eq!(c.median_turn_correct, Some(1.0));
+        assert_eq!(c.recovery, [Recovery { wave: 1, functions: 34, checkpoints: None }], "{mode}: never recovered");
+        assert_eq!(c.breakage, Breakage { after_wave: 21, other: 1 }, "{mode}");
+        assert_eq!(c.tokens_per_correct, Some(901_000.0 / 87.0));
+    }
+    // Recovery counts checkpoints after the release: with weigh done at turn 4, wave 1 recovers at its second.
+    let mut log = checkpoint_log("git");
+    let mut fixed = correct_programs(t, t.after_wave(1));
+    fixed.insert("total", candidates(t, "total").wrong[0]);
+    let text: Vec<(String, String)> =
+        crate::candidates::modules(t, &fixed).into_iter().map(|(m, s)| (m.to_string(), s)).collect();
+    log.events.pop();
+    log.ev(6, None, "checkpoint", json!({"turn": 4, "modules": text}));
+    let c = measure(&log.records(), &hidden).expect("measures").checkpoints.expect("checkpoints");
+    assert_eq!(c.recovery[0].checkpoints, Some(2));
+    // Phase 1 logs no checkpoints, so its measures have none and read as recorded.
+    assert!(Log::new("git").measure().checkpoints.is_none());
 }

@@ -32,7 +32,8 @@ pub const DEFINITIONS: &[(&str, &str)] = &[
         "snapshot",
         "The driver logs the hub's integrated library after setup, after the change requests are released, and \
          after every sync and hub tool call that changes it. Each snapshot is graded under the spec version in \
-         force when it was taken: the original until the release, all change requests after.",
+         force when it was taken: the original until the first release, then the change requests released so \
+         far (Phase 1's all at once, Phase 2's wave by wave).",
     ),
     (
         "tokens",
@@ -52,12 +53,15 @@ pub const DEFINITIONS: &[(&str, &str)] = &[
         "Git and Bracken: a write (a commit's functions whose definition differs from every parent's, an artifact's \
          function) whose definition differs from the integrated one at that moment. CRDT: a hub sync after which a \
          function's definition at the hub differs from before, credited to the syncing agent. A delivery is \
-         correct if it passes the grader standalone under the version in force; an open contract's member, with \
-         the delivering agent's working copy of the other members when the delivery becomes available to others \
-         (CRDT: the document after its sync; Git: the branch at the commit; Bracken: at its next sync, each \
-         member accepted at the hub, else any of the agent's own current implementations), and the integrated \
-         library for members the copy doesn't hold. A verdict's blocked definition is judged under the version at \
-         the verdict, a member with its latest delivery's working copy.",
+         correct if it passes the grader standalone under the version in force (Phase 2: the specs released as \
+         of the delivering agent's last sync before it); an open contract's member, with the delivering agent's \
+         working copy of the other members (CRDT: its own edits that sync delivered; Git: the branch at the \
+         commit; Bracken: each member accepted at the hub, else any of the agent's own current \
+         implementations before the sync that makes the delivery available), and for members the copy \
+         doesn't hold the integrated library as the agent's last sync before the delivery left it, the point \
+         its specs come from (CRDT: the sync before the delivering one). A verdict's blocked definition is \
+         judged under the version at the verdict (Phase 2: as of the verdict-giver's last sync before it), a \
+         member with its latest delivery's working copy.",
     ),
     (
         "duplicated",
@@ -96,6 +100,20 @@ pub const DEFINITIONS: &[(&str, &str)] = &[
         "quality",
         "The last snapshot graded under all change requests: functions correct in library, present but wrong, \
          and missing.",
+    ),
+    (
+        "checkpoints",
+        "Phase 2 ranks the modes by these alone (decision 288a16ce8cb2); its per-delivery measures above are \
+         per-mode diagnostics, not comparable across modes. A checkpoint is the end of a turn index, once \
+         every agent has finished that turn: the driver logs the hub's integrated library then (Git's main, \
+         Bracken's accepted layer, CRDT's document). Each is graded with the grader, the same in every mode, \
+         under the change requests released before it; a function is correct when it is right in the library. \
+         Final: correct at the last checkpoint. Time to correct: per function correct at the last, the turn of \
+         the first checkpoint from which it is correct at every one. Recovery per wave: of the checkpoints \
+         after the wave's release, how many until its targets, every function defined in terms of them, \
+         directly or not, and their open contracts' members are all correct (never, if not by the last). \
+         Breakage: a function correct at one checkpoint and wrong at the next, after a wave if one was \
+         released between them. Tokens per correct function: the run's tokens over the final count.",
     ),
 ];
 
@@ -180,7 +198,9 @@ pub fn incomplete(records: &Records, expect: &[String]) -> Option<String> {
         let what = match e.event.as_str() {
             "run_stopped" if expected.is_none() => "the run stopped, and not by a stop the plan expects",
             "snapshot_failed" => "a snapshot of the hub failed",
+            "checkpoint_failed" => "a checkpoint of the hub failed",
             "tool_result" if e.data["record"].get("error").is_some() => "a store failed to record a tool call",
+            "sync" if e.data["record"].get("error").is_some() => "a store failed to record a sync",
             _ => continue,
         };
         return Some(format!("{what} (seq {})", e.seq));
@@ -303,6 +323,47 @@ pub struct Quality {
     pub total: u64,
 }
 
+/// Phase 2's ranking measures, from the checkpoints ([`DEFINITIONS`], `checkpoints`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Checkpoints {
+    /// Per checkpoint, in turn order.
+    pub turns: Vec<Checkpoint>,
+    /// Correct at the last checkpoint, of all functions.
+    pub correct: u64,
+    pub total: u64,
+    /// Per function correct at the last checkpoint, the turn from which it is correct at every one.
+    pub correct_from: BTreeMap<String, u32>,
+    pub median_turn_correct: Option<f64>,
+    pub recovery: Vec<Recovery>,
+    pub breakage: Breakage,
+    pub tokens_per_correct: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Checkpoint {
+    pub turn: u32,
+    /// Waves released before it.
+    pub waves: u64,
+    /// Right in the library, and right standalone.
+    pub correct: u64,
+    pub standalone: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Recovery {
+    pub wave: u64,
+    /// The functions that must be correct again.
+    pub functions: u64,
+    /// Checkpoints after the release until they all are, counting that one; none if never.
+    pub checkpoints: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Breakage {
+    pub after_wave: u64,
+    pub other: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Measures {
     pub mode: String,
@@ -317,6 +378,9 @@ pub struct Measures {
     pub discovery: Discovery,
     pub incompatible: Incompatible,
     pub quality: Quality,
+    /// Phase 2's ranking measures; Phase 1's runs logged no checkpoints, so theirs have none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoints: Option<Checkpoints>,
 }
 
 /// When something happened: its place in the log and the harness's clock.
@@ -352,6 +416,12 @@ struct Delivery {
     available: Option<Point>,
     /// For an open contract's member, the working copy it is judged with ([`working_copy`]).
     copy: Copy,
+    /// The judging point ([`Analysis::seen_at`]), and the specs it is judged under; tests check that the copy's
+    /// hub is from the same point.
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the tests' invariant"))]
+    seen: Option<u64>,
+    #[cfg_attr(not(test), expect(dead_code, reason = "read by the tests' invariant"))]
+    version: Version,
 }
 
 /// What an open contract's member is judged with (decision `979e5085a1e7`): the delivering agent's working
@@ -366,30 +436,45 @@ struct Copy {
     choices: Vec<(String, Vec<String>)>,
 }
 
-/// The most combinations of a Bracken agent's current implementations a member is judged with.
+/// The most combinations of a Bracken agent's current implementations a member is judged with, newest
+/// first.
 const MAX_CHOICES: usize = 256;
 
 /// The working copy delivery `i` is judged with, if it is an open contract's member, per mode:
-/// - CRDT: the document after the sync that delivered it, the hub's snapshot then;
-/// - Git: the branch's members at the commit (its record), over the library integrated before it;
-/// - Bracken: at the agent's next sync, for each member accepted in the integrated library, that one, else
-///   any of the agent's own current implementations (its records' latest list), as the agent's check resolves.
-fn working_copy(a: &Analysis, mode: &str, records: &CopyRecords, found: &[Found], i: usize) -> Copy {
+/// - CRDT: the agent's own edits that the sync delivered;
+/// - Git: the branch's members at the commit (its record);
+/// - Bracken: for each member accepted in the hub, that one, else any of the agent's own current
+///   implementations (its records' latest list before the sync that makes the delivery available), as the
+///   agent's check resolves;
+///
+/// and in every mode, for the rest, the hub as `seen`, the delivery's judging point, left it.
+fn working_copy(a: &Analysis, mode: &str, records: &CopyRecords, found: &[Found], i: usize, seen: Option<u64>) -> Copy {
     let task = a.hidden.task();
     let (at, agent, _, function, _, _) = &found[i];
     let Some(contract) = task.contract_of(function) else { return Copy::default() };
     let others = |f: &str| f != function && contract.members.contains(&f);
-    let before = |seq: u64| a.snaps.iter().rposition(|s| s.at.seq < seq);
+    // In every mode the hub part of the copy is the hub as the agent saw it at the judging point.
+    let base = a.hub_seen(agent, seen);
     match mode {
-        "crdt" => Copy { base: a.snaps.iter().rposition(|s| s.at.seq <= at.seq), choices: Vec::new() },
+        // The agent's document as it synced: the hub at its sync before, with its own edits, which are what
+        // this sync delivered.
+        "crdt" => {
+            let choices = found
+                .iter()
+                .filter(|(p, by, _, f, _, _)| p.seq == at.seq && by == agent && others(f))
+                .map(|(_, _, _, f, d, _)| (f.clone(), vec![d.clone()]))
+                .collect();
+            Copy { base, choices }
+        }
         "git" => {
             let held = records.members_at.get(&at.seq).cloned().unwrap_or_default();
             let choices = held.into_iter().filter(|(f, _)| others(f)).map(|(f, d)| (f, vec![d])).collect();
-            Copy { base: before(at.seq), choices }
+            Copy { base, choices }
         }
         _ => {
+            // The agent's own members as it published them: its records before the sync that makes the
+            // delivery available, so a batch delivered at one sync stays together.
             let synced = a.next_sync(agent, at.seq).map_or(u64::MAX, |p| p.seq);
-            let base = before(synced);
             let integrated = |f: &str| base.is_some_and(|k| a.snaps[k].library.get(f).is_some());
             let own = records.own.get(agent).and_then(|r| r.iter().rev().find(|(seq, _)| *seq < synced));
             let mut choices: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -404,7 +489,7 @@ fn working_copy(a: &Analysis, mode: &str, records: &CopyRecords, found: &[Found]
 }
 
 /// The working copies the records state: Git's per commit, by event, and each Bracken agent's own current
-/// implementations of members, in the order its calls recorded them.
+/// implementations of members, in the order its calls and syncs recorded them, each list oldest first.
 #[derive(Default)]
 struct CopyRecords {
     members_at: BTreeMap<u64, Held>,
@@ -462,8 +547,11 @@ fn fails(task: Task, top: &Library, base: &Library, function: &str, args: &[i64]
 
 struct Analysis<'a> {
     hidden: &'a HiddenCases,
-    released: Option<u64>,
+    /// Each release's event, and the specs in force after it.
+    releases: Vec<(u64, Version)>,
     snaps: Vec<Snap>,
+    /// For each snapshot a sync took, the syncing agent.
+    snap_by: Vec<Option<String>>,
     syncs: Vec<(Point, String)>,
     starts: Vec<(Point, String, u64)>,
     /// By function, definition, version and, for an open contract's member, the working copy it is judged with.
@@ -472,7 +560,39 @@ struct Analysis<'a> {
 
 impl Analysis<'_> {
     fn version_at(&self, seq: u64) -> Version {
-        if self.released.is_some_and(|r| r < seq) { self.hidden.task().all() } else { Version::ORIGINAL }
+        self.releases.iter().rev().find(|(r, _)| *r < seq).map_or(Version::ORIGINAL, |(_, v)| *v)
+    }
+
+    /// The point `agent`'s work at `seq` is judged at (decision `5d049d7e4996`): its last sync before `seq`,
+    /// or `None` before its first. Both the specs it is judged under ([`Analysis::version_seen`]) and the
+    /// hub its working copy falls back on ([`Analysis::hub_seen`]) come from this one point, so they can't
+    /// drift apart (finding `0b115f0c0ec0`).
+    fn seen_at(&self, agent: &str, seq: u64) -> Option<u64> {
+        self.syncs.iter().rev().find(|(p, a)| a == agent && p.seq < seq).map(|(p, _)| p.seq)
+    }
+
+    /// The specs released as of `seen`, a point from [`Analysis::seen_at`]: what the agent could see, as
+    /// its own check sees them. Phase 1, which has no waves, keeps the specs in force at `seq`, the work's
+    /// own point, as its runs were measured.
+    fn version_seen(&self, seen: Option<u64>, seq: u64) -> Version {
+        if self.hidden.task().waves().is_empty() {
+            return self.version_at(seq);
+        }
+        seen.map_or(Version::ORIGINAL, |p| self.version_at(p))
+    }
+
+    /// The hub as `agent` saw it at `seen`, a point from [`Analysis::seen_at`]: the snapshot that sync took,
+    /// else the last one before it (the sync changed nothing); before any sync, the setup snapshot. A wave
+    /// can't fall between a sync and its snapshot, since the driver holds the hub across both.
+    fn hub_seen(&self, agent: &str, seen: Option<u64>) -> Option<usize> {
+        let Some(p) = seen else { return (!self.snaps.is_empty()).then_some(0) };
+        let next = self.next_sync(agent, p).map_or(u64::MAX, |n| n.seq);
+        let own = self
+            .snaps
+            .iter()
+            .enumerate()
+            .position(|(k, s)| s.at.seq > p && s.at.seq < next && self.snap_by[k].as_deref() == Some(agent));
+        own.or_else(|| self.snaps.iter().rposition(|s| s.at.seq < p))
     }
 
     fn snap_before(&self, seq: u64) -> Option<&Snap> {
@@ -495,10 +615,12 @@ impl Analysis<'_> {
         let delivery = Library::parse([("delivery", def)]);
         let combinations = copy.choices.iter().map(|(_, d)| d.len()).product::<usize>().min(MAX_CHOICES);
         let mut c = false;
+        // Combination 0 takes every member's newest implementation, and the cap cuts off the oldest.
         for mut n in 0..combinations.max(1) {
             let mut library = base.clone();
             for (_, defs) in &copy.choices {
-                library = library.with(&Library::parse([("delivery", defs[n % defs.len()].as_str())]));
+                let newest_first = defs.len() - 1 - n % defs.len();
+                library = library.with(&Library::parse([("delivery", defs[newest_first].as_str())]));
                 n /= defs.len();
             }
             if grade_function(&library.with(&delivery), function, version, self.hidden).standalone {
@@ -545,86 +667,8 @@ impl Analysis<'_> {
 pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, String> {
     let task = hidden.task();
     let events = &records.events;
-    let mode = events
-        .iter()
-        .find(|e| e.event == "setup")
-        .and_then(|e| e.data["mode"].as_str())
-        .ok_or("the log has no setup event")?
-        .to_string();
     let point = |e: &Event| Point { seq: e.seq, ms: e.ms };
-    let mut a = Analysis {
-        hidden,
-        released: events.iter().find(|e| e.event == "changes_released").map(|e| e.seq),
-        snaps: Vec::new(),
-        syncs: events.iter().filter(|e| e.event == "sync").filter_map(|e| Some((point(e), e.agent.clone()?))).collect(),
-        starts: events
-            .iter()
-            .filter(|e| e.event == "turn_start")
-            .filter_map(|e| Some((point(e), e.agent.clone()?, u(&e.data["turn"]))))
-            .collect(),
-        correct: BTreeMap::new(),
-    };
-
-    // Graded snapshots.
-    let mut snap_agents = Vec::new();
-    for e in events.iter().filter(|e| e.event == "snapshot") {
-        let modules: Vec<(String, String)> =
-            serde_json::from_value(e.data["modules"].clone()).map_err(|e| format!("a bad snapshot: {e}"))?;
-        let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
-        let version = a.version_at(e.seq);
-        let grades = grade(&library, version, hidden);
-        let before = match a.snaps.last() {
-            None => grades.clone(),
-            Some(prev) if a.version_at(prev.at.seq) == version => prev.grades.clone(),
-            Some(prev) => grade(&prev.library, version, hidden),
-        };
-        let from_sync = e.data["after"] == "sync";
-        snap_agents.push(e.agent.clone().filter(|_| from_sync));
-        a.snaps.push(Snap { at: point(e), defs: definitions(task, &modules), library, grades, before });
-    }
-
-    // Deliveries.
-    let mut found: Vec<Found> = Vec::new();
-    if mode == "crdt" {
-        for (k, agent) in snap_agents.iter().enumerate().skip(1) {
-            let Some(agent) = agent else { continue };
-            let (old, new) = (&a.snaps[k - 1], &a.snaps[k]);
-            for (f, def) in &new.defs {
-                if old.defs.get(f) != Some(def) {
-                    let turn = a.turn_at(agent, new.at.seq);
-                    found.push((new.at, agent.clone(), turn, f.clone(), def.clone(), Some(new.at)));
-                }
-            }
-        }
-    } else {
-        for e in events.iter().filter(|e| e.event == "tool_result") {
-            let Some(agent) = &e.agent else { continue };
-            for w in e.data["record"]["writes"].as_array().into_iter().flatten() {
-                let (Some(f), Some(def)) = (w[0].as_str(), w[1].as_str()) else { continue };
-                if a.snap_before(e.seq).and_then(|s| s.defs.get(f)).map(String::as_str) != Some(def) {
-                    let available = a.next_sync(agent, e.seq);
-                    found.push((point(e), agent.clone(), u(&e.data["turn"]), f.into(), def.into(), available));
-                }
-            }
-        }
-    }
-    let mut copies = CopyRecords::default();
-    for e in events.iter().filter(|e| e.event == "tool_result") {
-        let Some(members) = e.data["record"].get("members") else { continue };
-        let held: Held = serde_json::from_value(members.clone()).unwrap_or_default();
-        match (mode.as_str(), &e.agent) {
-            ("git", _) => drop(copies.members_at.insert(e.seq, held)),
-            (_, Some(agent)) => copies.own.entry(agent.clone()).or_default().push((e.seq, held)),
-            _ => {}
-        }
-    }
-    let mut deliveries = Vec::new();
-    for (i, (at, agent, turn, function, def, available)) in found.iter().cloned().enumerate() {
-        let copy = working_copy(&a, &mode, &copies, &found, i);
-        let correct = a.correct(&function, &def, a.version_at(at.seq), &copy);
-        deliveries.push(Delivery { at, agent, turn, function, def, correct, available, copy });
-    }
-
+    let (mut a, mode, deliveries) = analyse(records, hidden)?;
     // Tokens, per turn. Step 6's backend writes a row per assistant event, and each content block of a
     // message is an event repeating the message's usage (finding `9543c1272ea0`): a message counts once,
     // at its largest figures, asking for the tools of all its rows.
@@ -830,8 +874,10 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
         for e in events.iter().filter(|e| e.event == "tool_result") {
             let blocks: Vec<(String, String)> =
                 serde_json::from_value(e.data["record"]["blocks"].clone()).unwrap_or_default();
-            let version = a.version_at(e.seq);
-            // A blocked definition is judged under the version in force at the verdict, with the working copy its
+            let giver = e.agent.as_deref().unwrap_or_default();
+            let seen = a.seen_at(giver, e.seq);
+            let version = a.version_seen(seen, e.seq);
+            // A blocked definition is judged under the specs the verdict-giver could see, with the working copy its
             // latest delivery before the verdict had, else with the other blocked definitions over the library
             // integrated then. Only an open contract's member has a working copy, so anything else is judged by
             // its own code alone.
@@ -840,7 +886,7 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
                 let copy = match delivered {
                     Some(x) => x.copy.clone(),
                     None => Copy {
-                        base: a.snaps.iter().rposition(|s| s.at.seq < e.seq),
+                        base: a.hub_seen(giver, seen),
                         choices: blocks
                             .iter()
                             .filter(|(g, _)| g != f)
@@ -869,6 +915,7 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
     }
     quality.missing += quality.total - last.len() as u64;
 
+    let checkpoints = checkpoints(&a, events, tokens);
     Ok(Measures {
         stopped: stop_cap(records).map(str::to_string),
         mode,
@@ -881,7 +928,184 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
         discovery,
         incompatible,
         quality,
+        checkpoints,
     })
+}
+
+/// The functions wave `wave` changes, as recovery counts them: its targets, every spec defined in terms of
+/// one of them, directly or not, and the members of their open contracts.
+fn changed_by(task: Task, wave: usize) -> BTreeSet<&'static str> {
+    let mut set: BTreeSet<&'static str> = BTreeSet::new();
+    for c in task.wave_changes(wave) {
+        set.insert(c.target);
+        set.extend(task.contract_of(c.target).map(|k| k.members.iter().copied()).into_iter().flatten());
+    }
+    loop {
+        let callers: Vec<&'static str> = task
+            .specs()
+            .iter()
+            .filter(|s| !set.contains(s.name) && task.defined_by(s.name).iter().any(|d| set.contains(d)))
+            .map(|s| s.name)
+            .collect();
+        if callers.is_empty() {
+            return set;
+        }
+        set.extend(callers);
+    }
+}
+
+/// Phase 2's ranking measures, if the log has checkpoints.
+fn checkpoints(a: &Analysis, events: &[Event], tokens: u64) -> Option<Checkpoints> {
+    let task = a.hidden.task();
+    let mut graded: Vec<(u32, u64, BTreeSet<&'static str>)> = Vec::new();
+    let mut turns = Vec::new();
+    for e in events.iter().filter(|e| e.event == "checkpoint") {
+        let modules: Vec<(String, String)> = serde_json::from_value(e.data["modules"].clone()).ok()?;
+        let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
+        let grades = grade(&library, a.version_at(e.seq), a.hidden);
+        let correct: BTreeSet<&'static str> = grades.iter().filter(|g| g.in_library).map(|g| g.name).collect();
+        let turn = u(&e.data["turn"]) as u32;
+        let waves = a.releases.iter().filter(|(r, _)| *r < e.seq).count() as u64;
+        let standalone = grades.iter().filter(|g| g.standalone).count() as u64;
+        turns.push(Checkpoint { turn, waves, correct: correct.len() as u64, standalone });
+        graded.push((turn, e.seq, correct));
+    }
+    let last = &graded.last()?.2;
+    let mut correct_from = BTreeMap::new();
+    for f in last {
+        let from = graded.iter().rposition(|(_, _, c)| !c.contains(f)).map_or(0, |k| k + 1);
+        correct_from.insert(f.to_string(), graded[from].0);
+    }
+    let median_turn_correct = median(correct_from.values().map(|t| f64::from(*t)).collect());
+    let recovery = a
+        .releases
+        .iter()
+        .enumerate()
+        .map(|(k, (r, _))| {
+            let set = changed_by(task, k + 1);
+            let after = graded.iter().filter(|(_, seq, _)| seq > r);
+            let checkpoints = after.enumerate().find(|(_, (_, _, c))| set.is_subset(c)).map(|(n, _)| n as u64 + 1);
+            Recovery { wave: k as u64 + 1, functions: set.len() as u64, checkpoints }
+        })
+        .collect();
+    let mut breakage = Breakage::default();
+    for pair in graded.windows(2) {
+        let ((_, from, was), (_, to, now)) = (&pair[0], &pair[1]);
+        let broken = was.difference(now).count() as u64;
+        if a.releases.iter().any(|(r, _)| from < r && r < to) {
+            breakage.after_wave += broken;
+        } else {
+            breakage.other += broken;
+        }
+    }
+    let total = task.specs().len() as u64;
+    let correct = last.len() as u64;
+    let tokens_per_correct = (correct > 0).then(|| tokens as f64 / correct as f64);
+    Some(Checkpoints {
+        turns,
+        correct,
+        total,
+        correct_from,
+        median_turn_correct,
+        recovery,
+        breakage,
+        tokens_per_correct,
+    })
+}
+
+/// The log read for the measures: the analysis, the mode, and every delivery, judged.
+fn analyse<'h>(records: &Records, hidden: &'h HiddenCases) -> Result<(Analysis<'h>, String, Vec<Delivery>), String> {
+    let task = hidden.task();
+    let events = &records.events;
+    let mode = events
+        .iter()
+        .find(|e| e.event == "setup")
+        .and_then(|e| e.data["mode"].as_str())
+        .ok_or("the log has no setup event")?
+        .to_string();
+    let point = |e: &Event| Point { seq: e.seq, ms: e.ms };
+    let mut a = Analysis {
+        hidden,
+        // Phase 1's one release names no wave.
+        releases: events
+            .iter()
+            .filter(|e| e.event == "changes_released")
+            .map(|e| (e.seq, task.after_wave(e.data["wave"].as_u64().map_or(1, |w| w as usize))))
+            .collect(),
+        snaps: Vec::new(),
+        snap_by: Vec::new(),
+        syncs: events.iter().filter(|e| e.event == "sync").filter_map(|e| Some((point(e), e.agent.clone()?))).collect(),
+        starts: events
+            .iter()
+            .filter(|e| e.event == "turn_start")
+            .filter_map(|e| Some((point(e), e.agent.clone()?, u(&e.data["turn"]))))
+            .collect(),
+        correct: BTreeMap::new(),
+    };
+
+    // Graded snapshots.
+    for e in events.iter().filter(|e| e.event == "snapshot") {
+        let modules: Vec<(String, String)> =
+            serde_json::from_value(e.data["modules"].clone()).map_err(|e| format!("a bad snapshot: {e}"))?;
+        let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
+        let version = a.version_at(e.seq);
+        let grades = grade(&library, version, hidden);
+        let before = match a.snaps.last() {
+            None => grades.clone(),
+            Some(prev) if a.version_at(prev.at.seq) == version => prev.grades.clone(),
+            Some(prev) => grade(&prev.library, version, hidden),
+        };
+        let from_sync = e.data["after"] == "sync";
+        a.snap_by.push(e.agent.clone().filter(|_| from_sync));
+        a.snaps.push(Snap { at: point(e), defs: definitions(task, &modules), library, grades, before });
+    }
+
+    // Deliveries.
+    let mut found: Vec<Found> = Vec::new();
+    if mode == "crdt" {
+        for (k, agent) in a.snap_by.iter().enumerate().skip(1) {
+            let Some(agent) = agent else { continue };
+            let (old, new) = (&a.snaps[k - 1], &a.snaps[k]);
+            for (f, def) in &new.defs {
+                if old.defs.get(f) != Some(def) {
+                    let turn = a.turn_at(agent, new.at.seq);
+                    found.push((new.at, agent.clone(), turn, f.clone(), def.clone(), Some(new.at)));
+                }
+            }
+        }
+    } else {
+        for e in events.iter().filter(|e| e.event == "tool_result") {
+            let Some(agent) = &e.agent else { continue };
+            for w in e.data["record"]["writes"].as_array().into_iter().flatten() {
+                let (Some(f), Some(def)) = (w[0].as_str(), w[1].as_str()) else { continue };
+                if a.snap_before(e.seq).and_then(|s| s.defs.get(f)).map(String::as_str) != Some(def) {
+                    let available = a.next_sync(agent, e.seq);
+                    found.push((point(e), agent.clone(), u(&e.data["turn"]), f.into(), def.into(), available));
+                }
+            }
+        }
+    }
+    let mut copies = CopyRecords::default();
+    for e in events.iter().filter(|e| e.event == "tool_result" || e.event == "sync") {
+        let Some(members) = e.data["record"].get("members") else { continue };
+        let held: Held = serde_json::from_value(members.clone()).unwrap_or_default();
+        match (mode.as_str(), &e.agent) {
+            ("git", _) => drop(copies.members_at.insert(e.seq, held)),
+            (_, Some(agent)) => copies.own.entry(agent.clone()).or_default().push((e.seq, held)),
+            _ => {}
+        }
+    }
+    let mut deliveries = Vec::new();
+    for (i, (at, agent, turn, function, def, available)) in found.iter().cloned().enumerate() {
+        // A CRDT delivery is the snapshot after the sync that delivered it: the work was made before that sync.
+        let made = if mode == "crdt" { a.seen_at(&agent, at.seq).unwrap_or(at.seq) } else { at.seq };
+        let seen = a.seen_at(&agent, made);
+        let copy = working_copy(&a, &mode, &copies, &found, i, seen);
+        let version = a.version_seen(seen, made);
+        let correct = a.correct(&function, &def, version, &copy);
+        deliveries.push(Delivery { at, agent, turn, function, def, correct, available, copy, seen, version });
+    }
+    Ok((a, mode, deliveries))
 }
 
 /// A table row: its name and how a run's cell reads.
@@ -938,6 +1162,46 @@ pub fn table(runs: &[Measures]) -> String {
             }),
         ),
     ];
+    // Phase 2: the checkpoint measures rank the modes; the rest are per-mode diagnostics (decision
+    // `288a16ce8cb2`). Phase 1's table is as it was.
+    let rows = if runs.iter().any(|m| m.checkpoints.is_some()) {
+        let cp = |m: &Measures, f: &dyn Fn(&Checkpoints) -> String| m.checkpoints.as_ref().map_or("n/a".into(), f);
+        let mut ranked: Vec<Row> = vec![
+            (
+                "Ranking: checkpoints (turn: correct)",
+                Box::new(move |m| {
+                    cp(m, &|c| {
+                        c.turns.iter().map(|t| format!("{}: {}", t.turn, t.correct)).collect::<Vec<_>>().join(", ")
+                    })
+                }),
+            ),
+            ("  final correct", Box::new(move |m| cp(m, &|c| format!("{}/{}", c.correct, c.total)))),
+            ("  median turn to correct", Box::new(move |m| cp(m, &|c| f(c.median_turn_correct)))),
+            (
+                "  recovery per wave (checkpoints)",
+                Box::new(move |m| {
+                    cp(m, &|c| {
+                        let r: Vec<String> = c
+                            .recovery
+                            .iter()
+                            .map(|r| r.checkpoints.map_or("never".into(), |n| n.to_string()))
+                            .collect();
+                        r.join(", ")
+                    })
+                }),
+            ),
+            (
+                "  breakage: after a wave, other",
+                Box::new(move |m| cp(m, &|c| format!("{}, {}", c.breakage.after_wave, c.breakage.other))),
+            ),
+            ("  tokens per correct function", Box::new(move |m| cp(m, &|c| f(c.tokens_per_correct)))),
+            ("Per-delivery diagnostics, per mode only, not comparable across modes:", Box::new(|_| String::new())),
+        ];
+        ranked.extend(rows);
+        ranked
+    } else {
+        rows
+    };
     let header: Vec<String> = runs.iter().map(|m| m.mode.clone()).collect();
     let cells: Vec<Vec<String>> = rows.iter().map(|(_, r)| runs.iter().map(r).collect()).collect();
     let first = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(0).max("Measure".len());

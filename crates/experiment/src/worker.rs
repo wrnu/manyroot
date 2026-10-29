@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 use crate::args::{Args, MAX_NOTES, check_text};
 use crate::mode::{Session, Store, StoreConfig, Transfer, mode_under};
 use crate::sandbox::Sandbox;
+use crate::task::Task;
 
 /// The largest request or reply line a worker accepts: the hub's first export, which seeds each copy, fits easily.
 pub const MAX_LINE: usize = 64 * 1024 * 1024;
@@ -62,6 +63,7 @@ pub fn serve(mode: &str, config: StoreConfig) -> Result<(), String> {
     }
     let mode = mode_under(mode, config.accept_rule).ok_or_else(|| format!("no mode {mode}"))?;
     let notes = config.dir.join("notes.txt");
+    let task = config.task;
     let mut store = mode.open(config);
     let stdin = std::io::stdin();
     let mut out = std::io::stdout().lock();
@@ -69,7 +71,7 @@ pub fn serve(mode: &str, config: StoreConfig) -> Result<(), String> {
     let mut input = Lines::new(stdin.lock(), MAX_LINE);
     while input.next_line(&mut line)? {
         let reply = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => handle(store.as_mut(), &notes, req),
+            Ok(req) => handle(store.as_mut(), &notes, task, req),
             Err(e) => Reply::from(Err(format!("bad request: {e}"))),
         };
         let text = serde_json::to_string(&reply).map_err(|e| e.to_string())?;
@@ -78,7 +80,7 @@ pub fn serve(mode: &str, config: StoreConfig) -> Result<(), String> {
     Ok(())
 }
 
-fn handle(store: &mut dyn Store, notes: &Path, req: Request) -> Reply {
+fn handle(store: &mut dyn Store, notes: &Path, task: Task, req: Request) -> Reply {
     let bytes = match req.bytes.as_deref().map(hex::decode).transpose() {
         Ok(b) => b,
         Err(e) => return Reply::from(Err(format!("bad bytes: {e}"))),
@@ -116,7 +118,14 @@ fn handle(store: &mut dyn Store, notes: &Path, req: Request) -> Reply {
             let result = session(&req.args).and_then(|s| store.hub_tool(&s, &name, args));
             recorded(store, &name, args, result)
         }
-        "release" => Reply::from(store.release_changes()),
+        "record_sync" => Reply::from(store.record_sync()),
+        "release" => Reply::from(
+            req.args["wave"]
+                .as_u64()
+                .filter(|w| (1..=task.releases() as u64).contains(w))
+                .ok_or_else(|| format!("release needs a wave, from 1 to {}", task.releases()))
+                .and_then(|w| store.release_changes(w as usize)),
+        ),
         "integrated" => Reply::from(store.integrated().map(|m| json!(m))),
         "tool" => {
             let name = req.tool.unwrap_or_default();

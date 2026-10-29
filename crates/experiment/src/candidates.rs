@@ -131,6 +131,13 @@ pub const UPDATES: &[Update] = &[
     },
 ];
 
+/// A change request's target as the change has it: two correct and two subtly wrong programs, judged in
+/// the [`correct_library`] of the original specs with that change alone.
+pub struct Revision {
+    pub change: Change,
+    pub candidates: Candidates,
+}
+
 /// `task`'s candidates, one entry per spec.
 pub fn of(task: Task) -> &'static [Candidates] {
     match task {
@@ -139,11 +146,19 @@ pub fn of(task: Task) -> &'static [Candidates] {
     }
 }
 
-/// `task`'s updates, one per change request.
+/// `task`'s updates, at least one per change request, in the order they apply.
 pub fn updates(task: Task) -> &'static [Update] {
     match task {
         Task::Phase1 => UPDATES,
-        Task::Phase2 => &[],
+        Task::Phase2 => phase2::UPDATES,
+    }
+}
+
+/// `task`'s revisions, one per change request. Phase 1's runs had none, so it has none.
+pub fn revisions(task: Task) -> &'static [Revision] {
+    match task {
+        Task::Phase1 => &[],
+        Task::Phase2 => phase2::REVISIONS,
     }
 }
 
