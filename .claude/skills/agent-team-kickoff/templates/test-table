@@ -165,8 +165,11 @@ pass_on() {
 # hangs ends with everything cargo started (finding c7d17b82e315). That group is out of reach of a
 # signal to this part's, so the part's traps pass it on (pass_on). wait, which a signal interrupts at
 # once, gives the exit even if bash has already reaped timeout (note fa805ecf517e); after a signal it
-# waits again while timeout runs. timeout's pid is in a file while it runs, and after a stop, for
-# stop_parts to kill what in its group ignored the SIGTERM.
+# waits again while timeout runs. timeout's pid is in a file while it runs, for stop_parts to kill
+# what in its group ignored the SIGTERM. Afterwards it stays only if the run ended in a stop (finding
+# a9acfeadbe06) or at the limit (124, or 137 after -k; note 263eb49eb068), and only while the group
+# still has a process in it (note 76933aa89d52). After a normal end it's cleared: the group is gone,
+# and its id could be another process's.
 bounded() {
   local t rc=0 limit=$1
   shift
@@ -178,7 +181,9 @@ bounded() {
     rc=0
     wait "$t" || rc=$?
   done
-  $stopping || : >"$split_tmp/timeout.pid"
+  if ! { $stopping || [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; } || ! kill -0 -- "-$t" 2>/dev/null; then
+    : >"$split_tmp/timeout.pid"
+  fi
   return "$rc"
 }
 
@@ -221,22 +226,17 @@ echo "LIST end ignored"'
   # on them with wait, which a signal interrupts at once.
   # shellcheck disable=SC2329 # run by the EXIT trap
   stop_parts() {
-    local box job here_stopped=false t
+    local box job t
     # jobs -p: each part from its fork, before its pid is saved, as a signal between the two needs.
     for job in $(jobs -p); do
-      if [ "$job" = "$box_job" ]; then
-        echo "test-table: stopping the box" >&2
-      else
-        echo "test-table: stopping the tests here" >&2
-        here_stopped=true
-      fi
+      if [ "$job" = "$box_job" ]; then echo "test-table: stopping the box" >&2; else echo "test-table: stopping the tests here" >&2; fi
       stop_group "$job"
     done
-    # timeout's own group, only if the tests here were stopped while it ran and something in it
-    # outlived them: only SIGKILL is sure. Never after they ended by themselves, when the group is
-    # gone and its id could be another process's.
+    # timeout's own group, if something in it outlived the tests here: only SIGKILL is sure. bounded
+    # leaves its pid only while timeout runs, which the loop above has stopped, or after a stop or a
+    # limit hit, while the group still had a process in it; never after a normal end.
     t=$(cat "$split_tmp/timeout.pid" 2>/dev/null || true)
-    if $here_stopped && [ -n "$t" ] && kill -0 -- "-$t" 2>/dev/null; then
+    if [ -n "$t" ] && kill -0 -- "-$t" 2>/dev/null; then
       kill -KILL -- "-$t" 2>/dev/null || true
     fi
     box=$(box_in "$split_tmp/box")
