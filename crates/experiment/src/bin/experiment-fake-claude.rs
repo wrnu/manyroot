@@ -308,12 +308,20 @@ fn connect_loop(target: &str, file: &Path) -> ! {
     }
 }
 
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     static bootstrap_port: u32;
     fn bootstrap_look_up(bp: u32, name: *const std::ffi::c_char, sp: *mut u32) -> i32;
 }
 
+/// Elsewhere there are no mach services, so none can be looked up.
+#[cfg(not(target_os = "macos"))]
+fn mach_lookup(_name: &str) -> bool {
+    false
+}
+
 /// Whether the mach service `name` can be looked up: the keychain is behind such services.
+#[cfg(target_os = "macos")]
 fn mach_lookup(name: &str) -> bool {
     let Ok(name) = std::ffi::CString::new(name) else { return false };
     let mut port = 0u32;

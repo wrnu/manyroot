@@ -706,7 +706,7 @@ impl GitStore {
         std::fs::create_dir_all(self.work()).map_err(|e| format!("creating the copy: {e}"))?;
         self.git(&["init", "--quiet"], None)?;
         self.take_bundle(bundle, None, |r| (r == "refs/heads/main").then(|| "refs/remotes/hub/main".to_string()))?;
-        self.git(&["checkout", "--quiet", "--detach", "--end-of-options", "refs/remotes/hub/main", "--"], None)?;
+        self.git(&["switch", "--quiet", "--detach", "--end-of-options", "refs/remotes/hub/main"], None)?;
         Ok(json!({}))
     }
 

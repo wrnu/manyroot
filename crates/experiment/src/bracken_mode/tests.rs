@@ -82,6 +82,16 @@ fn store_as(dir: PathBuf, bracken: PathBuf, identity: &str, accept_rule: AcceptR
     BrackenStore { config, runs: 0, files: 0 }
 }
 
+/// A stand-in for a bracken that never stops writing, whatever its arguments: GNU `yes` would refuse
+/// bracken's options and exit at once.
+fn endless_writer(dir: &std::path::Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join("endless");
+    std::fs::write(&path, "#!/bin/sh\nexec /usr/bin/yes\n").expect("the stand-in");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    path
+}
+
 /// A hub stating the task, and agents a and b joined to it, each in its own directory under `root`.
 fn ground_of(root: &std::path::Path, rule: AcceptRule) -> (BrackenStore, BrackenStore, BrackenStore) {
     let at = |name: &str| {
@@ -507,11 +517,11 @@ fn the_artifact_tool_refuses_what_cant_be_an_implementation() {
 
 #[test]
 fn a_sync_session_ends_at_its_deadline_whatever_bracken_does() {
-    // `yes` stands in for a bracken that never stops writing, and the peer never reads.
+    // `endless_writer` stands in for a bracken that never stops writing, and the peer never reads.
     let dir = tempfile::tempdir().expect("a temp dir");
     let socket = dir.path().join("s.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
-    let mut s = store(dir.path().to_path_buf(), PathBuf::from("/usr/bin/yes"));
+    let mut s = store(dir.path().to_path_buf(), endless_writer(dir.path()));
     let session = Session { sync_seconds: 1, ..Session::default() };
     let (tx, rx) = std::sync::mpsc::channel();
     let held = std::thread::spawn(move || {
@@ -529,11 +539,11 @@ fn a_sync_session_ends_at_its_deadline_whatever_bracken_does() {
 
 #[test]
 fn a_sync_session_that_never_ends_by_itself_is_stopped_at_its_deadline() {
-    // `yes` never stops writing and this peer never stops reading, so only the deadline ends it.
+    // `endless_writer` never stops writing and this peer never stops reading, so only the deadline ends it.
     let dir = tempfile::tempdir().expect("a temp dir");
     let socket = dir.path().join("s.sock");
     let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
-    let mut s = store(dir.path().to_path_buf(), PathBuf::from("/usr/bin/yes"));
+    let mut s = store(dir.path().to_path_buf(), endless_writer(dir.path()));
     let session = Session { sync_seconds: 1, ..Session::default() };
     let reader = std::thread::spawn(move || {
         use std::io::Read;

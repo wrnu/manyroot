@@ -2,6 +2,7 @@
 # test-table: the whole test table, as the manager counts it, in one command.
 #
 #   test-table
+#   test-table --remote
 #
 # Runs, from the top of the checkout it lives in, stopping at the first that fails:
 #   cargo fmt --check
@@ -16,12 +17,93 @@
 #
 # Needs the x86_64-unknown-linux-gnu target (rustup target add x86_64-unknown-linux-gnu), and
 # timeout (gtimeout on macOS, from coreutils).
+#
+# --remote runs the same table, unchanged, in one boat.dev box instead of on this machine (owner
+# decision 25c1e3543e76): HEAD and origin/main go in as a git bundle, the box checks HEAD out with
+# origin/main beside it and runs this script there, so the Ground guards check the same commits. The
+# box gets no account secrets (--no-env), no credentials, and nothing the bundle doesn't hold: the
+# bundle is the only thing pushed. The tree must be clean, so what's tested is HEAD. It prints the
+# box's output, its exit and its cost line, and exits with the box's exit. The box is deleted on
+# every way out: boat run deletes it when the command ends or is interrupted, and once boat has
+# printed the box's id, a box still listed in any state when this exits (or any box, if boat can't
+# list them) is deleted by id. A Ctrl-C before boat prints the id leaves the deletion to boat run
+# alone. In the box, the guards use the bracken cargo just built.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$(git -C "$here" rev-parse --show-toplevel)"
 fail() { echo "test-table: $*" >&2; exit 1; }
 timeout=$(command -v timeout || command -v gtimeout) || fail "needs timeout (on macOS, gtimeout from coreutils)"
+
+# The table in one boat box, for HEAD.
+remote() {
+  local rc line
+  command -v boat >/dev/null || fail "--remote needs boat (reference ea41264b3c38)"
+  [ -z "$(git status --porcelain)" ] || fail "--remote tests HEAD: commit or set aside the changes first"
+  git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
+  # tmp, out and box are globals: the EXIT trap runs after this function has returned.
+  tmp=$(mktemp -d)
+  out="$tmp/box.out"
+  box=''
+  # Whether the box may still exist: listed in any state, or boat can't say. --all, because plain
+  # list shows only running boxes, and one left stopped, pending, stopping or in error keeps its data.
+  # shellcheck disable=SC2329 # run by cleanup
+  left() {
+    local listing
+    ! listing=$(boat list --all --json 2>/dev/null) || grep -qE "\"id\": *\"$box\"" <<<"$listing"
+  }
+  # Every way out deletes the box if boat left one, and the bundle. The id is the one boat announces
+  # ("bx_… ready"), not any id the box's own output mentions.
+  # shellcheck disable=SC2329 # run by the EXIT trap
+  cleanup() {
+    if [ -z "$box" ] && [ -f "$out" ]; then
+      box=$(grep -oE '^bx_[a-z0-9]+ ready' "$out" | head -1 | cut -d' ' -f1 || true)
+    fi
+    if [ -n "$box" ] && left; then
+      echo "test-table: deleting box $box" >&2
+      # It fails with "not found" if boat had deleted it after all; the check after says which.
+      boat delete --yes "$box" >/dev/null 2>&1 || true
+      ! left || echo "test-table: box $box may be left; see boat list --all, and delete it: boat delete --yes $box" >&2
+    fi
+    rm -rf -- "$tmp"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT TERM
+  mkdir "$tmp/push"
+  git bundle create -q "$tmp/push/tree.bundle" HEAD refs/remotes/origin/main
+  # In the box: the tools it lacks, HEAD checked out with origin/main beside it, then this script.
+  # It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
+  # programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both.
+  # The git-core PPA has the current git.
+  # shellcheck disable=SC2016 # expanded in the box
+  local inner='set -eu
+sudo=; [ "$(id -u)" -eq 0 ] || sudo=sudo
+$sudo add-apt-repository -y ppa:git-core/ppa >/dev/null 2>&1
+$sudo apt-get install -y -qq git b3sum >/dev/null 2>&1
+git init -q tree
+cd tree
+git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
+git checkout -q tested
+BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table'
+  set +e
+  # tee -i: a Ctrl-C must not stop the copy before boat has printed the box it's deleting.
+  boat run --no-env --push "$tmp/push" --type default --timeout 2400 -- bash -c "$inner" 2>&1 | tee -i "$out"
+  rc=${PIPESTATUS[0]}
+  set -e
+  line=$(grep -E '^exit [0-9]+ · ' "$out" | tail -1 || true)
+  echo "test-table: box: ${line:-no cost line from boat}"
+  if [ "$rc" -ne 0 ]; then
+    echo "test-table: the box's table exited $rc" >&2
+    exit "$rc"
+  fi
+  echo "test-table: all passed at $(git rev-parse HEAD), in a box"
+}
+
+case "${1:-}" in
+  '') ;;
+  --remote) remote; exit 0 ;;
+  *) fail "usage: test-table [--remote]" ;;
+esac
 
 step() {
   echo "test-table: $*"

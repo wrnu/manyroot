@@ -25,3 +25,9 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
+
+# Dependencies optimized in dev builds and tests: signing and hashing at opt-level 0 made the demo's
+# adversary tests 3x slower, and the full test table too slow for a 4-vCPU boat box (task 489bfeb6b5af).
+# The workspace's own crates stay unoptimized, for debugging.
+[profile.dev.package."*"]
+opt-level = 2
