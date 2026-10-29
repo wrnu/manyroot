@@ -104,6 +104,9 @@ pub trait Backend: Sync {
     fn lockstep(&self) -> bool {
         false
     }
+
+    /// Tests only: called while a checkpoint holds the hub, between reading its library and logging it.
+    fn checkpoint_read(&self, _turn: u32) {}
 }
 
 /// The next agent-turn allowed to run in lockstep, and the agents that have stopped playing.
@@ -365,7 +368,7 @@ impl Run<'_> {
             }
             self.events.log(Some(name), "turn_end", json!({"turn": turn}));
             let done = self.turns_done.fetch_add(1, Ordering::SeqCst) + 1;
-            self.checkpoint(turn);
+            self.checkpoint(turn, backend);
             self.maybe_release(done)?;
             self.lockstep_pass();
         }
@@ -412,20 +415,28 @@ impl Run<'_> {
     /// Phase 2 only (decision `288a16ce8cb2`): once every agent has finished turn `turn`, logs the hub's
     /// integrated library as it is at that moment (Git's main, Bracken's accepted layer, CRDT's document),
     /// which the measures grade to rank the modes. Phase 1's logs stay as its runs wrote them.
-    fn checkpoint(&self, turn: u32) {
+    ///
+    /// The read and its entry are one step at the hub (note `5b5757358523`). A release on another agent's
+    /// thread holds the hub from its release to its entry too, so no release falls between a checkpoint's
+    /// read and its entry. The measures then grade the library under the specs it was read under: those
+    /// released before its entry.
+    fn checkpoint(&self, turn: u32, backend: &dyn Backend) {
         if self.cfg.plan.task.waves().is_empty() {
             return;
         }
-        let mut finished = self.finished.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(count) = finished.get_mut(turn as usize - 1) else { return };
-        *count += 1;
-        if *count < self.cfg.agents {
-            return;
+        {
+            let mut finished = self.finished.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(count) = finished.get_mut(turn as usize - 1) else { return };
+            *count += 1;
+            if *count < self.cfg.agents {
+                return;
+            }
         }
         let mut hub = self.hub();
         let modules = hub
             .ok(&Request { op: "integrated".into(), ..Request::default() })
             .and_then(|r| serde_json::from_value::<Vec<(String, String)>>(r.result).map_err(|e| e.to_string()));
+        backend.checkpoint_read(turn);
         match modules {
             Ok(modules) => self.events.log(None, "checkpoint", json!({"turn": turn, "modules": modules})),
             Err(e) => {
@@ -433,6 +444,7 @@ impl Run<'_> {
                 self.events.log(None, "checkpoint_failed", data);
             }
         }
+        drop(hub);
     }
 
     /// Releases every wave due once `done` agent-turns are used: to all agents at once, at the same point
@@ -452,6 +464,7 @@ impl Run<'_> {
                 return Ok(());
             }
             let wave = released.len() + 1;
+            // The release and its entry are one step at the hub, as a checkpoint's read and entry are.
             let mut hub = self.hub();
             let reply = hub.ok(&Request { op: "release".into(), args: json!({"wave": wave}), ..Request::default() })?;
             let data = if waves.is_empty() {

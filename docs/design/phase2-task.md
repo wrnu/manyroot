@@ -597,7 +597,16 @@ hand-worked trace.
 **Completeness** (finding `bf3fde3cf637`). A checkpoint that isn't a
 module list is an error, as a bad snapshot is. A Phase 2 run with a turn
 that has no checkpoint is incomplete and isn't measured. The exception is
-the turn that a stop the plan expects cut short.
+a stop the plan expects. It can catch the agents spread over several turns,
+and any turn that some agent never ended has no checkpoint and needs none.
+A turn every agent ended still needs its checkpoint.
+
+**A checkpoint and a release** (note `5b5757358523`). A checkpoint reads
+the hub's library and logs it as one step under the hub's lock. A release
+does the same with its change and its entry. So no wave goes out between a
+checkpoint's read and its entry, and each checkpoint is graded under the
+specs it was read under. A test pauses a checkpoint between the two while
+another agent's turn makes a wave due, and the release waits.
 
 **The full mock run:** 10 agents and 8 turns in each mode, sandboxed, with
 no turn errors. The reports are recorded as evidence on the step's PR.
