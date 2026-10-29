@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use manyroot::store::{self, GroundInfo};
 use manyroot::validation::{open_conflicts, open_supersessors};
@@ -22,6 +22,7 @@ mod remote;
 mod runs;
 mod serve;
 mod terminal;
+mod verify;
 mod view;
 mod wire;
 
@@ -113,19 +114,36 @@ enum Command {
         #[arg(long, default_value = "")]
         note: String,
     },
-    /// Record the outcome of checking a contribution.
+    /// Record the outcome of checking a contribution: a verdict you give, or with --run, the result of
+    /// running a command.
+    ///
+    /// Usage: `bracken evidence <TARGET> <VERDICT> --method <METHOD>`, where the target and verdict may
+    /// also come after `--`; or `bracken evidence <TARGET> --run -- <COMMAND> [ARGS]`.
     Evidence {
-        target: String,
-        verdict: Verdict,
-        /// How it was checked, e.g. "cargo test".
-        #[arg(long)]
-        method: String,
-        #[arg(long, default_value = "")]
+        /// The contribution checked (required).
+        target: Option<String>,
+        /// pass or fail (required, except with --run, where the command's exit decides).
+        #[arg(conflicts_with = "run")]
+        verdict: Option<Verdict>,
+        /// How it was checked, e.g. "cargo test" (required, except with --run, where it's the command line).
+        #[arg(long, conflicts_with = "run")]
+        method: Option<String>,
+        #[arg(long, default_value = "", conflicts_with = "run")]
         details: String,
         /// Read the details from a regular file, or "-" for stdin, so they never appear on a command
         /// line. Process substitution (`<(...)`) is a pipe, not a regular file: pipe into "-" instead.
-        #[arg(long, value_name = "PATH", conflicts_with = "details")]
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["details", "run"])]
         details_file: Option<PathBuf>,
+        /// Run the command given after `--` (no shell, in this directory, with no input), its output
+        /// shown on stderr, and record pass if it exits 0, else fail. The method is the command line, and
+        /// the details are its exit and the last 40 lines (at most 8000 bytes) of its output, which
+        /// become permanent in the Ground: don't run a command whose output can hold secrets. Nothing is
+        /// recorded if it can't start. Exits with the command's exit code.
+        #[arg(long, requires = "command")]
+        run: bool,
+        /// After `--`: the command for --run, or without --run the target and verdict.
+        #[arg(last = true, value_name = "COMMAND")]
+        command: Vec<String>,
     },
     /// Withdraw one of your own contributions.
     Retract {
@@ -444,13 +462,48 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let (from, to) = (resolve(&s, &from)?, resolve(&s, &to)?);
             println!("{}", contribute(&mut s, &who, Body::Relation { from, kind, to, note })?);
         }
-        Command::Evidence { target, verdict, method, details, details_file } => {
+        Command::Evidence { target, verdict, method, details, details_file, run, command } => {
+            // Everything after `--` is one list to clap. With --run it's the command. Without, it's the
+            // target and verdict, so values that look like options can't be read as options there.
+            let (target, verdict, command) = if run {
+                ensure!(!command.is_empty(), "--run needs a command after --, e.g. --run -- cargo test");
+                (target.context("which contribution? give its id before --run")?, None, command)
+            } else {
+                let mut words = command.into_iter();
+                let target = target.or_else(|| words.next()).context("which contribution? give its id")?;
+                let verdict = match verdict {
+                    Some(v) => v,
+                    None => words
+                        .next()
+                        .context("pass or fail? give a verdict, or --run with a command")?
+                        .parse::<Verdict>()
+                        .map_err(|e| anyhow::anyhow!("the verdict is pass or fail: {e}"))?,
+                };
+                ensure!(words.next().is_none(), "a command after -- runs only with --run; nothing recorded");
+                (target, Some(verdict), Vec::new())
+            };
             let who = signer(&s, agent)?;
+            let target = resolve(&s, &target)?;
+            if run {
+                // The signer and target are settled first, so a run is never wasted on a refusal after.
+                let outcome = verify::run(&command)?;
+                let body = Body::Evidence {
+                    target,
+                    verdict: outcome.verdict,
+                    method: outcome.method,
+                    details: outcome.details,
+                };
+                let id = contribute(&mut s, &who, body)?;
+                BROKEN_PIPE_STATUS.store(i32::from(outcome.status), Ordering::Relaxed);
+                println!("{id}");
+                return Ok(ExitCode::from(outcome.status));
+            }
             let details = match details_file {
                 Some(path) => read_details(&path)?,
                 None => details,
             };
-            let target = resolve(&s, &target)?;
+            let verdict = verdict.expect("set above without --run");
+            let method = method.context("how was it checked? give --method, or use --run")?;
             println!("{}", contribute(&mut s, &who, Body::Evidence { target, verdict, method, details })?);
         }
         Command::Retract { target, reason } => {

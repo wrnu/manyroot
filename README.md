@@ -44,12 +44,22 @@ REQ=$(bracken claim "Sessions need bounded token lifetimes" --tag auth)
 # The artifact and its implements relation in one call; it prints both ids, the artifact's first.
 IMPL=$(bracken artifact src/session.rs --media-type text/x-rust --implements $REQ | head -1)
 bracken evidence $IMPL pass --method "cargo test" --as val
+# Or check and record in one step: pass if the command exits 0, else fail.
+bracken evidence $IMPL --run --as val -- cargo test
 
 bracken log                          # everything, in causal order
 bracken log --since ""               # the same, then a cursor: pass it next time for only what is new
 bracken log --compact                # one line each (at most 200 characters), shortest unique ids (8+ digits)
 bracken log --since "$C" --limit 50  # only the most recent 50 of what is new; the cursor still moves past all
 ```
+
+`evidence --run -- <command> [args]` runs the command without a shell, in the current directory, with no
+input, and shows its output on stderr as it runs. It records `pass` if the command exits 0 and `fail`
+otherwise. The method is the command line, and the details are its exit and the last 40 lines (at most
+8000 bytes) of its output, with control characters removed. It records nothing if the command can't
+start, and exits with the command's exit code. The output becomes permanent in the Ground, so don't use
+it for a command whose output can hold secrets. Without `--run`, the target and verdict may come after
+`--` too, as before.
 
 With `--since` or `--limit`, `log --json` prints an object, `{"contributions": [...], "cursor": "...",
 "omitted": N}`, instead of the bare array. A cursor means the same only under the same filters: new work

@@ -628,6 +628,63 @@ fn the_status_view_agrees_with_accepted_and_differs_only_by_the_tasks_rules() {
     assert_eq!(accepted_of(&mut b, &inc), None, "not an implementation the task counts");
 }
 
+/// Owner decision f3405c284180, change B: in Phase 2, check can record its result as the caller's evidence
+/// in the same call, through the evidence tool's own rules: a pass that counts, a fail that keeps an
+/// implementation out and is recorded as blocking it. Phase 1's check is as its runs were given it.
+#[test]
+fn check_records_its_result_as_evidence_in_the_same_call() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, mut b) = ground_of(dir.path(), AcceptRule::OnePass);
+    let abs = implement_in(&mut a, "abs", "a 0 < a neg a ?");
+    let sq = implement_in(&mut a, "sq", "a a +");
+    carry(&mut a, &mut b);
+
+    let plain = b.tool("check", &json!({"id": &abs[..8]})).expect("a check");
+    assert!(plain.get("evidence").is_none(), "without record, nothing is recorded: {plain}");
+    assert_eq!(accepted_of(&mut b, &abs).as_deref(), Some("waiting"));
+
+    let args = json!({"id": &abs[..8], "record": true});
+    let passed = b.tool("check", &args).expect("a check");
+    assert_eq!(
+        (passed["ok"].as_bool(), passed["evidence"]["verdict"].as_str()),
+        (Some(true), Some("pass")),
+        "{passed}"
+    );
+    let id = passed["evidence"]["id"].as_str().expect("the evidence's id").to_string();
+    let shown = b.tool("show", &json!({"id": id})).expect("the evidence");
+    assert_eq!(
+        (shown["body"]["method"].as_str(), shown["body"]["target"].as_str()),
+        (Some("check"), Some(abs.as_str()))
+    );
+    assert_eq!(shown["body"]["details"], passed["details"]);
+    assert_eq!(accepted_of(&mut b, &abs).as_deref(), Some("accepted"), "an independent pass counts");
+    assert!(b.record("check", &args, &passed).expect("a record").is_null(), "a pass blocks nothing");
+
+    let args = json!({"id": &sq[..8], "record": true});
+    let failed = b.tool("check", &args).expect("a check");
+    assert_eq!(
+        (failed["ok"].as_bool(), failed["evidence"]["verdict"].as_str()),
+        (Some(false), Some("fail")),
+        "{failed}"
+    );
+    assert!(status_of(&mut b, &sq).expect("listed").starts_with("rejected"));
+    let record = b.record("check", &args, &failed).expect("a record");
+    assert_eq!(record["blocks"][0][0], "sq", "a recorded fail blocks, as the evidence tool's does: {record}");
+
+    assert!(b.tool("check", &json!({"id": &sq[..8], "record": "yes"})).is_err(), "record is true or false");
+    let (_hub, mut p, _) = ground_of(&dir.path().join("phase1"), AcceptRule::MostPasses);
+    let old = implement_in(&mut p, "abs", "a 0 < a neg a ?");
+    let err = p.tool("check", &json!({"id": old, "record": true})).expect_err("Phase 1 has no record");
+    assert!(err.contains("unknown argument"), "{err}");
+    let props = |mode: BrackenMode, task: Task| {
+        let tools = mode.tools(task);
+        let check = tools.iter().find(|t| t.name == "check").expect("a check tool");
+        check.input_schema["properties"].as_object().expect("properties").keys().cloned().collect::<Vec<_>>()
+    };
+    assert_eq!(props(BrackenMode::PHASE1, Task::Phase1), ["id"]);
+    assert_eq!(props(BrackenMode::ONE_PASS, Task::Phase1), ["id", "record"]);
+}
+
 /// Each agent's `news` starts with everything, then shows only what arrived since its own last call.
 #[test]
 fn news_shows_what_arrived_since_each_agents_last_call() {

@@ -767,6 +767,16 @@ Git's prompt names too (evidence `e7e5868b02e8`). With `status`, `news`,
 short ids and the fail rule (task `541b6f3db130`), Bracken's are 25.4 words
 per tool (356 over 14).
 
+In Phase 2, Bracken mode's `check` takes an optional `record` (owner decision `f3405c284180`, change B,
+task `d508aae1ea72`). With it, the check's result also goes in as the caller's evidence on the artifact
+in the same call: pass or fail, method `check`, and details what the check found. It goes through the
+evidence tool's own command and argument rules, under the same sandbox. A recorded fail is logged as
+blocking the artifact, as the evidence tool's fail is. It adds 26 words to check's description, and no
+advice on when to use it. Phase 1's `check` is unchanged, so its runs' tool hash still holds. The other
+modes keep their tools. Git's nearest step, approving a PR after a check, is already its own tool
+(`pr_review`), so this asks the neutrality review whether one call where Git takes two (check, then
+review) is comparable. That is the product change being measured, as `status` was.
+
 Each mode names its shared channel once, in one tool description, in the same
 sentence: "<it> is where agents talk to each other: everyone can read it
 with <tool>." The channel is pr_comment's comments in Git, NOTES.md in CRDT

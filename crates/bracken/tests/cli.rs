@@ -390,6 +390,77 @@ fn evidence_details_come_from_a_file_or_stdin() {
     assert_eq!(ids(dir, &["log", "--json"]).len(), before, "a refused evidence writes nothing");
 }
 
+/// `evidence --run`: the command's exit is the verdict, its command line the method, its exit and output
+/// tail the details; the command's exit code passes through. A command that can't start records
+/// nothing, and a verdict, method or details given beside --run are refused.
+#[test]
+fn evidence_run_records_the_commands_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "alice"]);
+    bracken(dir, &["id", "new", "val"]);
+    let c = bracken(dir, &["claim", "Works", "--as", "alice"]);
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_bracken"))
+            .args(args)
+            .current_dir(dir)
+            .env_remove("BRACKEN_DIR")
+            .env_remove("BRACKEN_AGENT")
+            .output()
+            .unwrap()
+    };
+    let body = |out: &std::process::Output| {
+        let id = String::from_utf8(out.stdout.clone()).unwrap();
+        json(dir, &["show", id.trim(), "--json"])["body"].clone()
+    };
+
+    let pass = run(&["evidence", &c, "--run", "--as", "val", "--", "sh", "-c", "echo 'all 7 passed'"]);
+    assert_eq!(pass.status.code(), Some(0));
+    let b = body(&pass);
+    assert_eq!(
+        (b["verdict"].as_str(), b["method"].as_str()),
+        (Some("pass"), Some("sh -c 'echo '\\''all 7 passed'\\'''"))
+    );
+    assert_eq!(b["details"], "exit 0\nall 7 passed");
+    assert!(String::from_utf8_lossy(&pass.stderr).contains("all 7 passed"), "the output shows as it runs");
+
+    // A failure, with more output than the tail keeps and control characters in it.
+    let script = "for i in $(seq 1 100); do echo line $i; done; printf '\\033[2Kbad\\r\\n' >&2; exit 3";
+    let fail = run(&["evidence", &c, "--run", "--as", "val", "--", "sh", "-c", script]);
+    assert_eq!(fail.status.code(), Some(3), "the command's exit code passes through");
+    let b = body(&fail);
+    let details = b["details"].as_str().unwrap();
+    assert_eq!(b["verdict"], "fail");
+    assert!(details.starts_with("exit 3\n") && details.ends_with("line 100\n[2Kbad"), "{details}");
+    assert_eq!(details.lines().count(), 41, "the exit and the last 40 lines: {details}");
+
+    // Without --run, the target and verdict may still come after `--`, out of reach of option parsing.
+    let after = bracken(dir, &["evidence", "--method=-m", "--as", "val", "--", &c, "pass"]);
+    assert_eq!(json(dir, &["show", &after, "--json"])["body"]["method"], "-m");
+
+    let before = ids(dir, &["log", "--json"]).len();
+    let err = bracken_fails(dir, &["evidence", &c, "--run", "--as", "val", "--", "./no-such-program"]);
+    assert!(err.contains("couldn't start") && err.contains("nothing recorded"), "{err}");
+    for refused in [
+        vec!["evidence", &c, "pass", "--run", "--as", "val", "--", "true"],
+        vec!["evidence", &c, "--method", "m", "--run", "--as", "val", "--", "true"],
+        vec!["evidence", &c, "--details", "d", "--run", "--as", "val", "--", "true"],
+        vec!["evidence", &c, "--run", "--as", "val"],
+        vec!["evidence", &c, "pass", "--method", "m", "--as", "val", "--", "true"],
+        vec!["evidence", "--method", "m", "--as", "val", "--", &c, "pass", "true"],
+        vec!["evidence", "--method", "m", "--as", "val", "--", &c, "maybe"],
+        vec!["evidence", &c, "pass", "--as", "val"],
+    ] {
+        bracken_fails(dir, &refused);
+    }
+    // Without a way to sign, nothing runs.
+    let marker = dir.join("ran");
+    bracken_fails(dir, &["evidence", &c, "--run", "--as", "nobody", "--", "touch", marker.to_str().unwrap()]);
+    assert!(!marker.exists(), "a refusal comes before the command runs");
+    assert_eq!(ids(dir, &["log", "--json"]).len(), before, "a refused evidence writes nothing");
+}
+
 #[test]
 fn evidence_details_file_refuses_keys_devices_and_oversized_input() {
     let tmp = tempfile::tempdir().unwrap();
