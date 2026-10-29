@@ -294,3 +294,48 @@ button:disabled {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* A replay track: knots drawn on a canvas under a range input (the Root and Tension views). */
+.life-track {
+  position: relative;
+  flex: 1;
+  height: 34px;
+}
+.life-track canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+.life-track input[type="range"] {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  background: transparent;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: ew-resize;
+}
+.life-track input[type="range"]::-webkit-slider-runnable-track {
+  height: 34px;
+  background: transparent;
+}
+.life-track input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 3px;
+  height: 34px;
+  background: var(--root);
+  border-radius: 2px;
+}
+.life-track input[type="range"]::-moz-range-thumb {
+  width: 3px;
+  height: 34px;
+  background: var(--root);
+  border: 0;
+  border-radius: 2px;
+}
+.asof {
+  min-width: 4.5rem;
+  color: var(--root-dim);
+}

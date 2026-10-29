@@ -20,7 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use manyroot::validation::open_conflicts;
+use manyroot::validation::{open_conflicts, open_supersessors};
 use manyroot::{AgentEntry, Store};
 use manyroot::{
     AgentId, Assessment, Body, Conflict, Contribution, ContributionId, Graph, Policy, RelationKind, Status, Verdict,
@@ -39,7 +39,7 @@ pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; 
                        connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; \
                        frame-ancestors 'none'";
 
-/// The embedded pages, the Loom, the Root view and the Trust constellation (docs/design/visualizer.md
+/// The embedded pages, the Loom, the Root view, the Trust constellation, the Tension map and Runs (docs/design/visualizer.md
 /// section 3): path, media type, content. The fonts are Alegreya and Alegreya Sans SC under the OFL,
 /// which travels with them.
 const ASSETS: &[(&str, &str, &[u8])] = &[
@@ -54,6 +54,12 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
     ("/trust.html", "text/html; charset=utf-8", include_bytes!("../assets/view/trust.html")),
     ("/trust.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/trust.js")),
     ("/trust.css", "text/css; charset=utf-8", include_bytes!("../assets/view/trust.css")),
+    ("/tension.html", "text/html; charset=utf-8", include_bytes!("../assets/view/tension.html")),
+    ("/tension.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/tension.js")),
+    ("/tension.css", "text/css; charset=utf-8", include_bytes!("../assets/view/tension.css")),
+    ("/runs.html", "text/html; charset=utf-8", include_bytes!("../assets/view/runs.html")),
+    ("/runs.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/runs.js")),
+    ("/runs.css", "text/css; charset=utf-8", include_bytes!("../assets/view/runs.css")),
     ("/fonts/alegreya.woff2", "font/woff2", include_bytes!("../assets/view/fonts/alegreya.woff2")),
     ("/fonts/alegreya-italic.woff2", "font/woff2", include_bytes!("../assets/view/fonts/alegreya-italic.woff2")),
     (
@@ -227,6 +233,8 @@ struct Viewer {
     /// replica before it's used, so a test can write while one is under way. At most
     /// [`MAX_REREAD_DELAY`].
     reread_delay: Duration,
+    /// What `/api/runs` serves (section 1.10), if the view was started with `--runs`.
+    runs: Option<Value>,
 }
 
 /// Where a view listens and what it answers to: the addresses (127.0.0.1 unless `--bind` names others:
@@ -342,9 +350,19 @@ impl Listener {
 /// Every listener shares one snapshot and as_of cache. Each has its own Host rules and its own budget of
 /// connections and event streams, so one listener's clients can't lock out another's (finding
 /// 6e1807aa762f). For each listener off loopback it warns on stderr that anyone on that network can read
-/// the whole Ground: there's no login.
-pub fn serve(dir: &Path, policy: Policy, bind: &Bind) -> Result<()> {
+/// the whole Ground: there's no login. With `runs`, the run is read first, and refused unless every
+/// listener is on loopback (section 1.10).
+pub fn serve(dir: &Path, policy: Policy, bind: &Bind, runs: Option<&Path>) -> Result<()> {
     let ips = bind.check()?;
+    // Before anything listens, so a run that can't be shown, or one that would reach a network, stops
+    // the view at once.
+    let runs = match runs {
+        Some(runs_dir) => {
+            crate::runs::check_binds(&ips)?;
+            Some(crate::runs::load(runs_dir)?)
+        }
+        None => None,
+    };
     let mut port = bind.port;
     let mut sockets: Vec<(IpAddr, TcpListener)> = Vec::new();
     for &ip in &ips {
@@ -356,7 +374,7 @@ pub fn serve(dir: &Path, policy: Policy, bind: &Bind) -> Result<()> {
         .into_iter()
         .map(|(ip, socket)| (ip, socket, Arc::new(Listener::new(hosts(ip, port, bind.names_on(ip, &ips))))))
         .collect();
-    let viewer = Arc::new(Viewer::new(dir, policy)?);
+    let viewer = Arc::new(Viewer::new(dir, policy, runs)?);
     let mut stdout = io::stdout().lock();
     for (ip, ..) in &listeners {
         writeln!(stdout, "view at http://{}/", host_port(*ip, port))?;
@@ -528,7 +546,7 @@ impl Viewer {
     }
 
     /// The replica in `dir` read once, for listeners to serve.
-    fn new(dir: &Path, policy: Policy) -> Result<Viewer> {
+    fn new(dir: &Path, policy: Policy, runs: Option<Value>) -> Result<Viewer> {
         let dir = dir.to_owned();
         let first = signature(&dir)?;
         let snapshot = Snapshot::new(Store::open(&dir)?, &policy, None, first)?;
@@ -545,6 +563,7 @@ impl Viewer {
             past: Mutex::new(Vec::new()),
             building: Slots::new(PAST_BUILDS),
             reread_delay,
+            runs,
         })
     }
 
@@ -590,6 +609,7 @@ impl Viewer {
         let takes: &[&str] = match request.path.as_str() {
             "/api/graph" | "/api/contributions" => &["since", "limit"],
             "/api/events" => &["since"],
+            "/api/tension" => &["as_of"],
             path if path.starts_with("/api/root/") => &["as_of"],
             _ => &[],
         };
@@ -627,6 +647,8 @@ impl Viewer {
             "/api/conflicts" => Ok(json!(open_conflicts(snap.graph()))),
             "/api/intents" => Ok(intents_json(&snap)),
             "/api/trust" => Ok(self.trust_json(&snap)),
+            "/api/runs" => self.runs.clone().ok_or_else(|| error(404, "this view was started without --runs")),
+            "/api/tension" => self.tension_json(&snap, request.query.get("as_of").map(String::as_str)),
             path => match (path.strip_prefix("/api/contribution/"), path.strip_prefix("/api/root/")) {
                 (Some(id), _) => self.contribution_json(&snap, id),
                 (_, Some(id)) => self.root_json(&snap, id, request.query.get("as_of").map(String::as_str)),
@@ -724,6 +746,105 @@ impl Viewer {
             })
             .collect();
         json!({"policy": self.policy_json(), "edges": edges})
+    }
+
+    /// Section 1.9: the Tension map. Every `contradicts` relation, open or not, with both its ends as
+    /// `show --json` assesses them, and the open divergences, as `conflicts --json` gives them. `seq`
+    /// is each id's place in causal order, which the page replays by. With `as_of`, as in 1.5.
+    fn tension_json(&self, snap: &Snapshot, as_of: Option<&str>) -> Result<Value, Response> {
+        let past = as_of.map(|cursor| self.as_of(snap, cursor)).transpose()?;
+        let (g, order) = match &past {
+            Some(past) => (&past.0, &past.1),
+            None => (snap.graph(), &snap.order),
+        };
+        let seq: HashMap<ContributionId, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let conflicts = open_conflicts(g);
+        let open: HashSet<ContributionId> = conflicts
+            .iter()
+            .filter_map(|c| match c {
+                Conflict::Contradiction { relation, .. } => Some(*relation),
+                Conflict::Divergence { .. } => None,
+            })
+            .collect();
+        let names = &snap.names;
+        let end = |id: &ContributionId| {
+            let Some(c) = g.get(id) else { return json!({"id": id}) };
+            let mut v = short_json(g, names, &self.policy, id);
+            let assessment = self.policy.assess(g, id);
+            let mut evidence = evidence_json(g, names, id, assessment.as_ref());
+            // evidence_json lists the referrers in this same order.
+            let evidence_ids = g
+                .referrers(id)
+                .filter(|e| matches!(e.body(), Body::Evidence { target, .. } if target == id))
+                .map(|e| e.id());
+            for (e, at) in evidence.iter_mut().zip(evidence_ids) {
+                e["seq"] = json!(seq[&at]);
+            }
+            // What replaces it, as `conflicts` counts it: a live successor, by a supersedes relation its
+            // own author wrote and hasn't retracted.
+            let successors = open_supersessors(g, id);
+            let replaced_by: Vec<Value> = g
+                .referrers(id)
+                .filter_map(|r| match r.body() {
+                    Body::Relation { from, kind: RelationKind::Supersedes, to, .. }
+                        if to == id
+                            && r.author() == c.author()
+                            && !g.is_retracted(&r.id())
+                            && successors.contains(from) =>
+                    {
+                        let mut v = short_json(g, names, &self.policy, from);
+                        v["author"] = json!(g.get(from).map(|f| f.author()));
+                        v["relation"] = json!(r.id());
+                        v["seq"] = json!(seq[&r.id()]);
+                        Some(v)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let tags = match c.body() {
+                Body::Claim { tags, .. } => tags.clone(),
+                _ => Vec::new(),
+            };
+            v["kind"] = json!(c.body().kind());
+            v["author"] = json!(c.author());
+            v["tags"] = json!(tags);
+            v["seq"] = json!(seq[id]);
+            v["retracted"] = json!(g.is_retracted(id));
+            v["assessment"] = json!(assessment);
+            v["evidence"] = json!(evidence);
+            v["replaced_by"] = json!(replaced_by);
+            v
+        };
+        let springs: Vec<Value> = order
+            .iter()
+            .filter_map(|id| {
+                let c = g.get(id).expect("ordered ids exist");
+                let Body::Relation { from, kind: RelationKind::Contradicts, to, note } = c.body() else { return None };
+                let note: String = note.lines().next().unwrap_or_default().chars().take(SHORT_CHARS).collect();
+                Some(json!({
+                    "relation": id,
+                    "seq": seq[id],
+                    "author": c.author(),
+                    "author_name": names.0.get(&c.author()),
+                    "timestamp_ms": c.content().timestamp_ms,
+                    "note": note,
+                    "retracted": g.is_retracted(id),
+                    "open": open.contains(id),
+                    "from": end(from),
+                    "to": end(to),
+                }))
+            })
+            .collect();
+        let divergences: Vec<Value> = conflicts
+            .iter()
+            .filter_map(|c| match c {
+                Conflict::Divergence { target, successors } => {
+                    Some(json!({"target": end(target), "successors": successors.iter().map(end).collect::<Vec<_>>()}))
+                }
+                Conflict::Contradiction { .. } => None,
+            })
+            .collect();
+        Ok(json!({"policy": self.policy_json(), "springs": springs, "divergences": divergences}))
     }
 
     /// Section 1.3.
@@ -833,7 +954,11 @@ impl Viewer {
                     && *t == id
                     && g.get(f).is_some_and(|f| f.author() != r.author() || intent_until(f).is_none())
             })
-            .map(|(_, f, _)| short(&f))
+            .map(|(r, f, _)| {
+                let mut v = short(&f);
+                v["relation"] = json!(r.id());
+                v
+            })
             .collect();
         let mut rivals: Vec<Value> = relations(RelationKind::Contradicts)
             .filter(|(r, f, t)| (*f == id || *t == id) && f != t && stands(r, if *f == id { t } else { f }))
@@ -1268,6 +1393,7 @@ fn all_intents_json(g: &Graph, names: &Names, view: &CurrentView, target: &Contr
         };
         let v = json!({
             "id": claim.id(),
+            "relation": r.id(),
             "author": claim.author(),
             "author_name": names.0.get(&claim.author()),
             "from_ms": claim.content().timestamp_ms,
@@ -1350,7 +1476,7 @@ mod tests {
         let tmp = tempfile::tempdir().expect("a temp dir");
         let dir = tmp.path().join("g");
         Store::init(&dir, "budget").expect("a Ground");
-        let viewer = Arc::new(Viewer::new(&dir, Policy::default()).expect("a viewer"));
+        let viewer = Arc::new(Viewer::new(&dir, Policy::default(), None).expect("a viewer"));
         let mut ports = Vec::new();
         for _ in 0..2 {
             let socket = TcpListener::bind(("127.0.0.1", 0)).expect("a listener");
@@ -1516,7 +1642,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(scripts, 7, "the three pages and their four scripts");
+        assert_eq!(scripts, 11, "the five pages and their six scripts");
     }
 
     /// Computed property accesses that could build a sink's name or reach one on a DOM object: a string in

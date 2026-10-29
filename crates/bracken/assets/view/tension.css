@@ -1,0 +1,269 @@
+/* The Tension map: a hedgerow. Claims sit in their authors' rows; each contradiction is a bramble
+   between the two it holds apart, taut and thorned while open, slack once cleared. */
+
+.tension-page {
+  display: grid;
+  grid-template-rows: auto 1fr auto;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.hedge-wrap {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 24rem;
+  min-height: 0;
+}
+.hedge {
+  position: relative;
+  min-height: 0;
+  background:
+    radial-gradient(80% 70% at 50% 60%, var(--ground-raised), transparent 80%),
+    var(--ground);
+}
+.hedge-scroll {
+  position: absolute;
+  inset: 0 0 0 8.5rem;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.hedge-scroll.waiting {
+  opacity: 0.55;
+  transition: opacity 200ms ease-out;
+}
+.field {
+  display: block;
+}
+
+/* The authors' rows, named at the left; they stay put while the hedge scrolls. */
+.lanes {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 8.5rem;
+  border-right: 1px solid var(--stratum-line);
+  background: var(--ground);
+  z-index: 1;
+}
+.lanes .lane {
+  position: absolute;
+  left: 0.75rem;
+  right: 0.5rem;
+  transform: translateY(-50%);
+  font-size: 0.82rem;
+  color: var(--root-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  unicode-bidi: isolate;
+}
+
+.field .row {
+  stroke: var(--stratum-line);
+  stroke-width: 1;
+  opacity: 0.6;
+}
+.field .cane {
+  fill: none;
+  stroke-linecap: round;
+  cursor: pointer;
+  pointer-events: stroke;
+  transition: opacity 160ms ease-out;
+}
+.field .cane.open {
+  stroke: var(--rejected);
+}
+.field .cane.cleared {
+  stroke: var(--superseded);
+}
+.field .cane.withdrawn {
+  stroke: var(--retracted);
+}
+.field .cane.fork {
+  stroke: var(--focus);
+}
+.field .thorn {
+  fill: var(--rejected);
+  pointer-events: none;
+}
+.field .shoot {
+  fill: none;
+  stroke: var(--accepted);
+  stroke-width: 1.4;
+  pointer-events: none;
+}
+.field .hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 12;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+.field .knot {
+  cursor: pointer;
+}
+.field .label {
+  fill: var(--root);
+  font-family: "Alegreya", serif;
+  font-size: 13px;
+  paint-order: stroke;
+  stroke: var(--ground);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+  unicode-bidi: isolate;
+  pointer-events: none;
+}
+.field.lit .cane:not(.on),
+.field.lit .thorn:not(.on),
+.field.lit .shoot:not(.on) {
+  opacity: 0.08;
+}
+.field.lit .knot:not(.on) {
+  opacity: 0.3;
+}
+.field .cane.on {
+  stroke-width: 3px;
+}
+
+.tip {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  max-width: 24rem;
+  background: var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+  box-shadow: var(--shadow);
+  padding: 0.45rem 0.65rem;
+  font-size: 0.86rem;
+  unicode-bidi: isolate;
+}
+
+.side {
+  border-left: 1px solid var(--stratum-line);
+  padding: 1.1rem 1.1rem 2rem;
+  overflow-y: auto;
+  font-size: 0.88rem;
+}
+.side h2 {
+  font-size: 0.8rem;
+  margin: 1.1rem 0 0.4rem;
+  color: var(--root-faint);
+  font-weight: 500;
+}
+.side h2:first-child {
+  margin-top: 0;
+}
+.side ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.side li.spring {
+  padding: 0.35rem 0.45rem;
+  border-radius: 3px;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+}
+.side li.spring.open {
+  border-left-color: var(--rejected);
+}
+.side li.spring.fork {
+  border-left-color: var(--focus);
+}
+.side li.spring:hover,
+.side li.spring.on {
+  background: var(--ground-raised);
+}
+.side .ends {
+  display: block;
+}
+.side .why {
+  display: block;
+  color: var(--root-faint);
+  font-size: 0.8rem;
+}
+.side .empty {
+  color: var(--root-faint);
+  font-style: italic;
+}
+.side .statement {
+  font-style: italic;
+}
+
+/* One contradiction, chosen: its two ends as specimen labels. */
+.detail .end {
+  margin: 0.7rem 0 0.9rem;
+  padding: 0.6rem 0.7rem;
+  background: var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+}
+.detail .end .kind {
+  color: var(--root-faint);
+  font-size: 0.78rem;
+}
+.detail .end .word {
+  font-weight: 600;
+}
+.detail .end .word[data-status="accepted"] {
+  color: var(--accepted);
+}
+.detail .end .word[data-status="rejected"] {
+  color: var(--rejected);
+}
+.detail .end .word[data-status="superseded"],
+.detail .end .word[data-status="retracted"] {
+  color: var(--superseded);
+}
+.detail .evidence {
+  margin: 0.3rem 0 0;
+  font-size: 0.82rem;
+  color: var(--root-dim);
+}
+.detail .evidence li.uncounted {
+  opacity: 0.65;
+}
+.detail .evidence li.gone {
+  text-decoration: line-through;
+  opacity: 0.55;
+}
+.detail .cross {
+  text-align: center;
+  color: var(--rejected);
+  margin: 0;
+}
+.detail .actions {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin-top: 0.5rem;
+}
+.detail .actions button {
+  font-size: 0.78rem;
+  padding: 0.2rem 0.5rem;
+}
+
+.controls {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.6rem 1.25rem;
+  border-top: 1px solid var(--stratum-line);
+  background: var(--ground-raised);
+  font-size: 0.9rem;
+}
+.segmented {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+
+@media (max-width: 1000px) {
+  .hedge-wrap {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto;
+  }
+  .side {
+    max-height: 32vh;
+    border-left: 0;
+    border-top: 1px solid var(--stratum-line);
+  }
+}

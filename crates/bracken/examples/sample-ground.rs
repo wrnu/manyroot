@@ -6,7 +6,9 @@
 //! real Ground. Then `BRACKEN_DIR=<dir> bracken view` shows it. Deterministic apart from keys and ids:
 //! the same size gives the same shape. Every name and statement is synthetic. Agents work in bursts,
 //! mostly build on the same few partners, and check each other's work, so the Loom has real paths
-//! to show at 50,000.
+//! to show at 50,000. As on a team's Ground, some claims are prs and findings: a finding contradicts
+//! another agent's pr, and a pr's author replaces it with a new one (now and then twice over, which is
+//! a divergence), so the Tension map has contradictions open, cleared and forked.
 
 use std::path::{Path, PathBuf};
 
@@ -144,6 +146,15 @@ fn generate(dir: &Path, n: usize, agent_count: usize) -> Result<()> {
     let mut last: Vec<Option<usize>> = vec![None; agent_count];
     // Claims and artifacts, by position and author, for evidence, relations and retractions to name.
     let mut subjects: Vec<(usize, usize)> = Vec::new();
+    // Prs by position and author; each agent's findings waiting for their contradicts relation; prs
+    // already replaced.
+    let mut prs: Vec<(usize, usize)> = Vec::new();
+    let mut findings: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); agent_count];
+    // Each agent's prs that a finding contradicted, to fix; each replaced pr's replacement; and
+    // replacements left standing beside another, so their divergence stays open.
+    let mut fixes: Vec<Vec<usize>> = vec![Vec::new(); agent_count];
+    let mut replaced: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut frozen: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut batch: Vec<Contribution> = Vec::new();
     let mut t = START_MS as f64;
     for i in 0..n {
@@ -178,15 +189,60 @@ fn generate(dir: &Path, n: usize, agent_count: usize) -> Result<()> {
         let others: Vec<&(usize, usize)> = subjects.iter().rev().take(30).filter(|(_, by)| *by != a).collect();
         let own: Vec<&(usize, usize)> = subjects.iter().rev().take(200).filter(|(_, by)| *by == a).collect();
         let statement = format!("{} {} {}", r.pick(&SUBJECTS), r.pick(&VERBS), r.pick(&OBJECTS));
-        let body = if i < 3 || roll < 0.3 || subjects.is_empty() {
+        let their_prs: Vec<(usize, usize)> = prs.iter().rev().take(40).filter(|(_, by)| *by != a).copied().collect();
+        let own_prs: Vec<usize> = prs.iter().rev().take(12).filter(|(_, by)| *by == a).map(|(p, _)| *p).collect();
+        let body = if let Some((finding, pr, by)) = findings[a].pop() {
+            fixes[by].push(pr);
+            Body::Relation { from: all[finding], kind: RelationKind::Contradicts, to: all[pr], note: String::new() }
+        } else if own_prs.len() > 1
+            && ((0.3..0.36).contains(&roll) || ((0.36..0.5).contains(&roll) && !fixes[a].is_empty()))
+        {
+            // Its author replaces an earlier pr with its latest: first one a finding contradicted, as a fix
+            // would. Now and then one already replaced, whose first replacement then stands beside the
+            // second: a divergence.
+            let latest = own_prs[0];
+            let free = |p: &usize| *p != latest && !replaced.contains_key(p) && !frozen.contains(p);
+            let fix = std::iter::from_fn(|| fixes[a].pop()).find(|p| free(p));
+            let fork = (r.f() < 0.08)
+                .then(|| {
+                    own_prs[1..]
+                        .iter()
+                        .copied()
+                        .find(|p| replaced.get(p).is_some_and(|s| *s != latest && !replaced.contains_key(s)))
+                })
+                .flatten();
+            match fork.or(fix).or_else(|| own_prs[1..].iter().copied().find(|p| free(p))) {
+                Some(old) => {
+                    if let Some(first) = replaced.insert(old, latest) {
+                        frozen.extend([first, latest]);
+                    }
+                    Body::Relation {
+                        from: all[latest],
+                        kind: RelationKind::Supersedes,
+                        to: all[old],
+                        note: String::new(),
+                    }
+                }
+                None => Body::Claim { statement, tags: vec![] },
+            }
+        } else if i < 3 || roll < 0.3 || subjects.is_empty() {
             let tag = r.f();
-            let tags = if tag < 0.12 {
-                vec!["task".to_owned()]
+            let (statement, tags) = if tag < 0.12 {
+                (statement, vec!["task".to_owned()])
             } else if tag < 0.2 {
-                vec!["decision".to_owned()]
+                (statement, vec!["decision".to_owned()])
+            } else if tag < 0.3 {
+                (format!("PR: {statement}"), vec!["pr".to_owned()])
+            } else if tag < 0.36 && !their_prs.is_empty() {
+                let (pr, by) = their_prs[(r.next() % their_prs.len() as u64) as usize];
+                findings[a].push((i, pr, by));
+                (format!("finding: {statement}"), vec!["finding".to_owned()])
             } else {
-                vec![]
+                (statement, vec![])
             };
+            if tags.first().is_some_and(|t| t == "pr") {
+                prs.push((i, a));
+            }
             Body::Claim { statement, tags }
         } else if roll < 0.42 {
             let name = format!("src/{}.rs", r.pick(&SUBJECTS).trim_start_matches("the ").replace(' ', "_"));

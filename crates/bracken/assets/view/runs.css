@@ -1,0 +1,146 @@
+/* Runs: an experiment run as a growth view. Each mode's shared library is a stem that climbs with its
+   correct functions, checkpoint by checkpoint; waves of spec changes fall across all of them. */
+
+.runs-page {
+  min-height: 100vh;
+}
+.runs-main {
+  max-width: 78rem;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem 3rem;
+}
+.runs-main h2 {
+  font-size: 0.82rem;
+  color: var(--root-faint);
+  font-weight: 500;
+  margin: 1.6rem 0 0.6rem;
+}
+.runs-main section:first-child h2 {
+  margin-top: 0.4rem;
+}
+
+.plot {
+  position: relative;
+  background:
+    linear-gradient(to top, var(--ground-deep), transparent 30%),
+    var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+}
+.plot .field {
+  display: block;
+  width: 100%;
+  height: 26rem;
+}
+.field text {
+  fill: var(--root-dim);
+  font-family: "Alegreya", serif;
+  font-size: 13px;
+}
+.field .axis {
+  stroke: var(--stratum-line);
+  stroke-width: 1;
+}
+.field .grid {
+  stroke: var(--stratum-line);
+  stroke-width: 1;
+  opacity: 0.45;
+}
+.field .wave {
+  stroke: var(--focus);
+  stroke-width: 1.2;
+  stroke-dasharray: 3 4;
+}
+.field .wave-label {
+  fill: var(--focus);
+  font-size: 12px;
+}
+.field .stem {
+  fill: none;
+  stroke-width: 2.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.field .standalone {
+  fill: none;
+  stroke-width: 1;
+  stroke-dasharray: 2 3;
+  opacity: 0.7;
+}
+.field .leaf {
+  cursor: help;
+}
+.field .broken {
+  stroke: var(--fail);
+  stroke-width: 1.6;
+  fill: none;
+}
+.field .mode-label {
+  font-size: 14px;
+  font-weight: 600;
+  paint-order: stroke;
+  stroke: var(--ground-raised);
+  stroke-width: 4px;
+}
+
+.tip {
+  position: absolute;
+  z-index: 2;
+  pointer-events: none;
+  max-width: 20rem;
+  background: var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+  box-shadow: var(--shadow);
+  padding: 0.45rem 0.65rem;
+  font-size: 0.86rem;
+}
+
+/* One column per mode, side by side. */
+.modes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: 0.9rem;
+}
+.mode {
+  background: var(--ground-raised);
+  border: 1px solid var(--stratum-line);
+  border-top: 3px solid var(--mode-ink, var(--stratum-line));
+  border-radius: 3px;
+  padding: 0.7rem 0.9rem 0.8rem;
+}
+.mode h3 {
+  margin: 0 0 0.5rem;
+  font-size: 1.05rem;
+}
+.mode h3 .dir {
+  color: var(--root-faint);
+  font-weight: 400;
+  font-size: 0.82rem;
+}
+.mode dl {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.25rem 0.8rem;
+  margin: 0;
+  font-size: 0.88rem;
+}
+.mode dt {
+  color: var(--root-dim);
+}
+.mode dd {
+  margin: 0;
+  text-align: right;
+}
+.mode .none {
+  color: var(--root-faint);
+  font-style: italic;
+}
+.diagnostics .mode {
+  border-top-width: 1px;
+  opacity: 0.92;
+}
+.empty {
+  color: var(--root-faint);
+  font-style: italic;
+}
