@@ -205,6 +205,17 @@ replica. Every endpoint is a GET; there's no write path. Responses carry
 connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`, and the
 server checks `Host` is `127.0.0.1:<port>` or `localhost:<port>` (against DNS rebinding).
 
+By default it listens on 127.0.0.1 only. `--bind <ip>` names one other address instead. Owner decision
+917816c72975 (2026-10-29) allows this machine's NetBird IP, so the owner can read the team Ground's view
+from their own network. It narrows 09f29f6c727b's loopback-only rule for that one case.
+- Bound that way, anyone who can reach the address can read the whole Ground: there's no login, and the
+  server prints a warning saying so when it starts.
+- It refuses to bind every interface (`0.0.0.0`, `::`), a multicast address or a broadcast address.
+- It answers only to the Host `<ip>:<port>` (`[<ip>]:<port>` for IPv6) and to names given with
+  `--host <name>`, as `<name>:<port>`. `localhost` counts only on a loopback address. Every other Host
+  gets a 403.
+- Everything else is unchanged: GET only, the same headers, no CORS, and the same bounds.
+
 ## 2. The direction: soil and specimen
 
 The owner asked for organic and botanical (preference c60c03bca23d, 2026-10-28), with everything else the

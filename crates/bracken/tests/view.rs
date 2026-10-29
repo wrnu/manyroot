@@ -40,6 +40,8 @@ fn ground() -> PathBuf {
 struct View {
     child: Child,
     port: u16,
+    /// Where it listens, as the URL it printed has it: `127.0.0.1:<port>`, `[::1]:<port>`.
+    at: String,
 }
 
 impl Drop for View {
@@ -54,24 +56,38 @@ fn view(dir: &Path) -> View {
 }
 
 fn view_with(dir: &Path, env: &[(&str, &str)]) -> View {
+    view_args(dir, &[], env).0
+}
+
+/// A view started with `args`, and the first line it wrote to stderr (empty if none came within a second).
+fn view_args(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> (View, String) {
     let mut child = Command::new(BIN)
-        .args(["view"])
+        .arg("view")
+        .args(args)
         .envs(env.iter().copied())
         .env("BRACKEN_DIR", dir)
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let mut line = String::new();
-    BufReader::new(child.stdout.take().unwrap()).read_line(&mut line).unwrap();
-    let port = line
-        .trim()
-        .strip_prefix("view at http://127.0.0.1:")
-        .and_then(|p| p.strip_suffix('/'))
-        .unwrap_or_else(|| panic!("{line:?}"))
-        .parse()
-        .unwrap();
-    View { child, port }
+    let _ = BufReader::new(child.stdout.take().unwrap()).read_line(&mut line);
+    let at = line.trim().strip_prefix("view at http://").and_then(|p| p.strip_suffix('/')).map(str::to_owned);
+    let Some((at, port)) = at.and_then(|at| Some((at.clone(), at.rsplit(':').next()?.parse::<u16>().ok()?))) else {
+        // It didn't start: stop whatever was launched before failing, so no process outlives the test.
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("bracken view {args:?} didn't start: {line:?}");
+    };
+    let stderr = child.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut first = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut first);
+        let _ = tx.send(first);
+    });
+    let warning = rx.recv_timeout(Duration::from_secs(1)).unwrap_or_default();
+    (View { child, port, at }, warning)
 }
 
 struct Reply {
@@ -88,7 +104,7 @@ impl Reply {
 
 impl View {
     fn request(&self, method: &str, path: &str, host: &str) -> Reply {
-        let mut s = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
+        let mut s = TcpStream::connect(self.at.as_str()).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
         write!(s, "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").unwrap();
         let mut raw = Vec::new();
@@ -841,4 +857,146 @@ fn root_ends_and_counts_follow_the_protocol() {
         rivals.as_array().unwrap().iter().find(|r| r["id"] == y2.as_str()).unwrap_or_else(|| panic!("{rivals}"));
     assert_eq!(rival["how"], "divergent");
     assert_eq!(rival["relation"], alices.as_str(), "not bob's {bobs}");
+}
+
+/// Starts `bracken view` with `args` and returns its stderr, failing if it starts serving instead of
+/// refusing.
+fn view_refuses(dir: &Path, args: &[&str]) -> String {
+    let mut child = Command::new(BIN)
+        .arg("view")
+        .args(args)
+        .env("BRACKEN_DIR", dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bracken view {args:?} started serving");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let out = child.wait_with_output().unwrap();
+    assert!(!out.status.success(), "{args:?}");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// `--bind` names exactly one address (decision 917816c72975): never every interface, multicast or
+/// broadcast, and never a --host that isn't a plain name.
+#[test]
+fn bind_refuses_unspecified_multicast_and_broadcast() {
+    let dir = ground();
+    // The IPv4-mapped forms too (finding e20de255980d): checked as the IPv4 address they are.
+    for (ip, shown) in [
+        ("0.0.0.0", "0.0.0.0"),
+        ("::", "::"),
+        ("224.0.0.1", "224.0.0.1"),
+        ("239.255.255.250", "239.255.255.250"),
+        ("ff02::1", "ff02::1"),
+        ("255.255.255.255", "255.255.255.255"),
+        ("::ffff:0.0.0.0", "0.0.0.0"),
+        ("::ffff:0:0", "0.0.0.0"),
+        ("::ffff:224.0.0.1", "224.0.0.1"),
+        ("::ffff:255.255.255.255", "255.255.255.255"),
+    ] {
+        let err = view_refuses(&dir, &["--bind", ip]);
+        assert!(err.contains(&format!("--bind {shown}")), "{ip}: {err}");
+    }
+    for name in ["", "evil.example:80", "a b", "-x.example", "x..example", "http://x"] {
+        let err = view_refuses(&dir, &[&format!("--host={name}")]);
+        assert!(err.contains("isn't a host name"), "{name:?}: {err}");
+    }
+    assert!(view_refuses(&dir, &["--bind", "not-an-ip"]).contains("invalid"));
+}
+
+/// Without --bind nothing changes: 127.0.0.1 and localhost only, no warning, and a name nobody gave is
+/// refused.
+#[test]
+fn the_default_is_unchanged() {
+    let dir = ground();
+    let (v, warning) = view_args(&dir, &[], &[]);
+    assert!(v.at.starts_with("127.0.0.1:"), "{}", v.at);
+    assert_eq!(warning, "", "no warning on loopback");
+    for (host, status) in [
+        (format!("127.0.0.1:{}", v.port), 200),
+        (format!("localhost:{}", v.port), 200),
+        (format!("warren-mbp.jx.rs:{}", v.port), 403),
+        (format!("100.74.240.73:{}", v.port), 403),
+    ] {
+        assert_eq!(v.request("GET", "/api/ground", &host).status, status, "{host}");
+    }
+}
+
+/// Bound with --host, the view answers to its address and the names given, any case, at its port,
+/// and refuses every other Host with a 403 that still carries the headers.
+#[test]
+fn bound_with_names_answers_only_to_them() {
+    let dir = ground();
+    let (v, _) =
+        view_args(&dir, &["--bind", "127.0.0.1", "--host", "warren-mbp.jx.rs", "--host", "Other.Example"], &[]);
+    let p = v.port;
+    for (host, status) in [
+        (format!("warren-mbp.jx.rs:{p}"), 200),
+        (format!("WARREN-MBP.jx.rs:{p}"), 200),
+        (format!("other.example:{p}"), 200),
+        (format!("127.0.0.1:{p}"), 200),
+        (format!("warren-mbp.jx.rs:{}", p + 1), 403),
+        ("warren-mbp.jx.rs".to_owned(), 403),
+        (format!("warren-mbp.jx.rs.evil.example:{p}"), 403),
+        (format!("evil.warren-mbp.jx.rs:{p}"), 403),
+        (format!("evil.example:{p}"), 403),
+        (String::new(), 403),
+    ] {
+        let r = v.request("GET", "/api/ground", &host);
+        assert_eq!(r.status, status, "Host {host:?}");
+        assert_security_headers(&format!("Host {host:?}"), &r);
+    }
+    let r = v.request("POST", "/api/ground", &format!("warren-mbp.jx.rs:{p}"));
+    assert_eq!(r.status, 405, "still GET only");
+}
+
+/// Bound to another loopback address, IPv6's, where the machine has it: it listens there, answers to
+/// `[::1]:<port>` and localhost, not to 127.0.0.1, and doesn't warn. A mapped loopback address is bound
+/// as 127.0.0.1 and doesn't warn either. (Off loopback, the Host set and the warning are unit tests in
+/// view.rs; the real-interface run is `bound_to_this_machines_address`, opt-in.)
+#[test]
+fn bound_elsewhere_listens_and_answers_only_there() {
+    let dir = ground();
+    if let Ok((v, warning)) = std::panic::catch_unwind(|| view_args(&dir, &["--bind", "::1"], &[])) {
+        assert!(v.at.starts_with("[::1]:"), "{}", v.at);
+        assert_eq!(warning, "", "::1 is loopback");
+        assert_eq!(v.request("GET", "/api/ground", &format!("[::1]:{}", v.port)).status, 200);
+        assert_eq!(v.request("GET", "/api/ground", &format!("localhost:{}", v.port)).status, 200);
+        assert_eq!(v.request("GET", "/api/ground", &format!("127.0.0.1:{}", v.port)).status, 403);
+    }
+    let (v, warning) = view_args(&dir, &["--bind", "::ffff:127.0.0.1"], &[]);
+    assert!(v.at.starts_with("127.0.0.1:"), "{}", v.at);
+    assert_eq!(warning, "", "a mapped loopback address is loopback");
+}
+
+/// Bound to this machine's own network address: it warns, answers there, and isn't on 127.0.0.1. It
+/// listens on a real interface while it runs, so it's opt-in: `cargo test -- --ignored`.
+#[test]
+#[ignore = "listens on this machine's network address; run with --ignored"]
+fn bound_to_this_machines_address() {
+    let dir = ground();
+    let udp = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let Ok(own) = udp.connect("192.0.2.1:9").and_then(|()| udp.local_addr()).map(|a| a.ip()) else { return };
+    if own.is_loopback() || own.is_unspecified() {
+        return;
+    }
+    let (v, warning) = view_args(&dir, &["--bind", &own.to_string()], &[]);
+    assert!(warning.contains("warning") && warning.contains("anyone") && warning.contains("no login"), "{warning:?}");
+    assert_eq!(v.request("GET", "/api/ground", &format!("{own}:{}", v.port)).status, 200);
+    for host in [format!("127.0.0.1:{}", v.port), format!("localhost:{}", v.port)] {
+        assert_eq!(v.request("GET", "/api/ground", &host).status, 403, "{host}");
+    }
+    let loopback = TcpStream::connect_timeout(
+        &("127.0.0.1".parse::<std::net::IpAddr>().unwrap(), v.port).into(),
+        Duration::from_secs(2),
+    );
+    assert!(loopback.is_err(), "bound to {own}, it listens on 127.0.0.1 too");
 }
