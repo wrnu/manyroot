@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use manyroot::validation::open_conflicts;
 use manyroot::{AgentEntry, Store};
 use manyroot::{
-    AgentId, Assessment, Body, Conflict, Contribution, ContributionId, Graph, Policy, RelationKind, Status,
+    AgentId, Assessment, Body, Conflict, Contribution, ContributionId, Graph, Policy, RelationKind, Status, Verdict,
 };
 use serde_json::{Map, Value, json};
 
@@ -38,11 +38,22 @@ pub const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; 
                        connect-src 'self'; font-src 'self'; base-uri 'none'; form-action 'none'; \
                        frame-ancestors 'none'";
 
-/// The embedded page: path, media type, content.
+/// The embedded page, the Loom (docs/design/visualizer.md section 3.1): path, media type, content. The
+/// fonts are Alegreya and Alegreya Sans SC under the OFL, which travels with them.
 const ASSETS: &[(&str, &str, &[u8])] = &[
     ("/", "text/html; charset=utf-8", include_bytes!("../assets/view/index.html")),
-    ("/app.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/app.js")),
-    ("/style.css", "text/css; charset=utf-8", include_bytes!("../assets/view/style.css")),
+    ("/common.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/common.js")),
+    ("/loom.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/loom.js")),
+    ("/visualizer.css", "text/css; charset=utf-8", include_bytes!("../assets/view/visualizer.css")),
+    ("/loom.css", "text/css; charset=utf-8", include_bytes!("../assets/view/loom.css")),
+    ("/fonts/alegreya.woff2", "font/woff2", include_bytes!("../assets/view/fonts/alegreya.woff2")),
+    ("/fonts/alegreya-italic.woff2", "font/woff2", include_bytes!("../assets/view/fonts/alegreya-italic.woff2")),
+    (
+        "/fonts/alegreya-sans-sc-medium.woff2",
+        "font/woff2",
+        include_bytes!("../assets/view/fonts/alegreya-sans-sc-medium.woff2"),
+    ),
+    ("/fonts/OFL.txt", "text/plain; charset=utf-8", include_bytes!("../assets/view/fonts/OFL.txt")),
 ];
 
 /// The most connections served at once, and of those, event streams; more are refused.
@@ -62,8 +73,13 @@ const TAG_CHARS: usize = 64;
 const SHORT_CHARS: usize = 200;
 /// The fewest digits an id in a path may have.
 const PATH_ID_DIGITS: usize = 8;
-/// How many `?as_of=` graphs are kept.
-const PAST_GRAPHS: usize = 8;
+/// How many `?as_of=` graphs are kept. Each holds a copy of the replica.
+const PAST_GRAPHS: usize = 4;
+/// How many `?as_of=` graphs are built at once; more requests wait for a slot rather than all building
+/// together.
+const PAST_BUILDS: usize = 3;
+/// The most `BRACKEN_VIEW_REREAD_DELAY_MS` may hold a re-read back.
+const MAX_REREAD_DELAY: Duration = Duration::from_secs(2);
 
 /// One reading of the replica, with what every request needs from it computed once.
 struct Snapshot {
@@ -79,6 +95,8 @@ struct Snapshot {
     /// Subjects whose status isn't pending with no counted evidence (section 1.3).
     statuses: BTreeMap<ContributionId, Assessment>,
     conflicts: Vec<Conflict>,
+    /// The current view (what's hidden), which every `/api/contribution` and `/api/intents` needs.
+    current: CurrentView,
     /// What changes when the replica does: its object and agent entry counts.
     signature: (usize, usize),
 }
@@ -112,7 +130,8 @@ impl Snapshot {
             .map(|a| (a.id, a))
             .collect();
         let conflicts = policy.evaluate(g).conflicts;
-        Ok(Snapshot { store, names, order, depth, agents, agent_index, statuses, conflicts, signature })
+        let current = CurrentView::new(g, &order);
+        Ok(Snapshot { store, names, order, depth, agents, agent_index, statuses, conflicts, current, signature })
     }
 
     fn graph(&self) -> &Graph {
@@ -122,22 +141,41 @@ impl Snapshot {
 
 /// Agents' names from the public directory, `agents/*.json`. Unlike `Names::load` (which goes
 /// through `Store::agents`), this never reads `identities/`, where the private keys are.
+///
+/// A name two entries give to different keys is refused: neither key gets it, so both show by key, and
+/// one agent can't pass as another (finding 81a3c4d7bdec). A key named twice keeps the name the CLI's
+/// `Names` keeps, the last in name order, so `author_name` matches `log --json`.
 pub fn public_names(store: &Store) -> Result<Names> {
     let dir = store.agents_dir();
-    let mut names = HashMap::new();
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Names(names)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Names(HashMap::new())),
         Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
     };
+    let mut paths = Vec::new();
     for entry in entries {
         let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
+        if path.extension().is_some_and(|e| e == "json") {
+            paths.push(path);
         }
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    }
+    paths.sort();
+    let mut entries = Vec::with_capacity(paths.len());
+    let mut keys: HashMap<String, HashSet<AgentId>> = HashMap::new();
+    for path in &paths {
+        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let entry: AgentEntry = serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
-        names.insert(entry.agent, entry.name);
+        keys.entry(entry.name.clone()).or_default().insert(entry.agent);
+        entries.push(entry);
+    }
+    let mut names: HashMap<AgentId, String> = HashMap::new();
+    for entry in entries {
+        if keys[&entry.name].len() == 1 {
+            let name = names.entry(entry.agent).or_default();
+            if entry.name > *name {
+                *name = entry.name;
+            }
+        }
     }
     Ok(Names(names))
 }
@@ -177,8 +215,11 @@ struct Viewer {
     streams: AtomicUsize,
     /// The graphs `?as_of=` built last, by the hash of the set they hold.
     past: Mutex<Vec<(blake3::Hash, Arc<Past>)>>,
+    /// Slots for building `?as_of=` graphs, [`PAST_BUILDS`] of them.
+    building: Slots,
     /// For tests only (`BRACKEN_VIEW_REREAD_DELAY_MS`): how long a re-read waits after reading the
-    /// replica before it's used, so a test can write while one is under way.
+    /// replica before it's used, so a test can write while one is under way. At most
+    /// [`MAX_REREAD_DELAY`].
     reread_delay: Duration,
 }
 
@@ -193,7 +234,8 @@ pub fn serve(dir: &Path, policy: Policy, port: u16) -> Result<()> {
     let reread_delay = std::env::var("BRACKEN_VIEW_REREAD_DELAY_MS")
         .ok()
         .and_then(|ms| ms.parse().ok())
-        .map_or(Duration::ZERO, Duration::from_millis);
+        .map_or(Duration::ZERO, Duration::from_millis)
+        .min(MAX_REREAD_DELAY);
     let viewer = Arc::new(Viewer {
         dir,
         port,
@@ -203,6 +245,7 @@ pub fn serve(dir: &Path, policy: Policy, port: u16) -> Result<()> {
         connections: AtomicUsize::new(0),
         streams: AtomicUsize::new(0),
         past: Mutex::new(Vec::new()),
+        building: Slots::new(PAST_BUILDS),
         reread_delay,
     });
     let mut stdout = io::stdout().lock();
@@ -518,7 +561,7 @@ impl Viewer {
         let g = snap.graph();
         let id = resolve(g, prefix)?;
         let c = g.get(&id).expect("resolved ids exist");
-        let mut v = show_json(g, &snap.names, &self.policy, c, now_ms());
+        let mut v = show_json(g, &snap.names, &self.policy, &snap.current, c, now_ms());
         if let Some(text) = v["body"]["text"].as_str()
             && text.len() > TEXT_BYTES
         {
@@ -654,11 +697,16 @@ impl Viewer {
         key.sort();
         let key = blake3::hash(&key.iter().flat_map(|id| id.to_hex().into_bytes()).collect::<Vec<u8>>());
         // The lock is held only to look up and to insert, so a cached cursor never waits behind a build.
-        let cached = {
+        let cached = || {
             let cache = self.past.lock().unwrap_or_else(|p| p.into_inner());
             cache.iter().find(|(k, _)| *k == key).map(|(_, past)| Arc::clone(past))
         };
-        if let Some(past) = cached {
+        if let Some(past) = cached() {
+            return Ok(past);
+        }
+        let _slot = self.building.take();
+        // Another request may have built it while this one waited for a slot.
+        if let Some(past) = cached() {
             return Ok(past);
         }
         let mut past = Graph::new(snap.store.info().ground);
@@ -759,6 +807,39 @@ impl Viewer {
     }
 }
 
+/// A fixed number of slots: `take` waits until one is free.
+struct Slots {
+    max: usize,
+    taken: Mutex<usize>,
+    freed: Condvar,
+}
+
+impl Slots {
+    fn new(max: usize) -> Slots {
+        Slots { max, taken: Mutex::new(0), freed: Condvar::new() }
+    }
+
+    /// Waits for a slot, given back when the guard drops.
+    fn take(&self) -> Slot<'_> {
+        let mut taken = self.taken.lock().unwrap_or_else(|p| p.into_inner());
+        while *taken >= self.max {
+            taken = self.freed.wait(taken).unwrap_or_else(|p| p.into_inner());
+        }
+        *taken += 1;
+        Slot(self)
+    }
+}
+
+/// Gives back a slot when dropped, and wakes one waiting for it.
+struct Slot<'a>(&'a Slots);
+
+impl Drop for Slot<'_> {
+    fn drop(&mut self) {
+        *self.0.taken.lock().unwrap_or_else(|p| p.into_inner()) -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
 /// Gives back a counted slot when dropped.
 struct Release<'a>(&'a AtomicUsize);
 
@@ -841,7 +922,15 @@ fn graph_json(snap: &Snapshot, page: &Page) -> Value {
         contributions.iter().map(|c| c.parents().iter().map(|p| at.of(p)).collect()).collect();
     // What's retracted now, of this page and of what this page's retractions target.
     let mut retracted: Vec<usize> = Vec::new();
+    let mut failed: Vec<usize> = Vec::new();
+    let mut retracts: Vec<[usize; 2]> = Vec::new();
     for c in &contributions {
+        if let Body::Retract { target, .. } = c.body() {
+            retracts.push([at.index[&c.id()], at.of(target)]);
+        }
+        if let Body::Evidence { verdict: Verdict::Fail, .. } = c.body() {
+            failed.push(at.index[&c.id()]);
+        }
         if g.is_retracted(&c.id()) {
             retracted.push(at.index[&c.id()]);
         }
@@ -872,6 +961,8 @@ fn graph_json(snap: &Snapshot, page: &Page) -> Value {
         "tags": tags,
         "refs": at.refs,
         "retracted": retracted,
+        "failed": failed,
+        "retracts": retracts,
     })
 }
 
@@ -1005,14 +1096,14 @@ fn all_intents_json(g: &Graph, names: &Names, view: &CurrentView, target: &Contr
 /// Every live intent in the replica, by target, in causal order of the targets.
 fn intents_json(snap: &Snapshot) -> Value {
     let g = snap.graph();
-    let view = CurrentView::new(g, &snap.order);
+    let view = &snap.current;
     let now = now_ms();
     let rows: Vec<Value> = snap
         .order
         .iter()
         .filter(|id| !view.hidden.contains(id))
         .filter_map(|id| {
-            let live = live_intents(g, &view, id, now);
+            let live = live_intents(g, view, id, now);
             (!live.is_empty()).then(|| {
                 let intents: Vec<Value> = live.iter().map(|i| intent_json(g, &snap.names, i, now)).collect();
                 json!({"target": id, "intents": intents})
@@ -1060,6 +1151,171 @@ mod tests {
         assert_eq!(cut_bytes("aé", 2), "a");
         assert_eq!(cut_bytes("aé", 3), "aé");
         assert_eq!(cut_bytes("ab", 9), "ab");
+    }
+
+    /// Every file under `assets/view/` is served, and only those.
+    #[test]
+    fn every_asset_file_is_served() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/view");
+        let mut on_disk = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).expect("the assets directory reads") {
+                let p = e.expect("an entry reads").path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else {
+                    let rel = p.strip_prefix(&root).expect("under the root").to_string_lossy().replace('\\', "/");
+                    on_disk.push(if rel == "index.html" { "/".to_owned() } else { format!("/{rel}") });
+                }
+            }
+        }
+        on_disk.sort();
+        let mut served: Vec<String> = ASSETS.iter().map(|(p, ..)| (*p).to_owned()).collect();
+        served.sort();
+        assert_eq!(served, on_disk);
+        for (path, _, body) in ASSETS {
+            let file = if *path == "/" { "index.html" } else { &path[1..] };
+            assert_eq!(*body, std::fs::read(root.join(file)).expect("the file reads").as_slice(), "{path}");
+        }
+    }
+
+    /// The page's scripts never hand text to anything that parses it as markup or code: Ground text
+    /// goes in with `textContent` only (decision 09f29f6c727b). A word-by-word grep, comments included.
+    #[test]
+    fn the_scripts_never_parse_text_as_markup_or_code() {
+        let forbidden = [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "setHTMLUnsafe",
+            "parseHTMLUnsafe",
+            "createContextualFragment",
+            "DOMParser",
+            "eval",
+            "Function",
+            "srcdoc",
+            "Reflect",
+            "defineProperty",
+        ];
+        let mut scripts = 0;
+        for (path, media_type, body) in ASSETS {
+            if !media_type.starts_with("text/javascript") && *path != "/" {
+                continue;
+            }
+            scripts += 1;
+            let text = std::str::from_utf8(body).expect("assets are UTF-8");
+            let words: Vec<&str> = text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '$')).collect();
+            for bad in forbidden {
+                assert!(!words.contains(&bad), "{path} uses {bad}");
+            }
+            let squeezed: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+            for bad in ["document.write", "document[", "setTimeout(\"", "setInterval(\"", "<script>", "style="] {
+                assert!(!squeezed.contains(bad), "{path} uses {bad}");
+            }
+            let computed = computed_access(text);
+            assert!(computed.is_empty(), "{path} reaches properties by computed names: {computed:?}");
+            // Attributes are set only through common.js's helpers, which refuse href, src, style and on*.
+            if *path != "/common.js" {
+                assert!(
+                    !words.contains(&"setAttribute") && !words.contains(&"setAttributeNS"),
+                    "{path} sets attributes"
+                );
+            }
+        }
+        assert_eq!(scripts, 3, "the page and its two scripts");
+    }
+
+    /// Computed property accesses that could build a sink's name or reach one on a DOM object: a string in
+    /// the brackets (`el['inner' + 'HTML']`, `x[`on${e}`]`), or brackets straight after a DOM object
+    /// (`document[k]`, `el.style[p]`). Indexing data (`parents[i]`) passes.
+    fn computed_access(text: &str) -> Vec<String> {
+        const DOM: [&str; 13] = [
+            "document",
+            "window",
+            "globalThis",
+            "self",
+            "top",
+            "parent",
+            "frames",
+            "el",
+            "node",
+            "element",
+            "this",
+            "style",
+            "dataset",
+        ];
+        const KEYWORDS: [&str; 8] = ["return", "typeof", "case", "in", "of", "else", "yield", "await"];
+        let s: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+        let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
+        let mut found = Vec::new();
+        for i in 1..s.len() {
+            if s[i] != '[' || !(ident(s[i - 1]) || matches!(s[i - 1], ')' | ']')) {
+                continue;
+            }
+            let mut start = i;
+            while start > 0 && ident(s[start - 1]) {
+                start -= 1;
+            }
+            let receiver: String = s[start..i].iter().collect();
+            if KEYWORDS.contains(&receiver.as_str()) {
+                continue; // `return [a, b]` is an array, not an access
+            }
+            let mut depth = 0;
+            let mut end = i;
+            for (j, c) in s.iter().enumerate().skip(i) {
+                match c {
+                    '[' => depth += 1,
+                    ']' => depth -= 1,
+                    _ => {}
+                }
+                if depth == 0 {
+                    end = j;
+                    break;
+                }
+            }
+            let inside: String = s[i + 1..end.max(i + 1)].iter().collect();
+            if inside.contains(['\'', '"', '`']) || DOM.contains(&receiver.as_str()) {
+                found.push(format!("{receiver}[{inside}]"));
+            }
+        }
+        found
+    }
+
+    /// No more than the slots' number are ever taken at once, and every waiter gets one in the end.
+    #[test]
+    fn slots_cap_how_many_run_at_once() {
+        let slots = Arc::new(Slots::new(PAST_BUILDS));
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let threads: Vec<_> = (0..16)
+            .map(|_| {
+                let (slots, running, most) = (Arc::clone(&slots), Arc::clone(&running), Arc::clone(&most));
+                std::thread::spawn(move || {
+                    let _slot = slots.take();
+                    let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(now, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(20));
+                    running.fetch_sub(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("a waiter finished");
+        }
+        assert_eq!(most.load(Ordering::SeqCst), PAST_BUILDS);
+        assert_eq!(*slots.taken.lock().expect("not poisoned"), 0);
+    }
+
+    #[test]
+    fn computed_access_is_caught() {
+        for bad in ["el['inner' + 'HTML'] = t", "x[\"on\" + e] = f", "document[k]", "a.style[p] = v", "n[`on${e}`]"] {
+            assert!(!computed_access(bad).is_empty(), "{bad}");
+        }
+        for fine in ["parents[i].push(p)", "B.KIND_WORD[kind[i]]", "return [a, b]", "f([\"a\", \"b\"])", "x = [\"a\"]"]
+        {
+            assert_eq!(computed_access(fine), Vec::<String>::new(), "{fine}");
+        }
     }
 
     #[test]

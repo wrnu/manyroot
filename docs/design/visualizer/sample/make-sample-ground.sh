@@ -76,5 +76,9 @@ h evidence "$impl2" pass --method "review" --as maya >/dev/null
 h evidence "$task1" pass --method "acceptance: idle session expired at 15m" --as val >/dev/null
 for who in alice bob carol; do sync "$who"; done
 
+# Alice, bob and carol publish their agent entries (public keys and names, no private keys) to the hub, as
+# a team shares its agents/ directory, so the hub names them.
+for who in alice bob carol; do cp "$work/$who/.bracken/agents/$who.json" "$work/hub/.bracken/agents/"; done
+
 work="$work/hub"
 echo "$work"

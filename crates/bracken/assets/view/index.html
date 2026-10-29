@@ -1,21 +1,62 @@
 <!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Bracken view</title>
-<link rel="stylesheet" href="/style.css">
-<script src="/app.js" defer></script>
-</head>
-<body>
-<main>
-<h1 id="name">Bracken view</h1>
-<p id="summary">Reading the Ground…</p>
-<p class="note">A placeholder until the Loom arrives. The JSON this page reads is under <code>/api/</code>.</p>
-<h2>Agents</h2>
-<ul id="agents"></ul>
-<h2>Heads</h2>
-<ul id="heads"></ul>
-</main>
-</body>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>The Loom · Bracken</title>
+    <link rel="stylesheet" href="/visualizer.css" />
+    <link rel="stylesheet" href="/loom.css" />
+    <script src="/common.js" defer></script>
+    <script src="/loom.js" defer></script>
+  </head>
+  <body class="loom-page">
+    <header class="masthead">
+      <h1>The Loom <span class="ground-name" id="ground-name"></span></h1>
+      <span class="synthetic" id="data-note" role="status">Reading the Ground…</span>
+      <nav aria-label="Views">
+        <a href="/" aria-current="page">Loom</a>
+      </nav>
+    </header>
+
+    <main class="loom" id="loom">
+      <section class="gauge" aria-label="Time: drag the surface to replay">
+        <canvas id="gauge-canvas"></canvas>
+        <div class="surface-handle" id="surface" role="slider" tabindex="0" aria-label="Replay to" aria-valuemin="0" aria-valuemax="1000" aria-valuenow="1000">
+          <span class="surface-time num" id="surface-time"></span>
+        </div>
+        <div class="flag" id="flag" aria-hidden="true" hidden><span class="sc">you left here</span></div>
+      </section>
+
+      <section class="window" id="window" aria-label="Contributions, by agent and in causal order">
+        <div class="agents" id="agents"></div>
+        <canvas id="loom-canvas" role="img" aria-label="The Ground's contributions woven by agent"></canvas>
+        <div class="labels" id="labels" aria-hidden="true"></div>
+        <svg class="tether" id="tether" aria-hidden="true"></svg>
+        <div class="hover-label" id="hover-label" hidden></div>
+      </section>
+
+      <aside class="side" id="side" aria-live="polite">
+        <p class="side-hint">Hover a knot to light its ancestry. Click it for its label.</p>
+      </aside>
+    </main>
+
+    <footer class="controls" aria-label="Replay and view">
+      <button type="button" id="play" aria-pressed="false">Grow</button>
+      <label class="sc speed">pace
+        <select id="speed">
+          <option value="0.5">slow</option>
+          <option value="1" selected>steady</option>
+          <option value="3">quick</option>
+        </select>
+      </label>
+      <button type="button" id="to-flag" disabled>Back to where you left</button>
+      <span class="divider" aria-hidden="true"></span>
+      <div class="segmented" role="group" aria-label="Vertical axis">
+        <button type="button" id="axis-time" aria-pressed="true">Authors' clocks</button>
+        <button type="button" id="axis-causal" aria-pressed="false">Causal steps</button>
+      </div>
+      <div class="key" id="key" aria-label="Key"></div>
+    </footer>
+  </body>
 </html>

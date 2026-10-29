@@ -16,9 +16,20 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 here = os.path.dirname(os.path.abspath(__file__))
 hub = sys.argv[1]
+
+# Only a throwaway Ground: one under the temp directory, and never this repository's own Ground.
+ground_dir = os.path.realpath(os.path.join(hub, ".bracken"))
+temps = {os.path.realpath(tempfile.gettempdir()), os.path.realpath("/tmp")}
+if not any(os.path.commonpath([ground_dir, t]) == t for t in temps):
+    sys.exit(f"export-sample: {ground_dir} isn't under the temp directory; it reads throwaway Grounds only")
+common = subprocess.run(["git", "-C", here, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                        capture_output=True, text=True).stdout.strip()
+if common and ground_dir == os.path.realpath(os.path.join(os.path.dirname(common), ".bracken")):
+    sys.exit("export-sample: that's the main checkout's Ground; it reads throwaway Grounds only")
 binary = sys.argv[2] if len(sys.argv) > 2 else os.path.join(here, "../../../../target/debug/bracken")
 env = {k: v for k, v in os.environ.items() if k not in ("BRACKEN_AGENT",)}
 env["BRACKEN_DIR"] = os.path.join(hub, ".bracken")
@@ -32,18 +43,7 @@ def bk(*args):
 log = bk("log")
 by_id = {c["id"]: c for c in log}
 
-# The hub names only the identities it holds; alice, bob and carol hold theirs in their own replicas (siblings
-# of the hub), so the sample names them from there, as a replica with their agent entries would.
-names = {}
-for sibling in sorted(os.listdir(os.path.dirname(os.path.abspath(hub)))):
-    d = os.path.join(os.path.dirname(os.path.abspath(hub)), sibling, ".bracken")
-    if os.path.isdir(d):
-        e = dict(env, BRACKEN_DIR=d)
-        out = subprocess.run([binary, "id", "list", "--json"], env=e, check=True, capture_output=True, text=True)
-        names.update({a["agent"]: a["name"] for a in json.loads(out.stdout)})
-for c in log:
-    c["author_name"] = c["author_name"] or names.get(c["author"])
-
+# Names come from the hub alone: make-sample-ground.sh publishes every agent's entry there.
 # Respace time: keep the real order of timestamps, about 6 to 30 minutes apart, from 08:40.
 day0 = 1761640800000  # 2025-10-28T08:40:00Z, an invented day
 order = sorted(log, key=lambda c: (c["timestamp_ms"], log.index(c)))
