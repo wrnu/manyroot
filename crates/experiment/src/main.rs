@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use bracken_experiment::bracken_mode::AcceptRule;
 use bracken_experiment::claude::{
     Caps, ClaudeBackend, ClaudeConfig, Expect, Pin, RUN_TIME_CAP, RUN_TOKEN_CAP, Routing,
 };
@@ -43,6 +44,9 @@ enum Cmd {
         /// Record every command git starts in the store's git-trace.log (tests).
         #[arg(long)]
         trace: bool,
+        /// Bracken mode: which implementation counts for a function.
+        #[arg(long, default_value = "one-pass", value_parser = AcceptRule::NAMES)]
+        accept_rule: String,
     },
     /// Relay MCP between standard input and output and the driver's socket.
     Shim {
@@ -78,6 +82,9 @@ enum Cmd {
         /// The bracken binary; defaults to the one next to this executable.
         #[arg(long)]
         bracken: Option<PathBuf>,
+        /// Bracken mode: which implementation counts for a function (phase1-most-passes reproduces Phase 1).
+        #[arg(long, default_value = "one-pass", value_parser = AcceptRule::NAMES)]
+        accept_rule: String,
     },
     /// Run one mode with the mock backend into a new directory.
     MockRun {
@@ -97,6 +104,9 @@ enum Cmd {
         /// Run the workers under their sandbox profiles.
         #[arg(long)]
         sandbox: bool,
+        /// Bracken mode: which implementation counts for a function (phase1-most-passes reproduces Phase 1).
+        #[arg(long, default_value = "one-pass", value_parser = AcceptRule::NAMES)]
+        accept_rule: String,
     },
     /// Measure finished runs, one column each.
     Report {
@@ -112,27 +122,49 @@ enum Cmd {
 
 fn main() {
     let result = match Cli::parse().command {
-        Cmd::Worker { mode, identity, store, bracken, git, trace } => {
-            bracken_experiment::worker::serve(&mode, StoreConfig { dir: store, bracken, git, identity, trace })
+        Cmd::Worker { mode, identity, store, bracken, git, trace, accept_rule } => {
+            let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
+            bracken_experiment::worker::serve(
+                &mode,
+                StoreConfig { dir: store, bracken, git, identity, trace, accept_rule },
+            )
         }
         Cmd::Shim { socket } => bracken_experiment::shim::run(&socket),
         Cmd::Guard => bracken_experiment::claude::guard(),
-        Cmd::Run { dir, mode, agents, turns, claude, claude_version, settings, prompt_file, model, bracken } => {
-            claude_run(ClaudeRun {
-                dir,
-                mode,
-                agents,
-                turns,
-                claude,
-                claude_version,
-                settings,
-                prompt_file,
-                model,
-                bracken,
-            })
-        }
-        Cmd::MockRun { dir, mode, agents, turns, seed, bracken, sandbox } => {
-            mock_run(dir, &mode, agents, turns, seed, bracken, sandbox)
+        Cmd::Run {
+            dir,
+            mode,
+            agents,
+            turns,
+            claude,
+            claude_version,
+            settings,
+            prompt_file,
+            model,
+            bracken,
+            accept_rule,
+        } => claude_run(ClaudeRun {
+            accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
+            dir,
+            mode,
+            agents,
+            turns,
+            claude,
+            claude_version,
+            settings,
+            prompt_file,
+            model,
+            bracken,
+        }),
+        Cmd::MockRun { dir, mode, agents, turns, seed, bracken, sandbox, accept_rule } => {
+            let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
+            let plan = PlanInputs {
+                backend_seed: seed,
+                harness_commit: harness_commit(),
+                accept_rule,
+                ..PlanInputs::default()
+            };
+            mock_run(dir, &mode, agents, turns, bracken, sandbox, plan)
         }
         Cmd::Report { dirs, usage, json } => report(&dirs, usage.as_deref(), json),
     };
@@ -153,6 +185,7 @@ struct ClaudeRun {
     prompt_file: Option<PathBuf>,
     model: String,
     bracken: Option<PathBuf>,
+    accept_rule: AcceptRule,
 }
 
 fn claude_run(a: ClaudeRun) -> Result<(), String> {
@@ -177,6 +210,7 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
         caps: serde_json::Value::String(format!("{caps:?}")),
         system_prompt: blake3::hash(prompt.as_bytes()).to_hex().to_string(),
         expected_stops: vec![RUN_TOKEN_CAP.into(), RUN_TIME_CAP.into()],
+        accept_rule: a.accept_rule,
         usage: std::path::absolute(a.dir.join("claude").join("usage.jsonl"))
             .map_err(|e| e.to_string())?
             .display()
@@ -220,9 +254,9 @@ fn mock_run(
     mode: &str,
     agents: usize,
     turns: u32,
-    seed: u64,
     bracken: Option<PathBuf>,
     sandbox: bool,
+    plan: PlanInputs,
 ) -> Result<(), String> {
     let mode = bracken_experiment::mode::mode_named(mode).ok_or("no such mode")?.name();
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -243,9 +277,10 @@ fn mock_run(
         trace: false,
         calls_per_turn: CALLS_PER_TURN,
         turn_limit: TURN_LIMIT,
-        plan: PlanInputs { backend_seed: seed, harness_commit: harness_commit(), ..PlanInputs::default() },
+        plan,
         sandbox,
     };
+    let seed = cfg.plan.backend_seed;
     let usage = Some(cfg.root.join("usage.jsonl"));
     // Through the shim, as Claude Code reaches the driver.
     let outcome = run(&cfg, &MockBackend { seed, wrong_rate: 0.15, shim: Some(cfg.worker_bin.clone()), usage })?;

@@ -198,6 +198,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         git: cfg.git.clone(),
         identity: identity.into(),
         trace: cfg.trace,
+        accept_rule: cfg.plan.accept_rule,
     };
 
     let sockets = root.join("sockets");

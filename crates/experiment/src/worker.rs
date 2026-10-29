@@ -235,6 +235,7 @@ impl Worker {
             .arg("--git")
             .arg(&config.git)
             .args(config.trace.then_some("--trace"))
+            .args(["--accept-rule", config.accept_rule.name()])
             .env_clear()
             .current_dir(&config.dir)
             .stdin(Stdio::piped())

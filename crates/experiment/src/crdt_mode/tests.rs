@@ -18,6 +18,7 @@ fn store(dir: &Path, identity: &str) -> CrdtStore {
             git: PathBuf::from("/nonexistent"),
             identity: identity.into(),
             trace: false,
+            accept_rule: Default::default(),
         },
         doc: None,
     }

@@ -38,6 +38,8 @@ pub struct StoreConfig {
     pub identity: String,
     /// Tests only: record every command git starts in the store's `git-trace.log`.
     pub trace: bool,
+    /// Bracken mode: which implementation counts for a function.
+    pub accept_rule: crate::bracken_mode::AcceptRule,
 }
 
 /// One agent's working copy, or the mode's hub.
