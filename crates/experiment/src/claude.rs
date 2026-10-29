@@ -220,7 +220,60 @@ pub struct Caps {
     pub run_time: Duration,
 }
 
+/// The tokens of a whole replicate (the owner's go, approval `1316798b18f9`): no one mode's cap may pass it.
+pub const REPLICATE_TOKENS: u64 = 75_000_000;
+
+/// One mode's token cap for a run, given as `--mode-token-cap <mode>=<tokens>` (the manager's note
+/// `2018c9beceff`, decision `c90a34c1ca38`): a run of that mode stops at `tokens` instead of the pilot's
+/// [`Caps::run_tokens`], higher or lower; runs of other modes are unchanged. At most [`REPLICATE_TOKENS`].
+/// The replicate's total is kept by the run order: its last mode runs at what is left of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModeTokenCap {
+    pub mode: String,
+    pub tokens: u64,
+}
+
+impl std::str::FromStr for ModeTokenCap {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (mode, tokens) = s.split_once('=').ok_or_else(|| format!("{s:?}: expected <mode>=<tokens>"))?;
+        if crate::mode::mode_named(mode).is_none() {
+            return Err(format!("{mode:?}: not a mode (bracken, git or crdt)"));
+        }
+        if tokens.is_empty() || !tokens.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(format!("{tokens:?}: expected a whole number of tokens above 0"));
+        }
+        let tokens = match tokens.parse::<u64>() {
+            Ok(0) => return Err("0: expected a whole number of tokens above 0".to_string()),
+            Ok(n) if n <= REPLICATE_TOKENS => n,
+            _ => return Err(format!("{tokens}: above {REPLICATE_TOKENS}, the whole replicate's tokens")),
+        };
+        Ok(ModeTokenCap { mode: mode.to_string(), tokens })
+    }
+}
+
 impl Caps {
+    /// The caps of one run of `mode`: the pilot's, with the run's token cap from the entry of `given` naming
+    /// `mode`, if there is one. Without one they are exactly [`Caps::pilot`]. A mode named twice is refused.
+    pub fn for_mode(mode: &str, given: &[ModeTokenCap]) -> Result<Caps, String> {
+        let mut caps = Caps::pilot();
+        for (i, c) in given.iter().enumerate() {
+            if given[..i].iter().any(|d| d.mode == c.mode) {
+                return Err(format!("--mode-token-cap names {} twice", c.mode));
+            }
+            if c.mode == mode {
+                caps.run_tokens = c.tokens;
+            }
+        }
+        Ok(caps)
+    }
+
+    /// The caps as the plan records them, and so as its hash covers them.
+    pub fn plan_value(&self) -> serde_json::Value {
+        serde_json::Value::String(format!("{self:?}"))
+    }
+
     /// The pilot's caps (design section 5).
     pub fn pilot() -> Caps {
         Caps {
@@ -236,7 +289,8 @@ impl Caps {
             agent_output: 180_000,
             // One run is one mode, and the modes run one after another: each run's caps are a third
             // of the owner's go for the whole pilot, 75M tokens, 5M output and 3 h (decisions
-            // `3418fe14b8ed`, `ea053c2c4d48`), equal in every mode.
+            // `3418fe14b8ed`, `ea053c2c4d48`), equal in every mode. A run may take its mode's token cap in
+            // place of this (`--mode-token-cap`, [`Caps::for_mode`]).
             run_tokens: 25_000_000,
             run_output: 1_666_666,
             run_time: Duration::from_secs(3600),

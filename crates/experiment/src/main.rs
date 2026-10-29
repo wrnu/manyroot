@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 
 use bracken_experiment::bracken_mode::AcceptRule;
 use bracken_experiment::claude::{
-    Caps, ClaudeBackend, ClaudeConfig, Expect, Pin, RUN_TIME_CAP, RUN_TOKEN_CAP, Routing,
+    Caps, ClaudeBackend, ClaudeConfig, Expect, ModeTokenCap, Pin, RUN_TIME_CAP, RUN_TOKEN_CAP, Routing,
 };
 use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
 use bracken_experiment::mock::MockBackend;
@@ -91,6 +91,10 @@ enum Cmd {
         /// Bracken mode: which implementation counts for a function (phase1-most-passes reproduces Phase 1).
         #[arg(long, default_value = "one-pass", value_parser = AcceptRule::NAMES)]
         accept_rule: String,
+        /// A mode's token cap in place of the pilot's 25M, as MODE=TOKENS (e.g. bracken=30000000). It applies
+        /// only when MODE is this run's mode; give it once per mode. The plan records the caps in effect.
+        #[arg(long, value_name = "MODE=TOKENS")]
+        mode_token_cap: Vec<ModeTokenCap>,
     },
     /// Run one mode with the mock backend into a new directory.
     MockRun {
@@ -154,7 +158,9 @@ fn main() {
             task,
             bracken,
             accept_rule,
+            mode_token_cap,
         } => claude_run(ClaudeRun {
+            mode_token_cap,
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
             task: task_named(&task),
             dir,
@@ -208,6 +214,7 @@ struct ClaudeRun {
     model: String,
     bracken: Option<PathBuf>,
     accept_rule: AcceptRule,
+    mode_token_cap: Vec<ModeTokenCap>,
 }
 
 fn claude_run(a: ClaudeRun) -> Result<(), String> {
@@ -224,13 +231,16 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
     if a.prompt_file.is_some() {
         println!("the system prompt is from --prompt-file, not the reviewed prompts; the plan hashes it");
     }
-    let (expect, caps) = (Expect::pinned_2_1_311(&a.model), Caps::pilot());
+    let (expect, caps) = (Expect::pinned_2_1_311(&a.model), Caps::for_mode(&a.mode, &a.mode_token_cap)?);
+    if caps.run_tokens != Caps::pilot().run_tokens {
+        println!("this {} run's token cap is {} (--mode-token-cap); the plan records it", a.mode, caps.run_tokens);
+    }
     let plan = PlanInputs {
         task: a.task,
         model: expect.model.clone(),
         effort: expect.effort.clone(),
         harness_commit: harness_commit(),
-        caps: serde_json::Value::String(format!("{caps:?}")),
+        caps: caps.plan_value(),
         system_prompt: blake3::hash(prompt.as_bytes()).to_hex().to_string(),
         expected_stops: vec![RUN_TOKEN_CAP.into(), RUN_TIME_CAP.into()],
         accept_rule: a.accept_rule,
