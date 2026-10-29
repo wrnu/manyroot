@@ -13,6 +13,7 @@ fn store(dir: &Path, identity: &str) -> CrdtStore {
     std::fs::create_dir_all(dir).expect("a store dir");
     CrdtStore {
         config: StoreConfig {
+            task: Task::Phase1,
             dir: dir.to_path_buf(),
             bracken: PathBuf::from("/nonexistent"),
             git: PathBuf::from("/nonexistent"),
@@ -154,8 +155,8 @@ fn a_copy_and_the_hub_converge_and_concurrent_edits_merge() {
     let (served, synced) = sync(tmp.path(), &mut hub, &mut copies[0], &keys[0], &keys);
     served.and(synced).expect("sync");
     assert_eq!(
-        version_of(&text(&mut copies[0], TASKS)),
-        CHANGES.iter().fold(Version::ORIGINAL, |v, c| v.with(c.change))
+        Task::Phase1.version_of(&text(&mut copies[0], TASKS)),
+        Task::Phase1.changes().iter().fold(Version::ORIGINAL, |v, c| v.with(c.change))
     );
 }
 
@@ -706,7 +707,7 @@ fn hub_is_sound(root: &Path, hub: &mut CrdtStore) -> Vec<ChangeHash> {
     let now = heads(hub);
     let mut reopened = store(&root.join("hub"), "setter");
     assert_eq!(heads(&mut reopened), now, "the saved document is the one in memory");
-    for file in FILES {
+    for file in files(Task::Phase1) {
         reopened.text(file).expect("every text reads");
     }
     let saved = wire::save(hub.doc().expect("doc")).expect("it saves");

@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::task::Task;
+
 /// A tool as agents see it in `tools/list`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
@@ -38,6 +40,8 @@ pub struct StoreConfig {
     pub identity: String,
     /// Tests only: record every command git starts in the store's `git-trace.log`.
     pub trace: bool,
+    /// The task the run gives its agents.
+    pub task: Task,
     /// Bracken mode: which implementation counts for a function.
     pub accept_rule: crate::bracken_mode::AcceptRule,
 }
@@ -138,8 +142,8 @@ pub struct Session {
 /// A mode, as the driver and the workers know it.
 pub trait Mode: Sync {
     fn name(&self) -> &'static str;
-    /// The mode's tools, without the core's own (`sync`, `notes_read`, `notes_write`).
-    fn tools(&self) -> Vec<ToolSpec>;
+    /// The mode's tools for `task`, without the core's own (`sync`, `notes_read`, `notes_write`).
+    fn tools(&self, task: Task) -> Vec<ToolSpec>;
     /// Which of [`Mode::tools`] the hub serves ([`Store::hub_tool`]) rather than the agent's copy.
     fn hub_tools(&self) -> &'static [&'static str] {
         &[]

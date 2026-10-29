@@ -234,6 +234,7 @@ impl Worker {
             .arg(&config.bracken)
             .arg("--git")
             .arg(&config.git)
+            .args(["--task", config.task.name()])
             .args(config.trace.then_some("--trace"))
             .args(["--accept-rule", config.accept_rule.name()])
             .env_clear()

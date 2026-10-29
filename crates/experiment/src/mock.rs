@@ -21,9 +21,11 @@ use serde_json::{Value, json};
 
 use crate::candidates::{candidates, correct_programs};
 use crate::driver::Backend;
-use crate::task::{CHANGES, SPECS, Version, change_tag, version_of};
+use crate::task::{Spec, Task, Version, change_tag};
 
 pub struct MockBackend {
+    /// The task the run gives its agents.
+    pub task: Task,
     pub seed: u64,
     /// Chance that an implementation is a known-wrong program.
     pub wrong_rate: f64,
@@ -123,8 +125,8 @@ struct Memory {
 }
 
 /// The next function to implement: low layers first, spread across agents.
-fn next_spec(memory: &Memory, agent: usize) -> Option<&'static crate::task::Spec> {
-    let todo: Vec<_> = SPECS.iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
+fn next_spec(task: Task, memory: &Memory, agent: usize) -> Option<&'static Spec> {
+    let todo: Vec<_> = task.specs().iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
     todo.get(agent % 3).or(todo.first()).copied()
 }
 
@@ -206,7 +208,9 @@ impl MockBackend {
             .flat_map(|e| e["body"]["tags"].as_array().into_iter().flatten())
             .filter_map(Value::as_str)
             .collect();
-        let version = CHANGES
+        let version = self
+            .task
+            .changes()
             .iter()
             .filter(|ch| seen.contains(&change_tag(ch.change)))
             .fold(Version::ORIGINAL, |v, ch| v.with(ch.change));
@@ -223,11 +227,11 @@ impl MockBackend {
         };
 
         // Implement one function not done yet.
-        if let Some(spec) = next_spec(&memory, agent) {
+        if let Some(spec) = next_spec(self.task, &memory, agent) {
             let program = if rng.chance(self.wrong_rate) {
-                candidates(spec.name).wrong[0].to_string()
+                candidates(self.task, spec.name).wrong[0].to_string()
             } else {
-                correct_programs(version)[spec.name].to_string()
+                correct_programs(self.task, version)[spec.name].to_string()
             };
             let content = format!("def {} {} : {program}\n", spec.name, spec.arity);
             let artifact = first_line(&c.tool("artifact", json!({"function": spec.name, "content": content}))?);
@@ -290,18 +294,19 @@ impl MockBackend {
         rng: &mut Rng,
         memory: &mut Memory,
     ) -> Result<(), String> {
-        use crate::crdt_mode::{MODULE_FILES, NOTES, TASKS};
-        let version = version_of(&file_text(&c.tool("read", json!({"file": TASKS}))?));
-        let todo: Vec<_> = SPECS.iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
+        use crate::crdt_mode::{NOTES, TASKS};
+        let version = self.task.version_of(&file_text(&c.tool("read", json!({"file": TASKS}))?));
+        let todo: Vec<_> =
+            self.task.specs().iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
         let Some(spec) = todo.get(agent % 3).or(todo.first()).copied() else { return Ok(()) };
         let program = if rng.chance(self.wrong_rate) {
-            candidates(spec.name).wrong[0].to_string()
+            candidates(self.task, spec.name).wrong[0].to_string()
         } else {
-            correct_programs(version)[spec.name].to_string()
+            correct_programs(self.task, version)[spec.name].to_string()
         };
         let line = format!("def {} {} : {program}", spec.name, spec.arity);
-        let index = crate::task::MODULES.iter().position(|m| *m == spec.module).ok_or("a spec in no module")?;
-        let file = MODULE_FILES[index];
+        let index = self.task.modules().iter().position(|m| *m == spec.module).ok_or("a spec in no module")?;
+        let file = self.task.module_files()[index];
         // Concurrent edits of one line merge character by character, and can leave a line that
         // doesn't parse, which breaks its whole module for everyone. Like an agent reading the
         // check's error, delete such lines first, from the bottom so line numbers above stay put.
@@ -347,12 +352,12 @@ impl MockBackend {
     }
 
     fn git_turn(&self, c: &mut Client, agent: usize, rng: &mut Rng, memory: &mut Memory) -> Result<(), String> {
-        let version = version_of(&file_text(&c.tool("read", json!({"file": "TASKS.md"}))?));
-        let program = |spec: &crate::task::Spec, rng: &mut Rng| {
+        let version = self.task.version_of(&file_text(&c.tool("read", json!({"file": "TASKS.md"}))?));
+        let program = |spec: &Spec, rng: &mut Rng| {
             if rng.chance(self.wrong_rate) {
-                candidates(spec.name).wrong[0].to_string()
+                candidates(self.task, spec.name).wrong[0].to_string()
             } else {
-                correct_programs(version)[spec.name].to_string()
+                correct_programs(self.task, version)[spec.name].to_string()
             }
         };
 
@@ -393,7 +398,7 @@ impl MockBackend {
         }
 
         // Implement one function on a branch of its own, and open a PR.
-        if let Some(spec) = next_spec(memory, agent).filter(|_| c.calls + 6 <= budget) {
+        if let Some(spec) = next_spec(self.task, memory, agent).filter(|_| c.calls + 6 <= budget) {
             let branch = format!("f-{}", spec.name);
             memory.implemented.push(spec.name.to_string());
             c.tool("switch", json!({"branch": branch, "create": true}))?;

@@ -213,6 +213,16 @@ impl Library {
         library
     }
 
+    /// This library with `top`'s definitions in place of its own of the same names.
+    pub fn with(&self, top: &Library) -> Library {
+        let mut out = self.clone();
+        for (name, def) in &top.defs {
+            out.duplicates.remove(name);
+            out.defs.insert(name.clone(), def.clone());
+        }
+        out
+    }
+
     /// The one definition of `name`, if there is exactly one in a module that parses.
     pub fn get(&self, name: &str) -> Option<&Def> {
         self.defs.get(name)

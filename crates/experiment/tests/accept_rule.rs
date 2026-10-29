@@ -2,6 +2,7 @@
 //! applied to a Phase 1 mock run's hub log, gives exactly the library that run integrated.
 
 use bracken_experiment::bracken_mode::{AcceptRule, Snapshot, modules_of};
+use bracken_experiment::task::Task;
 use serde_json::Value;
 
 /// A Bracken mock run recorded with the harness as it was before the rule became selectable
@@ -15,8 +16,8 @@ const PHASE1_RUNS: &[(&str, &str)] = &[
 
 fn library(run: &Value, rule: AcceptRule) -> Vec<(String, String)> {
     let setter = run["setter"].as_str().expect("the setter's key");
-    let snapshot = Snapshot::new(&run["log"], setter, rule).expect("a snapshot");
-    modules_of(&snapshot.integrated())
+    let snapshot = Snapshot::new(&run["log"], setter, rule, Task::Phase1).expect("a snapshot");
+    modules_of(Task::Phase1, &snapshot.integrated())
 }
 
 #[test]

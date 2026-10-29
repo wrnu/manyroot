@@ -1,13 +1,15 @@
-//! Known programs for every spec: correct ones, subtly wrong ones, and the
-//! updates each change request needs. The scripted agents and the tests use
-//! them; no agent is shown them.
+//! Known programs for every spec of each task: correct ones, subtly wrong
+//! ones, and the updates each change request needs. The scripted agents and
+//! the tests use them; no agent is shown them.
 //!
 //! Each spec's first correct program, with the others' first correct
 //! programs, makes a library that is right everywhere under the original
 //! specs. A wrong program fails at least one hidden case; the last wrong one of
 //! each spec passes every public case, so a public check can't tell.
 
-use crate::task::{Change, MODULES, SPECS, Version, spec_named};
+use crate::task::{Change, Task, Version};
+
+pub mod phase2;
 
 pub struct Candidates {
     pub name: &'static str,
@@ -19,6 +21,7 @@ const fn c(name: &'static str, correct: &'static [&'static str], wrong: &'static
     Candidates { name, correct, wrong }
 }
 
+/// Phase 1's.
 pub const CANDIDATES: &[Candidates] = &[
     c("abs", &["a 0 < a neg a ?", "a 0 > a a neg ?"], &["a", "a -7 > a 0 < a neg a ? a ?"]),
     c(
@@ -104,6 +107,7 @@ pub struct Update {
     pub programs: &'static [(&'static str, &'static str)],
 }
 
+/// Phase 1's.
 pub const UPDATES: &[Update] = &[
     Update {
         change: Change::ClampOrder,
@@ -127,28 +131,45 @@ pub const UPDATES: &[Update] = &[
     },
 ];
 
-pub fn candidates(name: &str) -> &'static Candidates {
-    CANDIDATES.iter().find(|c| c.name == name).unwrap_or_else(|| panic!("no candidates for {name}"))
+/// `task`'s candidates, one entry per spec.
+pub fn of(task: Task) -> &'static [Candidates] {
+    match task {
+        Task::Phase1 => CANDIDATES,
+        Task::Phase2 => phase2::CANDIDATES,
+    }
+}
+
+/// `task`'s updates, one per change request.
+pub fn updates(task: Task) -> &'static [Update] {
+    match task {
+        Task::Phase1 => UPDATES,
+        Task::Phase2 => &[],
+    }
+}
+
+pub fn candidates(task: Task, name: &str) -> &'static Candidates {
+    of(task).iter().find(|c| c.name == name).unwrap_or_else(|| panic!("no candidates for {name}"))
 }
 
 /// One program per spec, by name.
 pub type Programs = std::collections::BTreeMap<&'static str, &'static str>;
 
 /// The library of first correct programs, with the updates for every change in `version`.
-pub fn correct_programs(version: Version) -> Programs {
-    let mut programs: Programs = CANDIDATES.iter().map(|c| (c.name, c.correct[0])).collect();
-    for update in UPDATES.iter().filter(|u| version.has(u.change)) {
+pub fn correct_programs(task: Task, version: Version) -> Programs {
+    let mut programs: Programs = of(task).iter().map(|c| (c.name, c.correct[0])).collect();
+    for update in updates(task).iter().filter(|u| version.has(u.change)) {
         programs.extend(update.programs.iter().copied());
     }
     programs
 }
 
 /// Module texts for `programs`, each function in its spec's module.
-pub fn modules(programs: &Programs) -> Vec<(&'static str, String)> {
-    MODULES
+pub fn modules(task: Task, programs: &Programs) -> Vec<(&'static str, String)> {
+    task.modules()
         .iter()
         .map(|&module| {
-            let text: String = SPECS
+            let text: String = task
+                .specs()
                 .iter()
                 .filter(|s| s.module == module)
                 .filter_map(|s| programs.get(s.name).map(|p| format!("def {} {} : {p}\n", s.name, s.arity)))
@@ -159,11 +180,11 @@ pub fn modules(programs: &Programs) -> Vec<(&'static str, String)> {
 }
 
 /// [`modules`] of [`correct_programs`].
-pub fn correct_library(version: Version) -> Vec<(&'static str, String)> {
-    modules(&correct_programs(version))
+pub fn correct_library(task: Task, version: Version) -> Vec<(&'static str, String)> {
+    modules(task, &correct_programs(task, version))
 }
 
 /// Whether every candidate names a spec, and every spec has candidates.
-pub fn covers_every_spec() -> bool {
-    CANDIDATES.len() == SPECS.len() && CANDIDATES.iter().all(|c| spec_named(c.name).is_some())
+pub fn covers_every_spec(task: Task) -> bool {
+    of(task).len() == task.specs().len() && of(task).iter().all(|c| task.spec_named(c.name).is_some())
 }

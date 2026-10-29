@@ -36,6 +36,7 @@ pub fn turn_message(turn: u32, turns: u32, name: &str) -> String {
 mod tests {
     use super::*;
     use crate::mode::mode_named;
+    use crate::task::Task;
 
     #[test]
     fn every_mode_has_its_own_prompt() {
@@ -81,7 +82,7 @@ mod tests {
     fn each_mode_names_its_shared_channel_once_alike() {
         let phrase = " where agents talk to each other: everyone can read ";
         for name in ["bracken", "git", "crdt"] {
-            let tools = mode_named(name).expect("a mode").tools();
+            let tools = mode_named(name).expect("a mode").tools(Task::Phase1);
             let naming: Vec<_> = tools.iter().filter(|t| t.description.contains(phrase)).collect();
             assert_eq!(naming.len(), 1, "{name}: one tool names the channel");
             let reader = naming[0].description.rsplit("with ").next().expect("a tool");
@@ -98,7 +99,7 @@ mod tests {
         for name in ["bracken", "git", "crdt"] {
             texts.push(section(name).expect("a section").to_string());
             let mode = mode_named(name).expect("a mode");
-            texts.push(serde_json::to_string(&mode.tools()).expect("JSON"));
+            texts.push(serde_json::to_string(&mode.tools(Task::Phase1)).expect("JSON"));
         }
         let all = texts.join("\n").to_lowercase();
         for word in ["experiment", "metric", "measure", "token", "score", "grader", "hidden", "mode", "crdt", "bracken"]

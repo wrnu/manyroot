@@ -4,18 +4,18 @@ use serde_json::{Value, json};
 
 use super::*;
 use crate::candidates::{candidates, correct_programs};
-use crate::task::spec_named;
+use crate::task::Task;
 
 fn right(f: &str) -> String {
-    def(f, correct_programs(Version::ORIGINAL)[f])
+    def(f, correct_programs(Task::Phase1, Version::ORIGINAL)[f])
 }
 
 fn wrong(f: &str) -> String {
-    def(f, candidates(f).wrong[0])
+    def(f, candidates(Task::Phase1, f).wrong[0])
 }
 
 fn def(f: &str, program: &str) -> String {
-    format!("def {f} {} : {program}", spec_named(f).expect("a spec").arity)
+    format!("def {f} {} : {program}", Task::Phase1.spec_named(f).expect("a spec").arity)
 }
 
 /// An event log and usage rows, written as the driver and a backend write them.
@@ -89,7 +89,7 @@ impl Log {
 
     fn measure(&self) -> Measures {
         let records = Records::parse(&self.events.join("\n"), &self.usage.join("\n")).expect("records");
-        measure(&records, &HiddenCases::new(1)).expect("measures")
+        measure(&records, &HiddenCases::new(Task::Phase1, 1)).expect("measures")
     }
 }
 
@@ -99,7 +99,7 @@ fn a_definition_holds_its_helpers_without_comments_or_spacing() {
         ("base".to_string(), "def abs 1 :  a 0 < a absneg@ a ?   # the sign flips\ndef absneg 1 : a neg\n".to_string()),
         ("order".to_string(), "def max2 2 : a b > a b ?\nnot a definition\ndef dist 2 : a b - abs@\n".to_string()),
     ];
-    let defs = definitions(&modules);
+    let defs = definitions(Task::Phase1, &modules);
     assert_eq!(defs["abs"], "def abs 1 : a 0 < a absneg@ a ?\ndef absneg 1 : a neg");
     assert_eq!(defs["max2"], "def max2 2 : a b > a b ?");
     // A task function it calls is its own function, not part of this definition.
@@ -110,15 +110,15 @@ fn a_definition_holds_its_helpers_without_comments_or_spacing() {
 #[test]
 fn bug_reports_are_found_in_the_form_check_prints() {
     let text = "check said abs(-3) gave -3, expected 3; max2(1, 2) gave 1 (5/60 cases passed)";
-    assert_eq!(bug_reports(text), vec![("abs".into(), vec![-3]), ("max2".into(), vec![1, 2])]);
+    assert_eq!(bug_reports(Task::Phase1, text), vec![("abs".into(), vec![-3]), ("max2".into(), vec![1, 2])]);
     for not in ["abs(-3) is wrong", "nosuch(1) gave 2", "max2(1) gave 1", "abs(x) gave 3", "abs(1) gave many"] {
-        assert!(bug_reports(not).is_empty(), "{not}");
+        assert!(bug_reports(Task::Phase1, not).is_empty(), "{not}");
     }
 }
 
 #[test]
 fn improvements_are_net_per_million_tokens_and_a_release_is_not_a_regression() {
-    let all_sign = def("sign", correct_programs(Version::all())["sign"]);
+    let all_sign = def("sign", correct_programs(Task::Phase1, Task::Phase1.all())["sign"]);
     let mut log = Log::new("bracken");
     log.snap(1, None, &[])
         .snap(2, Some("a"), &[right("abs")]) // +1
@@ -417,4 +417,204 @@ fn a_run_stopped_by_its_own_cap_is_measured_only_if_the_plan_expects_it() {
     other.start(1, "a", 1).ev(2, Some("a"), "turn_end", json!({"turn": 1}));
     other.turn_usage("a", 1, 10, 1).ev(3, None, "run_stopped", json!({"cap": null}));
     assert!(incomplete(&other.records(), &expected).is_some());
+}
+
+// Open contracts: a member is judged with the delivering agent's working copy (decision `979e5085a1e7`).
+
+fn phase2(f: &str, program: &str) -> String {
+    format!("def {f} {} : {program}", Task::Phase2.spec_named(f).expect("a spec").arity)
+}
+
+/// The rank contract's five members in one convention: the first correct programs', or the other one.
+fn rank_contract(other: bool) -> Vec<String> {
+    let canonical = correct_programs(Task::Phase2, Version::ORIGINAL);
+    let other_choice: BTreeMap<_, _> = crate::candidates::phase2::OTHER_CHOICE.iter().copied().collect();
+    ["rank", "flip", "isless", "issame", "ismore"]
+        .iter()
+        .map(|f| phase2(f, if other { other_choice[f] } else { canonical[f] }))
+        .collect()
+}
+
+fn name_of(d: &str) -> String {
+    d.split_whitespace().nth(1).expect("a def line").to_string()
+}
+
+/// One step of a scenario, played as each mode logs it.
+#[derive(Clone)]
+enum Step {
+    /// An agent writes definitions: one Git commit, Bracken artifacts, CRDT edits to its document.
+    Write(&'static str, Vec<String>),
+    /// An agent syncs: in CRDT its document and the hub's merge, its edits winning.
+    Sync(&'static str),
+    /// Git and Bracken: the agent's work is integrated (merged, or accepted after a pass).
+    Integrate(&'static str),
+    /// Git: the agent merges main into its branch. Bracken and CRDT have nothing to do.
+    Adopt(&'static str),
+    Release,
+    /// An agent's verdict blocks definitions.
+    Block(&'static str, Vec<String>),
+}
+
+/// The log `steps` leave in `mode`, with the records each mode's stores write.
+fn play(mode: &str, steps: &[Step]) -> Log {
+    use Step::*;
+    let mut log = Log::new(mode);
+    let mut ms = 10;
+    let mut hub: BTreeMap<String, String> = BTreeMap::new();
+    // Git: each agent's branch; Bracken: its own current implementations; CRDT: its document and unsynced edits.
+    let mut copy: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+    let mut edits: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+    let defs = |m: &BTreeMap<String, String>| m.values().cloned().collect::<Vec<_>>();
+    log.snap(ms, None, &[]);
+    for step in steps {
+        ms += 10;
+        match step {
+            Write(agent, ds) => match mode {
+                "git" => {
+                    let branch = copy.entry(agent).or_default();
+                    let mut writes = Vec::new();
+                    for d in ds {
+                        branch.retain(|(f, _)| *f != name_of(d));
+                        branch.push((name_of(d), d.clone()));
+                        writes.push(json!([name_of(d), d]));
+                    }
+                    let record = json!({"writes": writes, "members": branch});
+                    log.ev(
+                        ms,
+                        Some(agent),
+                        "tool_result",
+                        json!({"turn": 1, "tool": "`commit`", "ok": true, "record": record}),
+                    );
+                }
+                "bracken" => {
+                    for (k, d) in ds.iter().enumerate() {
+                        let own = copy.entry(agent).or_default();
+                        own.push((name_of(d), d.clone()));
+                        let record = json!({"writes": [[name_of(d), d]], "members": own});
+                        let data = json!({"turn": 1, "tool": "`artifact`", "ok": true, "record": record});
+                        log.ev(ms + k as u64, Some(agent), "tool_result", data);
+                    }
+                }
+                _ => edits.entry(agent).or_default().extend(ds.iter().map(|d| (name_of(d), d.clone()))),
+            },
+            Sync(agent) => {
+                log.sync(ms, agent);
+                if mode == "crdt" {
+                    hub.extend(edits.remove(agent).unwrap_or_default());
+                    log.snap(ms + 1, Some(agent), &defs(&hub));
+                }
+            }
+            Integrate(agent) => {
+                // Bracken accepts each function's earliest implementation with a pass.
+                for (f, d) in copy.get(agent).cloned().unwrap_or_default() {
+                    if mode == "git" || !hub.contains_key(&f) {
+                        hub.insert(f, d);
+                    }
+                }
+                log.snap(ms, None, &defs(&hub));
+            }
+            Adopt(agent) => {
+                if mode == "git" {
+                    copy.insert(agent, hub.clone().into_iter().collect());
+                }
+            }
+            Release => drop(log.ev(ms, None, "changes_released", json!({}))),
+            Block(agent, ds) => {
+                let blocks: Vec<_> = ds.iter().map(|d| json!([name_of(d), d])).collect();
+                log.result(ms, agent, "evidence", true, json!({"blocks": blocks}));
+            }
+        }
+    }
+    log
+}
+
+/// The decision's cases, each played in all three modes: the correct deliveries the measures count, Git's,
+/// Bracken's and CRDT's, and Git's and Bracken's semantic conflicts.
+#[test]
+fn every_contract_case_is_judged_by_the_agents_working_copy_in_every_mode() {
+    use Step::*;
+    let (canonical, other) = (rank_contract(false), rank_contract(true));
+    let mut mixed = other.clone();
+    mixed[1..].clone_from_slice(&canonical[1..]);
+    let adapted = phase2("isless", "a 0 < 0 +");
+    let kept = phase2("isless", "a 5 = 0 +");
+    let revised = phase2("isless", "0 a >");
+    let lost = |isless: &String| {
+        vec![
+            Write("a", other.clone()),
+            Sync("a"),
+            Write("b", canonical.clone()),
+            Sync("b"),
+            Integrate("b"),
+            Sync("a"),
+            Adopt("a"),
+            Write("a", vec![isless.clone()]),
+            Sync("a"),
+        ]
+    };
+    let cases: Vec<(&str, Vec<Step>, [u64; 3], u64)> = vec![
+        ("a whole contract at once", vec![Write("a", canonical.clone()), Sync("a")], [5, 5, 5], 0),
+        ("adapting after losing", lost(&adapted), [11, 11, 11], 0),
+        ("keeping the losing convention after losing", lost(&kept), [10, 10, 10], 0),
+        (
+            "a revision in a later turn",
+            vec![Write("a", canonical.clone()), Sync("a"), Write("a", vec![revised.clone()]), Sync("a")],
+            [6, 6, 6],
+            0,
+        ),
+        (
+            "a contract split over two turns: rank and flip have no readers when they reach others",
+            vec![Write("a", canonical[..2].to_vec()), Sync("a"), Write("a", canonical[2..].to_vec()), Sync("a")],
+            [3, 3, 3],
+            0,
+        ),
+        (
+            "a same-turn rewrite: the first version isn't judged against the second (CRDT never delivers it)",
+            vec![Write("a", other.clone()), Write("a", canonical.clone()), Sync("a")],
+            [10, 10, 5],
+            0,
+        ),
+        (
+            "a release between delivery and verdict: Phase 2 has no change requests yet, so the block of a correct \
+             member is a semantic conflict",
+            vec![Write("a", canonical.clone()), Sync("a"), Release, Block("b", vec![canonical[2].clone()])],
+            [5, 5, 5],
+            1,
+        ),
+        ("a mixed-convention contract stays wrong", vec![Write("a", mixed.clone()), Sync("a")], [0, 0, 0], 0),
+        (
+            "another agent's contract accepted, this agent's in the other convention pending: wrong in Bracken, \
+             where the accepted one is in the copy; right in Git's branch and CRDT's document, as each check says",
+            vec![Write("b", canonical.clone()), Sync("b"), Integrate("b"), Write("a", other.clone()), Sync("a")],
+            [10, 5, 10],
+            0,
+        ),
+    ];
+    for (name, steps, want, conflicts) in cases {
+        for (k, mode) in ["git", "bracken", "crdt"].into_iter().enumerate() {
+            let m = measure(&play(mode, &steps).records(), &HiddenCases::new(Task::Phase2, 1)).expect("measures");
+            assert_eq!(m.discovery.discoveries, want[k], "{mode}: {name}");
+            let want_conflicts = (mode != "crdt").then_some(conflicts);
+            assert_eq!(m.incompatible.semantic_conflicts, want_conflicts, "{mode}: {name}");
+        }
+    }
+}
+
+/// Finding `440196ce733f`: a verdict is judged under the version in force when it is given, as before open
+/// contracts, even for a definition delivered before the change requests were released.
+#[test]
+fn a_verdict_after_the_release_judges_under_the_released_specs() {
+    let mut log = Log::new("bracken");
+    log.snap(10, None, &[]);
+    log.write(20, "a", 1, &right("sign"));
+    log.ev(30, None, "changes_released", json!({}));
+    log.result(40, "b", "evidence", true, json!({"blocks": [["sign", right("sign")]]}));
+    let m = log.measure();
+    assert_eq!(m.incompatible.semantic_conflicts, Some(0), "sign(0) = 0 is wrong once sign-of-zero is released");
+    // Before the release, the same block is a semantic conflict.
+    let mut log = Log::new("bracken");
+    log.snap(10, None, &[]);
+    log.write(20, "a", 1, &right("sign"));
+    log.result(40, "b", "evidence", true, json!({"blocks": [["sign", right("sign")]]}));
+    assert_eq!(log.measure().incompatible.semantic_conflicts, Some(1));
 }

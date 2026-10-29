@@ -21,18 +21,24 @@ use serde_json::{Value, json};
 use crate::args::Args;
 use crate::lang::Library;
 use crate::mode::{Mode, Session, Store, StoreConfig, ToolSpec, is_within};
-use crate::task::{CHANGES, MODULES, Version, change_tag, check, spec_named, tasks_md, version_of};
+use crate::task::{Task, Version, change_tag};
 
 pub mod wire;
 
-/// The module files, as in Git mode.
-pub const MODULE_FILES: [&str; 4] = ["base.stk", "order.stk", "arith.stk", "shape.stk"];
 /// The task, written only by the setter.
 pub const TASKS: &str = "TASKS.md";
 /// The shared notes, which every agent may edit.
 pub const NOTES: &str = "NOTES.md";
-/// Every text object in the document, in the order the setter makes them.
-pub const FILES: [&str; 6] = ["base.stk", "order.stk", "arith.stk", "shape.stk", TASKS, NOTES];
+/// Every text object in the document, in the order the setter makes them: the module files (as in Git
+/// mode), the task and the notes.
+pub fn files(task: Task) -> Vec<&'static str> {
+    task.module_files().iter().copied().chain([TASKS, NOTES]).collect()
+}
+
+/// The files an agent may edit: the module files and the notes, never `TASKS.md`.
+fn editable_files(task: Task) -> Vec<&'static str> {
+    files(task).into_iter().filter(|f| *f != TASKS).collect()
+}
 /// The largest file an edit may leave, as in Git mode.
 pub const MAX_FILE: usize = 64 * 1024;
 /// The document's file in a store's directory.
@@ -53,10 +59,10 @@ impl Mode for CrdtMode {
         "crdt"
     }
 
-    fn tools(&self) -> Vec<ToolSpec> {
+    fn tools(&self, task: Task) -> Vec<ToolSpec> {
         let text = json!({"type": "string"});
-        let readable = json!({"type": "string", "enum": FILES});
-        let editable = json!({"type": "string", "enum": [FILES[0], FILES[1], FILES[2], FILES[3], NOTES]});
+        let readable = json!({"type": "string", "enum": files(task)});
+        let editable = json!({"type": "string", "enum": editable_files(task)});
         let line = json!({"type": "integer", "minimum": 1, "maximum": 100_000});
         vec![
             tool(
@@ -195,7 +201,7 @@ impl CrdtStore {
     /// `TASKS.md` and any other actor's to the module files and notes, never the setter's to
     /// those or anyone else's to `TASKS.md`.
     fn rules(&mut self, peers: &[String], hub: bool) -> Result<wire::Rules, String> {
-        let editable = self.object_ids(&[FILES[0], FILES[1], FILES[2], FILES[3], NOTES])?;
+        let editable = self.object_ids(&editable_files(self.config.task))?;
         let tasks = self.object_ids(&[TASKS])?;
         if hub {
             let peer = peers.first().ok_or("a hub session needs the agent's key")?;
@@ -239,16 +245,17 @@ impl CrdtStore {
     fn setup_hub(&mut self) -> Result<Value, String> {
         let mut doc = AutoCommit::new();
         doc.set_actor(actor_of("setter"));
-        for file in FILES {
+        let task = self.config.task;
+        for file in files(task) {
             let obj = doc.put_object(ROOT, file, ObjType::Text).map_err(|e| e.to_string())?;
             if file == TASKS {
-                doc.splice_text(&obj, 0, 0, &tasks_md(Version::ORIGINAL)).map_err(|e| e.to_string())?;
+                doc.splice_text(&obj, 0, 0, &task.tasks_md(Version::ORIGINAL)).map_err(|e| e.to_string())?;
             }
         }
         doc.commit();
         self.doc = Some(doc);
         self.save()?;
-        Ok(json!({ "files": FILES }))
+        Ok(json!({ "files": files(task) }))
     }
 
     /// An agent's copy from the hub's export: the fixed shape, written by the setter alone.
@@ -259,7 +266,7 @@ impl CrdtStore {
         let mut doc =
             wire::guard(|| AutoCommit::load(export))?.map_err(|e| format!("loading the hub's export: {e}"))?;
         let keys: Vec<String> = wire::guard(|| doc.keys(ROOT).collect())?;
-        if keys.iter().map(String::as_str).collect::<BTreeSet<_>>() != FILES.into_iter().collect() {
+        if keys.iter().map(String::as_str).collect::<BTreeSet<_>>() != files(self.config.task).into_iter().collect() {
             return Err("the hub's export doesn't have the document's shape".into());
         }
         let setter = actor_of("setter");
@@ -269,7 +276,7 @@ impl CrdtStore {
         let actor = actor_of(&self.config.identity);
         doc.set_actor(actor.clone());
         self.doc = Some(doc);
-        for file in FILES {
+        for file in files(self.config.task) {
             let obj = self.object(file)?;
             if self.with_doc(|d| d.object_type(obj))? != Ok(ObjType::Text) {
                 return Err(format!("{file} isn't text in the hub's export"));
@@ -283,7 +290,7 @@ impl CrdtStore {
     pub(crate) fn apply(&mut self, name: &str, args: &Args) -> Result<Value, String> {
         match name {
             "read" => {
-                let file = readable(args)?;
+                let file = readable(self.config.task, args)?;
                 let text = self.text(file)?;
                 let start = args.int_opt("start", 1..=100_000)?.unwrap_or(1) as usize;
                 let count = args.int_opt("count", 1..=100_000)?.unwrap_or(100_000) as usize;
@@ -297,7 +304,7 @@ impl CrdtStore {
                 Ok(json!({ "file": file, "lines": text.lines().count(), "text": lines }))
             }
             "edit" | "replace" => {
-                let file = editable(args)?;
+                let file = editable(self.config.task, args)?;
                 let text = self.text(file)?;
                 let new = if name == "edit" { edit_lines(&text, args)? } else { replace_once(&text, args)? };
                 if new.len() > MAX_FILE {
@@ -308,20 +315,22 @@ impl CrdtStore {
                 Ok(json!({ "file": file, "lines": new.lines().count() }))
             }
             "check" => {
-                let function = args.spec_name("function")?;
-                let spec = spec_named(function).ok_or("not a function of the task")?;
-                let version = version_of(&self.text(TASKS)?);
+                let task = self.config.task;
+                let function = args.spec_name("function", task)?;
+                let spec = task.spec_named(function).ok_or("not a function of the task")?;
+                let version = task.version_of(&self.text(TASKS)?);
                 let library = Library::parse(self.modules()?.iter().map(|(m, t)| (m.as_str(), t.as_str())));
-                let result = check(&library, spec.name, version)?;
+                let result = task.check(&library, spec.name, version)?;
                 Ok(json!({ "function": spec.name, "ok": result.ok(), "details": result.details() }))
             }
             other => Err(format!("no tool {}", crate::args::short(other))),
         }
     }
 
-    /// The four module texts, as `(module, text)` pairs.
+    /// The module texts, as `(module, text)` pairs.
     fn modules(&mut self) -> Result<Vec<(String, String)>, String> {
-        MODULES.iter().zip(MODULE_FILES).map(|(m, f)| Ok((m.to_string(), self.text(f)?))).collect()
+        let task = self.config.task;
+        task.modules().iter().zip(task.module_files()).map(|(m, f)| Ok((m.to_string(), self.text(f)?))).collect()
     }
 }
 
@@ -357,10 +366,10 @@ impl Store for CrdtStore {
     }
 
     fn release_changes(&mut self) -> Result<Value, String> {
-        let version = CHANGES.iter().fold(Version::ORIGINAL, |v, c| v.with(c.change));
-        self.write_text(TASKS, &tasks_md(version))?;
+        let task = self.config.task;
+        self.write_text(TASKS, &task.tasks_md(task.all()))?;
         self.save()?;
-        Ok(json!({ "released": CHANGES.iter().map(|c| change_tag(c.change)).collect::<Vec<_>>() }))
+        Ok(json!({ "released": task.changes().iter().map(|c| change_tag(c.change)).collect::<Vec<_>>() }))
     }
 
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String> {
@@ -369,19 +378,17 @@ impl Store for CrdtStore {
 }
 
 /// The readable file an argument names, from the fixed list: never a path.
-fn readable(args: &Args) -> Result<&'static str, String> {
+fn readable(task: Task, args: &Args) -> Result<&'static str, String> {
     let v = args.text("file")?;
-    FILES.iter().find(|f| **f == v).copied().ok_or_else(|| "no such file".to_string())
+    files(task).into_iter().find(|f| *f == v).ok_or_else(|| "no such file".to_string())
 }
 
 /// An editable file: a module file or the shared notes, never `TASKS.md`.
-fn editable(args: &Args) -> Result<&'static str, String> {
+fn editable(task: Task, args: &Args) -> Result<&'static str, String> {
     let v = args.text("file")?;
-    FILES
-        .iter()
-        .filter(|f| **f != TASKS)
-        .find(|f| **f == v)
-        .copied()
+    editable_files(task)
+        .into_iter()
+        .find(|f| *f == v)
         .ok_or_else(|| "only the module files and NOTES.md can be edited".to_string())
 }
 

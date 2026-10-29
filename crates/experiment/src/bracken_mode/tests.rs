@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::task::Change;
+use crate::task::{Change, Task};
 
 /// Values an agent might try to smuggle into a command line.
 fn hostile(canary: &str) -> Vec<String> {
@@ -73,6 +73,7 @@ fn is_free_text(tool: &str, slot: &str) -> bool {
 
 fn store(dir: PathBuf, bracken: PathBuf) -> BrackenStore {
     let config = StoreConfig {
+        task: Task::Phase1,
         dir,
         bracken,
         git: PathBuf::from("/nonexistent/git"),
@@ -85,14 +86,14 @@ fn store(dir: PathBuf, bracken: PathBuf) -> BrackenStore {
 
 #[test]
 fn every_tool_slot_is_in_the_table() {
-    let tools: Vec<&str> = BrackenMode.tools().iter().map(|t| t.name).collect();
+    let tools: Vec<&str> = BrackenMode.tools(Task::Phase1).iter().map(|t| t.name).collect();
     for t in &tools {
         assert!(
             slots().iter().any(|(name, _, _)| name == t) || matches!(*t, "heads" | "conflicts" | "accepted"),
             "{t}"
         );
     }
-    for t in BrackenMode.tools() {
+    for t in BrackenMode.tools(Task::Phase1) {
         let props = t.input_schema["properties"].as_object().expect("properties");
         for key in props.keys() {
             let typed_string = props[key]["type"] == "string" || props[key]["type"] == "array";
@@ -143,7 +144,7 @@ fn placement_alone_keeps_hostile_values_from_being_options() {
     for (tool, args, slot) in slots().into_iter().filter(|(t, _, _)| *t != "check") {
         for v in hostile(&canary.to_string_lossy()).into_iter().filter(|v| !v.contains('\0')) {
             let args = with_value(&args, slot, &v);
-            let plan = plan(tool, &Args::unchecked(&args).expect("an object"), "me").expect("a plan");
+            let plan = plan(tool, &Args::unchecked(&args).expect("an object"), "me", Task::Phase1).expect("a plan");
             // Every value is after `--` or inside one `--option=value` argument.
             let dashdash = plan.argv.iter().position(|a| a == "--");
             for (i, a) in plan.argv.iter().enumerate() {
@@ -210,7 +211,7 @@ impl Ground {
     }
 
     fn snapshot_under(&self, rule: AcceptRule) -> Snapshot {
-        Snapshot::new(&json!(self.rows), "setter", rule).expect("a snapshot")
+        Snapshot::new(&json!(self.rows), "setter", rule, Task::Phase1).expect("a snapshot")
     }
 }
 
@@ -316,10 +317,13 @@ fn an_artifact_defines_its_function_and_only_helpers_named_after_it() {
     g.artifact("sq-ok", "y", "sq", "def sq 1 : a sqtwice@\ndef sqtwice 1 : a a *\n");
     g.verdict("sq-ok", "validator-0", "pass");
     assert_eq!(g.snapshot().integrated().keys().copied().collect::<Vec<_>>(), ["sq"]);
-    assert!(artifact_problem("abs", "def abs 1 : a\ndef absx 1 : a\ndef absx 1 : a\n").is_some(), "a helper twice");
+    assert!(
+        artifact_problem(Task::Phase1, "abs", "def abs 1 : a\ndef absx 1 : a\ndef absx 1 : a\n").is_some(),
+        "a helper twice"
+    );
     // So helpers never collide across functions, no spec name starts another.
-    for s in SPECS {
-        for t in SPECS.iter().filter(|t| t.name != s.name) {
+    for s in Task::Phase1.specs() {
+        for t in Task::Phase1.specs().iter().filter(|t| t.name != s.name) {
             assert!(!t.name.starts_with(s.name), "{} starts {}", s.name, t.name);
         }
     }
@@ -370,23 +374,23 @@ fn one_artifact_cant_break_its_module() {
         let head = "def abs 1 : a 0 < a neg a ?\n#";
         format!("{head}{}\n", "x".repeat(n - head.len() - 1))
     };
-    assert!(artifact_problem("abs", &padded(MAX_ARTIFACT_BYTES)).is_none());
-    assert!(artifact_problem("abs", &padded(MAX_ARTIFACT_BYTES + 1)).is_some());
+    assert!(artifact_problem(Task::Phase1, "abs", &padded(MAX_ARTIFACT_BYTES)).is_none());
+    assert!(artifact_problem(Task::Phase1, "abs", &padded(MAX_ARTIFACT_BYTES + 1)).is_some());
     let mut g = Ground::new();
     g.artifact("big", "x", "abs", &padded(MAX_ARTIFACT_BYTES + 1));
     g.verdict("big", "validator-0", "pass");
     assert!(g.snapshot().integrated().is_empty());
     // Every module, each function's artifact at the largest size, still parses.
     let mut programs = Programs::new();
-    for s in SPECS {
+    for s in Task::Phase1.specs() {
         let head = format!("def {} {} : a\n#", s.name, s.arity);
         programs.insert(s.name, format!("{head}{}", "x".repeat(MAX_ARTIFACT_BYTES - head.len())));
     }
     assert!(programs.values().all(|t| t.len() == MAX_ARTIFACT_BYTES));
-    let modules = modules_of(&programs);
+    let modules = modules_of(Task::Phase1, &programs);
     let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
     assert!(library.broken.is_empty(), "{:?}", library.broken);
-    assert!(SPECS.iter().all(|s| library.get(s.name).is_some()));
+    assert!(Task::Phase1.specs().iter().all(|s| library.get(s.name).is_some()));
 }
 
 #[test]

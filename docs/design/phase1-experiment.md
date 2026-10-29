@@ -109,7 +109,9 @@ The demo's language, extended just enough to make a library:
   language (`abs`, `sign`, `max2`), layer 1 (`order`) calls layer 0
   (`clamp3`, `dist`, `median3`), and so on up to layer 3 (`shape`), so later
   functions are only as right as what they call. The list is `SPECS` in
-  `crates/experiment/src/task.rs`.
+  `crates/experiment/src/task/phase1.rs`. Runs choose their task with
+  `--task`, and Phase 1's is the default, so this one stays runnable as it
+  ran ([phase2-task.md](phase2-task.md), Step 1 as built).
 - **6 change requests**, released together when the agents have used 40% of
   all their turns in that mode (the same point in every mode). Each changes
   a shared contract: `clamp3` takes `(lo, hi, x)` instead of `(x, lo, hi)`,
@@ -899,7 +901,7 @@ definitions the manager settled (question `6c4aa5dc0a01`, decision
 - **The plan** is written to `plan.json` before any worker starts, and the
   setup event logs its blake3. It holds the run's configuration, the model,
   effort, caps and seeds, `git --version`, the blake3 of the measuring code
-  (`metrics.rs`, `grader.rs`, and the `task.rs` and `lang.rs` it judges by)
+  (`metrics.rs`, `grader.rs`, and the task's code and `lang.rs` it judges by)
   and of the task texts, tool list and turn message, the
   integration rules, and every measure's definition as `metrics.rs` computes
   it. The report refuses a plan whose hash isn't the logged one, or whose

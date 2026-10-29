@@ -23,12 +23,11 @@ use crate::args::{Args, is_branch, is_commit};
 use crate::bracken_mode::Programs;
 use crate::lang::Library;
 use crate::mode::{Mode, Session, Store, StoreConfig, SyncKind, ToolSpec, Transfer, is_within};
-use crate::task::{CHANGES, MODULES, Version, change_tag, check, tasks_md, version_of};
+use crate::task::{Task, Version, change_tag};
 
 pub mod prs;
 
 /// The module files, in the repository's root.
-pub const MODULE_FILES: [&str; 4] = ["base.stk", "order.stk", "arith.stk", "shape.stk"];
 /// The task, written only by the setter.
 pub const TASKS: &str = "TASKS.md";
 /// The largest module file an edit may leave.
@@ -58,10 +57,11 @@ impl Mode for GitMode {
         "git"
     }
 
-    fn tools(&self) -> Vec<ToolSpec> {
+    fn tools(&self, task: Task) -> Vec<ToolSpec> {
         let text = json!({"type": "string"});
-        let readable = json!({"type": "string", "enum": [MODULE_FILES[0], MODULE_FILES[1], MODULE_FILES[2], MODULE_FILES[3], TASKS]});
-        let module = json!({"type": "string", "enum": MODULE_FILES});
+        let files = task.module_files();
+        let readable = json!({"type": "string", "enum": files.iter().chain([&TASKS]).collect::<Vec<_>>()});
+        let module = json!({"type": "string", "enum": files});
         let line = json!({"type": "integer", "minimum": 1, "maximum": 100_000});
         let branch = json!({"type": "string", "description": "a-z, 0-9 and -, starting with a letter; not main"});
         let number = json!({"type": "integer", "minimum": 1, "maximum": 100_000});
@@ -499,7 +499,7 @@ impl GitStore {
                 return Ok(Some(format!("commit {} has no tree", short(commit))));
             }
             for (mode, name, sha) in tree_entries(&body)? {
-                let allowed = MODULE_FILES.contains(&name.as_str()) || name == TASKS;
+                let allowed = self.config.task.module_files().contains(&name.as_str()) || name == TASKS;
                 if !allowed {
                     return Ok(Some(format!(
                         "commit {}: {} isn't a module file",
@@ -587,7 +587,7 @@ impl GitStore {
         for line in listing.lines() {
             let (meta, path) = line.split_once('\t').ok_or("a tree entry without a path")?;
             let fields: Vec<&str> = meta.split_whitespace().collect();
-            let allowed = MODULE_FILES.contains(&path) || path == TASKS;
+            let allowed = self.config.task.module_files().contains(&path) || path == TASKS;
             if !allowed {
                 return Ok(Some(format!("{} isn't a module file", crate::args::short(path))));
             }
@@ -631,7 +631,8 @@ impl GitStore {
             return Err(problem);
         }
         let mut out = Vec::new();
-        for (module, file) in MODULES.iter().zip(MODULE_FILES) {
+        let task = self.config.task;
+        for (module, file) in task.modules().iter().zip(task.module_files()) {
             let repo = self.repo();
             let got = self.git_in(&repo, &["cat-file", "blob", &format!("{rev}:{file}")], None)?;
             out.push((module.to_string(), if got.ok { got.stdout } else { String::new() }));
@@ -642,7 +643,7 @@ impl GitStore {
     /// The version `TASKS.md` at `rev` states.
     fn version_at(&mut self, rev: &str) -> Result<Version, String> {
         let text = self.git(&["cat-file", "blob", &format!("{rev}:{TASKS}")], None)?;
-        Ok(version_of(&text))
+        Ok(self.config.task.version_of(&text))
     }
 
     // The hub.
@@ -650,7 +651,7 @@ impl GitStore {
     fn setup_hub(&mut self) -> Result<Value, String> {
         std::fs::create_dir_all(self.bare()).map_err(|e| format!("creating the hub: {e}"))?;
         self.git(&["init", "--quiet", "--bare"], None)?;
-        let tasks = tasks_md(Version::ORIGINAL);
+        let tasks = self.config.task.tasks_md(Version::ORIGINAL);
         let commit = self.commit_files(None, &[(TASKS, tasks.as_str())], "The task")?;
         self.git(&["update-ref", "refs/heads/main", &commit], None)?;
         prs::Prs::default().save(&self.config.dir)?;
@@ -673,8 +674,8 @@ impl GitStore {
                 }
             }
         }
-        for file in MODULE_FILES {
-            if !entries.contains_key(file) {
+        for file in self.config.task.module_files() {
+            if !entries.contains_key(*file) {
                 let blob = self.git(&["hash-object", "-w", "--stdin"], Some(b""))?;
                 entries.insert(file.to_string(), format!("100644 blob {}", blob.trim()));
             }
@@ -741,7 +742,7 @@ impl GitStore {
     fn copy_tool(&mut self, name: &str, args: &Args) -> Result<Value, String> {
         match name {
             "read" => {
-                let file = readable(args)?;
+                let file = readable(self.config.task, args)?;
                 let text = self.read_file(file)?;
                 let start = args.int_opt("start", 1..=100_000)?.unwrap_or(1) as usize;
                 let count = args.int_opt("count", 1..=100_000)?.unwrap_or(100_000) as usize;
@@ -755,7 +756,7 @@ impl GitStore {
                 Ok(json!({ "file": file, "lines": text.lines().count(), "text": lines }))
             }
             "edit" | "replace" => {
-                let file = module_file(args)?;
+                let file = module_file(self.config.task, args)?;
                 let path = self.file_path(file)?;
                 let text = self.read_file(file)?;
                 let new = if name == "edit" { edit_lines(&text, args)? } else { replace_once(&text, args)? };
@@ -785,7 +786,7 @@ impl GitStore {
                     return Err("switch to a branch of yours first".into());
                 }
                 let mut add = vec!["add", "--end-of-options"];
-                add.extend(MODULE_FILES);
+                add.extend(self.config.task.module_files());
                 self.git(&add, None)?;
                 self.git(
                     &["commit", "--quiet", "--no-verify", "--allow-empty-message", "--file=-"],
@@ -832,15 +833,16 @@ impl GitStore {
                 Err("the rebase stopped at a conflict and was undone; merge instead".into())
             }
             "check" => {
-                let function = args.spec_name("function")?;
+                let task = self.config.task;
+                let function = args.spec_name("function", task)?;
                 let mut modules = Vec::new();
-                for (module, file) in MODULES.iter().zip(MODULE_FILES) {
+                for (module, file) in task.modules().iter().zip(task.module_files()) {
                     let text = self.read_file(file)?;
                     modules.push((module.to_string(), text));
                 }
                 let library = Library::parse(modules.iter().map(|(m, t)| (m.as_str(), t.as_str())));
                 let version = self.version_at("refs/remotes/hub/main")?;
-                let result = check(&library, function, version)?;
+                let result = task.check(&library, function, version)?;
                 Ok(json!({ "function": function, "ok": result.ok(), "details": result.details() }))
             }
             other => Err(format!("no tool {}", crate::args::short(other))),
@@ -872,14 +874,18 @@ impl GitStore {
 }
 
 /// The readable file an argument names, from the fixed list: never a path.
-fn readable(args: &Args) -> Result<&'static str, String> {
+fn readable(task: Task, args: &Args) -> Result<&'static str, String> {
     let v = args.text("file")?;
-    MODULE_FILES.iter().chain([&TASKS]).find(|f| **f == v).copied().ok_or_else(|| "no such file".to_string())
+    task.module_files().iter().chain([&TASKS]).find(|f| **f == v).copied().ok_or_else(|| "no such file".to_string())
 }
 
-fn module_file(args: &Args) -> Result<&'static str, String> {
+fn module_file(task: Task, args: &Args) -> Result<&'static str, String> {
     let v = args.text("file")?;
-    MODULE_FILES.iter().find(|f| **f == v).copied().ok_or_else(|| "only the module files can be edited".to_string())
+    task.module_files()
+        .iter()
+        .find(|f| **f == v)
+        .copied()
+        .ok_or_else(|| "only the module files can be edited".to_string())
 }
 
 fn edit_lines(text: &str, args: &Args) -> Result<String, String> {
@@ -1098,10 +1104,11 @@ impl Store for GitStore {
 
     fn release_changes(&mut self) -> Result<Value, String> {
         let main = self.rev("refs/heads/main")?.ok_or("the hub has no main")?;
-        let tasks = tasks_md(Version::all());
+        let task = self.config.task;
+        let tasks = task.tasks_md(task.all());
         let commit = self.commit_files(Some(&main), &[(TASKS, tasks.as_str())], "Change requests")?;
         self.git(&["update-ref", "refs/heads/main", &commit, &main], None)?;
-        let released: Vec<&str> = CHANGES.iter().map(|c| change_tag(c.change)).collect();
+        let released: Vec<&str> = task.changes().iter().map(|c| change_tag(c.change)).collect();
         Ok(json!({ "released": released }))
     }
 
@@ -1118,14 +1125,22 @@ impl Store for GitStore {
                 let line = self.git(&["rev-list", "--parents", "--max-count=1", "HEAD"], None)?;
                 let ids: Vec<String> = line.split_whitespace().map(str::to_string).collect();
                 let head = ids.first().ok_or("a commit without HEAD")?;
-                let now = defs(&self.modules_at(head)?);
+                let now = defs(self.config.task, &self.modules_at(head)?);
                 let mut parents = Vec::new();
                 for p in &ids[1..] {
-                    parents.push(defs(&self.modules_at(p)?));
+                    parents.push(defs(self.config.task, &self.modules_at(p)?));
                 }
+                let task = self.config.task;
+                // A task with open contracts: the branch's members at the commit, its working copy of the
+                // contracts (decision `979e5085a1e7`).
+                let members: Vec<_> = now.iter().filter(|(f, _)| task.contract_of(f).is_some()).collect();
                 let writes: Vec<_> =
-                    now.into_iter().filter(|(f, d)| parents.iter().all(|b| b.get(f) != Some(d))).collect();
-                Ok(json!({ "writes": writes }))
+                    now.iter().filter(|(f, d)| parents.iter().all(|b| b.get(*f) != Some(*d))).collect();
+                if task.contracts().is_empty() {
+                    Ok(json!({ "writes": writes }))
+                } else {
+                    Ok(json!({ "writes": writes, "members": members }))
+                }
             }
             "merge" => Ok(json!({ "conflict": result["merged"] == false })),
             "pr_review" if args["verdict"] == "request_changes" => {
@@ -1160,14 +1175,14 @@ fn agent_ref(session: &Session) -> Result<&str, String> {
 }
 
 /// Programs by function from module texts, for CI's comparisons.
-pub(crate) fn definitions(modules: &[(String, String)]) -> Programs {
+pub(crate) fn definitions(task: Task, modules: &[(String, String)]) -> Programs {
     let mut out = Programs::new();
     for (_, text) in modules {
         for line in text.lines() {
             let code = line.split('#').next().unwrap_or_default();
             let mut words = code.split_whitespace();
             if words.next() == Some("def")
-                && let Some(spec) = words.next().and_then(crate::task::spec_named)
+                && let Some(spec) = words.next().and_then(|w| task.spec_named(w))
             {
                 out.entry(spec.name).or_default().push_str(&format!("{}\n", code.trim()));
             }

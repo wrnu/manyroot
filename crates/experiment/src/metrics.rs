@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::grader::{FunctionGrade, HiddenCases, grade, grade_function};
 use crate::lang::{Calls, Library, Target, Token, parse_module, run};
-use crate::task::{SPECS, Version, reference, spec_named};
+use crate::task::{Task, Version};
 
 /// Each measure exactly as computed here.
 pub const DEFINITIONS: &[(&str, &str)] = &[
@@ -52,7 +52,12 @@ pub const DEFINITIONS: &[(&str, &str)] = &[
         "Git and Bracken: a write (a commit's functions whose definition differs from every parent's, an artifact's \
          function) whose definition differs from the integrated one at that moment. CRDT: a hub sync after which a \
          function's definition at the hub differs from before, credited to the syncing agent. A delivery is \
-         correct if it passes the grader standalone under the version in force.",
+         correct if it passes the grader standalone under the version in force; an open contract's member, with \
+         the delivering agent's working copy of the other members when the delivery becomes available to others \
+         (CRDT: the document after its sync; Git: the branch at the commit; Bracken: at its next sync, each \
+         member accepted at the hub, else any of the agent's own current implementations), and the integrated \
+         library for members the copy doesn't hold. A verdict's blocked definition is judged under the version at \
+         the verdict, a member with its latest delivery's working copy.",
     ),
     (
         "duplicated",
@@ -72,7 +77,8 @@ pub const DEFINITIONS: &[(&str, &str)] = &[
     (
         "discovery",
         "A useful discovery is a correct delivery, or the first bug report of a function and its inputs that \
-         really fails: text 'f(1, 2) gave 3' in any tool's arguments but notes_write, where f, at that moment, \
+         really fails: text 'f(1, 2) gave 3' in any tool's arguments but notes_write, where f is no open \
+         contract's member (which has no single right answer) and, at that moment, \
          gives a wrong answer or fails on those inputs in the integrated library or in the latest delivered \
          definition of f. Available: the maker's next sync (a CRDT delivery, and a PR tool's text, at once). \
          Integrated: the first snapshot holding the delivered definition. Taken up: another agent's first sync \
@@ -99,7 +105,7 @@ pub const INTEGRATE: &[&str] =
 pub const VALIDATE: &[&str] = &["check", "evidence", "pr_review"];
 
 /// Every task function's definition in `modules`, as [`DEFINITIONS`] says. A line that doesn't parse is skipped.
-pub fn definitions(modules: &[(String, String)]) -> BTreeMap<String, String> {
+pub fn definitions(task: Task, modules: &[(String, String)]) -> BTreeMap<String, String> {
     let mut lines: BTreeMap<String, Vec<(String, Vec<String>)>> = BTreeMap::new();
     for (_, text) in modules {
         for raw in text.lines() {
@@ -111,13 +117,13 @@ pub fn definitions(modules: &[(String, String)]) -> BTreeMap<String, String> {
         }
     }
     let mut out = BTreeMap::new();
-    for s in SPECS {
+    for s in task.specs() {
         let Some(own) = lines.get(s.name) else { continue };
         let mut text: Vec<String> = own.iter().map(|(l, _)| l.clone()).collect();
         let (mut seen, mut helpers) = (BTreeSet::new(), Vec::new());
         let mut todo: Vec<String> = own.iter().flat_map(|(_, c)| c.clone()).collect();
         while let Some(n) = todo.pop() {
-            if spec_named(&n).is_some() || !seen.insert(n.clone()) {
+            if task.spec_named(&n).is_some() || !seen.insert(n.clone()) {
                 continue;
             }
             for (l, c) in lines.get(&n).into_iter().flatten() {
@@ -132,12 +138,15 @@ pub fn definitions(modules: &[(String, String)]) -> BTreeMap<String, String> {
     out
 }
 
-/// Bug reports in `text`: each `f(1, 2) gave 3` where `f` is a task function with that many inputs.
-pub fn bug_reports(text: &str) -> Vec<(String, Vec<i64>)> {
+/// Bug reports in `text`: each `f(1, 2) gave 3` where `f` is a task function with that many inputs and a
+/// reference implementation (an open contract's members have none, so no single answer to report against).
+pub fn bug_reports(task: Task, text: &str) -> Vec<(String, Vec<i64>)> {
     let mut out = Vec::new();
     for (open, _) in text.match_indices('(') {
         let name_start = text[..open].rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map_or(0, |i| i + 1);
-        let Some(spec) = spec_named(&text[name_start..open]) else { continue };
+        let Some(spec) = task.spec_named(&text[name_start..open]).filter(|s| task.contract_of(s.name).is_none()) else {
+            continue;
+        };
         let Some(close) = text[open..].find(')').map(|i| open + i) else { continue };
         let args: Option<Vec<i64>> = text[open + 1..close].split(',').map(|a| a.trim().parse().ok()).collect();
         let rest = &text[close + 1..];
@@ -341,7 +350,72 @@ struct Delivery {
     def: String,
     correct: bool,
     available: Option<Point>,
+    /// For an open contract's member, the working copy it is judged with ([`working_copy`]).
+    copy: Copy,
 }
+
+/// What an open contract's member is judged with (decision `979e5085a1e7`): the delivering agent's working
+/// copy of the contracts when the delivery becomes available to others, and the integrated library for the
+/// members the copy doesn't hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct Copy {
+    /// The snapshot whose library holds what the working copy doesn't.
+    base: Option<usize>,
+    /// Each other member the copy holds, with the definitions it may be: one in Git and CRDT, any of the
+    /// agent's current implementations in Bracken.
+    choices: Vec<(String, Vec<String>)>,
+}
+
+/// The most combinations of a Bracken agent's current implementations a member is judged with.
+const MAX_CHOICES: usize = 256;
+
+/// The working copy delivery `i` is judged with, if it is an open contract's member, per mode:
+/// - CRDT: the document after the sync that delivered it, the hub's snapshot then;
+/// - Git: the branch's members at the commit (its record), over the library integrated before it;
+/// - Bracken: at the agent's next sync, for each member accepted in the integrated library, that one, else
+///   any of the agent's own current implementations (its records' latest list), as the agent's check resolves.
+fn working_copy(a: &Analysis, mode: &str, records: &CopyRecords, found: &[Found], i: usize) -> Copy {
+    let task = a.hidden.task();
+    let (at, agent, _, function, _, _) = &found[i];
+    let Some(contract) = task.contract_of(function) else { return Copy::default() };
+    let others = |f: &str| f != function && contract.members.contains(&f);
+    let before = |seq: u64| a.snaps.iter().rposition(|s| s.at.seq < seq);
+    match mode {
+        "crdt" => Copy { base: a.snaps.iter().rposition(|s| s.at.seq <= at.seq), choices: Vec::new() },
+        "git" => {
+            let held = records.members_at.get(&at.seq).cloned().unwrap_or_default();
+            let choices = held.into_iter().filter(|(f, _)| others(f)).map(|(f, d)| (f, vec![d])).collect();
+            Copy { base: before(at.seq), choices }
+        }
+        _ => {
+            let synced = a.next_sync(agent, at.seq).map_or(u64::MAX, |p| p.seq);
+            let base = before(synced);
+            let integrated = |f: &str| base.is_some_and(|k| a.snaps[k].library.get(f).is_some());
+            let own = records.own.get(agent).and_then(|r| r.iter().rev().find(|(seq, _)| *seq < synced));
+            let mut choices: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            for (f, d) in own.map(|(_, held)| held.as_slice()).unwrap_or_default() {
+                if others(f) && !integrated(f) {
+                    choices.entry(f.clone()).or_default().push(d.clone());
+                }
+            }
+            Copy { base, choices: choices.into_iter().collect() }
+        }
+    }
+}
+
+/// The working copies the records state: Git's per commit, by event, and each Bracken agent's own current
+/// implementations of members, in the order its calls recorded them.
+#[derive(Default)]
+struct CopyRecords {
+    members_at: BTreeMap<u64, Held>,
+    own: BTreeMap<String, Vec<(u64, Held)>>,
+}
+
+/// Definitions a working copy holds, by function.
+type Held = Vec<(String, String)>;
+
+/// A delivery as found in the log: when, by whom, in which turn, what, and when it is available to others.
+type Found = (Point, String, u64, String, String, Option<Point>);
 
 /// The tool an event names: the log quotes it as `` `name` ``.
 fn tool_of(e: &Event) -> &str {
@@ -380,10 +454,10 @@ impl Calls for Over<'_> {
 }
 
 /// Whether `function`'s definition in `top` (else `base`) gives a wrong answer or fails on `args`.
-fn fails(top: &Library, base: &Library, function: &str, args: &[i64], version: Version) -> bool {
+fn fails(task: Task, top: &Library, base: &Library, function: &str, args: &[i64], version: Version) -> bool {
     let calls = Over { top, base };
     let Some(Target::Code(def)) = calls.resolve(function) else { return false };
-    run(def, args, &calls) != Ok(reference(function, args, version))
+    run(def, args, &calls) != Ok(task.reference(function, args, version))
 }
 
 struct Analysis<'a> {
@@ -392,28 +466,46 @@ struct Analysis<'a> {
     snaps: Vec<Snap>,
     syncs: Vec<(Point, String)>,
     starts: Vec<(Point, String, u64)>,
-    correct: BTreeMap<(String, String, Version), bool>,
+    /// By function, definition, version and, for an open contract's member, the working copy it is judged with.
+    correct: BTreeMap<(String, String, Version, Copy), bool>,
 }
 
 impl Analysis<'_> {
     fn version_at(&self, seq: u64) -> Version {
-        if self.released.is_some_and(|r| r < seq) { Version::all() } else { Version::ORIGINAL }
+        if self.released.is_some_and(|r| r < seq) { self.hidden.task().all() } else { Version::ORIGINAL }
     }
 
     fn snap_before(&self, seq: u64) -> Option<&Snap> {
         self.snaps.iter().rev().find(|s| s.at.seq < seq)
     }
 
-    fn correct(&mut self, function: &str, def: &str, version: Version) -> bool {
-        let key = (function.to_string(), def.to_string(), version);
+    /// Whether `def` is a correct definition of `function` under `version`: standalone, and for an open
+    /// contract's member with some choice of the working copy `copy` holds, over its base library.
+    fn correct(&mut self, function: &str, def: &str, version: Version, copy: &Copy) -> bool {
+        let task = self.hidden.task();
+        let copy = if task.contract_of(function).is_some() { copy.clone() } else { Copy::default() };
+        let key = (function.to_string(), def.to_string(), version, copy.clone());
         if let Some(&c) = self.correct.get(&key) {
             return c;
         }
-        if spec_named(function).is_none() {
+        if task.spec_named(function).is_none() {
             return false;
         }
-        let library = Library::parse([("delivery", def)]);
-        let c = grade_function(&library, function, version, self.hidden).standalone;
+        let base = copy.base.map_or_else(Library::default, |k| self.snaps[k].library.clone());
+        let delivery = Library::parse([("delivery", def)]);
+        let combinations = copy.choices.iter().map(|(_, d)| d.len()).product::<usize>().min(MAX_CHOICES);
+        let mut c = false;
+        for mut n in 0..combinations.max(1) {
+            let mut library = base.clone();
+            for (_, defs) in &copy.choices {
+                library = library.with(&Library::parse([("delivery", defs[n % defs.len()].as_str())]));
+                n /= defs.len();
+            }
+            if grade_function(&library.with(&delivery), function, version, self.hidden).standalone {
+                c = true;
+                break;
+            }
+        }
         self.correct.insert(key, c);
         c
     }
@@ -451,6 +543,7 @@ impl Analysis<'_> {
 
 /// The six measures of one run.
 pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, String> {
+    let task = hidden.task();
     let events = &records.events;
     let mode = events
         .iter()
@@ -487,11 +580,11 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
         };
         let from_sync = e.data["after"] == "sync";
         snap_agents.push(e.agent.clone().filter(|_| from_sync));
-        a.snaps.push(Snap { at: point(e), defs: definitions(&modules), library, grades, before });
+        a.snaps.push(Snap { at: point(e), defs: definitions(task, &modules), library, grades, before });
     }
 
     // Deliveries.
-    let mut found: Vec<(Point, String, u64, String, String, Option<Point>)> = Vec::new();
+    let mut found: Vec<Found> = Vec::new();
     if mode == "crdt" {
         for (k, agent) in snap_agents.iter().enumerate().skip(1) {
             let Some(agent) = agent else { continue };
@@ -515,10 +608,21 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
             }
         }
     }
+    let mut copies = CopyRecords::default();
+    for e in events.iter().filter(|e| e.event == "tool_result") {
+        let Some(members) = e.data["record"].get("members") else { continue };
+        let held: Held = serde_json::from_value(members.clone()).unwrap_or_default();
+        match (mode.as_str(), &e.agent) {
+            ("git", _) => drop(copies.members_at.insert(e.seq, held)),
+            (_, Some(agent)) => copies.own.entry(agent.clone()).or_default().push((e.seq, held)),
+            _ => {}
+        }
+    }
     let mut deliveries = Vec::new();
-    for (at, agent, turn, function, def, available) in found {
-        let correct = a.correct(&function, &def, a.version_at(at.seq));
-        deliveries.push(Delivery { at, agent, turn, function, def, correct, available });
+    for (i, (at, agent, turn, function, def, available)) in found.iter().cloned().enumerate() {
+        let copy = working_copy(&a, &mode, &copies, &found, i);
+        let correct = a.correct(&function, &def, a.version_at(at.seq), &copy);
+        deliveries.push(Delivery { at, agent, turn, function, def, correct, available, copy });
     }
 
     // Tokens, per turn. Step 6's backend writes a row per assistant event, and each content block of a
@@ -678,8 +782,8 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
             let base = a.snap_before(e.seq).map_or(&empty, |s| &s.library);
             let latest = deliveries.iter().rev().find(|d| d.function == f && d.at.seq < e.seq);
             let latest = latest.map(|d| Library::parse([("delivery", d.def.as_str())]));
-            let real = fails(&empty, base, f, &args, version)
-                || latest.as_ref().is_some_and(|l| l.get(f).is_some() && fails(l, base, f, &args, version));
+            let real = fails(task, &empty, base, f, &args, version)
+                || latest.as_ref().is_some_and(|l| l.get(f).is_some() && fails(task, l, base, f, &args, version));
             if real && reported.insert((f.to_string(), args)) {
                 bug_reports += 1;
                 let tool = tool_of(e);
@@ -703,7 +807,8 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
     let mut incompatible = Incompatible::default();
     for k in 1..a.snaps.len() {
         let (prev, s) = (&a.snaps[k - 1], &a.snaps[k]);
-        let broken: Vec<_> = SPECS
+        let broken: Vec<_> = task
+            .specs()
             .iter()
             .zip(s.grades.iter().zip(&s.before))
             .filter(|(spec, (now, was))| {
@@ -726,7 +831,26 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
             let blocks: Vec<(String, String)> =
                 serde_json::from_value(e.data["record"]["blocks"].clone()).unwrap_or_default();
             let version = a.version_at(e.seq);
-            if !blocks.is_empty() && blocks.iter().all(|(f, d)| a.correct(f, d, version)) {
+            // A blocked definition is judged under the version in force at the verdict, with the working copy its
+            // latest delivery before the verdict had, else with the other blocked definitions over the library
+            // integrated then. Only an open contract's member has a working copy, so anything else is judged by
+            // its own code alone.
+            let judged = |a: &mut Analysis, (f, d): &(String, String)| {
+                let delivered = deliveries.iter().rev().find(|x| x.at.seq < e.seq && x.function == *f && x.def == *d);
+                let copy = match delivered {
+                    Some(x) => x.copy.clone(),
+                    None => Copy {
+                        base: a.snaps.iter().rposition(|s| s.at.seq < e.seq),
+                        choices: blocks
+                            .iter()
+                            .filter(|(g, _)| g != f)
+                            .map(|(g, d)| (g.clone(), vec![d.clone()]))
+                            .collect(),
+                    },
+                };
+                a.correct(f, d, version, &copy)
+            };
+            if !blocks.is_empty() && blocks.iter().all(|b| judged(&mut a, b)) {
                 conflicts += 1;
             }
         }
@@ -734,8 +858,8 @@ pub fn measure(records: &Records, hidden: &HiddenCases) -> Result<Measures, Stri
     }
 
     // 6. Quality of the final artifact.
-    let mut quality = Quality { total: SPECS.len() as u64, ..Quality::default() };
-    let last = a.snaps.last().map(|s| grade(&s.library, Version::all(), hidden)).unwrap_or_default();
+    let mut quality = Quality { total: task.specs().len() as u64, ..Quality::default() };
+    let last = a.snaps.last().map(|s| grade(&s.library, task.all(), hidden)).unwrap_or_default();
     for g in &last {
         match (g.present, g.in_library) {
             (_, true) => quality.correct += 1,
