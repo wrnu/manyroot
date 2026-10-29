@@ -535,7 +535,7 @@ fn a_copy_never_follows_a_link_in_its_working_copy() {
     let c = &mut f.copies[0];
     let link = blob(c, outside.to_string_lossy().as_bytes());
     let commit = planted(c, "local", &format!("120000 blob {link}\tbase.stk"), "base.stk");
-    c.git(&["checkout", "--quiet", "--force", "--detach", "--end-of-options", &commit, "--"], None).expect("checkout");
+    c.git(&["switch", "--quiet", "--discard-changes", "--detach", "--end-of-options", &commit], None).expect("switch");
     assert!(std::fs::symlink_metadata(&base).expect("checked out").file_type().is_file());
 }
 

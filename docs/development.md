@@ -70,6 +70,49 @@ Network-sync step 3 (task `c03e893d04eb`, owner approval `f0f7caf53376`): the te
 
 `~/.bracken-team/manyroot/` (mode 0700) holds the server's replica (`ground/`), the tokens (`tokens/<identity>`, 0600), their blake3 hashes (`tokens.b3`), the allowlist (every identity the main checkout knows, rebuilt at each start), the first-seen log, `server.log`, `server.pid` and `url`. The server uses the limits recommended in `docs/design/network-sync.md` (17 MiB batches, an 8 MiB id budget, 16 sessions). It runs the pinned binary, which must include `bracken sync --confirm`: upgrade it before setting up. Nothing else writes the server's replica.
 
+## Remote test runs (boat.dev)
+
+Owner decision `25c1e3543e76` (task `489bfeb6b5af`, reference `ea41264b3c38`): the test table can run in a boat.dev box, a fresh Linux x86_64 machine, instead of on the owner's machine. It's a trial.
+
+**When to use it.** Run `scripts/test-table --remote` instead of a local `cargo test` (or a local `scripts/test-table`) whenever the machine is loaded: several builders or reviewers testing at once, or a long build already running. It's also the only place the Linux tests actually run (gotcha `2c9aebd6d370`). On an idle machine the local table is faster. A remote run counts as a test run like any other: record it with `"$main/scripts/bk-evidence" <pr> --as <you> -- scripts/test-table --remote`.
+
+**The trial's limits.** At most 2 boxes at a time across the whole team, 75 box starts a day and 25 hours of compute; `boat limits` shows what's left. So keep **at most one box of your own running**, and delete it the moment you're done with it (the owner's preference): never leave one idle. `boat run` does that for you. A full table on a default box (4 vCPU, 8 GB) takes about 5 minutes from a cold build and costs a third of a cent (5m 19s, $0.0032, for PR #68).
+
+### `scripts/test-table --remote`
+
+It tests HEAD, so commit first: it refuses a dirty tree, and needs `origin/main` (fetch it). It puts HEAD and `origin/main` in a git bundle, the only thing pushed, and runs one `boat run --no-env --push <bundle dir> --type default --timeout 2400`. In the box, it installs what the box lacks (below), clones the bundle with HEAD checked out and `origin/main` beside it, and runs the same, unchanged `scripts/test-table`, Ground guards included: the bundle is 5 MB and takes under a second, so the guards check the same commits as locally. The guards use the debug `bracken` the table just built (`BRACKEN_BIN`). It prints the box's output, then `test-table: box: exit N · time · type · cost`, and exits with the box's exit code (130 if interrupted).
+
+The box is deleted on every way out. `boat run` deletes it when the command ends, fails or times out, and when it's interrupted (Ctrl-C). Once boat has printed the box's id (`bx_… ready`), `--remote` also checks `boat list --all` as it exits, for any reason, and deletes the box by id if it's listed in any state, or if boat can't list boxes at all; plain `boat list` shows only running boxes, and one left stopped, pending, stopping or in error keeps its data (gotcha `93bae3ba4156`). If the box is still listed after that, it says so with the command to delete it. A Ctrl-C before boat prints the id leaves the deletion to `boat run` alone: check `boat list --all`. `crates/bracken/tests/scripts.rs` tests this with a stub `boat` that lists like the real one: a failed run that leaves its box stopped and an interrupted one each leave no box.
+
+### Using boat by hand
+
+| Task | Command |
+|---|---|
+| Run a command in a fresh box, then delete it | `boat run --no-env --push <dir> [--type small\|default] [--timeout <s>] -- <cmd>`. `--push` copies the git-tracked and unignored files under `<dir>` to `~/<dir name>` in the box, and the command runs there. It prints `bx_<id> ready`, the command's output, and `exit N · time · type · cost · bx_<id> deleted` |
+| See your boxes | `boat list --all` (JSON). Plain `boat list` shows only running ones. It should be empty whenever you aren't running something |
+| Delete a box | `boat delete --yes <bx_id>`. Without a terminal, `--yes` is required |
+| What's left of the trial | `boat limits` |
+
+The rules for every box:
+
+- **Always `--no-env`**, and never `-e`/`--env`: no secret, token or credential goes into a box, forge credentials included. A box gets no `~/.bracken-team`, no `.bracken/identities/` and nothing gitignored. Push a bundle or a clean directory, not a checkout with untracked files in it.
+- **Run it in the foreground**, and delete the box yourself if anything stops `boat run` from doing so (check `boat list --all`).
+- **A plain `--push .` has no `.git`.** Anything that needs git history (the Ground guards, git mode, tests that expect to be in a checkout) needs the bundle route that `--remote` uses: `git bundle create <dir>/tree.bundle HEAD refs/remotes/origin/main`, then in the box `git init -q tree && cd tree && git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main && git checkout -q tested`.
+
+### What a box has, and what tests need installed
+
+A box is Ubuntu 24.04 (x86_64) with Rust 1.97 (cargo, clippy, rustfmt), cc, git 2.43, `timeout`, python3, `sudo` and `apt-get`. The test table also needs:
+
+| Needed by | What | Install in the box |
+|---|---|---|
+| The Ground guards, tests run in a checkout | `git` and a clone with history | The history comes from the bundle (above) |
+| The experiment's git-mode tests | a git newer than Ubuntu's 2.43, which neither traces the programs it starts (`trace: start_command:`) nor fsck-checks a fetched bundle, so the hub there accepted a malformed commit | `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get install -y -qq git` (2.56 in October 2026) |
+| `scripts/team-server token` and its test | `b3sum` | `apt-get install -y -qq b3sum` (or with `sudo`) |
+| The Ground guards | a `bracken` binary | `BRACKEN_BIN="$PWD/target/debug/bracken"`, built by the table's `cargo test` |
+| The table's Linux-target clippy | the `x86_64-unknown-linux-gnu` target | Native in the box |
+
+`--remote` installs the PPA's git and `b3sum` in every box; anything a future test needs goes in its inner script too, and in this table. On Linux, the experiment's sandboxed tests are skipped with a printed reason (`needs macOS sandbox-exec`): `sandbox-exec` exists only on macOS, and they still run there. The workspace builds dependencies at `opt-level = 2` even in debug (`Cargo.toml`), which made the demo's adversary tests three times faster; without it they alone took 13 minutes in a box.
+
 ## Forge commands
 
 Forge isn't GitHub: wherever `process.md` says `gh`, use these instead.

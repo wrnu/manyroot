@@ -206,6 +206,7 @@ fn assert_verdicts(report: &Value, want: &[(&str, &str)]) {
 // ---- The agent profile ----
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_agent_profile_refuses_each_forbidden_access() {
     let s = Setup::new();
     let other_port = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -315,6 +316,7 @@ fn stores() -> Stores {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_tools_profile_holds_one_copy_and_runs_no_shell() {
     let st = stores();
     let fake = fake();
@@ -359,6 +361,7 @@ fn the_tools_profile_holds_one_copy_and_runs_no_shell() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_hub_profile_writes_no_copy_and_runs_no_shell() {
     let st = stores();
     let fake = fake();
@@ -420,21 +423,25 @@ fn syncs_both_ways_sandboxed(mode: &'static str) {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn bracken_mode_syncs_both_ways_with_every_worker_sandboxed() {
     syncs_both_ways_sandboxed("bracken");
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn git_mode_syncs_both_ways_with_every_worker_sandboxed() {
     syncs_both_ways_sandboxed("git");
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn crdt_mode_syncs_both_ways_with_every_worker_sandboxed() {
     syncs_both_ways_sandboxed("crdt");
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn git_modes_worker_profiles_run_git_and_still_no_shell() {
     let st = stores();
     let fake = fake();
@@ -484,6 +491,7 @@ fn refused_by_gate(script: &str) -> String {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_gate_passes_the_planned_init() {
     let s = Setup::new();
     let backend = s.backend("result 10", caps());
@@ -492,6 +500,7 @@ fn the_gate_passes_the_planned_init() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_gate_refuses_each_deviation() {
     let cases = [
         ("claude_code_version", "\"2.1.312\""),
@@ -519,6 +528,7 @@ fn the_gate_refuses_each_deviation() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn a_changed_turn_configuration_or_binary_stops_the_run() {
     // The turn configuration: changed between turns.
     let s = Setup::new();
@@ -552,6 +562,7 @@ fn turn_error_for(s: &Setup, events_path: &Path) -> usize {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn output_comes_from_the_result_and_repeated_blocks_count_once() {
     let s = Setup::new();
     // Three content blocks of one message repeat its usage; the stream says output 1, the result 5000.
@@ -566,6 +577,7 @@ fn output_comes_from_the_result_and_repeated_blocks_count_once() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_report_reads_the_backends_usage_rows() {
     let s = Setup::new();
     let backend = s.backend("call notes_read {}\ncall sync {}\nresult 4000", caps());
@@ -589,6 +601,7 @@ fn calls(n: usize, pause: u64) -> String {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn a_turn_that_stops_after_the_refusal_is_counted_from_its_result() {
     let s = Setup::new();
     let backend = s.backend(&(calls(4, 0) + "say\nresult 10"), Caps { calls_per_turn: 3, ..caps() });
@@ -630,6 +643,7 @@ fn the_pilots_run_caps_are_a_third_of_its_go_each() {
 /// stopped an agent after 6 of its 8 turns. Turns that reach the tool-call cap and end themselves
 /// count their real output, so the agent gets all 8; the per-agent cap is unchanged.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn an_agent_whose_turns_end_softly_at_the_cap_gets_all_its_turns() {
     assert_eq!((caps().agent_output, caps().turn_output), (180_000, 30_000), "the pilot's figures");
     let s = Setup::new();
@@ -655,6 +669,7 @@ fn an_agent_whose_turns_end_softly_at_the_cap_gets_all_its_turns() {
 /// Decision `74d00180c642`: past the cap, one notes_write still runs and is saved; a second, and
 /// any other tool, is refused.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn one_notes_write_runs_past_the_cap_and_no_other_call() {
     let s = Setup::new();
     let script = calls(3, 0)
@@ -715,6 +730,7 @@ fn oversized(mode: &str) -> String {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn an_oversized_result_comes_back_bounded_with_a_note_in_every_mode() {
     for mode in ["bracken", "git", "crdt"] {
         let s = Setup::new();
@@ -737,6 +753,7 @@ fn an_oversized_result_comes_back_bounded_with_a_note_in_every_mode() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn a_turn_that_ignores_the_refusal_is_ended_after_the_grace_at_the_ceiling() {
     let s = Setup::new();
     let grace = Caps { calls_per_turn: 3, cap_grace: Duration::from_secs(2), turn_time: LONG_TURN, ..caps() };
@@ -751,6 +768,7 @@ fn a_turn_that_ignores_the_refusal_is_ended_after_the_grace_at_the_ceiling() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn a_turn_that_keeps_calling_is_ended_after_the_grace_calls() {
     let s = Setup::new();
     let grace = Caps { calls_per_turn: 3, cap_grace: LONG_TURN, cap_grace_calls: 3, turn_time: LONG_TURN, ..caps() };
@@ -775,6 +793,7 @@ fn result_with(input: u64, output: u64) -> String {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_input_gap_stops_the_run_just_over_10_percent_and_its_result_is_counted() {
     // 9% over the stream's 1000: counted, the run goes on.
     let s = Setup::new();
@@ -791,6 +810,7 @@ fn the_input_gap_stops_the_run_just_over_10_percent_and_its_result_is_counted() 
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn a_halted_turn_is_charged_at_its_output_cap_with_a_closing_row() {
     let s = Setup::new();
     let backend = s.backend("say\nsay\nsay\nsleep 10000\nresult 10", Caps { run_tokens: 2500, ..caps() });
@@ -803,6 +823,7 @@ fn a_halted_turn_is_charged_at_its_output_cap_with_a_closing_row() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn a_result_less_turn_whose_stream_counted_more_records_what_it_counted() {
     let s = Setup::new();
     let usage = r#"{"input_tokens": 1000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0, "output_tokens": 31000}"#;
@@ -813,6 +834,7 @@ fn a_result_less_turn_whose_stream_counted_more_records_what_it_counted() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn a_tool_call_without_an_id_or_an_overflowing_figure_stops_the_run() {
     let idless = r#"line {"type":"assistant","message":{"id":"m1","model":"claude-opus-5-5","usage":{"input_tokens":1000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":1},"content":[{"type":"tool_use","name":"mcp__experiment__log","input":{}}]}}"#;
     let s = Setup::new();
@@ -837,6 +859,7 @@ fn a_tool_call_without_an_id_or_an_overflowing_figure_stops_the_run() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn context_past_the_cap_ends_the_turn() {
     let s = Setup::new();
     let usage = r#"{"input_tokens": 2000, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 160000, "output_tokens": 1}"#;
@@ -847,6 +870,7 @@ fn context_past_the_cap_ends_the_turn() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_turn_time_cap_ends_a_quiet_turn() {
     let s = Setup::new();
     let backend = s.backend(&format!("say\n{SLEEP}\nresult 10"), Caps { turn_time: Duration::from_secs(2), ..caps() });
@@ -858,6 +882,7 @@ fn the_turn_time_cap_ends_a_quiet_turn() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn an_agents_token_cap_ends_its_turns_and_the_run_cap_stops_the_run() {
     let s = Setup::new();
     let backend = s.backend("say\nresult 600", Caps { agent_output: 1000, ..caps() });
@@ -875,6 +900,7 @@ fn an_agents_token_cap_ends_its_turns_and_the_run_cap_stops_the_run() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn token_caps_act_while_a_turn_streams() {
     // The agent's cap: its turn ends at the third message, before the result.
     let s = Setup::new();
@@ -894,6 +920,7 @@ fn token_caps_act_while_a_turn_streams() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn the_run_time_cap_stops_the_run() {
     // The cap must run out while a turn streams, so the check during a turn is the one that acts,
     // not the check before each turn. On a loaded machine the run's setup alone can take longer
@@ -979,6 +1006,7 @@ result-json {"type":"result","subtype":"success","usage":{"input_tokens":1500,"o
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn a_turn_that_ends_without_a_result_counts_at_its_output_cap() {
     let s = Setup::new();
     let backend = s.backend("say\nexit 3", caps());
@@ -990,6 +1018,7 @@ fn a_turn_that_ends_without_a_result_counts_at_its_output_cap() {
 // ---- Transcripts ----
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn transcripts_are_kept_without_the_auth_value_and_a_leak_stops_the_run() {
     // Claude Code holds the auth value: a turn that prints it stops the run, and the line isn't kept.
     let s = Setup::new();
@@ -1030,6 +1059,7 @@ fn processes_mentioning(text: &str) -> String {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
 fn killing_the_driver_mid_turn_leaves_no_agent_process_and_no_request() {
     let tmp = tempfile::tempdir().expect("a temp dir");
     let dir = std::fs::canonicalize(tmp.path()).expect("resolved").join("exp");

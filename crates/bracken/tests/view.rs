@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 const BIN: &str = env!("CARGO_BIN_EXE_bracken");
+/// A file to contribute as an artifact: small on every platform (a debug binary is over the 16 MiB
+/// contribution limit on Linux).
+const FILE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml");
 const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; \
                    font-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 const HOSTILE: &str = "</script><img src=x onerror=alert(1)> & \u{1b}[2K\r\n\u{2028}forged \"quoted\"";
@@ -487,7 +490,7 @@ fn the_api_has_the_design_shapes() {
 fn events_announce_what_arrives() {
     let dir = ground();
     let claim = ok(&dir, &["claim", "spec", "--as", "alice"]);
-    let art = ok(&dir, &["artifact", BIN, "--name", "bin", "--implements", &claim, "--as", "bob"]);
+    let art = ok(&dir, &["artifact", FILE, "--name", "bin", "--implements", &claim, "--as", "bob"]);
     let art = art.lines().next().unwrap().to_owned();
     let v = view(&dir);
     let cursor = v.api("/api/ground")["cursor"].as_str().unwrap().to_owned();
@@ -526,7 +529,7 @@ fn root_lineage_and_as_of() {
     let before = cursor(&v);
     // The intent's cursor is its refines relation: the claim alone isn't an intent yet.
     let intent = ok(&dir, &["intend", &spec, "--as", "bob"]).lines().nth(1).unwrap().to_owned();
-    let out = ok(&dir, &["artifact", BIN, "--name", "bin", "--implements", &spec, "--as", "bob"]);
+    let out = ok(&dir, &["artifact", FILE, "--name", "bin", "--implements", &spec, "--as", "bob"]);
     let art = out.lines().next().unwrap().to_owned();
     let pass = ok(&dir, &["evidence", &art, "pass", "--method", "m", "--as", "val"]);
     drop(v);

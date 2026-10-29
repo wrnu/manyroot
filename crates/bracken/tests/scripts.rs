@@ -1395,3 +1395,98 @@ fn services_dry_run_holds_no_secret_and_uninstall_removes_only_its_plists() {
         assert!(!calls.contains("bootout"), "{scripts}: nothing was loaded, so nothing booted out: {calls}");
     }
 }
+
+/// `test-table --remote` (task `489bfeb6b5af`), with a stub `boat`: it asks for one default box with
+/// `--no-env`, no `-e`, a 2400 s limit and nothing pushed but a bundle of HEAD and origin/main; it
+/// prints the box's cost line and exits with the box's exit. A box boat leaves listed is deleted on
+/// every way out: a failed run and an interrupted one. A dirty tree is refused before any box.
+#[test]
+fn test_table_remote_runs_one_box_and_leaves_none_behind() {
+    for scripts in SCRIPTS {
+        let table = repo_root().join(scripts).join("test-table");
+        let (tmp, dir) = repo(&[("scripts/test-table", &table)], ".bracken/\n", |_| {});
+        assert!(run(&dir, "git", &["update-ref", "refs/remotes/origin/main", "HEAD"]).status.success());
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        // run: records its arguments and what was pushed, keeps the bundle, says which box (and touches
+        // $T/ready once it has), then sleeps
+        // $SLEEP seconds and exits $EXIT. list: logs its arguments and, like boat, shows the box only
+        // while it's running unless given --all; $T/left holds its state while it exists. delete: logs it.
+        // Its output also names another box, as the table's own tests do: that one is never deleted.
+        write_executable(
+            &stubs.join("boat"),
+            "#!/bin/bash\n\
+             case \"$1\" in\n\
+             run) printf '%s\\n' \"$@\" >\"$T/args\"\n\
+               while [ $# -gt 0 ]; do [ \"$1\" = --push ] && push=$2; shift; done\n\
+               ls -A \"$push\" >\"$T/pushed\"; cp \"$push/tree.bundle\" \"$T/\"\n\
+               echo 'bx_stub01 ready in 1.0s'; echo 'test-table: deleting box bx_other99'; touch \"$T/ready\"\n\
+               sleep \"${SLEEP:-0}\"\n\
+               echo \"exit $EXIT · 1m 00s · default · \\$0.0010 · bx_stub01 deleted\"; exit \"$EXIT\" ;;\n\
+             list) echo \"$*\" >>\"$T/listed\"\n\
+               if [ -e \"$T/left\" ] && { [ \"$(cat \"$T/left\")\" = running ] || [[ \" $* \" == *' --all '* ]]; }; then\n\
+                 echo '{\"sandboxes\":[{\"id\": \"bx_stub01\"}]}'; else echo '{\"sandboxes\":[]}'; fi ;;\n\
+             delete) echo \"$*\" >>\"$T/deleted\"; rm -f \"$T/left\" ;;\n\
+             esac\n",
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let remote = |exit: &str, sleep: &str| {
+            let mut c = command(&dir, "scripts/test-table", &["--remote"]);
+            c.env("PATH", &path).env("T", tmp.path()).env("EXIT", exit).env("SLEEP", sleep);
+            c
+        };
+        let read = |name: &str| std::fs::read_to_string(tmp.path().join(name)).unwrap_or_default();
+
+        let out = remote("0", "0").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains("test-table: box: exit 0 · 1m 00s · default · $0.0010"), "{scripts}: {stdout}");
+        let args: Vec<String> = read("args").lines().map(String::from).collect();
+        for want in ["--no-env", "--type", "default", "--timeout", "2400", "--push"] {
+            assert!(args.iter().any(|a| a == want), "{scripts}: no {want} in {args:?}");
+        }
+        assert!(!args.iter().any(|a| a == "-e" || a.starts_with("--env")), "{scripts}: {args:?}");
+        assert_eq!(read("pushed"), "tree.bundle\n", "{scripts}: pushed more than the bundle");
+        let bundle = tmp.path().join("tree.bundle");
+        let heads = run(&dir, "git", &["bundle", "list-heads", bundle.to_str().unwrap()]);
+        let heads = String::from_utf8_lossy(&heads.stdout);
+        assert!(heads.contains(" HEAD\n") && heads.contains(" refs/remotes/origin/main\n"), "{scripts}: {heads}");
+        assert!(read("deleted").is_empty(), "{scripts}: boat had deleted its box");
+
+        // A failed run that leaves its box stopped, which plain boat list doesn't show: test-table exits
+        // with the box's exit, and deletes it.
+        std::fs::write(tmp.path().join("left"), "stopped").unwrap();
+        let out = remote("3", "0").output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("exited 3"), "{scripts}");
+        assert!(read("listed").lines().all(|l| l.contains("--all")), "{scripts}: {}", read("listed"));
+        assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the box was left");
+        assert!(!tmp.path().join("left").exists());
+
+        // Interrupted mid-run (Ctrl-C reaches the whole process group): the box is deleted too.
+        std::fs::remove_file(tmp.path().join("deleted")).unwrap();
+        std::fs::remove_file(tmp.path().join("ready")).unwrap();
+        std::fs::write(tmp.path().join("left"), "running").unwrap();
+        let mut child = remote("0", "30");
+        std::os::unix::process::CommandExt::process_group(&mut child, 0);
+        let mut child = child.spawn().unwrap();
+        let started = std::time::Instant::now();
+        while !tmp.path().join("ready").exists() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "{scripts}: boat never ran");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let group = format!("-{}", child.id());
+        assert!(Command::new("/bin/kill").args(["-INT", "--", &group]).status().unwrap().success());
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "{scripts}: an interrupted run passed");
+        assert!(started.elapsed() < std::time::Duration::from_secs(25), "{scripts}: waited for the box");
+        assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the interrupted box was left");
+
+        // A dirty tree: refused, no box.
+        std::fs::remove_file(tmp.path().join("args")).unwrap();
+        std::fs::write(dir.join("dirty"), "x").unwrap();
+        let out = remote("0", "0").output().unwrap();
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("commit"), "{scripts}");
+        assert!(read("args").is_empty(), "{scripts}: a box for a dirty tree");
+    }
+}
