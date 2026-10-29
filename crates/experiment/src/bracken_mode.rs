@@ -141,16 +141,21 @@ impl Mode for BrackenMode {
                 json!({"from": id, "kind": {"type": "string", "enum": RELATIONS}, "to": id, "note": text}),
                 &["from", "kind", "to"],
             ),
-            tool(
-                "evidence",
-                if phase1 {
-                    "Record your pass or fail verdict on a contribution; method says how you judged it, details what you found. A later verdict of yours replaces your earlier one"
-                } else {
-                    "Record your pass or fail verdict on a contribution; method says how you judged it, details what you found. A fail of yours keeps an implementation from counting until you retract that fail; a later pass doesn't lift it"
-                },
-                json!({"target": id, "verdict": {"type": "string", "enum": VERDICTS}, "method": text, "details": text}),
-                &["target", "verdict", "method"],
-            ),
+            if phase1 {
+                tool(
+                    "evidence",
+                    "Record your pass or fail verdict on a contribution; method says how you judged it, details what you found. A later verdict of yours replaces your earlier one",
+                    json!({"target": id, "verdict": {"type": "string", "enum": VERDICTS}, "method": text, "details": text}),
+                    &["target", "verdict", "method"],
+                )
+            } else {
+                tool(
+                    "evidence",
+                    "Record your pass or fail verdict on a contribution; method says how you judged it, details what you found. A fail of yours keeps an implementation from counting until you retract that fail; a later pass doesn't lift it. With a fail, depends_on lists contributions the target needs: each is recorded as a depends_on relation from your evidence, and status shows the target blocked until each of them is accepted, then ready",
+                    json!({"target": id, "verdict": {"type": "string", "enum": VERDICTS}, "method": text, "details": text, "depends_on": {"type": "array", "items": id}}),
+                    &["target", "verdict", "method"],
+                )
+            },
             tool(
                 "retract",
                 "Withdraw one of your contributions, with a reason; it then no longer counts",
@@ -181,7 +186,7 @@ impl Mode for BrackenMode {
                 at(&tools, "log"),
                 tool(
                     "news",
-                    "Contributions that reached your replica since your last news call (all of them the first time), oldest first, one line each: short id, author, kind and tags, and the statement or name",
+                    "Contributions that reached your replica since your last news call (all of them the first time), one line each: short id, author, kind and tags, and the statement or name. Those that concern you come first, under \"for you:\" (others' verdicts on your contributions and contradictions of them, and others' contributions that implement something, with those implements relations), then the rest; oldest first within each. When they don't fit one page, they come oldest first, a page at a time",
                     json!({}),
                     &[],
                 ),
@@ -190,7 +195,7 @@ impl Mode for BrackenMode {
                 at(&tools, "accepted"),
                 tool(
                     "status",
-                    "Each claim something implements, with its implementations: which wait for a pass from someone other than their author (claims with one waiting come first), and which are accepted, rejected or superseded; plus live intents",
+                    "Implementations, one line each with the claim they implement: your own first, then claims contradicting yours, then others' implementations waiting for your pass, then the rest. Within each part, those waiting for a pass from someone other than their author, or ready (each fail on them named what they need and all of that is accepted), come first, oldest first; then blocked (a fail named something not yet accepted), rejected, superseded, retracted and accepted ones; plus live intents. At most 40 lines, and says how many more",
                     json!({}),
                     &[],
                 ),
@@ -217,6 +222,19 @@ pub struct Plan {
 
 fn opt(name: &str, value: impl std::fmt::Display) -> String {
     format!("--{name}={value}")
+}
+
+/// How many of `lines`, from the first, fit one news page, measured as the driver sends them:
+/// JSON-escaped (a quote is two characters), then a newline's two.
+fn fits(lines: &[String]) -> usize {
+    let mut size = 0;
+    lines
+        .iter()
+        .take_while(|l| {
+            size += serde_json::to_string(l).map_or(usize::MAX / 2, |j| j.chars().count() - 2 + 2);
+            size <= NEWS_PAGE_CHARS
+        })
+        .count()
 }
 
 /// The command for tool `name`, signing as `identity`. Every value from `args`
@@ -249,8 +267,10 @@ pub fn plan(name: &str, args: &Args, identity: &str, task: Task) -> Result<Plan,
         "show" => read(vec![s("show"), s("--json"), s("--"), s(args.id("id")?)]),
         "heads" => read(vec![s("heads"), s("--json")]),
         "conflicts" => read(vec![s("conflicts"), s("--json")]),
-        // Bracken's own view, as people read it: what waits for a pass comes first.
-        "status" => Plan { json: false, ..read(vec![s("status")]) },
+        // Bracken's own view, as people read it, from where this agent stands: its own work, contradictions
+        // of its claims and work waiting for its pass first, one short line each, at most bracken's default
+        // number of lines.
+        "status" => Plan { json: false, ..read(vec![s("status"), opt("as", identity)]) },
         "cat" => Plan { json: false, ..read(vec![s("cat"), s("--"), s(args.id("id")?)]) },
         "claim" => {
             let mut head = vec![s("claim")];
@@ -269,7 +289,8 @@ pub fn plan(name: &str, args: &Args, identity: &str, task: Task) -> Result<Plan,
             write(head, vec![s(args.id("from")?), s(args.choice("kind", &RELATIONS)?), s(args.id("to")?)])
         }
         "evidence" => {
-            let head = vec![s("evidence"), opt("method", args.text("method")?), s("--details-file=-")];
+            let mut head = vec![s("evidence"), opt("method", args.text("method")?), s("--details-file=-")];
+            head.extend(args.ids("depends_on")?.into_iter().map(|i| opt("depends-on", i)));
             let details = args.text_opt("details")?.as_bytes().to_vec();
             let plan = write(head, vec![s(args.id("target")?), s(args.choice("verdict", &VERDICTS)?)]);
             Plan { stdin: Some(details), ..plan }
@@ -287,7 +308,7 @@ fn allowed(name: &str) -> &'static [&'static str] {
         "claim" => &["statement", "tags", "supersedes"],
         "artifact" => &["function", "content"],
         "relate" => &["from", "kind", "to", "note"],
-        "evidence" => &["target", "verdict", "method", "details"],
+        "evidence" => &["target", "verdict", "method", "details", "depends_on"],
         "retract" => &["target", "reason"],
         _ => &[],
     }
@@ -463,7 +484,11 @@ impl Store for BrackenStore {
         if !self.tools_known(name) {
             return Err(format!("no tool {}", crate::args::short(name)));
         }
-        let args = Args::new(args, allowed(name))?;
+        let args = match (name, self.config.accept_rule) {
+            // Phase 1's evidence tool, as its runs were given it.
+            ("evidence", AcceptRule::MostPasses) => Args::new(args, &["target", "verdict", "method", "details"])?,
+            _ => Args::new(args, allowed(name))?,
+        };
         if name == "artifact"
             && let Some(problem) =
                 artifact_problem(self.config.task, args.spec_name("function", self.config.task)?, args.text("content")?)
@@ -686,7 +711,7 @@ impl BrackenStore {
         let mut out = args.clone();
         let Some(map) = out.as_object_mut() else { return Ok(out) };
         let mut ids: Option<Vec<String>> = None;
-        for key in ["id", "from", "to", "target", "supersedes"] {
+        for key in ["id", "from", "to", "target", "supersedes", "depends_on"] {
             let values: Vec<&mut Value> = match map.get_mut(key) {
                 Some(Value::Array(items)) => items.iter_mut().collect(),
                 Some(v @ Value::String(_)) => vec![v],
@@ -717,25 +742,19 @@ impl BrackenStore {
             Err(e) => return Err(format!("your news position couldn't be read ({}); use log instead", e.kind())),
         };
         let since = opt("since", cursor.trim());
-        let out = self.run(&["log".into(), since.clone(), "--compact".into()], None)?;
-        let text = String::from_utf8_lossy(&out).into_owned();
-        let mut lines: Vec<&str> = text.lines().collect();
-        let next = match lines.last().and_then(|l| l.strip_prefix("cursor: ")) {
-            Some(c) => c.trim().to_string(),
-            None => return Err("bracken log printed no cursor".into()),
-        };
-        lines.pop();
-        let mut shown = 0;
-        let mut size = 0;
-        for l in &lines {
-            // Measured as the driver sends it: JSON-escaped (a quote is two characters), then a newline's two.
-            let sent = serde_json::to_string(l).map_or(usize::MAX, |j| j.chars().count() - 2 + 2);
-            if size + sent > NEWS_PAGE_CHARS {
-                break;
+        // What concerns this agent first (bracken's `log --since --as`), when it all fits on one page.
+        let personal = vec!["log".into(), since.clone(), "--compact".into(), opt("as", &self.config.identity)];
+        let (lines, next) = self.news_lines(&personal)?;
+        if fits(&lines) == lines.len() {
+            std::fs::write(&file, &next).map_err(|e| format!("writing the news cursor: {e}"))?;
+            if lines.is_empty() {
+                return Ok(json!({ "output": "Nothing new since your last news call." }));
             }
-            size += sent;
-            shown += 1;
+            return Ok(json!({ "output": lines.join("\n") }));
         }
+        // More than a page: oldest first, so that what was shown is what the new cursor covers.
+        let (lines, next) = self.news_lines(&["log".into(), since.clone(), "--compact".into()])?;
+        let shown = fits(&lines);
         let (cursor, rest) = if shown == lines.len() {
             (next, String::new())
         } else {
@@ -760,6 +779,17 @@ impl BrackenStore {
             return Ok(json!({ "output": "Nothing new since your last news call." }));
         }
         Ok(json!({ "output": lines[..shown].join("\n") + &rest }))
+    }
+
+    /// The lines `bracken <argv>` prints for news, and the cursor it ends with.
+    fn news_lines(&mut self, argv: &[String]) -> Result<(Vec<String>, String), String> {
+        let out = self.run(argv, None)?;
+        let mut lines: Vec<String> = String::from_utf8_lossy(&out).lines().map(str::to_string).collect();
+        let next = match lines.pop().as_deref().and_then(|l| l.strip_prefix("cursor: ")) {
+            Some(c) => c.trim().to_string(),
+            None => return Err("bracken log printed no cursor".into()),
+        };
+        Ok((lines, next))
     }
 
     fn execute(&mut self, mut plan: Plan) -> Result<Value, String> {

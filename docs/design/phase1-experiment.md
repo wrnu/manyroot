@@ -339,13 +339,20 @@ starts from a fresh sync state.
   `accepted`, `cat`), `claim`, `artifact`, `relate`, `evidence`, `retract`,
   each run through the real `bracken` binary with `--json`, plus `check` on
   an artifact. Under the one-pass rule two more show Bracken's own views
-  (task `541b6f3db130`): `status`, Bracken's status view as `bracken status`
-  prints it (per claim, what implements it: what waits for an independent
-  pass, listed first, and what is accepted, rejected or superseded, with
-  live intents), and `news`, an incremental log: `bracken log --since
-  <cursor> --compact`, one line per contribution that arrived since the
-  agent's last `news` call, by a cursor the harness keeps in each agent's
-  own store. A `news` page stops below the result bound (36,000
+  (task `541b6f3db130`): `status`, Bracken's status view as `bracken status
+  --as <agent>` prints it (task `f1c8478d1012`: one line per implementation,
+  the agent's own work, contradictions of its claims and work waiting for its
+  pass first; within each part, work waiting for an independent pass or ready
+  first, oldest first, then blocked, rejected, superseded, retracted and
+  accepted; live intents; at most 40 lines), and `news`, an incremental log:
+  `bracken log --since <cursor> --compact --as <agent>`, one line per
+  contribution that arrived since the agent's last `news` call, what concerns
+  the agent first, by a cursor the harness keeps in each agent's own store.
+  The `evidence` tool's optional `depends_on` ids, each the agent's own
+  choice, become `--depends-on`: with a fail, status shows the target
+  blocked until they are accepted, then ready (answer `ae21de46a008`). News
+  that needs more than a page comes oldest first instead, without the
+  personal order. A `news` page stops below the result bound (36,000
   characters, measured JSON-escaped as the driver sends it, so the bound
   never cuts it) and says how many more arrived; its cursor is the old
   cursor's ids and the page's, so the next call starts after everything

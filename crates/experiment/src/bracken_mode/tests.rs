@@ -51,6 +51,7 @@ fn slots() -> Vec<(&'static str, Value, &'static str)> {
         ("evidence", json!({"target": id, "verdict": "pass", "method": "m"}), "verdict"),
         ("evidence", json!({"target": id, "verdict": "pass", "method": "m"}), "method"),
         ("evidence", json!({"target": id, "verdict": "pass", "method": "m", "details": "d"}), "details"),
+        ("evidence", json!({"target": id, "verdict": "fail", "method": "m", "depends_on": [id]}), "depends_on"),
         ("retract", json!({"target": id}), "target"),
         ("retract", json!({"target": id, "reason": "r"}), "reason"),
     ]
@@ -58,7 +59,7 @@ fn slots() -> Vec<(&'static str, Value, &'static str)> {
 
 fn with_value(args: &Value, slot: &str, v: &str) -> Value {
     let mut args = args.clone();
-    let value = if matches!(slot, "tags" | "supersedes") { json!([v]) } else { json!(v) };
+    let value = if matches!(slot, "tags" | "supersedes" | "depends_on") { json!([v]) } else { json!(v) };
     args[slot] = value;
     args
 }
@@ -137,7 +138,7 @@ fn implement_in(s: &mut BrackenStore, function: &str, program: &str) -> String {
 /// The status line of implementation `id`, trimmed, as the status tool prints it.
 fn status_of(s: &mut BrackenStore, id: &str) -> Option<String> {
     let text = output(s.tool("status", &json!({})));
-    text.lines().find(|l| l.contains(&id[..12])).map(|l| l.trim().to_string())
+    text.lines().find(|l| l.contains(&id[..8])).map(|l| l.trim().to_string())
 }
 
 fn accepted_of(s: &mut BrackenStore, id: &str) -> Option<String> {
@@ -836,4 +837,69 @@ fn an_unreadable_news_position_is_said() {
     std::fs::create_dir(a.config.dir.join("news-cursor.txt")).expect("a directory where the file goes");
     let err = a.tool("news", &json!({})).expect_err("refused");
     assert!(err.contains("couldn't be read"), "{err}");
+}
+
+/// Task `f1c8478d1012`: the status tool is bracken's queue from where the agent stands, and the evidence
+/// tool's depends_on, each id the agent's own choice, is what status shows blocked, then ready.
+#[test]
+fn status_is_the_agents_queue_and_a_fail_can_name_what_it_needs() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, mut b) = ground_of(dir.path(), AcceptRule::OnePass);
+    let abs = implement_in(&mut a, "abs", "a 0 < a neg a ?");
+    let sq = implement_in(&mut a, "sq", "a a *");
+    carry(&mut a, &mut b);
+    let text = output(b.tool("status", &json!({})));
+    let at = |text: &str, needle: &str| {
+        text.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}:\n{text}"))
+    };
+    assert!(at(&text, "waiting for your pass:") < at(&text, &abs[..8]), "{text}");
+    assert!(text.chars().count() < crate::driver::MAX_RESULT_CHARS);
+
+    let out = output(b.tool(
+        "evidence",
+        &json!({"target": &sq[..8], "verdict": "fail", "method": "ran it", "depends_on": [&abs[..8]]}),
+    ));
+    assert_eq!(out.lines().count(), 2, "the evidence, then its depends_on relation: {out}");
+    let line = status_of(&mut b, &sq).expect("listed");
+    assert!(line.starts_with("blocked") && line.contains(&format!("needs {}", &abs[..8])), "{line}");
+    b.tool("evidence", &json!({"target": &abs[..8], "verdict": "pass", "method": "ran it"})).expect("a pass");
+    assert!(status_of(&mut b, &sq).expect("listed").starts_with("ready"));
+    // The author sees their own work first.
+    carry(&mut b, &mut a);
+    let text = output(a.tool("status", &json!({})));
+    assert!(text.starts_with("yours:\nready "), "{text}");
+
+    // The ids are checked like every other id; a pass with depends_on is bracken's to refuse.
+    let refused =
+        b.tool("evidence", &json!({"target": sq, "verdict": "fail", "method": "m", "depends_on": ["ffffffff"]}));
+    assert!(refused.expect_err("unknown").contains("no contribution"));
+    let refused = b.tool("evidence", &json!({"target": sq, "verdict": "pass", "method": "m", "depends_on": [abs]}));
+    assert!(refused.expect_err("a pass").contains("goes with a fail"));
+    // Phase 1's evidence tool is as its runs were given it.
+    let phase1 = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut p, _b) = ground_of(phase1.path(), AcceptRule::MostPasses);
+    let spec = p.state().expect("state").spec_claim("abs").expect("a spec");
+    let args = json!({"target": spec, "verdict": "fail", "method": "m", "depends_on": [spec]});
+    assert!(p.tool("evidence", &args).is_err());
+    let tools = BrackenMode::PHASE1.tools(Task::Phase1);
+    let evidence = tools.iter().find(|t| t.name == "evidence").expect("evidence");
+    assert!(evidence.input_schema["properties"].get("depends_on").is_none());
+}
+
+/// News puts what concerns the agent first, when it fits one page.
+#[test]
+fn news_puts_what_concerns_the_agent_first() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, mut b) = ground_of(dir.path(), AcceptRule::OnePass);
+    let abs = implement_in(&mut a, "abs", "a 0 < a neg a ?");
+    carry(&mut a, &mut b);
+    output(a.tool("news", &json!({})));
+    b.tool("claim", &json!({"statement": "b's own aside", "tags": ["note"]})).expect("a claim");
+    let verdict = made(&mut b, "evidence", json!({"target": abs, "verdict": "pass", "method": "ran it"}));
+    carry(&mut b, &mut a);
+    let news = output(a.tool("news", &json!({})));
+    let lines: Vec<&str> = news.lines().collect();
+    assert_eq!(lines.len(), 4, "{news}");
+    assert!(lines[0] == "for you:" && lines[1].starts_with(&verdict[..8]) && lines[2] == "everything else:", "{news}");
+    assert!(lines[3].contains("b's own aside"), "{news}");
 }
