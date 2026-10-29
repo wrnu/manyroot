@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use manyroot::validation::dependencies;
+use manyroot::validation::{Trusted, dependencies, relation_counts};
 use manyroot::*;
 
 fn ground() -> GroundId {
@@ -372,4 +372,34 @@ fn off_by_default_the_fixture_ground_reads_as_before() {
         let now = serde_json::json!({"assessments": assessments, "evaluation": p.evaluate(g)});
         assert_eq!(now, before[name], "{name}");
     }
+}
+
+/// The shared authorship rule (note `dd842914e542`, decision `dd549e3a2a5c`), with each feature's set: a
+/// relation's source's author always counts; the target's author only where a feature trusts it (the CLI's
+/// review queue, for an implements onto a need); further authors only where named (following changes, for
+/// the authors of what the source implements); a stranger never.
+#[test]
+fn the_shared_authorship_rule_counts_each_features_set() {
+    let (owner, target_author, named, stranger) = (agent("owner"), agent("target"), agent("named"), agent("stranger"));
+    let mut g = Graph::new(ground());
+    let source = add(&mut g, &owner, claim("the source"));
+    let target = add(&mut g, &target_author, claim("the target"));
+    let by = |g: &mut Graph, who: &Identity| {
+        let id = add(g, who, relate(source, RelationKind::Implements, target));
+        g.get(&id).unwrap().clone()
+    };
+    let (r_owner, r_target, r_named, r_stranger) =
+        (by(&mut g, &owner), by(&mut g, &target_author), by(&mut g, &named), by(&mut g, &stranger));
+    let names = std::collections::HashSet::from([named.agent_id()]);
+    let sets = [
+        ("source only", Trusted::SOURCE, [true, false, false, false]),
+        ("source or target", Trusted::SOURCE_OR_TARGET, [true, true, false, false]),
+        ("source or named", Trusted::source_or(&names), [true, false, true, false]),
+    ];
+    for (name, trusted, want) in sets {
+        let got = [&r_owner, &r_target, &r_named, &r_stranger].map(|r| relation_counts(&g, r, &trusted));
+        assert_eq!(got, want, "{name}");
+    }
+    let not_a_relation = g.get(&source).unwrap().clone();
+    assert!(!relation_counts(&g, &not_a_relation, &Trusted::SOURCE_OR_TARGET));
 }

@@ -11,7 +11,7 @@ use std::rc::Rc;
 
 use serde::Serialize;
 
-use crate::contribution::{Body, RelationKind, Verdict};
+use crate::contribution::{Body, Contribution, RelationKind, Verdict};
 use crate::graph::Graph;
 use crate::id::{AgentId, ContributionId};
 
@@ -416,24 +416,64 @@ pub fn dependencies(graph: &Graph, x: &ContributionId) -> Vec<ContributionId> {
 
 /// The dependencies of `n` its counting relations name directly.
 fn direct_dependencies(graph: &Graph, n: &ContributionId) -> Vec<ContributionId> {
-    let Some(author) = graph.get(n).map(|c| c.author()) else { return Vec::new() };
-    let out_of = |kind: RelationKind| {
-        graph.referrers(n).filter_map(move |r| match r.body() {
-            Body::Relation { from, kind: k, to, .. } if from == n && *k == kind && !graph.is_retracted(&r.id()) => {
-                Some((r.author(), *to))
-            }
-            _ => None,
-        })
+    let out_of = |kind: RelationKind, trusted: Trusted<'_>| -> Vec<ContributionId> {
+        graph
+            .referrers(n)
+            .filter(|r| !graph.is_retracted(&r.id()) && relation_counts(graph, r, &trusted))
+            .filter_map(|r| match r.body() {
+                Body::Relation { from, kind: k, to, .. } if from == n && *k == kind => Some(*to),
+                _ => None,
+            })
+            .collect()
     };
-    let implements: Vec<ContributionId> =
-        out_of(RelationKind::Implements).filter(|(a, _)| *a == author).map(|(_, to)| to).collect();
-    let mut trusted: HashSet<AgentId> = implements.iter().filter_map(|c| graph.get(c)).map(|c| c.author()).collect();
-    trusted.insert(author);
+    let implements = out_of(RelationKind::Implements, Trusted::SOURCE);
+    let implemented: HashSet<AgentId> = implements.iter().filter_map(|c| graph.get(c)).map(|c| c.author()).collect();
     let mut out = implements;
     for kind in [RelationKind::DependsOn, RelationKind::Refines] {
-        out.extend(out_of(kind).filter(|(a, _)| trusted.contains(a)).map(|(_, to)| to));
+        out.extend(out_of(kind, Trusted::source_or(&implemented)));
     }
     out
+}
+
+/// Whose relation counts: the authorship rule that decides which relations a reader follows, shared so
+/// the features that follow relations can't drift apart (note `dd842914e542`). Each feature passes its own
+/// set (decision `dd549e3a2a5c`):
+/// - following changes (`dependencies`): an `implements` by its source's author ([`Trusted::SOURCE`]), and a
+///   `depends_on` or `refines` by its source's author or the author of a claim the source implements
+///   ([`Trusted::source_or`]);
+/// - the CLI's review queue, deciding whether what a fail needs is there: an `implements` by its source's
+///   author or by the need's author ([`Trusted::SOURCE_OR_TARGET`]).
+///
+/// The author of a relation's `from` end is always trusted; anyone else only where a feature's set names
+/// them.
+#[derive(Debug, Clone, Copy)]
+pub struct Trusted<'a> {
+    /// The author of the relation's `to` end.
+    pub target: bool,
+    /// Further authors.
+    pub authors: Option<&'a HashSet<AgentId>>,
+}
+
+impl<'a> Trusted<'a> {
+    /// Only the source's author.
+    pub const SOURCE: Trusted<'static> = Trusted { target: false, authors: None };
+    /// The source's author or the target's.
+    pub const SOURCE_OR_TARGET: Trusted<'static> = Trusted { target: true, authors: None };
+
+    /// The source's author or one of `authors`.
+    pub fn source_or(authors: &'a HashSet<AgentId>) -> Self {
+        Trusted { target: false, authors: Some(authors) }
+    }
+}
+
+/// Whether `relation` counts under `trusted`: it is a relation, and its author wrote its `from` end, or
+/// (if trusted) its `to` end, or is one of the further authors. Whether it is still current is the
+/// caller's to decide.
+pub fn relation_counts(graph: &Graph, relation: &Contribution, trusted: &Trusted<'_>) -> bool {
+    let Body::Relation { from, to, .. } = relation.body() else { return false };
+    let author = relation.author();
+    let wrote = |id: &ContributionId| graph.get(id).is_some_and(|c| c.author() == author);
+    wrote(from) || (trusted.target && wrote(to)) || trusted.authors.is_some_and(|a| a.contains(&author))
 }
 
 /// What changed `d`: the non-retracted `supersedes` relations by `d`'s author

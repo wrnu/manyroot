@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Args, Parser, Subcommand};
 use manyroot::store::{self, GroundInfo};
-use manyroot::validation::{Assessor, open_conflicts, open_supersessors};
+use manyroot::validation::{Assessor, Trusted, open_conflicts, open_supersessors, relation_counts};
 use manyroot::*;
 use serde_json::{Value, json};
 
@@ -1074,21 +1074,18 @@ impl<'a> Judge<'a> {
 
     /// Whether what a fail needs is there: the policy accepts it, or accepts something that currently
     /// implements it by a relation its source's author or the need's author wrote, as the accepted
-    /// count takes implements (a stranger's relation doesn't make someone else's work ready).
+    /// count takes implements (a stranger's relation doesn't make someone else's work ready). That is
+    /// the shared authorship rule with this feature's set, [`Trusted::SOURCE_OR_TARGET`].
     fn met(&mut self, id: &ContributionId) -> bool {
         if let Some(&known) = self.met.get(id) {
             return known;
         }
         let (g, view) = (self.g, self.view);
-        let need_author = g.get(id).map(Contribution::author);
         let mut sources: Vec<ContributionId> = g
             .referrers(id)
-            .filter(|r| !view.hidden.contains(&r.id()))
+            .filter(|r| !view.hidden.contains(&r.id()) && relation_counts(g, r, &Trusted::SOURCE_OR_TARGET))
             .filter_map(|r| match r.body() {
-                Body::Relation { from, kind: RelationKind::Implements, to, .. } if to == id => {
-                    let by_owner = g.get(from).is_some_and(|f| f.author() == r.author());
-                    (by_owner || need_author == Some(r.author())).then_some(*from)
-                }
+                Body::Relation { from, kind: RelationKind::Implements, to, .. } if to == id => Some(*from),
                 _ => None,
             })
             .collect();
