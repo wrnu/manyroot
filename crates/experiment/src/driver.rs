@@ -107,6 +107,10 @@ pub trait Backend: Sync {
 
     /// Tests only: called while a checkpoint holds the hub, between reading its library and logging it.
     fn checkpoint_read(&self, _turn: u32) {}
+
+    /// Tests only: called as an agent-turn is counted, `done` agent-turns in all, before its checkpoint and
+    /// any release it makes due.
+    fn turn_counted(&self, _done: u32) {}
 }
 
 /// The next agent-turn allowed to run in lockstep, and the agents that have stopped playing.
@@ -190,7 +194,8 @@ struct Run<'a> {
     sockets: PathBuf,
     tools: Vec<ToolSpec>,
     turns_done: AtomicU32,
-    /// The number of agent-turns used at each release so far.
+    /// The number of agent-turns used at each release so far. Held from counting an agent-turn to the
+    /// release it makes due, so a wave goes out at its boundary (note `65049c2f8795`).
     released: Mutex<Vec<u32>>,
     /// Per turn index, how many agents have finished it: the checkpoint is when all have.
     finished: Mutex<Vec<usize>>,
@@ -283,7 +288,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     };
     run.snapshot(&mut run.hub(), None, "setup");
     // A wave due after turn 0 goes out before anyone plays.
-    run.maybe_release(0)?;
+    run.maybe_release(&mut run.released.lock().unwrap_or_else(|e| e.into_inner()), 0)?;
     let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..cfg.agents)
             .map(|i| {
@@ -367,9 +372,15 @@ impl Run<'_> {
                 }
             }
             self.events.log(Some(name), "turn_end", json!({"turn": turn}));
+            // Counting the turn, its checkpoint and any release it makes due are one step: no other
+            // agent-turn is counted until the wave due at this count has gone out, whatever the hub's load
+            // in this mode (note `65049c2f8795`).
+            let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
             let done = self.turns_done.fetch_add(1, Ordering::SeqCst) + 1;
+            backend.turn_counted(done);
             self.checkpoint(turn, backend);
-            self.maybe_release(done)?;
+            self.maybe_release(&mut released, done)?;
+            drop(released);
             self.lockstep_pass();
         }
         Ok(())
@@ -449,11 +460,10 @@ impl Run<'_> {
 
     /// Releases every wave due once `done` agent-turns are used: to all agents at once, at the same point
     /// in every mode. Phase 1's one release has no wave in its event, as its runs' logs don't.
-    fn maybe_release(&self, done: u32) -> Result<(), String> {
+    fn maybe_release(&self, released: &mut Vec<u32>, done: u32) -> Result<(), String> {
         let agents = self.cfg.agents as u32;
         let task = self.cfg.plan.task;
         let waves = task.wave_turns(self.cfg.turns);
-        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             let due = if waves.is_empty() {
                 released.is_empty() && f64::from(done) >= RELEASE_AT * f64::from(self.cfg.turns * agents)

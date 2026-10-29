@@ -608,6 +608,18 @@ checkpoint's read and its entry, and each checkpoint is graded under the
 specs it was read under. A test pauses a checkpoint between the two while
 another agent's turn makes a wave due, and the release waits.
 
+**A wave at its boundary** (note `65049c2f8795`). Counting an agent-turn,
+its checkpoint and the release it makes due are one step under one lock.
+So no other agent-turn is counted until that wave has gone out, and each
+wave goes out at exactly its boundary in agent-turns in every mode. That
+holds even when the agent that reached the boundary waits on a busy hub.
+Before this, another agent could end a turn first and release the wave one
+agent-turn late. Meanwhile its own syncs were missing the wave, and how
+late depended on each mode's hub load. No agent ever started a turn after
+a boundary without the wave, because every agent passes the release check
+between its turns. A test stalls the agent at the boundary while another
+ends a turn.
+
 **The full mock run:** 10 agents and 8 turns in each mode, sandboxed, with
 no turn errors. The reports are recorded as evidence on the step's PR.
 

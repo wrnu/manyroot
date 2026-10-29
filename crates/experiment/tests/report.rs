@@ -182,8 +182,92 @@ fn a_release_waits_for_a_checkpoint_between_its_read_and_its_entry() {
     let (checkpoint, release) = (seq("checkpoint", "turn", 1), seq("changes_released", "wave", 1));
     assert!(checkpoint.is_some() && release.is_some());
     assert!(checkpoint < release, "checkpoint 1 at {checkpoint:?}, wave 1 at {release:?}");
+    // Note `65049c2f8795`: agent 0 ended turn 2 while the checkpoint was paused, yet wave 1 still goes out
+    // at its boundary, 2 agent-turns, by the agent whose turn reached it.
+    let wave1 = events.iter().find(|e| e["event"] == "changes_released" && e["data"]["wave"] == 1).expect("wave 1");
+    assert_eq!(wave1["data"]["turns_done"], 2, "{wave1}");
     let c = report(&cfg.root, None).expect("the report").measures.checkpoints.expect("checkpoints");
     assert_eq!(c.turns[0].waves, 0, "graded under the specs it was read under");
+}
+
+/// Note `65049c2f8795`: a wave goes out at its boundary in agent-turns, in every mode, however long the
+/// agent whose turn reaches it takes to release it. Agent 1 ends turn 1, the second agent-turn and wave 1's
+/// boundary, and stalls as it is counted, while agent 0 plays and ends turn 2. Agent 0's turn isn't counted
+/// until the wave has gone out, so the wave goes out at 2 agent-turns, not 3.
+#[test]
+fn a_wave_goes_out_at_its_boundary_while_another_agent_ends_a_turn() {
+    use bracken_experiment::driver::Backend;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    struct Stall {
+        mock: MockBackend,
+        second_turn: AtomicBool,
+        counted: AtomicBool,
+        played: AtomicBool,
+    }
+    fn wait_for(flag: &AtomicBool, limit: Duration) -> bool {
+        let start = Instant::now();
+        while !flag.load(Ordering::SeqCst) {
+            if start.elapsed() > limit {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+    impl Backend for Stall {
+        fn turn(&self, agent: usize, name: &str, turn: u32, socket: &Path) -> Result<(), String> {
+            match (agent, turn) {
+                // Agent 1's turn 1 is counted second: agent 0 has counted its own and started turn 2.
+                (1, 1) => assert!(wait_for(&self.second_turn, Duration::from_secs(120)), "agent 0's turn 2"),
+                (0, 2) => {
+                    self.second_turn.store(true, Ordering::SeqCst);
+                    assert!(wait_for(&self.counted, Duration::from_secs(120)), "agent 1's count");
+                }
+                _ => {}
+            }
+            let played = self.mock.turn(agent, name, turn, socket);
+            if (agent, turn) == (0, 2) {
+                self.played.store(true, Ordering::SeqCst);
+            }
+            played
+        }
+
+        fn turn_counted(&self, done: u32) {
+            if done == 2 {
+                self.counted.store(true, Ordering::SeqCst);
+                // Agent 0 plays turn 2 meanwhile; then time enough for its turn to be counted, if it could be.
+                wait_for(&self.played, Duration::from_secs(30));
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = config(dir.path(), "crdt", Task::Phase2, 2, 4);
+    let mock = MockBackend {
+        task: Task::Phase2,
+        moves: bracken_experiment::mock::Moves::PLAIN,
+        usage: Some(cfg.root.join("usage.jsonl")),
+        ..MockBackend::default()
+    };
+    let stall = Stall {
+        mock,
+        second_turn: AtomicBool::new(false),
+        counted: AtomicBool::new(false),
+        played: AtomicBool::new(false),
+    };
+    run(&cfg, &stall).expect("the run");
+    assert!(stall.played.load(Ordering::SeqCst), "agent 0 ended turn 2 during the stall");
+    let events: Vec<Value> = std::fs::read_to_string(cfg.root.join("events.jsonl"))
+        .expect("events")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("json"))
+        .collect();
+    let done: Vec<&Value> =
+        events.iter().filter(|e| e["event"] == "changes_released").map(|e| &e["data"]["turns_done"]).collect();
+    assert_eq!(done, [2, 4], "each wave at its boundary");
 }
 
 /// Task `07cb4ada01ea`: the scripted moves' checkpoint measures, checked by hand per mode. Two agents, four
