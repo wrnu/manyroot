@@ -1077,3 +1077,70 @@ fn bound_to_this_machines_address() {
     );
     assert!(loopback.is_err(), "bound to {own}, it listens on 127.0.0.1 too");
 }
+
+/// `--bind` is repeatable (decision 5863740ca157): at most one loopback and one other address, every
+/// refusal applying to each, and with one address it's as before.
+#[test]
+fn bind_twice_refuses_two_of_a_kind_and_any_bad_address() {
+    let dir = ground();
+    for pair in [["127.0.0.1", "::1"], ["127.0.0.1", "::ffff:127.0.0.1"], ["100.74.240.73", "100.74.240.74"]] {
+        let err = view_refuses(&dir, &["--bind", pair[0], "--bind", pair[1]]);
+        assert!(err.contains("at most one"), "{pair:?}: {err}");
+    }
+    for bad in ["0.0.0.0", "::ffff:0.0.0.0", "224.0.0.1", "255.255.255.255"] {
+        let err = view_refuses(&dir, &["--bind", "127.0.0.1", "--bind", bad]);
+        assert!(err.contains("--bind"), "{bad}: {err}");
+    }
+}
+
+/// One process on two listeners, loopback and this machine's own address, each with its own Host rules:
+/// localhost and 127.0.0.1 only on loopback; the address and the --host name only on their own listener.
+/// It listens on a real interface while it runs, so it's opt-in: `cargo test -- --ignored`.
+#[test]
+#[ignore = "listens on this machine's network address; run with --ignored"]
+fn two_listeners_keep_their_own_host_rules() {
+    let dir = ground();
+    let udp = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let own = udp.connect("192.0.2.1:9").and_then(|()| udp.local_addr()).map(|a| a.ip()).unwrap();
+    assert!(!own.is_loopback() && !own.is_unspecified(), "no network address here");
+    let mut child = Command::new(BIN)
+        .args(["view", "--bind", &own.to_string(), "--bind", "127.0.0.1", "--host", "named.example"])
+        .env("BRACKEN_DIR", &dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    let (mut first, mut second) = (String::new(), String::new());
+    out.read_line(&mut first).unwrap();
+    out.read_line(&mut second).unwrap();
+    let mut warning = String::new();
+    BufReader::new(child.stderr.take().unwrap()).read_line(&mut warning).unwrap();
+    let port: u16 = first.trim().trim_end_matches('/').rsplit(':').next().unwrap().parse().unwrap();
+    let loopback = View { child, port, at: format!("127.0.0.1:{port}") };
+    assert_eq!(first.trim(), format!("view at http://127.0.0.1:{port}/"), "loopback first");
+    assert_eq!(second.trim(), format!("view at http://{own}:{port}/"));
+    assert!(warning.contains(&format!("{own}:{port}")) && warning.contains("no login"), "{warning:?}");
+    let request = |at: String, host: &str| {
+        let mut s = TcpStream::connect(at.as_str()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        write!(s, "GET /api/ground HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").unwrap();
+        let mut raw = Vec::new();
+        s.read_to_end(&mut raw).unwrap();
+        parse(&raw).status
+    };
+    let (lo, net) = (format!("127.0.0.1:{port}"), format!("{own}:{port}"));
+    for (at, host, status) in [
+        (&lo, format!("127.0.0.1:{port}"), 200),
+        (&lo, format!("localhost:{port}"), 200),
+        (&lo, format!("named.example:{port}"), 403),
+        (&lo, format!("{own}:{port}"), 403),
+        (&net, format!("{own}:{port}"), 200),
+        (&net, format!("named.example:{port}"), 200),
+        (&net, format!("localhost:{port}"), 403),
+        (&net, format!("127.0.0.1:{port}"), 403),
+    ] {
+        assert_eq!(request(at.clone(), &host), status, "on {at}, Host {host}");
+    }
+    drop(loopback);
+}
