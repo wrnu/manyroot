@@ -52,7 +52,7 @@
     const c = r.claim;
     const ev = [{ t: c.timestamp_ms, ids: [c.id], who: nameOf(c.author, c.author_name), kind: "claim", what: "wrote it" }];
     for (const i of r.intents) {
-      ev.push({ t: i.from_ms, ids: [i.id], who: nameOf(i.author, i.author_name), kind: "intent", what: "intends to work on it" });
+      ev.push({ t: i.from_ms, ids: [i.id, i.relation], who: nameOf(i.author, i.author_name), kind: "intent", what: "intends to work on it" });
       if (i.ended_ms !== null) ev.push({ t: i.ended_ms, ids: [], who: nameOf(i.author, i.author_name), kind: "intent-end", what: `intent ended: ${i.ended_by}`, plain: "intent ended" });
     }
     for (const im of r.implementations) {
@@ -61,7 +61,7 @@
       for (const e of im.evidence) ev.push(evidenceEntry(e, `on ${a.body.name}`));
     }
     for (const e of r.evidence) ev.push(evidenceEntry(e, "on the claim"));
-    for (const rf of r.refinements) ev.push({ t: rf.timestamp_ms, ids: [rf.id], who: nameOf("", rf.author_name), kind: "claim", what: "refines it:", text: rf.statement });
+    for (const rf of r.refinements) ev.push({ t: rf.timestamp_ms, ids: [rf.id, rf.relation], who: nameOf("", rf.author_name), kind: "claim", what: "refines it:", text: rf.statement });
     for (const rv of r.rivals) ev.push({ t: rv.timestamp_ms, ids: [rv.id, rv.relation].filter(Boolean), who: nameOf("", rv.author_name), kind: "claim", what: rv.how === "contradicts" ? "contradicts it:" : "replaces the same claim:", text: rv.statement });
     for (const rp of r.lineage.replaces) ev.push({ t: rp.timestamp_ms, ids: [rp.id], who: nameOf("", rp.author_name), kind: "claim", what: "wrote what it replaces:", text: rp.statement });
     for (const rb of r.lineage.replaced_by)

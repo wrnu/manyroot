@@ -10,7 +10,7 @@ const Bracken = (() => {
 
   // The only elements and attributes the views make and set. Anything else is refused, so no slip can
   // load, navigate, style or run something, whatever text reaches these helpers.
-  const HTML_TAGS = new Set(["div", "span", "p", "article", "h2", "dl", "dt", "dd", "ul", "li", "bdi", "button"]);
+  const HTML_TAGS = new Set(["div", "span", "p", "article", "h2", "h3", "dl", "dt", "dd", "ul", "li", "bdi", "button"]);
   const SVG_TAGS = new Set(["svg", "g", "path", "circle", "rect", "text"]);
   const ATTRIBUTES = new Set([
     "class", "type", "title", "role", "aria-label", "aria-hidden", "aria-pressed", "aria-valuenow", "aria-valuetext",

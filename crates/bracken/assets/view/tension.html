@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>Tension · Bracken</title>
+    <link rel="stylesheet" href="/visualizer.css" />
+    <link rel="stylesheet" href="/tension.css" />
+    <script src="/common.js" defer></script>
+    <script src="/tension.js" defer></script>
+  </head>
+  <body class="tension-page">
+    <header class="masthead">
+      <h1>Tension <span class="ground-name" id="ground-name"></span></h1>
+      <span class="synthetic" id="data-note" role="status">Reading the Ground…</span>
+      <nav aria-label="Views">
+        <a href="/">Loom</a>
+        <a href="/root.html">Root</a>
+        <a href="/trust.html">Trust</a>
+        <a href="/tension.html" aria-current="page">Tension</a>
+        <a href="/runs.html">Runs</a>
+      </nav>
+    </header>
+
+    <main class="hedge-wrap">
+      <section class="hedge" aria-label="Contradictions, as brambles between the claims they hold apart">
+        <div class="lanes" id="lanes" aria-hidden="true"></div>
+        <div class="hedge-scroll" id="scroll">
+          <svg class="field" id="field" role="img" aria-label="Each contradiction is a bramble between two claims; open ones are taut and thorned, cleared ones hang slack"></svg>
+        </div>
+        <div class="tip" id="tip" hidden></div>
+      </section>
+      <aside class="side" id="side" aria-label="Every contradiction, open first"></aside>
+    </main>
+
+    <footer class="controls" aria-label="Which contradictions, and when">
+      <div class="segmented" role="group" aria-label="Which contradictions">
+        <button type="button" id="all" aria-pressed="true">Open and cleared</button>
+        <button type="button" id="open" aria-pressed="false">Only what's open</button>
+      </div>
+      <div class="life-track" id="track">
+        <canvas id="track-canvas" aria-hidden="true"></canvas>
+        <input type="range" id="asof" min="0" max="1" value="1" step="1" aria-label="As of" disabled />
+      </div>
+      <span class="asof num" id="asof-label"></span>
+      <button type="button" id="now" disabled>Now</button>
+    </footer>
+  </body>
+</html>

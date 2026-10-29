@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="data:," />
+    <title>Runs · Bracken</title>
+    <link rel="stylesheet" href="/visualizer.css" />
+    <link rel="stylesheet" href="/runs.css" />
+    <script src="/common.js" defer></script>
+    <script src="/runs.js" defer></script>
+  </head>
+  <body class="runs-page">
+    <header class="masthead">
+      <h1>Runs <span class="ground-name" id="run-name"></span></h1>
+      <span class="synthetic" id="data-note" role="status">Reading the run…</span>
+      <nav aria-label="Views">
+        <a href="/">Loom</a>
+        <a href="/root.html">Root</a>
+        <a href="/trust.html">Trust</a>
+        <a href="/tension.html">Tension</a>
+        <a href="/runs.html" aria-current="page">Runs</a>
+      </nav>
+    </header>
+
+    <main class="runs-main">
+      <section class="growth" aria-labelledby="growth-title">
+        <h2 class="sc" id="growth-title">How the shared library grew: correct functions at each checkpoint</h2>
+        <div class="plot">
+          <svg class="field" id="field" role="img" aria-labelledby="growth-title"></svg>
+          <div class="tip" id="tip" hidden></div>
+        </div>
+      </section>
+      <section aria-labelledby="ranking-title">
+        <h2 class="sc" id="ranking-title">Ranking measures, from the checkpoints, the same in every mode</h2>
+        <div class="modes" id="ranking"></div>
+      </section>
+      <section aria-labelledby="diagnostics-title">
+        <h2 class="sc" id="diagnostics-title">Per-delivery diagnostics: per mode only, not comparable across modes</h2>
+        <div class="modes diagnostics" id="diagnostics"></div>
+      </section>
+    </main>
+  </body>
+</html>

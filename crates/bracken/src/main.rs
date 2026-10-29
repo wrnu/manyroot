@@ -19,6 +19,7 @@ use serde_json::{Value, json};
 
 mod listing;
 mod remote;
+mod runs;
 mod serve;
 mod terminal;
 mod view;
@@ -286,6 +287,11 @@ enum Command {
         /// non-loopback listener (or the only one). Repeatable. Every other Host is refused.
         #[arg(long = "host", value_name = "NAME")]
         hosts: Vec<String>,
+        /// An experiment run to show on the Runs page, read once and never written: one mode's run
+        /// directory, or a directory of mode runs to compare. Each needs the report.json that
+        /// `bracken-experiment report --json` writes. Served on loopback only.
+        #[arg(long, value_name = "DIR")]
+        runs: Option<PathBuf>,
         /// The policy every status in the view is under.
         #[command(flatten)]
         policy: PolicyArgs,
@@ -587,10 +593,10 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             }
         }
         Command::Status { all, policy, out } => print_status(&s, all, &policy, out.json)?,
-        Command::View { port, bind, hosts, policy } => {
+        Command::View { port, bind, hosts, runs, policy } => {
             // Validators by name from the public agent directory: the view never reads identities.
             let policy = policy.build(&view::public_names(&s)?)?;
-            view::serve(s.dir(), policy, &view::Bind { ips: bind, port, names: hosts })?;
+            view::serve(s.dir(), policy, &view::Bind { ips: bind, port, names: hosts }, runs.as_deref())?;
         }
         Command::Intend { id, duration } => {
             let who = signer(&s, agent)?;

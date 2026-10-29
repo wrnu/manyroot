@@ -85,6 +85,13 @@ a Content-Security-Policy that allows no inline script.
 
 For example: `bracken view --bind 127.0.0.1 --bind 100.74.240.73 --port 7392 --host warren-mbp.jx.rs`.
 
+`bracken view --runs <dir>` adds an experiment run to the view's Runs page: one mode's run directory, or a
+directory of mode runs side by side. It reads each run's `report.json` once, at start, which
+`bracken-experiment report --json <run> > <run>/report.json` writes, after checking it's for the run's
+plan. It shows only that report and the plan's waves, and never serves a file. It looks no deeper than
+the directory's children, refuses every symlink and any home directory, and is refused unless the view
+listens on loopback only.
+
 Moving contributions between replicas:
 
 ```sh

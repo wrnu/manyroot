@@ -247,6 +247,10 @@ fn every_endpoint_is_read_only_and_carries_the_csp() {
         "/root.html".to_owned(),
         "/trust.html".to_owned(),
         "/api/trust".to_owned(),
+        "/tension.html".to_owned(),
+        "/runs.html".to_owned(),
+        "/api/tension".to_owned(),
+        format!("/api/tension?as_of={claim}"),
         "/loom.css".to_owned(),
         "/api/ground".to_owned(),
         "/api/graph".to_owned(),
@@ -383,13 +387,14 @@ fn the_api_has_the_design_shapes() {
     let pass = ok(&dir, &["evidence", art, "pass", "--method", "cargo test", "--as", "val"]);
     let fail = ok(&dir, &["evidence", &rival, "fail", "--method", "review", "--as", "val"]);
     ok(&dir, &["evidence", art, "pass", "--method", "self", "--as", "bob"]);
-    let live = ok(&dir, &["intend", &claim, "--as", "alice"]).lines().next().unwrap().to_owned();
+    let live = ok(&dir, &["intend", &claim, "--as", "alice"]);
+    let (live, live_relation) = live.split_once('\n').unwrap();
     let done = ok(&dir, &["intend", &claim, "--as", "bob"]).lines().next().unwrap().to_owned();
     ok(&dir, &["relate", art, "implements", &claim, "--as", "bob"]);
     let gone = ok(&dir, &["intend", &claim, "--as", "val"]).lines().next().unwrap().to_owned();
     let cut = ok(&dir, &["retract", &gone, "--as", "val"]);
     let refinement = ok(&dir, &["claim", "spec: parse ISO dates", "--as", "val"]);
-    ok(&dir, &["relate", &refinement, "refines", &claim, "--as", "val"]);
+    let refines = ok(&dir, &["relate", &refinement, "refines", &claim, "--as", "val"]);
     let v = view(&dir);
 
     let ground = v.api("/api/ground");
@@ -463,6 +468,10 @@ fn the_api_has_the_design_shapes() {
     let refinements: Vec<&str> =
         root["refinements"].as_array().unwrap().iter().map(|r| r["id"].as_str().unwrap()).collect();
     assert_eq!(refinements, [refinement.as_str()], "intents aren't refinements");
+    // Each carries its refines relation, so a replay stop can bring it in with the claim.
+    assert_eq!(root["refinements"][0]["relation"], refines.as_str());
+    let alice = root["intents"].as_array().unwrap().iter().find(|i| i["author_name"] == "alice").unwrap();
+    assert_eq!(alice["relation"], live_relation);
     assert_eq!(root["rivals"][0]["id"], rival.as_str());
     assert_eq!(root["rivals"][0]["how"], "contradicts");
     assert_eq!(root["rivals"][0]["relation"], contra.as_str());
@@ -471,7 +480,7 @@ fn the_api_has_the_design_shapes() {
 
     let intents = v.api("/api/intents");
     assert_eq!(intents[0]["target"], claim.as_str());
-    assert_eq!(intents[0]["intents"][0]["id"], live.as_str());
+    assert_eq!(intents[0]["intents"][0]["id"], live);
 }
 
 #[test]
@@ -658,7 +667,7 @@ fn every_asset_is_served_with_the_csp() {
     }
     // What the pages and their styles load, so nothing they ask for is missing.
     let mut named: Vec<String> = Vec::new();
-    for page in ["/", "/root.html", "/trust.html"] {
+    for page in ["/", "/root.html", "/trust.html", "/tension.html", "/runs.html"] {
         let page = String::from_utf8(v.get(page).body).unwrap();
         for attr in ["src=\"", "href=\""] {
             for part in page.split(attr).skip(1) {
@@ -666,7 +675,7 @@ fn every_asset_is_served_with_the_csp() {
             }
         }
     }
-    for css in ["/visualizer.css", "/loom.css", "/root.css", "/trust.css"] {
+    for css in ["/visualizer.css", "/loom.css", "/root.css", "/trust.css", "/tension.css", "/runs.css"] {
         let text = String::from_utf8(v.get(css).body).unwrap();
         for part in text.split("url(\"").skip(1) {
             named.push(part.split('"').next().unwrap().to_owned());
@@ -780,6 +789,88 @@ fn trust_agrees_with_show() {
     assert_eq!(have, want);
     assert!(want.values().any(|e| e[0] > e[2]), "the sample has an uncounted pass (bob's own)");
     assert!(want.values().any(|e| e[3] > 0) && want.len() >= 4, "{want:?}");
+}
+
+/// The Tension map's springs and divergences are what `conflicts --json` gives, and every end's
+/// assessment is `show --json`'s: a finding against a pr, its triage pass, the supersession that clears
+/// it, a withdrawn contradiction, and a divergence. As of before the supersession, the first is open.
+#[test]
+fn tension_agrees_with_conflicts_and_show() {
+    let dir = ground();
+    ok(&dir, &["id", "new", "maya"]);
+    let first = |out: String| out.lines().next().unwrap().to_owned();
+    let pr1 = ok(&dir, &["claim", "PR #1 parse @ aaa", "--tag", "pr", "--as", "alice"]);
+    let f1 = ok(&dir, &["claim", "finding: parse drops the last line", "--tag", "finding", "--as", "bob"]);
+    let early = ok(&dir, &["relate", &f1, "contradicts", &pr1, "--as", "bob"]);
+    ok(&dir, &["evidence", &f1, "pass", "--method", "triage", "--as", "maya"]);
+    let pr2 = ok(&dir, &["claim", "PR #1 parse @ bbb", "--tag", "pr", "--as", "alice"]);
+    ok(&dir, &["relate", &pr2, "supersedes", &pr1, "--as", "alice"]);
+    let f2 = ok(&dir, &["claim", "finding: parse is slow", "--tag", "finding", "--as", "val"]);
+    let open = ok(&dir, &["relate", &f2, "contradicts", &pr2, "--as", "val"]);
+    let f3 = ok(&dir, &["claim", "finding: parse panics", "--as", "bob"]);
+    let withdrawn = ok(&dir, &["relate", &f3, "contradicts", &pr2, "--as", "bob"]);
+    ok(&dir, &["retract", &withdrawn, "--as", "bob"]);
+    let t = ok(&dir, &["claim", "the plan", "--as", "maya"]);
+    for who in ["x", "y"] {
+        let s = first(ok(&dir, &["claim", &format!("the plan, {who}"), "--as", "maya"]));
+        ok(&dir, &["relate", &s, "supersedes", &t, "--as", "maya"]);
+    }
+    let v = view(&dir);
+
+    let tension = v.api("/api/tension");
+    let springs = tension["springs"].as_array().unwrap();
+    let by_relation = |id: &str| springs.iter().find(|s| s["relation"] == id).unwrap();
+    let conflicts = json(&dir, &["conflicts", "--json"]);
+    let mut want_open: Vec<&str> = conflicts
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["type"] == "contradiction")
+        .map(|c| c["relation"].as_str().unwrap())
+        .collect();
+    let mut have_open: Vec<&str> =
+        springs.iter().filter(|s| s["open"] == true).map(|s| s["relation"].as_str().unwrap()).collect();
+    want_open.sort();
+    have_open.sort();
+    assert_eq!(have_open, want_open);
+    assert_eq!(have_open, [open.as_str()]);
+    assert_eq!(springs.len(), 3, "every contradicts relation, open or not");
+    for s in springs {
+        for end in ["from", "to"] {
+            let id = s[end]["id"].as_str().unwrap();
+            assert_eq!(s[end]["assessment"], json(&dir, &["show", id, "--json"])["assessment"], "{id}");
+        }
+    }
+    let cleared = by_relation(&early);
+    assert_eq!(cleared["to"]["replaced_by"][0]["id"], pr2.as_str(), "the supersession clears it");
+    let triage = &cleared["from"]["evidence"][0];
+    assert_eq!((triage["method"].as_str(), triage["counted"].as_bool()), (Some("triage"), Some(true)));
+    assert_eq!(by_relation(&withdrawn)["retracted"], true);
+    let divergences: Vec<(Value, Vec<Value>)> = tension["divergences"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| {
+            (d["target"]["id"].clone(), d["successors"].as_array().unwrap().iter().map(|s| s["id"].clone()).collect())
+        })
+        .collect();
+    let want: Vec<(Value, Vec<Value>)> = conflicts
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["type"] == "divergence")
+        .map(|c| (c["target"].clone(), c["successors"].as_array().unwrap().clone()))
+        .collect();
+    assert_eq!((divergences.len(), &divergences), (1, &want));
+
+    // As the replica stood when the first finding's contradiction arrived, it was open.
+    let then = v.api(&format!("/api/tension?as_of={early}"));
+    let springs = then["springs"].as_array().unwrap();
+    assert_eq!(springs.len(), 1);
+    assert_eq!(
+        (springs[0]["open"].as_bool(), springs[0]["to"]["replaced_by"].as_array().map(Vec::len)),
+        (Some(true), Some(0))
+    );
 }
 
 /// A key published under two names shows by the one the CLI picks, so the view and `log --json` agree.
@@ -959,6 +1050,153 @@ fn view_refuses(dir: &Path, args: &[&str]) -> String {
     let out = child.wait_with_output().unwrap();
     assert!(!out.status.success(), "{args:?}");
     String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+fn view_refuses_with(dir: &Path, args: &[&str], vars: &[(&str, &str)]) -> String {
+    let out = Command::new(BIN)
+        .arg("view")
+        .args(args)
+        .envs(vars.iter().copied())
+        .env("BRACKEN_DIR", dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{args:?}");
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// A mock experiment run in `dir`: its plan, an event log that logged it at setup (with a snapshot of
+/// module text the view must never show), and the report `bracken-experiment report --json` would
+/// write. Returns the report's measures.
+fn mock_run(dir: &Path, mode: &str, turns: u32) -> Value {
+    std::fs::create_dir_all(dir).unwrap();
+    let plan =
+        serde_json::json!({"inputs": {"task": "phase2"}, "mode": mode, "agents": 3, "turns": turns, "waves": [2, 4]});
+    let plan = serde_json::to_vec_pretty(&plan).unwrap();
+    std::fs::write(dir.join("plan.json"), &plan).unwrap();
+    let hash = blake3::hash(&plan).to_hex().to_string();
+    let setup =
+        serde_json::json!({"seq": 0, "ms": 1, "agent": null, "event": "setup", "data": {"plan": hash, "mode": mode}});
+    let snapshot = serde_json::json!({"seq": 1, "ms": 2, "agent": null, "event": "checkpoint",
+        "data": {"turn": 1, "modules": [["base", "def never_shown(x): return x"]]}});
+    std::fs::write(dir.join("events.jsonl"), format!("{setup}\n{snapshot}\n")).unwrap();
+    let turns: Vec<Value> = (1..=turns)
+        .map(|t| serde_json::json!({"turn": t, "waves": u32::from(t > 2) + u32::from(t > 4), "correct": t, "standalone": t}))
+        .collect();
+    let measures = serde_json::json!({
+        "mode": mode, "stopped": null, "tokens": 1000, "output_tokens": 100, "snapshots": 4,
+        "checkpoints": {
+            "turns": turns, "correct": 3, "total": 90, "correct_from": {}, "median_turn_correct": 2.5,
+            "recovery": [{"wave": 1, "functions": 3, "checkpoints": 1}, {"wave": 2, "functions": 4, "checkpoints": null}],
+            "breakage": {"after_wave": 1, "other": 0}, "tokens_per_correct": 1.5
+        }
+    });
+    let report = serde_json::json!([{"dir": dir.display().to_string(), "plan": hash, "measures": measures}]);
+    std::fs::write(dir.join("report.json"), report.to_string()).unwrap();
+    measures
+}
+
+/// `--runs` serves each run's report measures and its plan's waves, nothing else: not the run's
+/// directory, not its events, no file. One mode's run, a real run's `run/` directory, or a directory
+/// of mode runs to compare; and without `--runs` there's no run to serve.
+#[test]
+fn runs_show_only_the_report() {
+    let dir = ground();
+    let base = tempfile::tempdir().unwrap().keep();
+    let cmp = base.join("cmp");
+    let want: Vec<Value> = ["bracken", "crdt", "git"].iter().map(|m| mock_run(&cmp.join(m), m, 6)).collect();
+    let (v, _) = view_args(&dir, &["--runs", cmp.to_str().unwrap()], &[]);
+    let r = v.get("/api/runs");
+    let text = String::from_utf8_lossy(&r.body).into_owned();
+    let runs = r.json()["runs"].as_array().unwrap().clone();
+    let measures: Vec<&Value> = runs.iter().map(|r| &r["measures"]).collect();
+    assert_eq!(measures, want.iter().collect::<Vec<_>>());
+    assert!(runs.iter().all(|r| r["waves"] == serde_json::json!([2, 4])));
+    let names: Vec<&str> = runs.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["bracken", "crdt", "git"]);
+    assert!(!text.contains(base.to_str().unwrap()) && !text.contains("never_shown"), "{text}");
+    for raw in ["/plan.json", "/report.json", "/events.jsonl", "/git/report.json"] {
+        assert_eq!(v.request("GET", raw, &format!("127.0.0.1:{}", v.port)).status, 404, "{raw}");
+    }
+    drop(v);
+
+    let (one, _) = view_args(&dir, &["--runs", cmp.join("git").to_str().unwrap()], &[]);
+    assert_eq!(one.api("/api/runs")["runs"].as_array().unwrap().len(), 1);
+    drop(one);
+    let real = base.join("opus-git-20261029T0000Z");
+    let measures = mock_run(&real.join("run"), "git", 3);
+    let (run, _) = view_args(&dir, &["--runs", real.to_str().unwrap()], &[]);
+    let runs = run.api("/api/runs");
+    assert_eq!(runs["runs"][0]["name"], "opus-git-20261029T0000Z");
+    assert_eq!(runs["runs"][0]["measures"], measures);
+    drop(run);
+
+    let none = view(&dir);
+    let r = none.request("GET", "/api/runs", &format!("127.0.0.1:{}", none.port));
+    assert_eq!((r.status, r.json()["error"].as_str()), (404, Some("this view was started without --runs")));
+}
+
+/// `--runs` refuses what it can't show faithfully, before it listens: a run with no report (saying how
+/// to make one), a report for another plan, a plan the run didn't log, a symlink, runs that don't
+/// compare, two runs of one mode, a home directory, nothing to show, and any address off loopback.
+#[test]
+fn runs_refuse_what_they_cant_show() {
+    let dir = ground();
+    let base = tempfile::tempdir().unwrap().keep();
+    let refuses = |runs: &Path, extra: &[&str], vars: &[(&str, &str)], why: &str| {
+        let mut args = vec!["--runs", runs.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        let err = view_refuses_with(&dir, &args, vars);
+        assert!(err.contains(why), "{runs:?} {extra:?}: {err}");
+    };
+    let no_report = base.join("no-report");
+    mock_run(&no_report, "git", 6);
+    std::fs::remove_file(no_report.join("report.json")).unwrap();
+    refuses(&no_report, &[], &[], "bracken-experiment report --json");
+
+    let other_plan = base.join("other-plan");
+    mock_run(&other_plan, "git", 6);
+    std::fs::write(other_plan.join("plan.json"), "{}").unwrap();
+    refuses(&other_plan, &[], &[], "made for another plan");
+
+    let not_logged = base.join("not-logged");
+    mock_run(&not_logged, "git", 6);
+    std::fs::write(not_logged.join("events.jsonl"), "{\"event\":\"setup\",\"data\":{\"plan\":\"0\"}}\n").unwrap();
+    refuses(&not_logged, &[], &[], "isn't the plan the run logged");
+
+    let linked = base.join("linked");
+    mock_run(&linked.join("bracken"), "bracken", 6);
+    std::os::unix::fs::symlink(base.join("other-plan"), linked.join("git")).unwrap();
+    refuses(&linked, &[], &[], "is a symlink");
+    let linked_file = base.join("linked-file");
+    mock_run(&linked_file, "git", 6);
+    std::fs::rename(linked_file.join("report.json"), base.join("elsewhere.json")).unwrap();
+    std::os::unix::fs::symlink(base.join("elsewhere.json"), linked_file.join("report.json")).unwrap();
+    refuses(&linked_file, &[], &[], "is a symlink");
+
+    let unlike = base.join("unlike");
+    mock_run(&unlike.join("bracken"), "bracken", 6);
+    mock_run(&unlike.join("git"), "git", 5);
+    refuses(&unlike, &[], &[], "don't compare");
+    let twice = base.join("twice");
+    mock_run(&twice.join("a"), "git", 6);
+    mock_run(&twice.join("b"), "git", 6);
+    refuses(&twice, &[], &[], "one run per mode");
+
+    let home = base.join("homes").join("someone");
+    std::fs::create_dir_all(&home).unwrap();
+    refuses(&base.join("homes"), &[], &[("HOME", home.to_str().unwrap())], "home directory");
+    refuses(&home, &[], &[("HOME", home.to_str().unwrap())], "home directory");
+    refuses(&base.join("homes"), &[], &[], "holds no experiment run");
+
+    let good = base.join("good");
+    mock_run(&good, "git", 6);
+    for bind in ["10.0.0.1", "192.168.1.10"] {
+        refuses(&good, &["--bind", bind], &[], "loopback only");
+    }
+    // A loopback listener beside one off it is still refused: the run would reach that network too.
+    refuses(&good, &["--bind", "127.0.0.1", "--bind", "100.74.240.73"], &[], "loopback only");
 }
 
 /// `--bind` names exactly one address (decision 917816c72975): never every interface, multicast or

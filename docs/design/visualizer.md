@@ -147,10 +147,10 @@ unique prefix of at least 8 digits; an unknown or ambiguous one is a 404 with
   ],
   "evidence": [ { "...": "evidence on the claim itself, same shape as above" } ],
   "intents": [
-    { "id": "<hex>", "author": "<hex>", "author_name": "bob", "from_ms": 1761680000000,
+    { "id": "<hex>", "relation": "<hex>", "author": "<hex>", "author_name": "bob", "from_ms": 1761680000000,
       "until_ms": 1761683600000, "ended_ms": null, "ended_by": null }
   ],
-  "refinements": [ { "id": "<hex>", "statement": "...", "author_name": "carol", "status": "pending" } ],
+  "refinements": [ { "id": "<hex>", "relation": "<hex>", "statement": "...", "author_name": "carol", "status": "pending" } ],
   "rivals": [
     { "id": "<hex>", "how": "contradicts", "relation": "<hex>", "statement": "...", "author_name": "dave",
       "status": "accepted" },
@@ -167,7 +167,8 @@ unique prefix of at least 8 digits; an unknown or ambiguous one is a 404 with
 - `intents` are every intent that refines the claim, live or not. `ended_by` is `implemented`,
   `retracted` or `expired` (or `null` while live); `ended_ms` is when (the implementing relation's or
   retraction's `timestamp_ms`, or `until_ms`). Intents without a valid `until:` tag aren't intents
-  (README) and don't appear.
+  (README) and don't appear. Intents and refinements carry their `refines` relation's id as
+  `relation`, as rivals do, so a replay stop can bring the relation into its cursor with the claim.
 - `lineage.replaced_by[].counts` is whether that supersession counts (its relation's author wrote this
   claim); one that doesn't still shows, as a seedling that "doesn't count".
 - `rivals`: claims that contradict this one (`how: contradicts`, either direction), and the other
@@ -247,6 +248,71 @@ lock out the other (finding 6e1807aa762f).
   evidence, with what the policy counted gathered into sets first, so it stays linear however much
   evidence one subject draws: about 65 ms on the 50,000 sample, debug build. (Looking each id up in its
   target's lists instead took a second a request when 50,000 passes landed on one claim.)
+
+### 1.9 `GET /api/tension[?as_of=<cursor>]`: contradictions, for the Tension map (step 5)
+
+```json
+{
+  "policy": { "min_passes": 1, "validators": [] },
+  "springs": [
+    { "relation": "<hex>", "seq": 4120, "author": "<hex>", "author_name": "reviewer", "timestamp_ms": 1761690000000,
+      "note": "", "retracted": false, "open": true,
+      "from": { "id": "<hex>", "kind": "claim", "statement": "finding: ...", "author": "<hex>", "author_name": "reviewer",
+                "tags": ["finding"], "seq": 4118, "retracted": false,
+                "assessment": { "status": "accepted", "passes": ["<hex>"], "fails": [], "superseded_by": [] },
+                "evidence": [ { "...": "as in 1.5", "seq": 4125 } ],
+                "replaced_by": [] },
+      "to": { "...": "the same, for the claim it contradicts, e.g. a pr" } }
+  ],
+  "divergences": [ { "target": { "...": "an end" }, "successors": [ { "...": "an end" } ] } ]
+}
+```
+
+- `springs` is every `contradicts` relation, in causal order, whether it's open or not. `open` is whether
+  `conflicts --json` lists it, so the open springs and that command's contradictions are the same set.
+  `retracted` is whether its author withdrew the relation.
+- Each end's `assessment` is `show --json`'s, under the view's policy. `evidence` is the evidence on it,
+  as in 1.5: a finding's triage pass shows there, counted or not. `replaced_by` is what replaces it as
+  `conflicts` counts it: a live successor, by a `supersedes` relation the end's own author wrote and
+  hasn't retracted. Each entry is a short entry (1.5) with its `author`, its `relation` and the
+  relation's `seq`. A contradiction a supersession cleared is the one whose end has a `replaced_by`.
+- `divergences` are `conflicts --json`'s divergences, with their ends in the same shape.
+- `seq` is each id's place in the replica's causal order, which the page lays out and replays by. A
+  test builds a finding against a pr, its triage pass, the supersession that clears it, a withdrawn
+  contradiction and a divergence on a throwaway Ground, and checks the result against `conflicts --json`
+  and `show --json`, and against `?as_of` from before the supersession.
+- `?as_of=<cursor>` answers as the replica stood at that cursor, as in 1.5. At 50,000 the response is
+  1.9 MB and takes 0.7 s on a debug build. A past graph costs what 1.5's does.
+
+### 1.10 `GET /api/runs`: an experiment run, for the Runs page (step 5)
+
+Served only when `bracken view` was started with `--runs <dir>`, and a 404 otherwise.
+
+```json
+{
+  "runs": [
+    { "name": "opus-git-20261029T1200Z", "plan": "<blake3 of plan.json>", "waves": [2, 4],
+      "measures": { "...": "the run's report.json measures, exactly as bracken-experiment report --json wrote them" } }
+  ]
+}
+```
+
+- **What it reads.** `<dir>` is one mode's run (it holds `plan.json`, or `run/plan.json` as
+  `bracken-experiment run --dir` lays it out) or a directory whose children are mode runs, one per mode.
+  Nothing deeper is read. Each run needs the `report.json` that `bracken-experiment report --json <run>
+  > <run>/report.json` writes, and the view refuses a run without one, saying how to make it. It reads
+  everything once, at start, and never again. `--runs` takes an explicit path only.
+- **What it checks.** The report's plan hash must be the blake3 of `plan.json`, and the run must have
+  logged that same hash at setup: the first line of `events.jsonl`, and no more of that file is read. Runs
+  compared side by side must share task, agents, turns and waves, with one run per mode.
+- **What it serves.** Only each report's `measures`, the plan's `waves`, the plan hash, and each run's
+  directory name. It never serves the report's `dir` or any other path, the event log (whose snapshots
+  hold module text), usage, transcripts or prompts, and it never serves a file.
+- **What it refuses.** A symlink anywhere it reads (the given directory's children, `run/` and the
+  files): the given directory itself is canonicalized. A home directory, or one that holds a home
+  directory. A view that would also listen off loopback: with `--bind`, `--runs` is refused unless every
+  address is loopback, so run data never reaches the NetBird view by accident. Every refusal happens
+  before it listens. Tests cover each one, on mock runs.
 
 ## 2. The direction: soil and specimen
 
@@ -499,7 +565,9 @@ in the Loom opens it with **Follow this claim's life**, and **Show in the Loom**
   stop show something that hadn't happened. The story beside the stage, and the knots on the track, are
   told from the same response as the stage. The steps after the one shown follow, faded, saying only
   what happened, so no later status shows as if it were past. A cursor that would hold more than 200
-  ids keeps the claim and the latest ones, so a request head stays small. Retractions and supersedes relations have no ids in
+  ids keeps the claim and the latest ones, so a request head stays small. An intent's and a
+  refinement's stop brings in its `refines` relation with it (step 5: finding ff653198909b and the
+  missing intent line), so that stop shows its own line. Retractions and supersedes relations have no ids in
   `/api/root`, so they aren't stops of their own; the last stop, now, shows them. Replay fetches one
   stop ahead. A past graph takes about 1.3 s to build at 50,000 on a release build, and 9 to 46 s on a
   debug one.
@@ -539,6 +607,74 @@ in the Loom opens it with **Follow this claim's life**, and **Show in the Loom**
 
 ![The sample's Trust constellation, with a self-check (Herbarium)](visualizer/shots/view-trust-herbarium.webp)
 
+### 3.5 The Tension map (step 5)
+
+`/tension.html` shows contradictions as brambles in a hedgerow.
+
+- **The form.** Each agent is a row, and each claim a knot in its author's row, in causal order from left
+  to right. A contradiction is a bramble cane between the two claims it holds apart. While it's open it's
+  taut, in the rejected colour, arched and thorned. Once something clears it, it hangs slack and dashed:
+  a green shoot runs from the end that was replaced to its replacement, or the retracted end carries its
+  cut. A contradiction its author withdrew is fainter and dotted. An open divergence is an amber bramble
+  between the competing replacements, with a shoot from the claim they all replace. Each end's evidence
+  hangs over it as spores, so a finding's triage pass shows there. Counted spores are solid and
+  uncounted ones faint.
+- **As the CLI gives them.** The open brambles are exactly `conflicts --json`'s contradictions, and every
+  status is `show --json`'s. A browser check at 1,000 and 50,000 compares the counts with `conflicts
+  --json`, and the chosen spring's ends with `show --json`.
+- **Choosing one.** Clicking a bramble, a knot or a row in the side list names both ends on the map and
+  shows them as specimen labels in the side panel: status, counted passes and fails, every piece of
+  evidence (counted, not counted or retracted), what replaced it, and buttons to its Root view or the
+  Loom. A toggle shows only what's open.
+- **Replay.** The stops are each contradiction (with both its ends), each piece of evidence on an end,
+  and each replacement (with its relation), in causal order. Stop k reads
+  `/api/tension?as_of=<everything up to stop k>`, so every status, every open or cleared state, and
+  which brambles exist at all are the server's answer as of then. The map keeps its layout from now, so
+  nothing moves as you scrub, and a bramble not yet written isn't drawn. A cursor keeps the latest 200
+  ids. On a Ground whose writers build on its heads, as `scripts/bk` does, their causal pasts hold
+  everything before. Replay fetches one stop ahead. At 50,000 a stop took 28 to 46 s on a debug build.
+- **At full scale.** The team's Ground has 280 contradictions, 28 of them open. `cargo run --example
+  sample-ground` now writes prs and findings too: a finding contradicts another agent's recent pr, the
+  pr's author usually replaces it, and now and then twice over, which leaves a divergence. Its 50,000
+  has 859 contradictions, 96 of them open, and 10 open divergences. (This changes the sample's shape at
+  every size, so step 3's measurements in 3.1 were taken on the earlier sample.) The hedge is at least
+  18 px a knot, scrolls sideways and opens at the latest work. Its rows stay named at the left.
+- **Why brambles and not springs.** The brief's first thought was springs. A cane that's taut while
+  the contradiction holds and slack once it's cleared is the same idea in this world's material, and
+  thorns read as "unresolved" without a legend.
+
+| 1,000 | 50,000 | 50,000, one chosen |
+|---|---|---|
+| ![](visualizer/shots/view-tension-1000.webp) | ![](visualizer/shots/view-tension-50000.webp) | ![](visualizer/shots/view-tension-50000-chosen.webp) |
+
+| 1,000, replayed to the middle | 50,000 (Herbarium) |
+|---|---|
+| ![](visualizer/shots/view-tension-replay.webp) | ![](visualizer/shots/view-tension-herbarium.webp) |
+
+### 3.6 Runs: an experiment as a growth view (step 5)
+
+`/runs.html` shows the run `bracken view --runs <dir>` was given (1.10). For each mode it shows how the
+shared library grew.
+
+- **Growth.** Each mode is a stem climbing with its correct functions at each checkpoint, the end of a
+  turn index (decision 288a16ce8cb2). A leaf marks each checkpoint, and a nick marks one where the count
+  fell. Each wave of spec changes is a dashed line across every stem, before the first checkpoint that
+  counts it. The stems are nudged a few pixels apart so equal counts stay visible, and each is named at
+  its end with its final correct count. Bracken is frond, git forget-me-not and crdt heather, none of
+  them a status colour. Hovering a leaf gives that checkpoint's library and standalone counts and its
+  waves.
+- **Side by side.** The ranking measures (final correct, median turn to correct, recovery per wave,
+  breakage after a wave and otherwise, tokens per correct function) sit in one column per mode. The
+  per-delivery diagnostics come under their own heading, "per mode only, not comparable across modes",
+  in quieter cards. Every value is formatted as `bracken-experiment report` formats it. A browser check
+  compares all 75 cells of a three-mode mock run with that command's table, and they agree.
+- **Nothing more.** The page shows only the report and the plan's waves. A Phase 1 run has no
+  checkpoints, and the page says so rather than ranking it.
+
+![A three-mode mock run](visualizer/shots/view-runs.webp)
+
+![The same run (Herbarium)](visualizer/shots/view-runs-herbarium.webp)
+
 ### 3.3 The language sheet ([visualizer/language.html](visualizer/language.html))
 
 The language sheet shows the knots and their states, both palettes, the type and the rules for motion and
@@ -569,8 +705,8 @@ scale. It's drawn by the same code and tokens as the views.
   Done in step 3: see section 3.1.
 - **Open choices for later steps:**
   - colour for more than twelve agents (today the inks repeat);
-  - where the Tension map sits in this world. A first thought: brambles at full scale for
-    contradictions. (The Trust constellation is done in step 4: pollinators between flowers, section 3.4.)
+  - (done) the Trust constellation is pollinators between flowers (step 4, section 3.4), and the Tension
+    map is brambles in a hedgerow (step 5, section 3.5).
 
 ## 6. How the mockups were made
 
