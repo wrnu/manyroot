@@ -425,8 +425,9 @@ fn evidence_run_records_the_commands_result() {
     assert_eq!(b["details"], "exit 0\nall 7 passed");
     assert!(String::from_utf8_lossy(&pass.stderr).contains("all 7 passed"), "the output shows as it runs");
 
-    // A failure, with more output than the tail keeps and control characters in it.
-    let script = "for i in $(seq 1 100); do echo line $i; done; printf '\\033[2Kbad\\r\\n' >&2; exit 3";
+    // A failure, with more output than the tail keeps and control characters in it. Both streams go to one
+    // pipe here: from two, their order in the tail is a race (note `4a2c53c065a9`).
+    let script = "exec 2>&1; for i in $(seq 1 100); do echo line $i; done; printf '\\033[2Kbad\\r\\n' >&2; exit 3";
     let fail = run(&["evidence", &c, "--run", "--as", "val", "--", "sh", "-c", script]);
     assert_eq!(fail.status.code(), Some(3), "the command's exit code passes through");
     let b = body(&fail);
@@ -434,6 +435,9 @@ fn evidence_run_records_the_commands_result() {
     assert_eq!(b["verdict"], "fail");
     assert!(details.starts_with("exit 3\n") && details.ends_with("line 100\n[2Kbad"), "{details}");
     assert_eq!(details.lines().count(), 41, "the exit and the last 40 lines: {details}");
+    // What the command writes to stderr is kept too.
+    let err_only = run(&["evidence", &c, "--run", "--as", "val", "--", "sh", "-c", "echo oops >&2; exit 1"]);
+    assert_eq!(body(&err_only)["details"], "exit 1\noops");
 
     // Both streams go into the details in the order the command wrote them (note 4a2c53c065a9).
     let script = "for i in $(seq 1 20); do echo out $i; echo err $i >&2; done";
@@ -627,7 +631,7 @@ fn status_shows_what_implements_each_claim_and_what_is_waiting() {
         oks.push(a);
     }
 
-    let text = bracken(dir, &["status"]);
+    let text = bracken(dir, &["status", "--full"]);
     let lines: Vec<&str> = text.lines().collect();
     let at = |id: &str| lines.iter().position(|l| l.contains(&id[..12])).unwrap_or_else(|| panic!("{id}: {text}"));
     assert!(at(&busy) < at(&done), "the claim with something waiting comes first:\n{text}");
@@ -638,13 +642,13 @@ fn status_shows_what_implements_each_claim_and_what_is_waiting() {
     for hidden in [&dropped, &old, &idle] {
         assert!(!text.contains(&hidden[..12]), "{hidden} listed:\n{text}");
     }
-    let all = bracken(dir, &["status", "--all"]);
+    let all = bracken(dir, &["status", "--all", "--full"]);
     let tail = all.split("nothing implements, or intends to:").nth(1).unwrap_or_else(|| panic!("{all}"));
     assert!(tail.contains(&idle[..12]) && tail.contains("spec: new") && !tail.contains(&busy[..12]), "{all}");
     // A stricter policy: nothing has two passes, so all waits. A second pass by the same validator is
     // still one independent pass.
     pass(&accepted);
-    let strict = bracken(dir, &["status", "--min-passes", "2"]);
+    let strict = bracken(dir, &["status", "--min-passes", "2", "--full"]);
     assert!(!strict.contains("accepted ") && strict.contains("1/2 passes") && !strict.contains("2/2"), "{strict}");
     let accepted_row = strict.lines().find(|l| l.contains(&accepted[..12])).unwrap();
     assert!(accepted_row.trim_start().starts_with("waiting") && accepted_row.contains("1/2 passes"), "{strict}");
@@ -738,7 +742,7 @@ fn status_escapes_control_characters_in_what_it_prints() {
     std::fs::write(dir.join("f"), "x").unwrap();
     bracken(dir, &["artifact", "f", "--name", "impl\u{1b}]0;title\u{7}.rs", "--implements", &spec, "--as", "mallory"]);
 
-    let text = bracken(dir, &["status", "--all"]);
+    let text = bracken(dir, &["status", "--all", "--full"]) + "\n" + &bracken(dir, &["status", "--all"]);
     for (n, line) in text.lines().enumerate() {
         let bad: Vec<char> = line.chars().filter(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')).collect();
         assert!(bad.is_empty(), "line {n} holds {bad:?}:\n{text}");
@@ -749,8 +753,9 @@ fn status_escapes_control_characters_in_what_it_prints() {
     );
     assert!(text.contains("t\\u{1b}[31m") && text.contains("impl\\u{1b}]0;title\\u{7}.rs"), "{text}");
     assert!(text.contains(&idle[..12]) && text.contains("idle\\u{2028}spec"), "{text}");
-    // One line for the claim, one for its implementer, then the "nothing implements" section.
-    assert_eq!(text.lines().filter(|l| !l.is_empty()).count(), 4, "{text}");
+    // --full: one line for the claim, one for its implementer, then the "nothing implements" section;
+    // compact: one line for the implementer, then that section.
+    assert_eq!(text.lines().filter(|l| !l.is_empty()).count(), 4 + 3, "{text}");
 
     let v = json(dir, &["status", "--json"]);
     assert_eq!(v["claims"][0]["claim"]["body"]["statement"], forged);
@@ -770,7 +775,7 @@ fn log_since_a_cursor_prints_only_what_is_new_and_the_next_cursor() {
     let first = bracken(&laptop, &["claim", "first", "--as", "alice"]);
     // The text form ends with the cursor; everything before it is the log.
     let since = |dir: &Path, cursor: &str, also: &[&str]| {
-        let out = bracken(dir, &[&["log", "--since", cursor][..], also].concat());
+        let out = bracken(dir, &[&["log", "--full", "--since", cursor][..], also].concat());
         let (rows, last) = out.rsplit_once('\n').map_or(("", out.as_str()), |(r, l)| (r, l));
         let cursor = last.strip_prefix("cursor: ").unwrap_or_else(|| panic!("no cursor after: {out}")).to_owned();
         let ids: Vec<String> = rows.lines().map(|l| l.split_whitespace().next().unwrap().to_owned()).collect();
@@ -928,7 +933,7 @@ fn compact_lines_stay_short_and_limit_keeps_the_cursor() {
     let v = json(dir, &["log", "--limit", "2", "--json"]);
     assert_eq!((v["contributions"].as_array().unwrap().len(), v["omitted"].as_u64()), (2, Some(298)));
     let next = bracken(dir, &["claim", "the next one", "--as", "alice"]);
-    let out = bracken(dir, &["log", "--since", &cursor, "--limit", "5"]);
+    let out = bracken(dir, &["log", "--since", &cursor, "--limit", "5", "--full"]);
     assert_eq!(out.lines().count(), 2, "{out}");
     assert!(out.starts_with(&next[..12]) && out.ends_with(&format!("cursor: {next}")), "{out}");
 }
@@ -1053,7 +1058,7 @@ fn intents_show_who_is_working_on_a_claim_until_they_expire_or_deliver() {
     assert!(until >= before + 29 * 60_000 && until <= now_ms() + 30 * 60_000, "{until}");
     assert!(intents[0]["until"].as_str().unwrap().ends_with('Z') && intents[0]["age_ms"].as_u64().is_some());
 
-    let text = bracken(dir, &["status"]);
+    let text = bracken(dir, &["status", "--full"]);
     let row = text.lines().find(|l| l.contains(&alice[..12])).unwrap_or_else(|| panic!("{text}"));
     assert!(row.trim_start().starts_with("intent") && row.contains("alice") && row.contains("until "), "{row}");
     for gone in [&old, &carol, &mallory, &dave] {
@@ -1122,8 +1127,10 @@ fn delivery_and_intent_shape_are_the_authors_own() {
     bracken(dir, &["relate", &daves, "implements", &spec, "--as", "carol"]);
     bracken(dir, &["retract", &daves, "--as", "dave"]);
     assert_eq!(live(dir), ["bob"], "someone else's retraction revived carol's intent");
-    let text = bracken(dir, &["status"]);
+    let text = bracken(dir, &["status", "--full"]);
     assert!(text.lines().filter(|l| l.trim_start().starts_with("intent")).count() == 1, "{text}");
+    let compact = bracken(dir, &["status"]);
+    assert!(compact.lines().filter(|l| l.starts_with("intent ")).count() == 1, "{compact}");
 
     // Tagged intent but not an intent: no expiry; an expiry but no refines; refines by someone else.
     let no_until = bracken(dir, &["claim", "intent: someday", "--tag", "intent", "--as", "erin"]);
@@ -1209,4 +1216,244 @@ fn show_conflicts_and_accepted_escape_other_agents_text() {
 
     let v = json(dir, &["show", &a, "--json"]);
     assert_eq!(v["body"]["statement"].as_str(), Some(hostile("a").as_str()), "--json keeps the text");
+}
+
+/// `status` is a review queue: what needs an independent pass first, oldest first, then blocked work,
+/// rejected work, and accepted work last, one short line each. A fail that names what it needs with
+/// `evidence --depends-on` shows its work blocked while any of that is unaccepted, then ready. Nothing
+/// here is code: every piece of work is a claim that implements another.
+#[test]
+fn status_is_a_review_queue_with_blocked_and_ready_work() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "queue"]);
+    for who in ["alice", "bob", "carol"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let goal = |text: &str| bracken(dir, &["claim", text, "--as", "alice"]);
+    let answer = |text: &str, to: &str, who: &str| {
+        let id = bracken(dir, &["claim", text, "--as", who]);
+        bracken(dir, &["relate", &id, "implements", to, "--as", who]);
+        id
+    };
+    let verdict = |id: &str, v: &str, who: &str, needs: &[&str]| {
+        let mut args = vec!["evidence", id, v, "--method", "read it", "--as", who];
+        for n in needs {
+            args.extend(["--depends-on", n]);
+        }
+        bracken(dir, &args)
+    };
+    let (g1, g2, g3, g4) = (goal("goal one"), goal("goal two"), goal("goal three"), goal("goal four"));
+    let accepted = answer("accepted answer", &g1, "bob");
+    verdict(&accepted, "pass", "carol", &[]);
+    let old = answer("older waiting answer", &g2, "bob");
+    let rejected = answer("rejected answer", &g3, "bob");
+    verdict(&rejected, "fail", "carol", &[]);
+    let base = answer("the base it needs", &g4, "carol");
+    let blocked = answer("blocked answer", &g3, "carol");
+    let out = verdict(&blocked, "fail", "bob", &[&base]);
+    assert_eq!(out.lines().count(), 2, "the evidence, then its depends_on relation: {out}");
+    let new = answer("newer waiting answer", &g2, "carol");
+
+    let order = |text: &str, ids: &[&str]| -> Vec<usize> {
+        ids.iter()
+            .map(|id| text.lines().position(|l| l.contains(&id[..8])).unwrap_or_else(|| panic!("{id}: {text}")))
+            .collect()
+    };
+    let text = bracken(dir, &["status"]);
+    // base and old/new wait; then blocked, rejected, accepted.
+    let at = order(&text, &[&old, &base, &new, &blocked, &rejected, &accepted]);
+    assert!(at.windows(2).all(|w| w[0] < w[1]), "queue order {at:?}:\n{text}");
+    let row = |id: &str| text.lines().find(|l| l.contains(&id[..8])).unwrap().to_owned();
+    assert!(row(&old).starts_with("waiting ") && row(&accepted).starts_with("accepted "), "{text}");
+    assert!(row(&rejected).starts_with("rejected "), "{text}");
+    assert!(
+        row(&blocked).starts_with("blocked ") && row(&blocked).contains(&format!("needs {}", &base[..8])),
+        "{text}"
+    );
+    assert!(text.lines().all(|l| l.chars().count() <= 200 && !l.contains("passes")), "short, no pass counts:\n{text}");
+
+    // Once what it needs is accepted, the blocked work is ready, and waits for a pass again.
+    verdict(&base, "pass", "alice", &[]);
+    let text = bracken(dir, &["status"]);
+    let ready = text.lines().find(|l| l.contains(&blocked[..8])).unwrap();
+    assert!(ready.starts_with("ready "), "{text}");
+    assert!(order(&text, &[&blocked, &rejected])[0] < order(&text, &[&rejected])[0], "{text}");
+    let v = json(dir, &["status", "--json"]);
+    let row = v["claims"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|c| c["implemented_by"].as_array().unwrap())
+        .find(|i| i["id"] == blocked.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!((row["standing"].as_str(), row["blocked_on"].as_array().unwrap().len()), (Some("ready"), 0));
+    assert_eq!(v["queue"][0]["work"], old.as_str(), "the queue starts with the oldest waiting work");
+
+    // --limit bounds the lines and says how many more; --full is each claim with everything.
+    let short = bracken(dir, &["status", "--limit", "2"]);
+    assert_eq!(short.lines().count(), 3, "{short}");
+    assert!(short.ends_with("more: status --limit <N>, or status --full"), "{short}");
+    assert!(bracken(dir, &["status", "--full"]).contains("1/1 passes"));
+
+    // --depends-on goes with a fail, and a bad id writes nothing.
+    let before = bracken(dir, &["log", "--json"]);
+    let err = bracken_fails(dir, &["evidence", &new, "pass", "--method", "m", "--depends-on", &base, "--as", "bob"]);
+    assert!(err.contains("goes with a fail"), "{err}");
+    // A run's verdict isn't known before it runs, so --depends-on doesn't go with --run.
+    let err = bracken_fails(dir, &["evidence", &new, "--run", "--depends-on", &base, "--as", "bob", "--", "false"]);
+    assert!(err.contains("cannot be used with"), "{err}");
+    let err =
+        bracken_fails(dir, &["evidence", &new, "fail", "--method", "m", "--depends-on", "ffffffffffff", "--as", "bob"]);
+    assert!(err.contains("no matching contribution"), "{err}");
+    assert_eq!(bracken(dir, &["log", "--json"]), before, "a refused evidence wrote something");
+}
+
+/// With --as, `status` and `log --since` are personal: your work, contradictions of your claims and
+/// the work waiting for your pass come first. Work you already passed isn't waiting for you.
+#[test]
+fn status_and_log_since_put_what_concerns_the_caller_first() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "personal"]);
+    for who in ["alice", "bob", "carol"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let goal = bracken(dir, &["claim", "a goal", "--as", "alice"]);
+    let answer = |text: &str, who: &str| {
+        let id = bracken(dir, &["claim", text, "--as", who]);
+        bracken(dir, &["relate", &id, "implements", &goal, "--as", who]);
+        id
+    };
+    let bobs = answer("bob's answer", "bob");
+    let carols = answer("carol's answer", "carol");
+    let passed = answer("carol's other answer", "carol");
+    bracken(dir, &["evidence", &passed, "pass", "--method", "m", "--as", "bob"]);
+    let cursor = json(dir, &["log", "--since", "", "--json"])["cursor"].as_str().unwrap().to_owned();
+    let objection = bracken(dir, &["claim", "that's wrong", "--as", "carol"]);
+    bracken(dir, &["relate", &objection, "contradicts", &bobs, "--as", "carol"]);
+    let verdict = bracken(dir, &["evidence", &bobs, "fail", "--method", "m", "--as", "carol"]);
+    bracken(dir, &["claim", "unrelated chatter", "--as", "alice"]);
+
+    let text = bracken(dir, &["status", "--as", "bob"]);
+    let at = |title: &str| text.lines().position(|l| l == title).unwrap_or_else(|| panic!("{title}:\n{text}"));
+    let line_of = |id: &str| text.lines().position(|l| l.contains(&id[..8])).unwrap_or_else(|| panic!("{id}:\n{text}"));
+    assert!(at("yours:") < line_of(&bobs) && line_of(&bobs) < at("contradicting your claims:"), "{text}");
+    assert!(at("contradicting your claims:") < at("waiting for your pass:"), "{text}");
+    assert!(at("waiting for your pass:") < line_of(&carols) && line_of(&carols) < at("everything else:"), "{text}");
+    assert!(at("everything else:") < line_of(&passed), "work bob passed isn't waiting for him:\n{text}");
+    let v = json(dir, &["status", "--as", "bob", "--json"]);
+    assert_eq!(v["for_your_pass"][0]["work"], carols.as_str());
+    assert_eq!(v["contradictions_of_yours"].as_array().unwrap().len(), 1);
+    // Without a caller, one queue; with an unknown one, it says so.
+    assert!(!bracken(dir, &["status"]).contains("yours:"));
+    assert!(bracken(dir, &["status", "--as", "nobody"]).starts_with("not personal: nobody is unknown here"));
+
+    // log --since: what concerns bob (carol's verdict on his work, her contradiction) first.
+    let news = bracken(dir, &["log", "--since", &cursor, "--as", "bob"]);
+    let lines: Vec<&str> = news.lines().collect();
+    assert_eq!(lines[0], "for you:", "{news}");
+    let pos =
+        |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}:\n{news}"));
+    assert!(
+        pos(&verdict[..8]) < pos("everything else:") && pos("everything else:") < pos("unrelated chatter"),
+        "{news}"
+    );
+    assert!(lines.iter().all(|l| l.chars().count() <= 200), "compact by default:\n{news}");
+    let v = json(dir, &["log", "--since", &cursor, "--as", "bob", "--json"]);
+    let for_you: Vec<&str> = v["for_you"].as_array().unwrap().iter().map(|i| i.as_str().unwrap()).collect();
+    assert!(for_you.contains(&verdict.as_str()) && for_you.len() == 2, "{v}");
+    let ids: Vec<&str> = v["contributions"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(ids.len(), 4, "the JSON keeps every row, in causal order: {v}");
+}
+
+/// Finding `10447f6d7e9f`: only each validator's latest fail decides blocked or ready. An earlier plain
+/// fail doesn't keep the work rejected, and an earlier fail's need that was since replaced doesn't keep it
+/// blocked. A need that can never be accepted is refused.
+#[test]
+fn only_each_validators_latest_fail_decides_blocked_or_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "latest"]);
+    for who in ["alice", "bob", "carol"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let goal = bracken(dir, &["claim", "a goal", "--as", "alice"]);
+    let answer = |text: &str, who: &str| {
+        let id = bracken(dir, &["claim", text, "--as", who]);
+        bracken(dir, &["relate", &id, "implements", &goal, "--as", who]);
+        id
+    };
+    let fail = |id: &str, needs: &[&str]| {
+        let mut args = vec!["evidence", id, "fail", "--method", "read it", "--as", "bob"];
+        for n in needs {
+            args.extend(["--depends-on", n]);
+        }
+        bracken(dir, &args)
+    };
+    let standing = |id: &str| {
+        let text = bracken(dir, &["status"]);
+        text.lines().find(|l| l.contains(&id[..8])).unwrap_or_else(|| panic!("{id}:\n{text}")).to_owned()
+    };
+
+    // 1: a plain fail, then a fail naming what it needs; once that's accepted, ready.
+    let w1 = answer("first work", "alice");
+    let x = answer("what it needs", "carol");
+    fail(&w1, &[]);
+    fail(&w1, &[&x]);
+    bracken(dir, &["evidence", &x, "pass", "--method", "m", "--as", "alice"]);
+    assert!(standing(&w1).starts_with("ready "), "{}", standing(&w1));
+
+    // 2: a fail naming x1; x1 is replaced by x2, never accepted; a fail naming x2; x2 accepted: ready.
+    let w2 = answer("second work", "alice");
+    let x1 = answer("a first need", "carol");
+    fail(&w2, &[&x1]);
+    let x2 = bracken(dir, &["claim", "its replacement", "--supersedes", &x1, "--as", "carol"]);
+    let x2 = x2.lines().next().unwrap();
+    bracken(dir, &["relate", x2, "implements", &goal, "--as", "carol"]);
+    fail(&w2, &[x2]);
+    assert!(standing(&w2).starts_with("blocked ") && standing(&w2).contains(&x2[..8]), "{}", standing(&w2));
+    assert!(!standing(&w2).contains(&x1[..8]), "the replaced need: {}", standing(&w2));
+    bracken(dir, &["evidence", x2, "pass", "--method", "m", "--as", "alice"]);
+    assert!(standing(&w2).starts_with("ready "), "{}", standing(&w2));
+
+    // A relation or an evidence can never be accepted: refused, and nothing written.
+    let relation = bracken(dir, &["relate", &x, "supports", &goal, "--as", "carol"]);
+    let before = bracken(dir, &["log", "--json"]);
+    let err = bracken_fails(dir, &["evidence", &w1, "fail", "--method", "m", "--depends-on", &relation, "--as", "bob"]);
+    assert!(err.contains("only a claim or an artifact"), "{err}");
+    assert_eq!(bracken(dir, &["log", "--json"]), before);
+}
+
+/// Finding `d987014caf64`: what a fail needs is met by something accepted that implements it only by a
+/// relation its own author or the need's author wrote. A stranger's relation leaves the work blocked.
+#[test]
+fn a_strangers_implements_doesnt_make_blocked_work_ready() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "stranger"]);
+    for who in ["builder", "reviewer", "other", "stranger"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let task = bracken(dir, &["claim", "a task", "--as", "other"]);
+    let work = bracken(dir, &["claim", "the work", "--as", "builder"]);
+    bracken(dir, &["relate", &work, "implements", &task, "--as", "builder"]);
+    let need = bracken(dir, &["claim", "what it needs", "--as", "other"]);
+    let x = bracken(dir, &["claim", "unrelated, accepted", "--as", "other"]);
+    let policy = ["--validator", "reviewer"];
+    bracken(dir, &["evidence", &x, "pass", "--method", "m", "--as", "reviewer"]);
+    bracken(dir, &["evidence", &work, "fail", "--method", "m", "--depends-on", &need, "--as", "reviewer"]);
+    let line = || {
+        let mut args = vec!["status"];
+        args.extend(policy);
+        let text = bracken(dir, &args);
+        text.lines().find(|l| l.contains(&work[..8])).unwrap_or_else(|| panic!("{text}")).to_owned()
+    };
+    assert!(line().starts_with("blocked "), "{}", line());
+    bracken(dir, &["relate", &x, "implements", &need, "--as", "stranger"]);
+    assert!(line().starts_with("blocked "), "a stranger's relation: {}", line());
+    // The need's own author relating it does count.
+    bracken(dir, &["relate", &x, "implements", &need, "--as", "other"]);
+    assert!(line().starts_with("ready "), "{}", line());
 }

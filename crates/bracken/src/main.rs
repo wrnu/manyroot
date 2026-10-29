@@ -134,6 +134,14 @@ enum Command {
         /// line. Process substitution (`<(...)`) is a pipe, not a regular file: pipe into "-" instead.
         #[arg(long, value_name = "PATH", conflicts_with_all = ["details", "run"])]
         details_file: Option<PathBuf>,
+        /// With a fail: what it needs that isn't accepted yet, recorded as a `depends_on` relation from
+        /// the evidence to each. `status` shows the target blocked until all of them are accepted (or
+        /// something that implements them is, by a relation its own author or theirs wrote), then
+        /// ready. Only each validator's latest fail counts for this. Each must be a claim or an
+        /// artifact. Ready work isn't accepted: the fail still counts until its author retracts it.
+        /// Repeatable.
+        #[arg(long = "depends-on", value_name = "ID", conflicts_with = "run")]
+        depends_on: Vec<String>,
         /// Run the command given after `--` (no shell, in this directory, with no input), its output
         /// shown on stderr, and record pass if it exits 0, else fail. The method is the command line, and
         /// the details are its exit and the last 40 lines (at most 8000 bytes) of its output, which
@@ -178,8 +186,12 @@ enum Command {
         /// One short line each, at most 200 characters (counted as chars, not display columns): the
         /// shortest unique id prefix (at least 8 digits), author, kind and tags, and the statement or name
         /// cut to one line. Control characters print as escapes such as \u{1b}, as in every log line.
-        #[arg(long, conflicts_with = "json")]
+        /// The default with --since.
+        #[arg(long, conflicts_with_all = ["json", "full"])]
         compact: bool,
+        /// With --since: full lines, as without it.
+        #[arg(long, conflicts_with = "json", requires = "since")]
+        full: bool,
         #[command(flatten)]
         out: Output,
     },
@@ -222,13 +234,20 @@ enum Command {
         #[arg(long = "for", value_name = "DURATION", default_value = "1h", value_parser = humantime::parse_duration)]
         duration: std::time::Duration,
     },
-    /// For each current claim that something implements or intends to, what does: which one the
-    /// policy accepts, which are still waiting for an independent pass (listed first), and the live
-    /// intents.
+    /// The review queue: one line for each piece of work that implements a current claim, what
+    /// needs an independent pass first (oldest first), then what is blocked on unaccepted work, and
+    /// accepted work last. With --as (or BRACKEN_AGENT), personal: your own work, contradictions of
+    /// your claims and the work waiting for your pass come first.
     Status {
         /// Also list the current claims that nothing implements, at the end.
         #[arg(long)]
         all: bool,
+        /// Each claim with all its implementations, pass counts and live intents, unbounded.
+        #[arg(long, conflicts_with = "json")]
+        full: bool,
+        /// The most lines the queue prints; it says how many more there are.
+        #[arg(long, value_name = "N", default_value_t = 40)]
+        limit: usize,
         #[command(flatten)]
         policy: PolicyArgs,
         #[command(flatten)]
@@ -462,7 +481,7 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let (from, to) = (resolve(&s, &from)?, resolve(&s, &to)?);
             println!("{}", contribute(&mut s, &who, Body::Relation { from, kind, to, note })?);
         }
-        Command::Evidence { target, verdict, method, details, details_file, run, command } => {
+        Command::Evidence { target, verdict, method, details, details_file, run, command, depends_on } => {
             // Everything after `--` is one list to clap. With --run it's the command. Without, it's the
             // target and verdict, so values that look like options can't be read as options there.
             let (target, verdict, command) = if run {
@@ -482,6 +501,9 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 ensure!(words.next().is_none(), "a command after -- runs only with --run; nothing recorded");
                 (target, Some(verdict), Vec::new())
             };
+            if !depends_on.is_empty() && verdict != Some(Verdict::Fail) {
+                bail!("--depends-on goes with a fail: it says what the fail needs that isn't accepted yet");
+            }
             let who = signer(&s, agent)?;
             let target = resolve(&s, &target)?;
             if run {
@@ -504,14 +526,42 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             };
             let verdict = verdict.expect("set above without --run");
             let method = method.context("how was it checked? give --method, or use --run")?;
-            println!("{}", contribute(&mut s, &who, Body::Evidence { target, verdict, method, details })?);
+            // Every id resolves before anything is written, so a bad one writes nothing.
+            let mut needs: Vec<ContributionId> = depends_on.iter().map(|d| resolve(&s, d)).collect::<Result<_>>()?;
+            needs.sort();
+            needs.dedup();
+            for n in &needs {
+                let subject = s.graph().get(n).is_some_and(|c| c.body().is_subject());
+                ensure!(
+                    subject,
+                    "--depends-on {}: only a claim or an artifact can be accepted; nothing recorded",
+                    n.short()
+                );
+            }
+            let evidence = contribute(&mut s, &who, Body::Evidence { target, verdict, method, details })?;
+            println!("{evidence}");
+            for (i, &to) in needs.iter().enumerate() {
+                let body = Body::Relation { from: evidence, kind: RelationKind::DependsOn, to, note: String::new() };
+                match contribute(&mut s, &who, body) {
+                    Ok(id) => println!("{id}"),
+                    Err(e) => {
+                        let left: Vec<String> = needs[i..].iter().map(ToString::to_string).collect();
+                        bail!(
+                            "evidence {evidence} recorded, but depends_on to {} not written ({e:#}): relate them by \
+                             hand, `relate {evidence} depends_on <id>`",
+                            left.join(", ")
+                        );
+                    }
+                }
+            }
         }
         Command::Retract { target, reason } => {
             let who = signer(&s, agent)?;
             let target = resolve(&s, &target)?;
             println!("{}", contribute(&mut s, &who, Body::Retract { target, reason })?);
         }
-        Command::Log { kind, tag, author, current, since, limit, compact, out } => {
+        Command::Log { kind, tag, author, current, since, limit, compact, full, out } => {
+            let compact = compact || (since.is_some() && !full);
             let names = Names::load(&s)?;
             let author = author.map(|a| names.resolve(&a)).transpose()?;
             let g = s.graph();
@@ -531,6 +581,11 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 .collect();
             let omitted = limit.map_or(0, |n| rows.len().saturating_sub(n));
             let rows = &rows[omitted..];
+            // What's new since a cursor, personal to the caller: what concerns them first.
+            let (me, note) = if since.is_some() { caller(&names, agent) } else { (None, None) };
+            let for_you_ids: Vec<ContributionId> =
+                me.map(|me| rows.iter().filter(|c| concerns(g, me, c)).map(|c| c.id()).collect()).unwrap_or_default();
+            let for_you: HashSet<ContributionId> = for_you_ids.iter().copied().collect();
             if out.json {
                 let rows: Vec<Value> = rows
                     .iter()
@@ -547,14 +602,30 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                     })
                     .collect();
                 if since.is_some() || limit.is_some() {
-                    print_json(&json!({"contributions": rows, "cursor": listing::cursor(g), "omitted": omitted}));
+                    let mut v = json!({"contributions": rows, "cursor": listing::cursor(g), "omitted": omitted});
+                    if me.is_some() {
+                        v["for_you"] = json!(for_you_ids);
+                    }
+                    print_json(&v);
                 } else {
                     print_json(&rows);
                 }
             } else {
                 let prefixes =
                     compact.then(|| listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS));
-                for &c in rows {
+                if let Some(note) = note {
+                    println!("{note}");
+                }
+                let (first, then): (Vec<&Contribution>, Vec<&Contribution>) =
+                    rows.iter().partition(|c| for_you.contains(&c.id()));
+                let headed = !first.is_empty();
+                if headed {
+                    println!("for you:");
+                }
+                for (n, &c) in first.iter().chain(&then).enumerate() {
+                    if headed && n == first.len() && !then.is_empty() {
+                        println!("everything else:");
+                    }
                     let mut text = match &prefixes {
                         Some(p) => compact_line(g, &names, p, c),
                         None => line(g, &names, c),
@@ -645,7 +716,9 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 }
             }
         }
-        Command::Status { all, policy, out } => print_status(&s, all, &policy, out.json)?,
+        Command::Status { all, full, limit, policy, out } => {
+            print_status(&s, &policy, &StatusArgs { all, full, limit, json: out.json, agent })?
+        }
         Command::View { port, bind, hosts, runs, policy } => {
             // Validators by name from the public agent directory: the view never reads identities.
             let policy = policy.build(&view::public_names(&s)?)?;
@@ -899,26 +972,185 @@ fn own_claim(s: &Store, names: &Names, who: &Identity, prefix: &str) -> Result<C
     Ok(id)
 }
 
-/// `status`: each current claim that something implements or has a live intent on, with what
-/// implements it and how the policy assesses each, waiting ones first, and its live intents; with
-/// `all`, then the current claims with neither. A contribution implements a claim through a current
-/// `implements` relation from it to the claim, whoever wrote the relation, and whatever kind of
-/// contribution it is.
-/// Each claim `status` lists, with what implements it and its live intents.
-type StatusRow<'a> = (&'a Contribution, Vec<(&'a Contribution, Assessment)>, Vec<Intent<'a>>);
+/// Where one piece of work stands in the review queue: the policy's status, with a rejection
+/// whose fails all name what they need (`depends_on` relations from the fail evidence, by its
+/// author) told apart as blocked, or ready once all of that is accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Standing {
+    Waiting,
+    Ready,
+    Blocked,
+    Rejected,
+    Superseded,
+    Retracted,
+    Accepted,
+}
 
-/// What `status` lists: the claims something implements or intends to, those with something waiting
-/// first, and (with `all`) the current claims nothing implements.
+impl Standing {
+    fn label(self) -> &'static str {
+        match self {
+            Standing::Waiting => "waiting",
+            Standing::Ready => "ready",
+            Standing::Blocked => "blocked",
+            Standing::Rejected => "rejected",
+            Standing::Superseded => "superseded",
+            Standing::Retracted => "retracted",
+            Standing::Accepted => "accepted",
+        }
+    }
+
+    /// Queue order: what needs an independent pass first, accepted work last.
+    fn rank(self) -> u8 {
+        match self {
+            Standing::Waiting | Standing::Ready => 0,
+            Standing::Blocked => 1,
+            Standing::Rejected => 2,
+            Standing::Superseded => 3,
+            Standing::Retracted => 4,
+            Standing::Accepted => 5,
+        }
+    }
+
+    fn needs_a_pass(self) -> bool {
+        self.rank() == 0
+    }
+}
+
+/// What a fail evidence says it needs: the targets of current `depends_on` relations from it that
+/// its own author wrote.
+fn fail_needs(g: &Graph, view: &CurrentView, evidence: &ContributionId) -> Vec<ContributionId> {
+    let Some(e) = g.get(evidence) else { return Vec::new() };
+    let mut out: Vec<ContributionId> = g
+        .referrers(evidence)
+        .filter(|r| r.author() == e.author() && !view.hidden.contains(&r.id()))
+        .filter_map(|r| match r.body() {
+            Body::Relation { from, kind: RelationKind::DependsOn, to, .. } if from == evidence => Some(*to),
+            _ => None,
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Standings for one `status` call. Each contribution's acceptance and each need's are worked out once
+/// and kept, so the whole call stays linear in the replica, whatever relations anyone writes.
+struct Judge<'a> {
+    g: &'a Graph,
+    view: &'a CurrentView,
+    policy: &'a Policy,
+    /// Each contribution's place in causal order.
+    position: HashMap<ContributionId, usize>,
+    accepted: HashMap<ContributionId, bool>,
+    met: HashMap<ContributionId, bool>,
+    /// Assessments made: each contribution's at most once.
+    assessed: usize,
+}
+
+impl<'a> Judge<'a> {
+    fn new(g: &'a Graph, view: &'a CurrentView, policy: &'a Policy, order: &[ContributionId]) -> Self {
+        let position = order.iter().enumerate().map(|(n, id)| (*id, n)).collect();
+        Judge { g, view, policy, position, accepted: HashMap::new(), met: HashMap::new(), assessed: 0 }
+    }
+
+    fn accepted(&mut self, id: &ContributionId) -> bool {
+        if let Some(&known) = self.accepted.get(id) {
+            return known;
+        }
+        self.assessed += 1;
+        let yes = self.policy.assess(self.g, id).is_some_and(|a| a.status == Status::Accepted);
+        self.accepted.insert(*id, yes);
+        yes
+    }
+
+    /// Whether what a fail needs is there: the policy accepts it, or accepts something that currently
+    /// implements it by a relation its source's author or the need's author wrote, as the accepted
+    /// count takes implements (a stranger's relation doesn't make someone else's work ready).
+    fn met(&mut self, id: &ContributionId) -> bool {
+        if let Some(&known) = self.met.get(id) {
+            return known;
+        }
+        let (g, view) = (self.g, self.view);
+        let need_author = g.get(id).map(Contribution::author);
+        let mut sources: Vec<ContributionId> = g
+            .referrers(id)
+            .filter(|r| !view.hidden.contains(&r.id()))
+            .filter_map(|r| match r.body() {
+                Body::Relation { from, kind: RelationKind::Implements, to, .. } if to == id => {
+                    let by_owner = g.get(from).is_some_and(|f| f.author() == r.author());
+                    (by_owner || need_author == Some(r.author())).then_some(*from)
+                }
+                _ => None,
+            })
+            .collect();
+        sources.sort();
+        sources.dedup();
+        let yes = self.accepted(id) || sources.iter().any(|f| self.accepted(f));
+        self.met.insert(*id, yes);
+        yes
+    }
+
+    /// Each author's latest of `fails` in causal order (bracken's deterministic order among concurrent
+    /// ones). An earlier fail by the same validator says what it needed then.
+    fn latest_fails(&self, fails: &[ContributionId]) -> Vec<ContributionId> {
+        let mut latest: HashMap<AgentId, (usize, ContributionId)> = HashMap::new();
+        for f in fails.iter().filter_map(|f| self.g.get(f)) {
+            let at = self.position.get(&f.id()).copied().unwrap_or(0);
+            let best = latest.entry(f.author()).or_insert((at, f.id()));
+            if at > best.0 {
+                *best = (at, f.id());
+            }
+        }
+        latest.into_values().map(|(_, id)| id).collect()
+    }
+
+    /// `a`'s standing, and what keeps it blocked. Its counted fails are the policy's; whether each
+    /// validator's latest fail names only what is now accepted decides blocked or ready. A ready work's
+    /// fails still count, so it stays ready, not accepted, until their authors retract them.
+    fn standing(&mut self, a: &Assessment) -> (Standing, Vec<ContributionId>) {
+        let plain = match a.status {
+            Status::Pending => Standing::Waiting,
+            Status::Accepted => Standing::Accepted,
+            Status::Superseded => Standing::Superseded,
+            Status::Retracted => Standing::Retracted,
+            Status::Rejected => {
+                let needs: Vec<Vec<ContributionId>> =
+                    self.latest_fails(&a.fails).iter().map(|f| fail_needs(self.g, self.view, f)).collect();
+                if needs.iter().any(Vec::is_empty) {
+                    Standing::Rejected
+                } else {
+                    let mut unmet: Vec<ContributionId> = needs.into_iter().flatten().collect();
+                    unmet.sort();
+                    unmet.dedup();
+                    unmet.retain(|n| !self.met(n));
+                    return if unmet.is_empty() { (Standing::Ready, unmet) } else { (Standing::Blocked, unmet) };
+                }
+            }
+        };
+        (plain, Vec::new())
+    }
+}
+
+/// One implementation of one claim, as `status` lists it.
+struct Work<'a> {
+    claim: &'a Contribution,
+    work: &'a Contribution,
+    assessment: Assessment,
+    standing: Standing,
+    blocked_on: Vec<ContributionId>,
+}
+
+/// Each claim `status` lists, with what implements it and its live intents.
+type StatusRow<'a> = (&'a Contribution, Vec<Work<'a>>, Vec<Intent<'a>>);
+
+/// What `status` lists: each current claim that something implements (through a current `implements`
+/// relation from it, whoever wrote the relation, whatever kind of contribution it is) or has a live
+/// intent on, with its implementations in queue order; claims with something needing a pass first,
+/// otherwise in causal order; and (with `all`) the current claims with neither.
 fn status_rows<'a>(g: &'a Graph, policy: &Policy, all: bool, now: u64) -> (Vec<StatusRow<'a>>, Vec<&'a Contribution>) {
     let order = g.topo_order();
     let view = CurrentView::new(g, &order);
-    let rank = |status: Status| match status {
-        Status::Pending => 0,
-        Status::Accepted => 1,
-        Status::Superseded => 2,
-        Status::Rejected => 3,
-        Status::Retracted => 4,
-    };
+    let mut judge = Judge::new(g, &view, policy, &order);
     let mut implemented: Vec<StatusRow> = Vec::new();
     let mut unimplemented: Vec<&Contribution> = Vec::new();
     for id in &order {
@@ -939,8 +1171,14 @@ fn status_rows<'a>(g: &'a Graph, policy: &Policy, all: bool, now: u64) -> (Vec<S
             .collect();
         by.sort();
         by.dedup();
-        let mut rows: Vec<(&Contribution, Assessment)> =
-            by.iter().filter_map(|i| Some((g.get(i).expect("related ids exist"), policy.assess(g, i)?))).collect();
+        let mut rows: Vec<Work> = by
+            .iter()
+            .filter_map(|i| {
+                let assessment = policy.assess(g, i)?;
+                let (standing, blocked_on) = judge.standing(&assessment);
+                Some(Work { claim: c, work: g.get(i).expect("related ids exist"), assessment, standing, blocked_on })
+            })
+            .collect();
         let intents = live_intents(g, &view, id, now);
         if rows.is_empty() && intents.is_empty() {
             if all {
@@ -948,11 +1186,11 @@ fn status_rows<'a>(g: &'a Graph, policy: &Policy, all: bool, now: u64) -> (Vec<S
             }
             continue;
         }
-        rows.sort_by_key(|(i, a)| (rank(a.status), i.content().timestamp_ms));
+        rows.sort_by_key(|w| (w.standing.rank(), w.work.content().timestamp_ms));
         implemented.push((c, rows, intents));
     }
-    // Claims with something waiting first; otherwise in causal order (the sort is stable).
-    implemented.sort_by_key(|(_, rows, _)| rows.iter().all(|(_, a)| a.status != Status::Pending));
+    // Claims with something needing a pass first; otherwise in causal order (the sort is stable).
+    implemented.sort_by_key(|(_, rows, _)| !rows.iter().any(|w| w.standing.needs_a_pass()));
     (implemented, unimplemented)
 }
 
@@ -961,41 +1199,222 @@ fn independent_passes(g: &Graph, a: &Assessment) -> usize {
     a.passes.iter().filter_map(|e| g.get(e)).map(|e| e.author()).collect::<HashSet<_>>().len()
 }
 
-/// `status --json`.
-fn status_json(g: &Graph, names: &Names, policy: &Policy, all: bool, now: u64) -> Value {
+/// The review queue, personal to `me` if given: `me`'s own work, contradictions of `me`'s claims, the
+/// others' work waiting for `me`'s pass, then everything else; each part in queue order (what needs
+/// an independent pass first, oldest first, accepted work last).
+struct Queue<'a> {
+    yours: Vec<&'a Work<'a>>,
+    contradictions: Vec<&'a Contribution>,
+    for_your_pass: Vec<&'a Work<'a>>,
+    rest: Vec<&'a Work<'a>>,
+}
+
+fn queue<'a>(g: &'a Graph, rows: &'a [StatusRow<'a>], me: Option<AgentId>) -> Queue<'a> {
+    let mut all: Vec<&Work> = rows.iter().flat_map(|(_, w, _)| w).collect();
+    all.sort_by_key(|w| (w.standing.rank(), w.work.content().timestamp_ms, w.work.id()));
+    let Some(me) = me else {
+        return Queue { yours: Vec::new(), contradictions: Vec::new(), for_your_pass: Vec::new(), rest: all };
+    };
+    let passed_by_me = |w: &Work| w.assessment.passes.iter().any(|e| g.get(e).is_some_and(|e| e.author() == me));
+    let (yours, others): (Vec<&Work>, Vec<&Work>) = all.into_iter().partition(|w| w.work.author() == me);
+    let (for_your_pass, rest) = others.into_iter().partition(|w| w.standing.needs_a_pass() && !passed_by_me(w));
+    let order = g.topo_order();
+    let view = CurrentView::new(g, &order);
+    let contradictions = order
+        .iter()
+        .filter(|id| !view.hidden.contains(id))
+        .map(|id| g.get(id).expect("ordered ids exist"))
+        .filter(|r| {
+            r.author() != me
+                && matches!(r.body(), Body::Relation { kind: RelationKind::Contradicts, to, .. }
+                    if g.get(to).is_some_and(|t| t.author() == me && matches!(t.body(), Body::Claim { .. })))
+        })
+        .collect();
+    Queue { yours, contradictions, for_your_pass, rest }
+}
+
+/// Whether `c` concerns `me`, for `log --since`: a verdict on `me`'s work, a contradiction of `me`'s
+/// claim, or someone else's work toward a claim (through an `implements` relation), which waits for an
+/// independent pass such as `me`'s.
+fn concerns(g: &Graph, me: AgentId, c: &Contribution) -> bool {
+    let mine = |id: &ContributionId| g.get(id).is_some_and(|t| t.author() == me);
+    if c.author() == me {
+        return false;
+    }
+    match c.body() {
+        Body::Evidence { target, .. } => mine(target),
+        Body::Relation { kind: RelationKind::Contradicts, to, .. } => mine(to),
+        Body::Relation { from, kind: RelationKind::Implements, .. } => !mine(from),
+        Body::Claim { .. } | Body::Artifact { .. } => g.referrers(&c.id()).any(
+            |r| matches!(r.body(), Body::Relation { from, kind: RelationKind::Implements, .. } if *from == c.id()),
+        ),
+        _ => false,
+    }
+}
+
+/// The caller `status` and `log --since` are personal to: the `--as` identity, by local name or
+/// public key. A name this replica doesn't know is said, and the view isn't personal.
+fn caller(names: &Names, agent: Option<&str>) -> (Option<AgentId>, Option<String>) {
+    match agent.map(|a| (a, names.resolve(a))) {
+        None => (None, None),
+        Some((_, Ok(id))) => (Some(id), None),
+        Some((a, Err(_))) => (None, Some(format!("not personal: {} is unknown here", terminal::printable(a)))),
+    }
+}
+
+fn work_json(g: &Graph, names: &Names, w: &Work, now: u64) -> Value {
+    let mut v = contribution_json(g, names, w.work);
+    v["assessment"] = json!(w.assessment);
+    v["waiting"] = json!(w.assessment.status == Status::Pending);
+    v["standing"] = json!(w.standing.label());
+    v["blocked_on"] = json!(w.blocked_on);
+    v["independent_passes"] = json!(independent_passes(g, &w.assessment));
+    v["age_ms"] = json!(now.saturating_sub(w.work.content().timestamp_ms));
+    v
+}
+
+/// `status --json`: every claim with its implementations, and the queue as id pairs, personal to `me`.
+fn status_json(g: &Graph, names: &Names, policy: &Policy, all: bool, me: Option<AgentId>, now: u64) -> Value {
     let (implemented, unimplemented) = status_rows(g, policy, all, now);
     let claims: Vec<Value> = implemented
         .iter()
         .map(|(c, rows, intents)| {
-            let by: Vec<Value> = rows
-                .iter()
-                .map(|(i, a)| {
-                    let mut v = contribution_json(g, names, i);
-                    v["assessment"] = json!(a);
-                    v["waiting"] = json!(a.status == Status::Pending);
-                    v["independent_passes"] = json!(independent_passes(g, a));
-                    v["age_ms"] = json!(now.saturating_sub(i.content().timestamp_ms));
-                    v
-                })
-                .collect();
+            let by: Vec<Value> = rows.iter().map(|w| work_json(g, names, w, now)).collect();
             let intents: Vec<Value> = intents.iter().map(|i| intent_json(g, names, i, now)).collect();
             json!({"claim": contribution_json(g, names, c), "implemented_by": by, "intents": intents})
         })
         .collect();
+    let q = queue(g, &implemented, me);
+    let pairs = |ws: &[&Work]| -> Vec<Value> {
+        ws.iter().map(|w| json!({"claim": w.claim.id(), "work": w.work.id(), "standing": w.standing.label()})).collect()
+    };
     let unimplemented: Vec<Value> = unimplemented.iter().map(|c| contribution_json(g, names, c)).collect();
-    json!({"min_passes": policy.min_passes, "claims": claims, "unimplemented": unimplemented})
+    let mut v = json!({
+        "min_passes": policy.min_passes,
+        "claims": claims,
+        "queue": pairs(&q.rest),
+        "unimplemented": unimplemented,
+    });
+    if let Some(me) = me {
+        v["caller"] = json!(me);
+        v["yours"] = json!(pairs(&q.yours));
+        v["contradictions_of_yours"] = q.contradictions.iter().map(|r| contribution_json(g, names, r)).collect();
+        v["for_your_pass"] = json!(pairs(&q.for_your_pass));
+    }
+    v
 }
 
-fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Result<()> {
+/// What `status` prints, and how much of it.
+struct StatusArgs<'a> {
+    all: bool,
+    full: bool,
+    limit: usize,
+    json: bool,
+    agent: Option<&'a str>,
+}
+
+fn print_status(s: &Store, policy: &PolicyArgs, a: &StatusArgs) -> Result<()> {
     let names = Names::load(s)?;
     let policy = policy.build(&names)?;
     let g = s.graph();
     let now = now_ms();
-    if json_out {
-        print_json(&status_json(g, &names, &policy, all, now));
+    let (me, note) = caller(&names, a.agent);
+    if a.json {
+        print_json(&status_json(g, &names, &policy, a.all, me, now));
         return Ok(());
     }
-    let (implemented, unimplemented) = status_rows(g, &policy, all, now);
+    if let Some(note) = note {
+        println!("{note}");
+    }
+    if a.full {
+        return print_full_status(g, &names, &policy, a.all, now);
+    }
+    let (implemented, unimplemented) = status_rows(g, &policy, a.all, now);
+    if implemented.is_empty() {
+        println!("no current claim is implemented by anything, or has a live intent");
+    }
+    let prefixes = listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS);
+    let q = queue(g, &implemented, me);
+    let mut left = a.limit;
+    let mut more = 0;
+    let mut part = |title: Option<&str>, lines: Vec<String>| {
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(t) = title.filter(|_| left > 0) {
+            println!("{t}");
+        }
+        for l in lines {
+            if left == 0 {
+                more += 1;
+                continue;
+            }
+            left -= 1;
+            println!("{l}");
+        }
+    };
+    let rows = |ws: &[&Work]| ws.iter().map(|w| queue_line(g, &names, &prefixes, w, now)).collect::<Vec<_>>();
+    if me.is_some() {
+        part(Some("yours:"), rows(&q.yours));
+        let lines = q.contradictions.iter().map(|r| compact_line(g, &names, &prefixes, r)).collect();
+        part(Some("contradicting your claims:"), lines);
+        part(Some("waiting for your pass:"), rows(&q.for_your_pass));
+        part(Some("everything else:"), rows(&q.rest));
+    } else {
+        part(None, rows(&q.rest));
+    }
+    let intents: Vec<String> = implemented
+        .iter()
+        .flat_map(|(c, _, intents)| intents.iter().map(move |i| (c, i)))
+        .map(|(c, i)| {
+            let line = format!(
+                "intent {} {} until {} ({} left) for {} {}",
+                prefixes[&i.claim.id()],
+                names.display(&i.claim.author()),
+                i.until,
+                age(i.until_ms.saturating_sub(now)),
+                prefixes[&c.id()],
+                listing::compact_text(c.body(), summary(g, c)),
+            );
+            listing::cap_line(terminal::printable(&line))
+        })
+        .collect();
+    part(Some("live intents:"), intents);
+    if a.all {
+        let idle = unimplemented.iter().map(|c| compact_line(g, &names, &prefixes, c)).collect();
+        part(Some("nothing implements, or intends to:"), idle);
+    }
+    if more > 0 {
+        println!("{more} more: status --limit <N>, or status --full");
+    }
+    Ok(())
+}
+
+/// One piece of work on one short line: standing, id, author, age, what it is, the claim it implements,
+/// and what keeps it blocked.
+fn queue_line(g: &Graph, names: &Names, prefixes: &HashMap<ContributionId, String>, w: &Work, now: u64) -> String {
+    let blocked = if w.blocked_on.is_empty() {
+        String::new()
+    } else {
+        let ids: Vec<&str> = w.blocked_on.iter().map(|i| prefixes.get(i).map_or("?", String::as_str)).collect();
+        format!(" (needs {})", ids.join(","))
+    };
+    let line = format!(
+        "{} {} {} {} ago {}{blocked} for {} {}",
+        w.standing.label(),
+        prefixes[&w.work.id()],
+        names.display(&w.work.author()),
+        age(now.saturating_sub(w.work.content().timestamp_ms)),
+        listing::compact_text(w.work.body(), summary(g, w.work)),
+        prefixes[&w.claim.id()],
+        listing::compact_text(w.claim.body(), summary(g, w.claim)),
+    );
+    listing::cap_line(terminal::printable(&line))
+}
+
+/// `status --full`: each claim with every implementation and intent, one row each.
+fn print_full_status(g: &Graph, names: &Names, policy: &Policy, all: bool, now: u64) -> Result<()> {
+    let (implemented, unimplemented) = status_rows(g, policy, all, now);
     let age_ms = |c: &Contribution| now.saturating_sub(c.content().timestamp_ms);
     if implemented.is_empty() {
         println!("no current claim is implemented by anything, or has a live intent");
@@ -1005,27 +1424,27 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
             println!();
         }
         // Other agents' text is printed escaped, so it can't forge lines (finding 252f052a283d).
-        println!("{}", terminal::printable(&line(g, &names, c)));
+        println!("{}", terminal::printable(&line(g, names, c)));
         for i in intents {
-            println!("{}", terminal::printable(&intent_line(&names, i, now)));
+            println!("{}", terminal::printable(&intent_line(names, i, now)));
         }
-        for (i, a) in rows {
-            let label = match a.status {
-                Status::Pending => "waiting",
-                Status::Accepted => "accepted",
-                Status::Superseded => "superseded",
-                Status::Rejected => "rejected",
-                Status::Retracted => "retracted",
+        for w in rows {
+            let blocked = if w.blocked_on.is_empty() {
+                String::new()
+            } else {
+                let ids: Vec<String> = w.blocked_on.iter().map(ContributionId::short).collect();
+                format!("  needs {}", ids.join(", "))
             };
             let row = format!(
-                "  {label:<10}  {}  {:<8}  {:<12}  {:>4} ago  {}/{} passes  {}",
-                i.id().short(),
-                i.body().kind(),
-                names.display(&i.author()),
-                age(age_ms(i)),
-                independent_passes(g, a),
+                "  {:<10}  {}  {:<8}  {:<12}  {:>4} ago  {}/{} passes  {}{blocked}",
+                w.standing.label(),
+                w.work.id().short(),
+                w.work.body().kind(),
+                names.display(&w.work.author()),
+                age(age_ms(w.work)),
+                independent_passes(g, &w.assessment),
                 policy.min_passes,
-                summary(g, i)
+                summary(g, w.work)
             );
             println!("{}", terminal::printable(&row));
         }
@@ -1034,7 +1453,7 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
         println!();
         println!("nothing implements, or intends to:");
         for c in &unimplemented {
-            println!("{}", terminal::printable(&line(g, &names, c)));
+            println!("{}", terminal::printable(&line(g, names, c)));
         }
     }
     Ok(())
@@ -1511,6 +1930,56 @@ fn print_json(v: &impl serde::Serialize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding `7ae8094d7f55`: W works blocked on one need, and R relations saying one contribution
+    /// implements it. Each standing used to assess that contribution once per relation, every assessment
+    /// reading all R relations: W x R^2. Now each contribution is assessed once per status call.
+    #[test]
+    fn status_stays_linear_however_many_relations_anyone_writes() {
+        let ground: GroundId = "0".repeat(64).parse().expect("a test ground");
+        let (s, p) = (Identity::generate("s").expect("a key"), Identity::generate("p").expect("a key"));
+        let mut g = Graph::new(ground);
+        let mut ts = 0;
+        let mut add = |g: &mut Graph, who: &Identity, body: Body| {
+            ts += 1;
+            let c = Contribution::create(ground, who, [], ts, body);
+            let id = c.id();
+            g.insert(c).expect("a valid contribution");
+            id
+        };
+        let claim = |text: &str| Body::Claim { statement: text.into(), tags: vec![] };
+        let relate = |from, kind, to, note: String| Body::Relation { from, kind, to, note };
+        let goal = add(&mut g, &s, claim("goal"));
+        let need = add(&mut g, &s, claim("need"));
+        let x = add(&mut g, &s, claim("x"));
+        let (w, r) = (1000, 1000);
+        for i in 0..r {
+            add(&mut g, &s, relate(x, RelationKind::Implements, need, format!("{i}")));
+        }
+        for i in 0..w {
+            let work = add(&mut g, &s, claim(&format!("work {i}")));
+            add(&mut g, &s, relate(work, RelationKind::Implements, goal, String::new()));
+            let fail =
+                Body::Evidence { target: work, verdict: Verdict::Fail, method: "m".into(), details: String::new() };
+            let fail = add(&mut g, &p, fail);
+            add(&mut g, &p, relate(fail, RelationKind::DependsOn, need, String::new()));
+        }
+        let policy = Policy { min_passes: 1, validators: None };
+        let start = std::time::Instant::now();
+        let (rows, _) = status_rows(&g, &policy, false, ts);
+        let works: Vec<&Work> = rows.iter().filter(|(c, _, _)| c.id() == goal).flat_map(|(_, ws, _)| ws).collect();
+        assert_eq!(works.len(), w);
+        assert!(works.iter().all(|w| w.standing == Standing::Blocked && w.blocked_on == [need]));
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
+
+        let order = g.topo_order();
+        let view = CurrentView::new(&g, &order);
+        let mut judge = Judge::new(&g, &view, &policy, &order);
+        for work in &works {
+            judge.standing(&work.assessment);
+        }
+        assert_eq!(judge.assessed, 2, "the need and x, once each");
+    }
 
     #[test]
     fn the_superseded_by_mark_escapes_the_agent_name() {

@@ -44,6 +44,7 @@ REQ=$(bracken claim "Sessions need bounded token lifetimes" --tag auth)
 # The artifact and its implements relation in one call; it prints both ids, the artifact's first.
 IMPL=$(bracken artifact src/session.rs --media-type text/x-rust --implements $REQ | head -1)
 bracken evidence $IMPL pass --method "cargo test" --as val
+bracken evidence $IMPL fail --method "read it" --depends-on $OTHER --as val  # blocked until $OTHER is accepted
 # Or check and record in one step: pass if the command exits 0, else fail.
 bracken evidence $IMPL --run --as val -- cargo test
 
@@ -51,6 +52,7 @@ bracken log                          # everything, in causal order
 bracken log --since ""               # the same, then a cursor: pass it next time for only what is new
 bracken log --compact                # one line each (at most 200 characters), shortest unique ids (8+ digits)
 bracken log --since "$C" --limit 50  # only the most recent 50 of what is new; the cursor still moves past all
+bracken log --since "$C" --as alice  # compact by default (--full for the long form); what concerns alice first
 ```
 
 `evidence --run -- <command> [args]` runs the command without a shell, in the current directory, with no
@@ -62,7 +64,8 @@ it for a command whose output can hold secrets. Without `--run`, the target and 
 `--` too, as before.
 
 With `--since` or `--limit`, `log --json` prints an object, `{"contributions": [...], "cursor": "...",
-"omitted": N}`, instead of the bare array. A cursor means the same only under the same filters: new work
+"omitted": N}`, instead of the bare array; with `--since` and a caller it adds `"for_you"`, the ids of
+others' verdicts on and contradictions of the caller's work and of others' work that implements something. A cursor means the same only under the same filters: new work
 that `--tag`, `--kind`, `--author` or `--current` hid is past it all the same, so keep one cursor per set of
 filters. Every read command prints control characters from contributions (CR, ESC, newlines and the
 like) as escapes such as `\u{1b}`, so no contribution can forge or hide a line; `show` keeps a statement's
@@ -71,7 +74,12 @@ or evidence's line breaks, with each of its lines starting `| `. `--json` escape
 ```sh
 bracken accepted                     # what the default policy accepts
 bracken accepted --min-passes 2 --validator val
-bracken status                       # per claim: what implements it, accepted or still waiting
+bracken status                       # the review queue, one line each: waiting or ready first, oldest first,
+                                     # then blocked, rejected, superseded, retracted, accepted; at most 40 lines
+bracken status --as alice            # alice's work, contradictions of her claims, work waiting for her pass, the rest
+bracken status --full                # per claim: what implements it, with passes and what blocked work needs
+# A fail with --depends-on shows its work blocked, then ready once all it names is accepted (only each
+# validator's latest fail counts for this). Ready isn't accepted: the fail counts until its author retracts it.
 bracken status --all                 # plus the claims nothing implements yet
 bracken intend $REQ --for 30m        # "I'm on this": shown in status and show until it ends
 bracken conflicts                    # divergences and contradictions
