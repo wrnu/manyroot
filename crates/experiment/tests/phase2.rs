@@ -4,7 +4,7 @@
 
 use std::collections::BTreeSet;
 
-use bracken_experiment::candidates::phase2::OTHER_CHOICE;
+use bracken_experiment::candidates::phase2::{OTHER_CHOICE, UNSETTLED};
 use bracken_experiment::candidates::{Programs, correct_programs, modules, of as candidates_of, revisions, updates};
 use bracken_experiment::grader::{CONTRACT_EDGES, HIDDEN_DRAWS, HiddenCases, grade, grade_function};
 use bracken_experiment::lang::{Library, parse_module};
@@ -475,6 +475,28 @@ fn the_interacting_pairs_need_a_shared_convention() {
     let broken = failing_at(&together, both_rank, &hidden);
     assert!(broken.contains("ismore") && broken.is_subset(&rank), "{broken:?}");
     assert!(failing_at(&with_at(both_rank, &[]), both_rank, &hidden).is_empty(), "the settled convention");
+}
+
+/// The mock's unsettled agents (task `07cb4ada01ea`) write each pair's obvious fixes together: right while
+/// either change applies alone, wrong once both do.
+#[test]
+fn the_mocks_unsettled_programs_fail_only_under_both_changes() {
+    let hidden = HiddenCases::new(T, SEED);
+    let o = Version::ORIGINAL;
+    assert_eq!(UNSETTLED.len(), 2);
+    for (u, fails) in UNSETTLED.iter().zip([&["cut", "pos"][..], &["ismore"]]) {
+        let [x, y] = u.pair;
+        assert!(T.waves().iter().any(|w| w.changes.contains(&x) && w.changes.contains(&y)), "one wave's pair");
+        let lib = with_at(o.with(x).with(y), u.programs);
+        let broken = failing_at(&lib, o.with(x).with(y), &hidden);
+        assert!(fails.iter().all(|f| broken.contains(f)), "{x:?}, {y:?}: {broken:?}");
+    }
+    let just_cut = with(UNSETTLED[0].programs);
+    assert!(failing_at(&just_cut, o.with(Change::CutSigned), &hidden).is_empty());
+    let rank = with(&UNSETTLED[1].programs[..1]);
+    let ismore = with(&UNSETTLED[1].programs[1..]);
+    assert!(failing_at(&rank, o.with(Change::RankWide), &hidden).is_empty());
+    assert!(failing_at(&ismore, o.with(Change::IsMoreFar), &hidden).is_empty());
 }
 
 /// Grading uses the specs in force: each wave's correct library is right under its own version and not

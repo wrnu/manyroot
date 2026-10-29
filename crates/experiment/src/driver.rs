@@ -15,8 +15,8 @@ use std::io::{BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -98,6 +98,18 @@ pub trait Backend: Sync {
     fn halted(&self) -> Option<String> {
         None
     }
+
+    /// Tests only: play agent-turns one at a time, turn 1 of every agent in order, then turn 2, each with its
+    /// syncs, so a mock run is the same every time. A real run's agents run at once.
+    fn lockstep(&self) -> bool {
+        false
+    }
+}
+
+/// The next agent-turn allowed to run in lockstep, and the agents that have stopped playing.
+struct Lockstep {
+    next: usize,
+    stopped: Vec<bool>,
 }
 
 pub struct Outcome {
@@ -179,6 +191,8 @@ struct Run<'a> {
     released: Mutex<Vec<u32>>,
     /// Per turn index, how many agents have finished it: the checkpoint is when all have.
     finished: Mutex<Vec<usize>>,
+    /// With a lockstep backend, whose agent-turn may run.
+    lockstep: Option<(Mutex<Lockstep>, Condvar)>,
     /// The digest of the hub's integrated library at the last snapshot.
     integrated: Mutex<String>,
 }
@@ -259,6 +273,9 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         turns_done: AtomicU32::new(0),
         released: Mutex::new(Vec::new()),
         finished: Mutex::new(vec![0; cfg.turns as usize]),
+        lockstep: backend
+            .lockstep()
+            .then(|| (Mutex::new(Lockstep { next: 0, stopped: vec![false; cfg.agents] }), Condvar::new())),
         integrated: Mutex::new(String::new()),
     };
     run.snapshot(&mut run.hub(), None, "setup");
@@ -323,9 +340,16 @@ impl Run<'_> {
     }
 
     fn agent(&self, i: usize, root: &Path, backend: &dyn Backend) -> Result<(), String> {
+        let played = self.agent_turns(i, root, backend);
+        self.lockstep_stop(i);
+        played
+    }
+
+    fn agent_turns(&self, i: usize, root: &Path, backend: &dyn Backend) -> Result<(), String> {
         let name = &self.names[i];
         let socket = root.join("sockets").join(format!("a{i}.sock"));
         for turn in 1..=self.cfg.turns {
+            self.lockstep_wait(i, turn);
             if backend.halted().is_some() {
                 break;
             }
@@ -343,8 +367,46 @@ impl Run<'_> {
             let done = self.turns_done.fetch_add(1, Ordering::SeqCst) + 1;
             self.checkpoint(turn);
             self.maybe_release(done)?;
+            self.lockstep_pass();
         }
         Ok(())
+    }
+
+    /// In lockstep, waits until it is agent `i`'s turn `turn`.
+    fn lockstep_wait(&self, i: usize, turn: u32) {
+        let Some((state, cv)) = &self.lockstep else { return };
+        let me = (turn as usize - 1) * self.cfg.agents + i;
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        while s.next != me {
+            s = cv.wait(s).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// In lockstep, hands the run to the next agent-turn, skipping agents that have stopped.
+    fn lockstep_pass(&self) {
+        let Some((state, cv)) = &self.lockstep else { return };
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.next += 1;
+        let total = self.cfg.agents * self.cfg.turns as usize;
+        while s.next < total && s.stopped[s.next % self.cfg.agents] {
+            s.next += 1;
+        }
+        cv.notify_all();
+    }
+
+    /// In lockstep, an agent that stops playing, early or after its last turn, no longer holds up the others.
+    fn lockstep_stop(&self, i: usize) {
+        let Some((state, cv)) = &self.lockstep else { return };
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.stopped[i] = true;
+        let total = self.cfg.agents * self.cfg.turns as usize;
+        if s.next < total && s.next % self.cfg.agents == i {
+            s.next += 1;
+            while s.next < total && s.stopped[s.next % self.cfg.agents] {
+                s.next += 1;
+            }
+        }
+        cv.notify_all();
     }
 
     /// Phase 2 only (decision `288a16ce8cb2`): once every agent has finished turn `turn`, logs the hub's

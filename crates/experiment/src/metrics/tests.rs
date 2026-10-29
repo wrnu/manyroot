@@ -312,12 +312,12 @@ fn whole() -> Log {
 }
 
 fn refused(log: &Log) -> String {
-    incomplete(&log.records(), &[]).expect("refused")
+    incomplete(&log.records(), &[], Task::Phase1).expect("refused")
 }
 
 #[test]
 fn a_whole_run_is_measured() {
-    assert_eq!(incomplete(&whole().records(), &[]), None);
+    assert_eq!(incomplete(&whole().records(), &[], Task::Phase1), None);
 }
 
 #[test]
@@ -380,12 +380,12 @@ fn a_turn_that_failed_before_playing_needs_no_usage() {
     let mut log = Log::new("git");
     unplayed(&mut log, 1, 1);
     log.ev(2, None, "integrated", json!({}));
-    assert_eq!(incomplete(&log.records(), &[]), None);
+    assert_eq!(incomplete(&log.records(), &[], Task::Phase1), None);
     // A turn that ended at the play step after usage: that turn's row is still required.
     let mut log = Log::new("git");
     log.start(1, "a", 1).ev(1, Some("a"), "turn_error", json!({"turn": 1, "step": "sync"}));
     log.ev(2, None, "integrated", json!({}));
-    assert!(incomplete(&log.records(), &[]).expect("refused").contains("no usage row"));
+    assert!(incomplete(&log.records(), &[], Task::Phase1).expect("refused").contains("no usage row"));
 }
 
 #[test]
@@ -397,7 +397,7 @@ fn a_turn_refused_for_a_spent_budget_counts_nothing() {
     );
     unplayed(&mut log, 3, 2);
     log.ev(4, None, "integrated", json!({}));
-    assert_eq!(incomplete(&log.records(), &[]), None);
+    assert_eq!(incomplete(&log.records(), &[], Task::Phase1), None);
     assert_eq!((log.measure().tokens, log.measure().output_tokens), (30000, 30000));
 }
 
@@ -408,15 +408,71 @@ fn a_run_stopped_by_its_own_cap_is_measured_only_if_the_plan_expects_it() {
     log.snap(0, None, &[right("max2")]).start(1, "a", 1).ev(2, Some("a"), "turn_end", json!({"turn": 1}));
     log.turn_usage("a", 1, 10, 1).ev(3, None, "run_stopped", json!({"cap": cap}));
     let expected = [cap.to_string()];
-    assert_eq!(incomplete(&log.records(), &expected), None, "measured from what exists");
+    assert_eq!(incomplete(&log.records(), &expected, Task::Phase1), None, "measured from what exists");
     let m = log.measure();
     assert_eq!((m.stopped.as_deref(), m.quality.correct), (Some(cap), 1));
-    assert!(incomplete(&log.records(), &[]).expect("refused").contains("not by a stop the plan expects"));
+    assert!(incomplete(&log.records(), &[], Task::Phase1).expect("refused").contains("not by a stop the plan expects"));
     // Any other stop is never named, so never expected.
     let mut other = Log::new("git");
     other.start(1, "a", 1).ev(2, Some("a"), "turn_end", json!({"turn": 1}));
     other.turn_usage("a", 1, 10, 1).ev(3, None, "run_stopped", json!({"cap": null}));
-    assert!(incomplete(&other.records(), &expected).is_some());
+    assert!(incomplete(&other.records(), &expected, Task::Phase1).is_some());
+}
+
+/// Note `ba986b386c7a`: a wave none of whose functions was correct before it has nothing to recover. Its
+/// recovery is n/a, never the best score, and the table prints how many functions each wave's counts.
+#[test]
+fn a_wave_with_nothing_correct_before_it_has_no_recovery() {
+    let t = Task::Phase2;
+    let hidden = HiddenCases::new(t, 1);
+    let text = |programs: &crate::candidates::Programs| -> Vec<(String, String)> {
+        crate::candidates::modules(t, programs).into_iter().map(|(m, s)| (m.to_string(), s)).collect()
+    };
+    // Turn 1 has only max2, which neither wave changes; both waves go out before turn 2, which has everything.
+    let original = correct_programs(t, Version::ORIGINAL);
+    let max2: crate::candidates::Programs =
+        original.iter().filter(|(f, _)| **f == "max2").map(|(f, p)| (*f, *p)).collect();
+    assert!(!changed_by(t, 1).contains("max2") && !changed_by(t, 2).contains("max2"));
+    let mut log = Log::new("git");
+    log.snap(1, None, &[]);
+    log.ev(2, None, "checkpoint", json!({"turn": 1, "modules": text(&max2)}));
+    log.ev(3, None, "changes_released", json!({"wave": 1}));
+    log.ev(4, None, "changes_released", json!({"wave": 2}));
+    log.ev(5, None, "checkpoint", json!({"turn": 2, "modules": text(&correct_programs(t, t.after_wave(2)))}));
+    log.turn_usage("agent-0", 1, 1_000, 10);
+    let m = measure(&log.records(), &hidden).expect("measures");
+    let c = m.checkpoints.clone().expect("checkpoints");
+    let none = |wave| Recovery { wave, functions: 0, checkpoints: None };
+    assert_eq!(c.recovery, [none(1), none(2)], "all correct at turn 2, yet nothing was recovered");
+    assert!(table(std::slice::from_ref(&m)).contains("| n/a (of 0), n/a (of 0) "));
+    // With something to recover, the count is beside it.
+    let c = measure(&checkpoint_log("git").records(), &hidden).expect("measures");
+    assert!(table(std::slice::from_ref(&c)).contains("| never (of 34) "));
+}
+
+/// Finding `bf3fde3cf637`: Phase 2 ranks by checkpoints, so a turn without one, or one that can't be read,
+/// can't be measured.
+#[test]
+fn a_phase2_turn_without_a_readable_checkpoint_is_refused() {
+    let p2 = Task::Phase2;
+    assert_eq!(incomplete(&whole().records(), &[], Task::Phase1), None, "Phase 1 has none");
+    assert_eq!(incomplete(&whole().records(), &[], p2).as_deref(), Some("turn 1 has no checkpoint"));
+    let mut log = Log::new("git");
+    log.start(1, "a", 1).ev(2, Some("a"), "turn_end", json!({"turn": 1}));
+    log.ev(3, None, "checkpoint", json!({"turn": 1, "modules": []})).start(4, "a", 2);
+    log.ev(5, Some("a"), "turn_end", json!({"turn": 2})).ev(6, None, "integrated", json!({}));
+    log.turn_usage("a", 1, 10, 1).turn_usage("a", 2, 10, 1);
+    assert_eq!(incomplete(&log.records(), &[], p2).as_deref(), Some("turn 2 has no checkpoint"));
+    // The turn an expected stop cut short has none.
+    let cap = crate::claude::RUN_TOKEN_CAP;
+    log.events.pop();
+    log.ev(6, None, "run_stopped", json!({"cap": cap}));
+    assert_eq!(incomplete(&log.records(), &[cap.to_string()], p2), None);
+    // A checkpoint that isn't a module list is an error, as a bad snapshot is.
+    let mut bad = Log::new("git");
+    bad.ev(1, None, "checkpoint", json!({"turn": 1, "modules": "not modules"}));
+    let error = measure(&bad.records(), &HiddenCases::new(p2, 1)).expect_err("refused");
+    assert!(error.contains("a bad checkpoint"), "{error}");
 }
 
 // Open contracts: a member is judged with the delivering agent's working copy (decision `979e5085a1e7`).

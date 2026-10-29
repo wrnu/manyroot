@@ -495,9 +495,14 @@ every mode:
 - **Time to correct:** per function correct at the last checkpoint, the
   turn of the first checkpoint from which it is correct at every one.
 - **Recovery per wave:** of the checkpoints after the wave's release, how
-  many pass until all of the wave's functions are correct, or never if
-  not by the last. Those functions are its targets, every function defined
+  many pass until the wave's functions that were correct at the checkpoint
+  before it are all correct again, or never if not by the last. If none
+  was correct before it, there is nothing to recover and it reads n/a.
+  The report prints the count beside each wave: `2 (of 5)`, `never (of 5)`,
+  `n/a (of 0)`. A wave's functions are its targets, every function defined
   in terms of them (directly or not) and their open contracts' members.
+  Step 3 narrowed this from all of the wave's functions, because the ones
+  not yet written made every run read never (note `ba986b386c7a`).
 - **Breakage:** a function correct at one checkpoint and wrong at the next.
   It counts as after a wave if a wave went out between the two, else as
   other: the semantic-conflict signal.
@@ -559,8 +564,43 @@ These are why the diagnostics don't rank the modes. Phase 1's measures are
 as recorded: its headline stays per delivery, its logs are byte-identical
 to main's, and it gets no checkpoint table.
 
-The mock agents still write only what step 1's mock writes. Scripted
-moves for the waves and the contracts, and a full mock run, are step 3.
+## Step 3 as built
+
+Task `07cb4ada01ea`. Phase 1's mock is unchanged: the same tool calls and
+the same random draws, so its logs stay byte-identical to main's.
+
+**Scripted moves** (`mock::Moves`). In Phase 2 each mock agent remembers
+what it wrote, and each turn first rewrites up to three of its own
+functions whose program isn't the one it now intends:
+
+- **Following the waves:** after a wave, the agent's functions that it
+  changes, clamp3's callers included, get the new spec's program.
+- **Unsettled pairs:** every fifth agent writes each interacting pair's
+  obvious fixes together (`candidates::phase2::UNSETTLED`). Each is right
+  under its own change and wrong once both apply.
+- **Breaks:** with nothing to rewrite, an agent sometimes (one turn in ten)
+  replaces a right function with a wrong one, and mends it the turn after.
+- **Each mode's way of rewriting:** Bracken writes a new artifact and
+  retracts the old one. Git commits to the function's open branch, or to
+  one new branch from main for the turn, with a PR. A merge conflict keeps
+  this branch's side of a function both sides define. CRDT replaces the
+  line. A CRDT agent also treats a function whose line the document no
+  longer holds as unwritten, because concurrent edits of one line can
+  corrupt it.
+- **Spread:** agent k takes the lowest unwritten of every fifth spec from
+  k, so two agents share each share.
+
+A test plays two agents one agent-turn at a time (`Backend::lockstep`, for
+tests only) and checks each mode's checkpoint rows and measures against a
+hand-worked trace.
+
+**Completeness** (finding `bf3fde3cf637`). A checkpoint that isn't a
+module list is an error, as a bad snapshot is. A Phase 2 run with a turn
+that has no checkpoint is incomplete and isn't measured. The exception is
+the turn that a stop the plan expects cut short.
+
+**The full mock run:** 10 agents and 8 turns in each mode, sandboxed, with
+no turn errors. The reports are recorded as evidence on the step's PR.
 
 ## What this can't settle
 

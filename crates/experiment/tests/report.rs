@@ -27,6 +27,13 @@ fn mock_run(dir: &Path, mode: &'static str) -> PathBuf {
 }
 
 fn mock_run_of(dir: &Path, mode: &'static str, task: Task, agents: usize, turns: u32) -> PathBuf {
+    let backend = MockBackend { task, seed: 5, wrong_rate: 0.25, ..MockBackend::default() };
+    mock_run_with(dir, mode, agents, turns, backend)
+}
+
+/// A run of `backend` (its task, its moves), which records usage under the run's directory.
+fn mock_run_with(dir: &Path, mode: &'static str, agents: usize, turns: u32, backend: MockBackend) -> PathBuf {
+    let task = backend.task;
     let root = dir.join(format!("{mode}-{}", task.name()));
     let cfg = RunConfig {
         root: root.clone(),
@@ -42,8 +49,7 @@ fn mock_run_of(dir: &Path, mode: &'static str, task: Task, agents: usize, turns:
         plan: PlanInputs { task, grader_seed: 7, ..PlanInputs::default() },
         sandbox: false,
     };
-    let usage = Some(root.join("usage.jsonl"));
-    run(&cfg, &MockBackend { task, seed: 5, wrong_rate: 0.25, shim: None, usage }).expect("the run");
+    run(&cfg, &MockBackend { usage: Some(root.join("usage.jsonl")), ..backend }).expect("the run");
     root
 }
 
@@ -102,6 +108,86 @@ fn a_phase_two_mock_run_of_each_mode_is_graded_as_phase_two_and_releases_both_wa
         assert!(waves.windows(2).all(|w| w[0] <= w[1]) && waves.last() == Some(&2), "{mode}: {waves:?}");
         assert_eq!(c.recovery.len(), 2);
         assert!(table(std::slice::from_ref(&m)).contains("Ranking: checkpoints"));
+    }
+}
+
+/// Task `07cb4ada01ea`: the scripted moves' checkpoint measures, checked by hand per mode. Two agents, four
+/// turns, played one agent-turn at a time; everyone settles and nothing breaks. Agent 0 implements abs, dec,
+/// diff, lt (every fifth spec from the first) and agent 1 sign, sq, add3, le, one a turn. Wave 1 (sign among
+/// its targets) goes out after turn 1 and wave 2 (abs) after turn 2.
+/// - CRDT: each write lands in the shared document, and each agent rewrites its own function the turn after
+///   a wave changes it, before the checkpoint: 2, 4, 6, 8 correct.
+/// - Bracken: the integrated library holds only implementations with an independent pass, and each agent
+///   checks the other's newest first. Turn 1: abs (agent 1 passed it); turn 2: abs, dec (the old sign
+///   failed, its rewrite unchecked); turn 3: those, sign, sq, the rewritten abs and diff; turn 4: add3, lt.
+/// - Git: a PR merges once the other agent approves it, and an agent reads the task on its own branch, so
+///   it learns of a wave only once it merges main in. Turn 1: abs; turn 2: dec; turn 3: diff, while the old
+///   abs fails under wave 2 (a breakage after it); turn 4: sign and sq, mended and merged, and lt, while abs's
+///   rewrite can't merge.
+#[test]
+fn scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    struct Expect {
+        rows: [(u32, u64, u64); 4],
+        from: &'static [(&'static str, u32)],
+        median: f64,
+        recovery: [(u64, Option<u64>); 2],
+        breakage: (u64, u64),
+    }
+    let expect = [
+        (
+            "crdt",
+            Expect {
+                rows: [(1, 0, 2), (2, 1, 4), (3, 2, 6), (4, 2, 8)],
+                from: &[("abs", 1), ("add3", 3), ("dec", 2), ("diff", 3), ("le", 4), ("lt", 4), ("sign", 1), ("sq", 2)],
+                median: 2.5,
+                // Wave 1 changes sign, correct before it; wave 2, abs. Each is rewritten by the next checkpoint.
+                recovery: [(1, Some(1)), (1, Some(1))],
+                breakage: (0, 0),
+            },
+        ),
+        (
+            "bracken",
+            Expect {
+                rows: [(1, 0, 1), (2, 1, 2), (3, 2, 5), (4, 2, 7)],
+                from: &[("abs", 1), ("add3", 4), ("dec", 2), ("diff", 3), ("lt", 4), ("sign", 3), ("sq", 3)],
+                median: 3.0,
+                // sign wasn't in the library before wave 1, so it has nothing to recover: n/a.
+                recovery: [(0, None), (1, Some(1))],
+                breakage: (0, 0),
+            },
+        ),
+        (
+            "git",
+            Expect {
+                rows: [(1, 0, 1), (2, 1, 2), (3, 2, 2), (4, 2, 5)],
+                from: &[("dec", 2), ("diff", 3), ("lt", 4), ("sign", 4), ("sq", 4)],
+                median: 4.0,
+                recovery: [(0, None), (1, None)],
+                breakage: (1, 0),
+            },
+        ),
+    ];
+    for (mode, e) in expect {
+        let backend = MockBackend {
+            task: Task::Phase2,
+            moves: bracken_experiment::mock::Moves::PLAIN,
+            lockstep: true,
+            ..MockBackend::default()
+        };
+        let root = mock_run_with(dir.path(), mode, 2, 4, backend);
+        let events = std::fs::read_to_string(root.join("events.jsonl")).expect("events");
+        assert!(!events.contains("\"turn_error\""), "{mode}");
+        let c = report(&root, None).expect("the report").measures.checkpoints.expect("checkpoints");
+        let rows: Vec<(u32, u64, u64)> = c.turns.iter().map(|k| (k.turn, k.waves, k.correct)).collect();
+        assert_eq!(rows, e.rows, "{mode}");
+        assert!(c.turns.iter().all(|k| k.standalone == k.correct), "{mode}: base functions call nothing");
+        let from: Vec<(&str, u32)> = c.correct_from.iter().map(|(f, t)| (f.as_str(), *t)).collect();
+        assert_eq!(from, e.from, "{mode}");
+        assert_eq!(c.median_turn_correct, Some(e.median), "{mode}");
+        let recovery: Vec<(u64, Option<u64>)> = c.recovery.iter().map(|r| (r.functions, r.checkpoints)).collect();
+        assert_eq!(recovery, e.recovery, "{mode}");
+        assert_eq!((c.breakage.after_wave, c.breakage.other), e.breakage, "{mode}");
     }
 }
 

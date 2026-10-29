@@ -9,6 +9,15 @@
 //! function, opens a PR, merges what is approved and passes CI, and brings its
 //! own PRs up to date when they conflict with `main`. In CRDT mode it writes the
 //! definition into its module file, checks it, and adds a line to the shared notes.
+//!
+//! Phase 2's mock does more ([`Moves`]), in every mode. It writes the open
+//! contracts' members, and after each wave it rewrites what it wrote that the
+//! released specs change: the targets, `clamp3`'s callers and the contracts'
+//! members. Some agents leave an interacting pair unsettled, writing one change's
+//! obvious fix. Now and then an agent breaks a function it wrote and mends it
+//! the turn after. In Bracken mode a rewrite retracts the agent's earlier
+//! artifact; in Git mode it goes on a branch from `main` with a PR, or onto the
+//! function's own branch while that PR is open. Phase 1's moves are as they ran.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -19,6 +28,7 @@ use bracken_demo::rng::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::candidates::phase2::UNSETTLED;
 use crate::candidates::{candidates, correct_programs};
 use crate::driver::Backend;
 use crate::task::{Spec, Task, Version, change_tag};
@@ -34,6 +44,46 @@ pub struct MockBackend {
     /// Append made-up token usage here, in the rows Claude Code's backend writes: one message per tool call,
     /// then the turn's settled total.
     pub usage: Option<PathBuf>,
+    /// Phase 2's moves beyond Phase 1's.
+    pub moves: Moves,
+    /// Play agent-turns one at a time ([`Backend::lockstep`]), so a run is the same every time.
+    pub lockstep: bool,
+}
+
+impl Default for MockBackend {
+    fn default() -> MockBackend {
+        MockBackend {
+            task: Task::Phase1,
+            seed: 0,
+            wrong_rate: 0.0,
+            shim: None,
+            usage: None,
+            moves: Moves::RUN,
+            lockstep: false,
+        }
+    }
+}
+
+/// Phase 2's scripted moves beyond Phase 1's (Phase 1's mock ignores them).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Moves {
+    /// Chance per turn that an agent breaks one of its correct functions, to mend it the turn after.
+    pub break_rate: f64,
+    /// Every n-th agent (agents n - 1, 2n - 1, ...) leaves the interacting pairs unsettled; 0 for none.
+    pub unsettled_every: usize,
+    /// The most of its own functions an agent rewrites in a turn.
+    pub rewrites_per_turn: usize,
+}
+
+impl Moves {
+    /// A full mock run's.
+    pub const RUN: Moves = Moves { break_rate: 0.1, unsettled_every: 5, rewrites_per_turn: 3 };
+    /// Everyone settles and nothing breaks: every function follows the waves.
+    pub const PLAIN: Moves = Moves { break_rate: 0.0, unsettled_every: 0, rewrites_per_turn: 3 };
+
+    fn unsettled(&self, agent: usize) -> bool {
+        self.unsettled_every > 0 && agent % self.unsettled_every == self.unsettled_every - 1
+    }
 }
 
 /// A minimal MCP client over newline-delimited JSON-RPC.
@@ -122,11 +172,29 @@ struct Memory {
     checked: Vec<String>,
     /// Git mode: my PRs, by number, with their branches.
     prs: Vec<(u64, String)>,
+    /// Phase 2: each function this agent wrote, with what it last wrote (absent in Phase 1's notes).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    written: Vec<Written>,
+}
+
+/// A function the agent wrote, the program it last wrote, and, in Bracken mode, that artifact.
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Written {
+    function: String,
+    program: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    artifact: Option<String>,
 }
 
 /// The next function to implement: low layers first, spread across agents.
 fn next_spec(task: Task, memory: &Memory, agent: usize) -> Option<&'static Spec> {
     let todo: Vec<_> = task.specs().iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
+    if !task.waves().is_empty() {
+        // Phase 2's 90 functions: agent k takes the lowest of every fifth from k, so two agents share each
+        // share, then anyone's.
+        let share = |s: &&&Spec| task.specs().iter().position(|t| t.name == s.name).is_some_and(|i| i % 5 == agent % 5);
+        return todo.iter().find(share).or(todo.first()).copied();
+    }
     todo.get(agent % 3).or(todo.first()).copied()
 }
 
@@ -134,7 +202,64 @@ fn first_line(v: &Value) -> String {
     v["output"].as_str().unwrap_or_default().lines().next().unwrap_or_default().trim().to_string()
 }
 
+impl MockBackend {
+    /// What `agent` means `function` to be under `version`: the correct program, or, for an agent that
+    /// leaves the interacting pairs unsettled, one change's obvious fix once both of a pair apply.
+    fn intended(&self, agent: usize, function: &str, version: Version) -> String {
+        if self.moves.unsettled(agent) {
+            let fix = UNSETTLED.iter().filter(|u| u.pair.iter().all(|c| version.has(*c)));
+            if let Some((_, p)) = fix.flat_map(|u| u.programs).find(|(f, _)| *f == function) {
+                return p.to_string();
+            }
+        }
+        correct_programs(self.task, version)[function].to_string()
+    }
+
+    /// A new function's program: usually what the agent intends, sometimes a known-wrong one.
+    fn first_program(&self, agent: usize, spec: &Spec, version: Version, rng: &mut Rng) -> String {
+        if rng.chance(self.wrong_rate) {
+            candidates(self.task, spec.name).wrong[0].to_string()
+        } else {
+            self.intended(agent, spec.name, version)
+        }
+    }
+
+    /// Phase 2: this turn's rewrites of the agent's own functions, lowest layer first. First those whose
+    /// last program isn't what the agent now intends (a wave changed them, or it was wrong); with none,
+    /// now and then a break of a right one.
+    fn rewrites(&self, agent: usize, turn: u32, memory: &Memory, version: Version) -> Vec<(&'static Spec, String)> {
+        let mut out: Vec<(&'static Spec, String)> = Vec::new();
+        for spec in self.task.specs() {
+            let Some(w) = memory.written.iter().find(|w| w.function == spec.name) else { continue };
+            let want = self.intended(agent, spec.name, version);
+            if w.program != want && out.len() < self.moves.rewrites_per_turn {
+                out.push((spec, want));
+            }
+        }
+        // Its own stream, so a break never shifts the other moves' draws.
+        let mut rng = Rng::derive(self.seed ^ 0x6272_6561_6b73, (agent as u64) << 16 | u64::from(turn));
+        if out.is_empty() && !memory.written.is_empty() && rng.chance(self.moves.break_rate) {
+            let w = &memory.written[rng.below(memory.written.len())];
+            let spec = self.task.spec_named(&w.function).expect("a function of the task");
+            out.push((spec, candidates(self.task, spec.name).wrong[0].to_string()));
+        }
+        out
+    }
+}
+
+/// Records that the agent wrote `program` for `function`, with its artifact in Bracken mode.
+fn wrote(memory: &mut Memory, function: &str, program: &str, artifact: Option<String>) {
+    match memory.written.iter_mut().find(|w| w.function == function) {
+        Some(w) => (w.program, w.artifact) = (program.to_string(), artifact),
+        None => memory.written.push(Written { function: function.into(), program: program.into(), artifact }),
+    }
+}
+
 impl Backend for MockBackend {
+    fn lockstep(&self) -> bool {
+        self.lockstep
+    }
+
     fn turn(&self, agent: usize, name: &str, turn: u32, socket: &Path) -> Result<(), String> {
         let mut c = Client::connect(socket, self.shim.as_deref())?;
         let played = self.play(&mut c, agent, name, turn);
@@ -190,7 +315,7 @@ impl MockBackend {
             return Ok(());
         }
         if has("pr_open") {
-            self.git_turn(c, agent, &mut rng, &mut memory)?;
+            self.git_turn(c, agent, turn, &mut rng, &mut memory)?;
             let text = serde_json::to_string(&memory).map_err(|e| e.to_string())?;
             c.tool("notes_write", json!({"text": text}))?;
             c.tool("sync", json!({}))?;
@@ -231,13 +356,7 @@ impl MockBackend {
                 .map(str::to_string)
         };
 
-        // Implement one function not done yet.
-        if let Some(spec) = next_spec(self.task, &memory, agent) {
-            let program = if rng.chance(self.wrong_rate) {
-                candidates(self.task, spec.name).wrong[0].to_string()
-            } else {
-                correct_programs(self.task, version)[spec.name].to_string()
-            };
+        let implement = |c: &mut Client, spec: &Spec, program: &str| -> Result<String, String> {
             let content = format!("def {} {} : {program}\n", spec.name, spec.arity);
             let artifact = first_line(&c.tool("artifact", json!({"function": spec.name, "content": content}))?);
             let to = spec_id(spec.name).ok_or_else(|| format!("{name}: no spec claim for {}", spec.name))?;
@@ -246,13 +365,43 @@ impl MockBackend {
                 // A short id where the tools take one: the spec claim's first 8 digits.
                 json!({"from": artifact, "kind": "implements", "to": if has("news") { &to[..8] } else { &to }, "note": format!("turn {turn}")}),
             )?;
+            Ok(artifact)
+        };
+        let phase2 = !self.task.waves().is_empty();
+        if phase2 {
+            // Rewrite what the specs or a mistake changed, retracting the artifact it replaces.
+            for (spec, program) in self.rewrites(agent, turn, &memory, version) {
+                let old = memory.written.iter().find(|w| w.function == spec.name).and_then(|w| w.artifact.clone());
+                let artifact = implement(c, spec, &program)?;
+                if let Some(old) = old {
+                    // Already gone if another call retracted it; that refusal is expected.
+                    let _ = c.tool("retract", json!({"target": old, "reason": "rewritten"}));
+                }
+                wrote(&mut memory, spec.name, &program, Some(artifact.clone()));
+                memory.mine.push(artifact);
+            }
+        }
+
+        // Implement one function not done yet.
+        if let Some(spec) = next_spec(self.task, &memory, agent) {
+            let program = if phase2 {
+                self.first_program(agent, spec, version, &mut rng)
+            } else if rng.chance(self.wrong_rate) {
+                candidates(self.task, spec.name).wrong[0].to_string()
+            } else {
+                correct_programs(self.task, version)[spec.name].to_string()
+            };
+            let artifact = implement(c, spec, &program)?;
+            if phase2 {
+                wrote(&mut memory, spec.name, &program, Some(artifact.clone()));
+            }
             memory.implemented.push(spec.name.to_string());
             memory.mine.push(artifact);
         }
 
         // Check up to two implementations by others.
         let artifacts = c.tool("log", json!({"kind": "artifact", "current": true}))?;
-        let others: Vec<String> = artifacts
+        let mut others: Vec<String> = artifacts
             .as_array()
             .into_iter()
             .flatten()
@@ -260,6 +409,10 @@ impl MockBackend {
             .filter(|id| !memory.mine.iter().any(|m| m == id) && !memory.checked.iter().any(|m| m == id))
             .map(str::to_string)
             .collect();
+        if phase2 {
+            // Rewrites keep coming: check the newest first, so the backlog doesn't hold up the latest.
+            others.reverse();
+        }
         for id in others.iter().take(2) {
             let result = c.tool("check", json!({"id": id}))?;
             let verdict = if result["ok"].as_bool().unwrap_or(false) { "pass" } else { "fail" };
@@ -276,6 +429,56 @@ impl MockBackend {
         c.tool("sync", json!({}))?;
         Ok(())
     }
+}
+
+/// Git mode, Phase 2: writes `program` as `spec`'s definition on the current branch, in place of the one
+/// there or after the last line.
+fn git_put(c: &mut Client, spec: &Spec, program: &str) -> Result<(), String> {
+    let file = format!("{}.stk", spec.module);
+    let read = c.tool("read", json!({"file": file}))?;
+    let line = format!("def {} {} : {program}", spec.name, spec.arity);
+    let prefix = format!("def {} ", spec.name);
+    let at = file_text(&read).lines().position(|l| l.starts_with(&prefix)).map(|k| k as u64 + 1);
+    let (start, end) = match at {
+        Some(k) => (k, k),
+        None => {
+            let lines = read["lines"].as_u64().unwrap_or(0);
+            (lines + 1, lines)
+        }
+    };
+    c.tool("edit", json!({"file": file, "start": start, "end": end, "text": line}))?;
+    Ok(())
+}
+
+/// A conflicted file resolved by keeping both sides, except that a function both sides define keeps this
+/// branch's definition (the side before `=======`).
+fn keep_ours(text: &str) -> String {
+    let name = |l: &str| l.strip_prefix("def ").and_then(|r| r.split_whitespace().next()).map(str::to_string);
+    let mut out = String::new();
+    let (mut ours, mut theirs, mut side) = (Vec::new(), Vec::new(), 0);
+    for l in text.lines() {
+        if l.starts_with("<<<<<<<") {
+            side = 1;
+        } else if l.starts_with("=======") && side == 1 {
+            side = 2;
+        } else if l.starts_with(">>>>>>>") && side == 2 {
+            let mine: Vec<Option<String>> = ours.iter().map(|l: &String| name(l)).collect();
+            for l in ours
+                .drain(..)
+                .chain(theirs.drain(..).filter(|l: &String| name(l).is_none() || !mine.contains(&name(l))))
+            {
+                out.push_str(&format!("{l}\n"));
+            }
+            side = 0;
+        } else {
+            match side {
+                1 => ours.push(l.to_string()),
+                2 => theirs.push(l.to_string()),
+                _ => out.push_str(&format!("{l}\n")),
+            }
+        }
+    }
+    out
 }
 
 /// A file's text from a `read` result, without its line numbers.
@@ -304,12 +507,57 @@ impl MockBackend {
         let version = self.task.version_of(&file_text(&c.tool("read", json!({"file": TASKS}))?));
         let todo: Vec<_> =
             self.task.specs().iter().filter(|s| !memory.implemented.iter().any(|d| d == s.name)).collect();
-        let Some(spec) = todo.get(agent % 3).or(todo.first()).copied() else { return Ok(()) };
-        let program = if rng.chance(self.wrong_rate) {
+        let phase2 = !self.task.waves().is_empty();
+        if phase2 {
+            // The document may no longer hold what this agent wrote: a concurrent edit of the same line, a
+            // broken line someone deleted, another agent's version. Then it counts as unwritten.
+            let mut texts: Vec<(&str, String)> = Vec::new();
+            for w in memory.written.iter_mut() {
+                let spec = self.task.spec_named(&w.function).ok_or("a function of the task")?;
+                let index = self.task.modules().iter().position(|m| *m == spec.module).ok_or("a spec in no module")?;
+                let file = self.task.module_files()[index];
+                if !texts.iter().any(|(f, _)| *f == file) {
+                    texts.push((file, file_text(&c.tool("read", json!({"file": file}))?)));
+                }
+                let text = &texts.iter().find(|(f, _)| *f == file).expect("read above").1;
+                let line = format!("def {} {} : {}", spec.name, spec.arity, w.program);
+                if !text.lines().any(|l| l == line) {
+                    w.program.clear();
+                }
+            }
+            for (spec, program) in self.rewrites(agent, turn, memory, version) {
+                self.crdt_write(c, spec, &program)?;
+                wrote(memory, spec.name, &program, None);
+            }
+        }
+        let spec =
+            if phase2 { next_spec(self.task, memory, agent) } else { todo.get(agent % 3).or(todo.first()).copied() };
+        let Some(spec) = spec else { return Ok(()) };
+        let program = if phase2 {
+            self.first_program(agent, spec, version, rng)
+        } else if rng.chance(self.wrong_rate) {
             candidates(self.task, spec.name).wrong[0].to_string()
         } else {
             correct_programs(self.task, version)[spec.name].to_string()
         };
+        self.crdt_write(c, spec, &program)?;
+        if phase2 {
+            wrote(memory, spec.name, &program, None);
+        }
+        // Another module can still be broken by someone else's merge: then the check can't run,
+        // and the mock counts that as failing, as an agent would.
+        let ok = c.tool("check", json!({"function": spec.name})).is_ok_and(|v| v["ok"].as_bool().unwrap_or(false));
+        let notes = file_text(&c.tool("read", json!({"file": NOTES}))?);
+        let n = notes.lines().count() as i64;
+        let note =
+            format!("{name}, turn {turn}: wrote {} (public check {})", spec.name, if ok { "passes" } else { "fails" });
+        c.tool("edit", json!({"file": NOTES, "start": n + 1, "end": n, "text": note}))?;
+        memory.implemented.push(spec.name.to_string());
+        Ok(())
+    }
+
+    /// CRDT mode: writes `program` as `spec`'s one definition in its module file.
+    fn crdt_write(&self, c: &mut Client, spec: &Spec, program: &str) -> Result<(), String> {
         let line = format!("def {} {} : {program}", spec.name, spec.arity);
         let index = self.task.modules().iter().position(|m| *m == spec.module).ok_or("a spec in no module")?;
         let file = self.task.module_files()[index];
@@ -345,22 +593,23 @@ impl MockBackend {
                 c.tool("edit", json!({"file": file, "start": n + 1, "end": n, "text": line}))?
             }
         };
-        // Another module can still be broken by someone else's merge: then the check can't run,
-        // and the mock counts that as failing, as an agent would.
-        let ok = c.tool("check", json!({"function": spec.name})).is_ok_and(|v| v["ok"].as_bool().unwrap_or(false));
-        let notes = file_text(&c.tool("read", json!({"file": NOTES}))?);
-        let n = notes.lines().count() as i64;
-        let note =
-            format!("{name}, turn {turn}: wrote {} (public check {})", spec.name, if ok { "passes" } else { "fails" });
-        c.tool("edit", json!({"file": NOTES, "start": n + 1, "end": n, "text": note}))?;
-        memory.implemented.push(spec.name.to_string());
         Ok(())
     }
 
-    fn git_turn(&self, c: &mut Client, agent: usize, rng: &mut Rng, memory: &mut Memory) -> Result<(), String> {
+    fn git_turn(
+        &self,
+        c: &mut Client,
+        agent: usize,
+        turn: u32,
+        rng: &mut Rng,
+        memory: &mut Memory,
+    ) -> Result<(), String> {
         let version = self.task.version_of(&file_text(&c.tool("read", json!({"file": "TASKS.md"}))?));
+        let phase2 = !self.task.waves().is_empty();
         let program = |spec: &Spec, rng: &mut Rng| {
-            if rng.chance(self.wrong_rate) {
+            if phase2 {
+                self.first_program(agent, spec, version, rng)
+            } else if rng.chance(self.wrong_rate) {
                 candidates(self.task, spec.name).wrong[0].to_string()
             } else {
                 correct_programs(self.task, version)[spec.name].to_string()
@@ -390,17 +639,57 @@ impl MockBackend {
                 continue;
             }
             for file in merged["conflicts"].as_array().into_iter().flatten().filter_map(Value::as_str) {
-                // Both sides only add definitions: keep both.
+                // Both sides only add definitions: keep both. In Phase 2 both may rewrite one: keep this
+                // branch's.
                 let read = c.tool("read", json!({"file": file}))?;
-                let kept: String = file_text(&read)
-                    .lines()
-                    .filter(|l| !(l.starts_with("<<<<<<<") || l.starts_with("=======") || l.starts_with(">>>>>>>")))
-                    .map(|l| format!("{l}\n"))
-                    .collect();
+                let kept: String = if phase2 {
+                    keep_ours(&file_text(&read))
+                } else {
+                    file_text(&read)
+                        .lines()
+                        .filter(|l| !(l.starts_with("<<<<<<<") || l.starts_with("=======") || l.starts_with(">>>>>>>")))
+                        .map(|l| format!("{l}\n"))
+                        .collect()
+                };
                 let lines = read["lines"].as_u64().unwrap_or(0);
                 c.tool("edit", json!({"file": file, "start": 1, "end": lines, "text": kept}))?;
             }
             c.tool("commit", json!({"message": format!("Merge main into {branch}")}))?;
+        }
+
+        // Phase 2: rewrite what the specs or a mistake changed, on the function's own branch while its PR is
+        // open, else on one branch from main for the turn, with a PR.
+        if phase2 {
+            let mut from_main = Vec::new();
+            let mut pushed = false;
+            for (spec, program) in self.rewrites(agent, turn, memory, version) {
+                let branch = format!("f-{}", spec.name);
+                let open_pr = memory.prs.iter().any(|(n, b)| *b == branch && open.iter().any(|p| p["number"] == *n));
+                if !open_pr {
+                    from_main.push((spec, program));
+                } else if c.calls + 5 <= budget {
+                    c.tool("switch", json!({"branch": branch}))?;
+                    git_put(c, spec, &program)?;
+                    c.tool("commit", json!({"message": format!("Rewrite {}", spec.name)}))?;
+                    wrote(memory, spec.name, &program, None);
+                    pushed = true;
+                }
+            }
+            if !from_main.is_empty() && c.calls + 4 + 2 * from_main.len() as u32 <= budget {
+                let branch = format!("u{turn}-{}", from_main[0].0.name);
+                c.tool("switch", json!({"branch": branch, "create": true}))?;
+                for (spec, program) in &from_main {
+                    git_put(c, spec, program)?;
+                    wrote(memory, spec.name, program, None);
+                }
+                c.tool("commit", json!({"message": format!("Rewrite {}", from_main[0].0.name)}))?;
+                c.tool("sync", json!({}))?;
+                if let Ok(opened) = c.tool("pr_open", json!({"branch": branch, "title": "Rewrite"})) {
+                    memory.prs.push((opened["number"].as_u64().unwrap_or(0), branch));
+                }
+            } else if pushed {
+                c.tool("sync", json!({}))?;
+            }
         }
 
         // Implement one function on a branch of its own, and open a PR.
@@ -410,8 +699,12 @@ impl MockBackend {
             c.tool("switch", json!({"branch": branch, "create": true}))?;
             let file = format!("{}.stk", spec.module);
             let lines = c.tool("read", json!({"file": file}))?["lines"].as_u64().unwrap_or(0);
-            let def = format!("def {} {} : {}", spec.name, spec.arity, program(spec, rng));
+            let written = program(spec, rng);
+            let def = format!("def {} {} : {written}", spec.name, spec.arity);
             c.tool("edit", json!({"file": file, "start": lines + 1, "end": lines, "text": def}))?;
+            if phase2 {
+                wrote(memory, spec.name, &written, None);
+            }
             c.tool("commit", json!({"message": format!("Implement {}", spec.name)}))?;
             c.tool("sync", json!({}))?;
             // At the open-PR cap the hub refuses; the branch waits for a later turn.
