@@ -2037,6 +2037,19 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         none_left("the test ignoring SIGTERM");
         assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the box was left: {}", text(&out));
 
+        // The tests here hit their limit, here 3 s, with no Ctrl-C, while a test ignores SIGTERM: timeout
+        // exits 124 as cargo does, and test-table still kills the test, by timeout's group (note 263eb49eb068).
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        std::fs::write(t("left"), "running").unwrap();
+        let _ = std::fs::remove_file(t("pids"));
+        let started = std::time::Instant::now();
+        let out = split_with("0", "600", "", &[("IGNORE_TERM", "1")], None);
+        let took = started.elapsed();
+        assert_eq!(out.status.code(), Some(124), "{scripts}: {}", text(&out));
+        assert!(took < std::time::Duration::from_secs(120), "{scripts}: took {took:?}: {}", text(&out));
+        none_left("the test ignoring SIGTERM at the limit");
+        assert_eq!(read("deleted"), "delete --yes bx_stub01\n", "{scripts}: the box was left: {}", text(&out));
+
         // Tests here that fail fast, timeout reaped before test-table waits on it (a delay put in on
         // purpose): the run still fails with their exit, not a pass (note fa805ecf517e).
         let script = std::fs::read_to_string(dir.join("scripts/test-table")).unwrap();
