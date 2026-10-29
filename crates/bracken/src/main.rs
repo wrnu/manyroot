@@ -583,7 +583,13 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
         Command::Intend { id, duration } => {
             let who = signer(&s, agent)?;
             let target = resolve(&s, &id)?;
-            let until = humantime::format_rfc3339_seconds(std::time::SystemTime::now() + duration).to_string();
+            // RFC 3339 years have four digits, so the last expiry it can write is 9999-12-31T23:59:59Z.
+            let last = std::time::UNIX_EPOCH + std::time::Duration::from_secs(253_402_300_799);
+            let until =
+                std::time::SystemTime::now().checked_add(duration).filter(|t| *t <= last).with_context(|| {
+                    format!("--for {} would end after the year 9999", humantime::format_duration(duration))
+                })?;
+            let until = humantime::format_rfc3339_seconds(until).to_string();
             let statement = format!("intent: working on {} until {until}", target.short());
             let tags = vec![INTENT_TAG.to_owned(), format!("{UNTIL_TAG}{until}")];
             let intent = contribute(&mut s, &who, Body::Claim { statement, tags })?;
@@ -848,7 +854,7 @@ fn print_status(s: &Store, all: bool, policy: &PolicyArgs, json_out: bool) -> Re
     for id in &order {
         let c = g.get(id).expect("ordered ids exist");
         // Intents are about other claims, not subjects of their own.
-        let is_claim = matches!(c.body(), Body::Claim { tags, .. } if !tags.iter().any(|t| t == INTENT_TAG));
+        let is_claim = matches!(c.body(), Body::Claim { .. }) && !is_intent(g, &view, c);
         if view.hidden.contains(id) || !is_claim {
             continue;
         }
@@ -959,8 +965,9 @@ const UNTIL_TAG: &str = "until:";
 
 /// A live intent: a current claim tagged `intent`, with a tag `until:<RFC 3339 time>` still in the
 /// future, related to its target by a current `refines` relation its own author wrote, and not
-/// ended by delivery: no current `implements` relation to the target by the same author that isn't
-/// causally before the intent. A convention on ordinary contributions; the time is advisory.
+/// ended by delivery: no `implements` relation to the target by the same author that isn't causally
+/// before the intent and that its author hasn't retracted. A convention on ordinary contributions;
+/// the time is advisory.
 struct Intent<'a> {
     claim: &'a Contribution,
     until: String,
@@ -969,32 +976,55 @@ struct Intent<'a> {
 
 /// The live intents on `target`, oldest first.
 fn live_intents<'a>(g: &'a Graph, view: &CurrentView, target: &ContributionId, now: u64) -> Vec<Intent<'a>> {
-    let current = |c: &&Contribution| !view.hidden.contains(&c.id());
     let relations = |kind: RelationKind| {
-        g.referrers(target).filter(current).filter_map(move |r| match r.body() {
+        g.referrers(target).filter_map(move |r| match r.body() {
             Body::Relation { from, kind: k, to, .. } if *k == kind && to == target => Some((r, *from)),
             _ => None,
         })
     };
     let mut intents: Vec<Intent> = relations(RelationKind::Refines)
+        .filter(|(r, _)| !view.hidden.contains(&r.id()))
         .filter_map(|(r, from)| {
             // Current already: a relation that refers to a hidden (retracted, superseded) claim is hidden too.
             let claim = g.get(&from)?;
-            let Body::Claim { tags, .. } = claim.body() else { return None };
-            if r.author() != claim.author() || !tags.iter().any(|t| t == INTENT_TAG) {
+            if r.author() != claim.author() {
                 return None;
             }
-            let until = tags.iter().find_map(|t| t.strip_prefix(UNTIL_TAG))?;
-            let at = humantime::parse_rfc3339(until).ok()?;
-            let until_ms = at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64;
-            let delivered = relations(RelationKind::Implements)
-                .any(|(d, _)| d.author() == claim.author() && !g.is_ancestor(&d.id(), &claim.id()));
+            let (until, until_ms) = intent_until(claim)?;
+            // Only the delivery relation's own retraction undoes it, not what happens to the
+            // contribution it relates, which someone else may have written.
+            let delivered = relations(RelationKind::Implements).any(|(d, _)| {
+                d.author() == claim.author() && !g.is_retracted(&d.id()) && !g.is_ancestor(&d.id(), &claim.id())
+            });
             (until_ms > now && !delivered).then(|| Intent { claim, until: until.to_owned(), until_ms })
         })
         .collect();
     intents.sort_by_key(|i| (i.claim.content().timestamp_ms, i.claim.id()));
     intents.dedup_by_key(|i| i.claim.id());
     intents
+}
+
+/// An intent claim's expiry, as written and in milliseconds since the Unix epoch: `None` unless `c`
+/// is a claim tagged `intent` with a parseable `until:` tag.
+fn intent_until(c: &Contribution) -> Option<(&str, u64)> {
+    let Body::Claim { tags, .. } = c.body() else { return None };
+    if !tags.iter().any(|t| t == INTENT_TAG) {
+        return None;
+    }
+    let until = tags.iter().find_map(|t| t.strip_prefix(UNTIL_TAG))?;
+    let at = humantime::parse_rfc3339(until).ok()?;
+    Some((until, at.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64))
+}
+
+/// Whether `c` is an intent, live or not: it has an expiry, and its own author relates it to
+/// something with a current `refines` relation. Any other claim tagged `intent` is an ordinary claim.
+fn is_intent(g: &Graph, view: &CurrentView, c: &Contribution) -> bool {
+    intent_until(c).is_some()
+        && g.referrers(&c.id()).any(|r| {
+            r.author() == c.author()
+                && !view.hidden.contains(&r.id())
+                && matches!(r.body(), Body::Relation { from, kind: RelationKind::Refines, .. } if *from == c.id())
+        })
 }
 
 fn intent_json(g: &Graph, names: &Names, i: &Intent, now: u64) -> Value {
