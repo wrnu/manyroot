@@ -5,7 +5,6 @@
 
 use std::io::{self, Read, Write};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail};
 use manyroot::Verdict;
@@ -28,49 +27,42 @@ pub struct Outcome {
 
 /// Runs `command` (program and arguments, no shell) in the current directory, with no input, its
 /// output streamed to stderr as it comes. Refuses, so that nothing is recorded, when it can't start.
+///
+/// Its stdout and stderr are one pipe, as `2>&1` makes them, so the details hold the output in the
+/// order the command wrote it (note 4a2c53c065a9: two pipes read on two threads interleave by chance).
 pub fn run(command: &[String]) -> Result<Outcome> {
     let Some((program, args)) = command.split_first() else { bail!("--run needs a command after --") };
-    let mut child = match Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(e) => bail!("couldn't start {program}: {e}; nothing recorded"),
+    let (mut output, into) = io::pipe()?;
+    let mut child = {
+        // The command holds the pipe's write ends until it's dropped here, so reading ends when the
+        // command (and anything it left holding them) closes them.
+        let mut cmd = Command::new(program);
+        cmd.args(args).stdin(Stdio::null()).stdout(into.try_clone()?).stderr(into);
+        match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => bail!("couldn't start {program}: {e}; nothing recorded"),
+        }
     };
-    let held = Arc::new(Mutex::new(Vec::new()));
-    let readers: Vec<_> = [
-        child.stdout.take().map(|o| Box::new(o) as Box<dyn Read + Send>),
-        child.stderr.take().map(|e| Box::new(e) as Box<dyn Read + Send>),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|mut from| {
-        let held = Arc::clone(&held);
-        std::thread::spawn(move || {
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = from.read(&mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                let _ = io::stderr().write_all(&chunk[..n]);
-                let mut held = held.lock().unwrap_or_else(|p| p.into_inner());
-                held.extend_from_slice(&chunk[..n]);
-                if held.len() > 2 * HELD {
-                    let cut = held.len() - HELD;
-                    held.drain(..cut);
-                }
+    let mut held = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = match output.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("reading {program}'s output: {e}; nothing recorded");
             }
-        })
-    })
-    .collect();
-    let exit = child.wait()?;
-    for r in readers {
-        let _ = r.join();
+        };
+        let _ = io::stderr().write_all(&chunk[..n]);
+        held.extend_from_slice(&chunk[..n]);
+        if held.len() > 2 * HELD {
+            held.drain(..held.len() - HELD);
+        }
     }
-    let output = held.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let exit = child.wait()?;
     let (ended, status) = match exit.code() {
         Some(code) => (format!("exit {code}"), u8::try_from(code).unwrap_or(1)),
         None => {
@@ -82,7 +74,7 @@ pub fn run(command: &[String]) -> Result<Outcome> {
         }
     };
     let verdict = if exit.success() { Verdict::Pass } else { Verdict::Fail };
-    let details = format!("{ended}\n{}", tail(&printable(&output)));
+    let details = format!("{ended}\n{}", tail(&printable(&held)));
     Ok(Outcome { verdict, method: command_line(command), details, status })
 }
 
