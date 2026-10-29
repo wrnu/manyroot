@@ -64,8 +64,8 @@ pub struct Property {
     pub arity: u8,
     /// The members it calls. A member is graded by every property that calls it.
     pub calls: &'static [&'static str],
-    /// The property on one case.
-    pub eval: fn(&mut Caller<'_>, &[i64]) -> Probe,
+    /// The property on one case, under the specs in force: a change request can change a convention's rules.
+    pub eval: fn(&mut Caller<'_>, &[i64], Version) -> Probe,
 }
 
 /// A property on one case: the expression, what it gave and what it must give.
@@ -78,7 +78,8 @@ pub struct Probe {
 /// An open contract's inputs are drawn from -CONTRACT_RANGE..=CONTRACT_RANGE, as its specs state.
 pub const CONTRACT_RANGE: i64 = 1000;
 
-/// A change request: the experiment releases all of them at once, partway through a run.
+/// A change request. Phase 1 releases all of its at once, partway through a run; Phase 2 releases its in
+/// two waves ([`Task::waves`]). A variant's number is its bit in a [`Version`], so new ones go last.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
     ClampOrder,
@@ -87,6 +88,20 @@ pub enum Change {
     BetweenExclusive,
     AbsSaturates,
     SpreadCounts,
+    ClampHiFirst,
+    CutSigned,
+    NoneWide,
+    WeighSubtracts,
+    RankWide,
+    IsMoreFar,
+    MixSubtracts,
+}
+
+/// One release of change requests, all agents at once: after `share` of each agent's turns, rounded to the
+/// nearest turn.
+pub struct Wave {
+    pub share: f64,
+    pub changes: &'static [Change],
 }
 
 pub struct ChangeRequest {
@@ -165,8 +180,42 @@ impl Task {
     pub fn changes(self) -> &'static [ChangeRequest] {
         match self {
             Task::Phase1 => phase1::CHANGES,
-            Task::Phase2 => &[],
+            Task::Phase2 => phase2::CHANGES,
         }
+    }
+
+    /// Phase 2's waves of change requests. Phase 1 has none: it releases every change at once, after
+    /// [`crate::driver::RELEASE_AT`] of all agent-turns, as its runs did.
+    pub fn waves(self) -> &'static [Wave] {
+        match self {
+            Task::Phase1 => &[],
+            Task::Phase2 => phase2::WAVES,
+        }
+    }
+
+    /// How many releases a run has: one per wave, and Phase 1's one.
+    pub fn releases(self) -> usize {
+        self.waves().len().max(1)
+    }
+
+    /// The turn after which each wave goes out, in a run of `turns` turns: `share * turns` rounded to the
+    /// nearest, half up, the same in every mode.
+    pub fn wave_turns(self, turns: u32) -> Vec<u32> {
+        self.waves().iter().map(|w| (w.share * f64::from(turns) + 0.5).floor() as u32).collect()
+    }
+
+    /// The specs in force once releases `1..=wave` are out; 0 is the original. Phase 1's one release is 1.
+    pub fn after_wave(self, wave: usize) -> Version {
+        if self.waves().is_empty() {
+            return if wave == 0 { Version::ORIGINAL } else { self.all() };
+        }
+        self.waves().iter().take(wave).flat_map(|w| w.changes).fold(Version::ORIGINAL, |v, c| v.with(*c))
+    }
+
+    /// The change requests release `wave` adds, in the order the task lists them.
+    pub fn wave_changes(self, wave: usize) -> impl Iterator<Item = &'static ChangeRequest> {
+        let before = self.after_wave(wave.saturating_sub(1));
+        self.changes_in(self.after_wave(wave)).filter(move |c| !before.has(c.change))
     }
 
     pub fn contracts(self) -> &'static [Contract] {
@@ -266,7 +315,7 @@ impl Task {
         if self.contract_of(name).is_some() {
             for (index, property) in self.properties_of(name) {
                 for case in self.property_cases(index, property) {
-                    let probe = self.probe(property, &case, library, library);
+                    let probe = self.probe(property, &case, library, library, version);
                     total += 1;
                     match probe.failure() {
                         None => passed += 1,
@@ -297,7 +346,14 @@ impl Task {
     }
 
     /// `property` on `case`, each member's definition taken from `library` and its calls resolved by `calls`.
-    pub fn probe(self, property: &Property, case: &Case, library: &Library, calls: &dyn Calls) -> Probe {
+    pub fn probe(
+        self,
+        property: &Property,
+        case: &Case,
+        library: &Library,
+        calls: &dyn Calls,
+        version: Version,
+    ) -> Probe {
         let mut call = |name: &str, args: &[i64]| -> Result<i64, String> {
             let def = library.get(name).ok_or_else(|| library.why_missing(name))?;
             match self.spec_named(name) {
@@ -307,7 +363,7 @@ impl Task {
                 _ => run(def, args, calls),
             }
         };
-        (property.eval)(&mut call, &case[..usize::from(property.arity)])
+        (property.eval)(&mut call, &case[..usize::from(property.arity)], version)
     }
 
     /// The task as agents read it under `version`: the language, the modules and
@@ -422,6 +478,13 @@ pub fn change_tag(change: Change) -> &'static str {
         Change::BetweenExclusive => "between-exclusive",
         Change::AbsSaturates => "abs-saturates",
         Change::SpreadCounts => "spread-counts",
+        Change::ClampHiFirst => "clamp-hi-first",
+        Change::CutSigned => "cut-signed",
+        Change::NoneWide => "none-wide",
+        Change::WeighSubtracts => "weigh-subtracts",
+        Change::RankWide => "rank-wide",
+        Change::IsMoreFar => "ismore-far",
+        Change::MixSubtracts => "mix-subtracts",
     }
 }
 

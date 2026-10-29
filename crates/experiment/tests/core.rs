@@ -634,3 +634,85 @@ fn an_agent_that_stops_reading_ends_at_the_turns_deadline() {
     let log = events(&outcome.events);
     assert_eq!(log.iter().filter(|e| e["event"] == "turn_error" && e["data"]["step"] == "play").count(), 1);
 }
+
+/// Note 6b8e8ce21f94: Bracken's store records the agent's own current implementations of open contracts'
+/// members after each call that can change them and after each sync, since a release the sync brings can
+/// supersede a member's spec and so its implementations. Phase 1's syncs record nothing.
+#[test]
+fn bracken_records_an_agents_contract_members_after_its_calls_and_its_syncs() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let config = |task: Task, name: &str, identity: &str| StoreConfig {
+        task,
+        dir: dir.path().join(name),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        identity: identity.into(),
+        trace: false,
+        accept_rule: Default::default(),
+    };
+    let sockets = dir.path().join("s");
+    std::fs::create_dir(&sockets).expect("sockets");
+    let t = Task::Phase2;
+    let mut hub = Worker::spawn(&bin(), "bracken", &config(t, "hub", "setter")).expect("hub");
+    hub.ok(&request("setup")).expect("hub setup");
+    let seed = Worker::bytes(&hub.ok(&request("export")).expect("export")).expect("bytes");
+    let mut copy = Worker::spawn(&bin(), "bracken", &config(t, "a", "agent-a")).expect("copy");
+    let reply = copy
+        .ok(&Request { op: "setup".into(), bytes: Some(hex::encode(&seed)), ..Request::default() })
+        .expect("copy setup");
+    let key = reply.result["key"].as_str().expect("a key").to_string();
+    let session = Session {
+        agent: 0,
+        name: "agent-0".into(),
+        peers: vec![key],
+        quota_contributions: 100,
+        quota_bytes: 1 << 20,
+        sync_seconds: 0,
+    };
+    let tool = |w: &mut Worker, name: &str, args: Value| {
+        w.ok(&Request { op: "tool".into(), tool: Some(name.into()), args, ..Request::default() }).expect(name)
+    };
+    let members = |record: &Value| -> Vec<String> {
+        record["members"].as_array().expect("members").iter().map(|m| m[0].as_str().expect("a name").into()).collect()
+    };
+    let implement = |w: &mut Worker, function: &str, program: &str| -> Value {
+        let content = format!("def {function} {} : {program}\n", t.spec_named(function).expect("a spec").arity);
+        let made = tool(w, "artifact", serde_json::json!({"function": function, "content": content}));
+        let artifact =
+            made.result["output"].as_str().expect("output").lines().next().expect("an id").trim().to_string();
+        let specs = tool(w, "log", serde_json::json!({"tag": function, "current": true})).result;
+        let spec = specs.as_array().expect("a list").iter().rev().find(|e| e["kind"] == "claim").expect("a spec claim")
+            ["id"]
+            .as_str()
+            .expect("an id")
+            .to_string();
+        tool(w, "relate", serde_json::json!({"from": artifact, "kind": "implements", "to": spec})).record
+    };
+    assert_eq!(members(&implement(&mut copy, "rank", "a b -")), ["rank"], "after the relate");
+    assert_eq!(members(&implement(&mut copy, "isless", "a 0 <")), ["rank", "isless"]);
+    let record_sync = |copy: &mut Worker| copy.ok(&request("record_sync")).expect("record_sync").result;
+    sync_session(&mut hub, &mut copy, &sockets, &session).expect("a sync");
+    assert_eq!(members(&record_sync(&mut copy)), ["rank", "isless"]);
+    // A release must name its wave.
+    assert!(hub.ok(&request("release")).is_err(), "no wave");
+    for wave in [0, 3] {
+        let release = Request { op: "release".into(), args: serde_json::json!({"wave": wave}), ..Request::default() };
+        assert!(hub.ok(&release).is_err(), "Phase 2 has waves 1 and 2, not {wave}");
+    }
+    // Wave 1 leaves rank alone; wave 2 supersedes rank's spec, so the agent's rank stops being current.
+    for wave in [1, 2] {
+        let release = Request { op: "release".into(), args: serde_json::json!({"wave": wave}), ..Request::default() };
+        hub.ok(&release).expect("a release");
+        sync_session(&mut hub, &mut copy, &sockets, &session).expect("a sync");
+        let want: &[&str] = if wave == 1 { &["rank", "isless"] } else { &["isless"] };
+        assert_eq!(members(&record_sync(&mut copy)), want, "after wave {wave}");
+    }
+    // Phase 1 has no open contracts: its syncs record nothing.
+    let mut phase1 = Worker::spawn(&bin(), "bracken", &config(Task::Phase1, "p1", "setter")).expect("a store");
+    phase1.ok(&request("setup")).expect("setup");
+    assert!(phase1.ok(&request("record_sync")).expect("record_sync").result.is_null());
+    let release =
+        |wave: u64| Request { op: "release".into(), args: serde_json::json!({"wave": wave}), ..Request::default() };
+    assert!(phase1.ok(&release(2)).is_err(), "Phase 1 has one release");
+    assert!(phase1.ok(&release(1)).is_ok());
+}

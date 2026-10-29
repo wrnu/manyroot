@@ -8,7 +8,8 @@
 //! so it passes every public case (inputs from -6 to 6) and fails hidden ones. A member of an open contract
 //! that reads another member's value is wrong only where that value is beyond what public inputs give.
 
-use super::{Candidates, c};
+use super::{Candidates, Revision, Update, c};
+use crate::task::Change;
 
 pub(super) const CANDIDATES: &[Candidates] = &[
     c("abs", &["a 0 < a neg a ?", "a 0 > a a neg ?"], &["a", "a 7 < a 0 < a neg a ? a 0 < a neg a ? 1 + ?"]),
@@ -338,4 +339,176 @@ pub const OTHER_CHOICE: &[(&str, &str)] = &[
     ("isnone", "a 99999 ="),
     ("either", "a 99999 = b a ?"),
     ("plus", "a 99999 = 99999 b 99999 = 99999 a b + ? ?"),
+];
+
+/// The programs each change request needs, in the order they apply: a later one replaces an earlier one's
+/// program. Both of open contract none's changes move none to -5000, and `cut-signed`'s comes last so its
+/// `cut` wins; `rank-wide`'s `rank` says how far apart a and b are up to 3, so `ismore-far`'s `ismore` reads
+/// it as it reads `a - b`.
+pub(super) const UPDATES: &[Update] = &[
+    Update {
+        change: Change::ClampOrder,
+        programs: &[
+            ("clamp3", "c a max2@ b min2@"),
+            ("clampsq", "b c a sq@ clamp3@"),
+            ("pull", "c opp@ c a b toward@ clamp3@"),
+            ("clip", "0 b 0 max2@ a clamp3@"),
+            ("fit", "b c min2@ b c max2@ a clamp3@"),
+            ("pinned", "b c a clamp3@ a neq@"),
+            ("safe", "b c a clamp3@ c b ge@ *"),
+            ("trim", "a sign@ 0 b a abs@ clamp3@ *"),
+            ("cap", "a b c clampsq@ b c a clamp3@ -"),
+            ("box", "a b c fit@ b c a clamp3@ -"),
+            ("hold", "b c a b c snap@ clamp3@"),
+            ("grade", "b c a b c route@ clamp3@"),
+            ("tune", "a b c press@ c opp@ c b clamp3@ +"),
+        ],
+    },
+    Update {
+        change: Change::ClampHiFirst,
+        programs: &[
+            ("clamp3", "c b max2@ a min2@"),
+            ("clampsq", "c b a sq@ clamp3@"),
+            ("pull", "c c opp@ a b toward@ clamp3@"),
+            ("clip", "b 0 max2@ 0 a clamp3@"),
+            ("fit", "b c max2@ b c min2@ a clamp3@"),
+            ("pinned", "c b a clamp3@ a neq@"),
+            ("safe", "c b a clamp3@ c b ge@ *"),
+            ("trim", "a sign@ b 0 a abs@ clamp3@ *"),
+            ("cap", "a b c clampsq@ c b a clamp3@ -"),
+            ("box", "a b c fit@ c b a clamp3@ -"),
+            ("hold", "c b a b c snap@ clamp3@"),
+            ("grade", "c b a b c route@ clamp3@"),
+            ("tune", "a b c press@ c c opp@ b clamp3@ +"),
+        ],
+    },
+    Update { change: Change::SignOfZero, programs: &[("sign", "a 0 < -1 1 ?")] },
+    Update { change: Change::BetweenExclusive, programs: &[("between", "a b < 0 a c < 1 0 ? ?")] },
+    Update {
+        change: Change::NoneWide,
+        programs: &[
+            ("cut", "a b < -5000 a b - ?"),
+            ("pos", "a 0 > a -5000 ?"),
+            ("isnone", "a -5000 ="),
+            ("either", "a -5000 = b a ?"),
+            ("plus", "a -5000 = -5000 b -5000 = -5000 a b + ? ?"),
+        ],
+    },
+    Update {
+        change: Change::CutSigned,
+        programs: &[
+            ("cut", "a b - -1000 < -5000 a b - 1000 > -5000 a b - ? ?"),
+            ("pos", "a 0 > a -5000 ?"),
+            ("isnone", "a -5000 ="),
+            ("either", "a -5000 = b a ?"),
+            ("plus", "a -5000 = -5000 b -5000 = -5000 a b + ? ?"),
+        ],
+    },
+    Update { change: Change::WeighSubtracts, programs: &[("weigh", "a b c gap@ a b c count3@ -")] },
+    Update { change: Change::IsMoreFar, programs: &[("ismore", "a 2 >")] },
+    Update { change: Change::RankWide, programs: &[("rank", "a b 2 + > 3 a b > 1 a b = 0 a 2 + b < -3 -1 ? ? ? ?")] },
+    Update { change: Change::NearerTies, programs: &[("nearer", "a b dist@ a c dist@ < b c ?")] },
+    Update {
+        change: Change::AbsSaturates,
+        programs: &[("abs", "a 0 < a neg a ? dup -1 > swap 9223372036854775807 ?")],
+    },
+    Update { change: Change::MixSubtracts, programs: &[("mix", "a b tilt@ a b clip@ -")] },
+];
+
+/// Each change request's target under it, in the correct library with the change's updates.
+pub(super) const REVISIONS: &[Revision] = &[
+    Revision {
+        change: Change::ClampOrder,
+        candidates: c(
+            "clamp3",
+            &["c a max2@ b min2@", "a c max2@ b min2@"],
+            &["c b min2@ a max2@", "a 7 < c a max2@ b min2@ c a max2@ b min2@ 1 + ?"],
+        ),
+    },
+    Revision {
+        change: Change::ClampHiFirst,
+        candidates: c(
+            "clamp3",
+            &["c b max2@ a min2@", "b c max2@ a min2@"],
+            &["c a min2@ b max2@", "a 7 < c b max2@ a min2@ c b max2@ a min2@ 1 + ?"],
+        ),
+    },
+    Revision {
+        change: Change::SignOfZero,
+        candidates: c(
+            "sign",
+            &["a 0 < -1 1 ?", "0 a > -1 1 ?"],
+            &["a 0 > 1 -1 ?", "a 7 < a 0 < -1 1 ? a 0 < -1 1 ? 1 + ?"],
+        ),
+    },
+    Revision {
+        change: Change::BetweenExclusive,
+        candidates: c(
+            "between",
+            &["a b < 0 a c < 1 0 ? ?", "a b < 0 = a c < *"],
+            &["a b < 0 a c > 0 1 ? ?", "a 7 < a b < 0 a c < 1 0 ? ? a b < 0 a c < 1 0 ? ? 1 + ?"],
+        ),
+    },
+    Revision {
+        change: Change::CutSigned,
+        candidates: c(
+            "cut",
+            &["a b - -1000 < -5000 a b - 1000 > -5000 a b - ? ?", "a b - dup -1000 < swap 1000 > + -5000 a b - ?"],
+            &["a b < -5000 a b - ?", "a b - -1000 < -5000 a b - ?"],
+        ),
+    },
+    Revision {
+        change: Change::NoneWide,
+        candidates: c("isnone", &["a -5000 =", "-5000 a ="], &["a -1 =", "a -5000 = a 18 > +"]),
+    },
+    Revision {
+        change: Change::WeighSubtracts,
+        candidates: c(
+            "weigh",
+            &["a b c gap@ a b c count3@ -", "a b c count3@ neg a b c gap@ +"],
+            &["a b c gap@ a b c count3@ +", "a 7 < a b c gap@ a b c count3@ - a b c gap@ a b c count3@ - 1 + ?"],
+        ),
+    },
+    Revision {
+        change: Change::RankWide,
+        candidates: c(
+            "rank",
+            &["a b 2 + > 3 a b > 1 a b = 0 a 2 + b < -3 -1 ? ? ? ?", "a b < -1 a b > 1 0 ? ?"],
+            &["b a -", "a b -"],
+        ),
+    },
+    Revision {
+        change: Change::IsMoreFar,
+        candidates: c("ismore", &["a 2 >", "2 a <"], &["a 0 >", "a 12 > 0 a 2 > ?"]),
+    },
+    Revision {
+        change: Change::NearerTies,
+        candidates: c(
+            "nearer",
+            &["a b dist@ a c dist@ < b c ?", "a c dist@ a b dist@ > b c ?"],
+            &["a b dist@ a c dist@ > c b ?", "a 7 < a b dist@ a c dist@ < b c ? a b dist@ a c dist@ < b c ? 1 + ?"],
+        ),
+    },
+    Revision {
+        change: Change::AbsSaturates,
+        candidates: c(
+            "abs",
+            &[
+                "a 0 < a neg a ? dup -1 > swap 9223372036854775807 ?",
+                "a -9223372036854775807 < 9223372036854775807 a 0 < a neg a ? ?",
+            ],
+            &[
+                "a 0 < a neg a ?",
+                "a 7 < a 0 < a neg a ? dup -1 > swap 9223372036854775807 ? a 0 < a neg a ? dup -1 > swap 9223372036854775807 ? 1 + ?",
+            ],
+        ),
+    },
+    Revision {
+        change: Change::MixSubtracts,
+        candidates: c(
+            "mix",
+            &["a b tilt@ a b clip@ -", "a b clip@ neg a b tilt@ +"],
+            &["a b tilt@ a b clip@ +", "a 7 < a b tilt@ a b clip@ - a b tilt@ a b clip@ - 1 + ?"],
+        ),
+    },
 ];

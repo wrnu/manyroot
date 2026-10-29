@@ -1102,13 +1102,13 @@ impl Store for GitStore {
         prs::run(self, session, name, &args)
     }
 
-    fn release_changes(&mut self) -> Result<Value, String> {
+    fn release_changes(&mut self, wave: usize) -> Result<Value, String> {
         let main = self.rev("refs/heads/main")?.ok_or("the hub has no main")?;
         let task = self.config.task;
-        let tasks = task.tasks_md(task.all());
+        let tasks = task.tasks_md(task.after_wave(wave));
         let commit = self.commit_files(Some(&main), &[(TASKS, tasks.as_str())], "Change requests")?;
         self.git(&["update-ref", "refs/heads/main", &commit, &main], None)?;
-        let released: Vec<&str> = task.changes().iter().map(|c| change_tag(c.change)).collect();
+        let released: Vec<&str> = task.wave_changes(wave).map(|c| change_tag(c.change)).collect();
         Ok(json!({ "released": released }))
     }
 

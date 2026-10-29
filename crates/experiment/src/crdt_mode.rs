@@ -365,11 +365,11 @@ impl Store for CrdtStore {
         self.apply(name, &args)
     }
 
-    fn release_changes(&mut self) -> Result<Value, String> {
+    fn release_changes(&mut self, wave: usize) -> Result<Value, String> {
         let task = self.config.task;
-        self.write_text(TASKS, &task.tasks_md(task.all()))?;
+        self.write_text(TASKS, &task.tasks_md(task.after_wave(wave)))?;
         self.save()?;
-        Ok(json!({ "released": task.changes().iter().map(|c| change_tag(c.change)).collect::<Vec<_>>() }))
+        Ok(json!({ "released": task.wave_changes(wave).map(|c| change_tag(c.change)).collect::<Vec<_>>() }))
     }
 
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String> {

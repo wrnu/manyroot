@@ -95,7 +95,11 @@ pub struct Plan {
     pub turns: u32,
     pub calls_per_turn: u32,
     pub turn_limit_seconds: u64,
+    /// Phase 1's one release, as a share of all agent-turns.
     pub release_at: f64,
+    /// Phase 2's: the turn after which each wave of change requests goes out. Phase 1's plans have none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waves: Vec<u32>,
     /// `git --version` of the binary the workers run.
     pub git: String,
     /// blake3 of the code that computes the measures and grades.
@@ -138,12 +142,16 @@ impl Plan {
         let mut tools = mode.tools(task);
         tools.extend(core_tools());
         let tools = serde_json::to_vec(&tools).expect("tool specs are plain JSON");
-        let prompts = BTreeMap::from([
+        let mut prompts = BTreeMap::from([
             ("task-original".to_string(), hash(task.task_text(Version::ORIGINAL).as_bytes())),
             ("task-changed".to_string(), hash(task.task_text(task.all()).as_bytes())),
             ("tools".to_string(), hash(&tools)),
             ("turn-message".to_string(), hash(TURN_MESSAGE.as_bytes())),
         ]);
+        // Between the first wave and the last, the task reads as each wave left it.
+        for wave in 1..task.waves().len() {
+            prompts.insert(format!("task-after-wave-{wave}"), hash(task.task_text(task.after_wave(wave)).as_bytes()));
+        }
         let pairs = |p: &[(&str, &str)]| p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         Plan {
             inputs: cfg.plan.clone(),
@@ -153,6 +161,7 @@ impl Plan {
             calls_per_turn: cfg.calls_per_turn,
             turn_limit_seconds: cfg.turn_limit.as_secs(),
             release_at: RELEASE_AT,
+            waves: task.wave_turns(cfg.turns),
             git,
             metrics_code: metrics_code(),
             prompts,

@@ -5,10 +5,10 @@
 use std::collections::BTreeSet;
 
 use bracken_experiment::candidates::phase2::OTHER_CHOICE;
-use bracken_experiment::candidates::{Programs, correct_programs, modules, of as candidates_of};
+use bracken_experiment::candidates::{Programs, correct_programs, modules, of as candidates_of, revisions, updates};
 use bracken_experiment::grader::{CONTRACT_EDGES, HIDDEN_DRAWS, HiddenCases, grade, grade_function};
 use bracken_experiment::lang::{Library, parse_module};
-use bracken_experiment::task::{CONTRACT_RANGE, PUBLIC_RANGE, Task, Version};
+use bracken_experiment::task::{CONTRACT_RANGE, Change, PUBLIC_RANGE, Task, Version, change_tag};
 
 const T: Task = Task::Phase2;
 const SEED: u64 = 7;
@@ -22,6 +22,18 @@ fn with(changes: &[(&'static str, &'static str)]) -> Library {
     let mut programs = correct_programs(T, Version::ORIGINAL);
     programs.extend(changes.iter().copied());
     library(&programs)
+}
+
+/// The correct library under `version`, with `changes` on top.
+fn with_at(version: Version, changes: &[(&'static str, &'static str)]) -> Library {
+    let mut programs = correct_programs(T, version);
+    programs.extend(changes.iter().copied());
+    library(&programs)
+}
+
+/// The functions `lib` gets wrong under `version`, alone or in the library.
+fn failing_at(lib: &Library, version: Version, hidden: &HiddenCases) -> BTreeSet<&'static str> {
+    grade(lib, version, hidden).into_iter().filter(|g| !(g.in_library && g.standalone)).map(|g| g.name).collect()
 }
 
 fn members() -> Vec<&'static str> {
@@ -48,7 +60,7 @@ fn ninety_specs_in_eight_modules_and_five_layers() {
     assert_eq!(layers.iter().copied().collect::<BTreeSet<_>>(), (0..5).collect(), "five layers");
     let mut seen = BTreeSet::new();
     assert!(specs.iter().all(|s| seen.insert(s.name)), "names are unique");
-    assert!(T.changes().is_empty(), "the change waves are build step 2");
+    assert_eq!(T.changes().len(), 12, "two waves of six");
     for s in specs {
         assert!(T.modules().contains(&s.module), "{}", s.name);
         let c = bracken_experiment::candidates::candidates(T, s.name);
@@ -211,7 +223,11 @@ fn property_cases_are_public_ones_plus_draws_and_edges_within_the_stated_range()
     // one-none rule, which only relates the producers' nones; each member's properties together still do.
     let mut fixed = Vec::new();
     for (index, p) in T.properties() {
-        let probes: Vec<_> = T.property_cases(index, p).iter().map(|c| T.probe(p, c, &canonical, &canonical)).collect();
+        let probes: Vec<_> = T
+            .property_cases(index, p)
+            .iter()
+            .map(|c| T.probe(p, c, &canonical, &canonical, Version::ORIGINAL))
+            .collect();
         let wants: BTreeSet<i64> = probes.iter().map(|probe| probe.want).collect();
         if wants.len() < 2 {
             fixed.push(probes[0].expr.clone());
@@ -224,7 +240,7 @@ fn property_cases_are_public_ones_plus_draws_and_edges_within_the_stated_range()
             .properties_of(name)
             .into_iter()
             .flat_map(|(i, p)| T.property_cases(i, p).into_iter().map(move |c| (p, c)))
-            .map(|(p, c)| T.probe(p, &c, &canonical, &canonical).want)
+            .map(|(p, c)| T.probe(p, &c, &canonical, &canonical, Version::ORIGINAL).want)
             .collect();
         assert!(wants.len() >= 2, "{name}: public answers {wants:?}");
     }
@@ -238,7 +254,11 @@ fn a_members_check_reports_only_public_inputs() {
     for name in members() {
         let mut public = Vec::new();
         for (index, p) in T.properties_of(name) {
-            public.extend(T.property_cases(index, p).iter().map(|c| T.probe(p, c, &canonical, &canonical).expr));
+            public.extend(
+                T.property_cases(index, p)
+                    .iter()
+                    .map(|c| T.probe(p, c, &canonical, &canonical, Version::ORIGINAL).expr),
+            );
         }
         let c = bracken_experiment::candidates::candidates(T, name);
         for program in c.correct.iter().chain(c.wrong) {
@@ -297,4 +317,215 @@ fn the_task_and_a_module_fit_in_one_tool_result() {
     assert!(numbered * 2 < MAX_RESULT_CHARS, "{numbered} characters numbered");
     let largest = modules(T, &correct_programs(T, Version::ORIGINAL)).into_iter().map(|(_, t)| t.len()).max();
     assert!(largest.is_some_and(|n| n * 4 < bracken_experiment::lang::MAX_MODULE_BYTES), "{largest:?}");
+}
+
+// The change waves.
+
+#[test]
+fn two_waves_of_six_at_thirty_and_sixty_percent_of_the_turns() {
+    let waves = T.waves();
+    assert_eq!(waves.len(), 2);
+    assert_eq!(waves.iter().map(|w| w.share).collect::<Vec<_>>(), [0.3, 0.6]);
+    assert_eq!(T.wave_turns(8), [2, 5], "after turns 2 and 5 of 8");
+    assert_eq!(T.wave_turns(2), [1, 1]);
+    assert_eq!(T.wave_turns(10), [3, 6]);
+    // Every change request is in exactly one wave, the task lists them wave by wave, and each wave has six.
+    let listed: Vec<Change> = waves.iter().flat_map(|w| w.changes.iter().copied()).collect();
+    assert_eq!(listed, T.changes().iter().map(|c| c.change).collect::<Vec<_>>());
+    assert!(waves.iter().all(|w| w.changes.len() == 6));
+    assert_eq!(T.after_wave(0), Version::ORIGINAL);
+    assert_eq!(T.after_wave(2), T.all());
+    let tags: BTreeSet<&str> = T.changes().iter().map(|c| change_tag(c.change)).collect();
+    assert_eq!(tags.len(), 12, "tags are unique");
+    // Phase 1 keeps its single release.
+    assert!(Task::Phase1.waves().is_empty() && Task::Phase1.wave_turns(8).is_empty());
+}
+
+/// clamp3 is the only function with 10 to 15 callers, so both signature changes are its: wave 2 changes
+/// what wave 1 changed.
+#[test]
+fn clamp3_changes_its_signature_in_each_wave_and_its_callers_must_follow_both_times() {
+    let hidden = HiddenCases::new(T, SEED);
+    let callers: BTreeSet<&str> =
+        T.specs().iter().filter(|s| T.defined_by(s.name).contains(&"clamp3")).map(|s| s.name).collect();
+    for (wave, change) in [(1, Change::ClampOrder), (2, Change::ClampHiFirst)] {
+        assert!(T.waves()[wave - 1].changes.contains(&change));
+        let update = updates(T).iter().find(|u| u.change == change).expect("an update");
+        let updated: BTreeSet<&str> = update.programs.iter().map(|(n, _)| *n).collect();
+        let mut want = callers.clone();
+        want.insert("clamp3");
+        assert_eq!(updated, want, "{change:?}: clamp3 and every caller");
+        // Callers left as they were are wrong on their own; with them updated but not clamp3, wrong through it.
+        let before = T.after_wave(wave - 1);
+        let after = T.after_wave(wave);
+        let old = library(&correct_programs(T, before));
+        let broken = failing_at(&old, after, &hidden);
+        for name in &want {
+            let g = grade_function(&old, name, after, &hidden);
+            assert!(!g.standalone, "{change:?}: {name}'s own code is out of date");
+        }
+        assert!(broken.is_superset(&want));
+        let mut programs = correct_programs(T, after);
+        programs.insert("clamp3", correct_programs(T, before)["clamp3"]);
+        let lib = library(&programs);
+        for name in &callers {
+            assert!(grade_function(&lib, name, after, &hidden).broken_by_callees(), "{change:?}: {name}");
+        }
+    }
+    let o = Version::ORIGINAL;
+    assert_eq!(T.reference("clamp3", &[5, 0, 3], o), 3);
+    assert_eq!(T.reference("clamp3", &[5, 0, 3], T.after_wave(1)), 0, "(lo, hi, x) = (5, 0, 3)");
+    assert_eq!(T.reference("clamp3", &[5, 0, 3], T.after_wave(2)), 3, "(hi, lo, x) = (5, 0, 3)");
+    assert_eq!(T.reference("clamp3", &[3, 0, 5], o.with(Change::ClampHiFirst)), 3, "alone too");
+    for version in [o, T.after_wave(1), T.after_wave(2)] {
+        assert_eq!(T.reference("clampsq", &[3, 0, 5], version), 5, "a caller's contract doesn't change");
+        assert_eq!(T.reference("tune", &[1, 9, 4], version), T.reference("tune", &[1, 9, 4], o));
+    }
+    let clamp3 = T.spec_named("clamp3").expect("a spec");
+    assert!(T.description_at(clamp3, T.after_wave(1)).starts_with("clamp3(lo, hi, x)"));
+    assert!(T.description_at(clamp3, T.after_wave(2)).starts_with("clamp3(hi, lo, x)"));
+}
+
+#[test]
+fn each_change_has_a_spec_version_a_reference_and_candidates() {
+    let hidden = HiddenCases::new(T, SEED);
+    let o = Version::ORIGINAL;
+    assert_eq!(revisions(T).len(), T.changes().len());
+    for c in T.changes() {
+        let v = o.with(c.change);
+        let spec = T.spec_named(c.target).expect("targets a spec");
+        assert_eq!(T.description_at(spec, o), spec.description);
+        assert_eq!(T.description_at(spec, v), c.description);
+        assert_ne!(c.description, spec.description);
+        assert!(!T.task_text(o).contains(c.text) && T.task_text(v).contains(c.text));
+        assert!(updates(T).iter().any(|u| u.change == c.change && u.programs.iter().any(|(n, _)| *n == c.target)));
+        // The target's own candidates under the change, in the library that has it.
+        let r = revisions(T).iter().find(|r| r.change == c.change).expect("a revision");
+        assert_eq!(r.candidates.name, c.target);
+        assert!(r.candidates.correct.len() == 2 && r.candidates.wrong.len() == 2);
+        for program in r.candidates.correct {
+            let g = grade_function(&with_at(v, &[(c.target, program)]), c.target, v, &hidden);
+            assert!(g.in_library && g.standalone, "{:?}: {program}: {:?}", c.change, g.note);
+        }
+        for program in r.candidates.wrong {
+            let g = grade_function(&with_at(v, &[(c.target, program)]), c.target, v, &hidden);
+            assert!(!g.in_library && !g.standalone, "{:?}: {program} should be wrong", c.change);
+        }
+        let subtle = r.candidates.wrong.last().expect("wrong candidates");
+        let check = T.check(&with_at(v, &[(c.target, subtle)]), c.target, v).expect("checkable");
+        assert!(check.ok(), "{:?}: {subtle}: {}", c.change, check.details());
+        // The original library is wrong under the change. For none-wide that is cut and pos, the producers
+        // of the old none, not isnone, where the rule is stated.
+        let old = failing_at(&with(&[]), v, &hidden);
+        let first = if c.change == Change::NoneWide { "cut" } else { c.target };
+        assert!(old.contains(first), "{:?}: {old:?}", c.change);
+    }
+    let v = |c: Change| o.with(c);
+    assert_eq!(T.reference("sign", &[0], v(Change::SignOfZero)), 1);
+    assert_eq!(T.reference("toward", &[3, 3], v(Change::SignOfZero)), 4, "defined in terms of sign, so it follows");
+    assert_eq!(T.reference("between", &[3, 0, 3], v(Change::BetweenExclusive)), 0);
+    assert_eq!(T.reference("band", &[3, 0, 3], v(Change::BetweenExclusive)), 0);
+    assert_eq!(T.reference("weigh", &[1, 2, 3], o), 5);
+    assert_eq!(T.reference("weigh", &[1, 2, 3], v(Change::WeighSubtracts)), -1);
+    assert_eq!(T.reference("nearer", &[0, 1, -1], v(Change::NearerTies)), -1);
+    assert_eq!(T.reference("abs", &[i64::MIN], v(Change::AbsSaturates)), i64::MAX);
+    assert_eq!(T.reference("dist", &[i64::MIN, 0], v(Change::AbsSaturates)), i64::MAX);
+    assert_eq!(T.reference("mix", &[2, 5], v(Change::MixSubtracts)), T.reference("tilt", &[2, 5], o) - 2);
+}
+
+/// Each pair's obvious fixes, one per change, conflict: a library must settle a new convention.
+#[test]
+fn the_interacting_pairs_need_a_shared_convention() {
+    let hidden = HiddenCases::new(T, SEED);
+    let o = Version::ORIGINAL;
+    let none: BTreeSet<&str> = ["cut", "pos", "isnone", "either", "plus"].into();
+    let rank: BTreeSet<&str> = ["rank", "flip", "isless", "issame", "ismore"].into();
+    let both_none = o.with(Change::CutSigned).with(Change::NoneWide);
+    assert!(T.waves()[0].changes.contains(&Change::CutSigned) && T.waves()[0].changes.contains(&Change::NoneWide));
+    // cut turning signed, with none still -1: -1 is now a difference too.
+    let signed = [("cut", "a b - -1000 < -1 a b - 1000 > -1 a b - ? ?")];
+    assert!(!failing_at(&with(&signed), o.with(Change::CutSigned), &hidden).is_empty());
+    // Its obvious fix moves none just past cut's range, which the other change rules out.
+    let just_past = [
+        ("cut", "a b - -1000 < -1001 a b - 1000 > -1001 a b - ? ?"),
+        ("pos", "a 0 > a -1001 ?"),
+        ("isnone", "a -1001 ="),
+        ("either", "a -1001 = b a ?"),
+        ("plus", "a -1001 = -1001 b -1001 = -1001 a b + ? ?"),
+    ];
+    assert!(failing_at(&with(&just_past), o.with(Change::CutSigned), &hidden).is_empty());
+    assert_eq!(failing_at(&with(&just_past), both_none, &hidden), ["cut", "pos"].into());
+    // The other's obvious fix moves none far away, but leaves cut unsigned.
+    let far: Vec<_> =
+        correct_programs(T, o.with(Change::NoneWide)).into_iter().filter(|(n, _)| none.contains(n)).collect();
+    assert!(failing_at(&with(&far), o.with(Change::NoneWide), &hidden).is_empty());
+    assert!(failing_at(&with(&far), both_none, &hidden).is_subset(&none));
+    assert!(!failing_at(&with(&far), both_none, &hidden).is_empty());
+    assert!(failing_at(&with_at(both_none, &[]), both_none, &hidden).is_empty(), "the settled convention");
+
+    let both_rank = o.with(Change::RankWide).with(Change::IsMoreFar);
+    assert!(T.waves()[1].changes.contains(&Change::RankWide) && T.waves()[1].changes.contains(&Change::IsMoreFar));
+    // rank's obvious fix for the wide range says only which is larger; ismore's for its margin reads a - b.
+    let by_sign = [("rank", "a b < -1 a b > 1 0 ? ?")];
+    let margin = [("ismore", "a 2 >")];
+    assert!(failing_at(&with(&by_sign), o.with(Change::RankWide), &hidden).is_empty());
+    assert!(failing_at(&with(&margin), o.with(Change::IsMoreFar), &hidden).is_empty());
+    assert!(!failing_at(&with(&margin), both_rank, &hidden).is_empty(), "a - b overflows on wide inputs");
+    let together = with(&[by_sign[0], margin[0]]);
+    let broken = failing_at(&together, both_rank, &hidden);
+    assert!(broken.contains("ismore") && broken.is_subset(&rank), "{broken:?}");
+    assert!(failing_at(&with_at(both_rank, &[]), both_rank, &hidden).is_empty(), "the settled convention");
+}
+
+/// Grading uses the specs in force: each wave's correct library is right under its own version and not
+/// under the next, and the task text and `TASKS.md` state each wave's version.
+#[test]
+fn each_wave_is_graded_and_stated_under_its_own_version() {
+    let hidden = HiddenCases::new(T, SEED);
+    for wave in 0..=2 {
+        let version = T.after_wave(wave);
+        let lib = with_at(version, &[]);
+        assert!(failing_at(&lib, version, &hidden).is_empty(), "wave {wave}");
+        if wave < 2 {
+            let next = T.after_wave(wave + 1);
+            let broken = failing_at(&lib, next, &hidden);
+            for c in T.waves()[wave].changes {
+                let target = T.changes().iter().find(|r| r.change == *c).expect("a request").target;
+                assert!(broken.contains(target), "wave {}: {target} is out of date", wave + 1);
+            }
+        }
+        let tasks = T.tasks_md(version);
+        assert_eq!(T.version_of(&tasks), version);
+        let released: Vec<&str> = T.changes_in(version).map(|c| change_tag(c.change)).collect();
+        assert_eq!(released.len(), wave * 6);
+        assert!(tasks.ends_with(&format!("Change requests released: {}\n", released.join(", "))));
+    }
+}
+
+/// Under `rank-wide`, a rank property's inputs span the range the spec states, and some pairs are close
+/// enough to test `ismore`'s margin.
+#[test]
+fn rank_properties_reach_the_wide_range_once_it_applies() {
+    let hidden = HiddenCases::new(T, SEED);
+    let canonical = with_at(T.all(), &[]);
+    let numbers = |expr: &str| -> Vec<i128> {
+        expr.split(|ch: char| !(ch.is_ascii_digit() || ch == '-')).filter_map(|w| w.parse().ok()).collect()
+    };
+    let rank = T.contracts().iter().find(|c| c.name == "rank").expect("the rank contract");
+    let mut widest = 0;
+    let mut close = 0;
+    for (index, p) in T.properties().filter(|(_, p)| p.calls.contains(&"rank")) {
+        assert!(rank.properties.iter().any(|q| std::ptr::eq(q, p)));
+        for case in hidden.of_property(index) {
+            let probe = T.probe(p, case, &canonical, &canonical, T.all());
+            let n = numbers(&probe.expr);
+            assert_eq!(n.len(), 2, "{}", probe.expr);
+            assert!(n.iter().all(|v| v.abs() <= 9_000_000_000_000_000_000), "{}", probe.expr);
+            widest = widest.max(n[0].abs());
+            close += usize::from((n[0] - n[1]).abs() <= 3 && n[0] != n[1]);
+            assert_eq!(probe.failure(), None);
+        }
+    }
+    assert_eq!(widest, 9_000_000_000_000_000_000);
+    assert!(close > 100, "{close} close pairs");
 }

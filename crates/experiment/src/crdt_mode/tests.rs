@@ -151,7 +151,7 @@ fn a_copy_and_the_hub_converge_and_concurrent_edits_merge() {
         assert_eq!(heads(c), heads(&mut hub));
     }
     // The change requests reach the copies through TASKS.md, and check uses them.
-    hub.release_changes().expect("release");
+    hub.release_changes(1).expect("release");
     let (served, synced) = sync(tmp.path(), &mut hub, &mut copies[0], &keys[0], &keys);
     served.and(synced).expect("sync");
     assert_eq!(

@@ -548,12 +548,12 @@ impl Store for BrackenStore {
         Ok(json!({ "served": true }))
     }
 
-    fn release_changes(&mut self) -> Result<Value, String> {
+    fn release_changes(&mut self, wave: usize) -> Result<Value, String> {
         let state = self.state()?;
         let me = self.config.identity.clone();
         let task = state.tagged("task").first().map(|e| e.id.clone()).ok_or("no task claim")?;
         let mut released = Vec::new();
-        for c in self.config.task.changes() {
+        for c in self.config.task.wave_changes(wave) {
             let old = state.spec_claim(c.target).ok_or_else(|| format!("no spec claim for {}", c.target))?;
             self.write(vec![
                 "claim".into(),
@@ -597,21 +597,6 @@ impl Store for BrackenStore {
             let defs = crate::metrics::definitions(task, &[("artifact".into(), text.into())]);
             defs.get(function).map(|d| vec![(function.to_string(), d.clone())]).unwrap_or_default()
         };
-        // A task with open contracts: the calls that can change which of this agent's own implementations of a
-        // member are current also record them, the agent's working copy of the contracts (decision `979e5085a1e7`).
-        let members = |me: &mut BrackenStore| -> Result<Option<Value>, String> {
-            if task.contracts().is_empty() || !["artifact", "relate", "claim", "retract"].contains(&tool) {
-                return Ok(None);
-            }
-            let (state, key) = (me.state()?, me.saved("key.txt")?);
-            let own: Vec<_> = state
-                .own_implementations(&key)
-                .into_iter()
-                .filter(|(f, _)| task.contract_of(f).is_some())
-                .flat_map(|(f, text)| of(f, &text))
-                .collect();
-            Ok(Some(json!(own)))
-        };
         let mut record = match tool {
             "artifact" => {
                 let function = args["function"].as_str().unwrap_or_default();
@@ -632,17 +617,45 @@ impl Store for BrackenStore {
             }
             _ => Value::Null,
         };
-        if let Some(own) = members(self)? {
+        // A task with open contracts: the calls that can change which of this agent's own implementations of a
+        // member are current also record them, the agent's working copy of the contracts (decision `979e5085a1e7`).
+        if !task.contracts().is_empty() && ["artifact", "relate", "claim", "retract"].contains(&tool) {
             if record.is_null() {
                 record = json!({});
             }
-            record["members"] = own;
+            record["members"] = self.members()?;
         }
         Ok(record)
+    }
+
+    /// A sync can change them too: a release that supersedes a member's spec makes this agent's
+    /// implementations of it no longer current (note `6b8e8ce21f94`).
+    fn record_sync(&mut self) -> Result<Value, String> {
+        if self.config.task.contracts().is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(json!({ "members": self.members()? }))
     }
 }
 
 impl BrackenStore {
+    /// This agent's own current implementations of open contracts' members, as `[function, definition]`
+    /// pairs in causal order: its working copy of the contracts.
+    pub fn members(&mut self) -> Result<Value, String> {
+        let task = self.config.task;
+        let (state, key) = (self.state()?, self.saved("key.txt")?);
+        let own: Vec<_> = state
+            .own_implementations(&key)
+            .into_iter()
+            .filter(|(f, _)| task.contract_of(f).is_some())
+            .flat_map(|(f, text)| {
+                let defs = crate::metrics::definitions(task, &[("artifact".into(), text)]);
+                defs.get(f).map(|d| (f.to_string(), d.clone()))
+            })
+            .collect();
+        Ok(json!(own))
+    }
+
     fn tools_known(&self, name: &str) -> bool {
         BrackenMode::under(self.config.accept_rule).tools(self.config.task).iter().any(|t| t.name == name)
     }

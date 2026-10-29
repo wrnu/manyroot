@@ -90,14 +90,19 @@ pub trait Store {
     }
     /// Runs one of the mode's tools for the agent that owns this copy.
     fn tool(&mut self, name: &str, args: &Value) -> Result<Value, String>;
-    /// The hub only: states the change requests, as the mode states them.
-    fn release_changes(&mut self) -> Result<Value, String>;
+    /// The hub only: states release `wave`'s change requests (from 1; Phase 1 has only 1), as the mode
+    /// states them.
+    fn release_changes(&mut self, wave: usize) -> Result<Value, String>;
     /// The hub only: the integrated library, as `(module, text)` pairs.
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String>;
     /// What the measures need to know about a tool call that just succeeded, for the event log only
     /// (never the agent): `writes`, the `[function, definition]` pairs it created or changed;
     /// `blocks`, the definitions a verdict against them stops; `conflict`, a merge that stopped.
     fn record(&mut self, _tool: &str, _args: &Value, _result: &Value) -> Result<Value, String> {
+        Ok(Value::Null)
+    }
+    /// The same, for a sync of this copy that just finished: what it changed that no tool call recorded.
+    fn record_sync(&mut self) -> Result<Value, String> {
         Ok(Value::Null)
     }
 }

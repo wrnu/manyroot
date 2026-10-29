@@ -207,7 +207,7 @@ fn only_the_setter_writes_tasks_md() {
     assert!(f.merge(1, n).is_err_and(|e| e.contains("TASKS.md")));
     assert_eq!(f.hub.hub_version().expect("version"), Version::ORIGINAL);
     // The setter's release changes it, and a copy's check uses it from its next sync.
-    f.hub.release_changes().expect("release");
+    f.hub.release_changes(1).expect("release");
     assert_eq!(f.copies[1].version_at("refs/remotes/hub/main").expect("version"), Version::ORIGINAL);
     f.sync(1);
     assert_eq!(f.copies[1].version_at("refs/remotes/hub/main").expect("version"), Task::Phase1.all());

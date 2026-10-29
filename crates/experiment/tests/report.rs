@@ -4,11 +4,13 @@
 
 use std::path::{Path, PathBuf};
 
+use serde_json::Value;
+
 use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, git_binary, run};
 use bracken_experiment::metrics::table;
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::plan::{Plan, PlanInputs, report};
-use bracken_experiment::task::{Task, Version};
+use bracken_experiment::task::{Task, Version, change_tag};
 
 fn bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_bracken-experiment"))
@@ -46,19 +48,60 @@ fn mock_run_of(dir: &Path, mode: &'static str, task: Task, agents: usize, turns:
 }
 
 /// The task selector end to end: a Phase 2 run gives its agents Phase 2's task in every mode, its plan says
-/// so, and the report grades Phase 2's functions.
+/// so, and the report grades Phase 2's functions. Its two waves go out once each, to all agents at once,
+/// at the same point in every mode: with 4 turns, after turns 1 and 2, so after 2 and 4 agent-turns.
 #[test]
-fn a_phase_two_mock_run_of_each_mode_is_graded_as_phase_two() {
+fn a_phase_two_mock_run_of_each_mode_is_graded_as_phase_two_and_releases_both_waves() {
     let dir = tempfile::tempdir().expect("a temp dir");
+    let t = Task::Phase2;
     for mode in ["bracken", "git", "crdt"] {
-        let root = mock_run_of(dir.path(), mode, Task::Phase2, 2, 2);
+        let root = mock_run_of(dir.path(), mode, t, 2, 4);
         let plan: Plan = serde_json::from_slice(&std::fs::read(root.join("plan.json")).expect("plan")).expect("json");
-        assert_eq!(plan.inputs.task, Task::Phase2);
+        assert_eq!(plan.inputs.task, t);
+        assert_eq!(plan.waves, [1, 2]);
         let hash = |t: String| blake3::hash(t.as_bytes()).to_hex().to_string();
-        assert_eq!(plan.prompts["task-original"], hash(Task::Phase2.task_text(Version::ORIGINAL)));
+        assert_eq!(plan.prompts["task-original"], hash(t.task_text(Version::ORIGINAL)));
+        assert_eq!(plan.prompts["task-after-wave-1"], hash(t.task_text(t.after_wave(1))));
+        assert_eq!(plan.prompts["task-changed"], hash(t.task_text(t.after_wave(2))));
+        let events: Vec<Value> = std::fs::read_to_string(root.join("events.jsonl"))
+            .expect("events")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("json"))
+            .collect();
+        let releases: Vec<&Value> = events.iter().filter(|e| e["event"] == "changes_released").collect();
+        assert_eq!(releases.len(), 2, "{mode}");
+        for (k, r) in releases.iter().enumerate() {
+            let wave = k + 1;
+            assert_eq!(r["data"]["wave"], wave, "{mode}");
+            assert_eq!(r["data"]["turns_done"], [2, 4][k], "{mode}");
+            let tags: Vec<&str> = t.wave_changes(wave).map(|c| change_tag(c.change)).collect();
+            assert_eq!(r["data"]["result"]["released"], serde_json::json!(tags), "{mode}");
+            // The agent-turns it counts have ended (another may end while the driver releases).
+            let before = events.iter().filter(|e| e["event"] == "turn_end" && e["seq"].as_u64() < r["seq"].as_u64());
+            assert!(before.count() >= [2, 4][k], "{mode}: wave {wave}");
+        }
+        if mode == "bracken" {
+            // Each sync records the agent's contract members.
+            assert!(events.iter().filter(|e| e["event"] == "sync").all(|e| e["data"]["record"]["members"].is_array()));
+        }
+        // A checkpoint once both agents end each turn, and none before a turn's last agent ended it.
+        let checkpoints: Vec<&Value> = events.iter().filter(|e| e["event"] == "checkpoint").collect();
+        assert_eq!(checkpoints.iter().map(|e| e["data"]["turn"].as_u64()).collect::<Vec<_>>(), [1, 2, 3, 4].map(Some));
+        for c in &checkpoints {
+            let turn = &c["data"]["turn"];
+            let ends = events.iter().filter(|e| e["event"] == "turn_end" && e["data"]["turn"] == *turn);
+            assert!(ends.clone().count() == 2 && ends.clone().all(|e| e["seq"].as_u64() < c["seq"].as_u64()), "{mode}");
+        }
         let m = report(&root, None).expect("the report").measures;
         assert_eq!(m.quality.total, 90, "{mode}");
         assert!(m.improvements.gained > 0, "{mode}: the mock delivered Phase 2's functions");
+        let c = m.checkpoints.clone().expect("Phase 2 measures its checkpoints");
+        assert_eq!(c.turns.iter().map(|k| k.turn).collect::<Vec<_>>(), [1, 2, 3, 4], "{mode}");
+        // With no barrier between turns, a wave can go out before the last agent ends its turn.
+        let waves: Vec<u64> = c.turns.iter().map(|k| k.waves).collect();
+        assert!(waves.windows(2).all(|w| w[0] <= w[1]) && waves.last() == Some(&2), "{mode}: {waves:?}");
+        assert_eq!(c.recovery.len(), 2);
+        assert!(table(std::slice::from_ref(&m)).contains("Ranking: checkpoints"));
     }
 }
 
@@ -75,6 +118,7 @@ fn a_mock_run_of_each_mode_produces_the_report() {
         assert!(m.tokens > m.output_tokens && m.output_tokens > 0, "{mode}: the mock's usage rows");
         assert!(m.duplication.deliveries >= 3, "{mode}: each agent delivers about once a turn");
         assert!(m.improvements.gained > 0 && m.improvements.per_million_tokens.is_some(), "{mode}");
+        assert!(m.checkpoints.is_none(), "{mode}: Phase 1 logs no checkpoints");
         assert!(m.overhead.integrate_tokens.is_some_and(|s| s > 0.0), "{mode}: every turn syncs");
         assert!(m.discovery.discoveries > 0, "{mode}");
         // CRDT mode has no review step (decision `bbb261d50871`).

@@ -27,7 +27,8 @@ use crate::plan::{Plan, PlanInputs};
 use crate::sandbox::{Git, Sandbox, WorkerPaths};
 use crate::worker::{Lines, Request, Worker};
 
-/// Turns used, as a share of all turns, before the change requests are released (design section 1).
+/// Phase 1's: turns used, as a share of all turns, before the change requests are released (design
+/// section 1). Phase 2 releases in waves, after the turns [`crate::task::Task::wave_turns`] gives.
 pub const RELEASE_AT: f64 = 0.4;
 /// Tool calls an agent may make in one turn (design section 5); the driver refuses the next.
 pub const CALLS_PER_TURN: u32 = 25;
@@ -103,8 +104,10 @@ pub struct Outcome {
     /// The hub's integrated library at the end.
     pub modules: Vec<(String, String)>,
     pub events: PathBuf,
-    /// The number of turns used when the change requests went out.
+    /// The number of agent-turns used when the change requests went out, the first release's in Phase 2.
     pub released_after: Option<u32>,
+    /// The number of agent-turns used at each release, in order.
+    pub released: Vec<u32>,
 }
 
 /// The run's record. Only the driver holds it.
@@ -172,7 +175,10 @@ struct Run<'a> {
     sockets: PathBuf,
     tools: Vec<ToolSpec>,
     turns_done: AtomicU32,
-    released_after: Mutex<Option<u32>>,
+    /// The number of agent-turns used at each release so far.
+    released: Mutex<Vec<u32>>,
+    /// Per turn index, how many agents have finished it: the checkpoint is when all have.
+    finished: Mutex<Vec<usize>>,
     /// The digest of the hub's integrated library at the last snapshot.
     integrated: Mutex<String>,
 }
@@ -251,10 +257,13 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         sockets,
         tools,
         turns_done: AtomicU32::new(0),
-        released_after: Mutex::new(None),
+        released: Mutex::new(Vec::new()),
+        finished: Mutex::new(vec![0; cfg.turns as usize]),
         integrated: Mutex::new(String::new()),
     };
     run.snapshot(&mut run.hub(), None, "setup");
+    // A wave due after turn 0 goes out before anyone plays.
+    run.maybe_release(0)?;
     let results: Vec<Result<(), String>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..cfg.agents)
             .map(|i| {
@@ -279,8 +288,8 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     if run.events.failed.load(Ordering::SeqCst) {
         return Err("writing the event log failed".into());
     }
-    let released_after = *run.released_after.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(Outcome { modules, events: root.join("events.jsonl"), released_after })
+    let released = run.released.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Ok(Outcome { modules, events: root.join("events.jsonl"), released_after: released.first().copied(), released })
 }
 
 /// Tools every mode has, which the core serves.
@@ -332,22 +341,66 @@ impl Run<'_> {
             }
             self.events.log(Some(name), "turn_end", json!({"turn": turn}));
             let done = self.turns_done.fetch_add(1, Ordering::SeqCst) + 1;
+            self.checkpoint(turn);
             self.maybe_release(done)?;
         }
         Ok(())
     }
 
-    fn maybe_release(&self, done: u32) -> Result<(), String> {
-        let total = self.cfg.turns * self.cfg.agents as u32;
-        let mut released = self.released_after.lock().unwrap_or_else(|e| e.into_inner());
-        if released.is_none() && f64::from(done) >= RELEASE_AT * f64::from(total) {
-            let mut hub = self.hub();
-            let reply = hub.ok(&Request { op: "release".into(), ..Request::default() })?;
-            self.events.log(None, "changes_released", json!({"turns_done": done, "result": reply.result}));
-            self.snapshot(&mut hub, None, "release");
-            *released = Some(done);
+    /// Phase 2 only (decision `288a16ce8cb2`): once every agent has finished turn `turn`, logs the hub's
+    /// integrated library as it is at that moment (Git's main, Bracken's accepted layer, CRDT's document),
+    /// which the measures grade to rank the modes. Phase 1's logs stay as its runs wrote them.
+    fn checkpoint(&self, turn: u32) {
+        if self.cfg.plan.task.waves().is_empty() {
+            return;
         }
-        Ok(())
+        let mut finished = self.finished.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(count) = finished.get_mut(turn as usize - 1) else { return };
+        *count += 1;
+        if *count < self.cfg.agents {
+            return;
+        }
+        let mut hub = self.hub();
+        let modules = hub
+            .ok(&Request { op: "integrated".into(), ..Request::default() })
+            .and_then(|r| serde_json::from_value::<Vec<(String, String)>>(r.result).map_err(|e| e.to_string()));
+        match modules {
+            Ok(modules) => self.events.log(None, "checkpoint", json!({"turn": turn, "modules": modules})),
+            Err(e) => {
+                let data = json!({"turn": turn, "bytes": e.len(), "digest": digest(e.as_bytes())});
+                self.events.log(None, "checkpoint_failed", data);
+            }
+        }
+    }
+
+    /// Releases every wave due once `done` agent-turns are used: to all agents at once, at the same point
+    /// in every mode. Phase 1's one release has no wave in its event, as its runs' logs don't.
+    fn maybe_release(&self, done: u32) -> Result<(), String> {
+        let agents = self.cfg.agents as u32;
+        let task = self.cfg.plan.task;
+        let waves = task.wave_turns(self.cfg.turns);
+        let mut released = self.released.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let due = if waves.is_empty() {
+                released.is_empty() && f64::from(done) >= RELEASE_AT * f64::from(self.cfg.turns * agents)
+            } else {
+                waves.get(released.len()).is_some_and(|turn| done >= turn * agents)
+            };
+            if !due {
+                return Ok(());
+            }
+            let wave = released.len() + 1;
+            let mut hub = self.hub();
+            let reply = hub.ok(&Request { op: "release".into(), args: json!({"wave": wave}), ..Request::default() })?;
+            let data = if waves.is_empty() {
+                json!({"turns_done": done, "result": reply.result})
+            } else {
+                json!({"turns_done": done, "wave": wave, "result": reply.result})
+            };
+            self.events.log(None, "changes_released", data);
+            self.snapshot(&mut hub, None, "release");
+            released.push(done);
+        }
     }
 
     /// What the hub takes from agent `i`, and as whom.
@@ -372,7 +425,19 @@ impl Run<'_> {
             SyncKind::Transfers => sync_transfers(&mut hub, &mut self.copy(i), &session),
         };
         if let Ok(summary) = &summary {
-            self.events.log(Some(&self.names[i]), "sync", summary.clone());
+            let mut data = summary.clone();
+            // Only a task with open contracts records what a sync changed: Phase 1's syncs log as they did.
+            if !self.cfg.plan.task.contracts().is_empty() {
+                let record = self.copy(i).ok(&Request { op: "record_sync".into(), ..Request::default() });
+                let record = match record {
+                    Ok(r) => r.result,
+                    Err(e) => json!({"error": e}),
+                };
+                if let (Some(map), false) = (data.as_object_mut(), record.is_null()) {
+                    map.insert("record".into(), record);
+                }
+            }
+            self.events.log(Some(&self.names[i]), "sync", data);
         }
         self.snapshot(&mut hub, Some(&self.names[i]), "sync");
         summary
