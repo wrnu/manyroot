@@ -157,10 +157,18 @@ pub trait Mode: Sync {
 /// The mode named `name`.
 pub fn mode_named(name: &str) -> Option<&'static dyn Mode> {
     match name {
-        "bracken" => Some(&crate::bracken_mode::BrackenMode),
+        "bracken" => Some(&crate::bracken_mode::BrackenMode::ONE_PASS),
         "crdt" => Some(&crate::crdt_mode::CrdtMode),
         "git" => Some(&crate::git_mode::GitMode),
         _ => None,
+    }
+}
+
+/// The mode `name`, with the tools of accept rule `rule` (only Bracken mode's differ).
+pub fn mode_under(name: &str, rule: crate::bracken_mode::AcceptRule) -> Option<&'static dyn Mode> {
+    match name {
+        "bracken" => Some(crate::bracken_mode::BrackenMode::under(rule)),
+        other => mode_named(other),
     }
 }
 

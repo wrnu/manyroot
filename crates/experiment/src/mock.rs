@@ -200,6 +200,11 @@ impl MockBackend {
             return Err(format!("{name}: no log tool"));
         }
 
+        // Bracken's own views, where the mode has them (task `541b6f3db130`).
+        if has("news") {
+            c.tool("news", json!({}))?;
+            c.tool("status", json!({}))?;
+        }
         let changes = c.tool("log", json!({"tag": "change", "current": true}))?;
         let seen: Vec<&str> = changes
             .as_array()
@@ -238,7 +243,8 @@ impl MockBackend {
             let to = spec_id(spec.name).ok_or_else(|| format!("{name}: no spec claim for {}", spec.name))?;
             c.tool(
                 "relate",
-                json!({"from": artifact, "kind": "implements", "to": to, "note": format!("turn {turn}")}),
+                // A short id where the tools take one: the spec claim's first 8 digits.
+                json!({"from": artifact, "kind": "implements", "to": if has("news") { &to[..8] } else { &to }, "note": format!("turn {turn}")}),
             )?;
             memory.implemented.push(spec.name.to_string());
             memory.mine.push(artifact);

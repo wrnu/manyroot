@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use crate::metrics::bug_reports;
-use crate::mode::{Mode, Session, StoreConfig, SyncKind, ToolSpec, mode_named};
+use crate::mode::{Mode, Session, StoreConfig, SyncKind, ToolSpec, mode_under};
 use crate::plan::{Plan, PlanInputs};
 use crate::sandbox::{Git, Sandbox, WorkerPaths};
 use crate::worker::{Lines, Request, Worker};
@@ -179,7 +179,7 @@ struct Run<'a> {
 
 /// Runs a whole mode with `backend` playing every agent.
 pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
-    let mode = mode_named(cfg.mode).ok_or_else(|| format!("no mode {}", cfg.mode))?;
+    let mode = mode_under(cfg.mode, cfg.plan.accept_rule).ok_or_else(|| format!("no mode {}", cfg.mode))?;
     if cfg.root.exists() {
         return Err(format!("{} already exists", cfg.root.display()));
     }

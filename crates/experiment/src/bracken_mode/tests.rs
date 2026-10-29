@@ -72,28 +72,80 @@ fn is_free_text(tool: &str, slot: &str) -> bool {
 }
 
 fn store(dir: PathBuf, bracken: PathBuf) -> BrackenStore {
-    let config = StoreConfig {
-        task: Task::Phase1,
-        dir,
-        bracken,
-        git: PathBuf::from("/nonexistent/git"),
-        identity: "me".into(),
-        trace: false,
-        accept_rule: Default::default(),
-    };
+    store_as(dir, bracken, "me", AcceptRule::OnePass)
+}
+
+fn store_as(dir: PathBuf, bracken: PathBuf, identity: &str, accept_rule: AcceptRule) -> BrackenStore {
+    let git = PathBuf::from("/nonexistent/git");
+    let config =
+        StoreConfig { task: Task::Phase1, dir, bracken, git, identity: identity.into(), trace: false, accept_rule };
     BrackenStore { config, runs: 0, files: 0 }
+}
+
+/// A hub stating the task, and agents a and b joined to it, each in its own directory under `root`.
+fn ground_of(root: &std::path::Path, rule: AcceptRule) -> (BrackenStore, BrackenStore, BrackenStore) {
+    let at = |name: &str| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("a store dir");
+        dir
+    };
+    let mut hub = store_as(at("hub"), bracken_bin(), "setter", rule);
+    hub.setup(None).expect("the hub");
+    let bundle = hub.export().expect("the hub's bundle");
+    let join = |name: &str| {
+        let mut s = store_as(at(name), bracken_bin(), name, rule);
+        s.setup(Some(&bundle)).expect("a copy");
+        s
+    };
+    let (a, b) = (join("a"), join("b"));
+    (hub, a, b)
+}
+
+/// What `from` has, now in `to` too.
+fn carry(from: &mut BrackenStore, to: &mut BrackenStore) {
+    let bytes = from.export().expect("a bundle");
+    to.import(&bytes).expect("import");
+}
+
+fn output(v: Result<Value, String>) -> String {
+    v.expect("the tool")["output"].as_str().expect("text output").to_string()
+}
+
+/// A new contribution by `s` through `tool`; its full id.
+fn made(s: &mut BrackenStore, tool: &str, args: Value) -> String {
+    output(s.tool(tool, &args)).trim().to_string()
+}
+
+/// An implementation of `function` by `s`, related to its current spec claim; its id.
+fn implement_in(s: &mut BrackenStore, function: &str, program: &str) -> String {
+    let id = made(s, "artifact", json!({"function": function, "content": format!("def {function} 1 : {program}")}));
+    let spec = s.state().expect("state").spec_claim(function).expect("a spec claim");
+    s.tool("relate", &json!({"from": id, "kind": "implements", "to": spec})).expect("relate");
+    id
+}
+
+/// The status line of implementation `id`, trimmed, as the status tool prints it.
+fn status_of(s: &mut BrackenStore, id: &str) -> Option<String> {
+    let text = output(s.tool("status", &json!({})));
+    text.lines().find(|l| l.contains(&id[..12])).map(|l| l.trim().to_string())
+}
+
+fn accepted_of(s: &mut BrackenStore, id: &str) -> Option<String> {
+    let rows = s.tool("accepted", &json!({})).expect("accepted");
+    rows.as_array()?.iter().find(|r| r["id"] == id).map(|r| r["status"].as_str().unwrap_or_default().to_string())
 }
 
 #[test]
 fn every_tool_slot_is_in_the_table() {
-    let tools: Vec<&str> = BrackenMode.tools(Task::Phase1).iter().map(|t| t.name).collect();
+    let tools: Vec<&str> = BrackenMode::ONE_PASS.tools(Task::Phase1).iter().map(|t| t.name).collect();
     for t in &tools {
         assert!(
-            slots().iter().any(|(name, _, _)| name == t) || matches!(*t, "heads" | "conflicts" | "accepted"),
+            slots().iter().any(|(name, _, _)| name == t)
+                || matches!(*t, "heads" | "conflicts" | "accepted" | "status" | "news"),
             "{t}"
         );
     }
-    for t in BrackenMode.tools(Task::Phase1) {
+    for t in BrackenMode::ONE_PASS.tools(Task::Phase1) {
         let props = t.input_schema["properties"].as_object().expect("properties");
         for key in props.keys() {
             let typed_string = props[key]["type"] == "string" || props[key]["type"] == "array";
@@ -206,6 +258,11 @@ impl Ground {
         self.push(&format!("ev-{}", self.evidence), "evidence", validator, body);
     }
 
+    /// The contribution `id` retracted: `log --current` leaves it out.
+    fn retract(&mut self, id: &str) {
+        self.rows.retain(|r| r["id"] != id);
+    }
+
     fn snapshot(&self) -> Snapshot {
         self.snapshot_under(AcceptRule::OnePass)
     }
@@ -254,12 +311,32 @@ fn one_independent_pass_accepts_and_a_later_independent_fail_takes_it_back() {
     // A later independent fail takes it back, even beside the pass.
     g.verdict("a1", "validator-1", "fail");
     assert!(g.snapshot().integrated().is_empty(), "un-accepted by the fail");
-    // A later rival with a pass counts while a1 is out; a1 counts again, as the earlier, once
-    // that validator's latest verdict is a pass.
+    // A later rival with a pass counts while a1 is out; a1 counts again, as the earlier, once that
+    // validator retracts its fail (decision `d036bab456a9`).
     g.implement("a2", "y", "abs", "a", 1);
     assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a\n");
-    g.verdict("a1", "validator-1", "pass");
+    let fail = format!("ev-{}", g.evidence - 1);
+    g.retract(&fail);
     assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
+}
+
+/// Decision `d036bab456a9`: under the one-pass rule, as in Bracken's default policy, a validator's
+/// later pass doesn't lift its fail; retracting the fail does. Phase 1's rule takes the latest verdict.
+#[test]
+fn a_fail_then_a_pass_stays_out_under_one_pass_and_counts_under_phase1s_rule() {
+    let mut g = Ground::new();
+    g.implement("a1", "x", "abs", "a 0 < a neg a ?", 0);
+    g.verdict("a1", "validator-0", "fail");
+    let fail = format!("ev-{}", g.evidence);
+    g.verdict("a1", "validator-0", "pass");
+    assert!(g.snapshot().integrated().is_empty(), "the fail still counts");
+    assert_eq!(g.snapshot_under(AcceptRule::MostPasses).integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
+    g.retract(&fail);
+    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n", "the retracted fail is lifted");
+    // The author's own fail never counts, under either rule.
+    g.verdict("a1", "x", "fail");
+    assert_eq!(g.snapshot().integrated().len(), 1);
+    assert_eq!(g.snapshot_under(AcceptRule::MostPasses).integrated().len(), 1);
 }
 
 #[test]
@@ -363,9 +440,11 @@ fn one_counted_fail_keeps_an_implementation_out() {
     g.implement("a1", "x", "abs", "a 0 < a neg a ?", 2);
     g.verdict("a1", "validator-2", "fail");
     assert!(g.snapshot().integrated().is_empty(), "{:?}", g.snapshot().integrated());
-    // The same validator's later pass lifts its fail: three passes.
+    // Under Phase 1's rule the same validator's later pass lifts its fail: three passes. Under the
+    // one-pass rule it doesn't (decision `d036bab456a9`).
     g.verdict("a1", "validator-2", "pass");
-    assert_eq!(g.snapshot().integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
+    assert_eq!(g.snapshot_under(AcceptRule::MostPasses).integrated()["abs"], "def abs 1 : a 0 < a neg a ?\n");
+    assert!(g.snapshot().integrated().is_empty());
 }
 
 #[test]
@@ -468,8 +547,9 @@ fn a_sync_session_that_never_ends_by_itself_is_stopped_at_its_deadline() {
     reader.join().expect("the peer");
 }
 
-/// The `accepted` tool shows what counts, by the same rule: a fail later replaced by the same validator's
-/// pass counts, and an artifact related only by someone else, or to no spec, doesn't (finding `6792b444895d`).
+/// The `accepted` tool shows what counts, by the same rule: a fail the same validator later followed with
+/// a pass still keeps it out (decision `d036bab456a9`), and an artifact related only by someone else, or
+/// to no spec, doesn't count (finding `6792b444895d`).
 #[test]
 fn the_accepted_tool_shows_exactly_what_counts() {
     let mut g = Ground::new();
@@ -493,11 +573,200 @@ fn the_accepted_tool_shows_exactly_what_counts() {
         .collect();
     assert_eq!(
         rows,
-        [("abs", "x-abs", "accepted"), ("abs", "w-abs", "waiting"), ("sq", "v-sq", "waiting")],
+        [("abs", "x-abs", "waiting"), ("abs", "w-abs", "accepted"), ("sq", "v-sq", "waiting")],
         "{counted}"
     );
     assert!(counted.as_array().expect("a list").iter().all(|r| r.get("passes").is_none()), "no pass counts");
     let integrated = g.snapshot().integrated();
-    assert_eq!(integrated["abs"], "def abs 1 : a\n", "the same pick as the integrated library");
+    assert_eq!(integrated["abs"], "def abs 1 : a a\n", "the same pick as the integrated library");
     assert_eq!(integrated.len(), 1);
+}
+
+/// Task `541b6f3db130` and decision `d036bab456a9`: Bracken's status view and the harness's accepted
+/// tool agree in the usual case and on fails; the task's own rules (here: only the author's own
+/// relation counts) are where they differ, and the accepted tool is what counts.
+#[test]
+fn the_status_view_agrees_with_accepted_and_differs_only_by_the_tasks_rules() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, mut b) = ground_of(dir.path(), AcceptRule::OnePass);
+    let abs = implement_in(&mut a, "abs", "a 0 < a neg a ?");
+    let sq = implement_in(&mut a, "sq", "a a *");
+    carry(&mut a, &mut b);
+    assert!(status_of(&mut b, &abs).expect("listed").starts_with("waiting"));
+    assert_eq!(accepted_of(&mut b, &abs).as_deref(), Some("waiting"));
+    // The usual case: one pass from someone else.
+    b.tool("evidence", &json!({"target": &abs[..8], "verdict": "pass", "method": "ran it"})).expect("a pass");
+    assert!(status_of(&mut b, &abs).expect("listed").starts_with("accepted"));
+    assert_eq!(accepted_of(&mut b, &abs).as_deref(), Some("accepted"));
+    // A fail, then a pass from the same validator: still out, in both.
+    let fail = made(&mut b, "evidence", json!({"target": sq, "verdict": "fail", "method": "ran it"}));
+    b.tool("evidence", &json!({"target": sq, "verdict": "pass", "method": "ran it again"})).expect("a pass");
+    assert!(status_of(&mut b, &sq).expect("listed").starts_with("rejected"));
+    assert_eq!(accepted_of(&mut b, &sq).as_deref(), Some("waiting"));
+    // Retracting the fail lifts it, in both.
+    b.tool("retract", &json!({"target": &fail[..10], "reason": "I was wrong"})).expect("retract");
+    assert!(status_of(&mut b, &sq).expect("listed").starts_with("accepted"));
+    assert_eq!(accepted_of(&mut b, &sq).as_deref(), Some("accepted"));
+    // A task rule: an implementation related by someone other than its author is accepted in
+    // Bracken's view, and doesn't count.
+    let inc = made(&mut a, "artifact", json!({"function": "inc", "content": "def inc 1 : a 1 +"}));
+    carry(&mut a, &mut b);
+    let spec = b.state().expect("state").spec_claim("inc").expect("a spec");
+    b.tool("relate", &json!({"from": inc, "kind": "implements", "to": spec})).expect("relate");
+    b.tool("evidence", &json!({"target": inc, "verdict": "pass", "method": "ran it"})).expect("a pass");
+    assert!(status_of(&mut b, &inc).expect("listed").starts_with("accepted"));
+    assert_eq!(accepted_of(&mut b, &inc), None, "not an implementation the task counts");
+}
+
+/// Each agent's `news` starts with everything, then shows only what arrived since its own last call.
+#[test]
+fn news_shows_what_arrived_since_each_agents_last_call() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, mut b) = ground_of(dir.path(), AcceptRule::OnePass);
+    let first = output(a.tool("news", &json!({})));
+    assert!(first.lines().count() > Task::Phase1.specs().len() * 2 && first.contains("[task]"), "{first}");
+    assert_eq!(output(a.tool("news", &json!({}))), "Nothing new since your last news call.");
+    let id = made(&mut a, "claim", json!({"statement": "I take abs", "tags": ["note"]}));
+    let news = output(a.tool("news", &json!({})));
+    assert_eq!(news.lines().count(), 1, "{news}");
+    assert!(news.starts_with(&id[..8]) && news.contains("I take abs"), "{news}");
+    // b's cursor is its own: everything, then the agent's claim once it arrives.
+    let b_first = output(b.tool("news", &json!({})));
+    assert_eq!(b_first.lines().count(), first.lines().count());
+    carry(&mut a, &mut b);
+    let b_news = output(b.tool("news", &json!({})));
+    assert!(b_news.contains("I take abs") && b_news.lines().count() == 1, "{b_news}");
+    assert!(BrackenMode::PHASE1.tools(Task::Phase1).iter().all(|t| t.name != "news" && t.name != "status"));
+}
+
+/// A page that would pass the result bound stops short of it, and the next call goes on from there.
+#[test]
+fn news_pages_below_the_result_bound_and_loses_nothing() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, _b) = ground_of(dir.path(), AcceptRule::OnePass);
+    output(a.tool("news", &json!({})));
+    for i in 0..320 {
+        let statement = format!("note {i:03} {}", "x".repeat(180));
+        a.tool("claim", &json!({"statement": statement, "tags": ["note"]})).expect("a claim");
+    }
+    let page = output(a.tool("news", &json!({})));
+    assert!(page.chars().count() < crate::driver::MAX_RESULT_CHARS, "{} chars", page.chars().count());
+    let (lines, tail) = page.rsplit_once('\n').expect("a tail");
+    assert!(tail.ends_with("more arrived: call news again for them."), "{tail}");
+    let rest = output(a.tool("news", &json!({})));
+    assert!(!rest.contains("more arrived"));
+    let seen: Vec<&str> = lines.lines().chain(rest.lines()).collect();
+    assert_eq!(seen.len(), 320, "every claim once");
+    for (i, l) in seen.iter().enumerate() {
+        assert!(l.contains(&format!("note {i:03} ")), "in order: {l}");
+    }
+    assert_eq!(output(a.tool("news", &json!({}))), "Nothing new since your last news call.");
+}
+
+#[test]
+fn a_short_id_resolves_and_an_ambiguous_or_unknown_one_is_refused() {
+    let ids = ["abcdef0123456789", "abcdef0199999999", "1234567890abcdef"];
+    let resolve = |p: &str, min| resolve_id(p, ids.iter().copied(), min);
+    assert_eq!(resolve("12345678", 8).as_deref(), Ok("1234567890abcdef"));
+    assert!(resolve("abcdef01", 8).expect_err("ambiguous").contains("2 contributions"));
+    assert_eq!(resolve("abcdef012", 8).as_deref(), Ok("abcdef0123456789"), "more digits settle it");
+    assert!(resolve("1234567", 8).expect_err("too short").contains("at least 8"));
+    assert!(resolve("ffffffff", 8).expect_err("unknown").contains("no contribution"));
+    assert_eq!(
+        resolve("12345678", 12).expect_err("Phase 1's rule"),
+        "`12345678` is not an id (12 to 64 lowercase hex digits)"
+    );
+
+    // Through the tools, in a real replica.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, _b) = ground_of(dir.path(), AcceptRule::OnePass);
+    let spec = a.state().expect("state").spec_claim("abs").expect("a spec");
+    let shown = a.tool("show", &json!({"id": &spec[..8]})).expect("show by 8 digits");
+    assert_eq!(shown["id"], spec.as_str());
+    assert!(a.tool("show", &json!({"id": &spec[..7]})).is_err(), "7 digits");
+    let mine = made(&mut a, "claim", json!({"statement": "first", "tags": ["note"]}));
+    a.tool("claim", &json!({"statement": "second", "supersedes": [&mine[..9]]})).expect("supersedes by 9 digits");
+    // Phase 1's tools take 12 digits or more, and have no status or news.
+    let phase1 = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut p, _b) = ground_of(phase1.path(), AcceptRule::MostPasses);
+    let spec = p.state().expect("state").spec_claim("abs").expect("a spec");
+    assert!(p.tool("show", &json!({"id": &spec[..8]})).expect_err("8 digits").contains("12 to 64"));
+    assert!(p.tool("show", &json!({"id": &spec[..12]})).is_ok());
+    assert!(p.tool("status", &json!({})).is_err() && p.tool("news", &json!({})).is_err());
+}
+
+/// The next `news` pages, until nothing is new: their entry lines.
+fn all_news(s: &mut BrackenStore) -> (Vec<String>, usize) {
+    let (mut seen, mut pages) = (Vec::new(), 0);
+    loop {
+        let result = s.tool("news", &json!({})).expect("news");
+        let sent = result.to_string().chars().count();
+        assert!(sent < crate::driver::MAX_RESULT_CHARS, "a page of {sent} characters as sent would be cut");
+        let page = result["output"].as_str().expect("text").to_string();
+        if page.starts_with("Nothing new") {
+            return (seen, pages);
+        }
+        pages += 1;
+        assert!(pages <= 12, "paging never ends: {} lines so far", seen.len());
+        seen.extend(page.lines().filter(|l| !l.contains("more arrived")).map(str::to_string));
+    }
+}
+
+/// Findings `f8b022bbf5fd` and `36c77161816c`: a cut page keeps what the old cursor covered, so two
+/// agents' concurrent work, part of it seen before, is listed once each across three or more pages.
+#[test]
+fn concurrent_work_across_pages_is_listed_once() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, mut b) = ground_of(dir.path(), AcceptRule::OnePass);
+    output(a.tool("news", &json!({})));
+    let note = |s: &mut BrackenStore, who: &str, i: usize| {
+        let statement = format!("{who} note {i:03} {}", "x".repeat(180));
+        s.tool("claim", &json!({"statement": statement, "tags": ["note"]})).expect("a claim");
+    };
+    // a's first notes, read; then more of a's, and b's, concurrently, unread.
+    for i in 0..40 {
+        note(&mut a, "a", i);
+    }
+    let (read, _) = all_news(&mut a);
+    assert_eq!(read.len(), 40);
+    for i in 40..100 {
+        note(&mut a, "a", i);
+    }
+    for i in 0..520 {
+        note(&mut b, "b", i);
+    }
+    carry(&mut b, &mut a);
+    let (seen, pages) = all_news(&mut a);
+    assert!(pages >= 3, "{pages} pages");
+    assert_eq!(seen.len(), 580, "60 of a's and 520 of b's, each once");
+    for (who, range) in [("a", 40..100), ("b", 0..520)] {
+        for i in range {
+            let n = seen.iter().filter(|l| l.contains(&format!(" {who} note {i:03} "))).count();
+            assert_eq!(n, 1, "{who} note {i}");
+        }
+    }
+    assert!(!seen.iter().any(|l| l.contains(" a note 000 ")), "seen before the cut, not listed again");
+}
+
+/// A page of quotes doubles when escaped; it is measured as sent, so the result bound never cuts it.
+#[test]
+fn a_news_page_of_quotes_fits_as_sent() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, _b) = ground_of(dir.path(), AcceptRule::OnePass);
+    output(a.tool("news", &json!({})));
+    for i in 0..300 {
+        let statement = format!("q{i:03} {}", "\"".repeat(180));
+        a.tool("claim", &json!({"statement": statement, "tags": ["note"]})).expect("a claim");
+    }
+    let (seen, pages) = all_news(&mut a);
+    assert!(pages >= 2 && seen.len() == 300, "{pages} pages, {} lines", seen.len());
+}
+
+#[test]
+fn an_unreadable_news_position_is_said() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (_hub, mut a, _b) = ground_of(dir.path(), AcceptRule::OnePass);
+    std::fs::create_dir(a.config.dir.join("news-cursor.txt")).expect("a directory where the file goes");
+    let err = a.tool("news", &json!({})).expect_err("refused");
+    assert!(err.contains("couldn't be read"), "{err}");
 }

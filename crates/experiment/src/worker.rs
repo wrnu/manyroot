@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::args::{Args, MAX_NOTES, check_text};
-use crate::mode::{Session, Store, StoreConfig, Transfer, mode_named};
+use crate::mode::{Session, Store, StoreConfig, Transfer, mode_under};
 use crate::sandbox::Sandbox;
 
 /// The largest request or reply line a worker accepts: the hub's first export, which seeds each copy, fits easily.
@@ -60,7 +60,7 @@ pub fn serve(mode: &str, config: StoreConfig) -> Result<(), String> {
     if std::env::vars_os().next().is_some() {
         return Err("a worker must start with an empty environment".into());
     }
-    let mode = mode_named(mode).ok_or_else(|| format!("no mode {mode}"))?;
+    let mode = mode_under(mode, config.accept_rule).ok_or_else(|| format!("no mode {mode}"))?;
     let notes = config.dir.join("notes.txt");
     let mut store = mode.open(config);
     let stdin = std::io::stdin();
