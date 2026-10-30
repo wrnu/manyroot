@@ -23,6 +23,10 @@
 # test', which bk-evidence then records in its method. Anything else, no origin/main, or no change
 # at all runs the whole table.
 #
+# HEAD at origin/main itself (verify-seq's run of main alone) runs the whole table but skips the Ground
+# guards, which compare a head with main and so have nothing to check, and says so (task
+# 1e89b53c6a4a). Any other head runs them; scripts/merge runs them again on every head it merges.
+#
 # The tests run under cargo-nextest (decision 4bf44934cb67 (4)): every test, each in its own process,
 # all of the workspace's test binaries at once, then the doctests, which nextest doesn't run, under
 # cargo test --doc. Nothing is left out: nextest's default profile has no filter, and the fast profile
@@ -381,11 +385,18 @@ step() {
   echo "test-table: $*"
   "$@" || fail "failed: $*"
 }
+guards() {
+  if [ "$(git rev-parse HEAD)" = "$(git rev-parse --verify -q origin/main^{commit} || true)" ]; then
+    echo "test-table: HEAD is origin/main: skipped the Ground guards (nothing to compare it with)"
+  else
+    step scripts/ground-guards origin/main HEAD
+  fi
+}
 if scope=$("$here/code-scope" docs-only origin/main HEAD 2>&1); then
   echo "test-table: $scope"
   step cargo fmt --check
   echo "test-table: docs-only: skipped clippy and cargo test"
-  step scripts/ground-guards origin/main HEAD
+  guards
   echo "test-table: all passed at $(git rev-parse HEAD), docs-only"
   exit 0
 fi
@@ -395,5 +406,5 @@ step cargo clippy --locked --all-targets -- -D warnings
 step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 step "$timeout" 1800 cargo nextest run --locked --workspace --no-fail-fast
 step "$timeout" 1800 cargo test --locked --doc --workspace
-step scripts/ground-guards origin/main HEAD
+guards
 echo "test-table: all passed at $(git rev-parse HEAD)"
