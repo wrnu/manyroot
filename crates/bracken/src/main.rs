@@ -36,7 +36,8 @@ macro_rules! println {
     };
 }
 
-// Declared after `println!`, so the module uses it too.
+// Declared after `println!`, so the modules use it too.
+mod watch;
 mod weave;
 
 /// Directory holding a Bracken workspace's Ground replica.
@@ -226,6 +227,9 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
+    /// Print the new contributions since a cursor, one compact line (or JSON object) each with the cursor
+    /// past it, then that cursor; with --follow, keep printing them as they arrive.
+    Watch(watch::WatchArgs),
     /// Show one contribution with its relations, evidence and status.
     Show {
         id: String,
@@ -453,6 +457,7 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
     match command {
         Command::Init { .. } | Command::Join { .. } => unreachable!("handled before opening a store"),
         Command::Weave(command) => return weave::run(&mut s, agent, command),
+        Command::Watch(args) => return watch::run(s, agent, args),
         Command::Id(IdCommand::New { name }) => {
             let id = s.create_identity(&name)?;
             println!("{}", id.agent_id());

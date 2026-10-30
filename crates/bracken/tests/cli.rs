@@ -1857,3 +1857,256 @@ fn a_strangers_implements_doesnt_make_blocked_work_ready() {
     bracken(dir, &["relate", &x, "implements", &need, "--as", "other"]);
     assert!(line().starts_with("ready "), "{}", line());
 }
+
+/// `watch` without --follow: each new contribution the filters admit on one compact line, then the cursor;
+/// that cursor round-trips, so the next watch prints only what came after it. Without --since it starts at
+/// the heads. --tag, --open and --for-me filter as `log` and `status --as` do, and text is escaped.
+#[test]
+fn watch_filters_new_contributions_and_its_cursor_round_trips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "watch"]);
+    for who in ["alice", "bob", "manager"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    // The text form ends with the cursor; the lines before it are the contributions' prefixes.
+    let watch = |args: &[&str]| -> (Vec<String>, String) {
+        let out = bracken(dir, &[&["watch"][..], args].concat());
+        let (rows, last) = out.rsplit_once('\n').map_or(("", out.as_str()), |(r, l)| (r, l));
+        let cursor = last.strip_prefix("cursor: ").unwrap_or_else(|| panic!("no cursor after: {out}")).to_owned();
+        (rows.lines().map(|l| l.split_whitespace().next().unwrap().to_owned()).collect(), cursor)
+    };
+    let short = |id: &str| id[..8].to_owned();
+    let goal = bracken(dir, &["claim", "alice's goal", "--tag", "task", "--as", "alice"]);
+    let (rows, start) = watch(&[]);
+    assert_eq!((rows, start.clone()), (vec![], goal.clone()), "without --since: nothing old, the heads");
+    assert_eq!(watch(&["--since", ""]).0, vec![short(&goal)], "--since \"\" is everything");
+
+    let chatter = bracken(dir, &["claim", "bob's chatter", "--tag", "note", "--as", "bob"]);
+    let objection = bracken(dir, &["claim", "that goal is wrong", "--tag", "finding", "--as", "bob"]);
+    let contradicts = bracken(dir, &["relate", &objection, "contradicts", &goal, "--as", "bob"]);
+    let refinement = bracken(dir, &["claim", "a narrower goal", "--as", "bob"]);
+    let refines = bracken(dir, &["relate", &refinement, "refines", &goal, "--as", "bob"]);
+    let work = bracken(dir, &["claim", "bob's work", "--as", "bob"]);
+    let implements = bracken(dir, &["relate", &work, "implements", &goal, "--as", "bob"]);
+    let own = bracken(dir, &["claim", "alice talks to herself", "--as", "alice"]);
+    bracken(dir, &["relate", &own, "refines", &goal, "--as", "alice"]);
+    let tricky = bracken(dir, &["claim", "ev\u{1b}[2Kil\nfake line", "--as", "bob"]);
+
+    let (rows, next) = watch(&["--since", &start]);
+    assert_eq!(rows.len(), 10, "{rows:?}");
+    assert_eq!(rows[0], short(&chatter));
+    assert_eq!(next, tricky, "the cursor is the heads");
+    assert_eq!(watch(&["--since", &next]), (vec![], next.clone()), "the cursor round-trips: nothing new");
+    assert_eq!(watch(&["--since", &start, "--tag", "note"]), (vec![short(&chatter)], next.clone()));
+    assert_eq!(watch(&["--since", &start, "--open"]).0, vec![short(&objection)], "an untriaged finding");
+    let mut mine = watch(&["--since", &start, "--for-me", "--as", "alice"]).0;
+    let mut expected = vec![short(&contradicts), short(&refines), short(&work), short(&implements)];
+    mine.sort();
+    expected.sort();
+    assert_eq!(mine, expected, "others' contradicts and refines, and work waiting for alice's pass");
+    let err = bracken_fails(dir, &["watch", "--for-me"]);
+    assert!(err.contains("--for-me") && err.contains("--as"), "{err}");
+
+    let text = bracken(dir, &["watch", "--since", &start]);
+    let line = text.lines().find(|l| l.starts_with(&short(&tricky))).unwrap();
+    assert!(line.contains("ev\\u{1b}[2Kil fake line") || line.contains("ev\\u{1b}[2Kil …"), "{line}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+
+    let err = bracken_fails(dir, &["watch", "--since", &"0".repeat(64)]);
+    assert!(err.contains("unknown id"), "{err}");
+    let err = bracken_fails(dir, &["watch", "--interval", "3s"]);
+    assert!(err.contains("--follow"), "{err}");
+    let err = bracken_fails(dir, &["watch", "--follow", "--interval", "1s"]);
+    assert!(err.contains("under the minimum"), "{err}");
+}
+
+/// `watch --json`: one JSON object per line, each new contribution as `log --json` has it with the cursor
+/// just past it, then a line with only the cursor if the filters hid what came last.
+#[test]
+fn watch_json_is_one_object_per_line_each_with_a_cursor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "watch-json"]);
+    bracken(dir, &["id", "new", "alice"]);
+    let start = bracken(dir, &["claim", "start", "--as", "alice"]);
+    let a = bracken(dir, &["claim", "a", "--tag", "x", "--as", "alice"]);
+    let b = bracken(dir, &["claim", "b", "--as", "alice"]);
+    let out = bracken(dir, &["watch", "--since", &start, "--json"]);
+    let lines: Vec<serde_json::Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    let c = &lines[0]["contribution"];
+    let keys: Vec<&str> = c.as_object().unwrap().keys().map(String::as_str).collect();
+    for key in ["id", "kind", "author", "author_name", "parents", "timestamp_ms", "retracted", "body"] {
+        assert!(keys.contains(&key), "{key} missing from {c}");
+    }
+    assert_eq!((c["id"].as_str(), c["author_name"].as_str()), (Some(a.as_str()), Some("alice")));
+    assert_eq!(c["body"]["tags"], serde_json::json!(["x"]));
+    assert_eq!(lines[0]["cursor"], a.as_str(), "the cursor just past it");
+    assert_eq!(lines[1]["contribution"]["id"], b.as_str());
+    assert_eq!(lines[1]["cursor"], b.as_str());
+
+    // Filtered: the last new contribution is hidden, so a cursor-only line ends it.
+    let out = bracken(dir, &["watch", "--since", &start, "--json", "--tag", "x"]);
+    let lines: Vec<serde_json::Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert_eq!((lines[0]["cursor"].as_str(), lines[1]["cursor"].as_str()), (Some(a.as_str()), Some(b.as_str())));
+    assert!(lines[1].get("contribution").is_none(), "{out}");
+    let out = bracken(dir, &["watch", "--since", &b, "--json"]);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&out).unwrap(), serde_json::json!({"cursor": b}));
+}
+
+/// The cursor doesn't skip what arrives out of order: a contribution synced in after a cursor was printed is
+/// reported by the next watch, however old its timestamp, and only once.
+#[test]
+fn watch_reports_a_late_arrival_with_an_older_timestamp_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (laptop, server) = (tmp.path().join("laptop"), tmp.path().join("server"));
+    std::fs::create_dir_all(&laptop).unwrap();
+    std::fs::create_dir_all(&server).unwrap();
+    bracken(&laptop, &["init", "--name", "late"]);
+    bracken(&laptop, &["id", "new", "alice"]);
+    let first = bracken(&laptop, &["claim", "first", "--as", "alice"]);
+    let bundle = tmp.path().join("seed.mrb");
+    bracken(&laptop, &["export", bundle.to_str().unwrap()]);
+    bracken(&server, &["join", bundle.to_str().unwrap()]);
+    bracken(&server, &["id", "new", "bob"]);
+
+    // Bob's claim, stamped in 1970 and on the first claim only, written while the laptop moves on.
+    let mut store = manyroot::Store::open(&server.join(".bracken")).unwrap();
+    let bob = store.identity("bob").unwrap();
+    let body = manyroot::Body::Claim { statement: "late and old".into(), tags: vec![] };
+    let old = manyroot::Contribution::create(store.info().ground, &bob, [first.parse().unwrap()], 1, body);
+    let old_id = old.id().to_hex();
+    store.add(old).unwrap();
+    drop(store);
+    let newer = bracken(&laptop, &["claim", "newer", "--as", "alice"]);
+    let cursor = |out: &str| out.lines().last().unwrap().strip_prefix("cursor: ").unwrap().to_owned();
+    let seen = bracken(&laptop, &["watch", "--since", &first]);
+    assert!(seen.starts_with(&newer[..8]) && seen.lines().count() == 2, "{seen}");
+    let at = cursor(&seen);
+    assert_eq!(at, newer);
+
+    bracken(&laptop, &["sync", "../server"]);
+    let late = bracken(&laptop, &["watch", "--since", &at]);
+    let lines: Vec<&str> = late.lines().collect();
+    assert_eq!(lines.len(), 2, "{late}");
+    assert!(lines[0].starts_with(&old_id[..8]) && lines[0].contains("late and old"), "{late}");
+    let again = bracken(&laptop, &["watch", "--since", &cursor(&late)]);
+    assert!(again.starts_with("cursor: "), "reported once: {again}");
+    let mut heads = [newer, old_id];
+    heads.sort();
+    assert_eq!(cursor(&late), heads.join(","));
+}
+
+/// `watch --follow` prints what arrives while it runs, and exits 0 once stdout's reader goes away, even
+/// though nothing more arrives to be written.
+#[test]
+fn watch_follow_streams_and_ends_on_a_closed_reader() {
+    use std::io::BufRead;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "follow"]);
+    bracken(dir, &["id", "new", "alice"]);
+    let start = bracken(dir, &["claim", "start", "--as", "alice"]);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
+        .args(["watch", "--follow", "--interval", "2s", "--json"])
+        .current_dir(dir)
+        .env_remove("BRACKEN_DIR")
+        .env_remove("BRACKEN_AGENT")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    let line =
+        |lines: &mut std::io::Lines<_>| -> Value { serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap() };
+    assert_eq!(line(&mut lines), serde_json::json!({"cursor": start}), "it starts at the heads");
+    let next = bracken(dir, &["claim", "while following", "--as", "alice"]);
+    let v = line(&mut lines);
+    assert_eq!((v["contribution"]["id"].as_str(), v["cursor"].as_str()), (Some(next.as_str()), Some(next.as_str())));
+
+    drop(lines);
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(20) {
+            child.kill().unwrap();
+            panic!("watch --follow kept running after its reader went away");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(status.success(), "{status}");
+}
+
+/// Finding `baff8404bbf5`: `watch --open` reports a finding when it becomes open, which is usually when its
+/// contradicts relation arrives, a round after the finding itself. It reports it once: not again when both
+/// arrive in one batch, nor when the triager confirms it, nor when resuming from a cursor printed with it.
+#[test]
+fn watch_open_reports_a_finding_once_when_its_contradicts_arrives_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "watch-open"]);
+    for who in ["alice", "bob", "manager"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let watch = |since: &str| -> (Vec<String>, String) {
+        let out = bracken(dir, &["watch", "--open", "--since", since]);
+        let (rows, last) = out.rsplit_once('\n').map_or(("", out.as_str()), |(r, l)| (r, l));
+        let cursor = last.strip_prefix("cursor: ").unwrap_or_else(|| panic!("no cursor after: {out}")).to_owned();
+        (rows.lines().map(|l| l.split_whitespace().next().unwrap().to_owned()).collect(), cursor)
+    };
+    let pr = bracken(dir, &["claim", "PR #1", "--tag", "pr", "--as", "bob"]);
+    let c0 = pr.clone();
+    let finding = bracken(dir, &["claim", "it breaks", "--tag", "finding", "--as", "alice"]);
+    let (rows, c1) = watch(&c0);
+    assert!(rows.is_empty(), "not open before its contradicts: {rows:?}");
+    bracken(dir, &["relate", &finding, "contradicts", &pr, "--as", "alice"]);
+    let (rows, c2) = watch(&c1);
+    assert_eq!(rows, vec![finding[..8].to_owned()], "open once its contradicts arrives");
+    assert_eq!(watch(&c0).0, vec![finding[..8].to_owned()], "both in one batch: reported once");
+    bracken(dir, &["evidence", &finding, "pass", "--method", "triage", "--as", "manager"]);
+    let (rows, c3) = watch(&c2);
+    assert!(rows.is_empty(), "a confirming triage doesn't report it again: {rows:?}");
+
+    let lines = |since: &str| -> Vec<Value> {
+        let out = bracken(dir, &["watch", "--open", "--since", since, "--json"]);
+        out.lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .filter(|v: &Value| v.get("contribution").is_some())
+            .collect()
+    };
+    let ids = |lines: &[Value]| -> Vec<String> {
+        lines.iter().map(|v| v["contribution"]["id"].as_str().unwrap().to_owned()).collect()
+    };
+    // Two findings in one batch: both at its end, with the cursor past all of it.
+    let mut found = Vec::new();
+    for text in ["second", "third"] {
+        let f = bracken(dir, &["claim", text, "--tag", "finding", "--as", "alice"]);
+        bracken(dir, &["relate", &f, "contradicts", &pr, "--as", "alice"]);
+        found.push(f);
+    }
+    let both = lines(&c3);
+    assert_eq!(ids(&both), found);
+    assert_eq!(both[0]["cursor"], both[1]["cursor"]);
+    assert!(lines(both[0]["cursor"].as_str().unwrap()).is_empty(), "resuming doesn't report them again");
+
+    // Finding 408881286395: what makes the contradicted claim current again comes after the contradicts
+    // relation in the batch. Resuming from the finding's line doesn't report it again.
+    let p = bracken(dir, &["claim", "P", "--as", "bob"]);
+    let ids_p2 = bracken(dir, &["claim", "P2", "--supersedes", &p, "--as", "bob"]);
+    let supersedes = ids_p2.lines().nth(1).unwrap().to_owned();
+    let f = bracken(dir, &["claim", "P is wrong", "--tag", "finding", "--as", "alice"]);
+    let c = bracken(dir, &["watch", "--open", "--since", "", "--json"]);
+    let c = serde_json::from_str::<Value>(c.lines().last().unwrap()).unwrap()["cursor"].as_str().unwrap().to_owned();
+    bracken(dir, &["relate", &f, "contradicts", &p, "--as", "alice"]);
+    bracken(dir, &["retract", &supersedes, "--as", "bob"]);
+    let reported = lines(&c);
+    assert_eq!(ids(&reported), vec![f.clone()], "open once P is current again");
+    let again = lines(reported[0]["cursor"].as_str().unwrap());
+    assert!(again.is_empty(), "resuming from its line reports it again: {again:?}");
+
+    let err = bracken_fails(dir, &["watch", "--follow", "--interval", "1000years"]);
+    assert!(err.contains("over the maximum"), "{err}");
+}

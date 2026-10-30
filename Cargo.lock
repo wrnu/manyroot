@@ -153,6 +153,7 @@ dependencies = [
  "httparse",
  "humantime",
  "manyroot",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

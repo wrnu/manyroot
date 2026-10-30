@@ -17,6 +17,8 @@
 #     until a later sync pushes it.
 #   - a read pulls first, with a short timeout, and falls back to the local replica, saying so on
 #     stderr. With BK_PULL=required (scripts/merge) a read fails instead.
+#   - watch is a read. With --follow it also syncs with the server before each look, on its own
+#     --interval (at least 2 seconds), through watch's --sync and --token-file, which only bk gives.
 #
 # It refuses what would reach another Ground, or bring in work the team server can't confirm: --dir in
 # any form, import, sync with anything but the team server, the weave command, and an artifact with a
@@ -43,7 +45,7 @@ fail() { echo "bk: $*" >&2; exit 1; }
 weave_media() { [[ $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') == application/vnd.bracken.weave* ]]; }
 # The command, and whose token: --as before any '--', else BRACKEN_AGENT. What follows '--' is the
 # command's own (evidence --run -- <cmd> ...), so an --as there isn't bk's (note 6b211180ec3a).
-cmd='' who=${BRACKEN_AGENT:-} at=0 help=false
+cmd='' who=${BRACKEN_AGENT:-} at=0 help=false follow=false peer=false
 media=()
 for ((i = 1; i <= $#; i++)); do
   case "${!i}" in
@@ -56,11 +58,15 @@ for ((i = 1; i <= $#; i++)); do
     # Help runs only after every refusal: an option that takes the rest of the line, such as sync's
     # --exec, can make -h the argument of something that really runs (finding 3e1a0454a03b).
     -h | --help) help=true ;;
+    --follow) follow=true ;;
+    --sync | --sync=* | --token-file | --token-file=*) peer=true ;;
     -*) ;;
     *) [ -n "$cmd" ] || { cmd=${!i}; at=$i; } ;;
   esac
 done
 [ "$cmd" != weave ] || fail "weave is refused: the Weave Ground is reached only through scripts/weave"
+# watch syncs only with the team server, as sync does (finding 6d623aa585d9): bk gives its --sync itself.
+[ "$cmd" != watch ] || ! $peer || fail "watch's --sync and --token-file are refused: bk syncs watch --follow with the team server itself"
 for m in ${media[@]+"${media[@]}"}; do
   ! weave_media "$m" || fail "a Weave media type is refused: Weave records go only into the Weave Ground, through scripts/weave"
 done
@@ -99,7 +105,7 @@ fi
 
 case "$cmd" in
   claim | artifact | relate | evidence | retract | intend) write=true ;;
-  log | show | heads | conflicts | accepted | cat | export) write=false ;;
+  log | show | heads | conflicts | accepted | cat | export | watch) write=false ;;
   *) exec "$bin" "$@" ;;
 esac
 token="$team/tokens/$who"
@@ -124,11 +130,16 @@ if $write; then
     fail "written to the local replica, but the team server didn't confirm it ($err). Don't report it done; retry with a read (bk heads), which pushes it"
   exit 0
 fi
+# watch --follow syncs again before each look, even if this first pull fails.
+more=()
+[ "$cmd" = watch ] && $follow && [ -n "$token" ] && more=(--sync "$url" --token-file "$token")
 if [ -z "$token" ]; then
   err="no team token for '${who:-}'; set BRACKEN_AGENT to your identity"
+  [ "$cmd" != watch ] || ! $follow || [ "${BK_PULL:-}" = required ] ||
+    echo "bk: watch --follow won't sync with the team server ($err): it reads only the local replica, which sees others' work only when something else pulls" >&2
 elif sync_team "$([ "${BK_PULL:-}" = required ] && echo 60 || echo 5)"; then
-  exec "$bin" "$@"
+  exec "$bin" "$@" ${more[@]+"${more[@]}"}
 fi
 [ "${BK_PULL:-}" != required ] || fail "can't pull from the team server, and this read must be current: $err"
 echo "bk: not pulled from the team server ($err); reading the local replica" >&2
-exec "$bin" "$@"
+exec "$bin" "$@" ${more[@]+"${more[@]}"}
