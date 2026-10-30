@@ -1,0 +1,159 @@
+{
+  "format": 1,
+  "name": "ledger",
+  "python": "3.12",
+  "package": "ledger",
+  "spec": "spec.md",
+  "seed": "seed",
+  "public_tests": "seed/tests",
+  "items": [
+    {
+      "id": "register",
+      "kind": "feature",
+      "title": "A register report",
+      "text": "items/register.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "periods",
+      "kind": "feature",
+      "title": "Totals by month, quarter or year",
+      "text": "items/periods.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "csv-import",
+      "kind": "feature",
+      "title": "Import a bank's CSV export",
+      "text": "items/csv-import.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "budgets",
+      "kind": "feature",
+      "title": "Budgets",
+      "text": "items/budgets.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "filters",
+      "kind": "feature",
+      "title": "A real filter syntax",
+      "text": "items/filters.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "json-output",
+      "kind": "feature",
+      "title": "JSON output for scripts",
+      "text": "items/json-output.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "check",
+      "kind": "feature",
+      "title": "A check command",
+      "text": "items/check.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "commodities",
+      "kind": "refactor",
+      "title": "Amounts with a commodity",
+      "text": "items/commodities.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "split-reports",
+      "kind": "refactor",
+      "title": "Split the reports module",
+      "text": "items/split-reports.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "errors",
+      "kind": "refactor",
+      "title": "One error type",
+      "text": "items/errors.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "bug-rounding",
+      "kind": "fix",
+      "title": "Amounts come out slightly wrong",
+      "text": "items/bug-rounding.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "bug-leap-day",
+      "kind": "fix",
+      "title": "Transactions on 29 February are refused",
+      "text": "items/bug-leap-day.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "bug-print-order",
+      "kind": "fix",
+      "title": "print reorders transactions on the same day",
+      "text": "items/bug-print-order.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "bug-account-spaces",
+      "kind": "fix",
+      "title": "Account names with a space are refused",
+      "text": "items/bug-account-spaces.md",
+      "release": {
+        "at": "start"
+      }
+    },
+    {
+      "id": "change-implied-amounts",
+      "kind": "change",
+      "title": "Change: a posting may leave its amount out",
+      "text": "items/change-implied-amounts.md",
+      "release": {
+        "after_share": 0.5
+      },
+      "revises": [
+        "check"
+      ]
+    }
+  ],
+  "limits": {
+    "cpu_seconds": 10,
+    "memory_mb": 512,
+    "output_bytes": 1048576,
+    "wall_seconds": 60
+  },
+  "hidden": {
+    "id": "ledger",
+    "digest": "40150f239da35c5ffedc1508d2e07d8588b75d3278177a8f6aa5afde1f425b10"
+  }
+}
