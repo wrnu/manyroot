@@ -214,8 +214,10 @@ enum Command {
         #[arg(long, conflicts_with = "json")]
         full: bool,
         /// Only open findings: those `scripts/merge` would block a current head on (process 4.2). Any
-        /// contribution, whatever its tags (finding `8c90edd63f5c`), not retracted, with a contradicts relation to something current that still
-        /// counts (live, or retracted by someone other than the finding's author and the triager), that
+        /// contribution, whatever its tags (finding `8c90edd63f5c`), not retracted, with a contradicts
+        /// relation to something current and not yet merged (no live pass of the triager's on it whose
+        /// method starts with `merge gate`, which `scripts/merge` takes back if the forge refuses)
+        /// that still counts (live, or retracted by someone other than the finding's author and the triager), that
         /// the triager hasn't triaged (no live evidence of theirs on it) or has confirmed (a live pass of
         /// theirs, whatever else they or anyone gave) and not deferred (a depends_on of theirs from a
         /// current task of theirs tagged `deferred`). Anyone else's evidence doesn't triage.
@@ -1704,7 +1706,19 @@ fn age(ms: u64) -> String {
     }
 }
 
-/// What `log --current` shows.
+/// Whether `id` was merged: the triager's live pass on it with a method starting `merge gate`, which
+/// `scripts/merge` records on the pr claim it merges, and retracts if the forge refuses the merge
+/// (finding `d494f36dee9d`). A merged PR's last pr claim stays current, so a finding against it is
+/// closed for `log --open` (task `3217747ec88b`).
+fn merged(g: &Graph, triager: AgentId, id: &ContributionId) -> bool {
+    g.referrers(id).any(|r| {
+        r.author() == triager
+            && !g.is_retracted(&r.id())
+            && matches!(r.body(), Body::Evidence { target, verdict: Verdict::Pass, method, .. }
+                if target == id && method.starts_with("merge gate"))
+    })
+}
+
 /// A finding `log --open` lists, whatever its kind or tags: one `scripts/merge`'s findings check (section
 /// 3) would block a current head on, under the same rules, which this mirrors; change both together (findings `090f4645800f`,
 /// `7c38339206c5`). Not retracted; with a contradicts relation from it to a contribution `view` shows that
@@ -1722,7 +1736,8 @@ fn open_finding(g: &Graph, view: &CurrentView, triager: AgentId, c: &Contributio
         match r.body() {
             Body::Relation { from, kind: RelationKind::Contradicts, to, .. } if *from == c.id() => {
                 let counts = live || (r.author() != c.author() && r.author() != triager);
-                against_current |= counts && g.get(to).is_some() && !view.hidden.contains(to);
+                against_current |=
+                    counts && g.get(to).is_some() && !view.hidden.contains(to) && !merged(g, triager, to);
             }
             Body::Evidence { target, verdict, .. } if *target == c.id() && live && r.author() == triager => {
                 triaged = true;
@@ -1744,6 +1759,7 @@ fn open_finding(g: &Graph, view: &CurrentView, triager: AgentId, c: &Contributio
     against_current && (!triaged || (confirmed && !deferred))
 }
 
+/// What `log --current` shows.
 struct CurrentView {
     /// Omitted: retracted contributions; claims and artifacts with a supersession that counts under
     /// docs/protocol.md (written by their own author, with a live newer side, whoever wrote it); and

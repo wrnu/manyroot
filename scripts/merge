@@ -43,8 +43,10 @@
 #      proof (task ec880b9c2c86).
 # If all pass, it records manager evidence "merge gate @ <sha>" on the claim, then
 # squash-merges through the forge API with head_commit_id set to the sha, so the
-# forge refuses the merge if the branch moved after the check. --dry-run runs every
-# check, records nothing, and makes only GET requests.
+# forge refuses the merge if the branch moved after the check. If the merge fails and
+# the forge shows the PR still open, it retracts that evidence: a live merge-gate pass
+# means the PR merged. If the outcome is unclear, it keeps it and says so. --dry-run runs
+# every check, records nothing, and makes only GET requests.
 #
 # The forge token comes from git's credential helper for the origin host. It is
 # kept in a shell variable and reaches curl only as a header read from a file
@@ -116,13 +118,15 @@ token=$(printf 'protocol=https\nhost=%s\n\n' "$host" | GIT_TERMINAL_PROMPT=0 git
   sed -n 's/^password=//p') || true
 [ -n "$token" ] || fail "no forge credential for $host from git's credential helper"
 
-# api <method> <path> [json body file]: prints the response body. The token goes in a header read from a
-# file descriptor. In a dry run, anything but GET is refused here, before any request.
+# api <method> <path> [json body file] [status]: prints the response body, or with "status" only the HTTP
+# status (000 if there was no reply). The token goes in a header read from a file descriptor. In a dry
+# run, anything but GET is refused here, before any request.
 api() {
-  local method=$1 path=$2 body=${3:-}
+  local method=$1 path=$2 body=${3:-} status=${4:-}
   [ "$method" = GET ] || ! $dry_run || fail "dry run: refusing $method $path"
   local args=(-sS --fail-with-body --proto "=https" --max-redirs 0 -X "$method" -H "Accept: application/json")
   [ -z "$body" ] || args+=(-H "Content-Type: application/json" --data-binary "@$body")
+  [ -z "$status" ] || args+=(-o /dev/null -w '%{http_code}')
   # -q first: no curlrc, whose 'verbose' or 'trace' would print or save the header.
   curl -q "${args[@]}" -H @<(printf 'Authorization: token %s\n' "$token") "$api_base$path"
 }
@@ -164,6 +168,8 @@ fi
 # counting only when it's retracted by the finding's author or the triager (a retract is always
 # by the relation's author), so no one else can drop a finding by retracting their own link to it.
 # `bracken log --open` (open_finding in crates/bracken/src/main.rs) mirrors these rules: change both.
+# It also treats a pr claim carrying the manager's 'merge gate' pass as merged, closing findings against
+# it; this check only looks at the PR it merges, so that doesn't arise here.
 triager=manager
 contradicts=$(jq -c --arg id "$full" '[.referrers[] | select(.kind == "relation"
   and .body.kind == "contradicts" and .body.to == $id)]' <<<"$shown")
@@ -366,7 +372,35 @@ written=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file 
 id=${written%%$'\n'*}
 id=${id##* }
 echo "recorded merge gate evidence $id"
-api POST "/pulls/$pr/merge" "$body" >/dev/null || fail "the forge refused the merge (if the head moved, it answers 409); the evidence $id stands"
+# A live merge-gate pass is what says a PR merged (bracken log --open closes findings against it), so a
+# merge the forge refused takes it back (finding d494f36dee9d). But the call also fails when the forge
+# merges anyway: a proxy's 502 or 504, or a dropped connection, while it's still merging. So the forge is
+# asked (findings f1fc25380904, 3623855aa0e8). Merged at this head keeps the pass. Open, at any head,
+# retracts it: at once after a 4xx (a 409 if the head moved), and otherwise only if it's still open after
+# asking again for a few seconds. Anything else stops, naming the evidence.
+pr_now() { # merged, merged-elsewhere, open or unknown
+  local now
+  now=$(api GET "/pulls/$pr" 2>/dev/null) || { echo unknown; return; }
+  jq -r --arg sha "$sha" 'if .merged == true then (if .head.sha == $sha then "merged" else "merged-elsewhere" end)
+    elif .state == "open" then "open" else "unknown" end' <<<"$now" 2>/dev/null || echo unknown
+}
+if ! status=$(api POST "/pulls/$pr/merge" "$body" status); then
+  outcome=$(pr_now)
+  case "$status" in 4??) asks=0 ;; *) asks=3 ;; esac
+  while [ "$outcome" = open ] && [ "$asks" -gt 0 ]; do
+    sleep 2
+    asks=$((asks - 1))
+    outcome=$(pr_now)
+  done
+  case "$outcome" in
+    open)
+      bk retract "$id" --reason "the forge didn't merge PR #$pr at $sha (HTTP $status)" --as "$agent" >/dev/null ||
+        fail "the merge failed (HTTP $status; a 409 if the head moved) and PR #$pr is open, and retracting the merge gate evidence $id failed or wasn't confirmed: check with scripts/bk show $id, and if it isn't retracted, run scripts/bk retract $id --as $agent, or log --open counts PR #$pr as merged"
+      fail "the merge failed (HTTP $status; a 409 if the head moved) and PR #$pr is open; the merge gate evidence $id is retracted, so it still counts as open" ;;
+    merged) echo "the merge call failed (HTTP $status), but the forge shows PR #$pr merged at $sha; the evidence $id stands" ;;
+    *) fail "the merge's outcome is unclear: the call failed (HTTP $status), and the forge shows PR #$pr neither merged at $sha nor open (${outcome}). The merge gate evidence $id stands; if the PR didn't merge at $sha, run scripts/bk retract $id --as $agent" ;;
+  esac
+fi
 echo "merged PR #$pr at $sha"
 # Free what finished work left behind (process 11f1ac552f26). The merge stands whatever cleanup does.
 if [ -x "$here/cleanup" ]; then
