@@ -391,6 +391,13 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         let intent = intent.lines().next().unwrap();
         let (shown, _) = ok(sh(&a, "scripts/bk", &["show", intent], Some("alice")), "alice reads the intent");
         assert!(shown.contains("intent: working on"), "{scripts}: {shown}");
+        // An --as after '--' is the command's, not bk's: the write pushes with the signer's token (note
+        // 6b211180ec3a).
+        let before = syncs().lines().count();
+        let run = ["evidence", &alice[..12], "--run", "--as", "bob", "--", "/usr/bin/true", "--as", "alice"];
+        ok(sh(&b, "scripts/bk", &run, None), "bob's evidence --run");
+        let new: Vec<String> = syncs().lines().skip(before).map(String::from).collect();
+        assert!(new.len() == 1 && new[0].contains("tokens/bob "), "{scripts}: pushed with {new:?}");
         // bk-evidence's reads and its write go through the server too.
         let evidence = [&alice[..12], "--as", "bob", "--any-head", "--", "/usr/bin/true"];
         let (_, stderr) = ok(sh(&b, "scripts/bk-evidence", &evidence, None), "bk-evidence");
@@ -2774,6 +2781,48 @@ fn owner_approve_signs_as_owner_only_on_a_terminal_and_never_prints_a_key() {
         let stderr = String::from_utf8_lossy(&again.stderr);
         assert!(again.status.code() == Some(1) && stderr.contains("its own yes"), "{scripts}: reused: {stderr}");
         assert_eq!(count(), 2, "{scripts}: a retracted approval's yes signed again");
+    }
+}
+
+/// Finding 410e2e5d0239: scripts/bk refuses import, which would add a bundle (other authors' work
+/// included) to the team's Ground with no confirmation, and points at a throwaway Ground. Nothing is
+/// written, with or without a team server set up.
+#[test]
+fn bk_refuses_import_and_writes_nothing() {
+    for scripts in SCRIPTS {
+        let bk_copy = repo_root().join(scripts).join("bk");
+        let (tmp, dir) = repo(&[("scripts/bk", &bk_copy)], ".bracken/\n", |_| {});
+        bk(&dir, &["init", "--name", "team"]);
+        bk(&dir, &["id", "new", "alice"]);
+        bk(&dir, &["claim", "ours", "--as", "alice"]);
+        // A bundle from a copy of the Ground with a claim the team's doesn't have.
+        let seed = tmp.path().join("seed.mrb");
+        bk(&dir, &["export", seed.to_str().unwrap()]);
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let real = |args: &[&str]| {
+            let out = Command::new(env!("CARGO_BIN_EXE_bracken"))
+                .args(args)
+                .current_dir(&other)
+                .env_remove("BRACKEN_DIR")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        real(&["join", seed.to_str().unwrap()]);
+        real(&["id", "new", "bob"]);
+        real(&["claim", "theirs", "--as", "bob"]);
+        let bundle = tmp.path().join("other.mrb");
+        real(&["export", bundle.to_str().unwrap()]);
+        let before = bk(&dir, &["log", "--json"]);
+        for args in [&["import", bundle.to_str().unwrap()][..], &["--as", "alice", "import", bundle.to_str().unwrap()]]
+        {
+            let out = run(&dir, "scripts/bk", args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {args:?}: {stderr}");
+            assert!(stderr.contains("import is refused") && stderr.contains("mktemp -d"), "{scripts}: {stderr}");
+        }
+        assert_eq!(bk(&dir, &["log", "--json"]), before, "{scripts}: import wrote");
     }
 }
 
