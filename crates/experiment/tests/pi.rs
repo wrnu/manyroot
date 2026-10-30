@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use bracken_experiment::claude::{Caps, Routing};
 use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
 use bracken_experiment::mode::mode_named;
-use bracken_experiment::pi::{CLI, PiBackend, PiConfig, PiExpect};
+use bracken_experiment::pi::{CLI, PiBackend, PiConfig, PiCredential, PiExpect};
 use bracken_experiment::plan::PlanInputs;
 use bracken_experiment::sandbox::{AgentPaths, Profile, Sandbox, resolved};
 use bracken_experiment::task::Task;
@@ -224,6 +224,27 @@ fn certificates(dir: &Path) -> Vec<u8> {
 #[test]
 #[ignore = "runs the Pi prefix; set EXPERIMENT_PI_PREFIX"]
 fn a_pi_turn_runs_through_the_proxy_to_a_stub_provider() {
+    let routing = Routing::new(vec![
+        ("ANTHROPIC_BASE_URL".into(), format!("https://{HOST}")),
+        ("ANTHROPIC_AUTH_TOKEN".into(), FAKE_AUTH.into()),
+    ])
+    .expect("routing");
+    let credential = PiCredential::anthropic(&routing).expect("a credential");
+    stub_turn(credential, MODEL, "medium", "/v1/messages");
+}
+
+/// The same through Pi's built-in OpenRouter provider, as task 19228e53a342's run uses it: DeepSeek
+/// V4.1 Flash from Pi's own catalog, OpenAI's chat completions, the key in `OPENROUTER_API_KEY`.
+#[test]
+#[ignore = "runs the Pi prefix; set EXPERIMENT_PI_PREFIX"]
+fn a_pi_turn_through_openrouter_runs_through_the_proxy_to_a_stub_provider() {
+    let credential =
+        PiCredential::new("openrouter", &format!("https://{HOST}/api/v1"), FAKE_AUTH.into()).expect("a credential");
+    stub_turn(credential, "deepseek/deepseek-v4.1-flash", "high", "/api/v1/chat/completions");
+}
+
+/// One Pi turn with `credential` to the stub, as `model` at `thinking`; the model call goes to `path`.
+fn stub_turn(credential: PiCredential, model: &str, thinking: &str, path: &str) {
     let prefix = prefix();
     let tmp = tempfile::tempdir().expect("a temp dir");
     let root = resolved(tmp.path()).expect("resolved");
@@ -231,18 +252,14 @@ fn a_pi_turn_runs_through_the_proxy_to_a_stub_provider() {
     std::fs::create_dir(&certs).expect("certs");
     let ca = certificates(&certs);
     let stub = Stub::start(&prefix, &certs);
-    let routing = Routing::new(vec![
-        ("ANTHROPIC_BASE_URL".into(), format!("https://{HOST}")),
-        ("ANTHROPIC_AUTH_TOKEN".into(), FAKE_AUTH.into()),
-    ])
-    .expect("routing");
+    let provider = credential.provider().to_string();
     let backend = PiBackend::with_test_ca(
         PiConfig {
             prefix: prefix.clone(),
             version: PI_VERSION.into(),
-            expect: PiExpect { provider: "anthropic".into(), model: MODEL.into(), thinking: "medium".into() },
+            expect: PiExpect { provider: provider.clone(), model: model.into(), thinking: thinking.into() },
             caps: Caps { turn_time: Duration::from_secs(120), turn_budget_usd: None, ..Caps::pilot() },
-            routing,
+            credential,
             dir: root.join("pi"),
             shim: bin(),
             prompt: "You are a test. Reply with one word.".into(),
@@ -280,6 +297,7 @@ fn a_pi_turn_runs_through_the_proxy_to_a_stub_provider() {
     // The run's record of the harness comes first, and says this run trusted a test CA (finding 695de67678dd).
     assert_eq!(usage[0], *backend.harness_record());
     assert_eq!((&usage[0]["harness"], &usage[0]["about"]["test_ca"]), (&json!("Pi"), &json!(true)));
+    assert_eq!(usage[0]["about"]["provider"], json!(provider));
     assert!(usage.iter().any(|r| r["gate"] == true), "the gate passed: {usage:#?}");
     let settled = usage.iter().find(|r| r["result"].is_string()).unwrap_or_else(|| {
         panic!(
@@ -297,13 +315,11 @@ fn a_pi_turn_runs_through_the_proxy_to_a_stub_provider() {
     assert!(!transcript.contains(FAKE_AUTH), "no token in the transcript");
 
     let requests: Vec<Value> = stub.requests().into_iter().filter(|r| r["path"].as_str().is_some()).collect();
-    let messages: Vec<&Value> = requests
-        .iter()
-        .filter(|r| r["path"].as_str().is_some_and(|p| p.split('?').next() == Some("/v1/messages")))
-        .collect();
+    let messages: Vec<&Value> =
+        requests.iter().filter(|r| r["path"].as_str().is_some_and(|p| p.split('?').next() == Some(path))).collect();
     assert_eq!(messages.len(), 1, "one model call: {requests:#?}");
     assert_eq!(messages[0]["auth"], "the token", "the bearer token arrived through the proxy");
-    assert_eq!(messages[0]["model"], MODEL);
+    assert_eq!(messages[0]["model"], model);
     // Beside them, Pi sends one placeholder for Anthropic's prompt cache, with defer_loading: in its
     // source, 'never activated and the model cannot see it'. A call to it would stop the run.
     let declared: std::collections::BTreeSet<String> = messages[0]["tools"]

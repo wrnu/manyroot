@@ -83,16 +83,8 @@ impl Routing {
             return Err("ANTHROPIC_AUTH_TOKEN is too short to check transcripts for".into());
         }
         let url = get("ANTHROPIC_BASE_URL").ok_or("no ANTHROPIC_BASE_URL")?;
-        let rest = url.strip_prefix("https://").ok_or("ANTHROPIC_BASE_URL is not https")?;
-        let authority = rest.split('/').next().unwrap_or_default();
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => (h, p.parse().map_err(|_| "ANTHROPIC_BASE_URL has a bad port")?),
-            None => (authority, 443),
-        };
-        if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
-            return Err("ANTHROPIC_BASE_URL has a bad host".into());
-        }
-        Ok(Routing { host: host.to_ascii_lowercase(), port, env })
+        let (host, port) = https_host(url, "ANTHROPIC_BASE_URL")?;
+        Ok(Routing { host, port, env })
     }
 
     fn secret(&self) -> &str {
@@ -103,6 +95,21 @@ impl Routing {
     pub(crate) fn get(&self, k: &str) -> Option<&str> {
         self.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
     }
+}
+
+/// The host (lowercased) and port of `url`, which must be https; `what` names it in errors, which never
+/// quote it.
+pub(crate) fn https_host(url: &str, what: &str) -> Result<(String, u16), String> {
+    let rest = url.strip_prefix("https://").ok_or_else(|| format!("{what} is not https"))?;
+    let authority = rest.split('/').next().unwrap_or_default();
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().map_err(|_| format!("{what} has a bad port"))?),
+        None => (authority, 443),
+    };
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-') {
+        return Err(format!("{what} has a bad host"));
+    }
+    Ok((host.to_ascii_lowercase(), port))
 }
 
 /// What the `init` event must show, from the plan.

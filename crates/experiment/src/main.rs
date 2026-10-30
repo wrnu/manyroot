@@ -18,7 +18,7 @@ use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routi
 use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_under};
-use bracken_experiment::pi::{PiBackend, PiConfig, PiExpect};
+use bracken_experiment::pi::{PiBackend, PiConfig, PiCredential, PiExpect};
 use bracken_experiment::plan::PlanInputs;
 use bracken_experiment::task::Task;
 
@@ -29,6 +29,8 @@ struct Cli {
     command: Cmd,
 }
 
+// Parsed once, at start: the size of `Run`'s options costs nothing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
     /// Hold one store and answer the driver on standard input and output.
@@ -85,10 +87,22 @@ enum Cmd {
         /// Pi: the version the prefix must hold [default: 1.4.0].
         #[arg(long)]
         pi_version: Option<String>,
-        /// A Claude Code settings file holding the routing entries, read for them alone: either harness
-        /// sends its model calls there, with its token.
+        /// Pi: the provider its model calls go to [default: anthropic]. anthropic is routed by
+        /// --settings; openrouter goes to Pi's own OpenRouter URL with the key in --pi-auth.
+        #[arg(long, value_parser = ["anthropic", "openrouter"])]
+        pi_provider: Option<String>,
+        /// Pi with openrouter: a Pi auth.json (Pi's /login writes one) holding the OpenRouter API key.
+        /// Only that entry is read, into memory; a key Pi would get by running a command is refused.
         #[arg(long)]
-        settings: PathBuf,
+        pi_auth: Option<PathBuf>,
+        /// Pi: the thinking level asked for [default: the plan's effort, medium]. Pick one the model
+        /// supports: DeepSeek V4.1 Flash has off, low, high and max.
+        #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
+        pi_thinking: Option<String>,
+        /// A Claude Code settings file holding the routing entries, read for them alone: Claude Code,
+        /// and Pi with anthropic, send their model calls there, with its token.
+        #[arg(long)]
+        settings: Option<PathBuf>,
         /// Tests only: a system prompt file in place of the reviewed prompts built into the binary.
         #[arg(long)]
         prompt_file: Option<PathBuf>,
@@ -167,6 +181,9 @@ fn main() {
             claude_version,
             pi_prefix,
             pi_version,
+            pi_provider,
+            pi_auth,
+            pi_thinking,
             settings,
             prompt_file,
             model,
@@ -182,9 +199,19 @@ fn main() {
             mode,
             agents,
             turns,
-            harness: HarnessArgs::of(harness.as_deref(), claude, claude_version, pi_prefix, pi_version)
-                .unwrap_or_else(|e| refuse_run(&e)),
-            settings,
+            harness: HarnessOptions {
+                harness,
+                claude,
+                claude_version,
+                pi_prefix,
+                pi_version,
+                pi_provider,
+                pi_auth,
+                pi_thinking,
+                settings,
+            }
+            .args()
+            .unwrap_or_else(|e| refuse_run(&e)),
             prompt_file,
             model,
             bracken,
@@ -216,10 +243,39 @@ fn task_named(name: &str) -> Task {
     Task::named(name).expect("the parser accepts only the tasks' names")
 }
 
-/// The harness `run` plays every turn with, and what it pins.
+/// The harness `run` plays every turn with, what it pins, and where its model calls go.
 enum HarnessArgs {
-    Claude { binary: PathBuf, version: String },
-    Pi { prefix: PathBuf, version: String },
+    Claude { binary: PathBuf, version: String, settings: PathBuf },
+    Pi { prefix: PathBuf, version: String, thinking: Option<String>, provider: PiProvider },
+}
+
+/// Pi's provider and where its key comes from.
+enum PiProvider {
+    Anthropic { settings: PathBuf },
+    OpenRouter { auth: PathBuf },
+}
+
+/// `run`'s harness options as given.
+struct HarnessOptions {
+    harness: Option<String>,
+    claude: Option<PathBuf>,
+    claude_version: Option<String>,
+    pi_prefix: Option<PathBuf>,
+    pi_version: Option<String>,
+    pi_provider: Option<String>,
+    pi_auth: Option<PathBuf>,
+    pi_thinking: Option<String>,
+    settings: Option<PathBuf>,
+}
+
+/// The refusal of options `given` for something else: `--x is <theirs>, but <but>: drop it, or give <fix>`.
+fn not_for(given: &[(&str, bool)], theirs: &str, but: &str, fix: &str) -> Result<(), String> {
+    let named: Vec<&str> = given.iter().filter_map(|(name, set)| set.then_some(*name)).collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    let (verb, them) = if named.len() == 1 { ("is", "it") } else { ("are", "them") };
+    Err(format!("{} {verb} {theirs}, but {but}: drop {them}, or give {fix}", named.join(" and ")))
 }
 
 /// Ends the process as clap ends it on a bad `run` command line: the message, `run`'s usage, exit 2.
@@ -233,46 +289,48 @@ fn refuse_run(message: &str) -> ! {
 /// The Pi version a prefix must hold when `--pi-version` isn't given.
 const PI_VERSION: &str = "1.4.0";
 
-impl HarnessArgs {
-    /// The harness `--harness` names, Claude Code unless given, from its own options. An option for the
-    /// other harness is refused, not ignored (task 4cd030ab8dd1); clap has already asked for the
-    /// harness's own.
-    fn of(
-        harness: Option<&str>,
-        claude: Option<PathBuf>,
-        claude_version: Option<String>,
-        pi_prefix: Option<PathBuf>,
-        pi_version: Option<String>,
-    ) -> Result<HarnessArgs, String> {
-        let pi = harness == Some("pi");
-        let others: Vec<&str> = if pi {
-            [("--claude", claude.is_some()), ("--claude-version", claude_version.is_some())].to_vec()
-        } else {
-            [("--pi-prefix", pi_prefix.is_some()), ("--pi-version", pi_version.is_some())].to_vec()
+impl HarnessOptions {
+    /// The harness `--harness` names, Claude Code unless given, from its own options, and for Pi the
+    /// provider `--pi-provider` names, anthropic unless given, from its own. An option for another
+    /// harness or provider is refused, not ignored (task 4cd030ab8dd1); clap has already asked for the
+    /// harness's binary or prefix.
+    fn args(self) -> Result<HarnessArgs, String> {
+        let o = self;
+        if o.harness.as_deref() != Some("pi") {
+            let pi = [
+                ("--pi-prefix", o.pi_prefix.is_some()),
+                ("--pi-version", o.pi_version.is_some()),
+                ("--pi-provider", o.pi_provider.is_some()),
+                ("--pi-auth", o.pi_auth.is_some()),
+                ("--pi-thinking", o.pi_thinking.is_some()),
+            ];
+            not_for(&pi, "Pi's", "the harness is Claude Code", "--harness pi")?;
+            return Ok(HarnessArgs::Claude {
+                binary: o.claude.expect("clap requires it"),
+                version: o.claude_version.expect("clap requires it"),
+                settings: o.settings.ok_or("Claude Code needs --settings, the file holding its routing entries")?,
+            });
         }
-        .into_iter()
-        .filter_map(|(name, given)| given.then_some(name))
-        .collect();
-        if !others.is_empty() {
-            let (theirs, this, other) =
-                if pi { ("Claude Code's", "Pi", "claude") } else { ("Pi's", "Claude Code", "pi") };
-            return Err(format!(
-                "{} {} {theirs}, but the harness is {this}: drop {}, or give --harness {other}",
-                others.join(" and "),
-                if others.len() == 1 { "is" } else { "are" },
-                if others.len() == 1 { "it" } else { "them" },
-            ));
-        }
-        Ok(if pi {
-            HarnessArgs::Pi {
-                prefix: pi_prefix.expect("clap requires it"),
-                version: pi_version.unwrap_or_else(|| PI_VERSION.into()),
+        let claude = [("--claude", o.claude.is_some()), ("--claude-version", o.claude_version.is_some())];
+        not_for(&claude, "Claude Code's", "the harness is Pi", "--harness claude")?;
+        let provider = if o.pi_provider.as_deref() == Some("openrouter") {
+            let but = "Pi's provider is openrouter";
+            not_for(&[("--settings", o.settings.is_some())], "anthropic's", but, "--pi-provider anthropic")?;
+            PiProvider::OpenRouter {
+                auth: o.pi_auth.ok_or("Pi's openrouter provider needs --pi-auth, a Pi auth.json holding its key")?,
             }
         } else {
-            HarnessArgs::Claude {
-                binary: claude.expect("clap requires it"),
-                version: claude_version.expect("clap requires it"),
+            let but = "Pi's provider is anthropic";
+            not_for(&[("--pi-auth", o.pi_auth.is_some())], "openrouter's", but, "--pi-provider openrouter")?;
+            PiProvider::Anthropic {
+                settings: o.settings.ok_or("Pi's anthropic provider needs --settings, the file holding its routing")?,
             }
+        };
+        Ok(HarnessArgs::Pi {
+            prefix: o.pi_prefix.expect("clap requires it"),
+            version: o.pi_version.unwrap_or_else(|| PI_VERSION.into()),
+            thinking: o.pi_thinking,
+            provider,
         })
     }
 }
@@ -284,7 +342,6 @@ struct AgentRun {
     agents: usize,
     turns: u32,
     harness: HarnessArgs,
-    settings: PathBuf,
     prompt_file: Option<PathBuf>,
     model: String,
     bracken: Option<PathBuf>,
@@ -315,10 +372,15 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
         HarnessArgs::Claude { .. } => "claude",
         HarnessArgs::Pi { .. } => "pi",
     });
+    // Pi's thinking level is the plan's effort, Claude Code's own unless --pi-thinking names one.
+    let effort = match &a.harness {
+        HarnessArgs::Pi { thinking: Some(t), .. } => t.clone(),
+        _ => expect.effort.clone(),
+    };
     let plan = PlanInputs {
         task: a.task,
         model: expect.model.clone(),
-        effort: expect.effort.clone(),
+        effort: effort.clone(),
         harness_commit: harness_commit(),
         caps: caps.plan_value(),
         system_prompt: blake3::hash(prompt.as_bytes()).to_hex().to_string(),
@@ -343,14 +405,13 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
             sandbox: true,
         })
     };
-    let routing = Routing::from_settings(&a.settings)?;
     let outcome = match &a.harness {
-        HarnessArgs::Claude { binary, version } => {
+        HarnessArgs::Claude { binary, version, settings } => {
             let backend = ClaudeBackend::new(ClaudeConfig {
                 pin: Pin::of(binary, version)?,
                 expect,
                 caps,
-                routing,
+                routing: Routing::from_settings(settings)?,
                 dir: backend_dir,
                 shim: me.clone(),
                 prompt,
@@ -360,13 +421,17 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
             })?;
             run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
         }
-        HarnessArgs::Pi { prefix, version } => {
+        HarnessArgs::Pi { prefix, version, provider, .. } => {
+            let credential = match provider {
+                PiProvider::Anthropic { settings } => PiCredential::anthropic(&Routing::from_settings(settings)?)?,
+                PiProvider::OpenRouter { auth } => PiCredential::openrouter(auth)?,
+            };
             let backend = PiBackend::new(PiConfig {
                 prefix: prefix.clone(),
                 version: version.clone(),
-                expect: PiExpect { provider: "anthropic".into(), model: expect.model, thinking: expect.effort },
+                expect: PiExpect { provider: credential.provider().into(), model: expect.model, thinking: effort },
                 caps,
-                routing,
+                credential,
                 dir: backend_dir,
                 shim: me.clone(),
                 prompt,

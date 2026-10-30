@@ -182,3 +182,44 @@ fn run_refuses_an_option_for_the_other_harness() {
         assert!(!dir.path().join("run").exists());
     }
 }
+
+/// Pi's provider takes only its own options, and asks for them (task `19228e53a342`): `--pi-auth` is
+/// openrouter's, `--settings` is anthropic's and Claude Code's, and each is required where it's used.
+#[test]
+fn run_asks_each_pi_provider_for_its_own_key() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_bracken-experiment"));
+    let pi = ["--harness", "pi", "--pi-prefix", "/nonexistent"];
+    let claude = ["--claude", "/nonexistent", "--claude-version", "0"];
+    let settings = ["--settings", "/nonexistent"];
+    let cases: [(Vec<&str>, &str); 6] = [
+        ([&pi[..], &["--pi-provider", "openrouter"]].concat(), "Pi's openrouter provider needs --pi-auth"),
+        (
+            [&pi[..], &["--pi-provider", "openrouter", "--pi-auth", "/a"], &settings].concat(),
+            "--settings is anthropic's, but Pi's provider is openrouter: drop it, or give --pi-provider anthropic",
+        ),
+        (pi.to_vec(), "Pi's anthropic provider needs --settings"),
+        (
+            [&pi[..], &settings, &["--pi-auth", "/a"]].concat(),
+            "--pi-auth is openrouter's, but Pi's provider is anthropic: drop it, or give --pi-provider openrouter",
+        ),
+        (claude.to_vec(), "Claude Code needs --settings"),
+        (
+            [&claude[..], &settings, &["--pi-provider", "openrouter", "--pi-thinking", "high"]].concat(),
+            "--pi-provider and --pi-thinking are Pi's, but the harness is Claude Code",
+        ),
+    ];
+    for (args, says) in cases {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let out = Command::new(bin)
+            .args(["run", "--dir"])
+            .arg(dir.path().join("run"))
+            .args(["--mode", "git"])
+            .args(&args)
+            .output()
+            .expect("the binary runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(err.contains(says), "{args:?}: {err}");
+        assert!(!dir.path().join("run").exists());
+    }
+}

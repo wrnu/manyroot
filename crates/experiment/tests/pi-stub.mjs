@@ -1,11 +1,13 @@
 // A stub model provider for the Pi tests (tests/pi.rs; answer cc34f6275877 (3)): an HTTPS server on
-// 127.0.0.1 speaking just enough of Anthropic's streaming Messages API for one Pi turn, so a turn runs
-// end to end with no model. Run by the test prefix's own node, outside the sandbox:
+// 127.0.0.1 speaking just enough of Anthropic's streaming Messages API, and of OpenAI's streaming chat
+// completions as OpenRouter serves them, for one Pi turn, so a turn runs end to end with no model. Run
+// by the test prefix's own node, outside the sandbox:
 //
 //   node pi-stub.mjs <cert.pem> <key.pem> <log.jsonl> <token>
 //
-// It prints its port, then answers every POST .../v1/messages with one assistant message of fixed text
-// and usage, and logs each request as a JSON line: method, path, whether its bearer token was <token>
+// It prints its port, then answers every POST .../v1/messages and .../chat/completions with one
+// assistant message of fixed text and the same usage (input 1200, cache read 4000, cache write 300,
+// output 7), and logs each request as a JSON line: method, path, whether its bearer token was <token>
 // (never the value), the model asked for and the names of the tools declared. Anything else gets 404.
 // The certificate and key are made by the test, at test time; none is kept in the repository.
 
@@ -32,10 +34,23 @@ const server = createServer({ cert: readFileSync(cert), key: readFileSync(key) }
         path: req.url,
         auth: auth === `Bearer ${token}` ? "the token" : auth ? "another" : "none",
         model: request.model ?? null,
-        tools: (request.tools ?? []).map((t) => t.name),
+        tools: (request.tools ?? []).map((t) => t.name ?? t.function?.name),
       }) + "\n",
     );
-    if (req.method !== "POST" || new URL(req.url, "https://stub").pathname !== "/v1/messages") {
+    const path = new URL(req.url, "https://stub").pathname;
+    if (req.method === "POST" && path.endsWith("/chat/completions")) {
+      res.writeHead(200, { "content-type": "text/event-stream" });
+      const chunk = (rest) =>
+        res.write(`data: ${JSON.stringify({ id: "gen-stub-1", object: "chat.completion.chunk", model: request.model, ...rest })}\n\n`);
+      chunk({ choices: [{ index: 0, delta: { role: "assistant", content: "Done." }, finish_reason: null }] });
+      chunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
+      const details = { cached_tokens: 4000, cache_write_tokens: 300 };
+      chunk({ choices: [], usage: { prompt_tokens: 5500, completion_tokens: 7, prompt_tokens_details: details } });
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+    if (req.method !== "POST" || path !== "/v1/messages") {
       res.writeHead(404).end();
       return;
     }

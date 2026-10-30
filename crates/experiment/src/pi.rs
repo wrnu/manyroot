@@ -23,30 +23,32 @@
 //!   `compaction_end`, so its tokens would escape the totals and the caps (finding ac5a014447a1).
 //! - **The run's record** says all this ([`Harness::about`]): where results come from, compaction off,
 //!   and whether a test CA was trusted (finding 695de67678dd).
+//! - **Its provider** ([`PiCredential`]): `anthropic`, routed by the owner's Claude Code settings, or
+//!   `openrouter` at Pi's own base URL for it, with the key from a Pi `auth.json` (task 19228e53a342,
+//!   note ea4e2f77d70e). Either way the forwarding proxy reaches only that host, and the key reaches Pi
+//!   only in the one environment entry Pi reads for the provider.
 
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
 use crate::backend::{BackendConfig, Caps, Event, Harness, HarnessBackend, Launch, Pin, Tokens, Turn, make_dir};
-use crate::claude::{Routing, SERVER};
+use crate::claude::{Routing, SERVER, https_host};
 use crate::proxy::Route;
 use crate::sandbox::{Profile, resolved};
 
-/// The environment entries Pi adds to the backend's base: its agent and session directories, network
-/// activity of its own off, and the bearer credential. Nothing else reaches it (note 5f9353037f2f).
-pub const ENV_NAMES: [&str; 6] = [
-    "PI_CODING_AGENT_DIR",
-    "PI_CODING_AGENT_SESSION_DIR",
-    "PI_OFFLINE",
-    "PI_SKIP_VERSION_CHECK",
-    "PI_TELEMETRY",
-    "ANTHROPIC_AUTH_TOKEN",
-];
+/// The environment entries Pi adds to the backend's base, before its provider's key: its agent and
+/// session directories and network activity of its own off. Nothing else reaches it but the key's one
+/// entry ([`PROVIDERS`]) and, for a stub provider in tests only, `NODE_EXTRA_CA_CERTS` (note
+/// 5f9353037f2f).
+pub const ENV_NAMES: [&str; 5] =
+    ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY"];
 
-/// [`ENV_NAMES`] and, for a stub provider in tests only, the CA node trusts beside its own.
-pub const TEST_ENV_NAMES: [&str; 7] =
-    [ENV_NAMES[0], ENV_NAMES[1], ENV_NAMES[2], ENV_NAMES[3], ENV_NAMES[4], ENV_NAMES[5], "NODE_EXTRA_CA_CERTS"];
+/// The providers a run may name, each with the one environment entry Pi reads its key from.
+pub const PROVIDERS: [(&str, &str); 2] = [("anthropic", "ANTHROPIC_AUTH_TOKEN"), ("openrouter", "OPENROUTER_API_KEY")];
+
+/// OpenRouter's API, Pi 1.4.0's base URL for its `openrouter` provider.
+pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
 
 /// The session header version Pi 1.4.0 writes.
 pub const HEADER_VERSION: u64 = 3;
@@ -70,7 +72,8 @@ pub struct PiConfig {
     pub version: String,
     pub expect: PiExpect,
     pub caps: Caps,
-    pub routing: Routing,
+    /// Where model calls go, and their key; for [`PiExpect::provider`].
+    pub credential: PiCredential,
     /// The backend's own directory, as [`crate::claude::ClaudeConfig::dir`]. Must not exist yet.
     pub dir: PathBuf,
     /// The `bracken-experiment` binary: the shim and the guard.
@@ -81,6 +84,70 @@ pub struct PiConfig {
     pub tools: Vec<String>,
     /// Tests only: where the forwarding proxy connects instead of resolving the routing host.
     pub upstream: Option<std::net::SocketAddr>,
+}
+
+/// Where a provider's model calls go and the key they carry, held in memory only. Its `Debug` shows the
+/// provider and host, never the key, and no error quotes it.
+pub struct PiCredential {
+    provider: &'static str,
+    key_name: &'static str,
+    base_url: String,
+    host: String,
+    port: u16,
+    key: String,
+}
+
+impl std::fmt::Debug for PiCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "PiCredential {{ provider: {}, host: {}, port: {} }}", self.provider, self.host, self.port)
+    }
+}
+
+impl PiCredential {
+    /// `provider`'s calls to `base_url` (https), carrying `key`, which must be at least 8 bytes for the
+    /// transcripts to be checked for it.
+    pub fn new(provider: &str, base_url: &str, key: String) -> Result<PiCredential, String> {
+        let (provider, key_name) = PROVIDERS
+            .into_iter()
+            .find(|(p, _)| *p == provider)
+            .ok_or_else(|| format!("Pi's provider {} isn't one a run may use", crate::args::short(provider)))?;
+        let (host, port) = https_host(base_url, &format!("{provider}'s base URL"))?;
+        if key.len() < 8 {
+            return Err(format!("{provider}'s key is too short to check transcripts for"));
+        }
+        Ok(PiCredential { provider, key_name, base_url: base_url.to_string(), host, port, key })
+    }
+
+    /// Anthropic, routed by the owner's Claude Code settings.
+    pub fn anthropic(routing: &Routing) -> Result<PiCredential, String> {
+        let url = routing.get("ANTHROPIC_BASE_URL").ok_or("no ANTHROPIC_BASE_URL")?;
+        let key = routing.get("ANTHROPIC_AUTH_TOKEN").ok_or("no ANTHROPIC_AUTH_TOKEN")?;
+        PiCredential::new("anthropic", url, key.to_string())
+    }
+
+    /// OpenRouter at Pi's own base URL for it ([`OPENROUTER_BASE_URL`]), with the API key Pi's `/login`
+    /// saved in the `auth.json` at `path`. Only that entry is read; a key Pi would get by running a
+    /// command (`!…`) is refused, not run.
+    pub fn openrouter(path: &Path) -> Result<PiCredential, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let auth: Value = serde_json::from_str(&text).map_err(|_| format!("{} is not JSON", path.display()))?;
+        let entry = &auth["openrouter"];
+        if entry.is_null() {
+            return Err(format!("{} has no openrouter entry", path.display()));
+        }
+        if entry["type"] != "api_key" {
+            return Err(format!("{}'s openrouter entry isn't an API key", path.display()));
+        }
+        let key = entry["key"].as_str().ok_or_else(|| format!("{}'s openrouter entry has no key", path.display()))?;
+        if key.starts_with('!') {
+            return Err(format!("{}'s openrouter key is a command, which the run won't run", path.display()));
+        }
+        PiCredential::new("openrouter", OPENROUTER_BASE_URL, key.to_string())
+    }
+
+    pub fn provider(&self) -> &str {
+        self.provider
+    }
 }
 
 /// The backend with Pi playing each turn.
@@ -100,7 +167,14 @@ impl HarnessBackend<Pi> {
     }
 
     fn with(cfg: PiConfig, test_ca: Option<Vec<u8>>) -> Result<PiBackend, String> {
-        let PiConfig { prefix, version, expect, caps, routing, dir, shim, prompt, turns, tools, upstream } = cfg;
+        let PiConfig { prefix, version, expect, caps, credential, dir, shim, prompt, turns, tools, upstream } = cfg;
+        if expect.provider != credential.provider {
+            return Err(format!(
+                "the plan's provider is {}, but the key is {}'s",
+                crate::args::short(&expect.provider),
+                credential.provider
+            ));
+        }
         let pin = Pin::tree(&prefix.join("bin/node"), &prefix, &version)?;
         let cli = resolved(&prefix.join(CLI))?;
         let package = cli.parent().and_then(Path::parent).and_then(Path::parent).ok_or("Pi's CLI has no package")?;
@@ -108,11 +182,17 @@ impl HarnessBackend<Pi> {
         if found != version {
             return Err(format!("the prefix holds Pi {}, not {}", crate::args::short(&found), version));
         }
-        let base_url = routing.get("ANTHROPIC_BASE_URL").ok_or("no ANTHROPIC_BASE_URL")?.to_string();
         let backend = BackendConfig { caps, dir, shim: shim.clone(), turns };
-        let pi = Pi { pin, cli, expect, routing, base_url, shim, prompt, tools, upstream, test_ca };
+        let env_names = env_names(&credential, test_ca.is_some());
+        let pi = Pi { pin, cli, expect, credential, env_names, shim, prompt, tools, upstream, test_ca };
         HarnessBackend::start(pi, backend)
     }
+}
+
+/// What Pi's turns may add to the backend's base: [`ENV_NAMES`], the credential's one entry and, with a
+/// test CA, `NODE_EXTRA_CA_CERTS`.
+fn env_names(credential: &PiCredential, test_ca: bool) -> Vec<&'static str> {
+    ENV_NAMES.into_iter().chain([credential.key_name]).chain(test_ca.then_some("NODE_EXTRA_CA_CERTS")).collect()
 }
 
 fn package_version(path: &Path) -> Result<String, String> {
@@ -126,8 +206,8 @@ pub struct Pi {
     pin: Pin,
     cli: PathBuf,
     expect: PiExpect,
-    routing: Routing,
-    base_url: String,
+    credential: PiCredential,
+    env_names: Vec<&'static str>,
     shim: PathBuf,
     prompt: String,
     tools: Vec<String>,
@@ -143,7 +223,8 @@ impl Pi {
             "args": ["-i", self.shim, "shim", "--socket", socket],
             "exposure": "direct",
         }}});
-        let models = json!({"providers": {self.expect.provider.as_str(): {"baseUrl": self.base_url}}});
+        // The base URL alone: for OpenRouter it's Pi's own, written so the checked file says where calls go.
+        let models = json!({"providers": {self.credential.provider: {"baseUrl": self.credential.base_url}}});
         let json = |v: &Value| -> Result<Vec<u8>, String> {
             if let Some(s) = commands(v) {
                 return Err(format!("the Pi configuration holds {}, which Pi would run", crate::args::short(&s)));
@@ -253,11 +334,11 @@ impl Harness for Pi {
     }
 
     fn route(&self) -> Route {
-        Route { host: self.routing.host.clone(), port: self.routing.port, connect: self.upstream }
+        Route { host: self.credential.host.clone(), port: self.credential.port, connect: self.upstream }
     }
 
     fn secret(&self) -> &str {
-        self.routing.get("ANTHROPIC_AUTH_TOKEN").unwrap_or_default()
+        &self.credential.key
     }
 
     fn pin(&self) -> &Pin {
@@ -269,14 +350,18 @@ impl Harness for Pi {
     }
 
     fn about(&self) -> Value {
-        json!({"result": "the stream's sum", "compaction": "off", "test_ca": self.test_ca.is_some()})
+        json!({
+            "result": "the stream's sum",
+            "compaction": "off",
+            "test_ca": self.test_ca.is_some(),
+            "provider": self.credential.provider,
+            "host": self.credential.host,
+            "key_entry": self.credential.key_name,
+        })
     }
 
     fn env_names(&self) -> &[&str] {
-        match self.test_ca {
-            Some(_) => &TEST_ENV_NAMES,
-            None => &ENV_NAMES,
-        }
+        &self.env_names
     }
 
     fn config(&self, _name: &str, socket: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
@@ -303,7 +388,7 @@ impl Harness for Pi {
             .env("PI_OFFLINE", "1")
             .env("PI_SKIP_VERSION_CHECK", "1")
             .env("PI_TELEMETRY", "0")
-            .env("ANTHROPIC_AUTH_TOKEN", self.secret());
+            .env(self.credential.key_name, self.secret());
         if self.test_ca.is_some() {
             l.env("NODE_EXTRA_CA_CERTS", turn.config.join("test-ca.pem"));
         }
@@ -341,22 +426,22 @@ mod tests {
     const TOKEN: &str = "fake-auth-value-not-a-secret-0123456789";
 
     fn pi(test_ca: Option<Vec<u8>>) -> Pi {
-        let exe = std::env::current_exe().expect("the test binary");
         let routing = Routing::new(vec![
             ("ANTHROPIC_BASE_URL".into(), "https://llm.stub.invalid".into()),
             ("ANTHROPIC_AUTH_TOKEN".into(), TOKEN.into()),
         ])
         .expect("routing");
+        with_credential(PiCredential::anthropic(&routing).expect("a credential"), "claude-opus-5-5", test_ca)
+    }
+
+    fn with_credential(credential: PiCredential, model: &str, test_ca: Option<Vec<u8>>) -> Pi {
+        let exe = std::env::current_exe().expect("the test binary");
         Pi {
             pin: Pin::of(&exe, "1.4.0").expect("a pin"),
             cli: exe.clone(),
-            expect: PiExpect {
-                provider: "anthropic".into(),
-                model: "claude-opus-5-5".into(),
-                thinking: "medium".into(),
-            },
-            routing,
-            base_url: "https://llm.stub.invalid".into(),
+            expect: PiExpect { provider: credential.provider.into(), model: model.into(), thinking: "high".into() },
+            env_names: env_names(&credential, test_ca.is_some()),
+            credential,
             shim: PathBuf::from("/bin/shim"),
             prompt: "the prompt".into(),
             tools: vec!["notes_read".into(), "claim".into()],
@@ -500,7 +585,7 @@ mod tests {
         assert_eq!(commands(&json!({"!k": "v"})), Some("!k".into()));
         assert_eq!(commands(&json!({"a": "x!"})), None);
         let mut bad = pi(None);
-        bad.base_url = "!curl evil".into();
+        bad.credential.base_url = "!curl evil".into();
         assert_eq!(
             bad.turn_files(Path::new("/s.sock")).err(),
             Some("the Pi configuration holds `!curl evil`, which Pi would run".into())
@@ -518,8 +603,99 @@ mod tests {
             let err = p.event(&line, false, t).expect_err("refused");
             assert!(err.starts_with("Pi began compacting (`overflow`), which the plan turns off"), "{err}");
         });
-        assert_eq!(p.about(), json!({"result": "the stream's sum", "compaction": "off", "test_ca": false}));
+        assert_eq!(
+            p.about(),
+            json!({
+                "result": "the stream's sum", "compaction": "off", "test_ca": false,
+                "provider": "anthropic", "host": "llm.stub.invalid", "key_entry": "ANTHROPIC_AUTH_TOKEN",
+            })
+        );
         assert_eq!(pi(Some(b"a CA".to_vec())).about()["test_ca"], true);
+    }
+
+    /// A Pi auth.json in a temp dir holding `openrouter`, for [`PiCredential::openrouter`].
+    fn auth(dir: &Path, openrouter: Value) -> PathBuf {
+        let path = dir.join("auth.json");
+        std::fs::write(&path, json!({"anthropic": {"type": "oauth"}, "openrouter": openrouter}).to_string())
+            .expect("auth.json");
+        path
+    }
+
+    #[test]
+    fn openrouter_takes_its_key_from_a_pi_auth_file_and_goes_to_pis_own_url() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let c = PiCredential::openrouter(&auth(tmp.path(), json!({"type": "api_key", "key": TOKEN})))
+            .expect("a credential");
+        assert_eq!((c.provider(), c.host.as_str(), c.port), ("openrouter", "openrouter.ai", 443));
+        assert!(!format!("{c:?}").contains(TOKEN), "its Debug never shows the key");
+
+        let p = with_credential(c, "deepseek/deepseek-v4.1-flash", None);
+        let route = p.route();
+        assert_eq!((route.host.as_str(), route.port), ("openrouter.ai", 443));
+        assert_eq!(p.secret(), TOKEN);
+        assert!(p.env_names().contains(&"OPENROUTER_API_KEY") && !p.env_names().contains(&"ANTHROPIC_AUTH_TOKEN"));
+        let files = p.turn_files(Path::new("/s.sock")).expect("files");
+        let models: Value = serde_json::from_slice(&files[2].1).expect("JSON");
+        assert_eq!(models, json!({"providers": {"openrouter": {"baseUrl": OPENROUTER_BASE_URL}}}));
+        assert_eq!(p.about()["key_entry"], "OPENROUTER_API_KEY");
+        with_turn(|t| {
+            let shown = format!("{:?}", p.launch(t).expect("a launch"));
+            assert!(shown.contains("openrouter/deepseek/deepseek-v4.1-flash") && shown.contains("OPENROUTER_API_KEY"));
+            assert!(!shown.contains("ANTHROPIC_AUTH_TOKEN"), "{shown}");
+            let line = assistant("openrouter", "deepseek/deepseek-v4.1-flash", json!([]));
+            assert!(matches!(p.event(&line, false, t), Ok(Event::Message { .. })));
+            let other = assistant("anthropic", "deepseek/deepseek-v4.1-flash", json!([]));
+            assert!(p.event(&other, false, t).is_err(), "another provider stops the run");
+        });
+    }
+
+    #[test]
+    fn a_pi_auth_file_without_a_plain_openrouter_key_is_refused_and_never_quoted() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let refused = |entry: Value| PiCredential::openrouter(&auth(tmp.path(), entry)).expect_err("refused");
+        let path = tmp.path().join("auth.json").display().to_string();
+        let cases = [
+            (Value::Null, "has no openrouter entry"),
+            (json!({"type": "oauth", "key": TOKEN}), "openrouter entry isn't an API key"),
+            (json!({"type": "api_key"}), "openrouter entry has no key"),
+            (json!({"type": "api_key", "key": format!("!security find-generic-password {TOKEN}")}), "is a command"),
+            (json!({"type": "api_key", "key": "short"}), "too short"),
+        ];
+        for (entry, says) in cases {
+            let e = refused(entry.clone());
+            assert!(e.contains(says), "{entry}: {e}");
+            assert!(!e.contains(TOKEN), "{entry}: the error quotes the key: {e}");
+            assert!(says == "too short" || e.contains(&path), "{e}");
+        }
+        let missing = PiCredential::openrouter(&tmp.path().join("none.json")).expect_err("no file");
+        assert!(missing.starts_with("reading "), "{missing}");
+        let e = PiCredential::new("openai", OPENROUTER_BASE_URL, TOKEN.into()).expect_err("not a provider");
+        assert_eq!(e, "Pi's provider `openai` isn't one a run may use");
+        let e = PiCredential::new("openrouter", "http://openrouter.ai/api/v1", TOKEN.into()).expect_err("not https");
+        assert_eq!(e, "openrouter's base URL is not https");
+    }
+
+    #[test]
+    fn a_key_for_another_provider_than_the_plans_is_refused_before_anything_starts() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let credential =
+            PiCredential::new("anthropic", "https://llm.stub.invalid", TOKEN.into()).expect("a credential");
+        let cfg = PiConfig {
+            prefix: tmp.path().join("no-prefix"),
+            version: "1.4.0".into(),
+            expect: PiExpect { provider: "openrouter".into(), model: "m".into(), thinking: "high".into() },
+            caps: Caps::pilot(),
+            credential,
+            dir: tmp.path().join("pi"),
+            shim: PathBuf::from("/bin/shim"),
+            prompt: "p".into(),
+            turns: 1,
+            tools: vec![],
+            upstream: None,
+        };
+        let err = PiBackend::new(cfg).err().expect("refused");
+        assert_eq!(err, "the plan's provider is `openrouter`, but the key is anthropic's");
+        assert!(!tmp.path().join("pi").exists(), "nothing started");
     }
 
     #[test]
