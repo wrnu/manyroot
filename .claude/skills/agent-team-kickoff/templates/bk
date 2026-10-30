@@ -12,7 +12,7 @@
 # Once the team server is set up (scripts/team-server setup, which writes the main checkout's
 # .bracken-team), the main checkout's replica syncs with it, using the token of the identity in --as
 # or BRACKEN_AGENT:
-#   - a write (claim, artifact, relate, evidence, retract) is pushed, and bk fails unless the server
+#   - a write (claim, artifact, relate, evidence, retract, intend) is pushed, and bk fails unless the server
 #     then confirms its heads cover it (one retry). Don't report work done on a failed write: it is only local
 #     until a later sync pushes it.
 #   - a read pulls first, with a short timeout, and falls back to the local replica, saying so on
@@ -51,7 +51,7 @@ for ((i = 1; i <= $#; i++)); do
   esac
 done
 case "$cmd" in
-  claim | artifact | relate | evidence | retract) write=true ;;
+  claim | artifact | relate | evidence | retract | intend) write=true ;;
   log | show | heads | conflicts | accepted | cat | export) write=false ;;
   *) exec "$bin" "$@" ;;
 esac
