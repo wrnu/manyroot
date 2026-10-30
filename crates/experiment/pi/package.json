@@ -1,0 +1,8 @@
+{
+  "name": "bracken-experiment-pi",
+  "private": true,
+  "description": "The Pi a Pi run pins, at one exact version. scripts/pi-prefix installs exactly package-lock.json into a prefix with its own node, install scripts off; nothing in the workspace depends on it.",
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0"
+  }
+}
