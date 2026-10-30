@@ -25,7 +25,7 @@ This table is the CI: the forge's workflow runs only by hand, and the manager's 
 |---|---|---|---|
 | workspace | `cargo test --workspace` | `cargo clippy --all-targets -- -D warnings` | `cargo fmt --check` |
 
-Builders don't run the whole `cargo test --workspace` (decision `ef5b807d3196`): the manager's counted run does. Before every `pr` claim, run the lint and format checks, and `cargo test` with the packages for every row your branch touches (a package's dependents include the crates whose tests run the `bracken` binary):
+Builders don't run the whole `cargo test --workspace` (decision `ef5b807d3196`): the manager's counted run does. Before every `pr` claim, run the lint and format checks, then `cargo nextest run -P fast` with the packages for every row your branch touches (a package's dependents include the crates whose tests run the `bracken` binary), and `cargo test --doc` with those of them that have a library. That's every package but `bracken`, which is a binary only: `cargo test --doc -p bracken` fails with "no library targets", so when `-p bracken` is your whole scope there's no doctest step. You need cargo-nextest: `cargo install --locked cargo-nextest` (reference `4f8a96525a1e`). The `fast` profile in `.config/nextest.toml` leaves out the slowest tests, which the counted run still runs (decision `4bf44934cb67`). The packages for each row:
 
 | You changed | Test |
 |---|---|

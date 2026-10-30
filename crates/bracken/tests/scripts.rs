@@ -13,6 +13,9 @@ fn repo_root() -> PathBuf {
 }
 
 const SCRIPTS: [&str; 2] = ["scripts", ".claude/skills/agent-team-kickoff/templates"];
+// The tests split per copy (the _in_scripts and _in_the_kickoff_templates pairs) name each copy by
+// index: a third copy needs a third of each.
+const _: () = assert!(SCRIPTS.len() == 2);
 
 fn command(dir: &Path, program: &str, args: &[&str]) -> Command {
     let mut command = Command::new(program);
@@ -1044,99 +1047,104 @@ fn commit_all(dir: &Path, message: &str) {
 /// records it) that main's tip has moved past only in .bracken/ and docs. A pass of part of the table
 /// (cargo fmt --check alone, or cargo test) doesn't count (task 0e67e870e14e). Evidence on an older main that main has since moved past in code is refused,
 /// naming that sha, as are no such evidence, evidence by anyone but the manager, and evidence on another head.
-#[test]
-fn merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge() {
+/// One test per copy (decision 4bf44934cb67 (5)), so nextest runs the two at once.
+fn merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge(scripts: &str) {
     let code = |dir: &Path| put(dir, "code.txt", "a change\n");
-    for scripts in SCRIPTS {
-        let case = |what: &str| format!("{scripts}: {what}");
+    let case = |what: &str| format!("{scripts}: {what}");
 
-        let lib = |dir: &Path| put(dir, "lib.rs", "main's code\n");
+    let lib = |dir: &Path| put(dir, "lib.rs", "main's code\n");
 
-        // Tested on main's tip.
-        let out = merge_dry_run_on(scripts, |_| {}, code, lib, Some(tested("manager", "main")));
+    // Tested on main's tip.
+    let out = merge_dry_run_on(scripts, |_| {}, code, lib, Some(tested("manager", "main")));
+    let line = check_line(&out, "main");
+    assert!(out.status.success(), "{}: {line}", case("on the tip"));
+    assert!(line.starts_with("ok ") && line.contains("tested") && !line.contains("moved past"), "{line}");
+
+    // Tested on a main that main's tip has moved past only in the Ground and docs.
+    let ground_after = |dir: &Path| {
+        lib(dir);
+        commit_all(dir, "code on main");
+        bk(dir, &["claim", "later", "--tag", "note", "--as", "val"]);
+        put(dir, "docs/guide.md", "a guide\n");
+    };
+    let out = merge_dry_run_on(scripts, |_| {}, code, ground_after, Some(tested("manager", "main~1")));
+    let line = check_line(&out, "main");
+    assert!(out.status.success(), "{}: {line}", case("ground and docs after"));
+    assert!(line.contains("moved past only in .bracken/ and docs"), "{line}");
+
+    // Tested on a main that main's tip has moved past in code.
+    let code_after = |dir: &Path| {
+        lib(dir);
+        commit_all(dir, "code on main");
+        put(dir, "more.rs", "more code\n");
+    };
+    let out = merge_dry_run_on(scripts, |_| {}, code, code_after, Some(tested("manager", "main~1")));
+    let line = check_line(&out, "main");
+    assert_eq!(out.status.code(), Some(1), "{}: {line}", case("code after"));
+    assert!(line.starts_with("FAIL") && line.contains("has moved in code since") && line.contains("more.rs"), "{line}");
+
+    // Tested on a main older than the branch point (finding e82a2f2c7ff5): main added x.rs at the branch
+    // point and reverted it later, so the diff from the evidence's main to the tip is empty, yet the
+    // tested tree held x.rs and the merge won't.
+    let out = merge_dry_run_on(
+        scripts,
+        |dir| put(dir, "x.rs", "used by the branch\n"),
+        |dir| put(dir, "code.txt", "uses x.rs\n"),
+        |dir| std::fs::remove_file(dir.join("x.rs")).unwrap(),
+        Some(tested("manager", ":/^scripts")),
+    );
+    let line = check_line(&out, "main");
+    assert_eq!(out.status.code(), Some(1), "{}: {line}", case("evidence before the branch point"));
+    assert!(line.starts_with("FAIL") && line.contains("x.rs"), "{line}");
+
+    // Tested on a commit off main that holds the branch point and differs from the tip only in docs,
+    // but isn't on main: it isn't the main the merge will use.
+    let side = |dir: &Path| {
+        lib(dir);
+        commit_all(dir, "code on main");
+        assert!(run(dir, "git", &["switch", "-qc", "side"]).status.success());
+        put(dir, "docs/side.md", "off main\n");
+        commit_all(dir, "side");
+        assert!(run(dir, "git", &["switch", "-q", "main"]).status.success());
+    };
+    let out = merge_dry_run_on(scripts, |_| {}, code, side, Some(tested("manager", "side")));
+    let line = check_line(&out, "main");
+    assert_eq!(out.status.code(), Some(1), "{}: {line}", case("evidence off main"));
+    assert!(line.starts_with("FAIL"), "{line}");
+
+    // Evidence that doesn't count (finding eed0580eba69 for the last three).
+    let (other_head, unknown) = ("f".repeat(40), "e".repeat(40));
+    let manager = tested("manager", "main");
+    for (what, evidence) in [
+        ("no evidence", None),
+        ("val's evidence", Some(tested("val", "main"))),
+        ("evidence on another head", Some(Tested { head: Some(other_head.as_str()), ..manager })),
+        ("a manager fail", Some(Tested { verdict: "fail", ..manager })),
+        ("a retracted manager pass", Some(Tested { retracted: true, ..manager })),
+        ("a main sha this checkout lacks", Some(Tested { rev: unknown.as_str(), ..manager })),
+        ("a pass of cargo fmt --check alone", Some(Tested { command: "cargo fmt --check", ..manager })),
+        ("a pass of cargo test alone", Some(Tested { command: "cargo test --workspace", ..manager })),
+        ("test-table by another path", Some(Tested { command: "./scripts/test-table", ..manager })),
+    ] {
+        let out = merge_dry_run_on(scripts, |_| {}, code, lib, evidence);
         let line = check_line(&out, "main");
-        assert!(out.status.success(), "{}: {line}", case("on the tip"));
-        assert!(line.starts_with("ok ") && line.contains("tested") && !line.contains("moved past"), "{line}");
-
-        // Tested on a main that main's tip has moved past only in the Ground and docs.
-        let ground_after = |dir: &Path| {
-            lib(dir);
-            commit_all(dir, "code on main");
-            bk(dir, &["claim", "later", "--tag", "note", "--as", "val"]);
-            put(dir, "docs/guide.md", "a guide\n");
-        };
-        let out = merge_dry_run_on(scripts, |_| {}, code, ground_after, Some(tested("manager", "main~1")));
-        let line = check_line(&out, "main");
-        assert!(out.status.success(), "{}: {line}", case("ground and docs after"));
-        assert!(line.contains("moved past only in .bracken/ and docs"), "{line}");
-
-        // Tested on a main that main's tip has moved past in code.
-        let code_after = |dir: &Path| {
-            lib(dir);
-            commit_all(dir, "code on main");
-            put(dir, "more.rs", "more code\n");
-        };
-        let out = merge_dry_run_on(scripts, |_| {}, code, code_after, Some(tested("manager", "main~1")));
-        let line = check_line(&out, "main");
-        assert_eq!(out.status.code(), Some(1), "{}: {line}", case("code after"));
+        assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
         assert!(
-            line.starts_with("FAIL") && line.contains("has moved in code since") && line.contains("more.rs"),
-            "{line}"
+            line.starts_with("FAIL") && line.contains("bk-evidence --on origin/main -- scripts/test-table"),
+            "{}: {line}",
+            case(what)
         );
-
-        // Tested on a main older than the branch point (finding e82a2f2c7ff5): main added x.rs at the branch
-        // point and reverted it later, so the diff from the evidence's main to the tip is empty, yet the
-        // tested tree held x.rs and the merge won't.
-        let out = merge_dry_run_on(
-            scripts,
-            |dir| put(dir, "x.rs", "used by the branch\n"),
-            |dir| put(dir, "code.txt", "uses x.rs\n"),
-            |dir| std::fs::remove_file(dir.join("x.rs")).unwrap(),
-            Some(tested("manager", ":/^scripts")),
-        );
-        let line = check_line(&out, "main");
-        assert_eq!(out.status.code(), Some(1), "{}: {line}", case("evidence before the branch point"));
-        assert!(line.starts_with("FAIL") && line.contains("x.rs"), "{line}");
-
-        // Tested on a commit off main that holds the branch point and differs from the tip only in docs,
-        // but isn't on main: it isn't the main the merge will use.
-        let side = |dir: &Path| {
-            lib(dir);
-            commit_all(dir, "code on main");
-            assert!(run(dir, "git", &["switch", "-qc", "side"]).status.success());
-            put(dir, "docs/side.md", "off main\n");
-            commit_all(dir, "side");
-            assert!(run(dir, "git", &["switch", "-q", "main"]).status.success());
-        };
-        let out = merge_dry_run_on(scripts, |_| {}, code, side, Some(tested("manager", "side")));
-        let line = check_line(&out, "main");
-        assert_eq!(out.status.code(), Some(1), "{}: {line}", case("evidence off main"));
-        assert!(line.starts_with("FAIL"), "{line}");
-
-        // Evidence that doesn't count (finding eed0580eba69 for the last three).
-        let (other_head, unknown) = ("f".repeat(40), "e".repeat(40));
-        let manager = tested("manager", "main");
-        for (what, evidence) in [
-            ("no evidence", None),
-            ("val's evidence", Some(tested("val", "main"))),
-            ("evidence on another head", Some(Tested { head: Some(other_head.as_str()), ..manager })),
-            ("a manager fail", Some(Tested { verdict: "fail", ..manager })),
-            ("a retracted manager pass", Some(Tested { retracted: true, ..manager })),
-            ("a main sha this checkout lacks", Some(Tested { rev: unknown.as_str(), ..manager })),
-            ("a pass of cargo fmt --check alone", Some(Tested { command: "cargo fmt --check", ..manager })),
-            ("a pass of cargo test alone", Some(Tested { command: "cargo test --workspace", ..manager })),
-            ("test-table by another path", Some(Tested { command: "./scripts/test-table", ..manager })),
-        ] {
-            let out = merge_dry_run_on(scripts, |_| {}, code, lib, evidence);
-            let line = check_line(&out, "main");
-            assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
-            assert!(
-                line.starts_with("FAIL") && line.contains("bk-evidence --on origin/main -- scripts/test-table"),
-                "{}: {line}",
-                case(what)
-            );
-        }
     }
+}
+
+#[test]
+fn merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge_in_scripts() {
+    merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge(SCRIPTS[0]);
+}
+
+#[test]
+fn merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge_in_the_kickoff_templates() {
+    merge_accepts_main_ahead_in_code_only_where_the_manager_tested_the_merge(SCRIPTS[1]);
 }
 
 /// bk-evidence --on tests the tree the merge will produce, in a scratch worktree it removes, and records
@@ -1861,70 +1869,77 @@ fn bk_evidence_reuses_a_whole_table_pass_of_the_same_merged_tree_on_the_same_pr(
 /// merge checks the two shortcuts with main's code-scope: a manager pass labelled docs-only counts only
 /// on a docs-only head, and one that reuses an earlier pass only when that pass is the manager's, of the
 /// whole table, on this PR, with the same key. Either fails the scope check otherwise.
-#[test]
-fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds() {
+/// One test per copy (decision 4bf44934cb67 (5)), so nextest runs the two at once.
+fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds(scripts: &str) {
     let code = |dir: &Path| put(dir, "code.txt", "a change\n");
     let doc = |dir: &Path| put(dir, "docs/guide.md", "a guide\n");
     let lib = |dir: &Path| put(dir, "lib.rs", "main's code\n");
     fn docs_only(rev: &str) -> Tested<'_> {
         Tested { suffix: " tree 1111111111111111111111111111111111111111 docs-only", ..tested("manager", rev) }
     }
-    for scripts in SCRIPTS {
-        let case = |what: &str| format!("{scripts}: {what}");
+    let case = |what: &str| format!("{scripts}: {what}");
 
-        // A docs-only pass on a docs-only head, main an ancestor and then ahead in code: both pass.
-        for (what, on_main) in [("docs head", (|_| {}) as fn(&Path)), ("docs head, main ahead in code", lib)] {
-            let out = merge_dry_run_on(scripts, |_| {}, doc, on_main, Some(docs_only("main")));
-            assert!(out.status.success(), "{}: {}", case(what), String::from_utf8_lossy(&out.stdout));
-            assert!(check_line(&out, "scope").contains("the head is docs-only"), "{}", case(what));
-        }
+    // A docs-only pass on a docs-only head, main an ancestor and then ahead in code: both pass.
+    for (what, on_main) in [("docs head", (|_| {}) as fn(&Path)), ("docs head, main ahead in code", lib)] {
+        let out = merge_dry_run_on(scripts, |_| {}, doc, on_main, Some(docs_only("main")));
+        assert!(out.status.success(), "{}: {}", case(what), String::from_utf8_lossy(&out.stdout));
+        assert!(check_line(&out, "scope").contains("the head is docs-only"), "{}", case(what));
+    }
 
-        // A docs-only pass on a head that changes code fails, ahead or not, naming the path.
-        for (what, on_main) in [("code head", (|_| {}) as fn(&Path)), ("code head, main ahead in code", lib)] {
-            let out = merge_dry_run_on(scripts, |_| {}, code, on_main, Some(docs_only("main")));
-            let line = check_line(&out, "scope");
-            assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
-            assert!(line.starts_with("FAIL") && line.contains("code.txt"), "{}: {line}", case(what));
-        }
+    // A docs-only pass on a head that changes code fails, ahead or not, naming the path.
+    for (what, on_main) in [("code head", (|_| {}) as fn(&Path)), ("code head, main ahead in code", lib)] {
+        let out = merge_dry_run_on(scripts, |_| {}, code, on_main, Some(docs_only("main")));
+        let line = check_line(&out, "scope");
+        assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
+        assert!(line.starts_with("FAIL") && line.contains("code.txt"), "{}: {line}", case(what));
+    }
 
-        // A reused pass, main ahead in code: it counts when it cites the manager's whole-table pass on this
-        // PR with the same key; not when the cited pass is someone else's, docs-only, another key's, or
-        // on another PR.
-        let key = "2".repeat(40);
-        let earlier = |head: &str, main: &str, k: &str| format!("scripts/test-table @ {head} on {main} tree {k}");
-        for (what, who, other_pr, cited_suffix, cited_key, ok) in [
-            ("the manager's pass", "manager", false, "", key.as_str(), true),
-            ("val's pass", "val", false, "", key.as_str(), false),
-            ("a docs-only pass", "manager", false, " docs-only", key.as_str(), false),
-            ("another key's pass", "manager", false, "", "3333333333333333333333333333333333333333", false),
-            ("a pass on another PR", "manager", true, "", key.as_str(), false),
-        ] {
-            let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, |_| {}, code, lib, None);
-            let rev =
-                |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
-            let (head, tip) = (rev("pr"), rev("main"));
-            let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
-            let claim = prs[0]["id"].as_str().unwrap().to_owned();
-            let target = if other_pr {
-                bk(&dir, &["claim", &format!("PR #2 other @ {head}: another"), "--tag", "pr", "--as", "builder"])
-            } else {
-                claim.clone()
-            };
-            let cited_method = format!("{}{cited_suffix}", earlier(&"a".repeat(40), &"b".repeat(40), cited_key));
-            let cited = bk(&dir, &["evidence", &target, "pass", "--method", &cited_method, "--as", who]);
-            let method = format!("{} reuses {cited}", earlier(&head, &tip, &key));
-            bk(&dir, &["evidence", &claim, "pass", "--method", &method, "--as", "manager"]);
-            let out = merge.output().unwrap();
-            let line = check_line(&out, "scope");
-            assert_eq!(out.status.success(), ok, "{}: {line}", case(what));
-            assert_eq!(line.starts_with("ok "), ok, "{}: {line}", case(what));
-            if ok {
-                assert!(check_line(&out, "main").starts_with("ok "), "{}", case(what));
-            } else {
-                assert!(line.contains(&format!("reusing {cited}")), "{}: {line}", case(what));
-            }
+    // A reused pass, main ahead in code: it counts when it cites the manager's whole-table pass on this
+    // PR with the same key; not when the cited pass is someone else's, docs-only, another key's, or
+    // on another PR.
+    let key = "2".repeat(40);
+    let earlier = |head: &str, main: &str, k: &str| format!("scripts/test-table @ {head} on {main} tree {k}");
+    for (what, who, other_pr, cited_suffix, cited_key, ok) in [
+        ("the manager's pass", "manager", false, "", key.as_str(), true),
+        ("val's pass", "val", false, "", key.as_str(), false),
+        ("a docs-only pass", "manager", false, " docs-only", key.as_str(), false),
+        ("another key's pass", "manager", false, "", "3333333333333333333333333333333333333333", false),
+        ("a pass on another PR", "manager", true, "", key.as_str(), false),
+    ] {
+        let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, |_| {}, code, lib, None);
+        let rev = |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
+        let (head, tip) = (rev("pr"), rev("main"));
+        let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+        let claim = prs[0]["id"].as_str().unwrap().to_owned();
+        let target = if other_pr {
+            bk(&dir, &["claim", &format!("PR #2 other @ {head}: another"), "--tag", "pr", "--as", "builder"])
+        } else {
+            claim.clone()
+        };
+        let cited_method = format!("{}{cited_suffix}", earlier(&"a".repeat(40), &"b".repeat(40), cited_key));
+        let cited = bk(&dir, &["evidence", &target, "pass", "--method", &cited_method, "--as", who]);
+        let method = format!("{} reuses {cited}", earlier(&head, &tip, &key));
+        bk(&dir, &["evidence", &claim, "pass", "--method", &method, "--as", "manager"]);
+        let out = merge.output().unwrap();
+        let line = check_line(&out, "scope");
+        assert_eq!(out.status.success(), ok, "{}: {line}", case(what));
+        assert_eq!(line.starts_with("ok "), ok, "{}: {line}", case(what));
+        if ok {
+            assert!(check_line(&out, "main").starts_with("ok "), "{}", case(what));
+        } else {
+            assert!(line.contains(&format!("reusing {cited}")), "{}: {line}", case(what));
         }
     }
+}
+
+#[test]
+fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_scripts() {
+    merge_counts_a_docs_only_or_reused_pass_only_where_it_holds(SCRIPTS[0]);
+}
+
+#[test]
+fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_the_kickoff_templates() {
+    merge_counts_a_docs_only_or_reused_pass_only_where_it_holds(SCRIPTS[1]);
 }
 
 /// verify-seq runs each head in a scratch worktree of the main checkout, through the bk-evidence beside it,
