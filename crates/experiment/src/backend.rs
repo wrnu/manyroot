@@ -336,20 +336,22 @@ pub trait Harness: Sync {
     fn route(&self) -> Route;
 
     /// What no transcript or standard error kept may hold: its credential. At least [`MIN_SECRET`]
-    /// bytes, or the backend doesn't start.
+    /// bytes, or the backend doesn't start. Read once, at the start: the run checks what it gave then.
     fn secret(&self) -> &str;
 
     /// The program that plays every turn, checked before each; the sandbox lets it start nothing else
-    /// but the shim (and `/usr/bin/env`, which the shim is started through).
+    /// but the shim (and `/usr/bin/env`, which the shim is started through). Read once, at the start.
     fn pin(&self) -> &Pin;
 
-    /// The environment entries it may add beyond [`BASE_ENV`], by name, fixed for the run. One of
-    /// [`BASE_ENV`] here and the backend doesn't start.
+    /// The environment entries it may add beyond [`BASE_ENV`], by name, fixed for the run: read once, at
+    /// the start. Each must be a plain name, and none may be one of [`BASE_ENV`] or a proxy setting, in
+    /// any case ([`declared_name`]), or the backend doesn't start.
     fn env_names(&self) -> &[&str];
 
-    /// An agent's turn configuration: (file name, bytes). The backend writes it read-only into
-    /// [`Turn::config`] before the agent's first turn, and before every turn checks it is unchanged and
-    /// still what this gives; either failing stops the run.
+    /// An agent's turn configuration: (file name, bytes), each name one plain path component of printable
+    /// ASCII, none twice in any case.
+    /// The backend writes it read-only into [`Turn::config`] before the agent's first turn, and before
+    /// every turn checks it is unchanged and still what this gives; any of these failing stops the run.
     fn config(&self, name: &str, socket: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String>;
 
     /// The turn's arguments and environment entries. Its standard output is the event stream, a line an
@@ -394,6 +396,10 @@ enum End {
 /// The driver's [`Backend`] for any [`Harness`].
 pub struct HarnessBackend<H> {
     harness: H,
+    /// What the harness declared, as the start checked it: the run uses these, never asking again.
+    secret: String,
+    pin: Pin,
+    env_names: Vec<String>,
     cfg: BackendConfig,
     proxy: Proxy,
     totals: Mutex<Totals>,
@@ -407,14 +413,16 @@ impl<H: Harness> HarnessBackend<H> {
     /// forwarding proxy.
     pub fn start(harness: H, cfg: BackendConfig) -> Result<HarnessBackend<H>, String> {
         let name = harness.name();
-        let secret = harness.secret().len();
-        if secret < MIN_SECRET {
+        let (secret, pin) = (harness.secret().to_string(), harness.pin().clone());
+        let env_names: Vec<String> = harness.env_names().iter().map(|n| n.to_string()).collect();
+        if secret.len() < MIN_SECRET {
             return Err(format!(
-                "{name}'s secret is {secret} bytes, under {MIN_SECRET}: too short to check transcripts for"
+                "{name}'s secret is {} bytes, under {MIN_SECRET}: too short to check transcripts for",
+                secret.len()
             ));
         }
-        if let Some(n) = harness.env_names().iter().find(|n| BASE_ENV.contains(n)) {
-            return Err(format!("{name} declares {n}, which the backend sets"));
+        for n in &env_names {
+            declared_name(name, n)?;
         }
         if cfg.dir.exists() {
             return Err(format!("{} already exists", cfg.dir.display()));
@@ -422,11 +430,14 @@ impl<H: Harness> HarnessBackend<H> {
         for sub in ["", "agents", "turn", "transcripts"] {
             make_dir(&cfg.dir.join(sub))?;
         }
-        harness.pin().check(name)?;
+        pin.check(name)?;
         let proxy = Proxy::start(harness.route(), cfg.caps.turn_time)?;
         let usage = private_file(&cfg.dir.join("usage.jsonl"))?;
         Ok(HarnessBackend {
             harness,
+            secret,
+            pin,
+            env_names,
             cfg,
             proxy,
             totals: Mutex::new(Totals::default()),
@@ -484,7 +495,7 @@ impl<H: Harness> HarnessBackend<H> {
     fn play(&self, name: &str, turn: u32, socket: &Path) -> Result<End, String> {
         let config = self.cfg.dir.join("turn").join(name);
         let h = &self.harness;
-        h.pin().check(h.name()).and_then(|()| self.turn_config(&config, name, socket)).map_err(|e| self.halting(e))?;
+        self.pin.check(h.name()).and_then(|()| self.turn_config(&config, name, socket)).map_err(|e| self.halting(e))?;
         let message = crate::prompts::turn_message(turn, self.cfg.turns, name);
         let own = self.cfg.dir.join("agents").join(name);
         let (home, tmp) = (own.join("home"), own.join("tmp"));
@@ -506,7 +517,7 @@ impl<H: Harness> HarnessBackend<H> {
         let launch = h.launch(&t)?;
         let mut cmd = self.command(&t, launch)?;
         let path = self.cfg.dir.join("transcripts").join(format!("{name}-{turn}.jsonl"));
-        let mut transcript = Transcript::create(&path, h.secret())?;
+        let mut transcript = Transcript::create(&path, &self.secret)?;
         let group = Group::start(&self.cfg.shim, &mut cmd, h.name())?;
         let (lines, stderr) = (read_lines(group.stdout), read_stderr(group.stderr));
         let end = self.watch(&t, &lines, &mut transcript);
@@ -531,6 +542,19 @@ impl<H: Harness> HarnessBackend<H> {
     /// what the harness gives.
     fn turn_config(&self, dir: &Path, name: &str, socket: &Path) -> Result<(), String> {
         let files = self.harness.config(name, socket)?;
+        // Every name checked before anything is written: each is one plain component of `dir`, so no file
+        // lands outside it (finding 85d103a6132a), and none comes twice in any case, since macOS's volumes
+        // fold case; ASCII only, so no two spellings of one Unicode name pass either (finding 2c8cbade851b).
+        for (k, (file, _)) in files.iter().enumerate() {
+            if !plain_file_name(file) {
+                let file = crate::args::short(&file.escape_debug().to_string());
+                return Err(format!("the turn configuration's file name {file} isn't one plain name"));
+            }
+            if let Some((f, _)) = files[..k].iter().find(|(f, _)| f.eq_ignore_ascii_case(file)) {
+                let same = if f == file { String::new() } else { format!(" (as {f})") };
+                return Err(format!("the turn configuration names {file} twice{same}"));
+            }
+        }
         if !dir.exists() {
             make_dir(dir)?;
             for (file, bytes) in &files {
@@ -556,11 +580,11 @@ impl<H: Harness> HarnessBackend<H> {
     /// environment of [`BASE_ENV`] and the harness's declared entries only, and standard input null.
     fn command(&self, t: &Turn, launch: Launch) -> Result<Command, String> {
         let h = &self.harness;
-        if let Some((k, _)) = launch.env.iter().find(|(k, _)| !h.env_names().contains(&k.as_str())) {
+        if let Some((k, _)) = launch.env.iter().find(|(k, _)| !self.env_names.contains(k)) {
             let why = format!("{} set {}, an environment entry it didn't declare", h.name(), crate::args::short(k));
             return Err(self.halting(why));
         }
-        let pin = h.pin();
+        let pin = &self.pin;
         let install = pin.path.parent().ok_or("the pinned binary has no directory")?;
         let sandbox = Sandbox::agent(&AgentPaths {
             program: &pin.path,
@@ -755,6 +779,37 @@ impl<H: Harness> Backend for HarnessBackend<H> {
     fn halted(&self) -> Option<String> {
         self.halt.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
+}
+
+/// Checks a name a harness declares ([`Harness::env_names`]): a plain environment name
+/// (`[A-Za-z_][A-Za-z0-9_]*`), not one of [`BASE_ENV`] in any case, and no proxy setting in any case:
+/// none with `PROXY` in it (`https_proxy`, `NO_PROXY`, `ALL_PROXY`, `npm_config_proxy`...), since
+/// programs read those beside or before `HTTPS_PROXY`, and only the backend's says where the agent
+/// connects (finding 85d103a6132a). `harness` names it in the error.
+pub fn declared_name(harness: &str, n: &str) -> Result<(), String> {
+    let mut chars = n.chars();
+    let plain = chars.next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !plain {
+        let n = crate::args::short(&n.escape_debug().to_string());
+        return Err(format!("{harness} declares {n}, which isn't an environment variable name"));
+    }
+    let upper = n.to_ascii_uppercase();
+    if BASE_ENV.contains(&upper.as_str()) {
+        return Err(format!("{harness} declares {n}, which the backend sets"));
+    }
+    if upper.contains("PROXY") {
+        return Err(format!(
+            "{harness} declares {n}, a proxy setting: only the backend's HTTPS_PROXY says where the agent connects"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `file` is one plain path component: printable ASCII without a space or `/`, and not empty, `.`
+/// or `..`.
+fn plain_file_name(file: &str) -> bool {
+    !file.is_empty() && file != "." && file != ".." && file.bytes().all(|b| b.is_ascii_graphic() && b != b'/')
 }
 
 /// Makes `path` and its parents, private to this user.
