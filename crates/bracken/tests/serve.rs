@@ -935,3 +935,371 @@ fn sync_confirm_needs_the_servers_heads_to_cover_this_replica() {
     let out = run(&g.a, &["sync", "--confirm", g.b.to_str().unwrap()]);
     assert!(!out.status.success());
 }
+
+// The change feed (task 09bf8248e69b): `POST /v1/<ground>/changes`, and `watch --feed` reading it.
+
+fn feed_body(since: &str, wait_ms: u64) -> Vec<u8> {
+    serde_json::json!({"since": since, "wait_ms": wait_ms}).to_string().into_bytes()
+}
+
+/// A change feed request: the status, the head, and the reply's contributions.
+fn changes(port: u16, ground: GroundId, since: &str, wait_ms: u64) -> (u16, String, Vec<manyroot::Contribution>) {
+    let (status, head, body) = post(port, &format!("/v1/{ground}/changes"), TOKEN, &feed_body(since, wait_ms));
+    if status != 200 {
+        return (status, head, Vec::new());
+    }
+    let (from, contributions) = manyroot::bundle::read(body.as_slice()).expect("a bundle");
+    assert_eq!(from, ground);
+    (status, head, contributions)
+}
+
+/// The heads of what `cs` holds, as a cursor.
+fn cursor_of(cs: &[manyroot::Contribution]) -> String {
+    let parents: std::collections::HashSet<ContributionId> = cs.iter().flat_map(|c| c.parents().to_vec()).collect();
+    let mut heads: Vec<String> =
+        cs.iter().map(|c| c.id()).filter(|id| !parents.contains(id)).map(|id| id.to_hex()).collect();
+    heads.sort();
+    heads.join(",")
+}
+
+/// Every contribution's parents come before it, or were seen already.
+fn in_causal_order(cs: &[manyroot::Contribution], seen: &[manyroot::Contribution]) -> bool {
+    let mut held: std::collections::HashSet<ContributionId> = seen.iter().map(|c| c.id()).collect();
+    cs.iter().all(|c| {
+        let ok = c.parents().iter().all(|p| held.contains(p));
+        held.insert(c.id());
+        ok
+    })
+}
+
+#[test]
+fn the_change_feed_answers_what_a_cursor_hasnt_seen() {
+    let g = grounds();
+    for i in 0..3 {
+        claim(&g.b, "bob", &format!("b{i}"));
+    }
+    let server = g.http(&[]);
+    let ground = ground_id(&g.b);
+    let path = format!("/v1/{ground}/changes");
+    // A token is needed, and the server's ground.
+    assert_eq!(post(server.port, &path, "not-a-token", &feed_body("", 0)).0, 401);
+    let body = feed_body("", 0);
+    let unsigned = format!("POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len());
+    assert_eq!(raw_http(server.port, &[unsigned.as_bytes(), &body].concat(), true).0, 401, "no token at all");
+    assert_eq!(post(server.port, "/v1/nowhere/changes", TOKEN, &feed_body("", 0)).0, 404);
+    // From "": everything, in causal order, in one reply.
+    let (status, head, all) = changes(server.port, ground, "", 0);
+    assert_eq!(status, 200, "{head}");
+    let mut got: Vec<String> = all.iter().map(|c| c.id().to_hex()).collect();
+    let mut want = ids(&g.b);
+    got.sort();
+    want.sort();
+    assert_eq!(got, want);
+    assert!(in_causal_order(&all, &[]), "parents first");
+    assert_eq!(header(&head, "x-bracken-more"), None);
+    // Past the heads, nothing, once the wait is over.
+    let at = cursor_of(&all);
+    let started = Instant::now();
+    let (status, head, none) = changes(server.port, ground, &at, 400);
+    assert!(status == 200 && none.is_empty(), "{head}");
+    assert!(started.elapsed() >= Duration::from_millis(400), "answered before its wait was over");
+    // Past the first claim only, the rest. A head the server lacks is named, and left out of what's seen.
+    let first =
+        all.iter().position(|c| matches!(c.body(), manyroot::Body::Claim { statement, .. } if statement == "b0"));
+    let first = &all[..=first.expect("b0")];
+    let lacked = "0".repeat(64);
+    let (status, head, rest) = changes(server.port, ground, &format!("{},{lacked}", cursor_of(first)), 0);
+    assert_eq!(status, 200, "{head}");
+    assert_eq!(rest.len(), all.len() - first.len());
+    assert!(in_causal_order(&rest, first));
+    assert_eq!(header(&head, "x-bracken-unknown-heads").as_deref(), Some(lacked.as_str()));
+    // Bad requests.
+    for (body, status) in [
+        (feed_body("", 25_001), 400),
+        (b"{\"since\": \"\"}".to_vec(), 400),
+        (feed_body("abc", 0), 400),
+        (feed_body(&at[..12], 0), 400),
+        (vec![b' '; 64 * 1024 + 1], 413),
+    ] {
+        assert_eq!(post(server.port, &path, TOKEN, &body).0, status, "{}", String::from_utf8_lossy(&body[..20]));
+    }
+}
+
+#[test]
+fn a_change_feed_long_poll_is_woken_by_a_push() {
+    let g = grounds();
+    let server = g.http(&[]);
+    let ground = ground_id(&g.b);
+    let (_, _, all) = changes(server.port, ground, "", 0);
+    let at = cursor_of(&all);
+    let port = server.port;
+    let started = Instant::now();
+    let waiting = std::thread::spawn(move || changes(port, ground, &at, 20_000));
+    std::thread::sleep(Duration::from_millis(500));
+    let pushed = claim(&g.a, "alice", "while the feed waits");
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (status, head, new) = waiting.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(10), "the long poll wasn't woken: {:?}", started.elapsed());
+    assert_eq!(status, 200, "{head}");
+    assert_eq!(new.iter().map(|c| c.id().to_hex()).collect::<Vec<_>>(), vec![pushed]);
+}
+
+#[test]
+fn the_change_feed_pages_by_size_and_bounds_its_waiters() {
+    let g = grounds();
+    // Two 5 MiB artifacts: the 8 MiB reply holds the first, and says there is more.
+    for name in ["one", "two"] {
+        let file = g.tmp.join(name);
+        std::fs::write(&file, vec![name.as_bytes()[0]; 5 << 20]).unwrap();
+        ok(&g.a, &["artifact", file.to_str().unwrap(), "--as", "alice"]);
+    }
+    let server = g.http_for(&g.a, &[]);
+    let ground = ground_id(&g.a);
+    let (status, head, page) = changes(server.port, ground, "", 0);
+    assert_eq!(status, 200, "{head}");
+    assert_eq!(header(&head, "x-bracken-more").as_deref(), Some("1"));
+    let (_, head, rest) = changes(server.port, ground, &cursor_of(&page), 0);
+    assert_eq!(header(&head, "x-bracken-more"), None);
+    assert_eq!(page.len() + rest.len(), ids(&g.a).len());
+    assert!(rest.len() == 1 && in_causal_order(&rest, &page));
+    // Sixteen requests may wait at once; the seventeenth is refused until one ends.
+    let at = cursor_of(&[page, rest].concat());
+    let port = server.port;
+    let waiters: Vec<_> = (0..16)
+        .map(|_| {
+            let at = at.clone();
+            std::thread::spawn(move || changes(port, ground, &at, 3_000).0)
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(changes(port, ground, &at, 0).0, 429);
+    assert!(waiters.into_iter().all(|w| w.join().unwrap() == 200));
+    assert_eq!(changes(port, ground, &at, 0).0, 200);
+}
+
+/// `watch --follow --feed` against `url`, reading `dir`, with its stdout lines arriving on a channel.
+fn watch_feed(dir: &Path, url: &str, token_file: &Path, since: &str) -> (Child, std::sync::mpsc::Receiver<String>) {
+    let mut child = cmd(dir)
+        .args(["watch", "--follow", "--interval", "2s", "--json", "--since", since, "--sync", url, "--feed"])
+        .arg("--token-file")
+        .arg(token_file)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (send, lines) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if send.send(line.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    (child, lines)
+}
+
+/// The next line that prints a contribution, within `limit`.
+fn next_contribution(lines: &std::sync::mpsc::Receiver<String>, limit: Duration) -> Option<Value> {
+    let end = Instant::now() + limit;
+    loop {
+        let line = lines.recv_timeout(end.saturating_duration_since(Instant::now())).ok()?;
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if v.get("contribution").is_some() {
+            return Some(v);
+        }
+    }
+}
+
+#[test]
+fn watch_feed_prints_what_the_feed_brings_and_writes_nothing() {
+    let g = grounds();
+    let bobs = claim(&g.b, "bob", "only on the server");
+    let server = g.http(&[]);
+    let token = g.tmp.join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let at = cursor_of(&manyroot::bundle::read(std::fs::read(g.tmp.join("seed.mrb")).unwrap().as_slice()).unwrap().1);
+    let (mut watch, lines) = watch_feed(&g.a, &server.url, &token, &at);
+    let first = next_contribution(&lines, Duration::from_secs(20)).expect("bob's claim, from the feed");
+    assert_eq!(first["contribution"]["id"], bobs.as_str());
+    // Read-only: a's replica doesn't hold it.
+    assert!(!ids(&g.a).contains(&bobs));
+    // A push wakes it.
+    let alices = claim(&g.a, "alice", "pushed while watched");
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let next = next_contribution(&lines, Duration::from_secs(20)).expect("alice's claim, from the feed");
+    assert_eq!(next["contribution"]["id"], alices.as_str());
+    watch.kill().unwrap();
+    watch.wait().unwrap();
+}
+
+/// A server on 127.0.0.1 that answers every request with `status` and `body`.
+fn fake_server(status: u16, body: Vec<u8>) -> String {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let mut got = Vec::new();
+            let mut buf = [0u8; 4096];
+            // The head, then the body its Content-Length says.
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                got.extend_from_slice(&buf[..n]);
+                let Some(end) = got.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                let head = String::from_utf8_lossy(&got[..end]).to_ascii_lowercase();
+                let length: usize = header(&head, "content-length").and_then(|l| l.parse().ok()).unwrap_or(0);
+                if got.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            let head = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = s.write_all(&[head.as_bytes(), &body].concat());
+        }
+    });
+    url
+}
+
+#[test]
+fn watch_feed_drops_a_reply_that_fails_verification_and_falls_back_without_a_feed() {
+    let g = grounds();
+    claim(&g.b, "bob", "b0");
+    claim(&g.b, "bob", "b1");
+    let exported = g.tmp.join("b.mrb");
+    ok(&g.b, &["export", exported.to_str().unwrap()]);
+    let (ground, all) = manyroot::bundle::read(std::fs::read(&exported).unwrap().as_slice()).unwrap();
+    let bob = |text: &str| {
+        all.iter()
+            .find(|c| matches!(c.body(), manyroot::Body::Claim { statement, .. } if statement == text))
+            .unwrap()
+            .clone()
+    };
+    let bundle = |ground, cs: Vec<manyroot::Contribution>| {
+        let mut out = Vec::new();
+        manyroot::bundle::write(&mut out, ground, cs).unwrap();
+        out
+    };
+    // A signature byte changed: the last of the encoding, which ends in the signature.
+    let mut bad_signature = bundle(ground, vec![bob("b0")]);
+    *bad_signature.last_mut().unwrap() ^= 1;
+    // Another ground's bundle.
+    let other = g.tmp.join("other");
+    ok(&other, &["init", "--name", "other"]);
+    let another_ground = bundle(ground_id(&other), vec![bob("b0")]);
+    // b1 without b0, its parent.
+    let missing_parent = bundle(ground, vec![bob("b1")]);
+    // b0 with a byte after its encoding, counted in its length: not canonical.
+    let mut not_canonical = bundle(ground, vec![bob("b0")]);
+    let len = bob("b0").encode().len();
+    let at = not_canonical.len() - len - 4;
+    not_canonical[at..at + 4].copy_from_slice(&u32::try_from(len + 1).unwrap().to_be_bytes());
+    not_canonical.push(0);
+    let token = g.tmp.join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let at = cursor_of(&manyroot::bundle::read(std::fs::read(g.tmp.join("seed.mrb")).unwrap().as_slice()).unwrap().1);
+    let cases = [
+        ("bad signature", bad_signature, "signature"),
+        ("another ground", another_ground, "another ground"),
+        ("missing parent", missing_parent, "lack a parent"),
+        ("not canonical", not_canonical, "decoding the reply"),
+    ];
+    let runs: Vec<_> = cases
+        .into_iter()
+        .map(|(case, body, says)| {
+            let (dir, token, at) = (g.a.clone(), token.clone(), at.clone());
+            std::thread::spawn(move || {
+                let url = fake_server(200, body);
+                let (mut watch, lines) = watch_feed(&dir, &url, &token, &at);
+                let printed = next_contribution(&lines, Duration::from_secs(30));
+                // Three bad replies, two seconds apart, end it: well within the limit.
+                let end = Instant::now() + Duration::from_secs(30);
+                while watch.try_wait().unwrap().is_none() && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                let _ = watch.kill();
+                let status = watch.wait().unwrap();
+                let mut stderr = String::new();
+                watch.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+                assert!(printed.is_none(), "{case}: printed {printed:?}");
+                assert_eq!(status.code(), Some(1), "{case}: {stderr}");
+                assert!(stderr.contains("failed verification") && stderr.contains(says), "{case}: {stderr}");
+            })
+        })
+        .collect();
+    for run in runs {
+        run.join().unwrap();
+    }
+    // A server without the feed is synced with instead: here it refuses that too.
+    let url = fake_server(404, b"no such ground here\n".to_vec());
+    let (mut watch, _lines) = watch_feed(&g.a, &url, &token, &at);
+    let mut said = BufReader::new(watch.stderr.take().unwrap()).lines();
+    let first = said.next().unwrap().unwrap();
+    let second = said.next().unwrap().unwrap();
+    assert!(watch.try_wait().unwrap().is_none(), "it stopped");
+    watch.kill().unwrap();
+    watch.wait().unwrap();
+    assert!(first.contains("has no change feed (404); syncing with it instead"), "{first}");
+    assert!(second.contains("not synced with"), "{second}");
+}
+
+/// A proxy on 127.0.0.1 in front of `port` that counts the requests it passes on.
+fn counting_proxy(port: u16) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = std::sync::Arc::clone(&count);
+    std::thread::spawn(move || {
+        for client in listener.incoming() {
+            let Ok(client) = client else { continue };
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let Ok(upstream) = TcpStream::connect(("127.0.0.1", port)) else { return };
+                let (mut c, mut u) = (client.try_clone().unwrap(), upstream.try_clone().unwrap());
+                std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut c, &mut u);
+                    let _ = u.shutdown(std::net::Shutdown::Write);
+                });
+                let (mut u, mut c) = (upstream, client);
+                let _ = std::io::copy(&mut u, &mut c);
+                let _ = c.shutdown(std::net::Shutdown::Write);
+            });
+        }
+    });
+    (url, count)
+}
+
+/// Finding 6552f9b16c65: a head of the watching replica that the server lacks is named in the reply and
+/// left out of the next cursor, so the request waits instead of bringing back what is here already; and
+/// once the head reaches the server, it counts as seen and the request still waits, rather than coming
+/// back at once, again and again.
+#[test]
+fn watch_feed_waits_while_and_after_a_local_head_reaches_the_server() {
+    let g = grounds();
+    let server = g.http(&[]);
+    // A claim both hold, and one a holds alone.
+    claim(&g.a, "alice", "on both");
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    claim(&g.a, "alice", "not pushed yet");
+    let (url, requests) = counting_proxy(server.port);
+    let token = g.tmp.join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let (mut watch, _lines) = watch_feed(&g.a, &url, &token, "");
+    let count = || requests.load(std::sync::atomic::Ordering::SeqCst);
+    // The first reply names the head and brings back what a holds (it came at once with nothing new, so
+    // the next waits --interval, 2 s); the second, without it in what's seen, waits.
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(count(), 2, "requests while the head is only a's");
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    std::thread::sleep(Duration::from_secs(4));
+    let after = count();
+    assert!(watch.try_wait().unwrap().is_none(), "watch stopped");
+    watch.kill().unwrap();
+    watch.wait().unwrap();
+    assert!(after <= 3, "{after} requests once the head reached the server");
+}

@@ -352,3 +352,64 @@ pub fn plan(repo: &Path, source: &Source, known: &KnownKeys) -> Result<Plan, Imp
     }
     Ok(plan)
 }
+
+/// A file read from inside a directory, by its path there: its bytes, and
+/// whether it is executable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadFile {
+    pub bytes: Vec<u8>,
+    pub executable: bool,
+}
+
+/// Why [`read_beneath`] refused.
+#[derive(Debug, thiserror::Error)]
+pub enum ReadError {
+    #[error("{0:?} isn't a regular file")]
+    NotAFile(String),
+    #[error("{path:?} is over the {MAX_FILE_BYTES}-byte limit")]
+    TooLarge { path: String },
+    #[error("opening {path:?} without following a symlink: {error}")]
+    Open { path: String, error: std::io::Error },
+}
+
+/// Reads the file at `relative` under the directory `root`, opening each
+/// directory with `openat` and `O_DIRECTORY | O_NOFOLLOW` and the file with
+/// `O_NOFOLLOW`, then checking and reading that one open file. So a symlink
+/// swapped in anywhere on the path after it was checked is refused, and the type
+/// and size checked are those of the bytes read (finding 0bbc434b2588). Reads at
+/// most [`MAX_FILE_BYTES`].
+#[cfg(unix)]
+pub fn read_beneath(root: &Path, relative: &str) -> Result<ReadFile, ReadError> {
+    use rustix::fs::{self as fs, CWD, FileType, OFlags};
+
+    let open = |error: rustix::io::Errno| ReadError::Open { path: relative.to_owned(), error: error.into() };
+    let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut dir = fs::openat(CWD, root, dir_flags, fs::Mode::empty()).map_err(open)?;
+    let (dirs, name) = match relative.rsplit_once('/') {
+        Some((dirs, name)) => (dirs.split('/').collect(), name),
+        None => (Vec::new(), relative),
+    };
+    for component in dirs {
+        dir = fs::openat(&dir, component, dir_flags, fs::Mode::empty()).map_err(open)?;
+    }
+    // O_NONBLOCK, so a FIFO put there doesn't block the open; it is refused below.
+    let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let fd = fs::openat(&dir, name, file_flags, fs::Mode::empty()).map_err(open)?;
+    let stat = fs::fstat(&fd).map_err(open)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
+        return Err(ReadError::NotAFile(relative.to_owned()));
+    }
+    let too_large = || ReadError::TooLarge { path: relative.to_owned() };
+    if stat.st_size as u64 > MAX_FILE_BYTES as u64 {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::from(fd)
+        .take(MAX_FILE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ReadError::Open { path: relative.to_owned(), error })?;
+    if bytes.len() > MAX_FILE_BYTES {
+        return Err(too_large());
+    }
+    Ok(ReadFile { bytes, executable: stat.st_mode & 0o111 != 0 })
+}

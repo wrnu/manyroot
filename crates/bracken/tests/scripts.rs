@@ -311,6 +311,7 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
             "#!/usr/bin/env bash\n\
              if [ \"$1\" = sync ]; then\n  echo \"$*\" >>\"$T/sync.log\"\n\
                if [ -e \"$T/fail-once\" ]; then rm -f \"$T/fail-once\"; echo refused >&2; exit 1; fi\nfi\n\
+             [ \"$1\" != watch ] || echo \"$*\" >>\"$T/watch.log\"\n\
              [ \"${3:-}\" != serve ] || [ ! -e \"$T/slow-serve\" ] || sleep 2\n\
              exec \"$REAL_BRACKEN\" \"$@\"\n",
         );
@@ -409,8 +410,13 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         follow.kill().unwrap();
         follow.wait().unwrap();
         assert!(next.contains(&later) && next.contains("while alice follows"), "{scripts}: {next}");
+        // It did so on the team server's change feed (task 09bf8248e69b): bk gives --feed to a bracken
+        // that has it.
+        let watches = std::fs::read_to_string(tmp.path().join("watch.log")).unwrap();
+        let followed = watches.lines().rfind(|l| l.contains("--follow")).unwrap_or_else(|| panic!("{watches}"));
+        assert!(followed.contains(" --sync ") && followed.ends_with(" --feed"), "{scripts}: {followed}");
         // Only bk gives watch its peer, the team server: another would bring in unconfirmed work.
-        for peer in [&["--sync", "http://127.0.0.1:1"][..], &["--token-file=/dev/null"]] {
+        for peer in [&["--sync", "http://127.0.0.1:1"][..], &["--token-file=/dev/null"], &["--feed"]] {
             let args = [&["watch", "--follow"][..], peer].concat();
             for agent in [Some("alice"), Some("carol")] {
                 let out = sh(&a, "scripts/bk", &args, agent);
@@ -3486,7 +3492,8 @@ fn ground_checkpoint_refuses_a_ground_holding_a_weave_record() {
 }
 
 /// A repository holding scripts/weave, with a throwaway HOME beside it, and a stub bracken that prints
-/// the BRACKEN_DIR it was given and its arguments.
+/// the BRACKEN_DIR it was given and its arguments. The stub hands `show` to the real bracken, so
+/// scripts/weave can still look an owner decision up in the coordination Ground through scripts/bk.
 fn weave_repo() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let weave = repo_root().join("scripts/weave");
     let (tmp, dir) = repo(&[("scripts/weave", &weave)], ".bracken/\n", |_| {});
@@ -3494,8 +3501,17 @@ fn weave_repo() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let stub = tmp.path().join("stub");
-    write_executable(&stub, "#!/bin/sh\necho \"BRACKEN_DIR=$BRACKEN_DIR $*\"\n");
+    write_executable(
+        &stub,
+        "#!/bin/sh\ncase \" $* \" in *\" show \"*) exec \"$REAL_BRACKEN\" \"$@\" ;; esac\necho \"BRACKEN_DIR=$BRACKEN_DIR $*\"\n",
+    );
     (tmp, dir, home, stub)
+}
+
+/// A claim tagged decision in the coordination Ground of a [`weave_repo`], for --owner-decision.
+fn owner_decision(dir: &Path) -> String {
+    bk(dir, &["id", "new", "manager"]);
+    bk(dir, &["claim", "Decision (owner): a weave line", "--tag", "decision", "--as", "manager"])
 }
 
 fn weave(dir: &Path, script: &str, home: &Path, bin: Option<&Path>, args: &[&str]) -> Output {
@@ -3598,30 +3614,101 @@ fn weave_opens_only_the_weave_ground_and_refuses_what_it_must() {
     refused(&copy, &["weave", "check"], "has the coordination Ground's id");
 }
 
-/// scripts/weave refuses a line write without a non-empty --owner-decision (answer 2a620fd0b0dc).
+/// scripts/weave refuses a line write unless --owner-decision names a claim tagged decision, not
+/// retracted, in the coordination Ground (answer 2a620fd0b0dc, finding 3cd6cd19f9a0).
 #[test]
 fn weave_needs_an_owner_decision_for_line_writes() {
     let (_tmp, dir, home, stub) = weave_repo();
     std::fs::create_dir_all(home.join("bracken-weave/manyroot")).unwrap();
+    let decision = owner_decision(&dir);
+    let note = bk(&dir, &["claim", "a note", "--tag", "note", "--as", "manager"]);
+    let retracted = bk(&dir, &["claim", "withdrawn", "--tag", "decision", "--as", "manager"]);
+    bk(&dir, &["retract", &retracted, "--reason", "withdrawn", "--as", "manager"]);
     let run_with = |args: &[&str]| weave(&dir, "scripts/weave", &home, Some(&stub), args);
-    for args in [
-        &["weave", "line", "create", "main", "--as", "a"][..],
-        &["--as", "a", "weave", "line", "policy", "x"],
-        &["weave", "line", "create", "main", "--owner-decision", ""],
-        &["weave", "line", "policy", "x", "--owner-decision="],
+    for (args, expected) in [
+        (&["weave", "line", "create", "main", "--as", "a"][..], "needs --owner-decision"),
+        (&["--as", "a", "weave", "line", "policy", "x"], "needs --owner-decision"),
+        (&["weave", "line", "create", "main", "--owner-decision", ""], "needs --owner-decision"),
+        (&["weave", "line", "policy", "x", "--owner-decision="], "needs --owner-decision"),
+        (&["weave", "line", "policy", "x", "--owner-decision", "TODO"], "12 to 64 lowercase hex"),
+        (&["weave", "line", "create", "x", "--owner-decision", "0123456789ab"], "has no such contribution"),
+        (&["weave", "line", "create", "x", "--owner-decision", &note], "isn't a claim tagged decision"),
+        (&["weave", "line", "create", "x", "--owner-decision", &retracted], "isn't a claim tagged decision"),
     ] {
         let out = run_with(args);
-        assert_eq!(out.status.code(), Some(1), "{args:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("needs --owner-decision"), "{args:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr}");
     }
+    let equals = format!("--owner-decision={}", &decision[..12]);
     for args in [
-        &["weave", "line", "create", "main", "--owner-decision", "abc", "--as", "a"][..],
-        &["weave", "line", "policy", "x", "--owner-decision=abc"],
+        &["weave", "line", "create", "main", "--owner-decision", &decision, "--as", "a"][..],
+        &["weave", "line", "policy", "x", &equals],
         &["weave", "check"],
     ] {
         let out = run_with(args);
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
+}
+
+/// scripts/weave refuses what would make a line version or a supersedes relation by hand: artifact with a
+/// Weave media type, in any case, and relate ... supersedes. line create and line policy still work through
+/// it (answer 12000ab70ae5).
+#[test]
+fn weave_refuses_hand_made_weave_records_but_line_writes_work() {
+    let (_tmp, dir, home, stub) = weave_repo();
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let out = weave(&dir, "scripts/weave", &home, None, &["weave", "init", "--as", "weave-integrator"]);
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    for (args, expected) in [
+        (
+            &["artifact", "p.cbor", "--media-type", "application/vnd.bracken.weave.line+cbor", "--as", "a"][..],
+            "Weave media type is refused",
+        ),
+        (
+            &["artifact", "p.cbor", "--media-type=Application/VND.Bracken.Weave.decision+cbor"],
+            "Weave media type is refused",
+        ),
+        (&["relate", "a", "supersedes", "b", "--as", "a"], "supersedes is refused"),
+        (&["--as", "a", "relate", "--note", "n", "a", "Supersedes", "b"], "supersedes is refused"),
+        // Finding 56dadb600ba2: bracken still reads the kind past '--'.
+        (&["relate", "a", "--", "supersedes", "b"], "supersedes is refused"),
+        (&["relate", "a", "supersedes", "--", "b"], "supersedes is refused"),
+    ] {
+        let out = weave(&dir, "scripts/weave", &home, Some(&stub), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr}");
+    }
+    for args in [&["artifact", "p", "--media-type", "text/plain"][..], &["relate", "a", "supports", "b"]] {
+        let out = weave(&dir, "scripts/weave", &home, Some(&stub), args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let real = |args: &[&str]| {
+        let out = weave(&dir, "scripts/weave", &home, None, args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let decision = owner_decision(&dir);
+    let created = real(&["weave", "line", "create", "dev", "--owner-decision", &decision, "--as", "weave-integrator"]);
+    assert!(created.starts_with("line ") && created.trim_end().ends_with(" (dev)"), "{created}");
+    let changed = real(&[
+        "weave",
+        "line",
+        "policy",
+        "dev",
+        "--validator",
+        "weave-integrator",
+        "--owner-decision",
+        &decision,
+        "--as",
+        "weave-integrator",
+    ]);
+    let lines: Vec<&str> = changed.lines().collect();
+    assert_eq!(lines.len(), 2, "{changed}");
+    assert!(lines[0].starts_with("line ") && lines[1].starts_with("relation ") && lines[1].ends_with(" (supersedes)"));
+    assert_eq!(real(&["weave", "check"]).trim(), "no problems");
 }
 
 /// A batch (decision db6f7705c0a4), end to end: a repository with the real merge, verify-seq, bk-evidence,

@@ -384,3 +384,35 @@ fn the_key_scan_refuses_symlinks_and_oversized_identity_files() {
     let error = KnownKeys::new().add_identities_dir(&dir).expect_err("a directory is refused");
     assert!(error.to_string().contains("not a regular file"), "{error}");
 }
+
+/// Finding 0bbc434b2588: resolve --file reads through one open that follows no symlink, so a symlink
+/// anywhere on the path, a FIFO, or a file over the limit is refused, and the bytes are the file's.
+#[cfg(unix)]
+#[test]
+fn read_beneath_follows_no_symlink_and_reads_one_file() {
+    use bracken_tree::import::{ReadError, read_beneath};
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let tmp = tempfile::tempdir().expect("a temporary directory");
+    let root = tmp.path().join("root");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(root.join("dir")).expect("mkdir");
+    std::fs::create_dir_all(&outside).expect("mkdir");
+    std::fs::write(outside.join("f"), b"outside\n").expect("write");
+    std::fs::write(root.join("dir/f"), b"inside\n").expect("write");
+    std::fs::set_permissions(root.join("dir/f"), std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    symlink(&outside, root.join("linked")).expect("symlink");
+    symlink(outside.join("f"), root.join("dir/link")).expect("symlink");
+    assert!(std::process::Command::new("mkfifo").arg(root.join("fifo")).status().expect("mkfifo").success());
+
+    let read = read_beneath(&root, "dir/f").expect("a regular file");
+    assert_eq!((read.bytes.as_slice(), read.executable), (b"inside\n".as_slice(), true));
+    for path in ["linked/f", "dir/link"] {
+        assert!(matches!(read_beneath(&root, path), Err(ReadError::Open { .. })), "{path}");
+    }
+    assert!(matches!(read_beneath(&root, "fifo"), Err(ReadError::NotAFile(_))));
+    assert!(matches!(read_beneath(&root, "dir"), Err(ReadError::NotAFile(_))));
+    let big = std::fs::File::create(root.join("big")).expect("create");
+    big.set_len(bracken_tree::import::MAX_FILE_BYTES as u64 + 1).expect("grow");
+    assert!(matches!(read_beneath(&root, "big"), Err(ReadError::TooLarge { .. })));
+}

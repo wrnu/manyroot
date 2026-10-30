@@ -16,7 +16,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
 
-use crate::format::{DECISION_MEDIA_TYPE, Decision, LINE_MEDIA_TYPE, Line, Record};
+use crate::format::{
+    Change, DECISION_MEDIA_TYPE, Decision, LINE_MEDIA_TYPE, Line, PROPOSAL_MEDIA_TYPE, Proposal, Record,
+};
 use crate::ground::Index;
 use crate::hash::ContentHash;
 
@@ -34,6 +36,28 @@ pub struct DecisionRecord {
     pub id: ContributionId,
     pub author: AgentId,
     pub decision: Decision,
+}
+
+/// A proposal artifact whose payload decodes, and whether it is valid.
+#[derive(Debug, Clone)]
+pub struct ProposalRecord {
+    pub id: ContributionId,
+    pub author: AgentId,
+    pub proposal: Proposal,
+    pub verdict: Result<(), InvalidProposal>,
+}
+
+/// Why a proposal is invalid: views ignore it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum InvalidProposal {
+    #[error("its line {0} isn't a line's first artifact in its causal past")]
+    NotALine(ContributionId),
+    #[error("its base {0} isn't a qualifying decision on its line, in its causal past")]
+    Base(ContributionId),
+    #[error("its manifest {0} isn't a valid manifest held here")]
+    ManifestNotHeld(ContentHash),
+    #[error("its change {given} isn't the change from its base's manifest to its own, {computed}")]
+    Change { given: ContentHash, computed: ContentHash },
 }
 
 /// Why a decision doesn't qualify: the first rule it breaks.
@@ -84,10 +108,13 @@ pub struct Lines {
     /// it superseded one. [`Lines::lines`] and the default line take only the first kind.
     firsts: BTreeSet<ContributionId>,
     decisions: BTreeMap<ContributionId, DecisionRecord>,
+    proposals: BTreeMap<ContributionId, ProposalRecord>,
     judged: BTreeMap<ContributionId, Result<Qualified, Unqualified>>,
     /// Decisions in causal order, parents first, ties by the smallest id.
     order: Vec<ContributionId>,
     default_line: Option<ContributionId>,
+    /// Policy versions ignored for want of an owner decision.
+    ignored: Vec<ContributionId>,
 }
 
 impl Lines {
@@ -101,6 +128,12 @@ impl Lines {
                 LINE_MEDIA_TYPE if !g.is_retracted(id) => {
                     if let Ok(policy) = Line::decode(content) {
                         lines.versions.insert(*id, Version { id: *id, author: c.author(), policy });
+                    }
+                }
+                PROPOSAL_MEDIA_TYPE if !g.is_retracted(id) => {
+                    if let Ok(proposal) = Proposal::decode(content) {
+                        let record = ProposalRecord { id: *id, author: c.author(), proposal, verdict: Ok(()) };
+                        lines.proposals.insert(*id, record);
                     }
                 }
                 DECISION_MEDIA_TYPE => {
@@ -125,6 +158,30 @@ impl Lines {
                 }
             }
         }
+        // A policy version cites the owner's decision; only the main line weave init writes, a first
+        // artifact named main by the counted marker's author, may carry none (finding 12643881ac59).
+        // The rest count for nothing, and weave check lists them.
+        let marker_author = ix.counted_marker().and_then(|m| g.get(&m)).map(|c| c.author());
+        let ignored: BTreeSet<ContributionId> = lines
+            .versions
+            .values()
+            .filter(|v| {
+                v.policy.owner_decision.is_none()
+                    && !(Some(v.author) == marker_author
+                        && v.policy.name == "main"
+                        && !lines.predecessors.contains_key(&v.id))
+            })
+            .map(|v| v.id)
+            .collect();
+        lines.versions.retain(|id, _| !ignored.contains(id));
+        for links in [&mut lines.successors, &mut lines.predecessors] {
+            links.retain(|id, _| !ignored.contains(id));
+            for list in links.values_mut() {
+                list.retain(|(_, other)| !ignored.contains(other));
+            }
+            links.retain(|_, list| !list.is_empty());
+        }
+        lines.ignored = ignored.into_iter().collect();
         // Parents come before children in `order`, so each parent is judged first.
         for id in lines.order.clone() {
             let record = &lines.decisions[&id];
@@ -141,6 +198,42 @@ impl Lines {
             lines.judged.values().filter_map(|v| v.as_ref().ok()).map(|q| q.line).collect();
         lines.firsts = lines.versions.keys().filter(|id| !lines.predecessors.contains_key(id)).copied().collect();
         lines.firsts.extend(lines_used);
+
+        // A proposal's base is a qualifying decision on its line, and its change recomputes.
+        let verdicts: Vec<(ContributionId, Result<(), InvalidProposal>)> = lines
+            .proposals
+            .values()
+            .map(|r| {
+                let p = &r.proposal;
+                let before = |a: &ContributionId| g.is_ancestor(a, &r.id);
+                let verdict = if !lines.versions.contains_key(&p.line)
+                    || !before(&p.line)
+                    || lines.predecessors.get(&p.line).into_iter().flatten().any(|(rel, _)| before(rel))
+                {
+                    Err(InvalidProposal::NotALine(p.line))
+                } else if !before(&p.base) || !matches!(lines.judged.get(&p.base), Some(Ok(q)) if q.line == p.line) {
+                    Err(InvalidProposal::Base(p.base))
+                } else {
+                    let base = ix.manifest(&lines.decisions[&p.base].decision.manifest).map(|(_, m)| m);
+                    match (base, ix.manifest(&p.manifest).map(|(_, m)| m)) {
+                        (_, None) => Err(InvalidProposal::ManifestNotHeld(p.manifest)),
+                        (None, _) => Err(InvalidProposal::Base(p.base)),
+                        (Some(base), Some(new)) => {
+                            let computed = Change::between(base, new).hash();
+                            if computed == p.change {
+                                Ok(())
+                            } else {
+                                Err(InvalidProposal::Change { given: p.change, computed })
+                            }
+                        }
+                    }
+                };
+                (r.id, verdict)
+            })
+            .collect();
+        for (id, verdict) in verdicts {
+            lines.proposals.get_mut(&id).expect("listed").verdict = verdict;
+        }
 
         if let Some(marker) = ix.counted_marker() {
             let author = g.get(&marker).expect("indexed from the graph").author();
@@ -248,6 +341,22 @@ impl Lines {
         self.versions.get(id)
     }
 
+    /// Valid line artifacts that count for nothing, because they cite no owner decision and aren't
+    /// the main line weave init writes; ascending.
+    pub fn ignored_versions(&self) -> &[ContributionId] {
+        &self.ignored
+    }
+
+    /// The line's current policy: the version of its chain no other in the replica supersedes. Several
+    /// if the chain diverged.
+    pub fn current_versions(&self, line: &ContributionId) -> Vec<ContributionId> {
+        match self.policy_in_force(line, &|_: &ContributionId| true) {
+            Ok(one) => vec![one],
+            Err(Unqualified::PolicyDiverged(many)) => many,
+            Err(_) => vec![],
+        }
+    }
+
     /// The current line named `main` by the counted marker's author, with the smallest id.
     pub fn default_line(&self) -> Option<ContributionId> {
         self.default_line
@@ -255,6 +364,16 @@ impl Lines {
 
     pub fn decision(&self, id: &ContributionId) -> Option<&DecisionRecord> {
         self.decisions.get(id)
+    }
+
+    /// A proposal, valid or not.
+    pub fn proposal(&self, id: &ContributionId) -> Option<&ProposalRecord> {
+        self.proposals.get(id)
+    }
+
+    /// The valid proposals on a line, ascending.
+    pub fn proposals_on<'a>(&'a self, line: &'a ContributionId) -> impl Iterator<Item = &'a ProposalRecord> + 'a {
+        self.proposals.values().filter(move |r| r.verdict.is_ok() && r.proposal.line == *line)
     }
 
     /// Whether a decision qualifies, and if not, why.
@@ -296,6 +415,46 @@ impl Lines {
             .filter(|id| past.as_ref().is_none_or(|p| !p.contains(id) && Some(id) != since))
             .map(|id| &self.decisions[&id])
             .collect()
+    }
+}
+
+impl Lines {
+    /// `id` and every decision it descends from through decision parents.
+    pub fn decision_ancestry(&self, id: &ContributionId) -> HashSet<ContributionId> {
+        let mut seen = HashSet::new();
+        let mut stack = vec![*id];
+        while let Some(d) = stack.pop() {
+            if seen.insert(d)
+                && let Some(record) = self.decisions.get(&d)
+            {
+                stack.extend(record.decision.parents.iter().copied());
+            }
+        }
+        seen
+    }
+
+    /// The merge bases of two decisions: their common ancestors in the decision
+    /// graph (each counting as its own ancestor) that aren't ancestors of another
+    /// common ancestor, ascending. In v0 a merge needs exactly one: several is a
+    /// criss-cross, and none means the two share no history.
+    pub fn merge_bases(&self, a: &ContributionId, b: &ContributionId) -> Vec<ContributionId> {
+        let (ours, theirs) = (self.decision_ancestry(a), self.decision_ancestry(b));
+        let common: BTreeSet<ContributionId> = ours.intersection(&theirs).copied().collect();
+        // Every strict ancestor of a common ancestor, in one walk from their parents.
+        let mut below: HashSet<ContributionId> = HashSet::new();
+        let mut stack: Vec<ContributionId> = common
+            .iter()
+            .filter_map(|c| self.decisions.get(c))
+            .flat_map(|r| r.decision.parents.iter().copied())
+            .collect();
+        while let Some(d) = stack.pop() {
+            if below.insert(d)
+                && let Some(record) = self.decisions.get(&d)
+            {
+                stack.extend(record.decision.parents.iter().copied());
+            }
+        }
+        common.into_iter().filter(|c| !below.contains(c)).collect()
     }
 }
 
