@@ -107,7 +107,7 @@ impl KnownKeys {
             if path.extension().is_none_or(|e| e != "json") {
                 continue;
             }
-            let text = fs::read(&path)?;
+            let text = read_identity_file(&path)?;
             if let Some(hex) = secret_key_field(&text) {
                 let name = path.file_stem().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
                 self.add(name, &hex);
@@ -211,7 +211,7 @@ fn has_putty_header(content: &[u8]) -> bool {
 
 /// The value of a `secret_key` field holding exactly 64 hex digits:
 /// - the key, alone as a word, quoted or not: `"secret_key"` (JSON, a Bracken
-///   identity file), `secret_key` (YAML, TOML);
+///   identity file), `secret_key` or `'secret_key'` (YAML, TOML);
 /// - optional whitespace, then `:` or `=`, then optional whitespace;
 /// - the value, in double or single quotes or bare, and nothing hex-like right
 ///   after it.
@@ -226,7 +226,8 @@ fn secret_key_field(content: &[u8]) -> Option<String> {
         if start > 0 && word(content[start - 1]) {
             continue;
         }
-        let mut s = content[end..].strip_prefix(b"\"").unwrap_or(&content[end..]);
+        let after = &content[end..];
+        let mut s = after.strip_prefix(b"\"").or_else(|| after.strip_prefix(b"'")).unwrap_or(after);
         if s.first().copied().is_some_and(word) {
             continue;
         }
@@ -253,6 +254,54 @@ fn secret_key_field(content: &[u8]) -> Option<String> {
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// The largest identity file read; a real one is well under a kilobyte.
+pub const MAX_IDENTITY_FILE_BYTES: u64 = 64 * 1024;
+
+/// Reads an identity file without following a symlink, refusing anything that
+/// isn't a regular file or is larger than [`MAX_IDENTITY_FILE_BYTES`].
+fn read_identity_file(path: &Path) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+
+    let refuse = |why: &str| io::Error::new(io::ErrorKind::InvalidData, format!("{}: {why}", path.display()));
+    let file = open_no_follow(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(refuse("not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_IDENTITY_FILE_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_IDENTITY_FILE_BYTES {
+        return Err(refuse(&format!("larger than {MAX_IDENTITY_FILE_BYTES} bytes, too large for an identity file")));
+    }
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn open_no_follow(path: &Path) -> io::Result<fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    // NONBLOCK, so a FIFO can't stall the open; NOFOLLOW refuses a symlink.
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    match rustix::fs::open(path, flags, Mode::empty()) {
+        Ok(fd) => Ok(fs::File::from(fd)),
+        Err(rustix::io::Errno::LOOP) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: a symlink, not a regular file", path.display()),
+        )),
+        Err(e) => Err(io::Error::new(io::Error::from(e).kind(), format!("{}: {e}", path.display()))),
+    }
+}
+
+#[cfg(not(unix))]
+fn open_no_follow(path: &Path) -> io::Result<fs::File> {
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{}: a symlink, not a regular file", path.display()),
+        ));
+    }
+    fs::File::open(path)
 }
 
 #[cfg(test)]
@@ -337,6 +386,9 @@ mod tests {
             (format!("{} = \"{hex}\"\n", "secret_key"), SecretRule::SecretKeyField),
             (format!("{}='{}'", "secret_key", hex.to_uppercase()), SecretRule::SecretKeyField),
             (format!("{}:{hex}", "secret_key"), SecretRule::SecretKeyField),
+            // Task b89618b2bc44: a YAML key in single quotes.
+            (format!("'{}': {hex}\n", "secret_key"), SecretRule::SecretKeyField),
+            (format!("'{}': '{hex}'", "secret_key"), SecretRule::SecretKeyField),
         ];
         for (content, rule) in cases {
             assert_eq!(scan(content.as_bytes(), &none), Some(rule), "{content:?}");
@@ -354,6 +406,8 @@ mod tests {
             format!("{}: \"{hex}", "secret_key"),
             format!("{}: String", "secret_key"),
             format!("{}: hex::encode(key)", "secret_key"),
+            format!("'{}_old': {hex}", "secret_key"),
+            format!("'{}' is the field: {hex}", "secret_key"),
         ] {
             assert_eq!(scan(prose.as_bytes(), &none), None, "{prose:?}");
         }

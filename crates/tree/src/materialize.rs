@@ -12,7 +12,10 @@
 //!   `O_DIRECTORY | O_NOFOLLOW`, each file is created with
 //!   `O_CREAT | O_EXCL | O_NOFOLLOW`, and its mode is set exactly to `0644` or
 //!   `0755` with `fchmod`, whatever the umask;
-//! - symlinks are created last, after every file and directory.
+//! - symlinks are created last, after every file and directory;
+//! - if writing fails part way, everything this call made is removed again, in
+//!   reverse order, so the target is left empty. If even that fails, the error
+//!   is [`MaterializeError::PartlyWritten`], which lists what is left.
 //!
 //! This is Unix only. Elsewhere [`materialize`] refuses with
 //! [`MaterializeError::Unsupported`] and writes nothing: a writer for Windows
@@ -47,6 +50,16 @@ pub enum MaterializeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("{error}; and these paths couldn't be removed again, so the target holds them: {left:?}")]
+    PartlyWritten { error: Box<MaterializeError>, left: Vec<String> },
+}
+
+/// What [`materialize`] made, in order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Made {
+    Dir,
+    File,
+    Symlink,
 }
 
 /// Writes `manifest` into `target`, an existing empty directory, taking each
@@ -73,17 +86,29 @@ pub fn materialize(
         }
         contents.push(bytes);
     }
-    write(manifest, &contents, target)
+    write(manifest, &contents, target, None).map(|_| ())
 }
 
 #[cfg(not(unix))]
-fn write(_manifest: &Manifest, _contents: &[Vec<u8>], _target: &Path) -> Result<(), MaterializeError> {
+fn write(
+    _manifest: &Manifest,
+    _contents: &[Vec<u8>],
+    _target: &Path,
+    _fail_after: Option<usize>,
+) -> Result<Vec<(String, Made)>, MaterializeError> {
     Err(MaterializeError::Unsupported)
 }
 
+/// Writes the checked contents and returns what it made, in order. On an error,
+/// removes it all again. `fail_after` makes the write fail once that many things
+/// are made, for tests.
 #[cfg(unix)]
-fn write(manifest: &Manifest, contents: &[Vec<u8>], target: &Path) -> Result<(), MaterializeError> {
-    use std::io::Write;
+fn write(
+    manifest: &Manifest,
+    contents: &[Vec<u8>],
+    target: &Path,
+    fail_after: Option<usize>,
+) -> Result<Vec<(String, Made)>, MaterializeError> {
     use std::os::fd::OwnedFd;
 
     use rustix::fs::{self as fs, CWD, Dir, OFlags};
@@ -101,7 +126,58 @@ fn write(manifest: &Manifest, contents: &[Vec<u8>], target: &Path) -> Result<(),
     // Directories opened so far, by path from the root ("" is the root).
     let mut dirs: BTreeMap<String, OwnedFd> = BTreeMap::new();
     dirs.insert(String::new(), root);
+    let mut made = Vec::new();
+    match write_all(manifest, contents, &mut dirs, &mut made, fail_after) {
+        Ok(()) => Ok(made),
+        Err(error) => {
+            let left = undo(&dirs, &made);
+            if left.is_empty() {
+                Err(error)
+            } else {
+                Err(MaterializeError::PartlyWritten { error: Box::new(error), left })
+            }
+        }
+    }
+}
+
+/// Removes what `made` lists, last first, through the directories already open.
+/// Returns what couldn't be removed.
+#[cfg(unix)]
+fn undo(dirs: &BTreeMap<String, std::os::fd::OwnedFd>, made: &[(String, Made)]) -> Vec<String> {
+    use rustix::fs::{self as fs, AtFlags};
+
+    let mut left = Vec::new();
+    for (path, kind) in made.iter().rev() {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let flags = if *kind == Made::Dir { AtFlags::REMOVEDIR } else { AtFlags::empty() };
+        if fs::unlinkat(&dirs[parent], name, flags).is_err() {
+            left.push(path.clone());
+        }
+    }
+    left.reverse();
+    left
+}
+
+#[cfg(unix)]
+fn write_all(
+    manifest: &Manifest,
+    contents: &[Vec<u8>],
+    dirs: &mut BTreeMap<String, std::os::fd::OwnedFd>,
+    made: &mut Vec<(String, Made)>,
+    fail_after: Option<usize>,
+) -> Result<(), MaterializeError> {
+    use std::io::Write;
+
+    use rustix::fs::{self as fs, OFlags};
+
     let basename = |path: &str| path.rsplit('/').next().expect("split always yields one part").to_owned();
+    let check = |made: &Vec<(String, Made)>| match fail_after {
+        Some(n) if made.len() >= n => Err(MaterializeError::Io {
+            path: made.last().map_or_else(String::new, |(p, _)| p.clone()),
+            source: std::io::Error::other("injected failure"),
+        }),
+        _ => Ok(()),
+    };
 
     let file_flags = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     for (entry, bytes) in manifest.entries.iter().zip(contents) {
@@ -110,9 +186,12 @@ fn write(manifest: &Manifest, contents: &[Vec<u8>], target: &Path) -> Result<(),
             Mode::Executable => 0o755,
             Mode::Symlink => continue,
         };
-        let parent = open_parent(&mut dirs, &entry.path)?;
+        let parent = open_parent(dirs, made, &entry.path)?;
+        check(made)?;
         let fd = fs::openat(&dirs[&parent], basename(&entry.path), file_flags, fs::Mode::from_raw_mode(0o600))
             .map_err(io(&entry.path))?;
+        made.push((entry.path.clone(), Made::File));
+        check(made)?;
         fs::fchmod(&fd, fs::Mode::from_raw_mode(mode)).map_err(io(&entry.path))?;
         let mut file = std::fs::File::from(fd);
         file.write_all(bytes)
@@ -124,9 +203,12 @@ fn write(manifest: &Manifest, contents: &[Vec<u8>], target: &Path) -> Result<(),
         if entry.mode != Mode::Symlink {
             continue;
         }
-        let parent = open_parent(&mut dirs, &entry.path)?;
+        let parent = open_parent(dirs, made, &entry.path)?;
+        check(made)?;
         let link_target = std::str::from_utf8(target_bytes).expect("targets were checked to be UTF-8");
         fs::symlinkat(link_target, &dirs[&parent], basename(&entry.path)).map_err(io(&entry.path))?;
+        made.push((entry.path.clone(), Made::Symlink));
+        check(made)?;
     }
     Ok(())
 }
@@ -139,9 +221,13 @@ fn io(path: &str) -> impl FnOnce(rustix::io::Errno) -> MaterializeError {
 
 /// Opens (creating as needed, at exactly 0755) the directory holding `path`, one
 /// component at a time from the root, never following a symlink, and returns its
-/// key in `dirs`.
+/// key in `dirs`. Each directory it creates goes into `made`.
 #[cfg(unix)]
-fn open_parent(dirs: &mut BTreeMap<String, std::os::fd::OwnedFd>, path: &str) -> Result<String, MaterializeError> {
+fn open_parent(
+    dirs: &mut BTreeMap<String, std::os::fd::OwnedFd>,
+    made: &mut Vec<(String, Made)>,
+    path: &str,
+) -> Result<String, MaterializeError> {
     use rustix::fs::{self as fs, OFlags};
 
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
@@ -152,7 +238,10 @@ fn open_parent(dirs: &mut BTreeMap<String, std::os::fd::OwnedFd>, path: &str) ->
         if !dirs.contains_key(&next) {
             let parent = &dirs[&at];
             let created = match fs::mkdirat(parent, *name, fs::Mode::from_raw_mode(0o755)) {
-                Ok(()) => true,
+                Ok(()) => {
+                    made.push((next.clone(), Made::Dir));
+                    true
+                }
                 Err(rustix::io::Errno::EXIST) => false,
                 Err(e) => return Err(io(&next)(e)),
             };
@@ -165,4 +254,69 @@ fn open_parent(dirs: &mut BTreeMap<String, std::os::fd::OwnedFd>, path: &str) ->
         at = next;
     }
     Ok(at)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::format::Entry;
+
+    fn tree(files: &[(&str, Mode, &[u8])]) -> (Manifest, Vec<Vec<u8>>) {
+        let entries = files
+            .iter()
+            .map(|(path, mode, bytes)| Entry {
+                path: (*path).to_owned(),
+                mode: *mode,
+                hash: ContentHash::of(bytes),
+                size: bytes.len() as u64,
+            })
+            .collect();
+        let manifest = Manifest::new(entries);
+        let contents = manifest
+            .entries
+            .iter()
+            .map(|e| files.iter().find(|(p, _, _)| *p == e.path).expect("listed").2.to_vec())
+            .collect();
+        (manifest, contents)
+    }
+
+    fn sample() -> (Manifest, Vec<Vec<u8>>) {
+        tree(&[
+            ("a", Mode::Symlink, b"b/f"),
+            ("b/f", Mode::File, b"f"),
+            ("b/l", Mode::Symlink, b"f"),
+            ("c/d/x", Mode::Executable, b"x"),
+            ("z", Mode::File, b"z"),
+        ])
+    }
+
+    // Note fefde0fa66f2 item 5: this fails if symlinks are written before files
+    // or directories, whatever the paths' order.
+    #[test]
+    fn symlinks_are_made_after_every_file_and_directory() {
+        let (manifest, contents) = sample();
+        let dir = tempfile::tempdir().expect("a target");
+        let made = write(&manifest, &contents, dir.path(), None).expect("write");
+        let kinds: Vec<Made> = made.iter().map(|(_, k)| *k).collect();
+        let first_link = kinds.iter().position(|k| *k == Made::Symlink).expect("symlinks are made");
+        assert!(kinds[first_link..].iter().all(|k| *k == Made::Symlink), "{made:?}");
+        assert_eq!(kinds.iter().filter(|k| **k == Made::Symlink).count(), 2);
+        assert!(made.iter().any(|(p, k)| p == "c/d" && *k == Made::Dir));
+    }
+
+    // Note fefde0fa66f2 item 4: a failure at any point leaves the target empty.
+    #[test]
+    fn a_failure_part_way_leaves_nothing_behind() {
+        let (manifest, contents) = sample();
+        let total = {
+            let dir = tempfile::tempdir().expect("a target");
+            write(&manifest, &contents, dir.path(), None).expect("write").len()
+        };
+        for n in 1..=total {
+            let dir = tempfile::tempdir().expect("a target");
+            let result = write(&manifest, &contents, dir.path(), Some(n));
+            assert!(matches!(result, Err(MaterializeError::Io { .. })), "failing after {n}: {result:?}");
+            assert!(std::fs::read_dir(dir.path()).expect("read").next().is_none(), "failing after {n} left files");
+        }
+    }
 }

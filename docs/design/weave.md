@@ -640,7 +640,8 @@ or commit them first. On top of git's view:
     (finding `ecfbb7d52203`);
   - content holding a Bracken identity's key: a `secret_key` field with a
     64-hex-digit value, in JSON (`"secret_key": "<hex>"`) or as a YAML or
-    TOML line (`secret_key: <hex>`, `secret_key = "<hex>"`). A key embedded
+    TOML line (`secret_key: <hex>`, `'secret_key': <hex>`,
+    `secret_key = "<hex>"`). A key embedded
     as an escaped JSON string isn't matched; the exact-key rule below still
     catches either Ground's own;
   - content holding the exact key of any identity in either Ground's
@@ -690,7 +691,7 @@ never write outside the target directory, and never follow a symlink
 
 | Command | Does |
 |---|---|
-| `weave init [--purpose text]` | Writes the Weave marker and a `main` line into an empty new Ground, with its `identities/` directory at mode 0700. Refuses inside a git checkout, or in a Ground that already has contributions. |
+| `weave init [--purpose text]` | Creates a new Ground at `--dir` and writes the Weave marker and a `main` line into it, signed by `--as` (an identity created there), with its `identities/` directory at mode 0700. The line's author is its only integrator and goal setter, with no checks yet. `--dir` must not exist yet and its parent must; the parent's real path is searched for `.git`, and the Ground directory is made with a single mkdir. Refuses inside a git checkout. It guards against mistakes, not against concurrent writers on the path, and doesn't see a work tree declared only through `core.worktree` or `GIT_DIR`. |
 | `weave init --in-place --decision <id>` | The join only (section 5): writes the marker into an existing Ground, naming in `in_place` a claim tagged `decision` in that Ground, which must exist. |
 | `weave import [--from-git <rev> \| --index] [--dry-run]` | Records the tree as file versions (only those whose content hash is new) and one manifest. Prints the manifest's hash. |
 | `weave status` | The index or `HEAD` against main's manifest: added, changed, deleted, mode changed. |
@@ -702,12 +703,12 @@ never write outside the target directory, and never follow a symlink
 | `weave head [--line L]`, `weave green [--line L]` | The head, or the fork's heads, and green, with the manifest hash. |
 | `weave log [--line L] [--limit N] [--since D]` | Decisions on a line, newest first in causal order, with their checks and breakage. At most 20 unless `--limit` says otherwise; never prints payloads. |
 | `weave slice [--at D] <path or prefix>...` | Those paths' contents at a decision or manifest, for an agent that needs a part, not the whole. |
-| `weave checkout [--at D] <dir>` | Materializes a manifest into an empty directory, or updates a directory that is clean against it. |
+| `weave checkout [--at D] <dir>` | Materializes a manifest into an empty directory, or updates a directory that is clean against it. If writing fails part way, it removes what it wrote, or names what it couldn't remove. |
 | `weave line create <name> [--integrator ...] [--owner-decision <id>]`, `weave line policy <line> ... --owner-decision <id>` | Creates a line, or writes a new policy version that supersedes the current one. Before stage 2, `--owner-decision` is required. |
 | `weave line merge <from> --into <line> [--base D]` | Builds the merge candidate and lists its conflicts. |
 | `weave resolve <path> --take <side>\|--delete\|--file <f> [--mode m] [--dry-run]` | Writes a resolution for one conflict. `--file` has the refusals above. |
 | `weave verify --git <rev> [--at D \| --manifest H]` | Compares a manifest with a git commit's tree: the same paths, modes and bytes, with the excluded root entries left out. Used throughout the dogfood. |
-| `weave check` | Lists Weave payloads that are invalid or break the ancestor rule, manifests not yet complete, and markers past the one that counts. |
+| `weave check` | Lists Weave payloads that are invalid or break the ancestor rule, manifests not yet complete, and markers past the one that counts. It exits non-zero when it lists any. |
 
 Plain commands work on Weave records too: `relate ... supports` or
 `contradicts` reviews a decision, proposal or manifest, and `claim --tag

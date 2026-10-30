@@ -36,6 +36,9 @@ macro_rules! println {
     };
 }
 
+// Declared after `println!`, so the module uses it too.
+mod weave;
+
 /// Directory holding a Bracken workspace's Ground replica.
 const DIR_NAME: &str = ".bracken";
 
@@ -363,6 +366,9 @@ enum Command {
         #[command(flatten)]
         policy: PolicyArgs,
     },
+    /// Bracken's source trees on Weave: import from git, manifests, checkout, diff and verify.
+    #[command(subcommand)]
+    Weave(weave::WeaveCommand),
     /// Write every contribution to a bundle file ("-" for stdout).
     Export { file: PathBuf },
     /// Import contributions from a bundle file ("-" for stdin).
@@ -434,6 +440,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             println!("joined ground {ground} in {}", dir.display());
             return Ok(code);
         }
+        Command::Weave(weave::WeaveCommand::Init { purpose, out }) => {
+            return weave::init(cli.dir.as_deref(), cli.agent.as_deref(), purpose, out);
+        }
         command => return run_in_store(open_store(cli.dir.as_deref())?, cli.agent.as_deref(), command),
     }
     Ok(ExitCode::SUCCESS)
@@ -442,6 +451,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<ExitCode> {
     match command {
         Command::Init { .. } | Command::Join { .. } => unreachable!("handled before opening a store"),
+        Command::Weave(command) => return weave::run(&mut s, agent, command),
         Command::Id(IdCommand::New { name }) => {
             let id = s.create_identity(&name)?;
             println!("{}", id.agent_id());

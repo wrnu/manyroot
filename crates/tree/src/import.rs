@@ -245,6 +245,9 @@ fn read_blobs(repo: &Path, oids: &[&str]) -> Result<Vec<Blob>, ImportError> {
         }
         let mut newline = [0u8; 1];
         out.read_exact(&mut newline).map_err(ImportError::Spawn)?;
+        if newline != *b"\n" {
+            return Err(output_error("cat-file", format!("no newline after {oid}")));
+        }
     }
     drop(out);
     writer.join().expect("the writer thread doesn't panic").map_err(ImportError::Spawn)?;
@@ -253,6 +256,16 @@ fn read_blobs(repo: &Path, oids: &[&str]) -> Result<Vec<Blob>, ImportError> {
         return Err(output_error("cat-file", format!("exited with {status}")));
     }
     Ok(blobs)
+}
+
+/// The main checkout of the repository at `repo`: the directory holding its
+/// common `.git`, so the coordination Ground's `.bracken/` is found there from
+/// any worktree.
+pub fn main_checkout(repo: &Path) -> Result<PathBuf, ImportError> {
+    let common = run(repo, &["rev-parse", "--path-format=absolute", "--git-common-dir"])?;
+    let common = String::from_utf8(common).map_err(|_| output_error("rev-parse", "the git directory isn't UTF-8"))?;
+    let common = PathBuf::from(common.trim_end_matches('\n'));
+    common.parent().map(Path::to_path_buf).ok_or_else(|| output_error("rev-parse", "the git directory has no parent"))
 }
 
 /// Plans an import of git's view of the repository at `repo`. `known` holds the
