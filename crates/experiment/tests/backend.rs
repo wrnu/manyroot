@@ -5,7 +5,7 @@
 //! harness.
 
 use std::collections::BTreeSet;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -19,6 +19,7 @@ use bracken_experiment::backend::{
 };
 use bracken_experiment::driver::Backend;
 use bracken_experiment::proxy::Route;
+use bracken_experiment::sandbox::Profile;
 
 const SECRET: &str = "mock-secret-not-a-real-one-0123";
 
@@ -28,6 +29,7 @@ const SECRET: &str = "mock-secret-not-a-real-one-0123";
 struct Mock {
     script: String,
     pin: Pin,
+    profile: Profile,
     secret: String,
     /// What it declares, and what it sets each turn.
     names: Vec<&'static str>,
@@ -50,6 +52,7 @@ impl Mock {
         Mock {
             script: script.into(),
             pin: Pin::of(Path::new("/bin/bash"), "mock").expect("a pin"),
+            profile: Profile::Agent,
             secret: SECRET.into(),
             names: vec!["MOCK_SET", "MOCK_CONF"],
             env: vec![("MOCK_SET", "yes".into())],
@@ -84,6 +87,10 @@ impl Harness for Mock {
 
     fn pin(&self) -> &Pin {
         self.now().map_or(&self.pin, |l| &l.pin)
+    }
+
+    fn profile(&self) -> Profile {
+        self.profile
     }
 
     fn env_names(&self) -> &[&str] {
@@ -336,6 +343,220 @@ fn a_changed_pin_stops_the_run_before_the_turn_starts() {
     assert_eq!(s.turn(1), Err("the pinned mock binary changed".into()));
     assert!(s.transcript(1).is_none(), "nothing started");
     assert!(s.backend.halted().is_some());
+}
+
+/// A tree to pin, in `tmp`: `root/bin/prog`, `root/lib/pkg/index.js`, `root/lib/pkg/data/a.json`,
+/// `root/lib/current`, a link to `pkg`, an empty directory `root/lib/e` (mode 755) and a file
+/// `root/lib/755`. Returns the root, resolved. Its program never runs: every test
+/// here stops before the turn starts. A tree-pinned turn is in `tests/agent.rs`, with a program macOS will
+/// run from anywhere, which no copy of a system binary such as bash is.
+fn tree(tmp: &Path) -> PathBuf {
+    let root = std::fs::canonicalize(tmp).expect("resolved").join("root");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    std::fs::create_dir_all(root.join("lib/pkg/data")).expect("lib");
+    std::fs::write(root.join("bin/prog"), "the program\n").expect("a program");
+    std::fs::write(root.join("lib/pkg/index.js"), "module.exports = 1;\n").expect("a file");
+    std::fs::write(root.join("lib/pkg/data/a.json"), "{}\n").expect("a file");
+    symlink("pkg", root.join("lib/current")).expect("a link");
+    std::fs::create_dir(root.join("lib/e")).expect("an empty directory");
+    std::fs::set_permissions(root.join("lib/e"), std::fs::Permissions::from_mode(0o755)).expect("its mode");
+    std::fs::write(root.join("lib/755"), "").expect("a file");
+    root
+}
+
+/// Makes something in a tree (its root, then a path outside it).
+type Make = fn(&Path, &Path);
+
+/// Changes a pinned tree, given its root.
+type Change = fn(&Path);
+
+#[test]
+fn a_tree_pin_refuses_what_could_reach_outside_its_tree() {
+    let cases: [(&str, Make); 5] = [
+        ("lib/out links to ../../outside, which isn't inside the tree", |root, out| {
+            std::fs::write(out, "outside").expect("a file outside");
+            symlink("../../outside", root.join("lib/out")).expect("a link");
+        }),
+        ("lib/gone links to nowhere, which isn't inside the tree", |root, _| {
+            symlink("nowhere", root.join("lib/gone")).expect("a link");
+        }),
+        ("lib/pkg/twin.js has another hard link", |root, out| {
+            std::fs::write(root.join("lib/pkg/twin.js"), "x").expect("a file");
+            std::fs::hard_link(root.join("lib/pkg/twin.js"), out).expect("a hard link");
+        }),
+        ("lib/fifo isn't a file, directory or symbolic link", |root, _| {
+            let made = Command::new("/usr/bin/mkfifo").arg(root.join("lib/fifo")).status().expect("mkfifo");
+            assert!(made.success());
+        }),
+        ("bin/../.. isn't a file inside", |_, _| {}),
+    ];
+    for (want, make) in cases {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = tree(tmp.path());
+        make(&root, &tmp.path().join("outside"));
+        let program = if want.starts_with("bin/../..") { tmp.path().join("outside") } else { root.join("bin/prog") };
+        if !program.exists() {
+            std::fs::write(&program, "outside").expect("a program outside");
+        }
+        let err = Pin::tree(&program, &root, "1").expect_err(want);
+        let want =
+            want.strip_prefix("bin/../.. ").map_or(want.to_string(), |rest| format!("{} {rest}", program.display()));
+        assert!(err.starts_with(&want), "{want}: {err}");
+    }
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let root = tree(tmp.path());
+    Pin::tree(&root.join("bin/prog"), &root, "1").expect("a link inside the tree is fine");
+}
+
+/// Makes links in a tree (its resolved root, then the resolved directory around it) and says the error
+/// the tree is refused with.
+type Links = fn(&Path, &Path) -> String;
+
+#[test]
+fn a_tree_pin_refuses_a_link_that_leaves_the_tree_on_the_way_even_if_it_comes_back() {
+    let cases: [(&str, Links); 5] = [
+        ("out and back, absolute", |root, tmp| {
+            symlink(root.join("lib/pkg"), tmp.join("hop")).expect("a link outside, back in");
+            symlink(tmp.join("hop"), root.join("lib/x")).expect("a link out");
+            format!("lib/x links to {}, which leads to an absolute path", tmp.join("hop").display())
+        }),
+        ("out and back, relative", |root, tmp| {
+            symlink("root/lib/pkg", tmp.join("hop")).expect("a link outside, back in");
+            symlink("../../hop", root.join("lib/x")).expect("a link out");
+            "lib/x links to ../../hop, which isn't inside the tree".into()
+        }),
+        ("above the root after a link inside it", |root, tmp| {
+            std::fs::write(tmp.join("outside"), "outside").expect("a file outside");
+            // Read as text, without following `up`, the target is lib/outside, which is there too.
+            std::fs::write(root.join("lib/outside"), "inside").expect("a file inside");
+            symlink("..", root.join("lib/up")).expect("a link to the root");
+            symlink("up/../outside", root.join("lib/x")).expect("a link up from it");
+            "lib/x links to up/../outside, which isn't inside the tree".into()
+        }),
+        ("absolute, though to inside", |root, _| {
+            symlink(root.join("lib/pkg"), root.join("lib/x")).expect("an absolute link");
+            format!("lib/x links to {}, which leads to an absolute path", root.join("lib/pkg").display())
+        }),
+        ("a loop", |root, _| {
+            symlink("y", root.join("lib/x")).expect("a link");
+            symlink("x", root.join("lib/y")).expect("a link back");
+            "lib/x links to y, which isn't inside the tree".into()
+        }),
+    ];
+    for (what, make) in cases {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = tree(tmp.path());
+        let want = make(&root, root.parent().expect("a parent"));
+        assert_eq!(Pin::tree(&root.join("bin/prog"), &root, "1").err(), Some(want), "{what}");
+    }
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let root = tree(tmp.path());
+    symlink("../../lib/current/data/a.json", root.join("lib/pkg/back")).expect("a link up and back, inside");
+    Pin::tree(&root.join("bin/prog"), &root, "1").expect("links that stay inside, through a link, are fine");
+}
+
+#[test]
+fn a_tree_pins_hash_is_its_manifest_in_name_order() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let root = std::fs::canonicalize(tmp.path()).expect("resolved").join("root");
+    let mode = |p: &Path, m: u32| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).expect("a mode");
+    std::fs::create_dir_all(root.join("b")).expect("dirs");
+    // Made in reverse, so only the walk's sort, not the file system, puts them in name order.
+    let names = ["h", "g", "f", "e", "d", "c", "b", "a"];
+    for n in names {
+        std::fs::write(root.join("b").join(n), n).expect("a file");
+        mode(&root.join("b").join(n), 0o644);
+    }
+    std::fs::write(root.join("a.txt"), "x").expect("a file");
+    mode(&root.join("a.txt"), 0o600);
+    symlink("b/a", root.join("l")).expect("a link");
+    mode(&root.join("b"), 0o755);
+    mode(&root, 0o755);
+
+    // The manifest, by hand: each field ends in NUL; kind, path, then mode, contents' hash or target.
+    let mut m: Vec<u8> = Vec::new();
+    let mut entry = |fields: &[&str]| fields.iter().for_each(|f| m.extend([f.as_bytes(), b"\0"].concat()));
+    let hash = |b: &str| blake3::hash(b.as_bytes()).to_hex().to_string();
+    entry(&["d", "", "755"]);
+    entry(&["f", "a.txt", "600", &hash("x")]);
+    entry(&["d", "b", "755"]);
+    for n in names.iter().rev() {
+        entry(&["f", &format!("b/{n}"), "644", &hash(n)]);
+    }
+    entry(&["l", "l", "b/a"]);
+    let pin = Pin::tree(&root.join("b/a"), &root, "1").expect("a pin");
+    assert_eq!(pin.blake3(), blake3::hash(&m).to_hex().as_str());
+}
+
+#[test]
+fn a_tree_pins_hash_is_its_content_not_the_order_it_was_made_in() {
+    let (one, two) = (tempfile::tempdir().expect("a temp dir"), tempfile::tempdir().expect("a temp dir"));
+    let a = tree(one.path());
+    let root = std::fs::canonicalize(two.path()).expect("resolved").join("root");
+    // The same tree, made in another order.
+    std::fs::create_dir_all(root.join("lib/pkg/data")).expect("lib");
+    symlink("pkg", root.join("lib/current")).expect("a link");
+    std::fs::write(root.join("lib/pkg/data/a.json"), "{}\n").expect("a file");
+    std::fs::write(root.join("lib/pkg/index.js"), "module.exports = 1;\n").expect("a file");
+    std::fs::create_dir_all(root.join("bin")).expect("bin");
+    std::fs::write(root.join("bin/prog"), "the program\n").expect("a program");
+    std::fs::write(root.join("lib/755"), "").expect("a file");
+    std::fs::create_dir(root.join("lib/e")).expect("an empty directory");
+    std::fs::set_permissions(root.join("lib/e"), std::fs::Permissions::from_mode(0o755)).expect("its mode");
+    let pin = |r: &Path| Pin::tree(&r.join("bin/prog"), r, "1").expect("a pin").blake3().to_string();
+    assert_eq!(pin(&a), pin(&root));
+}
+
+#[test]
+fn a_changed_pinned_tree_stops_the_run_before_the_turn_starts() {
+    let changes: [(&str, Change); 11] = [
+        ("a file deep in it", |r| std::fs::write(r.join("lib/pkg/data/a.json"), "{\"x\":1}\n").expect("changed")),
+        ("a file added", |r| std::fs::write(r.join("lib/pkg/new.js"), "").expect("added")),
+        ("a file removed", |r| std::fs::remove_file(r.join("lib/pkg/index.js")).expect("removed")),
+        ("a file renamed", |r| {
+            std::fs::rename(r.join("lib/pkg/index.js"), r.join("lib/pkg/main.js")).expect("renamed")
+        }),
+        ("a mode", |r| {
+            std::fs::set_permissions(r.join("lib/pkg/index.js"), std::fs::Permissions::from_mode(0o755)).expect("chmod")
+        }),
+        ("a link's target, still inside", |r| {
+            std::fs::remove_file(r.join("lib/current")).expect("unlinked");
+            symlink("pkg/data", r.join("lib/current")).expect("relinked");
+        }),
+        ("the program", |r| std::fs::write(r.join("bin/prog"), "#!/bin/sh\n").expect("changed")),
+        ("an empty directory added", |r| std::fs::create_dir(r.join("lib/pkg/empty")).expect("added")),
+        ("a directory's mode", |r| {
+            std::fs::set_permissions(r.join("lib/pkg/data"), std::fs::Permissions::from_mode(0o700)).expect("chmod")
+        }),
+        ("a file swapped for a link", |r| {
+            std::fs::remove_file(r.join("lib/pkg/index.js")).expect("removed");
+            symlink("data/a.json", r.join("lib/pkg/index.js")).expect("a link in its place");
+        }),
+        // Without the kind tag, ('d', lib/e, 755) and ('l', lib/e, 755) would be the same fields.
+        ("a directory swapped for a link whose target is its mode", |r| {
+            std::fs::remove_dir(r.join("lib/e")).expect("removed");
+            symlink("755", r.join("lib/e")).expect("a link in its place");
+        }),
+    ];
+    for (what, change) in changes {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = tree(tmp.path());
+        let pin = Pin::tree(&root.join("bin/prog"), &root, "mock").expect("a pin");
+        let s = Setup::with(Mock { pin, profile: Profile::Node, ..Mock::new("echo init ok; echo result 0 1") }, caps());
+        change(&root);
+        assert_eq!(s.turn(1), Err("the pinned mock install changed: its manifest's hash differs".into()), "{what}");
+        assert!(s.transcript(1).is_none(), "{what}: nothing started");
+        assert!(s.backend.halted().is_some(), "{what}");
+    }
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let root = tree(tmp.path());
+    let pin = Pin::tree(&root.join("bin/prog"), &root, "mock").expect("a pin");
+    let outside = tmp.path().join("elsewhere");
+    let s = Setup::with(Mock { pin, profile: Profile::Node, ..Mock::new("echo init ok") }, caps());
+    std::fs::rename(&root, &outside).expect("moved");
+    symlink(&outside, &root).expect("the root, now a link");
+    let err = s.turn(1).expect_err("moved");
+    assert!(err.starts_with("the pinned mock install changed: "), "{err}");
 }
 
 /// The tests that play a turn, which the backend runs under the agent profile: they need macOS, for

@@ -549,6 +549,39 @@ fn real_claude_code_reaches_init_and_first_request() {
 mod macos_only {
     use super::*;
 
+    /// A tree pin (security note `b8bbcf81bc17` (d)): the harness reads anything in its tree, through a
+    /// link inside it too, but starts nothing in it but the pinned program, and reads nothing beside it.
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn a_tree_pinned_harness_reads_its_tree_but_starts_nothing_else_in_it() {
+        let s = Setup::new();
+        let root = s.dir.join("install");
+        std::fs::create_dir_all(root.join("bin")).expect("bin");
+        std::fs::create_dir_all(root.join("lib/pkg")).expect("lib");
+        std::fs::copy(fake(), root.join("bin/claude")).expect("the program");
+        std::fs::copy(fake(), root.join("bin/other")).expect("another program in the tree");
+        std::fs::write(root.join("lib/pkg/index.js"), "x\n").expect("a file");
+        std::os::unix::fs::symlink("pkg", root.join("lib/current")).expect("a link");
+        let beside = s.dir.join("beside");
+        std::fs::write(&beside, "x\n").expect("a file beside the tree");
+        let (js, through) = (root.join("lib/pkg/index.js"), root.join("lib/current/index.js"));
+        let other = root.join("bin/other");
+        let spec = json!({"read": [js, through, beside], "exec": [other]});
+        let p = |pre: &str, path: &Path| format!("{pre}:{}", path.display());
+
+        // Without the sandbox, the same attempts work (gotcha fd7742fa71ce).
+        let out = Command::new(&other).arg("probe").arg(spec.to_string()).stdin(Stdio::null()).output().expect("probe");
+        let r = serde_json::from_slice::<Value>(&out.stdout).expect("JSON")["results"].clone();
+        let all = [p("read", &js), p("read", &through), p("read", &beside), p("exec", &other)];
+        assert_verdicts(&r, &all.iter().map(|k| (k.as_str(), "allowed")).collect::<Vec<_>>());
+
+        let pin = Pin::tree(&root.join("bin/claude"), &root, "2.1.311").expect("pin");
+        let backend = s.backend_with(&format!("probe {spec}\nresult 10"), caps(), pin);
+        s.run(&backend, 1, 1).expect("the run");
+        let want = [(&all[0], "allowed"), (&all[1], "allowed"), (&all[2], "denied"), (&all[3], "denied")];
+        assert_verdicts(&s.probe("agent-0", 1), &want.map(|(k, v)| (k.as_str(), v)));
+    }
+
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
     fn the_agent_profile_refuses_each_forbidden_access() {

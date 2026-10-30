@@ -2,10 +2,11 @@
 //! runs under one that allows only its row of the process table and denies
 //! everything else.
 //!
-//! - **agent**: the harness (Claude Code) and the shim it starts. Reads the
-//!   system, the installation, its own directory and the turn configuration;
-//!   writes only its own directory; starts only the pinned binary, `/usr/bin/env` and the
-//!   shim; connects only to the forwarding proxy's port and its one socket.
+//! - **agent**: the harness and the shim it starts, under one of a closed set
+//!   of [`Profile`]s the harness names, never its own text. Reads the system,
+//!   the installation, its own directory and the turn configuration; writes
+//!   only its own directory; starts only the pinned program, `/usr/bin/env` and
+//!   the shim; connects only to the forwarding proxy's port and its one socket.
 //!   No mach service at all, so no keychain.
 //! - **tools**: one agent's worker. Reads and writes only that agent's copy;
 //!   starts only the worker binary, `bracken` and git (with its exec path),
@@ -39,7 +40,7 @@ const AGENT: &str = r#"(allow file-read*
   (literal "/private/etc/localtime")
   (subpath (param "INSTALL")) (subpath (param "TURN")) (literal (param "SHIM")))
 (allow file-read* file-write* (subpath (param "OWN")))
-(allow process-exec (literal (param "CLAUDE")) (literal "/usr/bin/env") (literal (param "SHIM")))
+(allow process-exec (literal (param "PROGRAM")) (literal "/usr/bin/env") (literal (param "SHIM")))
 (allow network-outbound
   (remote ip (string-append "localhost:" (param "PORT")))
   (remote unix-socket (path-literal (param "SOCKET"))))
@@ -55,6 +56,33 @@ const WORKER: &str = r#"(allow file-read* (literal (param "WORKER")) (literal (p
 const GIT: &str = r#"(allow file-read* (literal (param "GIT")) (subpath (param "GIT_EXEC_PATH")))
 (allow process-exec (literal (param "GIT")) (subpath (param "GIT_EXEC_PATH")))
 "#;
+
+/// The agent profiles a harness may run under. The backend owns their text: a harness names one, so no
+/// harness writes its own rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Profile {
+    /// A native program, such as Claude Code's binary: the agent rules alone.
+    Agent,
+    /// A program Node.js runs, such as Pi: the agent rules, plus only what a run under it shows Node needs,
+    /// each with why. None is shown yet, so its text is the agent rules' (security note `b8bbcf81bc17` (e)).
+    Node,
+}
+
+impl Profile {
+    /// Its name, in errors and the plan.
+    pub fn name(self) -> &'static str {
+        match self {
+            Profile::Agent => "agent",
+            Profile::Node => "node",
+        }
+    }
+
+    fn text(self) -> String {
+        match self {
+            Profile::Agent | Profile::Node => format!("{BASE}{AGENT}"),
+        }
+    }
+}
 
 /// A profile and the values of its parameters.
 #[derive(Debug, Clone)]
@@ -91,9 +119,9 @@ impl Git {
 
 /// What an agent's harness may touch.
 pub struct AgentPaths<'a> {
-    /// The harness's pinned binary.
+    /// The harness's pinned program, the one it starts.
     pub program: &'a Path,
-    /// The directory it was installed in: it reads its own files there.
+    /// What it was installed in ([`crate::backend::Pin::install`]): it reads its own files there.
     pub install: &'a Path,
     /// Its own directory: `HOME`, the temporary directory and the harness's own are inside.
     pub own: &'a Path,
@@ -140,10 +168,10 @@ fn param(name: &str, path: &Path) -> Result<(String, String), String> {
 }
 
 impl Sandbox {
-    /// The agent profile.
-    pub fn agent(p: &AgentPaths) -> Result<Sandbox, String> {
+    /// An agent profile.
+    pub fn agent(profile: Profile, p: &AgentPaths) -> Result<Sandbox, String> {
         let params = vec![
-            param("CLAUDE", p.program)?,
+            param("PROGRAM", p.program)?,
             param("INSTALL", p.install)?,
             param("OWN", p.own)?,
             param("TURN", p.turn)?,
@@ -151,7 +179,7 @@ impl Sandbox {
             param("SOCKET", p.socket)?,
             ("PORT".to_string(), p.proxy_port.to_string()),
         ];
-        Ok(Sandbox { text: format!("{BASE}{AGENT}"), params })
+        Ok(Sandbox { text: profile.text(), params })
     }
 
     /// The tools profile: one agent's copy.
