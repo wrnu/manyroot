@@ -146,3 +146,39 @@ fn run_asks_each_harness_for_its_own_pin() {
         assert!(!dir.path().join("run").exists());
     }
 }
+
+/// `run` refuses an option for the other harness rather than ignore it, before anything runs (task
+/// `4cd030ab8dd1`): Pi's with Claude Code, named or by default, and Claude Code's with Pi.
+#[test]
+fn run_refuses_an_option_for_the_other_harness() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_bracken-experiment"));
+    let claude = ["--claude", "/nonexistent", "--claude-version", "0"];
+    let pi = ["--harness", "pi", "--pi-prefix", "/nonexistent"];
+    let cases: [(Vec<&str>, &str); 5] = [
+        ([&claude[..], &["--pi-prefix", "/p"]].concat(), "--pi-prefix is Pi's, but the harness is Claude Code"),
+        (
+            [&["--harness", "claude"][..], &claude, &["--pi-version", "1.4.0"]].concat(),
+            "--pi-version is Pi's, but the harness is Claude Code: drop it, or give --harness pi",
+        ),
+        ([&pi[..], &["--claude", "/c"]].concat(), "--claude is Claude Code's, but the harness is Pi"),
+        ([&pi[..], &["--claude-version", "0"]].concat(), "--claude-version is Claude Code's"),
+        (
+            [&pi[..], &claude].concat(),
+            "--claude and --claude-version are Claude Code's, but the harness is Pi: drop them, or give --harness claude",
+        ),
+    ];
+    for (args, says) in cases {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let out = Command::new(bin)
+            .args(["run", "--dir"])
+            .arg(dir.path().join("run"))
+            .args(["--mode", "git", "--settings", "/nonexistent"])
+            .args(&args)
+            .output()
+            .expect("the binary runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(err.contains(says) && err.contains("Usage: bracken-experiment run"), "{args:?}: {err}");
+        assert!(!dir.path().join("run").exists());
+    }
+}
