@@ -155,7 +155,7 @@ and roadmap are in [docs/vision.md](docs/vision.md).
 | [`manyroot`](crates/manyroot)       | The protocol library: contributions, causal graph, validation, storage.  |
 | [`bracken`](crates/bracken)         | The `bracken` CLI, for agents and humans.                                |
 | [`bracken-demo`](crates/demo)       | Agents on a toy task through `bracken`, with a measured report ([docs/demo.md](docs/demo.md)). |
-| [`bracken-tree`](crates/tree)       | Source trees on Weave, so far the payload formats, content hashes and path rules ([spec](docs/design/weave.md)). |
+| [`bracken-tree`](crates/tree)       | Source trees on Weave, so far the payload formats, content hashes, path rules, import from git and safe materialization ([spec](docs/design/weave.md)). |
 | [`bracken-experiment`](crates/experiment) | The Phase 1 experiment; so far its task (`stacklib`), the hidden grader, the driver with its workers and shim, Bracken mode, Git mode and a mock backend ([design](docs/design/phase1-experiment.md)). |
 
 Manyroot subsystems map onto modules as they come into being:

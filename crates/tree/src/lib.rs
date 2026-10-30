@@ -10,13 +10,19 @@
 //! | [`hash`]   | Content hashes, labelled `blake3:` in text                    |
 //! | [`path`]   | Path and symlink-target rules, folding and collisions         |
 //! | [`format`] | Every Weave record's payload format, in canonical CBOR        |
+//! | [`import`] | Import from git's view of a tree, with exclusions and refusals |
+//! | [`materialize`] | Writing a manifest out without following a symlink     |
+//! | [`secrets`]| The deny-list and the key-material scan import refuses by      |
 //!
 //! Every record is a plain manyroot contribution, so nothing here changes the
 //! protocol.
 
 pub mod format;
 pub mod hash;
+pub mod import;
+pub mod materialize;
 pub mod path;
+pub mod secrets;
 
 pub use format::{
     Answer, Breakage, Change, ChangeEntry, CheckDefinition, Decision, Disposition, Entry, FileValue, FormatError,

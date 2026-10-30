@@ -194,8 +194,10 @@ dependencies = [
  "hex",
  "icu_casemap",
  "manyroot",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "unicode-normalization",
 ]
