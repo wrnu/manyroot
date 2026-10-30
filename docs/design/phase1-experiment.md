@@ -501,7 +501,7 @@ used.
 |---|---|---|
 | Git | The tool worker bundles every branch of its copy without what the hub has (`--not --remotes=hub` and the tips the hub last said it holds of this agent's branches) and sends the tips with it; the hub worker checks the bundle (below) and fetches its `refs/heads/<branch>` into that agent's namespace (`refs/agents/<agent>/<branch>`), then moves any branch whose tip it already had. A PR merge is then a merge inside the hub. Each agent's pushes are capped at the run's per-agent byte quota | The hub worker bundles `main` and every open PR's head (`refs/pr/<n>`) without the commits the copy said it has, and sends their tips and what it holds of the agent's branches; the tool worker checks the bundle and fetches it into `refs/remotes/hub/main` and `refs/remotes/hub/pr-<n>`, moves any of those whose tip it already had, and drops PRs no longer open. A sync with nothing new moves no bundle at all |
 | CRDT | The tool worker produces an Automerge sync message from its document's sync state; the hub worker applies it | The reverse, repeated until neither side has anything to send |
-| Bracken | One session, both halves: the tool worker runs `bracken sync --exec <bracken-experiment> shim --socket <driver socket>` in its replica, and the hub worker runs `bracken serve --stdio --allow <the agents' keys>` in the hub, relaying its standard input and output to its own driver socket. The driver relays between the two sockets, counting and hashing each direction. Heads and offers go first, so only what each side is missing moves. Both sides cap the session's time and bytes (60 s, 32 MiB). Over stdio every session has the same credential, so the hub gives each agent its own first-seen log, and with it its own quota, set from the run's caps (turns × 25 calls × 9, the most contributions one call adds, and their bytes): no agent within the caps reaches it, and one past them is refused alone (finding `57acf0d9ce57`) | (same session) |
+| Bracken | One session, both halves: the tool worker runs `bracken sync --exec <bracken-experiment> shim --socket <driver socket>` in its replica, and the hub worker runs `bracken serve --stdio --allow <the agents' keys>` in the hub, relaying its standard input and output to its own driver socket. The driver relays between the two sockets, counting and hashing each direction. Heads and offers go first, so only what each side is missing moves. Both sides cap the session's time and bytes (60 s, 32 MiB). Over stdio every session has the same credential, so the hub gives each agent its own first-seen log, and with it its own quota, set from the run's caps (turns × the per-turn call cap × 9, the most contributions one call adds, and their bytes): no agent within the caps reaches it, and one past them is refused alone (finding `57acf0d9ce57`) | (same session) |
 
 Every import validates what it receives as it does any bundle (Bracken
 checks signatures and parents; git checks objects), and a bundle that fails
@@ -701,8 +701,9 @@ the same values; the security review's `--receive-pack` reproduction
    its duration.
 3. The turn ends when the model stops, or when the driver ends the process
    at a cap (section 5): 150,000 tokens of context, or 10 minutes. The
-   25-tool-call cap ends a turn softly (decision `147a36d5d623`): the
-   driver's MCP server refuses the 26th call and every later one, except
+   50-tool-call cap ends a turn softly (decision `147a36d5d623`; 25 until
+   owner decision `63f4fd5cab66`): the
+   driver's MCP server refuses the 51st call and every later one, except
    one `notes_write` (decision `74d00180c642`), telling the agent its tool
    calls are used up and to save its notes and stop, and the turn may still
    end itself and write its `result` event. Only if it hasn't within 60
@@ -760,6 +761,17 @@ log records the full length as `cut_from`. No result is cut silently.
 The base prompt tells every agent alike to sync before choosing what to
 work on (task `541b6f3db130`): a pass usually arrived a turn later in
 Phase 1. When the harness syncs doesn't change.
+
+The base prompt also says, to every agent alike, that a function's inputs are
+named a, b and c in its specification's order whatever names the specification
+uses, and that an author's own check never counts as anyone else's, so others'
+current work is checked first, before more is written (task `6b3f9afbdcf2`,
+owner approval `e0ff76633d31`). Both come from the first Pi run (analysis
+`61e53d61b843`): its agents wrote the specification's names (`x`, `lo`) where
+the language takes `a`, `b`, `c`, and checked only their own work, so nothing
+was accepted. The check sentence is true in every mode, even one with no
+check step. Runs before and after the change aren't strictly comparable, and
+the owner accepted that.
 
 What the three share word for word: the base prompt, the turn message, the
 core tools (`sync`, `notes_read`, `notes_write`), and the fourth sentence. The
@@ -1126,10 +1138,13 @@ measures, so throttling can't favour one mode.
 Each layer stops a run's use on its own:
 
 1. **Per call:** Claude Code's own output limit per response.
-2. **Per turn:** 25 tool calls, 150,000 tokens of context, 10 minutes.
-   The driver ends the process at the context and time caps. The tool-call
+2. **Per turn:** 50 tool calls, 150,000 tokens of context, 10 minutes.
+   The call cap was 25 until owner decision `63f4fd5cab66` raised it: it
+   only stops a runaway turn, which the token caps stop too, and runs
+   needn't stay comparable with the pilot's. The driver ends the process at
+   the context and time caps. The tool-call
    cap is a soft stop (decision `147a36d5d623`): the driver's MCP server
-   refuses the 26th call and every later one, so none reaches a tool, with
+   refuses the 51st call and every later one, so none reaches a tool, with
    the message "This turn's tool calls are used up: no more will run this
    turn, except one notes_write. Finish now: save your notes if you haven't,
    then stop and end your turn." The one exception is the turn's first

@@ -92,6 +92,29 @@ mod tests {
         assert!(!BASE.contains(phrase));
     }
 
+    /// Every mode's prompt says, in the shared words, that an author's own check never counts, so
+    /// others' current work is checked first, and that inputs are a, b and c whatever the
+    /// specification calls them (task `6b3f9afbdcf2`, approval `e0ff76633d31`, analysis `61e53d61b843`).
+    #[test]
+    fn every_prompt_says_whose_check_counts_and_what_inputs_are_named() {
+        let rules = [
+            "A function's inputs are always named a, b and c, in the order its specification lists them, whatever \
+             names the specification gives them.",
+            "Your own check of your own work never counts as anyone else's: where the library needs another \
+             agent's check before work counts, only theirs does. So when others' current work is there, check it \
+             first, before you write more of your own.",
+        ];
+        for name in ["bracken", "git", "crdt"] {
+            let prompt = system_prompt(name).expect("a prompt");
+            for rule in rules {
+                assert_eq!(prompt.matches(rule).count(), 1, "{name}: {rule}");
+            }
+        }
+        for name in ["bracken", "git", "crdt"] {
+            assert!(!section(name).expect("a section").contains("a, b and c"), "{name}: the base says it, once");
+        }
+    }
+
     /// Nothing tells an agent it is measured, or that other modes exist (design section 4).
     #[test]
     fn the_prompts_never_mention_the_experiment() {

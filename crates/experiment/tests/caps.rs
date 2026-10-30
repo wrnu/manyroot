@@ -13,8 +13,9 @@ use bracken_experiment::plan::{Plan, PlanInputs};
 const MODES: [&str; 3] = ["bracken", "git", "crdt"];
 
 /// The pilot's caps as the plans of the pilot and calibrations recorded them, before this option existed
-/// (main 1f288796).
-const PILOT: &str = "Caps { calls_per_turn: 25, cap_grace: 60s, cap_grace_calls: 3, context: 150000, \
+/// (main 1f288796), but for the per-turn call cap: 50 since owner decision `63f4fd5cab66`, where those
+/// plans say 25.
+const PILOT: &str = "Caps { calls_per_turn: 50, cap_grace: 60s, cap_grace_calls: 3, context: 150000, \
                      turn_time: 600s, turn_output: 30000, turn_budget_usd: Some(1.0), agent_tokens: 3000000, \
                      agent_output: 180000, run_tokens: 25000000, run_output: 1666666, run_time: 3600s }";
 

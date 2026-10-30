@@ -151,10 +151,11 @@ impl Caps {
         serde_json::Value::String(format!("{self:?}"))
     }
 
-    /// The pilot's caps (design section 5).
+    /// The pilot's caps (design section 5), with the per-turn call cap at 50 since owner decision
+    /// `63f4fd5cab66`, as the driver's [`crate::driver::CALLS_PER_TURN`].
     pub fn pilot() -> Caps {
         Caps {
-            calls_per_turn: 25,
+            calls_per_turn: crate::driver::CALLS_PER_TURN,
             cap_grace: Duration::from_secs(60),
             cap_grace_calls: 3,
             context: 150_000,
