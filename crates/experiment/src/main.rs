@@ -9,7 +9,8 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser, Subcommand};
 
 use bracken_experiment::backend::{Caps, ModeTokenCap, RUN_TIME_CAP, RUN_TOKEN_CAP};
 use bracken_experiment::bracken_mode::AcceptRule;
@@ -81,9 +82,9 @@ enum Cmd {
         /// Pi: a prefix `scripts/pi-prefix` built, pinned whole.
         #[arg(long, required_if_eq("harness", "pi"))]
         pi_prefix: Option<PathBuf>,
-        /// Pi: the version the prefix must hold.
-        #[arg(long, default_value = "1.4.0")]
-        pi_version: String,
+        /// Pi: the version the prefix must hold [default: 1.4.0].
+        #[arg(long)]
+        pi_version: Option<String>,
         /// A Claude Code settings file holding the routing entries, read for them alone: either harness
         /// sends its model calls there, with its token.
         #[arg(long)]
@@ -181,13 +182,8 @@ fn main() {
             mode,
             agents,
             turns,
-            harness: match harness.as_deref() {
-                Some("pi") => HarnessArgs::Pi { prefix: pi_prefix.expect("clap requires it"), version: pi_version },
-                _ => HarnessArgs::Claude {
-                    binary: claude.expect("clap requires it"),
-                    version: claude_version.expect("clap requires it"),
-                },
-            },
+            harness: HarnessArgs::of(harness.as_deref(), claude, claude_version, pi_prefix, pi_version)
+                .unwrap_or_else(|e| refuse_run(&e)),
             settings,
             prompt_file,
             model,
@@ -224,6 +220,61 @@ fn task_named(name: &str) -> Task {
 enum HarnessArgs {
     Claude { binary: PathBuf, version: String },
     Pi { prefix: PathBuf, version: String },
+}
+
+/// Ends the process as clap ends it on a bad `run` command line: the message, `run`'s usage, exit 2.
+fn refuse_run(message: &str) -> ! {
+    let mut cli = Cli::command();
+    cli.build();
+    let run = cli.find_subcommand_mut("run").expect("run is a subcommand");
+    run.error(ErrorKind::ArgumentConflict, message).exit()
+}
+
+/// The Pi version a prefix must hold when `--pi-version` isn't given.
+const PI_VERSION: &str = "1.4.0";
+
+impl HarnessArgs {
+    /// The harness `--harness` names, Claude Code unless given, from its own options. An option for the
+    /// other harness is refused, not ignored (task 4cd030ab8dd1); clap has already asked for the
+    /// harness's own.
+    fn of(
+        harness: Option<&str>,
+        claude: Option<PathBuf>,
+        claude_version: Option<String>,
+        pi_prefix: Option<PathBuf>,
+        pi_version: Option<String>,
+    ) -> Result<HarnessArgs, String> {
+        let pi = harness == Some("pi");
+        let others: Vec<&str> = if pi {
+            [("--claude", claude.is_some()), ("--claude-version", claude_version.is_some())].to_vec()
+        } else {
+            [("--pi-prefix", pi_prefix.is_some()), ("--pi-version", pi_version.is_some())].to_vec()
+        }
+        .into_iter()
+        .filter_map(|(name, given)| given.then_some(name))
+        .collect();
+        if !others.is_empty() {
+            let (theirs, this, other) =
+                if pi { ("Claude Code's", "Pi", "claude") } else { ("Pi's", "Claude Code", "pi") };
+            return Err(format!(
+                "{} {} {theirs}, but the harness is {this}: drop {}, or give --harness {other}",
+                others.join(" and "),
+                if others.len() == 1 { "is" } else { "are" },
+                if others.len() == 1 { "it" } else { "them" },
+            ));
+        }
+        Ok(if pi {
+            HarnessArgs::Pi {
+                prefix: pi_prefix.expect("clap requires it"),
+                version: pi_version.unwrap_or_else(|| PI_VERSION.into()),
+            }
+        } else {
+            HarnessArgs::Claude {
+                binary: claude.expect("clap requires it"),
+                version: claude_version.expect("clap requires it"),
+            }
+        })
+    }
 }
 
 struct AgentRun {
