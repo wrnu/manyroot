@@ -394,8 +394,11 @@ never writes a `supersedes` relation for another author's artifact.
   first artifact. The tag is namespaced because tags are queries: the
   coordination Ground already holds claims tagged `goal`, which would meet
   Weave's at the join (retrospective `16cbeff051ea`, gotcha
-  `11230613d276`). A goal binds the line under a policy if its author is in
-  that policy's `goal_setters`.
+  `11230613d276`). A goal binds the line under a policy if its author, and
+  the author of its `refines` link, are in that policy's `goal_setters`. So
+  no one else can bind a setter's goal by linking it, including after the
+  setter withdrew it by retracting their link (task `8ff95e0b756f`).
+  Whether it binds a decision is judged within the decision's past.
 - **A check result** is evidence whose target is a manifest artifact and
   whose `method` names one of the line's `checks` with its definition hash.
   By convention under shared keys, only Weave's runner writes them (`weave
@@ -491,7 +494,12 @@ never changes whether `E` qualified (finding `b2098df8e4be`). A decision
 2. Its author is in `P_E`'s `integrators`.
 3. Every parent is a qualifying decision and a causal ancestor of `E`. A
    decision with no parents is a root of `L`.
-4. Its manifest is complete, and valid.
+4. Its manifest is complete, and valid. Manifests and file versions are
+   content, named by hash, so they resolve whether or not the artifact
+   carrying them is retracted: a later retraction of a manifest artifact or
+   a file version never unqualifies `E`, and v0 has no content takedown
+   (answer `2c28892e9701`). Completeness alone is read over the replica, as
+   it converges once replicas sync.
 5. **Every objection in its window is answered, and allowed.** Take any
    non-retracted `contradicts` relation `O` that is a causal ancestor of `E`
    and targets a qualifying decision `D`, where `D` is a strict ancestor of
@@ -499,13 +507,19 @@ never changes whether `E` qualified (finding `b2098df8e4be`). A decision
    is `E` itself, or is a descendant of `D` and an ancestor of `E`. So an
    objection made before the line moved counts against that move, and one
    made later binds the next move. This is the causal window, counted in
-   line moves (findings `6b3daf366e21` and `ec772d4abda9`).
+   line moves (findings `6b3daf366e21` and `ec772d4abda9`). An objection to
+   `D` stays in the window of every later decision, and its answers are
+   judged again under each one's `P_E`: so, as in the example below, a
+   policy that makes a goal binding binds the moves under it.
+   "Non-retracted" is judged within `E`'s past, by the protocol's rule (a
+   retracted retraction restores it), and a target resolves whether or not
+   it is retracted (gotcha `b4d45c7352d4`).
 
    **Objections to what `E` uses unchanged.** Take any non-retracted
    `contradicts` relation `O` that is a causal ancestor of `E` and targets
    either a manifest artifact with `E`'s manifest hash, or a proposal `X`
    that `E` uses. `E` uses `X` if it lists, in `proposals`, `X` or any
-   proposal with the same `change`, or if every entry of `X`'s change
+   proposal on `X`'s line with the same `change`, or if every entry of `X`'s change
    appears in `E`'s own change against one of its parents on `L`. The
    second test catches an integrate of a given tree that lists no
    proposals, as stage 1 does (security note `17906a29698f`). Then `E`, or
@@ -517,7 +531,8 @@ never changes whether `E` qualified (finding `b2098df8e4be`). A decision
    The answer's disposition must be allowed for `O`'s basis (finding
    `e99c224ed5b6`). The basis is classified under `P_E`, over `E`'s
    ancestors, and a counted fail is one eligible for the objected decision
-   (or, for an objection to a manifest or a proposal, for `E`):
+   (or, for an objection to a manifest or a proposal, for `E`), whether or
+   not a later result replaced it; its check is the failing check:
 
    | Disposition | Means, and is checked as | Allowed for |
    |---|---|---|
@@ -540,7 +555,11 @@ never changes whether `E` qualified (finding `b2098df8e4be`). A decision
    - **Count and age.** `E`'s breakage has at most `max_known` entries, and
      no entry is more than `max_age` line moves old. An entry's age is the
      length of the longest unbroken chain of ancestors on `L`, ending at
-     `E`, that list the same `check`.
+     `E`, that list the same `check`, counted in decisions with `E` itself:
+     a new entry is 1 move old, so `max_age` 0, like `max_known` 0, allows
+     no breakage.
+   - A path is under a protected prefix if it is the prefix, or below it.
+     "Strict subset" compares the entries' checks.
    - **Reducing is allowed.** Past the count or age limit, `E` still
      qualifies if it has at least one parent on `L`, and its breakage is a
      strict subset of every `L` parent's breakage. A root, or a decision
@@ -619,7 +638,11 @@ what weave-mode.md asks for.
 
 **Open objections.** These are the `contradicts` relations on `L`'s
 decisions that rule 5 hasn't yet seen answered: what the next move must
-answer. `weave review` also lists the reviews of each open proposal on
+answer. That is the window of a decision with every head as a parent, less
+the objections an answer there allows, judged under `L`'s current policy
+over the whole replica, each with the dispositions its basis allows. A
+decision `integrate` would write is judged the same way: its past is the
+whole replica. `weave review` also lists the reviews of each open proposal on
 `L`, carried over by `change`, and what a decision using it unchanged
 would have to answer.
 
@@ -986,8 +1009,25 @@ from its results.
     and their retractions are in that past, and whether the policy version
     is in each result's: references, a bit each. Which of those results
     lie below one another is a list per validator, check and manifest,
-    answered in rounds within the batch budget; so a later re-run or
-    retraction never changes what the decision saw.
+    answered once per list however many decisions are counted: each
+    eligible result reads its word once, and ORs it into a mark word per
+    decision it is eligible for (finding `eb8b992ae58f`). So a list of `N`
+    results costs `N/64` passes, `N^2/64` words read and, per decision,
+    `N/64` words of marks. Measured in a release build on an M-series Mac,
+    one validator's 8,000 failed results on one manifest take about 0.25 s
+    for one decision and 0.3 s for ten (4.3 s for one before). A later
+    re-run or retraction never changes what the decision saw.
+  - **Objections** (build step 7, rules 5 and 6). Each decision's window
+    (the objections to its ancestors in the decision graph), the answers
+    below it and the objections to what it uses come from the decision
+    graph, shared along single-parent runs, with no Ground walk. Every
+    question they ask of a decision's past is asked at once: whether each
+    objection, the retractions below it, its basis's result and goal links
+    and their retractions are in the past, and whether the policy in force
+    is in the result's, all references through one ancestor answer. A
+    decision asks one question per objection in its window, so `D`
+    decisions below `K` objections ask about `D x K`, a bit each; objections
+    are judged again by every later move, as rule 5 requires.
   - A question nothing asked at build would be a bug. It is answered by
     walking and counted, and fails debug builds; the tests assert the count
     is zero.

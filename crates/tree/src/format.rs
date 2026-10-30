@@ -391,6 +391,18 @@ pub enum Disposition {
     Overridden,
 }
 
+impl Disposition {
+    /// The name the payload and the CLI use: `fixed`, `fell_back`, `accepted_breakage`, `overridden`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Disposition::Fixed => "fixed",
+            Disposition::FellBack => "fell_back",
+            Disposition::AcceptedBreakage => "accepted_breakage",
+            Disposition::Overridden => "overridden",
+        }
+    }
+}
+
 /// How the integrator dealt with an objection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {

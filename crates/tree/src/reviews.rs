@@ -2,7 +2,9 @@
 //! objections*).
 //!
 //! A goal is a claim tagged `weave-goal` that `refines` a line's first artifact,
-//! and binds the line under a policy whose `goal_setters` include its author. A
+//! and binds the line under a policy whose `goal_setters` include its author and
+//! the author of that `refines` link, so no one else can bind a setter's goal by
+//! linking it (task 8ff95e0b756f). A
 //! review is a `supports` (agreement) or `contradicts` (objection) relation to a
 //! decision, a manifest artifact, or a proposal. One to a manifest artifact
 //! reviews every decision and proposal with that manifest hash; one to a proposal
@@ -34,12 +36,14 @@ pub struct Goal {
     pub author: AgentId,
     /// Its `refines` relation to the line's first artifact.
     pub link: ContributionId,
+    /// The relation's author.
+    pub linker: AgentId,
 }
 
 impl Goal {
-    /// Whether the goal binds its line under `policy`: its author is one of the policy's goal setters.
+    /// Whether the goal binds its line under `policy`: its author, and its link's, are goal setters.
     pub fn binds(&self, policy: &Line) -> bool {
-        policy.goal_setters.contains(&self.author)
+        policy.goal_setters.contains(&self.author) && policy.goal_setters.contains(&self.linker)
     }
 }
 
@@ -50,7 +54,7 @@ pub fn goals(ix: &Index, line: &ContributionId) -> Vec<Goal> {
     ix.goal_links()
         .iter()
         .filter(|link| link.to == *line && !link.retracted)
-        .map(|link| Goal { id: link.goal, author: link.author, link: link.id })
+        .map(|link| Goal { id: link.goal, author: link.author, link: link.id, linker: link.linker })
         .collect()
 }
 

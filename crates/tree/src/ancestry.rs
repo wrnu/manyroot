@@ -237,21 +237,33 @@ impl Ancestry {
                 owners_by_pass[marker_target / 64].push((at, marker_bit));
             }
         }
-        // The askers, with their positions, and a cursor into their references: the first not yet answered.
-        // References are sorted by target index, so each pass answers a run of each.
-        let mut askers: Vec<(usize, ContributionId, usize)> =
-            ancestry.asked.keys().filter_map(|id| passes.position(id).map(|at| (at, *id, 0))).collect();
-        askers.sort_unstable();
+        // Each pass's askers, with their positions and the run of their references it answers: references
+        // are sorted by target index, so each pass answers a run of each, and an asker is visited only in
+        // the passes its references meet.
+        let mut by_pass: Vec<Vec<(usize, ContributionId, usize)>> = vec![Vec::new(); pass_count];
+        for (id, asked) in &ancestry.asked {
+            let Some(at) = passes.position(id) else { continue };
+            let mut start = 0;
+            while start < asked.refs.len() {
+                let pass = asked.refs[start] as usize / 64;
+                by_pass[pass].push((at, *id, start));
+                start += asked.refs[start..].iter().take_while(|r| **r as usize / 64 == pass).count();
+            }
+        }
         for (pass, owners) in owners_by_pass.iter().enumerate() {
+            if by_pass[pass].is_empty() && pass != marker_target / 64 {
+                continue;
+            }
             passes.run(owners, usize::MAX);
-            for (at, asker, next) in &mut askers {
+            for (at, asker, start) in &by_pass[pass] {
                 let asked = ancestry.asked.get_mut(asker).expect("an asker");
                 let word = passes.below(*at);
-                while *next < asked.refs.len() && asked.refs[*next] as usize / 64 == pass {
-                    if word & (1 << (asked.refs[*next] % 64)) != 0 {
-                        set(&mut asked.answers, *next);
+                let mut next = *start;
+                while next < asked.refs.len() && asked.refs[next] as usize / 64 == pass {
+                    if word & (1 << (asked.refs[next] % 64)) != 0 {
+                        set(&mut asked.answers, next);
                     }
-                    *next += 1;
+                    next += 1;
                 }
             }
             if pass == marker_target / 64 {
@@ -453,11 +465,33 @@ pub fn rounds(
 }
 
 /// For each of `groups`, which of its members no other member of the same group descends from: the
-/// latest, in causal order (weave.md section 2, the latest-result rule). The members are targets, 64 to
-/// a pass as for references, and each member reads its own word to mark the members of its group below
-/// it, so nothing is kept but a bit per member. A member the graph doesn't hold is never latest.
+/// latest, in causal order (weave.md section 2, the latest-result rule). A member the graph doesn't hold
+/// is never latest. [`below_in_groups`], with every member reading into one sink per group.
 #[doc(hidden)]
 pub fn latest(g: &Graph, groups: &[Vec<ContributionId>]) -> (Vec<Vec<bool>>, Stats) {
+    let sinks: Vec<Vec<Vec<usize>>> = groups.iter().enumerate().map(|(k, group)| vec![vec![k]; group.len()]).collect();
+    let (below, stats) = below_in_groups(g, groups, &sinks, groups.len());
+    let latest = groups
+        .iter()
+        .zip(below)
+        .map(|(group, below)| group.iter().zip(below).map(|(t, b)| !b && g.contains(t)).collect())
+        .collect();
+    (latest, stats)
+}
+
+/// For each of `groups`, marks the members below each reader in the reader's sinks: `sinks[k][m]` lists
+/// the sinks member `m` of group `k` reads into, each sink belonging to one group, and `count` is how
+/// many sinks there are. Returns, per sink, a bit per member of its group: whether some reader into it
+/// has that member as a strict ancestor. The members are targets, 64 to a pass as for references, and
+/// each reader reads its own word once, however many sinks it has, so the latest rule over `Q` sets
+/// of readers costs `Q` bits per member and pair rather than a question per set (finding eb8b992ae58f).
+#[doc(hidden)]
+pub fn below_in_groups(
+    g: &Graph,
+    groups: &[Vec<ContributionId>],
+    sinks: &[Vec<Vec<usize>>],
+    count: usize,
+) -> (Vec<Vec<bool>>, Stats) {
     let mut passes = Passes::new(g);
     // The groups side by side, each in causal order: group `k` holds targets `offsets[k]..offsets[k + 1]`,
     // and target `t` is at position `targets[t]` (`u32::MAX` off the graph, first) and is member
@@ -465,7 +499,11 @@ pub fn latest(g: &Graph, groups: &[Vec<ContributionId>]) -> (Vec<Vec<bool>>, Sta
     let mut offsets = vec![0];
     let mut targets: Vec<u32> = Vec::new();
     let mut slots: Vec<u32> = Vec::new();
-    for group in groups {
+    // Each group's last reader, by position, if it has one on the graph.
+    let mut last_reader: Vec<Option<u32>> = Vec::with_capacity(groups.len());
+    // Each sink's group, to size its marks: a word per chunk the group meets, from the group's first.
+    let mut sink_group = vec![usize::MAX; count];
+    for (k, group) in groups.iter().enumerate() {
         let mut by_position: Vec<(u32, u32)> = group
             .iter()
             .enumerate()
@@ -475,9 +513,18 @@ pub fn latest(g: &Graph, groups: &[Vec<ContributionId>]) -> (Vec<Vec<bool>>, Sta
         targets.extend(by_position.iter().map(|(at, _)| *at));
         slots.extend(by_position.iter().map(|(_, slot)| *slot));
         offsets.push(targets.len());
+        let reads = by_position.iter().filter(|(at, slot)| *at != u32::MAX && !sinks[k][*slot as usize].is_empty());
+        last_reader.push(reads.map(|(at, _)| *at).max());
+        for sink in sinks[k].iter().flatten() {
+            sink_group[*sink] = k;
+        }
     }
-    let mut latest: Vec<Vec<bool>> =
-        groups.iter().map(|group| group.iter().map(|t| passes.position(t).is_some()).collect()).collect();
+    let chunks_of = |k: usize| match offsets[k] < offsets[k + 1] {
+        true => offsets[k] / 64..(offsets[k + 1] - 1) / 64 + 1,
+        false => 0..0,
+    };
+    let mut marks: Vec<Vec<u64>> =
+        sink_group.iter().map(|k| if *k == usize::MAX { vec![] } else { vec![0; chunks_of(*k).len()] }).collect();
     let mut skipped = 0;
     // Groups are in target order, so those meeting a chunk are a run, from `low`.
     let mut low = 0;
@@ -487,12 +534,8 @@ pub fn latest(g: &Graph, groups: &[Vec<ContributionId>]) -> (Vec<Vec<bool>>, Sta
             low += 1;
         }
         let high = low + offsets[low..groups.len()].iter().take_while(|from| **from < stop).count();
-        // Every member of a group meeting the chunk reads it: the pass reaches the latest of them.
-        let last = (low..high)
-            .filter(|k| offsets[*k] < offsets[*k + 1])
-            .map(|k| targets[offsets[k + 1] - 1])
-            .filter(|at| *at != u32::MAX)
-            .max();
+        // Every reader of a group meeting the chunk reads it: the pass reaches the latest of them.
+        let last = (low..high).filter_map(|k| last_reader[k]).max();
         let owners: Vec<(usize, u64)> =
             (start..stop).filter(|t| targets[*t] != u32::MAX).map(|t| (targets[t] as usize, 1 << (t % 64))).collect();
         match last {
@@ -503,20 +546,43 @@ pub fn latest(g: &Graph, groups: &[Vec<ContributionId>]) -> (Vec<Vec<bool>>, Sta
             }
         }
         for k in low..high {
-            let mine = start.max(offsets[k])..stop.min(offsets[k + 1]);
-            for reader in &targets[offsets[k]..offsets[k + 1]] {
-                if *reader == u32::MAX {
+            // The chunk's bits that are this group's members.
+            let (from, to) = (start.max(offsets[k]) - start, stop.min(offsets[k + 1]) - start);
+            let mask = if to - from == 64 { u64::MAX } else { ((1u64 << (to - from)) - 1) << from };
+            let at = chunk - chunks_of(k).start;
+            for r in offsets[k]..offsets[k + 1] {
+                let reads = &sinks[k][slots[r] as usize];
+                if targets[r] == u32::MAX || reads.is_empty() {
                     continue;
                 }
-                let word = passes.below(*reader as usize);
-                for t in mine.clone() {
-                    if word & (1 << (t % 64)) != 0 {
-                        latest[k][slots[t] as usize] = false;
+                let word = passes.below(targets[r] as usize) & mask;
+                if word != 0 {
+                    for sink in reads {
+                        marks[*sink][at] |= word;
                     }
                 }
             }
         }
     }
-    let questions = groups.iter().map(|group| group.len() * group.len()).sum();
-    (latest, Stats { questions, skipped, list_entries: targets.len(), ..passes.stats() })
+    let below: Vec<Vec<bool>> = marks
+        .iter()
+        .zip(&sink_group)
+        .map(|(marks, k)| {
+            if *k == usize::MAX {
+                return vec![];
+            }
+            let first = chunks_of(*k).start;
+            let mut mine = vec![false; groups[*k].len()];
+            for t in offsets[*k]..offsets[*k + 1] {
+                mine[slots[t] as usize] = marks[t / 64 - first] & (1 << (t % 64)) != 0;
+            }
+            mine
+        })
+        .collect();
+    let questions = groups
+        .iter()
+        .zip(sinks)
+        .map(|(group, sinks)| group.len() * sinks.iter().filter(|s| !s.is_empty()).count())
+        .sum();
+    (below, Stats { questions, skipped, list_entries: targets.len(), ..passes.stats() })
 }

@@ -19,12 +19,14 @@ use std::sync::Arc;
 
 use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
 
-use crate::ancestry::{self, Stats};
+use crate::ancestry::{self, Ancestry, Stats};
 use crate::format::{
-    Change, DECISION_MEDIA_TYPE, Decision, LINE_MEDIA_TYPE, Line, PROPOSAL_MEDIA_TYPE, Proposal, Record,
+    Change, DECISION_MEDIA_TYPE, Decision, Disposition, LINE_MEDIA_TYPE, Line, PROPOSAL_MEDIA_TYPE, Proposal, Record,
 };
 use crate::ground::Index;
 use crate::hash::ContentHash;
+use crate::objections::{Obligations, Open};
+use crate::results::answer;
 
 /// One version of a line's policy: a valid, non-retracted line artifact.
 #[derive(Debug, Clone)]
@@ -96,6 +98,20 @@ pub enum Unqualified {
     ManifestNotHeld(ContentHash),
     #[error("its manifest {hash} isn't complete here: {missing} files are missing, or held at another size")]
     ManifestIncomplete { hash: ContentHash, missing: usize },
+    /// Rule 5.
+    #[error("it doesn't answer the {basis} objection {objection}, nor does a decision in its window")]
+    Unanswered { objection: ContributionId, basis: &'static str },
+    #[error("the {basis} objection {objection} is answered only {}, which its basis doesn't allow", disposition.as_str())]
+    AnswerNotAllowed { objection: ContributionId, disposition: Disposition, basis: &'static str },
+    /// Rule 6.
+    #[error("its breakage for {check} names the protected path {path}")]
+    ProtectedPath { check: String, path: String },
+    #[error("its breakage has {count} entries, more than the {max} its policy allows, and doesn't reduce its parents'")]
+    TooMuchBreakage { count: usize, max: u64 },
+    #[error(
+        "its breakage for {check} is {age} line moves old, more than the {max} its policy allows, and doesn't reduce its parents'"
+    )]
+    BreakageTooOld { check: String, age: u64, max: u64 },
 }
 
 /// The most versions a [`Unqualified::PolicyDiverged`] verdict holds. Each decision whose
@@ -127,6 +143,8 @@ pub struct Lines {
     /// Retracted proposals' payloads: a review of one still names its line and change.
     retracted_proposals: BTreeMap<ContributionId, Proposal>,
     judged: BTreeMap<ContributionId, Result<Qualified, Unqualified>>,
+    /// The policy version in force for each decision whose line's chain gives one, qualifying or not.
+    in_force: HashMap<ContributionId, ContributionId>,
     /// Decisions in causal order, parents first, ties by the smallest id.
     order: Vec<ContributionId>,
     default_line: Option<ContributionId>,
@@ -134,6 +152,10 @@ pub struct Lines {
     ignored: Vec<ContributionId>,
     /// What answering the chain questions did.
     stats: Stats,
+    /// Every objection, and what rules 5 and 6 read of each decision.
+    obligations: Obligations,
+    /// What answering rule 5's questions of each decision's past did.
+    obligation_stats: Stats,
 }
 
 impl Lines {
@@ -232,6 +254,31 @@ impl Lines {
             true => g.is_ancestor(a, b),
             false => ix.is_ancestor(g, a, b),
         };
+        // Rules 5 and 6: each decision's window, answers and used objections from the decision graph, then
+        // every question they ask of each decision's past, under the policy in force for it, at once
+        // (decision on split note dc467163233c).
+        let obligations = Obligations::build(ix, &lines, &lines.order);
+        let mut refs: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
+        if !walking {
+            for (id, chain) in &chains {
+                let (Ok(policy), Some(d)) = (chain, lines.decisions.get(id)) else { continue };
+                let (mut past, mut epoch) = (Vec::new(), Vec::new());
+                obligations.asks(id, &d.decision.line, ix.retractions(), &mut past, &mut epoch);
+                if !past.is_empty() {
+                    refs.insert(*id, past);
+                }
+                for r in epoch {
+                    refs.entry(r).or_default().push(*policy);
+                }
+            }
+        }
+        let pasts = Ancestry::build(g, &refs, &[]);
+        drop(refs);
+        let rule_5_missed = Cell::new(0);
+        let in_past_of = |a: &ContributionId, b: &ContributionId| match walking {
+            true => g.is_ancestor(a, b),
+            false => answer(&pasts, &rule_5_missed, g, a, b),
+        };
         // Parents come before children in `order`, so each parent is judged first.
         for id in lines.order.clone() {
             let record = &lines.decisions[&id];
@@ -239,8 +286,37 @@ impl Lines {
                 Err(Unqualified::Retracted)
             } else {
                 let line = &record.decision.line;
-                let chain = || chains.remove(&id).unwrap_or_else(|| walk(&lines, line, &id, true));
-                lines.judge(ix, record.author, &record.decision, |a| is_ancestor(a, &id), chain)
+                let in_force = Cell::new(None);
+                let chain = || {
+                    let chain = chains.remove(&id).unwrap_or_else(|| walk(&lines, line, &id, true));
+                    in_force.set(chain.as_ref().ok().copied());
+                    chain
+                };
+                let verdict = lines.judge(ix, record.author, &record.decision, |a| is_ancestor(a, &id), chain);
+                if let Some(policy) = in_force.get() {
+                    lines.in_force.insert(id, policy);
+                }
+                verdict.and_then(|q| {
+                    let policy = &lines.versions[&q.policy].policy;
+                    let reads = obligations.of(&id);
+                    let mut in_past = |x: &ContributionId| in_past_of(x, &id);
+                    let mut in_epoch = |r: &ContributionId| in_past_of(&q.policy, r);
+                    obligations.rule_5(
+                        &lines,
+                        ix.retractions(),
+                        Some(&id),
+                        &record.author,
+                        &record.decision,
+                        policy,
+                        &reads.window,
+                        &reads.uses,
+                        &reads.answered,
+                        &mut in_past,
+                        &mut in_epoch,
+                    )?;
+                    obligations.rule_6(&lines, &record.decision, policy, &reads.ages)?;
+                    Ok(q)
+                })
             };
             lines.judged.insert(id, verdict);
         }
@@ -293,6 +369,8 @@ impl Lines {
             lines.default_line = main;
         }
         lines.stats.fallbacks += missed.get();
+        lines.obligation_stats = Stats { fallbacks: rule_5_missed.get(), ..pasts.stats() };
+        lines.obligations = obligations;
         lines
     }
 
@@ -515,7 +593,84 @@ impl Lines {
     /// Whether a decision `author` would write now, listing every current head of
     /// the Ground as a parent, would qualify. Its manifest must already be held.
     pub fn judge_new(&self, g: &Graph, ix: &Index, author: AgentId, d: &Decision) -> Result<Qualified, Unqualified> {
-        self.judge(ix, author, d, |id| g.contains(id), || self.chain(&d.line, true, |id| g.contains(id)))
+        let q = self.judge(ix, author, d, |id| g.contains(id), || self.chain(&d.line, true, |id| g.contains(id)))?;
+        // Its past is the whole replica, and retraction is read now; the epoch is asked of the index.
+        let policy = &self.versions[&q.policy].policy;
+        let reads = self.obligations.of_new(ix, self, d);
+        let candidates: Vec<(bool, u32)> =
+            reads.window.iter().map(|at| (false, *at)).chain(reads.uses.iter().map(|at| (true, *at))).collect();
+        let epochs = self.epochs(g, &candidates, &q.policy);
+        let missed = Cell::new(0);
+        let mut in_epoch = |r: &ContributionId| answer(&epochs, &missed, g, &q.policy, r);
+        let mut in_past = |x: &ContributionId| g.contains(x);
+        let (retractions, obligations) = (ix.retractions(), &self.obligations);
+        obligations.rule_5(
+            self,
+            retractions,
+            None,
+            &author,
+            d,
+            policy,
+            &reads.window,
+            &reads.uses,
+            &reads.answered,
+            &mut in_past,
+            &mut in_epoch,
+        )?;
+        obligations.rule_6(self, d, policy, &reads.ages)?;
+        Ok(q)
+    }
+
+    /// Whether `version` is an ancestor of each result an objection in `candidates` comes from, asked of
+    /// the ancestor index.
+    fn epochs(&self, g: &Graph, candidates: &[(bool, u32)], version: &ContributionId) -> Ancestry {
+        let refs: HashMap<ContributionId, Vec<ContributionId>> =
+            self.obligations.basis_results(candidates).into_iter().map(|r| (r, vec![*version])).collect();
+        Ancestry::build(g, &refs, &[])
+    }
+
+    /// The objections the next move on `line` must answer (weave.md section 2, *Open objections*): those
+    /// in the window of a decision with every head as a parent that no answer allows, judged under the
+    /// line's current policy over the whole replica, each with the dispositions its basis allows. `None`
+    /// if the line has no current policy.
+    pub fn open_objections(&self, g: &Graph, ix: &Index, line: &ContributionId) -> Option<Vec<Open>> {
+        let [version] = self.current_versions(line)[..] else { return None };
+        let policy = &self.versions[&version].policy;
+        let (candidates, answered) = self.obligations.next_move(&self.heads(line));
+        let epochs = self.epochs(g, &candidates, &version);
+        let missed = Cell::new(0);
+        let mut in_epoch = |r: &ContributionId| answer(&epochs, &missed, g, &version, r);
+        let retractions = ix.retractions();
+        Some(self.obligations.open(self, retractions, line, policy, &candidates, &answered, None, &mut in_epoch))
+    }
+
+    /// The objections a decision using `proposal` unchanged on its line would have to answer, to any
+    /// proposal with its line and change or to its manifest, that no decision on the line has answered
+    /// as their basis allows, under the line's current policy over the whole replica. Results by any
+    /// validator count, as the integrator isn't known. `None` if `proposal` isn't one, or its line has
+    /// no current policy.
+    pub fn proposal_objections(&self, g: &Graph, ix: &Index, proposal: &ContributionId) -> Option<Vec<Open>> {
+        let line = self.proposal_named(proposal)?.line;
+        let [version] = self.current_versions(&line)[..] else { return None };
+        let policy = &self.versions[&version].policy;
+        let candidates = self.obligations.of_proposal(self, proposal);
+        let (_, answered) = self.obligations.next_move(&self.heads(&line));
+        let epochs = self.epochs(g, &candidates, &version);
+        let missed = Cell::new(0);
+        let mut in_epoch = |r: &ContributionId| answer(&epochs, &missed, g, &version, r);
+        let retractions = ix.retractions();
+        Some(self.obligations.open(self, retractions, &line, policy, &candidates, &answered, None, &mut in_epoch))
+    }
+
+    /// Every objection in the replica whose target resolves.
+    pub fn objections(&self) -> &Obligations {
+        &self.obligations
+    }
+
+    /// What answering rule 5's questions of each decision's past did, and how many fell back to a walk.
+    #[doc(hidden)]
+    pub fn obligation_stats(&self) -> Stats {
+        self.obligation_stats
     }
 
     /// The line's first artifact, if `id` names one: a version that supersedes none,
@@ -580,6 +735,11 @@ impl Lines {
     /// The valid proposals on a line, ascending.
     pub fn proposals_on<'a>(&'a self, line: &'a ContributionId) -> impl Iterator<Item = &'a ProposalRecord> + 'a {
         self.proposals.values().filter(move |r| r.verdict.is_ok() && r.proposal.line == *line)
+    }
+
+    /// The policy version in force for a decision, qualifying or not, if its line's chain gives one.
+    pub fn policy_in_force_for(&self, decision: &ContributionId) -> Option<&Version> {
+        self.in_force.get(decision).map(|v| &self.versions[v])
     }
 
     /// Whether a decision qualifies, and if not, why.
