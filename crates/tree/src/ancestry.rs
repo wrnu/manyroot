@@ -36,8 +36,11 @@ pub struct Stats {
     pub ors: usize,
     /// Questions answered.
     pub questions: usize,
-    /// Bytes kept once built, by the vectors' capacities and the maps' entries (not their slack).
+    /// Bytes kept once built, by the vectors' capacities and the maps' entries (not their slack). For
+    /// Lines, what its chain questions hold until its records are judged.
     pub bytes: usize,
+    /// Answer vectors [`rounds`] computed: one per list and class of askers' pasts.
+    pub vectors: usize,
     /// The most answer words held at once by [`rounds`]; never more than one per contribution.
     pub peak_words: usize,
     /// Contributions stored in the shared lists [`rounds`] asks about.
@@ -55,6 +58,8 @@ pub(crate) struct Passes {
     parents: Vec<u32>,
     own: Vec<u64>,
     below: Vec<u64>,
+    /// The positions the last pass swept: `below` is 0 before them, and unset after.
+    swept: (usize, usize),
     passes: usize,
     ors: usize,
 }
@@ -71,7 +76,7 @@ impl Passes {
         }
         starts.push(parents.len() as u32);
         let n = order.len();
-        Passes { position, starts, parents, own: vec![0; n], below: vec![0; n], passes: 0, ors: 0 }
+        Passes { position, starts, parents, own: vec![0; n], below: vec![0; n], swept: (n, 0), passes: 0, ors: 0 }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -83,17 +88,27 @@ impl Passes {
     }
 
     /// One pass: `owners` are the contributions asked about, each with its bit. Afterwards, until the
-    /// next pass, [`Passes::below`] gives each contribution the bits of the owners that are its strict
-    /// ancestors.
-    pub(crate) fn run(&mut self, owners: &[(usize, u64)]) {
+    /// next pass, [`Passes::below`] gives each contribution up to position `last` the bits of the owners
+    /// that are its strict ancestors. Nothing before the first owner can have one, so the pass sweeps
+    /// only from there to `last`, and not at all if that is empty.
+    pub(crate) fn run(&mut self, owners: &[(usize, u64)], last: usize) {
+        let first = owners.iter().map(|(at, _)| *at).min().unwrap_or(self.len());
+        let last = last.min(self.len().saturating_sub(1));
+        self.swept = (first, last);
+        if first >= last {
+            return;
+        }
         for (at, b) in owners {
             self.own[*at] |= b;
         }
-        for at in 0..self.len() {
+        for at in first..=last {
             let (from, to) = (self.starts[at] as usize, self.starts[at + 1] as usize);
             let mut word = 0;
             for p in &self.parents[from..to] {
-                word |= self.below[*p as usize] | self.own[*p as usize];
+                let p = *p as usize;
+                if p >= first {
+                    word |= self.below[p] | self.own[p];
+                }
             }
             self.below[at] = word;
             self.ors += to - from + 1;
@@ -105,7 +120,29 @@ impl Passes {
     }
 
     pub(crate) fn below(&self, at: usize) -> u64 {
-        self.below[at]
+        let (first, last) = self.swept;
+        debug_assert!(at <= last || first >= last, "position {at} is past the pass's last, {last}");
+        if at <= first || at > last { 0 } else { self.below[at] }
+    }
+
+    /// A class for each contribution, such that two of the same class have the same `targets` among
+    /// their strict ancestors: a contribution is in its parents' class if they all share one and none is
+    /// a target, and starts a new class otherwise. Roots are class 0, with none.
+    fn classes(&self, targets: &[bool]) -> Vec<u32> {
+        let mut class = vec![0u32; self.len()];
+        let mut next = 1;
+        for at in 0..self.len() {
+            let parents = &self.parents[self.starts[at] as usize..self.starts[at + 1] as usize];
+            let Some(first) = parents.first() else { continue };
+            let c = class[*first as usize];
+            class[at] = if parents.iter().all(|p| class[*p as usize] == c && !targets[*p as usize]) {
+                c
+            } else {
+                next += 1;
+                next - 1
+            };
+        }
+        class
     }
 
     fn stats(&self) -> Stats {
@@ -188,7 +225,7 @@ impl Ancestry {
             ancestry.asked.keys().filter_map(|id| passes.position(id).map(|at| (at, *id, 0))).collect();
         askers.sort_unstable();
         for (pass, owners) in owners_by_pass.iter().enumerate() {
-            passes.run(owners);
+            passes.run(owners, usize::MAX);
             for (at, asker, next) in &mut askers {
                 let asked = ancestry.asked.get_mut(asker).expect("an asker");
                 let word = passes.below(*at);
@@ -261,9 +298,14 @@ impl Answers<'_> {
 
 /// Answers, for each of `askers` (an asker and the index of its list in `lists`), whether each
 /// contribution of its list is a strict ancestor, and calls `verdict` with each asker's index in `askers`
-/// and its answers. Each list must be sorted and without repeats. The answers are freed in rounds: a round
-/// holds at most one word per contribution, unless one asker alone needs more, so a large list asked by
-/// many takes more passes rather than more memory.
+/// and its answers. Each list must be sorted and without repeats.
+///
+/// Askers whose pasts provably hold the same targets ([`Passes::classes`]) and who ask about the same
+/// list share one answer vector, so many records written after a line's chain cost one. The vectors are
+/// answered and freed in rounds: a round holds at most one word per contribution, unless one vector alone
+/// needs more, so a large list asked by many distinct pasts takes more passes rather than more memory.
+/// A pass over a chunk of 64 targets sweeps only from the first of them to the round's last vector that
+/// reads it, and is skipped if none can have them below it.
 #[doc(hidden)]
 pub fn rounds(
     g: &Graph,
@@ -273,78 +315,109 @@ pub fn rounds(
 ) -> Stats {
     let mut passes = Passes::new(g);
     let budget = passes.len();
-    // The lists side by side: list `l` holds targets `offsets[l]..offsets[l + 1]`, and the target `t` is at
-    // position `targets[t]` (`u32::MAX` if the graph doesn't hold it).
+    // The lists side by side: list `l` holds targets `offsets[l]..offsets[l + 1]`, each list's in causal
+    // order, so a chunk of 64 starts as late as it can. The target `t` is at position `targets[t]`
+    // (`u32::MAX` if the graph doesn't hold it, first), and is entry `slots[t]` of its list.
     let mut offsets = vec![0];
     let mut targets: Vec<u32> = Vec::new();
+    let mut slots: Vec<u32> = Vec::new();
     for list in lists {
         debug_assert!(list.windows(2).all(|w| w[0] < w[1]), "sorted, without repeats");
-        targets.extend(list.iter().map(|t| passes.position(t).map_or(u32::MAX, |at| at as u32)));
+        let mut by_position: Vec<(u32, u32)> = list
+            .iter()
+            .enumerate()
+            .map(|(slot, t)| (passes.position(t).map_or(u32::MAX, |at| at as u32), slot as u32))
+            .collect();
+        by_position.sort_unstable_by_key(|(at, _)| at.wrapping_add(1));
+        targets.extend(by_position.iter().map(|(at, _)| *at));
+        slots.extend(by_position.iter().map(|(_, slot)| *slot));
         offsets.push(targets.len());
     }
+    // One answer vector per list and class: its list, the earliest position among its askers (any would
+    // do, their pasts being the same; `None` off the graph), and its askers.
+    let mut vectors: Vec<(usize, Option<usize>, Vec<usize>)> = Vec::new();
+    {
+        let mut is_target = vec![false; passes.len()];
+        for t in &targets {
+            if *t != u32::MAX {
+                is_target[*t as usize] = true;
+            }
+        }
+        let class = passes.classes(&is_target);
+        let mut vector_of: HashMap<(usize, Option<u32>), usize> = HashMap::new();
+        for (k, (asker, l)) in askers.iter().enumerate() {
+            let at = passes.position(asker);
+            let next = vectors.len();
+            let v = *vector_of.entry((*l, at.map(|at| class[at]))).or_insert(next);
+            if v == next {
+                vectors.push((*l, at, Vec::new()));
+            }
+            let vector = &mut vectors[v];
+            vector.1 = vector.1.min(at).or(at);
+            vector.2.push(k);
+        }
+    }
+    vectors.sort_by_key(|(l, at, _)| (*l, *at));
     let words_for = |l: usize| lists[l].len().div_ceil(64);
-    let mut order: Vec<usize> = (0..askers.len()).collect();
-    order.sort_by_key(|k| askers[*k].1);
     let mut peak = 0;
     let mut first = 0;
-    while first < order.len() {
-        // A round: the next askers, in list order, while their answers fit the budget.
+    while first < vectors.len() {
+        // A round: the next vectors, in list order, while they fit the budget.
         let mut used = 0;
         let mut end = first;
-        while end < order.len() {
-            let words = words_for(askers[order[end]].1);
+        while end < vectors.len() {
+            let words = words_for(vectors[end].0);
             if end > first && used + words > budget {
                 break;
             }
             used += words;
             end += 1;
         }
-        let round = &order[first..end];
-        peak = peak.max(used);
-        let mut bits: Vec<Vec<u64>> = round.iter().map(|k| vec![0; words_for(askers[*k].1)]).collect();
-        let at: Vec<Option<usize>> = round.iter().map(|k| passes.position(&askers[*k].0)).collect();
+        let round = &vectors[first..end];
+        let mut bits: Vec<Vec<u64>> = round.iter().map(|(l, _, _)| vec![0; words_for(*l)]).collect();
+        peak = peak.max(bits.iter().map(Vec::capacity).sum());
         // The chunks of 64 targets the round's lists meet, ascending; a list nobody here asks about costs no
         // pass.
         let mut chunks: Vec<usize> = Vec::new();
-        for k in round {
-            let l = askers[*k].1;
-            for chunk in offsets[l] / 64..offsets[l + 1].div_ceil(64) {
+        for (l, _, _) in round {
+            for chunk in offsets[*l] / 64..offsets[*l + 1].div_ceil(64) {
                 if chunks.last().is_none_or(|last| *last < chunk) {
                     chunks.push(chunk);
                 }
             }
         }
-        // Askers are in list order, so those whose lists meet a chunk are a run, starting at `low`.
+        // Vectors are in list order, so those whose lists meet a chunk are a run, from `low` to `high`.
         let mut low = 0;
         for chunk in chunks {
             let (start, stop) = (chunk * 64, (chunk * 64 + 64).min(targets.len()));
+            while low < round.len() && offsets[round[low].0 + 1] <= start {
+                low += 1;
+            }
+            let high = low + round[low..].iter().take_while(|(l, _, _)| offsets[*l] < stop).count();
+            let Some(last) = round[low..high].iter().filter_map(|(_, at, _)| *at).max() else { continue };
             let owners: Vec<(usize, u64)> = (start..stop)
                 .filter(|t| targets[*t] != u32::MAX)
                 .map(|t| (targets[t] as usize, 1 << (t % 64)))
                 .collect();
-            passes.run(&owners);
-            while low < round.len() && offsets[askers[round[low]].1 + 1] <= start {
-                low += 1;
-            }
-            for i in low..round.len() {
-                let l = askers[round[i]].1;
-                if offsets[l] >= stop {
-                    break;
-                }
-                let Some(at) = at[i] else { continue };
-                let word = passes.below(at);
-                for t in start.max(offsets[l])..stop.min(offsets[l + 1]) {
+            passes.run(&owners, last);
+            for (i, (l, at, _)) in round.iter().enumerate().take(high).skip(low) {
+                let Some(at) = at else { continue };
+                let word = passes.below(*at);
+                let mine = start.max(offsets[*l])..stop.min(offsets[*l + 1]);
+                for (t, slot) in mine.clone().zip(&slots[mine]) {
                     if word & (1 << (t % 64)) != 0 {
-                        set(&mut bits[i], t - offsets[l]);
+                        set(&mut bits[i], *slot as usize);
                     }
                 }
             }
         }
-        for (i, k) in round.iter().enumerate() {
-            verdict(*k, Answers { list: &lists[askers[*k].1], bits: &bits[i] });
+        for (i, (l, _, members)) in round.iter().enumerate() {
+            for k in members {
+                verdict(*k, Answers { list: &lists[*l], bits: &bits[i] });
+            }
         }
         first = end;
     }
     let questions = askers.iter().map(|(_, l)| lists[*l].len()).sum();
-    Stats { questions, peak_words: peak, list_entries: targets.len(), ..passes.stats() }
+    Stats { questions, vectors: vectors.len(), peak_words: peak, list_entries: targets.len(), ..passes.stats() }
 }

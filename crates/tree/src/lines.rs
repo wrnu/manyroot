@@ -14,6 +14,7 @@
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::mem::size_of;
 
 use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
 
@@ -397,6 +398,8 @@ impl Lines {
                 asks.push((p.proposal.line, false));
             }
         }
+        askers.shrink_to_fit();
+        asks.shrink_to_fit();
         let missed = Cell::new(0);
         let mut chains = HashMap::new();
         let stats = ancestry::rounds(g, &lists, &askers, |k, answers| {
@@ -411,7 +414,21 @@ impl Lines {
             };
             chains.insert(asker, self.chain(&line, policy, before));
         });
-        self.stats = Stats { fallbacks: missed.get(), ..stats };
+        // What the chain questions hold until the records are judged: the lists, the askers, and a verdict
+        // each, with any diverged policy's versions (task a90865cb60db).
+        let id = size_of::<ContributionId>();
+        let bytes = lists.iter().map(|l| size_of::<Vec<ContributionId>>() + l.capacity() * id).sum::<usize>()
+            + askers.capacity() * size_of::<(ContributionId, usize)>()
+            + asks.capacity() * size_of::<(ContributionId, bool)>()
+            + chains.len() * (id + size_of::<Result<ContributionId, Unqualified>>())
+            + chains
+                .values()
+                .map(|c| match c {
+                    Err(Unqualified::PolicyDiverged(versions)) => versions.capacity() * id,
+                    _ => 0,
+                })
+                .sum::<usize>();
+        self.stats = Stats { fallbacks: missed.get(), bytes, ..stats };
         chains
     }
 
