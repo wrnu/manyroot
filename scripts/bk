@@ -33,15 +33,12 @@ if [ ! -x "$bin" ]; then
   echo "bk: the manager installs it (agent-team-kickoff skill, SKILL.md section 2.1)" >&2
   exit 1
 fi
-marker="$main/.bracken-team"
-[ -f "$marker" ] || exec "$bin" "$@"
-team=$(cat "$marker")
-url=$(cat "$team/url")
-
-# The command, and whose token: --as anywhere, else BRACKEN_AGENT.
+# The command, and whose token: --as before any '--', else BRACKEN_AGENT. What follows '--' is the
+# command's own (evidence --run -- <cmd> ...), so an --as there isn't bk's (note 6b211180ec3a).
 cmd='' who=${BRACKEN_AGENT:-}
 for ((i = 1; i <= $#; i++)); do
   case "${!i}" in
+    --) break ;;
     --as) j=$((i + 1)); who=${!j:-}; i=$j ;;
     --as=*) who=${!i#--as=} ;;
     --dir) i=$((i + 1)) ;;
@@ -50,6 +47,17 @@ for ((i = 1; i <= $#; i++)); do
     *) [ -n "$cmd" ] || cmd=${!i} ;;
   esac
 done
+# import adds whole bundles, other authors' work included, which the team server can't confirm: it
+# never goes into the team's Ground through bk (finding 410e2e5d0239).
+if [ "$cmd" = import ]; then
+  echo "bk: import is refused: it would add a bundle to the team's Ground unconfirmed. Try it in a throwaway Ground with your branch's binary: export BRACKEN_DIR=\$(mktemp -d)/g; target/debug/bracken init; target/debug/bracken import <bundle>" >&2
+  exit 1
+fi
+marker="$main/.bracken-team"
+[ -f "$marker" ] || exec "$bin" "$@"
+team=$(cat "$marker")
+url=$(cat "$team/url")
+
 case "$cmd" in
   claim | artifact | relate | evidence | retract | intend) write=true ;;
   log | show | heads | conflicts | accepted | cat | export) write=false ;;
