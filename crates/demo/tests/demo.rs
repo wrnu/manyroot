@@ -240,10 +240,16 @@ fn a_bare_bracken_name_is_not_looked_up_on_path() {
     // With a `bracken` in the current directory, that one runs, not the one on PATH.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        // Written by a child sh, so this process never holds it open for writing: a parallel test's fork
+        // would inherit that descriptor until its exec, and running the file meanwhile fails with ETXTBSY
+        // (task c454c1095594, as 1b273bf9a56c).
         let fake = cwd.join("bracken");
-        std::fs::write(&fake, "#!/bin/sh\necho fake bracken >&2\nexit 3\n").unwrap();
-        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let written = Command::new("sh")
+            .args(["-c", "printf '#!/bin/sh\\necho fake bracken >&2\\nexit 3\\n' >\"$0\" && chmod 755 \"$0\""])
+            .arg(&fake)
+            .status()
+            .unwrap();
+        assert!(written.success(), "writing the fake bracken");
         let out = Command::new(env!("CARGO_BIN_EXE_bracken-demo"))
             .args(["--agents", "2", "--rounds", "1", "--bracken", "bracken"])
             .current_dir(&cwd)
