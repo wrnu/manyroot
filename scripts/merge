@@ -2,6 +2,7 @@
 # merge: the manager's merge step (process section 5, step 8), checked and recorded.
 #
 #   merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--owner-approval] [--dry-run]
+#   merge --batch <batch claim> --validator <id>... --min-passes N --as manager [--owner-approval] [--dry-run]
 #
 # Only the manager merges, so it runs only as manager (a dry run defaults to it), and
 # triage and deferrals count only when manager wrote them.
@@ -41,6 +42,26 @@
 #      earlier head doesn't count (findings 9e8e0c849724, fb07d1777cf6): each head needs its own. A
 #      manager-signed quote doesn't count. In v0 keys are shared, so this checks recorded intent, not
 #      proof (task ec880b9c2c86).
+# A batch pass (scripts/verify-seq --batch, decision db6f7705c0a4) is a manager pass whose method is
+# 'scripts/test-table[ --split] @ <sha> batch <batch claim> on <main> tree <key> run <evidence>'. It
+# counts only if the batch claim is a current manager claim tagged batch that lists this PR, claim and
+# sha with that main and key, and <evidence> is the manager's pass on the batch claim of a commit whose
+# key is <key>. In check 5, the plain form accepts it only when this head merged with main's tip is
+# exactly the tested tree: the same key, and differing from the tested commit only in .bracken/ and docs
+# no member touches (finding 9a3eaf48e2d7). Never a prefix of the batch.
+#
+# --batch merges a whole batch, all or nothing. It first runs every check for every member, in a dry
+# run, with check 5 asking that main's tip differs from the batch's main only in .bracken/ and docs no
+# member touches (the same untested() rule as below, and the same key), and that the members merge onto
+# it, in order, into the tested tree. If any member fails, it merges none. Then it merges them in the
+# tested order, each with every check again and check 5 asking that main's tip is the prefix before it,
+# by the same rule, and that the forge's squash tree (git merge-tree) is the next prefix; after each
+# merge, including one the forge made though the call failed (the outcome handling below), it fetches
+# main and compares again (finding 3199c8e0a8ad). If anything fails part way, it stops, and says which members
+# merged, by their live merge-gate passes: main is then on a prefix nothing tested, and the rest need a
+# new run on it. Which member it checks or merges, and how, is state inside this process: merge reads
+# none from the environment (finding f692f52a1a43).
+#
 # If all pass, it records manager evidence "merge gate @ <sha>" on the claim, then
 # squash-merges through the forge API with head_commit_id set to the sha, so the
 # forge refuses the merge if the branch moved after the check. If the merge fails and
@@ -63,10 +84,54 @@ unset token
 
 usage() {
   echo "usage: merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--owner-approval] [--dry-run]" >&2
+  echo "       merge --batch <batch claim> --validator <id>... --min-passes N --as manager [--owner-approval] [--dry-run]" >&2
   exit 2
 }
 fail() { echo "merge: $*" >&2; exit 1; }
+# Batch state lives in these shell variables, set only by --batch below for the members it checks and
+# merges, never from the environment (finding f692f52a1a43); a caller still setting the old variables is
+# told so, rather than ignored.
+for v in MERGE_BATCH MERGE_BATCH_PRECHECK MERGE_NO_CLEANUP; do
+  [ -z "${!v+x}" ] || fail "$v is set in the environment; merge takes no batch state from it: unset it, and use merge --batch"
+done
+batch_member='' batch_precheck=false no_cleanup=false
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# read_batch <id>: the batch claim, if it is current, the manager's, tagged batch, and well formed. Sets
+# b_full, b_main, b_key, b_n and the arrays b_pr, b_claim, b_sha (members in the tested order, from 0);
+# otherwise returns 1 with batch_why saying why.
+read_batch() {
+  local about items item k=0
+  about=$(bk show "$1" --json 2>/dev/null) || { batch_why="no contribution $1 in the Ground"; return 1; }
+  b_full=$(jq -r .id <<<"$about")
+  jq -e '.kind == "claim" and .retracted == false and .author_name == "manager" and (.body.tags | index("batch"))' \
+    <<<"$about" >/dev/null || { batch_why="$1 isn't a current manager claim tagged batch"; return 1; }
+  bk log --tag batch --current --json | jq -e --arg id "$b_full" \
+    'any(.[]; .id == $id and .retracted == false and (.superseded_by_others | length) == 0)' >/dev/null ||
+    { batch_why="batch $1 is superseded"; return 1; }
+  [[ $(jq -r .body.statement <<<"$about") =~ ^Batch\ of\ ([1-9][0-9]*)\ on\ main\ ([0-9a-f]{40})\ tree\ ([0-9a-f]{40,64}),\ tested\ in\ this\ order:\ (.*)$ ]] ||
+    { batch_why="batch $1's statement isn't 'Batch of <n> on main <sha> tree <key>, tested in this order: ...'"; return 1; }
+  b_n=${BASH_REMATCH[1]} b_main=${BASH_REMATCH[2]} b_key=${BASH_REMATCH[3]} items=${BASH_REMATCH[4]}
+  b_pr=() b_claim=() b_sha=()
+  while [ -n "$items" ]; do
+    item=${items%%; *}
+    [ "$item" = "$items" ] && items='' || items=${items#*; }
+    k=$((k + 1))
+    [[ $item =~ ^$k\ PR\ \#([1-9][0-9]*)\ ([0-9a-f]{64})\ @\ ([0-9a-f]{40})$ ]] ||
+      { batch_why="batch $1's member $k isn't '$k PR #<n> <claim> @ <sha>'"; return 1; }
+    b_pr+=("${BASH_REMATCH[1]}") b_claim+=("${BASH_REMATCH[2]}") b_sha+=("${BASH_REMATCH[3]}")
+  done
+  [ "$k" = "$b_n" ] || { batch_why="batch $1 says $b_n members and lists $k"; return 1; }
+}
+
+
+# merge_one <pr number> <pr claim> <options>: checks one PR and, unless it's a dry run, merges it. Its body
+# is the whole plain form, left unindented; --batch runs it in a subshell per member, with batch_member
+# (and batch_precheck) set.
+merge_one() {
+# --batch runs this in a subshell with errexit off around it, so it turns errexit back on: every read
+# below that isn't checked otherwise must stop the gate (finding 54a83c918a26).
+set -e
 [ $# -ge 2 ] || usage
 pr=$1
 claim=$2
@@ -94,7 +159,6 @@ $dry_run || [ -n "$agent" ] || fail "no identity: pass --as manager or set BRACK
   fail "only the manager merges (process 4.2): run with --as manager, not '$agent' (dry runs too)"
 for tool in curl jq; do command -v "$tool" >/dev/null || fail "needs $tool"; done
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 # With a team server set up, the gate decides only on a replica that has just pulled from it
 # (network-sync.md section 5): every read below must pull, with no fallback to the local replica.
@@ -145,7 +209,7 @@ full=$(jq -r '.id' <<<"$shown")
 [ "${BASH_REMATCH[1]}" = "$pr" ] || fail "$claim is for PR #${BASH_REMATCH[1]}, not #$pr"
 branch=${BASH_REMATCH[2]}
 sha=${BASH_REMATCH[3]}
-current=$(bk log --tag pr --current --json)
+current=$(bk log --tag pr --current --json) || fail "couldn't read the current pr claims"
 # log --current keeps a claim someone else superseded, marked; that one isn't current either.
 if jq -e --arg id "$full" 'any(.[]; .id == $id and .retracted == false and (.superseded_by_others | length) == 0)' \
   <<<"$current" >/dev/null; then
@@ -175,9 +239,9 @@ contradicts=$(jq -c --arg id "$full" '[.referrers[] | select(.kind == "relation"
   and .body.kind == "contradicts" and .body.to == $id)]' <<<"$shown")
 findings=$(jq -r '[.[].body.from] | unique | .[]' <<<"$contradicts")
 untriaged=() undeferred=() deferred=() findings_count=0
-current_tasks=$(bk log --tag task --current --json)
+current_tasks=$(bk log --tag task --current --json) || fail "couldn't read the current tasks"
 for f in $findings; do
-  about=$(bk show "$f" --json)
+  about=$(bk show "$f" --json) || fail "couldn't read finding $f, so the findings check can't decide"
   [ "$(jq -r .retracted <<<"$about")" = false ] || continue
   jq -e --arg f "$f" --arg by "$(jq -r .author <<<"$about")" --arg who "$triager" 'any(.[]; .body.from == $f
     and (.retracted == false or (.author != $by and .author_name != $who)))' <<<"$contradicts" >/dev/null || continue
@@ -232,6 +296,127 @@ tables=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind
   and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
   | .body.method | capture("^scripts/test-table( --split)? @ (?<h>[0-9a-f]{40})( on (?<m>[0-9a-f]{40})( tree (?<k>[0-9a-f]{40,64}))?)?(?<x> docs-only| reuses [0-9a-f]{64})?$")?
   | select(.h == $sha) | [.m // "", .k // "", .x // ""] | @tsv] | unique | .[]' <<<"$shown")
+# The manager's batch passes naming the sha, one '<batch>\t<main>\t<key>\t<run>' line each.
+batch_passes=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
+  and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
+  | .body.method | capture("^scripts/test-table( --split)? @ (?<h>[0-9a-f]{40}) batch (?<b>[0-9a-f]{64}) on (?<m>[0-9a-f]{40}) tree (?<k>[0-9a-f]{40,64}) run (?<e>[0-9a-f]{64})$")?
+  | select(.h == $sha) | [.b, .m, .k, .e] | @tsv] | unique | .[]' <<<"$shown")
+# batch_pass_ok <batch> <main> <key> <run>: whether a batch pass counts (see the header). Sets member to
+# this PR's place in the batch, from 1, and leaves read_batch's b_* set.
+batch_pass_ok() {
+  local about c j
+  read_batch "$1" || return 1
+  [ "$b_main" = "$2" ] && [ "$b_key" = "$3" ] || return 1
+  member=''
+  for ((j = 0; j < b_n; j++)); do
+    [ "${b_pr[j]}" = "$pr" ] && [ "${b_claim[j]}" = "$full" ] && [ "${b_sha[j]}" = "$sha" ] && member=$((j + 1))
+  done
+  [ -n "$member" ] || return 1
+  about=$(bk show "$4" --json 2>/dev/null) || return 1
+  c=$(jq -r --arg b "$b_full" 'select(.kind == "evidence" and .retracted == false and .author_name == "manager"
+    and .body.verdict == "pass" and .body.target == $b) | .body.method
+    | (capture("^scripts/test-table( --split)? @ (?<c>[0-9a-f]{40})$") | .c)? // empty' <<<"$about")
+  run_commit=$c
+  [ -n "$c" ] && [ "$(key_of "$c")" = "$3" ]
+}
+key_of() { (cd "$main" && "$here/code-scope" key "$1" 2>/dev/null); }
+# untested <from> [<to>]: what changed from <from> to <to> (main's tip by default) that can change what
+# builds, tests or runs. Docs and skill .md files count only where $ours, the paths the head (or the
+# batch's members) changed, lists them; docs/vision.md and skill templates always count.
+untested() {
+  local changed
+  # A diff that fails says so as a line of its own, so it counts as untested, never as nothing.
+  changed=$(git -C "$main" diff --no-renames --name-only "$1" "${2:-$tip}") ||
+    { echo "(git diff $1 ${2:-$tip} failed)"; return; }
+  printf '%s\n' "$changed" | while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$f" in
+      .bracken/*) ;;
+      docs/vision.md) echo "$f" ;;
+      .claude/skills/templates/* | .claude/skills/*/templates/*) echo "$f" ;;
+      docs/* | .claude/skills/*.md) ! grep -qxF -- "$f" <<<"$ours" || echo "$f" ;;
+      *) echo "$f" ;;
+    esac
+  done
+}
+# batch_ours: sets ours to every path a member of the batch read_batch last read changed since its main.
+batch_ours() {
+  local h base paths all=''
+  for h in "${b_sha[@]}"; do
+    base=$(git -C "$main" merge-base "$b_main" "$h") || return 1
+    paths=$(git -C "$main" diff --no-renames --name-only "$base" "$h") || return 1
+    all=$(printf '%s\n%s' "$all" "$paths")
+  done
+  ours=$(sort -u <<<"$all")
+}
+# merged_commit <onto> <head>...: <onto> merged with the heads in order (code-scope chain); empty on a conflict.
+merged_commit() { (cd "$main" && "$here/code-scope" chain "$@" 2>/dev/null | tail -n 1 | cut -d' ' -f2); }
+# merged_key <onto> <head>...: the key of <onto> merged with the heads in order; empty if they don't merge.
+merged_key() { (cd "$main" && "$here/code-scope" chain "$@" 2>/dev/null | tail -n 1 | cut -d' ' -f3); }
+expect_after=''
+# A batch pass counts in the plain form only for exactly the tested tree: never a prefix (decision
+# db6f7705c0a4).
+exact=''
+if [ -z "$batch_member" ] && [ -n "$batch_passes" ] && git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  here_commit=$(merged_commit "$tip" "$sha")
+  here_key=$([ -z "$here_commit" ] || key_of "$here_commit")
+  while IFS=$'\t' read -r b m k e; do
+    if [ -n "$here_key" ] && [ "$k" = "$here_key" ] && batch_pass_ok "$b" "$m" "$k" "$e"; then
+      batch_ours || continue
+      # The same key, and nothing else that can matter: the tested tree and this merge's differ only in
+      # .bracken/ and docs no member touched (finding 9a3eaf48e2d7).
+      [ -z "$(untested "$run_commit" "$here_commit")" ] || continue
+      exact="batch ${b_full:0:12} (member $member of $b_n) tested exactly this head merged with main ($tip): key $k"
+      break
+    fi
+  done <<<"$batch_passes"
+fi
+# Check 5 for a member of a batch merge (batch_member): see the header.
+batch_member_main() {
+  local b m k e c found=false t next chain j
+  local -a keys=() commits=()
+  while IFS=$'\t' read -r b m k e; do
+    [ "$b" = "$batch_member" ] || continue
+    if batch_pass_ok "$b" "$m" "$k" "$e"; then found=true; break; fi
+  done <<<"$batch_passes"
+  if ! $found; then
+    check FAIL main "no manager batch pass of batch ${batch_member:0:12} on this claim that counts (a current batch claim listing #$pr $full @ $sha, and its run's pass)"
+    return
+  fi
+  if ! chain=$(cd "$main" && "$here/code-scope" chain "$b_main" "${b_sha[@]}" 2>&1); then
+    check FAIL main "batch ${b_full:0:12} no longer merges onto its own main: $chain"
+    return
+  fi
+  while read -r j c k; do commits[j]=$c keys[j]=$k; done <<<"$chain"
+  if ! batch_ours; then
+    check FAIL main "couldn't list the paths batch ${b_full:0:12}'s members change (git merge-base or diff failed)"
+    return
+  fi
+  t=$(key_of "$tip")
+  if $batch_precheck; then
+    bad=$(untested "${commits[0]}")
+    if [ -z "$bad" ] && [ "$t" = "${keys[0]}" ] && [ "$(merged_key "$tip" "${b_sha[@]}")" = "$b_key" ]; then
+      main_case="batch ${b_full:0:12}, member $member of $b_n: main ($tip) is the batch's main ${b_main:0:12} but for .bracken/ and docs no member touches, and the members merge onto it, in order, into the tested tree $b_key"
+      check ok main "$main_case"
+    else
+      check FAIL main "main ($tip) has moved since the batch's main ${b_main:0:12} in what can change the tests (${bad:+$(tr "\n" " " <<<"$bad")}key $t, the batch's ${keys[0]}), or the members no longer merge onto it into the tested tree: verify the batch again on main's tip"
+    fi
+    return
+  fi
+  # The forge's squash merge of this head onto main, as git merge-tree computes it, must be the next
+  # prefix, before the POST; after it, the merged main is compared again.
+  bad=$(untested "${commits[member - 1]}")
+  next=$(merged_commit "$tip" "$sha")
+  if [ -z "$bad" ] && [ "$t" = "${keys[member - 1]}" ] && [ -n "$next" ] && [ "$(key_of "$next")" = "${keys[member]}" ] &&
+    [ -z "$(untested "${commits[member]}" "$next")" ]; then
+    expect_after=${commits[member]}
+    main_case="batch ${b_full:0:12}, member $member of $b_n: main ($tip) is the batch's prefix $((member - 1)), and this merge gives prefix $member (key ${keys[member]})"
+    [ "$member" != "$b_n" ] || main_case="$main_case, the tested tree"
+    check ok main "$main_case"
+  else
+    check FAIL main "main ($tip, key $t) isn't the batch's prefix $((member - 1)) (key ${keys[member - 1]})${bad:+, differing in $(tr "\n" " " <<<"$bad")}, or merging $sha onto it ($( [ -n "$next" ] && echo "key $(key_of "$next")" || echo "a conflict")) isn't prefix $member (key ${keys[member]}): stop the batch"
+  fi
+}
 # Whether <id> is a current manager pass of the whole table, with key <key>, on a pr claim of this PR.
 reuses_a_pass() {
   local about target
@@ -264,6 +449,13 @@ else
 fi
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
   check FAIL main "$sha isn't on the forge (fetched refs/pull/$pr/head)"
+elif [ -n "$batch_member" ]; then
+  batch_member_main
+elif [ -n "$exact" ]; then
+  main_case="$exact"
+  check ok main "$main_case"
+elif [ -z "$tables" ] && [ -n "$batch_passes" ]; then
+  check FAIL main "the manager's only table passes of $sha are batch passes, and a batch pass counts only for exactly the tested tree: this head merged with main ($tip) isn't it. Merge the batch with merge --batch, or verify this head on main's tip"
 elif git -C "$main" merge-base --is-ancestor "$tip" "$sha"; then
   main_case="main ($tip) is an ancestor of $sha"
   check ok main "$main_case"
@@ -271,18 +463,6 @@ else
   base=$(git -C "$main" merge-base "$tip" "$sha")
   # --no-renames: a file moved from code into docs/ must count under both paths.
   ours=$(git -C "$main" diff --no-renames --name-only "$base" "$sha")
-  # untested <from>: what main changed from <from> to its tip that can change what builds, tests or runs.
-  untested() {
-    git -C "$main" diff --no-renames --name-only "$1" "$tip" | while IFS= read -r f; do
-      case "$f" in
-        .bracken/*) ;;
-        docs/vision.md) echo "$f" ;;
-        .claude/skills/templates/* | .claude/skills/*/templates/*) echo "$f" ;;
-        docs/* | .claude/skills/*.md) ! grep -qxF -- "$f" <<<"$ours" || echo "$f" ;;
-        *) echo "$f" ;;
-      esac
-    done
-  }
   bad=$(untested "$base")
   # The main shas the manager's test-table passes tested this head merged with ('scripts/test-table @
   # <sha> on <main sha>'); a docs-only one only for a docs-only head, and the scope check vets a reused
@@ -331,7 +511,7 @@ fi
 # 7. The owner's own approval, when the class needs it.
 owner_case="not required for this class"
 if $owner_approval; then
-  approvals=$(bk log --tag approval --current --json)
+  approvals=$(bk log --tag approval --current --json) || fail "couldn't read the current approvals"
   approved=""
   for a in $(jq -r --arg t "$full" '.referrers[] | select(.kind == "relation" and .retracted == false
     and .author_name == "owner" and .body.kind == "supports" and .body.to == $t) | .body.from' <<<"$shown"); do
@@ -402,8 +582,73 @@ if ! status=$(api POST "/pulls/$pr/merge" "$body" status); then
   esac
 fi
 echo "merged PR #$pr at $sha"
+if [ -n "$expect_after" ]; then
+  git -C "$main" fetch -q origin main || fail "merged PR #$pr, but couldn't fetch main to compare it with the batch: stop the batch"
+  now=$(key_of origin/main)
+  bad=$(untested "$expect_after" "$(git -C "$main" rev-parse origin/main)")
+  [ "$now" = "$(key_of "$expect_after")" ] && [ -z "$bad" ] ||
+    fail "merged PR #$pr, but main (key ${now:-unknown}) isn't the batch's prefix $member (commit $expect_after, key $(key_of "$expect_after"))${bad:+, differing in $(tr "\n" " " <<<"$bad")}: stop the batch"
+  echo "main is the batch's prefix $member (key $now)"
+fi
 # Free what finished work left behind (process 11f1ac552f26). The merge stands whatever cleanup does.
-if [ -x "$here/cleanup" ]; then
+if $no_cleanup; then
+  :
+elif [ -x "$here/cleanup" ]; then
   "$here/cleanup" --apply </dev/null 2>&1 | sed 's/^/  /' || echo "merge: cleanup failed (the merge stands); run scripts/cleanup to see why"
 fi
 echo "update the main checkout only through scripts/ground-checkpoint and the sha it names, not git pull (process 9.3)"
+}
+
+# The whole batch: check every member, then merge them in order (see the header).
+if [ "${1:-}" = --batch ]; then
+  [ $# -ge 2 ] && [[ $2 =~ ^[0-9a-f]{12,64}$ ]] || usage
+  batch=$2
+  shift 2
+  rest=() dry=false agent=${BRACKEN_AGENT:-}
+  for a in "$@"; do
+    case "$a" in --dry-run) dry=true ;; *) rest+=("$a") ;; esac
+  done
+  for ((k = 0; k < ${#rest[@]}; k++)); do [ "${rest[k]}" != --as ] || agent=${rest[k + 1]:-}; done
+  command -v jq >/dev/null || fail "needs jq"
+  bk() { BK_PULL=required BRACKEN_AGENT=${agent:-manager} "$here/bk" "$@"; }
+  read_batch "$batch" || fail "$batch_why"
+  # Which members the Ground says merged: a live manager 'merge gate @ <sha>' pass on the claim.
+  gated() {
+    local j out=()
+    for ((j = 0; j < b_n; j++)); do
+      bk show "${b_claim[j]}" --json 2>/dev/null | jq -e --arg sha "${b_sha[j]}" 'any(.referrers[]; .kind == "evidence"
+        and .retracted == false and .author_name == "manager" and .body.method == "merge gate @ " + $sha)' >/dev/null &&
+        out+=("#${b_pr[j]}")
+    done
+    echo "${out[*]:-none}"
+  }
+  echo "batch ${b_full:0:12}: $b_n members on main ${b_main:0:12}, tree $b_key"
+  for ((k = 0; k < b_n; k++)); do
+    echo "== check member $((k + 1)): PR #${b_pr[k]} (${b_claim[k]:0:12})"
+    set +e
+    (batch_member=$b_full batch_precheck=true; merge_one "${b_pr[k]}" "${b_claim[k]}" "${rest[@]}" --dry-run) 2>&1 | sed 's/^/  /'
+    code=${PIPESTATUS[0]}
+    set -e
+    [ "$code" = 0 ] || fail "member $((k + 1)) (PR #${b_pr[k]}) fails a check: merging none of the batch"
+  done
+  if $dry; then
+    echo "dry run: every member passes; would merge, in order: $(printf '#%s ' "${b_pr[@]}")"
+    exit 0
+  fi
+  for ((k = 0; k < b_n; k++)); do
+    echo "== merge member $((k + 1)): PR #${b_pr[k]} (${b_claim[k]:0:12})"
+    set +e
+    (batch_member=$b_full no_cleanup=true; merge_one "${b_pr[k]}" "${b_claim[k]}" "${rest[@]}") 2>&1 | sed 's/^/  /'
+    code=${PIPESTATUS[0]}
+    set -e
+    if [ "$code" != 0 ]; then
+      fail "stopped at member $((k + 1)) (PR #${b_pr[k]}); merged, by the live merge-gate passes: $(gated). main is on a prefix of the batch that nothing tested: verify the rest again on main's new tip"
+    fi
+  done
+  echo "merged the batch, in order: $(gated); main is on the tested tree $b_key"
+  if [ -x "$here/cleanup" ]; then
+    "$here/cleanup" --apply </dev/null 2>&1 | sed 's/^/  /' || echo "merge: cleanup failed (the merges stand); run scripts/cleanup to see why"
+  fi
+  exit 0
+fi
+merge_one "$@"

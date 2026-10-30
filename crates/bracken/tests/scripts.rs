@@ -3491,3 +3491,534 @@ fn weave_needs_an_owner_decision_for_line_writes() {
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 }
+
+/// A batch (decision db6f7705c0a4), end to end: a repository with the real merge, verify-seq, bk-evidence,
+/// code-scope and ground-guards, a committed stub scripts/test-table that fails when the tree holds a
+/// file named `broken`, and a local forge whose `curl` stub answers GET /pulls/<n> and does POST
+/// /pulls/<n>/merge as a squash merge (git merge-tree onto main). PR #n adds `a<n>.rs`, and `broken` too
+/// if it is in `broken`. With `$T/tamper` holding n, the forge's merge of #n leaves main's tree as it was.
+/// With `$T/flaky`, the table's next run fails, once. With `$T/hook-<n>`, the forge runs it at the
+/// `$T/hook-at-<n>`'th GET of /pulls/<n>. With `$T/post-502-<n>`, the POST of #n merges but answers 502,
+/// as a proxy can while the forge merges anyway.
+struct Batch {
+    tmp: tempfile::TempDir,
+    dir: PathBuf,
+    forge: PathBuf,
+    claims: Vec<String>,
+    shas: Vec<String>,
+}
+
+impl Batch {
+    fn new(scripts: &str, prs: usize, broken: &[usize], main_broken: bool) -> Batch {
+        let file = |name: &str| repo_root().join(scripts).join(name);
+        let names = ["merge", "ground-guards", "code-scope", "verify-seq", "bk-evidence"];
+        let paths: Vec<(String, PathBuf)> = names.iter().map(|n| (format!("scripts/{n}"), file(n))).collect();
+        let files: Vec<(&str, &Path)> = paths.iter().map(|(to, from)| (to.as_str(), from.as_path())).collect();
+        let (tmp, dir) = repo(&files, ".bracken/identities/\n", |dir| {
+            write_executable(
+                &dir.join("scripts/test-table"),
+                "#!/bin/sh\necho \"run $(ls a*.rs 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\"\n\
+                 if [ -e \"$T/flaky\" ]; then rm \"$T/flaky\"; echo 'test result: FAILED (flaky)'; exit 1; fi\n\
+                 if [ -e broken ]; then echo 'test result: FAILED'; exit 1; fi\necho 'test-table: all passed'\n",
+            );
+            if main_broken {
+                put(dir, "broken", "on main\n");
+            }
+        });
+        let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
+        bk(&dir, &["init", "--name", "batch"]);
+        for who in ["builder", "val", "manager"] {
+            bk(&dir, &["id", "new", who]);
+        }
+        bk(&dir, &["claim", "first", "--tag", "note", "--as", "val"]);
+        commit_all(&dir, "ground");
+        let mut shas = Vec::new();
+        for n in 1..=prs {
+            git(&["switch", "-qc", &format!("pr{n}"), "main"]);
+            put(&dir, &format!("a{n}.rs"), &format!("pr {n}\n"));
+            if broken.contains(&n) {
+                put(&dir, "broken", &format!("by pr {n}\n"));
+            }
+            commit_all(&dir, &format!("pr {n}"));
+            shas.push(String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned());
+        }
+        git(&["switch", "-q", "main"]);
+        let forge = tmp.path().join("forge.git");
+        git(&["init", "-q", "--bare", forge.to_str().unwrap()]);
+        let mut refs = vec!["main".to_owned()];
+        refs.extend((1..=prs).map(|n| format!("pr{n}:refs/pull/{n}/head")));
+        let mut push = vec!["push", "-q", forge.to_str().unwrap()];
+        push.extend(refs.iter().map(String::as_str));
+        git(&push);
+        git(&["config", "remote.origin.url", "https://forge.example/o/r.git"]);
+        git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
+        git(&["config", &format!("url.{}.insteadOf", forge.display()), "https://forge.example/o/r.git"]);
+        git(&[
+            "config",
+            "credential.https://forge.example.helper",
+            "!f() { echo username=t; echo password=DUMMY; }; f",
+        ]);
+        git(&["fetch", "-q", "origin"]);
+        let mut claims = Vec::new();
+        for (n, sha) in shas.iter().enumerate() {
+            let claim = bk(
+                &dir,
+                &[
+                    "claim",
+                    &format!("PR #{} pr{} @ {sha}: change {}", n + 1, n + 1, n + 1),
+                    "--tag",
+                    "pr",
+                    "--as",
+                    "builder",
+                ],
+            );
+            bk(&dir, &["evidence", &claim, "pass", "--method", "checked", "--as", "val"]);
+            claims.push(claim);
+        }
+        std::fs::create_dir_all(tmp.path().join("stubs")).unwrap();
+        write_executable(
+            &tmp.path().join("stubs/curl"),
+            "#!/bin/bash\nmethod=GET body=\nwhile [ $# -gt 0 ]; do case \"$1\" in -X) method=$2; shift 2 ;; \
+             --data-binary) body=${2#@}; shift 2 ;; -H) shift 2 ;; *) url=$1; shift ;; esac; done\n\
+             n=$(sed -E 's|.*/pulls/([0-9]+).*|\\1|' <<<\"$url\")\n\
+             g() { git --git-dir=\"$FORGE\" \"$@\"; }\n\
+             if [ \"$method\" = GET ]; then\n\
+               echo x >>\"$T/gets-$n\"\n\
+               if [ -x \"$T/hook-$n\" ] && [ \"$(wc -l <\"$T/gets-$n\")\" -eq \"$(cat \"$T/hook-at-$n\")\" ]; then \"$T/hook-$n\"; fi\n\
+               head=$(g rev-parse \"refs/pull/$n/head\"); merged=false; [ ! -e \"$T/merged-$n\" ] || merged=true\n\
+               echo \"{\\\"head\\\":{\\\"sha\\\":\\\"$head\\\"},\\\"state\\\":\\\"open\\\",\\\"merged\\\":$merged,\\\"base\\\":{\\\"ref\\\":\\\"main\\\"},\\\"title\\\":\\\"t$n\\\"}\"\n\
+               exit 0\n\
+             fi\n\
+             sha=$(jq -r .head_commit_id \"$body\")\n\
+             tree=$(g merge-tree --write-tree main \"$sha\") || exit 22\n\
+             [ \"$(cat \"$T/tamper\" 2>/dev/null)\" != \"$n\" ] || tree=$(g rev-parse 'main^{tree}')\n\
+             new=$(g -c user.name=f -c user.email=f@invalid commit-tree \"$tree\" -p main -m \"squash $n\")\n\
+             g update-ref refs/heads/main \"$new\"; touch \"$T/merged-$n\"\n\
+             if [ -e \"$T/post-502-$n\" ]; then echo 502; exit 22; fi\n\
+             echo 200\n",
+        );
+        Batch { tmp, dir, forge, claims, shas }
+    }
+
+    fn command(&self, program: &str, args: &[&str]) -> Command {
+        let path = std::env::var("PATH").unwrap();
+        let mut c = command(&self.dir, program, args);
+        c.env("PATH", format!("{}:{path}", self.tmp.path().join("stubs").display()))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("LOG", self.tmp.path().join("log"))
+            .env("T", self.tmp.path())
+            .env("FORGE", &self.forge)
+            .env("TMPDIR", self.tmp.path())
+            .env_remove("ON")
+            .env_remove("MERGE_BATCH")
+            .env_remove("MERGE_BATCH_PRECHECK");
+        c
+    }
+
+    fn verify(&self, members: &[usize]) -> Output {
+        let pairs: Vec<String> =
+            members.iter().map(|n| format!("{}:{}", &self.claims[n - 1][..12], self.shas[n - 1])).collect();
+        let mut args = vec!["--batch"];
+        args.extend(pairs.iter().map(String::as_str));
+        self.command("scripts/verify-seq", &args).output().unwrap()
+    }
+
+    fn runs(&self) -> Vec<String> {
+        std::fs::read_to_string(self.tmp.path().join("log")).unwrap_or_default().lines().map(String::from).collect()
+    }
+
+    /// The manager's evidence methods on PR #n's claim, with their verdicts.
+    fn evidence(&self, n: usize) -> Vec<(String, String)> {
+        let shown: serde_json::Value =
+            serde_json::from_str(&bk(&self.dir, &["show", &self.claims[n - 1], "--json"])).unwrap();
+        shown["referrers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "evidence" && r["author_name"] == "manager")
+            .map(|r| {
+                (r["body"]["verdict"].as_str().unwrap().to_owned(), r["body"]["method"].as_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    fn batch_claim(&self) -> String {
+        let log: serde_json::Value =
+            serde_json::from_str(&bk(&self.dir, &["log", "--tag", "batch", "--json"])).unwrap();
+        log[0]["id"].as_str().expect("a batch claim").to_owned()
+    }
+
+    fn merge(&self, args: &[&str]) -> Output {
+        let mut all = args.to_vec();
+        all.extend(["--validator", "val", "--min-passes", "1", "--as", "manager"]);
+        self.command("scripts/merge", &all).output().unwrap()
+    }
+
+    fn forge_main(&self) -> String {
+        let out = run(&self.dir, "git", &["--git-dir", self.forge.to_str().unwrap(), "rev-parse", "main"]);
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    fn merged(&self) -> Vec<usize> {
+        (1..=self.claims.len()).filter(|n| self.tmp.path().join(format!("merged-{n}")).exists()).collect()
+    }
+}
+
+fn text(out: &Output) -> String {
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+#[test]
+fn a_batch_passes_every_member_once_and_merge_batch_merges_them_onto_the_tested_tree() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 3, &[], false);
+        let out = b.verify(&[1, 2, 3]);
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert_eq!(b.runs(), ["run a1.rs a2.rs a3.rs "], "{scripts}: one run, of the whole batch");
+        let batch = b.batch_claim();
+        let key = String::from_utf8(
+            run(&b.dir, "scripts/code-scope", &["chain", "origin/main", &b.shas[0], &b.shas[1], &b.shas[2]]).stdout,
+        )
+        .unwrap()
+        .lines()
+        .last()
+        .unwrap()
+        .split(' ')
+        .nth(2)
+        .unwrap()
+        .to_owned();
+        for n in 1..=3 {
+            let evidence = b.evidence(n);
+            assert_eq!(evidence.len(), 1, "{scripts}: PR #{n}: {evidence:?}");
+            let (verdict, method) = &evidence[0];
+            assert_eq!(verdict, "pass");
+            assert!(
+                method.starts_with(&format!("scripts/test-table @ {} batch {batch} on ", b.shas[n - 1])),
+                "{method}"
+            );
+            assert!(method.contains(&format!(" tree {key} run ")), "{scripts}: {method}");
+        }
+
+        // The plain form never accepts a prefix: PR #1 alone onto main isn't the tested tree.
+        let out = b.merge(&["1", &b.claims[0][..12], "--dry-run"]);
+        let line = check_line(&out, "main");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {line}");
+        assert!(line.starts_with("FAIL") && line.contains("only for exactly the tested tree"), "{scripts}: {line}");
+
+        // The batch form checks every member, then merges them in order onto the tested tree.
+        let out = b.merge(&["--batch", &batch[..12], "--dry-run"]);
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("would merge, in order: #1 #2 #3"), "{scripts}: {}", text(&out));
+        assert!(b.merged().is_empty(), "{scripts}: a dry run merged");
+        let out = b.merge(&["--batch", &batch[..12]]);
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert_eq!(b.merged(), [1, 2, 3], "{scripts}");
+        let tip = b.forge_main();
+        run(&b.dir, "git", &["fetch", "-q", "origin"]);
+        let now = String::from_utf8(run(&b.dir, "scripts/code-scope", &["key", &tip]).stdout).unwrap();
+        assert_eq!(now.trim(), key, "{scripts}: main ends on the tested tree");
+        for n in 1..=3 {
+            assert!(
+                b.evidence(n).iter().any(|(v, m)| v == "pass" && m.starts_with("merge gate @ ")),
+                "{scripts}: PR #{n}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_failing_batch_records_a_fail_only_on_the_member_bisect_pins() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 3, &[2], false);
+        let out = b.verify(&[1, 2, 3]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        // The whole batch, then prefixes 1 (passes) and 2 (fails), and 2 once more before it is pinned.
+        assert_eq!(
+            b.runs(),
+            ["run a1.rs a2.rs a3.rs ", "run a1.rs ", "run a1.rs a2.rs ", "run a1.rs a2.rs "],
+            "{scripts}"
+        );
+        assert!(
+            b.evidence(1).is_empty() && b.evidence(3).is_empty(),
+            "{scripts}: {:?} {:?}",
+            b.evidence(1),
+            b.evidence(3)
+        );
+        let evidence = b.evidence(2);
+        assert_eq!(evidence.len(), 1, "{scripts}: {evidence:?}");
+        assert!(evidence[0].0 == "fail" && evidence[0].1.ends_with(" pinned"), "{scripts}: {evidence:?}");
+
+        // A flaky fail of the whole batch: every prefix passes, and the pinned prefix's rerun too, so
+        // nothing is recorded on any member (finding 663c221a4c20).
+        let b = Batch::new(scripts, 3, &[], false);
+        std::fs::write(b.tmp.path().join("flaky"), "").unwrap();
+        let out = b.verify(&[1, 2, 3]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("a flaky failure, not pinned"), "{scripts}: {}", text(&out));
+        assert_eq!(b.runs().len(), 4, "{scripts}: {:?}", b.runs());
+        assert!((1..=3).all(|n| b.evidence(n).is_empty()), "{scripts}");
+
+        // With main itself failing, nothing is pinned on a member.
+        let b = Batch::new(scripts, 2, &[], true);
+        let out = b.verify(&[1, 2]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("main alone"), "{scripts}: {}", text(&out));
+        assert_eq!(b.runs(), ["run a1.rs a2.rs ", "run a1.rs ", "run "], "{scripts}");
+        assert!(b.evidence(1).is_empty() && b.evidence(2).is_empty(), "{scripts}");
+    }
+}
+
+#[test]
+fn merge_batch_merges_none_when_a_member_fails_a_check_and_stops_when_main_isnt_the_prefix() {
+    for scripts in SCRIPTS {
+        // A member whose pr claim was retracted after the run: none of the batch merges.
+        let b = Batch::new(scripts, 3, &[], false);
+        assert!(b.verify(&[1, 2, 3]).status.success(), "{scripts}");
+        let batch = b.batch_claim();
+        bk(&b.dir, &["retract", &b.claims[1], "--as", "builder"]);
+        let before = b.forge_main();
+        let out = b.merge(&["--batch", &batch[..12]]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("member 2 (PR #2) fails a check: merging none"), "{scripts}: {}", text(&out));
+        assert!(b.merged().is_empty() && b.forge_main() == before, "{scripts}: something merged");
+
+        // The forge's merge of #2 doesn't give the batch's prefix: it stops there, and #3 isn't merged.
+        let b = Batch::new(scripts, 3, &[], false);
+        assert!(b.verify(&[1, 2, 3]).status.success(), "{scripts}");
+        let batch = b.batch_claim();
+        std::fs::write(b.tmp.path().join("tamper"), "2").unwrap();
+        let out = b.merge(&["--batch", &batch[..12]]);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {said}");
+        assert!(
+            said.contains("isn't the batch's prefix 2") && said.contains("stopped at member 2"),
+            "{scripts}: {said}"
+        );
+        // It says what merged by the Ground's live merge-gate passes, so #2, which did merge, is named.
+        assert!(said.contains("merge-gate passes: #1 #2.") && said.contains("nothing tested"), "{scripts}: {said}");
+        assert_eq!(b.merged(), [1, 2], "{scripts}");
+
+        // main moved in code after the run: the batch is checked against its own main and refused whole.
+        let b = Batch::new(scripts, 2, &[], false);
+        assert!(b.verify(&[1, 2]).status.success(), "{scripts}");
+        let batch = b.batch_claim();
+        put(&b.dir, "elsewhere.rs", "main moved\n");
+        commit_all(&b.dir, "main moves in code");
+        assert!(run(&b.dir, "git", &["push", "-q", b.forge.to_str().unwrap(), "main"]).status.success());
+        let out = b.merge(&["--batch", &batch[..12]]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("has moved since the batch's main"), "{scripts}: {}", text(&out));
+        assert!(b.merged().is_empty(), "{scripts}");
+    }
+}
+
+#[test]
+fn the_plain_merge_accepts_a_batch_pass_for_exactly_the_tested_tree() {
+    for scripts in SCRIPTS {
+        // A batch of one: the head merged with main is the tested tree, so the plain form accepts it,
+        // even after main moved, in docs only.
+        let b = Batch::new(scripts, 1, &[], false);
+        assert!(b.verify(&[1]).status.success(), "{scripts}");
+        put(&b.dir, "docs/guide.md", "a guide\n");
+        commit_all(&b.dir, "docs on main");
+        assert!(run(&b.dir, "git", &["push", "-q", b.forge.to_str().unwrap(), "main"]).status.success());
+        let out = b.merge(&["1", &b.claims[0][..12], "--dry-run"]);
+        let line = check_line(&out, "main");
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert!(line.contains("tested exactly this head merged with main"), "{scripts}: {line}");
+    }
+}
+
+impl Batch {
+    /// Commits `path` with `text` on the forge's main, as another merge would, through a temporary index.
+    fn hook(&self, n: usize, at_get: usize, path: &str, text: &str) {
+        write_executable(
+            &self.tmp.path().join(format!("hook-{n}")),
+            &format!(
+                "#!/bin/bash\nset -e\ng() {{ git --git-dir=\"$FORGE\" \"$@\"; }}\nexport GIT_INDEX_FILE=\"$T/hook-index\"\n\
+                 g read-tree main\nblob=$(printf '{text}' | g hash-object -w --stdin)\n\
+                 g update-index --add --cacheinfo 100644,\"$blob\",'{path}'\n\
+                 new=$(g -c user.name=h -c user.email=h@invalid commit-tree \"$(g write-tree)\" -p main -m intruder)\n\
+                 g update-ref refs/heads/main \"$new\"\n"
+            ),
+        );
+        std::fs::write(self.tmp.path().join(format!("hook-at-{n}")), at_get.to_string()).unwrap();
+    }
+
+    /// main gains `path` on the branch's checkout and the forge, as a merge of other work would.
+    fn main_moves(&self, path: &str) {
+        put(&self.dir, path, "main moved\n");
+        commit_all(&self.dir, "main moves");
+        assert!(run(&self.dir, "git", &["push", "-q", self.forge.to_str().unwrap(), "main"]).status.success());
+    }
+}
+
+/// Finding aa857de39d64: each rule merge has for batch passes, with a case that breaks it.
+#[test]
+fn merge_counts_a_batch_pass_only_under_every_rule() {
+    for scripts in SCRIPTS {
+        // The environment carries no batch state (finding f692f52a1a43): the old variables are refused.
+        let b = Batch::new(scripts, 1, &[], false);
+        assert!(b.verify(&[1]).status.success(), "{scripts}");
+        let batch = b.batch_claim();
+        for var in ["MERGE_BATCH", "MERGE_BATCH_PRECHECK", "MERGE_NO_CLEANUP"] {
+            let mut c =
+                b.command("scripts/merge", &["1", &b.claims[0][..12], "--validator", "val", "--min-passes", "1"]);
+            c.args(["--as", "manager"]).env(var, &batch);
+            let out = c.output().unwrap();
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {var}: {}", text(&out));
+            assert!(text(&out).contains(&format!("{var} is set in the environment")), "{scripts}: {}", text(&out));
+            assert!(b.merged().is_empty(), "{scripts}: {var}");
+        }
+
+        // The plain exact path refuses once main has moved in code, or in a root .md file, since the run.
+        for moved in ["elsewhere.rs", "AGENTS.md"] {
+            let b = Batch::new(scripts, 1, &[], false);
+            assert!(b.verify(&[1]).status.success(), "{scripts}");
+            b.main_moves(moved);
+            let out = b.merge(&["1", &b.claims[0][..12], "--dry-run"]);
+            let line = check_line(&out, "main");
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {moved}: {line}");
+            assert!(line.starts_with("FAIL"), "{scripts}: {moved}: {line}");
+            // And merge --batch refuses the whole batch.
+            let out = b.merge(&["--batch", &b.batch_claim()[..12], "--dry-run"]);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {moved}: {}", text(&out));
+            assert!(text(&out).contains("has moved since the batch's main"), "{scripts}: {}", text(&out));
+        }
+
+        // A batch claim by anyone but the manager, or superseded, counts for nothing.
+        let b = Batch::new(scripts, 1, &[], false);
+        assert!(b.verify(&[1]).status.success(), "{scripts}");
+        let batch = b.batch_claim();
+        let statement: serde_json::Value = serde_json::from_str(&bk(&b.dir, &["show", &batch, "--json"])).unwrap();
+        let statement = statement["body"]["statement"].as_str().unwrap().to_owned();
+        let forged = bk(&b.dir, &["claim", &statement, "--tag", "batch", "--as", "val"]);
+        let out = b.merge(&["--batch", &forged[..12], "--dry-run"]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("isn't a current manager claim tagged batch"), "{scripts}: {}", text(&out));
+        assert!(b.merge(&["1", &b.claims[0][..12], "--dry-run"]).status.success(), "{scripts}: before superseding");
+        bk(&b.dir, &["claim", "a different batch", "--tag", "batch", "--supersedes", &batch, "--as", "manager"]);
+        let out = b.merge(&["--batch", &batch[..12], "--dry-run"]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("is superseded"), "{scripts}: {}", text(&out));
+        let out = b.merge(&["1", &b.claims[0][..12], "--dry-run"]);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{scripts}: a superseded batch still counted: {}",
+            check_line(&out, "main")
+        );
+
+        // A member pass whose run isn't the manager's pass on the batch claim, or is one of another tree.
+        let b = Batch::new(scripts, 1, &[], false);
+        assert!(b.verify(&[1]).status.success(), "{scripts}");
+        let batch = b.batch_claim();
+        let (_, method) = b.evidence(1).into_iter().next().unwrap();
+        let shown: serde_json::Value = serde_json::from_str(&bk(&b.dir, &["show", &b.claims[0], "--json"])).unwrap();
+        let ids: Vec<(String, String)> = shown["referrers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "evidence")
+            .map(|r| (r["id"].as_str().unwrap().to_owned(), r["author_name"].as_str().unwrap().to_owned()))
+            .collect();
+        let real = ids.iter().find(|(_, who)| who == "manager").unwrap().0.clone();
+        let vals = ids.iter().find(|(_, who)| who == "val").unwrap().0.clone();
+        bk(&b.dir, &["retract", &real, "--as", "manager"]);
+        let main_sha =
+            String::from_utf8(run(&b.dir, "git", &["rev-parse", "origin/main"]).stdout).unwrap().trim().to_owned();
+        let other_tree = bk(
+            &b.dir,
+            &["evidence", &batch, "pass", "--method", &format!("scripts/test-table @ {main_sha}"), "--as", "manager"],
+        );
+        let run_id = method.rsplit(' ').next().unwrap().to_owned();
+        for wrong in [vals, other_tree] {
+            let forged = method.replace(&run_id, &wrong);
+            let id = bk(&b.dir, &["evidence", &b.claims[0], "pass", "--method", &forged, "--as", "manager"]);
+            let out = b.merge(&["--batch", &batch[..12], "--dry-run"]);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: run {wrong}: {}", text(&out));
+            assert!(text(&out).contains("no manager batch pass"), "{scripts}: {}", text(&out));
+            bk(&b.dir, &["retract", &id, "--as", "manager"]);
+        }
+
+        // main moves in code between two members' merges: the second is refused before its POST, and
+        // the batch stops with only the first merged.
+        let b = Batch::new(scripts, 2, &[], false);
+        assert!(b.verify(&[1, 2]).status.success(), "{scripts}");
+        b.hook(2, 2, "intruder.rs", "elsewhere");
+        let out = b.merge(&["--batch", &b.batch_claim()[..12]]);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {said}");
+        assert!(
+            said.contains("isn't the batch's prefix 1") && said.contains("stopped at member 2"),
+            "{scripts}: {said}"
+        );
+        assert!(said.contains("by the live merge-gate passes: #1."), "{scripts}: {said}");
+        assert_eq!(b.merged(), [1], "{scripts}: #2 was POSTed");
+    }
+}
+
+/// Finding 3199c8e0a8ad: a member's POST that fails while the forge merges anyway goes through the
+/// plain form's outcome handling (PR #107), which finds it merged; the batch's key check still runs, and
+/// the batch goes on to the tested tree.
+#[test]
+fn merge_batch_carries_on_when_a_failed_post_merged_anyway_and_checks_the_prefix() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 3, &[], false);
+        assert!(b.verify(&[1, 2, 3]).status.success(), "{scripts}");
+        std::fs::write(b.tmp.path().join("post-502-2"), "").unwrap();
+        let out = b.merge(&["--batch", &b.batch_claim()[..12]]);
+        let said = text(&out);
+        assert!(out.status.success(), "{scripts}: {said}");
+        assert!(
+            said.contains("the merge call failed (HTTP 502), but the forge shows PR #2 merged"),
+            "{scripts}: {said}"
+        );
+        assert!(said.contains("main is the batch's prefix 2"), "{scripts}: the key check didn't run after it: {said}");
+        assert_eq!(b.merged(), [1, 2, 3], "{scripts}");
+
+        // The same, but what merged isn't the prefix: the key check after the outcome stops the batch.
+        let b = Batch::new(scripts, 3, &[], false);
+        assert!(b.verify(&[1, 2, 3]).status.success(), "{scripts}");
+        std::fs::write(b.tmp.path().join("post-502-2"), "").unwrap();
+        std::fs::write(b.tmp.path().join("tamper"), "2").unwrap();
+        let out = b.merge(&["--batch", &b.batch_claim()[..12]]);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {said}");
+        assert!(said.contains("merged") && said.contains("isn't the batch's prefix 2"), "{scripts}: {said}");
+        assert_eq!(b.merged(), [1, 2], "{scripts}");
+    }
+}
+
+/// Finding 54a83c918a26: merge --batch runs each member's checks with errexit on, so a read that fails
+/// stops the gate rather than letting it decide without it. Member 2 has an untriaged finding, and every
+/// read of that finding fails: the batch refuses, merging none, as the plain form does.
+#[test]
+fn merge_batch_refuses_when_a_findings_read_fails() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 2, &[], false);
+        assert!(b.verify(&[1, 2]).status.success(), "{scripts}");
+        let finding = bk(&b.dir, &["claim", "member 2 breaks x", "--tag", "finding", "--as", "val"]);
+        bk(&b.dir, &["relate", &finding, "contradicts", &b.claims[1], "--as", "val"]);
+        // bracken, failing `show` of the finding alone, as a pull that drops would.
+        let wrapper = b.tmp.path().join("stubs/failing-bracken");
+        write_executable(
+            &wrapper,
+            &format!(
+                "#!/usr/bin/env bash\nset -o pipefail\nfor a in \"$@\"; do [ \"$a\" != {finding} ] || {{ echo 'pull dropped' >&2; exit 1; }}; done\n\
+                 \"$REAL_BRACKEN\" \"$@\" | cat\n"
+            ),
+        );
+        for (form, args) in
+            [("batch", vec!["--batch", &b.batch_claim()[..12]]), ("plain", vec!["2", &b.claims[1][..12]])]
+        {
+            let mut all = args.clone();
+            all.extend(["--validator", "val", "--min-passes", "1", "--as", "manager"]);
+            let out = b.command("scripts/merge", &all).env("BRACKEN_BIN", &wrapper).output().unwrap();
+            let said = text(&out);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {form}: {said}");
+            assert!(said.contains(&format!("couldn't read finding {finding}")), "{scripts}: {form}: {said}");
+            assert!(b.merged().is_empty(), "{scripts}: {form}: merged past an unread finding");
+        }
+    }
+}
