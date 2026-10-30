@@ -5,7 +5,7 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
@@ -67,6 +67,18 @@ impl Setup {
         String::from_utf8_lossy(&out.tail).into_owned()
     }
 
+    /// `runner` refuses, with NoSandbox, a check that would leave a marker, and leaves nothing behind.
+    fn assert_refused(&self, runner: &Runner) {
+        let marker = self.path().join("ran");
+        let script = format!("touch {}", marker.display());
+        let argv: Vec<String> = ["sh", "-c", &script].iter().map(|a| (*a).to_owned()).collect();
+        let (manifest, blobs) = tree(&[("README", Mode::File, b"r\n")]);
+        let result = runner.run(&CheckDefinition { name: "test", argv: &argv }, &manifest, |h| blobs.get(h).cloned());
+        assert!(matches!(result, Err(CheckError::NoSandbox(_))), "{result:?}");
+        assert!(!marker.exists(), "the check ran");
+        self.assert_cleaned_up();
+    }
+
     /// The base holds no fresh directory: each run removed its own.
     fn assert_cleaned_up(&self) {
         let left: Vec<_> = std::fs::read_dir(self.base.path())
@@ -80,7 +92,16 @@ impl Setup {
 
 #[cfg(target_os = "macos")]
 mod macos_only {
+    use std::path::Path;
+
     use super::*;
+
+    /// The Command Line Tools' python3: /usr/bin/python3 is a shim the sandbox can't run.
+    const PYTHON: &str = "/Library/Developer/CommandLineTools/usr/bin/python3";
+
+    /// The longest a run with an orphaned escapee may take: far past a normal run on a loaded machine, so
+    /// only a run that waited on the escapee (a reader that didn't stop) reaches it (finding 166c97812d6e).
+    const ESCAPEE_RUN_LIMIT: Duration = Duration::from_secs(120);
 
     #[test]
     fn a_passing_and_a_failing_check() {
@@ -293,7 +314,7 @@ mod macos_only {
                 .expect("kill")
                 .success()
         };
-        let python = "/Library/Developer/CommandLineTools/usr/bin/python3";
+        let python = PYTHON;
         if !Path::new(python).exists() {
             panic!("this test needs the Command Line Tools' python3 at {python}");
         }
@@ -347,27 +368,82 @@ mod macos_only {
         assert_eq!(out.output_bytes, 18);
     }
 
-    // Finding 234b9aad594d and the reviewer's asks: the documented gap, an escapee orphaned before
-    // the sweep, still can't keep the output reader alive (the run returns and joins it) or create
-    // the fresh directory again once it's removed (the sandbox may write only under its w/).
-    #[test]
-    fn an_orphaned_escapee_cant_hold_the_reader_or_recreate_the_directory() {
-        let s = Setup::new();
-        let python = "/Library/Developer/CommandLineTools/usr/bin/python3";
+    /// Runs `escapee` (bash, with bash's default PATH) as a process that leaves the check's group with
+    /// posix_spawn's setsid, so the sweep can't find it once its spawner is gone, after the commands in
+    /// `before`. Returns the outcome and how long the run took.
+    fn orphaned(s: &Setup, before: &str, escapee: &str) -> (bracken_tree::check::Outcome, Duration) {
+        let python = PYTHON;
         assert!(Path::new(python).exists(), "this test needs the Command Line Tools' python3 at {python}");
-        // The escapee keeps stdout open and tries, every 50 ms, to create the fresh directory again.
-        let escapee = r#"F=$(cd ../.. && pwd); while :; do mkdir -p "$F/w/tree" 2>/dev/null; sleep 0.05; done"#;
         let script = format!(
-            "{python} -c 'import os, sys; p = os.posix_spawn(\"/bin/bash\", [\"bash\", \"-c\", sys.argv[1]], dict(os.environ), \
-             setsid=True); print(p, flush=True)' '{escapee}'"
+            "{before}{python} -c 'import os, sys; p = os.posix_spawn(\"/bin/bash\", [\"bash\", \"-c\", sys.argv[1]], {{}}, \
+             setsid=True); print(\"pid\", p, flush=True)' '{escapee}'"
         );
         let started = Instant::now();
         let out = s.run(&["bash", "-c", &script], &[]).expect("runs");
+        (out, started.elapsed())
+    }
+
+    /// The escapee's pid, as the spawner printed it.
+    fn printed_pid(out: &bracken_tree::check::Outcome) -> KillOnDrop {
         let tail = String::from_utf8_lossy(&out.tail).into_owned();
-        let pid: i32 = tail.trim().parse().unwrap_or_else(|_| panic!("no pid in {tail:?}"));
-        let _kill = KillOnDrop(Some(pid));
-        assert!(started.elapsed() < Duration::from_secs(10), "the run waited on the escapee: {:?}", started.elapsed());
+        let pid = tail.lines().find_map(|l| l.strip_prefix("pid ")?.trim().parse().ok());
+        KillOnDrop(Some(pid.unwrap_or_else(|| panic!("no pid in {tail:?}"))))
+    }
+
+    // Finding 234b9aad594d and the reviewer's asks: the documented gap, an escapee orphaned before
+    // the sweep, still can't keep the output reader alive (the run returns and joins it), and holding the
+    // output fails the run (task 6b8a1b5a6108). It can't create the fresh directory again, during its
+    // removal or after: clean-up first renames it, and the sandbox may write only under the old path's w/.
+    // Finding 32a23fca15ab: the removal is made long (twenty thousand files), and the escapee, without a
+    // pause, keeps making directories it locks under the old absolute path, which would leave the
+    // directory behind if one landed during the removal; and writes relative to its own directory, which
+    // is inside the renamed tree.
+    #[test]
+    fn an_orphaned_escapee_cant_hold_the_reader_or_recreate_the_directory() {
+        let s = Setup::new();
+        let bulk =
+            format!("mkdir bulk && {PYTHON} -c 'for i in range(20000): open(\"bulk/%d\" % i, \"w\").close()' && ");
+        let escapee = r#"F=$(cd ../.. && pwd); i=0; while :; do i=$((i+1)); mkdir -p "$F/w/l$i/x" 2>/dev/null && chmod 000 "$F/w/l$i" 2>/dev/null; mkdir "r$i" 2>/dev/null; echo x > "../f$i" 2>/dev/null; done"#;
+        let (out, took) = orphaned(&s, &bulk, escapee);
+        let _kill = printed_pid(&out);
+        assert_eq!(out.exit, Exit::HeldOutput, "{}", out.exit);
+        assert!(!out.exit.passed());
+        assert!(took < ESCAPEE_RUN_LIMIT, "the run waited on the escapee: {took:?}");
         std::thread::sleep(Duration::from_millis(500));
+        s.assert_cleaned_up();
+    }
+
+    // Task 6b8a1b5a6108: orphaned escapees that write without pause, eight at once, still can't keep the
+    // reader going: it stops when told, and the run fails as held. (Whether the pipe ever runs dry here is
+    // up to the scheduler; check.rs's own test gives the reader a pipe that never does.) The run is on a
+    // thread of its own: if it hangs, the writers are killed after the limit, which frees it, and the test
+    // fails.
+    #[test]
+    fn orphaned_escapees_writing_without_pause_cant_hold_the_reader() {
+        let s = Setup::new();
+        // Their output fills the tail, so they're found by a word of their own.
+        let word = format!(
+            "escapee-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("after 1970").as_nanos()
+        );
+        let _kill = PkillOnDrop(word.clone());
+        let writers = format!("for i in 1 2 3 4 5 6 7 8; do /bin/cat /dev/zero {word} & done; wait");
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (out, took) = orphaned(&s, "", &writers);
+            let _ = done.send((s, out, took));
+        });
+        let (s, out, took) = match finished.recv_timeout(ESCAPEE_RUN_LIMIT) {
+            Ok(result) => result,
+            Err(_) => {
+                drop(_kill);
+                let _ = finished.recv_timeout(Duration::from_secs(30));
+                panic!("the run was still reading the escapees' output after {ESCAPEE_RUN_LIMIT:?}");
+            }
+        };
+        assert_eq!(out.exit, Exit::HeldOutput, "{}", out.exit);
+        assert!(took < ESCAPEE_RUN_LIMIT, "the run waited on the escapees: {took:?}");
         s.assert_cleaned_up();
     }
 
@@ -419,35 +495,30 @@ mod macos_only {
         assert!(lines.next().is_some_and(|l| l.starts_with("rustc ")), "rustc didn't run: {out}");
         s.assert_cleaned_up();
     }
+
+    // No sandbox, no run: without a usable sandbox-exec the runner refuses before materializing
+    // anything, so the check never starts. Here, so the Mac half of a split run exercises the probe
+    // (finding 4891b9db1618): elsewhere the runner refuses before any probe.
+    #[test]
+    fn without_a_sandbox_nothing_runs() {
+        let s = Setup::new();
+        // Finding 63ce139411e0: a stand-in that runs the program without the profile fails the probe too.
+        let open = s.path().join("open-sandbox-exec");
+        std::fs::write(&open, "#!/bin/sh\nwhile [ \"$1\" = -D ] || [ \"$1\" = -p ]; do shift 2; done\nexec \"$@\"\n")
+            .expect("write");
+        std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+        for sandbox_exec in [Path::new("/nonexistent/sandbox-exec"), Path::new("/usr/bin/false"), open.as_path()] {
+            s.assert_refused(&s.runner.clone().with_sandbox_exec(sandbox_exec));
+        }
+    }
 }
 
-// No sandbox, no run: without a usable sandbox-exec the runner refuses before materializing
-// anything, so the check never starts.
+// On another OS there is no sandbox, so even the real sandbox-exec path is refused and nothing runs.
+#[cfg(not(target_os = "macos"))]
 #[test]
-fn without_a_sandbox_nothing_runs() {
+fn off_macos_nothing_runs() {
     let s = Setup::new();
-    let marker = s.path().join("ran");
-    let script = format!("touch {}", marker.display());
-    let argv: Vec<String> = ["sh", "-c", &script].iter().map(|a| (*a).to_owned()).collect();
-    let (manifest, blobs) = tree(&[("README", Mode::File, b"r\n")]);
-    let check = CheckDefinition { name: "test", argv: &argv };
-    // Finding 63ce139411e0: a stand-in that runs the program without the profile fails the probe too.
-    let open = s.path().join("open-sandbox-exec");
-    std::fs::write(&open, "#!/bin/sh\nwhile [ \"$1\" = -D ] || [ \"$1\" = -p ]; do shift 2; done\nexec \"$@\"\n")
-        .expect("write");
-    std::fs::set_permissions(&open, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
-    for sandbox_exec in [Path::new("/nonexistent/sandbox-exec"), Path::new("/usr/bin/false"), open.as_path()] {
-        let runner = s.runner.clone().with_sandbox_exec(sandbox_exec);
-        let result = runner.run(&check, &manifest, |h| blobs.get(h).cloned());
-        assert!(matches!(result, Err(CheckError::NoSandbox(_))), "{}: {result:?}", sandbox_exec.display());
-    }
-    // On another OS, even the real path is refused.
-    if !cfg!(target_os = "macos") {
-        let result = s.runner.run(&check, &manifest, |h| blobs.get(h).cloned());
-        assert!(matches!(result, Err(CheckError::NoSandbox(_))), "{result:?}");
-    }
-    assert!(!marker.exists(), "the check ran");
-    s.assert_cleaned_up();
+    s.assert_refused(&s.runner);
 }
 
 // The tail as recorded: control characters stripped, and withheld as its size and hash when it holds
@@ -466,6 +537,17 @@ fn a_tail_holding_a_key_is_withheld() {
             assert_eq!(hash, ContentHash::of(pem.as_bytes()));
         }
         other => panic!("not withheld: {other:?}"),
+    }
+}
+
+/// Kills every process whose command line holds this word when dropped.
+#[cfg(target_os = "macos")]
+struct PkillOnDrop(String);
+
+#[cfg(target_os = "macos")]
+impl Drop for PkillOnDrop {
+    fn drop(&mut self) {
+        let _ = std::process::Command::new("/usr/bin/pkill").args(["-KILL", "-f", &self.0]).status();
     }
 }
 

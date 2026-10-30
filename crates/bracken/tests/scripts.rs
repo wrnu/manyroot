@@ -1330,6 +1330,20 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
         assert!(!out.status.success(), "{scripts}: ran without nextest");
         assert_eq!(calls, "cargo nextest --version\n", "{scripts}: went on without nextest");
         assert!(String::from_utf8_lossy(&out.stderr).contains("needs cargo-nextest"), "{scripts}");
+
+        // HEAD at origin/main (verify-seq's main alone): the whole table, but the Ground guards, which
+        // would have nothing to compare, are skipped, saying so (task 1e89b53c6a4a). A head past it runs them.
+        assert!(run(&dir, "git", &["update-ref", "refs/remotes/origin/main", "HEAD"]).status.success());
+        let (out, calls) = table_run("");
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(!calls.contains("ground-guards") && calls.contains("cargo test --locked --doc"), "{scripts}: {calls}");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(said.contains("HEAD is origin/main: skipped the Ground guards"), "{scripts}: {said}");
+        put(&dir, "code.txt", "a change\n");
+        commit_all(&dir, "code");
+        let (out, calls) = table_run("");
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(calls.ends_with("ground-guards origin/main HEAD\n"), "{scripts}: {calls}");
     }
 }
 
@@ -4599,6 +4613,63 @@ fn a_speculative_queue_pins_the_first_member_only_when_main_alone_passes() {
         assert!(!text(&out).contains("pinned: #"), "{scripts}: {}", text(&out));
         assert!(b.evidence(1).is_empty() && b.evidence(2).is_empty(), "{scripts}");
         assert_eq!(b.worktrees(), 1, "{scripts}");
+    }
+}
+
+/// Task 1e89b53c6a4a: the same, with the real test-table, code-scope and Ground guards, and a stub cargo
+/// whose clippy fails on a tree holding `broken`. Main alone, where HEAD is origin/main, runs the whole
+/// table but not the guards, which have nothing to compare, so it passes: --batch pins the first member,
+/// and --speculative pins it too and then tests the second without it. --speculative's runs are --split
+/// ones, in boxes; here its test-table drops --split and runs the real table's plain form.
+#[test]
+fn main_alone_passes_the_real_table_so_a_failing_first_member_is_pinned() {
+    for scripts in SCRIPTS {
+        let real = repo_root().join(scripts).join("test-table");
+        let shaped = |plain: bool| {
+            let on_main = |dir: &Path| {
+                if plain {
+                    std::fs::copy(&real, dir.join("scripts/test-table")).unwrap();
+                } else {
+                    std::fs::copy(&real, dir.join("scripts/real-table")).unwrap();
+                    write_executable(&dir.join("scripts/test-table"), "#!/bin/sh\nexec scripts/real-table\n");
+                }
+            };
+            let b = Batch::shaped(scripts, 2, &[1], false, &on_main, &|_| 0, &|_, _| {});
+            write_executable(
+                &b.tmp.path().join("stubs/cargo"),
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 'fmt --check') echo \"run $(ls a*.rs 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\" ;;\n\
+                 *clippy*) [ ! -e broken ] || { echo 'error: a lint'; exit 1; } ;;\n\
+                 esac\n",
+            );
+            b
+        };
+
+        let b = shaped(true);
+        let out = b.verify(&[1, 2]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert_eq!(
+            b.runs(),
+            ["run a1.rs a2.rs ", "run a1.rs ", "run ", "run a1.rs "],
+            "{scripts}: the batch, prefix 1, main alone, prefix 1 again: {}",
+            text(&out)
+        );
+        let one = b.evidence(1);
+        assert!(one.len() == 1 && one[0].0 == "fail" && one[0].1.ends_with(" pinned"), "{scripts}: {one:?}");
+
+        let b = shaped(false);
+        let out = b.speculative(&[b.pair(1), b.pair(2)], "1");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert_eq!(
+            b.runs(),
+            ["run a1.rs ", "run a1.rs ", "run ", "run a2.rs "],
+            "{scripts}: prefix 1, its rerun, main alone, then #2 without #1: {}",
+            text(&out)
+        );
+        let one = b.evidence(1);
+        assert!(one.len() == 1 && one[0].0 == "fail" && one[0].1.ends_with(" pinned"), "{scripts}: {one:?}");
+        assert!(text(&out).contains("pinned: #1"), "{scripts}: {}", text(&out));
+        assert_eq!(b.passes_by_batch(2).len(), 1, "{scripts}: {:?}", b.evidence(2));
     }
 }
 
