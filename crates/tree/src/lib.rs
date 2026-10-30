@@ -13,6 +13,7 @@
 //! | [`diff`]   | Differences between manifests, and unified text diffs          |
 //! | [`format`] | Every Weave record's payload format, in canonical CBOR        |
 //! | [`import`] | Import from git's view of a tree, with exclusions and refusals |
+//! | [`lines`]  | Lines and their policies, qualifying decisions, heads and forks |
 //! | [`materialize`] | Writing a manifest out without following a symlink     |
 //! | [`secrets`]| The deny-list and the key-material scan import refuses by      |
 //!
@@ -24,6 +25,7 @@ pub mod format;
 pub mod ground;
 pub mod hash;
 pub mod import;
+pub mod lines;
 pub mod materialize;
 pub mod path;
 pub mod secrets;

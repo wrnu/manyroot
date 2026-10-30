@@ -24,9 +24,9 @@ pub enum Problem {
     InvalidPayload { id: ContributionId, media_type: String, error: FormatError },
     /// A reference inside a payload that isn't a causal ancestor of its record.
     NotAnAncestor { id: ContributionId, reference: ContributionId },
-    /// A manifest whose files this replica doesn't all hold.
+    /// A manifest whose files this replica doesn't all hold, at the sizes it names.
     Incomplete { id: ContributionId, hash: ContentHash, missing: Vec<String> },
-    /// A valid marker past the one that counts.
+    /// A valid marker other than the one that counts: written after it, or concurrent with it.
     ExtraMarker { id: ContributionId, counted: ContributionId },
 }
 
@@ -35,10 +35,14 @@ pub enum Problem {
 pub struct Index {
     /// File versions by content hash: artifact ids, ascending.
     files: BTreeMap<ContentHash, Vec<ContributionId>>,
+    /// Each held file version's size, by content hash: the same bytes under every id.
+    sizes: BTreeMap<ContentHash, u64>,
     /// Valid manifests by content hash: artifact ids, ascending, and the manifest.
     manifests: BTreeMap<ContentHash, (Vec<ContributionId>, Manifest)>,
     /// Valid markers, ascending.
     markers: Vec<ContributionId>,
+    /// The marker that counts.
+    counted: Option<ContributionId>,
     problems: Vec<Problem>,
 }
 
@@ -69,10 +73,6 @@ fn references(media_type: &str, content: &[u8]) -> Result<Vec<ContributionId>, F
             Resolution::decode(content)?;
             Vec::new()
         }
-        MANIFEST_MEDIA_TYPE => {
-            Manifest::decode(content)?;
-            Vec::new()
-        }
         _ => return Err(FormatError::Malformed(format!("unknown Weave media type {media_type:?}"))),
     })
 }
@@ -89,7 +89,27 @@ impl Index {
                 continue;
             }
             if media_type == FILE_MEDIA_TYPE {
-                index.files.entry(ContentHash::of(content)).or_default().push(id);
+                let hash = ContentHash::of(content);
+                index.files.entry(hash).or_default().push(id);
+                index.sizes.insert(hash, content.len() as u64);
+                continue;
+            }
+            // A manifest refers to no contribution, and is decoded once per content hash: the same
+            // bytes are equally valid, or invalid, under every id.
+            if media_type == MANIFEST_MEDIA_TYPE {
+                let hash = ContentHash::of(content);
+                if let Some((ids, _)) = index.manifests.get_mut(&hash) {
+                    ids.push(id);
+                    continue;
+                }
+                match Manifest::decode(content) {
+                    Ok(manifest) => {
+                        index.manifests.insert(hash, (vec![id], manifest));
+                    }
+                    Err(error) => {
+                        index.problems.push(Problem::InvalidPayload { id, media_type: media_type.clone(), error })
+                    }
+                }
                 continue;
             }
             match references(media_type, content) {
@@ -105,18 +125,8 @@ impl Index {
                     }
                 }
             }
-            match media_type.as_str() {
-                MANIFEST_MEDIA_TYPE => {
-                    let manifest = Manifest::decode(content).expect("decoded above");
-                    index
-                        .manifests
-                        .entry(ContentHash::of(content))
-                        .or_insert_with(|| (Vec::new(), manifest))
-                        .0
-                        .push(id);
-                }
-                MARKER_MEDIA_TYPE => index.markers.push(id),
-                _ => {}
+            if media_type == MARKER_MEDIA_TYPE {
+                index.markers.push(id);
             }
         }
         for (hash, (ids, manifest)) in &index.manifests {
@@ -125,17 +135,22 @@ impl Index {
                 index.problems.push(Problem::Incomplete { id: ids[0], hash: *hash, missing });
             }
         }
-        if let Some((counted, rest)) = index.markers.split_first() {
-            for id in rest {
-                index.problems.push(Problem::ExtraMarker { id: *id, counted: *counted });
+        // Decision 049d02449a94: the marker that counts has no other valid marker in its causal past,
+        // so one written after it has been seen never takes over. Among concurrent ones, the smallest id.
+        index.counted =
+            index.markers.iter().find(|m| !index.markers.iter().any(|other| g.is_ancestor(other, m))).copied();
+        if let Some(counted) = index.counted {
+            for id in index.markers.iter().filter(|id| **id != counted) {
+                index.problems.push(Problem::ExtraMarker { id: *id, counted });
             }
         }
         index
     }
 
-    /// The valid, non-retracted marker with the smallest id: the one that counts.
+    /// The marker that counts: the valid, non-retracted marker with no other such
+    /// marker among its causal ancestors, the smallest id if several are concurrent.
     pub fn counted_marker(&self) -> Option<ContributionId> {
-        self.markers.first().copied()
+        self.counted
     }
 
     /// Whether this replica holds a file version with this content hash.
@@ -157,10 +172,10 @@ impl Index {
         self.manifests.get(hash).map(|(ids, m)| (ids[0], m))
     }
 
-    /// The paths of `manifest` whose files this replica doesn't hold. A manifest is
-    /// complete when this is empty.
+    /// The paths of `manifest` whose files this replica doesn't hold with the size
+    /// the entry names. A manifest is complete when this is empty.
     pub fn missing(&self, manifest: &Manifest) -> Vec<String> {
-        manifest.entries.iter().filter(|e| !self.holds_file(&e.hash)).map(|e| e.path.clone()).collect()
+        manifest.entries.iter().filter(|e| self.sizes.get(&e.hash) != Some(&e.size)).map(|e| e.path.clone()).collect()
     }
 
     /// What kind of Weave record has this content hash: `"manifest"` or `"file"`.

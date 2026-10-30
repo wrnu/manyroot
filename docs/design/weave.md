@@ -297,9 +297,19 @@ policy:
   guardrails, because only the author can change the policy (again a
   convention under shared keys).
 - **The marker that counts** is the valid, non-retracted Weave marker with
-  the smallest id. The **default line** is the line named `main` by that
-  marker's author. If there are several, it is the one with the smallest
-  id that isn't superseded.
+  no other such marker among its causal ancestors. If several are
+  concurrent, the smallest id among them counts, and `weave check` lists the
+  others. So a marker written after the first has been seen, by anyone, can
+  never take over the default line (finding `d8168e1a9ebb`, decision
+  `049d02449a94`). A deliberately concurrent marker, written with forged
+  parents, is outside the threat model of decision `7529dd229d6f`: mistakes,
+  not adversaries, under shared keys.
+- The **default line** is the line named `main` by that marker's author.
+  Only a line's first artifact that supersedes no version in the replica is
+  a candidate, so a version that joins another line's chain stops being
+  one, though decisions made on it keep their judgement (finding
+  `fdd17cbdc816`). If there are several, it is the one with the smallest
+  id.
 
 ### Decisions: integration as a record
 
@@ -696,10 +706,10 @@ never write outside the target directory, and never follow a symlink
 | `weave init [--purpose text]` | Creates a new Ground at `--dir` and writes the Weave marker and a `main` line into it, signed by `--as` (an identity created there), with its `identities/` directory at mode 0700. The line's author is its only integrator and goal setter, with no checks yet. `--dir` must not exist yet and its parent must; the parent's real path is searched for `.git`, and the Ground directory is made with a single mkdir. Refuses inside a git checkout. It guards against mistakes, not against concurrent writers on the path, and doesn't see a work tree declared only through `core.worktree` or `GIT_DIR`. |
 | `weave init --in-place --decision <id>` | The join only (section 5): writes the marker into an existing Ground, naming in `in_place` a claim tagged `decision` in that Ground, which must exist. |
 | `weave import [--from-git <rev> \| --index] [--dry-run]` | Records the tree as file versions (only those whose content hash is new) and one manifest. Prints the manifest's hash. |
-| `weave status` | The index or `HEAD` against main's manifest: added, changed, deleted, mode changed. |
+| `weave status [--index] [--at D]` | The index or `HEAD` against main's manifest (or `D`'s, which a forked line needs): added, changed, deleted, mode changed. |
 | `weave diff <a> <b>` | Per-file difference between two manifests or decisions. Text files show a unified diff. |
 | `weave propose [--line L] [--base D] [--from-git <rev> \| --index] [--dry-run]` | Imports the tree and writes a proposal against `base` (default: the line's head). |
-| `weave integrate [--line L] [--proposals ...] [--run]` | Integrator: builds the candidate and writes the decision, in the order below. Runs no checks unless `--run` is given. Refuses if the result wouldn't qualify. |
+| `weave integrate [--line L] [--proposals ...] [--run]` | Integrator: builds the candidate and writes the decision, in the order below. Runs no checks unless `--run` is given. Refuses if the result wouldn't qualify. Without proposals it records a given tree, `--from-git <rev>` (the default is `HEAD`, named in the decision's `source`), `--index` or `--manifest H`, with every head of the line as a parent, so on a forked line it settles the fork. |
 | `weave validate --manifest H [--check <name>]... [--again]` | Validator: runs the line's named checks (default: all of them) on manifest `H` through the check runner, and records each result. Refuses a check it already has a latest result for on `H` unless `--again`. |
 | `weave review [--line L] [<proposal or decision>]` | Reviews and open objections, with what each would need as an answer. |
 | `weave head [--line L]`, `weave green [--line L]` | The head, or the fork's heads, and green, with the manifest hash. |
