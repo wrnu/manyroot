@@ -7,6 +7,7 @@
 | [demo.md](demo.md) | The agent demo harness: how to run it and what its report measures |
 | [development.md](development.md) | This repo's values for the team process: profile, models, risky classes, tool mapping, Forge commands. The process itself is [process.md](../.claude/skills/agent-team-kickoff/process.md) |
 | [builder.md](builder.md) | One-page role card for builders |
+| [design/eval-suite.md](design/eval-suite.md) | Proposal (2026-10-30): an evaluation suite of Python projects (spec, seed, hidden tests, golden solution) to test Bracken and Weave as a development system; full traces, metrics decided after exploratory pilots, isolation, a cost estimate |
 | [design/agents.md](design/agents.md) | Decided (2026-10-30): how agents relate to Bracken and Weave: Bracken owns the record and the work queue, harnesses launch agents, `bracken watch`, CLI first, and the experiment crate repurposed to evaluate Weave configurations with Claude Code and Pi |
 | [design/acceptance-follows-changes.md](design/acceptance-follows-changes.md) | Decided (2026-10-29): an accepted contribution whose dependencies changed after its evidence shows as needs re-check, under an opt-in policy; class, cost, and its effect on the Phase 2 pilot |
 | [design/network-sync.md](design/network-sync.md) | Network sync design, decided in part (2026-10-27): syncing Grounds over a network, and what it retires from the process |
