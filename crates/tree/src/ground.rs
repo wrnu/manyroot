@@ -17,6 +17,7 @@ use crate::format::{
 };
 use crate::hash::ContentHash;
 use crate::merge::Resolutions;
+use crate::path::PathCache;
 
 /// Something `weave check` reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +86,7 @@ impl Index {
         let mut index = Index::default();
         let mut ids: Vec<ContributionId> = g.iter().map(|c| c.id()).collect();
         ids.sort();
+        let mut paths = PathCache::new();
         for id in ids {
             let c = g.get(&id).expect("listed by the graph");
             let Body::Artifact { media_type, content, .. } = c.body() else { continue };
@@ -105,7 +107,7 @@ impl Index {
                     ids.push(id);
                     continue;
                 }
-                match Manifest::decode(content) {
+                match Manifest::decode_with(content, &mut paths) {
                     Ok(manifest) => {
                         index.manifests.insert(hash, (vec![id], manifest));
                     }

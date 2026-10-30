@@ -18,7 +18,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::hash::ContentHash;
-use crate::path::{self, Collision, PathError};
+use crate::path::{self, Collision, PathCache, PathError};
 
 /// The format version every record starts with.
 pub const VERSION: u64 = 1;
@@ -36,6 +36,12 @@ pub const MEDIA_TYPE_PREFIX: &str = "application/vnd.bracken.weave";
 
 /// The tag a goal claim carries.
 pub const GOAL_TAG: &str = "weave-goal";
+
+/// The most contributions one decision may refer to: its line, parents, proposals,
+/// answered objections, resolutions and goals together. Every reference is checked
+/// against the ancestor rule on each open, so an unbounded list would let one
+/// decision make every open slow (finding 1873f4834edd).
+pub const MAX_REFERENCES: usize = 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum FormatError {
@@ -57,6 +63,8 @@ pub enum FormatError {
     EmptyArgv(String),
     #[error("{0} are not strictly ascending")]
     Order(&'static str),
+    #[error("the decision refers to {0} contributions, over the limit of {MAX_REFERENCES}")]
+    TooManyReferences(usize),
 }
 
 /// Canonical CBOR of any value: what every record and hashed list is written as.
@@ -226,6 +234,32 @@ pub struct Manifest {
 }
 
 impl Manifest {
+    /// [`Record::decode`], with the paths checked through `paths`, so a path seen
+    /// in another manifest isn't checked or folded again.
+    pub fn decode_with(bytes: &[u8], paths: &mut PathCache) -> Result<Manifest, FormatError> {
+        let manifest: Manifest = from_cbor(bytes)?;
+        if manifest.v != VERSION {
+            return Err(FormatError::Version(manifest.v));
+        }
+        manifest.check_with(paths)?;
+        Ok(manifest)
+    }
+
+    fn check_with(&self, paths: &mut PathCache) -> Result<(), FormatError> {
+        for pair in self.entries.windows(2) {
+            if pair[0].path.as_bytes() >= pair[1].path.as_bytes() {
+                return Err(FormatError::EntryOrder(pair[1].path.clone()));
+            }
+        }
+        for entry in &self.entries {
+            paths.validate(&entry.path).map_err(|error| FormatError::Path { path: entry.path.clone(), error })?;
+        }
+        match paths.find_collision(self.entries.iter().map(|e| e.path.as_str())) {
+            Some(collision) => Err(FormatError::Collision(collision)),
+            None => Ok(()),
+        }
+    }
+
     /// A manifest of `entries` in any order; they are sorted by path bytes.
     pub fn new(mut entries: Vec<Entry>) -> Manifest {
         entries.sort_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
@@ -245,18 +279,7 @@ impl Record for Manifest {
     }
 
     fn check(&self) -> Result<(), FormatError> {
-        for pair in self.entries.windows(2) {
-            if pair[0].path.as_bytes() >= pair[1].path.as_bytes() {
-                return Err(FormatError::EntryOrder(pair[1].path.clone()));
-            }
-        }
-        for entry in &self.entries {
-            valid_path(&entry.path)?;
-        }
-        match path::find_collision(self.entries.iter().map(|e| e.path.as_str())) {
-            Some(collision) => Err(FormatError::Collision(collision)),
-            None => Ok(()),
-        }
+        self.check_with(&mut PathCache::new())
     }
 
     fn artifact_name(&self) -> &str {
@@ -407,6 +430,15 @@ impl Record for Decision {
     }
 
     fn check(&self) -> Result<(), FormatError> {
+        let references = 1
+            + self.parents.len()
+            + self.proposals.len()
+            + self.answers.len()
+            + self.resolutions.len()
+            + self.goals.len();
+        if references > MAX_REFERENCES {
+            return Err(FormatError::TooManyReferences(references));
+        }
         strictly_ascending(&self.parents, "a decision's parents")?;
         for breakage in &self.breakage {
             not_blank(&breakage.check, "a breakage entry's check")?;

@@ -344,6 +344,10 @@ A decision moves a line. It is the commit:
   stored: it is counted in line moves (section 2).
 - `proposals` and `resolutions` name the proposals the decision integrates
   and the resolutions its merge used. Both obey the ancestor rule.
+- A decision refers to at most 1,024 contributions in all: its line,
+  parents, proposals, answered objections, resolutions and goals. Every
+  reference is checked on each open, so a longer list makes the payload
+  invalid (finding `1873f4834edd`).
 - An answer is a record of how the integrator dealt with an objection, not
   proof that it was settled. It doesn't need the objector's agreement.
   Section 2 says which dispositions an objection allows.
@@ -904,6 +908,11 @@ from its results.
   stage 2 starts, and reads stay bounded: `weave log` prints at most 20
   decisions by default and never prints payloads. Loading payloads lazily
   is left for later (section 8).
+- **What opening costs.** Opening checks each distinct path once, however
+  many manifests list it. The ancestor rule still walks the history once
+  per reference, and the 1,024-reference cap bounds how many walks one
+  record can cause (finding `1873f4834edd`). An index that answers the
+  rule without walking is its own design task (decision `41670d761ba6`).
 - **Compaction is left open.** Signed history can't be shortened without
   losing what it signs. A later checkpoint scheme (Rings, protocol.md *Not
   yet specified*) is where it belongs.
