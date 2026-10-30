@@ -821,7 +821,14 @@ fn a_short_id_resolves_and_an_ambiguous_or_unknown_one_is_refused() {
     assert_eq!(shown["id"], spec.as_str());
     assert!(a.tool("show", &json!({"id": &spec[..7]})).is_err(), "7 digits");
     let mine = made(&mut a, "claim", json!({"statement": "first", "tags": ["note"]}));
-    a.tool("claim", &json!({"statement": "second", "supersedes": [&mine[..9]]})).expect("supersedes by 9 digits");
+    let second = output(a.tool("claim", &json!({"statement": "second", "supersedes": [&mine[..9]]})));
+    // What the agent sees of a write is what bracken printed before it labelled its ids (task
+    // d4e958fd6719): each id it wrote, one per line, the claim first, then its supersedes relation.
+    let lines: Vec<&str> = second.lines().collect();
+    assert!(second.ends_with('\n') && lines.len() == 2, "{second:?}");
+    assert!(lines.iter().all(|l| l.len() == 64 && l.bytes().all(|b| b.is_ascii_hexdigit())), "{second:?}");
+    let relation = a.tool("show", &json!({"id": lines[1]})).expect("the relation");
+    assert_eq!((relation["body"]["from"].as_str(), relation["body"]["to"].as_str()), (Some(lines[0]), Some(&*mine)));
     // Phase 1's tools take 12 digits or more, and have no status or news.
     let phase1 = tempfile::tempdir().expect("a temp dir");
     let (_hub, mut p, _b) = ground_of(phase1.path(), AcceptRule::MostPasses);

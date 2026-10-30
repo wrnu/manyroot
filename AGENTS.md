@@ -34,6 +34,7 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 - At the start of every task, read `scripts/bk log --tag decision --current` and `scripts/bk show <task id>`. `--current` leaves out retracted entries and those their own author superseded; one someone else superseded stays, marked.
 - Check a claim with `scripts/bk show <id>` before acting on it. A `note` is a lead, not a fact.
 - Contribute what others would need **as you learn it**, not at the end.
+- A write prints one labelled line per record, the primary first: `claim <id>`, then `relation <id> (supersedes)`. Pass on the id from the line you mean, never just the first word; scripts use `--json` and its `id`.
 - Messages carry ids; the content goes in the Ground. No secrets or personal data: contributions are permanent.
 
 | What | How |

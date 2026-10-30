@@ -359,8 +359,11 @@ fi
 
 printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\nforge head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nowner: %s\n' \
   "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$owner_case" >"$details"
-id=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
+written=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
   fail "couldn't record the merge-gate evidence; not merging"
+# The first line's last word: 'evidence <id>' (task d4e958fd6719), or a bare id from an older pinned binary.
+id=${written%%$'\n'*}
+id=${id##* }
 echo "recorded merge gate evidence $id"
 api POST "/pulls/$pr/merge" "$body" >/dev/null || fail "the forge refused the merge (if the head moved, it answers 409); the evidence $id stands"
 echo "merged PR #$pr at $sha"

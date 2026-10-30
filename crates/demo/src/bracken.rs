@@ -149,10 +149,11 @@ impl<'b> Replica<'b> {
     /// Runs a write command signed by this replica's identity, and returns the new id.
     fn write(&self, args: &[&OsStr]) -> Result<String> {
         let mut all = args.to_vec();
-        all.extend([OsStr::new("--as"), OsStr::new(&self.identity)]);
+        all.extend([OsStr::new("--as"), OsStr::new(&self.identity), OsStr::new("--json")]);
         let out = self.run(&all)?;
-        // The new contribution's id is the first line; later lines may list related ids.
-        Ok(out.lines().next().unwrap_or_default().trim().to_owned())
+        // The new contribution's id is the JSON's "id"; "written" lists any related ones.
+        let v: Value = serde_json::from_str(&out).context("parsing a write's --json")?;
+        v["id"].as_str().map(str::to_owned).context("a write printed no id")
     }
 
     fn json(&self, args: &[&str]) -> Result<Value> {

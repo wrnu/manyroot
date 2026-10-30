@@ -225,6 +225,10 @@ pub struct Plan {
     pub file: Option<String>,
     /// Whether the output is JSON.
     pub json: bool,
+    /// A write, run with --json: the agent gets the ids it wrote, one per line, the primary first, as
+    /// bracken printed them before it labelled them (task d4e958fd6719). What the agent sees stays as it
+    /// was; changing it is a neutrality question (decision 4cf00e1d701d).
+    pub ids: bool,
 }
 
 /// Whether acceptance follows changes in this task (decision `2b91a9541aba`): Phase 2's, whose waves change
@@ -267,12 +271,13 @@ fn fits(lines: &[String]) -> usize {
 /// lands after `--` or inside one `--option=value` argument, never anywhere it
 /// could be read as an option.
 pub fn plan(name: &str, args: &Args, identity: &str, task: Task) -> Result<Plan, String> {
-    let read = |argv: Vec<String>| Plan { argv, stdin: None, file: None, json: true };
+    let read = |argv: Vec<String>| Plan { argv, stdin: None, file: None, json: true, ids: false };
     let write = |mut head: Vec<String>, tail: Vec<String>| {
         head.insert(1, opt("as", identity));
+        head.push("--json".into());
         head.push("--".into());
         head.extend(tail);
-        Plan { argv: head, stdin: None, file: None, json: false }
+        Plan { argv: head, stdin: None, file: None, json: false, ids: true }
     };
     let s = |v: &str| v.to_string();
     Ok(match name {
@@ -393,9 +398,14 @@ impl BrackenStore {
         serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))
     }
 
-    fn write(&mut self, argv: Vec<String>) -> Result<String, String> {
+    /// Runs a write of the setter's, `argv` holding its `--`, and returns the primary id it wrote, from
+    /// its --json.
+    fn write(&mut self, mut argv: Vec<String>) -> Result<String, String> {
+        let dashdash = argv.iter().position(|a| a == "--").ok_or("a write's argv has no --")?;
+        argv.insert(dashdash, "--json".into());
         let out = self.run(&argv, None)?;
-        Ok(String::from_utf8_lossy(&out).lines().next().unwrap_or_default().trim().to_string())
+        let v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
+        v["id"].as_str().map(str::to_string).ok_or_else(|| "bracken printed no id".into())
     }
 
     /// A file of the store's own for `content`, under `files/`.
@@ -906,7 +916,12 @@ impl BrackenStore {
             plan.argv.push(path.to_string_lossy().into_owned());
         }
         let out = self.run(&plan.argv, plan.stdin.as_deref())?;
-        if plan.json {
+        if plan.ids {
+            let v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
+            let written = v["written"].as_array().ok_or("bracken printed no written ids")?;
+            let text: String = written.iter().filter_map(|w| w["id"].as_str()).map(|id| format!("{id}\n")).collect();
+            Ok(json!({ "output": text }))
+        } else if plan.json {
             serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))
         } else {
             let text = String::from_utf8_lossy(&out).into_owned();

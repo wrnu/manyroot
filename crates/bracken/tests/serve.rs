@@ -1,6 +1,8 @@
 //! `bracken serve` and `bracken sync <url>` / `--exec`, end to end on 127.0.0.1 and over stdio,
 //! against throwaway Grounds.
 
+mod common;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -28,7 +30,7 @@ fn run(dir: &Path, args: &[&str]) -> Output {
 fn ok(dir: &Path, args: &[&str]) -> String {
     let out = run(dir, args);
     assert!(out.status.success(), "bracken {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned())
 }
 
 /// Two replicas of one Ground, `a` and `b`, sharing identities alice and bob (in `a`), and the

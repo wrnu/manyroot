@@ -97,6 +97,8 @@ enum Command {
         /// One of your own claims that this one replaces; records the supersedes relation too. Repeatable.
         #[arg(long, value_name = "ID")]
         supersedes: Vec<String>,
+        #[command(flatten)]
+        out: Output,
     },
     /// Contribute an artifact from a file.
     Artifact {
@@ -110,6 +112,8 @@ enum Command {
         /// too, signed by the same identity.
         #[arg(long, value_name = "ID")]
         implements: Option<String>,
+        #[command(flatten)]
+        out: Output,
     },
     /// Relate two contributions, e.g. `bracken relate <a> supersedes <b>`.
     Relate {
@@ -118,6 +122,8 @@ enum Command {
         to: String,
         #[arg(long, default_value = "")]
         note: String,
+        #[command(flatten)]
+        out: Output,
     },
     /// Record the outcome of checking a contribution: a verdict you give, or with --run, the result of
     /// running a command.
@@ -157,12 +163,16 @@ enum Command {
         /// After `--`: the command for --run, or without --run the target and verdict.
         #[arg(last = true, value_name = "COMMAND")]
         command: Vec<String>,
+        #[command(flatten)]
+        out: Output,
     },
     /// Withdraw one of your own contributions.
     Retract {
         target: String,
         #[arg(long, default_value = "")]
         reason: String,
+        #[command(flatten)]
+        out: Output,
     },
     /// List contributions in causal order.
     Log {
@@ -238,6 +248,8 @@ enum Command {
         /// How long the intent holds, e.g. 30m or 2h. Advisory, like every timestamp.
         #[arg(long = "for", value_name = "DURATION", default_value = "1h", value_parser = humantime::parse_duration)]
         duration: std::time::Duration,
+        #[command(flatten)]
+        out: Output,
     },
     /// The review queue: one line for each piece of work that implements a current claim, what
     /// needs an independent pass first (oldest first), then what is blocked on unaccepted work, and
@@ -437,39 +449,38 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 }
             }
         }
-        Command::Claim { statement, tags, supersedes } => {
+        Command::Claim { statement, tags, supersedes, out } => {
             let who = signer(&s, agent)?;
             let names = Names::load(&s)?;
             let old = supersedes.iter().map(|id| own_claim(&s, &names, &who, id)).collect::<Result<BTreeSet<_>>>()?;
-            let new = contribute(&mut s, &who, Body::Claim { statement, tags })?;
-            let mut written = vec![new];
+            let mut w = Writes::new(out.json);
+            let new = w.add(&mut s, &who, Body::Claim { statement, tags })?;
             for to in old {
                 let note = String::new();
-                written.push(contribute(
-                    &mut s,
-                    &who,
-                    Body::Relation { from: new, kind: RelationKind::Supersedes, to, note },
-                )?);
+                let relation = Body::Relation { from: new, kind: RelationKind::Supersedes, to, note };
+                if let Err(e) = w.add(&mut s, &who, relation) {
+                    w.finish_failed();
+                    return Err(e.context(format!("claim {new} was recorded, but not all its supersedes relations")));
+                }
             }
-            for id in written {
-                println!("{id}");
-            }
+            w.finish();
         }
-        Command::Artifact { file, name, media_type, implements } => {
+        Command::Artifact { file, name, media_type, implements, out } => {
             let who = signer(&s, agent)?;
             // Resolved first, so an unknown id writes nothing.
             let target = implements.as_deref().map(|id| resolve(&s, id)).transpose()?;
             let content = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             let name = name.unwrap_or_else(|| file.display().to_string());
-            let artifact = contribute(&mut s, &who, Body::Artifact { name, media_type, content })?;
-            println!("{artifact}");
+            let mut w = Writes::new(out.json);
+            let artifact = w.add(&mut s, &who, Body::Artifact { name, media_type, content })?;
             if let Some(to) = target {
                 let relation =
                     Body::Relation { from: artifact, kind: RelationKind::Implements, to, note: String::new() };
-                match contribute(&mut s, &who, relation) {
-                    Ok(id) => println!("{id}"),
-                    // The artifact stays: the Ground is append-only. Its id is printed above.
+                match w.add(&mut s, &who, relation) {
+                    Ok(_) => {}
+                    // The artifact stays: the Ground is append-only. Its id is printed.
                     Err(e) => {
+                        w.finish_failed();
                         eprintln!(
                             "bracken: artifact {artifact} was recorded, but its implements relation to {to} couldn't be: \
                              {e:#}; relate it with `bracken relate {} implements {}`",
@@ -480,13 +491,16 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                     }
                 }
             }
+            w.finish();
         }
-        Command::Relate { from, kind, to, note } => {
+        Command::Relate { from, kind, to, note, out } => {
             let who = signer(&s, agent)?;
             let (from, to) = (resolve(&s, &from)?, resolve(&s, &to)?);
-            println!("{}", contribute(&mut s, &who, Body::Relation { from, kind, to, note })?);
+            let mut w = Writes::new(out.json);
+            w.add(&mut s, &who, Body::Relation { from, kind, to, note })?;
+            w.finish();
         }
-        Command::Evidence { target, verdict, method, details, details_file, run, command, depends_on } => {
+        Command::Evidence { target, verdict, method, details, details_file, run, command, depends_on, out } => {
             // Everything after `--` is one list to clap. With --run it's the command. Without, it's the
             // target and verdict, so values that look like options can't be read as options there.
             let (target, verdict, command) = if run {
@@ -520,9 +534,10 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                     method: outcome.method,
                     details: outcome.details,
                 };
-                let id = contribute(&mut s, &who, body)?;
+                let mut w = Writes::new(out.json);
+                w.add(&mut s, &who, body)?;
                 BROKEN_PIPE_STATUS.store(i32::from(outcome.status), Ordering::Relaxed);
-                println!("{id}");
+                w.finish();
                 return Ok(ExitCode::from(outcome.status));
             }
             let details = match details_file {
@@ -543,13 +558,14 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                     n.short()
                 );
             }
-            let evidence = contribute(&mut s, &who, Body::Evidence { target, verdict, method, details })?;
-            println!("{evidence}");
+            let mut w = Writes::new(out.json);
+            let evidence = w.add(&mut s, &who, Body::Evidence { target, verdict, method, details })?;
             for (i, &to) in needs.iter().enumerate() {
                 let body = Body::Relation { from: evidence, kind: RelationKind::DependsOn, to, note: String::new() };
-                match contribute(&mut s, &who, body) {
-                    Ok(id) => println!("{id}"),
+                match w.add(&mut s, &who, body) {
+                    Ok(_) => {}
                     Err(e) => {
+                        w.finish_failed();
                         let left: Vec<String> = needs[i..].iter().map(ToString::to_string).collect();
                         bail!(
                             "evidence {evidence} recorded, but depends_on to {} not written ({e:#}): relate them by \
@@ -559,11 +575,14 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                     }
                 }
             }
+            w.finish();
         }
-        Command::Retract { target, reason } => {
+        Command::Retract { target, reason, out } => {
             let who = signer(&s, agent)?;
             let target = resolve(&s, &target)?;
-            println!("{}", contribute(&mut s, &who, Body::Retract { target, reason })?);
+            let mut w = Writes::new(out.json);
+            w.add(&mut s, &who, Body::Retract { target, reason })?;
+            w.finish();
         }
         Command::Log { kind, tag, author, current, since, limit, compact, full, out } => {
             let compact = compact || (since.is_some() && !full);
@@ -729,7 +748,7 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let policy = policy.build(&view::public_names(&s)?)?;
             view::serve(s.dir(), policy, &view::Bind { ips: bind, port, names: hosts }, runs.as_deref())?;
         }
-        Command::Intend { id, duration } => {
+        Command::Intend { id, duration, out } => {
             let who = signer(&s, agent)?;
             let target = resolve(&s, &id)?;
             // RFC 3339 years have four digits, so the last expiry it can write is 9999-12-31T23:59:59Z.
@@ -741,14 +760,15 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             let until = humantime::format_rfc3339_seconds(until).to_string();
             let statement = format!("intent: working on {} until {until}", target.short());
             let tags = vec![INTENT_TAG.to_owned(), format!("{UNTIL_TAG}{until}")];
-            let intent = contribute(&mut s, &who, Body::Claim { statement, tags })?;
-            println!("{intent}");
+            let mut w = Writes::new(out.json);
+            let intent = w.add(&mut s, &who, Body::Claim { statement, tags })?;
             let relation =
                 Body::Relation { from: intent, kind: RelationKind::Refines, to: target, note: String::new() };
-            match contribute(&mut s, &who, relation) {
-                Ok(id) => println!("{id}"),
-                // The claim stays: the Ground is append-only. Its id is printed above.
+            match w.add(&mut s, &who, relation) {
+                Ok(_) => w.finish(),
+                // The claim stays: the Ground is append-only. Its id is printed.
                 Err(e) => {
+                    w.finish_failed();
                     eprintln!(
                         "bracken: intent {intent} was recorded, but its refines relation to {target} couldn't be: \
                          {e:#}; relate it with `bracken relate {} refines {}`",
@@ -894,6 +914,60 @@ fn read_details(path: &Path) -> Result<String> {
         bail!("{} is over the {limit}-byte contribution limit", path.display());
     }
     String::from_utf8(bytes).with_context(|| format!("{} isn't UTF-8 text", path.display()))
+}
+
+/// What one write command recorded, the primary record first (task `d4e958fd6719`): one labelled line
+/// each, `claim <id>` or `relation <id> (supersedes)`, or with --json `{"id": <primary>, "written": [{"id",
+/// "kind", "relation"?}]}`. Printed only once every write is done, as a reader that stops early must not
+/// stop one half-way, and on a failure part way, for what was written before it.
+struct Writes {
+    json: bool,
+    written: Vec<Value>,
+}
+
+impl Writes {
+    fn new(json: bool) -> Writes {
+        Writes { json, written: Vec::new() }
+    }
+
+    fn add(&mut self, s: &mut Store, who: &Identity, body: Body) -> Result<ContributionId> {
+        let kind = body.kind().as_str();
+        let relation = match &body {
+            Body::Relation { kind, .. } => Some(kind.as_str()),
+            _ => None,
+        };
+        let id = contribute(s, who, body)?;
+        let mut row = json!({"id": id, "kind": kind});
+        if let Some(r) = relation {
+            row["relation"] = json!(r);
+        }
+        self.written.push(row);
+        Ok(id)
+    }
+
+    /// After a failure part way: decides the failing exit first, as `decide` does, so a reader that
+    /// stops early can't turn it into success (finding `58def77d1d97`), then prints what was written.
+    fn finish_failed(&self) {
+        decide(false);
+        self.finish();
+    }
+
+    /// Prints whatever was written.
+    fn finish(&self) {
+        if self.json {
+            if !self.written.is_empty() {
+                print_json(&json!({"id": self.written[0]["id"], "written": self.written}));
+            }
+            return;
+        }
+        for row in &self.written {
+            let (kind, id) = (row["kind"].as_str().unwrap_or_default(), row["id"].as_str().unwrap_or_default());
+            match row["relation"].as_str() {
+                Some(r) => println!("{kind} {id} ({r})"),
+                None => println!("{kind} {id}"),
+            }
+        }
+    }
 }
 
 /// Signs and adds a contribution, unless it holds the private key of an identity in this replica.

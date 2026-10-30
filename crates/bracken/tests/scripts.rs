@@ -1,6 +1,8 @@
 //! The team scripts in `scripts/` (and their copies in the agent-team-kickoff skill), run
 //! against a throwaway Ground in a throwaway git repository.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -54,7 +56,7 @@ fn copy_executable(from: &Path, to: &Path) {
 fn bk(dir: &Path, args: &[&str]) -> String {
     let out = run(dir, "scripts/bk", args);
     assert!(out.status.success(), "bk {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned())
 }
 
 /// A git repository holding `scripts/bk`, the given `bk-evidence` and the `code-scope` beside it, with a
@@ -132,6 +134,11 @@ fn bk_evidence_any_head_refuses_a_pr_claim_in_a_large_pr_log() {
         let note = bk(&dir, &["claim", "a note", "--tag", "note", "--as", "val"]);
         let out = run(&dir, "scripts/bk-evidence", &[&note[..12], "--as", "val", "--any-head", "--", "/usr/bin/true"]);
         assert!(out.status.success(), "{script}: {}", String::from_utf8_lossy(&out.stderr));
+        // It names the evidence by its id alone, out of bracken's labelled line (task d4e958fd6719).
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let evidence = bk(&dir, &["log", "--kind", "evidence", "--json"]);
+        let id = serde_json::from_str::<serde_json::Value>(&evidence).unwrap()[0]["id"].as_str().unwrap().to_owned();
+        assert!(stderr.contains(&format!("bk-evidence: recorded pass {id} (exit 0)")), "{script}: {stderr}");
     }
 }
 
@@ -356,14 +363,18 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         assert!(out.contains(&format!("listening on http://127.0.0.1:{port}")), "{scripts}: {out}");
         assert!(stderr.is_empty(), "{scripts}: the first start said {stderr:?}");
 
-        // Writes push and confirm; stdout stays the new id alone.
+        // Writes push and confirm; stdout stays bracken's one labelled line for the new claim.
         let before = syncs().lines().count();
         let (alice, _) = ok(sh(&a, "scripts/bk", &["claim", "from alice", "--as", "alice"], None), "alice's claim");
         let new: Vec<String> = syncs().lines().skip(before).map(String::from).collect();
         assert!(new.len() == 1 && new[0].contains(" --confirm"), "{scripts}: alice's write synced as {new:?}");
         let (bob, _) = ok(sh(&b, "scripts/bk", &["claim", "from bob", "--as", "bob"], None), "bob's claim");
+        for out in [&alice, &bob] {
+            assert!(out.starts_with("claim ") && out.trim().lines().count() == 1, "{scripts}: {out:?}");
+        }
+        let (alice, bob) = (common::bare_ids(alice.trim().to_owned()), common::bare_ids(bob.trim().to_owned()));
         for id in [&alice, &bob] {
-            assert!(id.trim().len() == 64 && id.trim().bytes().all(|c| c.is_ascii_hexdigit()), "{scripts}: {id:?}");
+            assert!(id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()), "{scripts}: {id:?}");
         }
         // Each sees the other's: alice's replica learns bob's claim only by pulling.
         let (shown, stderr) = ok(sh(&a, "scripts/bk", &["show", bob.trim()], Some("alice")), "alice reads");
