@@ -555,7 +555,8 @@ the same way, and reads a module only after its size (finding
 `bracken sync <dir>`, which writes both replicas, isn't used. A sync that
 fails, like any failure of one agent's (a dropped connection, an MCP
 message over 256 KiB, its backend's error), is logged as that agent's
-`turn_error`, with its size and digest only, and ends only that turn. The
+`turn_error`, with its size and digest only, and the path of the agent's
+socket it names, if any, and ends only that turn. The
 run goes on (finding `2b37d97ab9c6`). Nothing waits without a deadline:
 the driver serves a turn's connection until the turn's time (10 minutes)
 is spent, every read of a sync relay has a deadline past bracken's own
