@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use bracken_tree::ancestry::{Ancestry, Stats, rounds};
+use bracken_tree::ancestry::{Ancestry, Stats, latest, rounds};
 use bracken_tree::ground::Index;
 use bracken_tree::lines::Lines;
 use manyroot::{Body, Contribution, ContributionId, Graph, GroundId, Identity};
@@ -341,4 +341,46 @@ fn the_index_is_send() {
     send::<Index>();
     send::<Ancestry>();
     send::<Lines>();
+}
+
+/// The latest-result rule's engine: for random groups on random graphs, a member is latest exactly when
+/// no member of its group descends from it, as the walk says; an id the graph lacks is never latest,
+/// and an empty group costs nothing.
+#[test]
+fn latest_agrees_with_walking_the_graph() {
+    for seed in 0..4 {
+        let mut rng = Lcg(seed + 10);
+        let mut b = Built::new();
+        for _ in 0..300 {
+            let n = b.ids.len();
+            let parents: Vec<ContributionId> = match (n == 0, rng.below(10)) {
+                (true, _) | (_, 0) => vec![],
+                (false, 1..=2) => (0..3).map(|_| b.ids[rng.below(n)]).collect(),
+                _ => vec![b.ids[n - 1 - rng.below(n.min(5))]],
+            };
+            b.add(parents);
+        }
+        let ids = b.ids.clone();
+        let mut groups: Vec<Vec<ContributionId>> = (0..12)
+            .map(|k| {
+                let mut group: Vec<ContributionId> = (0..k * 9).map(|_| ids[rng.below(ids.len())]).collect();
+                group.sort();
+                group.dedup();
+                group
+            })
+            .collect();
+        groups[5].push(ContributionId([9; 32]));
+        let (answers, stats) = latest(&b.g, &groups);
+        assert_eq!(stats.fallbacks, 0);
+        let mut some_not_latest = false;
+        for (group, answer) in groups.iter().zip(&answers) {
+            for (member, is_latest) in group.iter().zip(answer) {
+                let walked = b.g.contains(member) && !group.iter().any(|other| b.g.is_ancestor(member, other));
+                assert_eq!(*is_latest, walked, "seed {seed}: {member}");
+                some_not_latest |= b.g.contains(member) && !walked;
+            }
+        }
+        assert!(some_not_latest, "seed {seed}: the groups are deep enough to test");
+        assert!(stats.passes <= stats.list_entries.div_ceil(64), "{stats:?}");
+    }
 }

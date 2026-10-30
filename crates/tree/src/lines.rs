@@ -124,6 +124,8 @@ pub struct Lines {
     firsts: BTreeSet<ContributionId>,
     decisions: BTreeMap<ContributionId, DecisionRecord>,
     proposals: BTreeMap<ContributionId, ProposalRecord>,
+    /// Retracted proposals' payloads: a review of one still names its line and change.
+    retracted_proposals: BTreeMap<ContributionId, Proposal>,
     judged: BTreeMap<ContributionId, Result<Qualified, Unqualified>>,
     /// Decisions in causal order, parents first, ties by the smallest id.
     order: Vec<ContributionId>,
@@ -158,10 +160,14 @@ impl Lines {
                         lines.versions.insert(*id, Version { id: *id, author: c.author(), policy });
                     }
                 }
-                PROPOSAL_MEDIA_TYPE if !g.is_retracted(id) => {
+                PROPOSAL_MEDIA_TYPE => {
                     if let Ok(proposal) = Proposal::decode(content) {
-                        let record = ProposalRecord { id: *id, author: c.author(), proposal, verdict: Ok(()) };
-                        lines.proposals.insert(*id, record);
+                        if g.is_retracted(id) {
+                            lines.retracted_proposals.insert(*id, proposal);
+                        } else {
+                            let record = ProposalRecord { id: *id, author: c.author(), proposal, verdict: Ok(()) };
+                            lines.proposals.insert(*id, record);
+                        }
                     }
                 }
                 DECISION_MEDIA_TYPE => {
@@ -526,6 +532,11 @@ impl Lines {
         self.firsts.iter().filter(|id| !self.predecessors.contains_key(id)).map(|id| &self.versions[id])
     }
 
+    /// Every version of every line's policy that counts, in id order.
+    pub fn versions(&self) -> impl Iterator<Item = &Version> {
+        self.versions.values()
+    }
+
     /// Any version of any line's policy.
     pub fn version(&self, id: &ContributionId) -> Option<&Version> {
         self.versions.get(id)
@@ -555,9 +566,15 @@ impl Lines {
         self.decisions.get(id)
     }
 
-    /// A proposal, valid or not.
+    /// A proposal, valid or not, not retracted.
     pub fn proposal(&self, id: &ContributionId) -> Option<&ProposalRecord> {
         self.proposals.get(id)
+    }
+
+    /// The payload of a proposal artifact that decodes, retracted or not, valid or not: what a review of
+    /// it names, by its line and change (finding 06bbc6a34636).
+    pub fn proposal_named(&self, id: &ContributionId) -> Option<&Proposal> {
+        self.proposals.get(id).map(|r| &r.proposal).or_else(|| self.retracted_proposals.get(id))
     }
 
     /// The valid proposals on a line, ascending.

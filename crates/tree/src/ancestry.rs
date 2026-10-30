@@ -451,3 +451,72 @@ pub fn rounds(
         ..passes.stats()
     }
 }
+
+/// For each of `groups`, which of its members no other member of the same group descends from: the
+/// latest, in causal order (weave.md section 2, the latest-result rule). The members are targets, 64 to
+/// a pass as for references, and each member reads its own word to mark the members of its group below
+/// it, so nothing is kept but a bit per member. A member the graph doesn't hold is never latest.
+#[doc(hidden)]
+pub fn latest(g: &Graph, groups: &[Vec<ContributionId>]) -> (Vec<Vec<bool>>, Stats) {
+    let mut passes = Passes::new(g);
+    // The groups side by side, each in causal order: group `k` holds targets `offsets[k]..offsets[k + 1]`,
+    // and target `t` is at position `targets[t]` (`u32::MAX` off the graph, first) and is member
+    // `slots[t]` of its group.
+    let mut offsets = vec![0];
+    let mut targets: Vec<u32> = Vec::new();
+    let mut slots: Vec<u32> = Vec::new();
+    for group in groups {
+        let mut by_position: Vec<(u32, u32)> = group
+            .iter()
+            .enumerate()
+            .map(|(slot, t)| (passes.position(t).map_or(u32::MAX, |at| at as u32), slot as u32))
+            .collect();
+        by_position.sort_unstable_by_key(|(at, _)| at.wrapping_add(1));
+        targets.extend(by_position.iter().map(|(at, _)| *at));
+        slots.extend(by_position.iter().map(|(_, slot)| *slot));
+        offsets.push(targets.len());
+    }
+    let mut latest: Vec<Vec<bool>> =
+        groups.iter().map(|group| group.iter().map(|t| passes.position(t).is_some()).collect()).collect();
+    let mut skipped = 0;
+    // Groups are in target order, so those meeting a chunk are a run, from `low`.
+    let mut low = 0;
+    for chunk in 0..targets.len().div_ceil(64) {
+        let (start, stop) = (chunk * 64, (chunk * 64 + 64).min(targets.len()));
+        while offsets[low + 1] <= start {
+            low += 1;
+        }
+        let high = low + offsets[low..groups.len()].iter().take_while(|from| **from < stop).count();
+        // Every member of a group meeting the chunk reads it: the pass reaches the latest of them.
+        let last = (low..high)
+            .filter(|k| offsets[*k] < offsets[*k + 1])
+            .map(|k| targets[offsets[k + 1] - 1])
+            .filter(|at| *at != u32::MAX)
+            .max();
+        let owners: Vec<(usize, u64)> =
+            (start..stop).filter(|t| targets[*t] != u32::MAX).map(|t| (targets[t] as usize, 1 << (t % 64))).collect();
+        match last {
+            Some(last) if passes.run(&owners, last as usize) => {}
+            _ => {
+                skipped += 1;
+                continue;
+            }
+        }
+        for k in low..high {
+            let mine = start.max(offsets[k])..stop.min(offsets[k + 1]);
+            for reader in &targets[offsets[k]..offsets[k + 1]] {
+                if *reader == u32::MAX {
+                    continue;
+                }
+                let word = passes.below(*reader as usize);
+                for t in mine.clone() {
+                    if word & (1 << (t % 64)) != 0 {
+                        latest[k][slots[t] as usize] = false;
+                    }
+                }
+            }
+        }
+    }
+    let questions = groups.iter().map(|group| group.len() * group.len()).sum();
+    (latest, Stats { questions, skipped, list_entries: targets.len(), ..passes.stats() })
+}

@@ -12,6 +12,8 @@
 //! | [`ground`] | Weave's records in a Ground: an index, kinds, and what check lists |
 //! | [`hash`]   | Content hashes, labelled `blake3:` in text                    |
 //! | [`path`]   | Path and symlink-target rules, folding and collisions         |
+//! | [`results`] | Check results, counted under a policy, and green             |
+//! | [`reviews`] | Goals, and reviews of decisions, proposals and manifests     |
 //! | [`diff`]   | Differences between manifests, and unified text diffs          |
 //! | [`format`] | Every Weave record's payload format, in canonical CBOR        |
 //! | [`import`] | Import from git's view of a tree, with exclusions and refusals |
@@ -34,6 +36,8 @@ pub mod lines;
 pub mod materialize;
 pub mod merge;
 pub mod path;
+pub mod results;
+pub mod reviews;
 pub mod secrets;
 
 pub use format::{
