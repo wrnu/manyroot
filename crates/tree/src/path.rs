@@ -6,6 +6,8 @@
 //! `core.protectHFS` and `core.protectNTFS` do, and keep `.git` and every
 //! `.bracken*` name out of a tree.
 
+use std::collections::HashMap;
+
 use icu_casemap::CaseMapper;
 use unicode_normalization::UnicodeNormalization;
 
@@ -161,8 +163,13 @@ pub enum Collision {
 /// ones are neighbours, and the paths under a directory `d` are the contiguous run
 /// that starts with `d/`. Validate the paths first, so their length is bounded.
 pub fn find_collision<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<Collision> {
+    collision_among(paths.into_iter().map(|path| (fold(path), path)).collect())
+}
+
+/// [`find_collision`] on paths already folded.
+fn collision_among(folds: Vec<(String, &str)>) -> Option<Collision> {
     let mut folded: Vec<(String, usize, &str)> =
-        paths.into_iter().enumerate().map(|(i, path)| (fold(path), i, path)).collect();
+        folds.into_iter().enumerate().map(|(i, (fold, path))| (fold, i, path)).collect();
     folded.sort();
     if let Some(pair) = folded.windows(2).find(|pair| pair[0].0 == pair[1].0) {
         return Some(Collision::Equal(pair[0].2.to_owned(), pair[1].2.to_owned()));
@@ -177,6 +184,62 @@ pub fn find_collision<'a>(paths: impl IntoIterator<Item = &'a str>) -> Option<Co
         }
     }
     None
+}
+
+/// Each distinct path's validity and fold, worked out once. Opening a Ground
+/// checks every manifest's paths, and most paths recur in every manifest of a
+/// line, so folding each again would cost most of an open (note a7fa29b0b0f3).
+/// It holds one entry per distinct path it was asked about, and gives the same
+/// answers as [`validate_path`], [`fold`] and [`find_collision`].
+#[derive(Debug, Default)]
+pub struct PathCache {
+    paths: HashMap<String, Checked>,
+}
+
+#[derive(Debug)]
+struct Checked {
+    valid: Result<(), PathError>,
+    /// Folded only once the path is valid, so its length is bounded.
+    fold: Option<String>,
+}
+
+impl PathCache {
+    pub fn new() -> PathCache {
+        PathCache::default()
+    }
+
+    fn checked(&mut self, path: &str) -> &mut Checked {
+        if !self.paths.contains_key(path) {
+            self.paths.insert(path.to_owned(), Checked { valid: validate_path(path), fold: None });
+        }
+        self.paths.get_mut(path).expect("inserted above")
+    }
+
+    /// [`validate_path`].
+    pub fn validate(&mut self, path: &str) -> Result<(), PathError> {
+        self.checked(path).valid.clone()
+    }
+
+    /// [`find_collision`]. Validate the paths first.
+    pub fn find_collision<'a>(&mut self, paths: impl IntoIterator<Item = &'a str>) -> Option<Collision> {
+        let folds = paths
+            .into_iter()
+            .map(|path| {
+                let checked = self.checked(path);
+                (checked.fold.get_or_insert_with(|| fold(path)).clone(), path)
+            })
+            .collect();
+        collision_among(folds)
+    }
+
+    /// How many distinct paths it holds.
+    pub fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
 }
 
 #[cfg(test)]

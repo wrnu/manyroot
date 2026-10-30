@@ -1,7 +1,7 @@
 //! Every path, folding, collision and symlink-target rule, positive and negative
 //! (docs/design/weave.md, *Unit: a file, by path*, and build step 1).
 
-use bracken_tree::path::{find_collision, fold, validate_path, validate_symlink_target};
+use bracken_tree::path::{PathCache, find_collision, fold, validate_path, validate_symlink_target};
 use bracken_tree::{Collision, PathError};
 
 #[test]
@@ -271,5 +271,47 @@ fn canonically_equivalent_folds_collide() {
 fn a_bracken_prefix_with_a_combining_mark_is_refused() {
     for path in [".bracken\u{300}", ".bracken\u{301}-bin", "x/.bracken\u{327}team", ".BRACKEN\u{301}", ".brackeñ"] {
         assert!(matches!(validate_path(path), Err(PathError::Reserved(_))), "{path:?}");
+    }
+}
+
+/// The cache an open checks manifests through gives the answers the plain functions give, the first time
+/// and every time after (note a7fa29b0b0f3).
+#[test]
+fn the_path_cache_gives_the_same_answers() {
+    let paths = [
+        "a",
+        "src/lib.rs",
+        "docs/über.md",
+        "docs/u\u{308}ber.md",
+        "Read.md",
+        "read.md",
+        "d",
+        "d/x",
+        "D/y",
+        "",
+        "/abs",
+        "a/../b",
+        ".git/config",
+        ".Bracken/x",
+        "a\u{200b}b",
+        "c:d",
+    ];
+    let mut cache = PathCache::new();
+    for _ in 0..2 {
+        for path in paths {
+            assert_eq!(cache.validate(path), validate_path(path), "{path:?}");
+        }
+    }
+    assert_eq!(cache.len(), paths.len());
+    let valid: Vec<&str> = paths.iter().copied().filter(|p| validate_path(p).is_ok()).collect();
+    for set in [
+        &["a", "src/lib.rs"][..],
+        &["Read.md", "read.md"],
+        &["docs/über.md", "docs/u\u{308}ber.md"],
+        &["d", "D/y"],
+        &["d/x", "D/y", "a"],
+        &valid,
+    ] {
+        assert_eq!(cache.find_collision(set.iter().copied()), find_collision(set.iter().copied()), "{set:?}");
     }
 }

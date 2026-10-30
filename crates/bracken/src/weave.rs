@@ -270,6 +270,8 @@ pub(crate) fn init(dir: Option<&Path>, agent: Option<&str>, purpose: String, out
 }
 
 fn write_record<R: Record>(s: &mut Store, who: &Identity, record: &R) -> Result<ContributionId> {
+    // Weave would ignore a record that breaks its own rules, such as a decision over MAX_REFERENCES.
+    record.validate().context("the record isn't valid, so it wasn't written")?;
     let body = Body::Artifact {
         name: record.artifact_name().to_owned(),
         media_type: R::MEDIA_TYPE.to_owned(),

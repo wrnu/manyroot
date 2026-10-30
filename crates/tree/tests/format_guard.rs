@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use bracken_tree::format::{
     self, DECISION_MEDIA_TYPE, FILE_MEDIA_TYPE, LINE_MEDIA_TYPE, MANIFEST_MEDIA_TYPE, MARKER_MEDIA_TYPE,
-    PROPOSAL_MEDIA_TYPE, RESOLUTION_MEDIA_TYPE, from_cbor, parse_method, to_cbor,
+    MAX_REFERENCES, PROPOSAL_MEDIA_TYPE, RESOLUTION_MEDIA_TYPE, from_cbor, parse_method, to_cbor,
 };
 use bracken_tree::{
     Answer, Breakage, Change, CheckDefinition, ContentHash, Decision, Disposition, Entry, FileValue, FormatError,
@@ -323,6 +323,26 @@ fn line_rules() {
 
     let blank_owner = Line { owner_decision: Some(" ".to_owned()), ..line() };
     assert_eq!(Line::decode(&blank_owner.encode()), Err(FormatError::Blank("owner_decision")));
+}
+
+/// Finding 1873f4834edd: a decision may refer to at most MAX_REFERENCES contributions in all.
+#[test]
+fn a_decision_refers_to_at_most_max_references() {
+    let d = decision();
+    let others = 1 + d.proposals.len() + d.answers.len() + d.resolutions.len() + d.goals.len();
+    let parents = |n: usize| -> Vec<ContributionId> {
+        (0..n)
+            .map(|i| {
+                let mut bytes = [0; 32];
+                bytes[..8].copy_from_slice(&(i as u64).to_be_bytes());
+                ContributionId(bytes)
+            })
+            .collect()
+    };
+    let at_limit = Decision { parents: parents(MAX_REFERENCES - others), ..decision() };
+    assert_eq!(Decision::decode(&at_limit.encode()), Ok(at_limit));
+    let over = Decision { parents: parents(MAX_REFERENCES - others + 1), ..decision() };
+    assert_eq!(Decision::decode(&over.encode()), Err(FormatError::TooManyReferences(MAX_REFERENCES + 1)));
 }
 
 #[test]
