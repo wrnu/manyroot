@@ -10,6 +10,7 @@ repository = "https://forge.jx.rs/Autimo/manyroot"
 
 [workspace.dependencies]
 manyroot = { path = "crates/manyroot" }
+bracken-tree = { path = "crates/tree" }
 anyhow = "1"
 blake3 = "1"
 ciborium = "0.2"

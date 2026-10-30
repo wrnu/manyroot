@@ -355,3 +355,32 @@ fn the_callers_git_environment_and_fsmonitor_are_ignored() {
     assert!(status.success(), "the child read another repository");
     assert!(!marker.exists(), "a configured fsmonitor ran");
 }
+
+// Security's note on PR #98: the key scan doesn't follow a symlink in
+// identities/, reads only regular files, and refuses one too large to be an
+// identity.
+#[test]
+fn the_key_scan_refuses_symlinks_and_oversized_identity_files() {
+    let ground = tempfile::tempdir().expect("a temporary Ground");
+    let elsewhere = ground.path().join("elsewhere.json");
+    std::fs::write(&elsewhere, format!("{{\"secret_key\": \"{}\"}}\n", "cd".repeat(32))).expect("write");
+
+    let linked = ground.path().join("linked");
+    std::fs::create_dir(&linked).expect("mkdir");
+    std::os::unix::fs::symlink(&elsewhere, linked.join("a.json")).expect("symlink");
+    let error = KnownKeys::new().add_identities_dir(&linked).expect_err("a symlink is refused");
+    assert!(error.to_string().contains("a.json"), "{error}");
+
+    let large = ground.path().join("large");
+    std::fs::create_dir(&large).expect("mkdir");
+    let mut big = format!("{{\"secret_key\": \"{}\", \"pad\": \"", "cd".repeat(32)).into_bytes();
+    big.resize(bracken_tree::secrets::MAX_IDENTITY_FILE_BYTES as usize + 1, b'x');
+    std::fs::write(large.join("b.json"), &big).expect("write");
+    let error = KnownKeys::new().add_identities_dir(&large).expect_err("an oversized file is refused");
+    assert!(error.to_string().contains("too large"), "{error}");
+
+    let dir = ground.path().join("dir");
+    std::fs::create_dir_all(dir.join("c.json")).expect("mkdir");
+    let error = KnownKeys::new().add_identities_dir(&dir).expect_err("a directory is refused");
+    assert!(error.to_string().contains("not a regular file"), "{error}");
+}
