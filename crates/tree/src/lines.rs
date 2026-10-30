@@ -15,6 +15,7 @@
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem::size_of;
+use std::sync::Arc;
 
 use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
 
@@ -73,9 +74,15 @@ pub enum Unqualified {
     NotALine(ContributionId),
     #[error("its line {0} isn't a causal ancestor of it")]
     LineNotAnAncestor(ContributionId),
-    /// No single policy is in force: the chain diverged among its ancestors.
-    #[error("the line's policy has diverged into {0:?}, so no policy is in force; the line's author settles them")]
-    PolicyDiverged(Vec<ContributionId>),
+    /// No single policy is in force: the chain diverged among its ancestors, into
+    /// `count` versions. `versions` holds the first [`DIVERGED_SHOWN`] of them, ascending,
+    /// shared by every decision that found the same ones (task a90865cb60db);
+    /// [`Lines::current_versions`] lists them all.
+    #[error(
+        "the line's policy has diverged into {count} versions, among them {versions:?}, so no policy is in force; \
+         the line's author settles them"
+    )]
+    PolicyDiverged { versions: Arc<[ContributionId]>, count: usize },
     /// Rule 2.
     #[error("its author {author} isn't an integrator under the policy in force, {policy}")]
     NotAnIntegrator { author: AgentId, policy: ContributionId },
@@ -90,6 +97,11 @@ pub enum Unqualified {
     #[error("its manifest {hash} isn't complete here: {missing} files are missing, or held at another size")]
     ManifestIncomplete { hash: ContentHash, missing: usize },
 }
+
+/// The most versions a [`Unqualified::PolicyDiverged`] verdict holds. Each decision whose
+/// past saw a different divergence keeps its own list, so a line's author could otherwise
+/// make D decisions keep up to D x K versions (task a90865cb60db).
+pub const DIVERGED_SHOWN: usize = 8;
 
 /// A qualifying decision's line and the policy version in force for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -402,6 +414,8 @@ impl Lines {
         asks.shrink_to_fit();
         let missed = Cell::new(0);
         let mut chains = HashMap::new();
+        // Each distinct list of diverged versions, kept once and shared by every verdict naming it.
+        let mut diverged: HashSet<Arc<[ContributionId]>> = HashSet::new();
         let stats = ancestry::rounds(g, &lists, &askers, |k, answers| {
             let (asker, (line, policy)) = (askers[k].0, asks[k]);
             let before = |a: &ContributionId| {
@@ -412,21 +426,33 @@ impl Lines {
                     g.is_ancestor(a, &asker)
                 })
             };
-            chains.insert(asker, self.chain(&line, policy, before));
+            let mut verdict = self.chain(&line, policy, before);
+            if let Err(Unqualified::PolicyDiverged { versions, .. }) = &mut verdict {
+                match diverged.get(&versions[..]) {
+                    Some(shared) => *versions = shared.clone(),
+                    None => {
+                        diverged.insert(versions.clone());
+                    }
+                }
+            }
+            chains.insert(asker, verdict);
         });
-        // What the chain questions hold until the records are judged: the lists, the askers, and a verdict
-        // each, with any diverged policy's versions (task a90865cb60db).
-        let id = size_of::<ContributionId>();
-        let bytes = lists.iter().map(|l| size_of::<Vec<ContributionId>>() + l.capacity() * id).sum::<usize>()
-            + askers.capacity() * size_of::<(ContributionId, usize)>()
-            + asks.capacity() * size_of::<(ContributionId, bool)>()
-            + chains.len() * (id + size_of::<Result<ContributionId, Unqualified>>())
-            + chains
-                .values()
-                .map(|c| match c {
-                    Err(Unqualified::PolicyDiverged(versions)) => versions.capacity() * id,
-                    _ => 0,
-                })
+        // What the chain questions hold until the records are judged, counted by hand from each structure's
+        // own element type: the lists, the askers, a verdict each, and each distinct list of diverged
+        // versions once (task a90865cb60db).
+        fn kept<T>(v: &Vec<T>) -> usize {
+            size_of::<Vec<T>>() + v.capacity() * size_of::<T>()
+        }
+        fn entries<K, V>(m: &HashMap<K, V>) -> usize {
+            m.len() * size_of::<(K, V)>()
+        }
+        let bytes = lists.iter().map(kept).sum::<usize>()
+            + kept(&askers)
+            + kept(&asks)
+            + entries(&chains)
+            + diverged
+                .iter()
+                .map(|d| size_of::<Arc<[ContributionId]>>() + 2 * size_of::<usize>() + size_of_val(&d[..]))
                 .sum::<usize>();
         self.stats = Stats { fallbacks: missed.get(), bytes, ..stats };
         chains
@@ -445,6 +471,19 @@ impl Lines {
         line: &ContributionId,
         before: &impl Fn(&ContributionId) -> bool,
     ) -> Result<ContributionId, Unqualified> {
+        let newest = self.newest(line, before);
+        match newest.as_slice() {
+            [one] => Ok(*one),
+            _ => Err(Unqualified::PolicyDiverged {
+                versions: newest.iter().take(DIVERGED_SHOWN).copied().collect(),
+                count: newest.len(),
+            }),
+        }
+    }
+
+    /// The versions of `line`'s chain among the contributions `before` holds that no
+    /// other version there supersedes, ascending.
+    fn newest(&self, line: &ContributionId, before: &impl Fn(&ContributionId) -> bool) -> Vec<ContributionId> {
         let mut newest = Vec::new();
         let mut seen = HashSet::from([*line]);
         let mut stack = vec![*line];
@@ -464,10 +503,7 @@ impl Lines {
             }
         }
         newest.sort();
-        match newest.as_slice() {
-            [one] => Ok(*one),
-            _ => Err(Unqualified::PolicyDiverged(newest)),
-        }
+        newest
     }
 
     /// Whether a decision `author` would write now, listing every current head of
@@ -504,10 +540,9 @@ impl Lines {
     /// The line's current policy: the version of its chain no other in the replica supersedes. Several
     /// if the chain diverged.
     pub fn current_versions(&self, line: &ContributionId) -> Vec<ContributionId> {
-        match self.policy_in_force(line, &|_: &ContributionId| true) {
-            Ok(one) => vec![one],
-            Err(Unqualified::PolicyDiverged(many)) => many,
-            Err(_) => vec![],
+        match self.versions.contains_key(line) {
+            true => self.newest(line, &|_: &ContributionId| true),
+            false => vec![],
         }
     }
 

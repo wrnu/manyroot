@@ -3,13 +3,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use bracken_tree::format::{
     Change, DECISION_MEDIA_TYPE, Decision, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line, Manifest, Marker,
     Proposal, Record, VERSION,
 };
 use bracken_tree::ground::Index;
-use bracken_tree::lines::{InvalidProposal, Lines, Unqualified};
+use bracken_tree::lines::{DIVERGED_SHOWN, InvalidProposal, Lines, Unqualified};
 use bracken_tree::{ContentHash, Entry, Mode};
 use manyroot::{Body, Contribution, ContributionId, Graph, GroundId, Identity, RelationKind};
 
@@ -309,7 +310,7 @@ fn a_diverged_policy_qualifies_nothing_until_the_author_settles_it() {
     let b = w.record(&alice, &other);
     w.supersede(&alice, b, w.line);
     let d = w.decide(&alice, "d", m0, &[], None);
-    assert!(matches!(w.unqualified(&d), Unqualified::PolicyDiverged(v) if v.len() == 2));
+    assert!(matches!(w.unqualified(&d), Unqualified::PolicyDiverged { versions, count: 2 } if versions.len() == 2));
     let settled = w.record(&alice, &policy(&[&alice]));
     w.supersede(&alice, settled, a);
     w.supersede(&alice, settled, b);
@@ -661,13 +662,14 @@ fn only_the_authors_supersedes_relations_are_asked_about() {
     assert_kept(&w.lines(), 1, 2);
 }
 
-/// What Lines' chain questions hold until its records are judged (finding 1cdb8b4dcac8): 32 bytes a
-/// relation in the lists, 64 for the lists themselves (these shapes have at most two), and 184 bytes an asker
-/// for its two entries and its verdict (177 measured on a 64-bit target). Keeping an asker's answers after its
-/// verdict would add K / 8 bytes an asker, 38 at K = 300, and a list per asker 32 K: either breaks it.
+/// What Lines' chain questions hold until its records are judged (findings 1cdb8b4dcac8 and 09c403532fc9):
+/// 32 bytes a relation in the lists, 128 for the vectors themselves (these shapes have at most two lists),
+/// and 184 bytes an asker for its two entries and its verdict, by their types' sizes on a 64-bit target.
+/// Keeping an asker's answers after its verdict would add K / 8 bytes an asker, 38 at K = 300, and a list
+/// per asker 32 K: either breaks it.
 fn assert_kept(lines: &Lines, relations: usize, askers: usize) {
     let stats = lines.stats();
-    let bound = 32 * relations + 184 * askers + 64;
+    let bound = 32 * relations + 184 * askers + 128;
     assert!(stats.bytes > 0 && stats.bytes <= bound, "{relations} relations, {askers} askers: {stats:?}");
 }
 
@@ -704,10 +706,11 @@ fn many_decisions_after_a_long_chain_share_one_answer_vector() {
 
 /// The batch budget (answer b2dbc4f5e810): a decision after each new version of a long chain, so every
 /// past differs. The answers are held a round at a time, within a word per contribution, and a round's
-/// passes reach only the relations written before its last decision.
+/// passes reach only the relations written before its last decision. Checked against the walk (finding
+/// 09c403532fc9), so a little smaller than the other long chains.
 #[test]
 fn a_decision_after_each_version_is_answered_in_rounds_within_a_word_per_contribution() {
-    const K: usize = 300;
+    const K: usize = 200;
     let mut w = World::new(counter());
     let alice = w.alice.clone();
     let m0 = w.tree(&alice, b"zero");
@@ -718,11 +721,12 @@ fn a_decision_after_each_version_is_answered_in_rounds_within_a_word_per_contrib
         newest = next;
         decisions.push(w.record(&alice, &decision(w.line, m0, vec![], "d")));
     }
-    let lines = unchecked(&w.g);
+    let lines = w.lines();
     let stats = lines.stats();
     let n = w.g.len();
+    assert!(K * K.div_ceil(64) > n, "more than one round");
     assert_eq!((stats.vectors, stats.questions), (K, K * K), "{stats:?}");
-    // 5 words a vector and n words a round: ceil(5K / (5 floor(n / 5))) rounds, each reaching the chunks
+    // ceil(K / 64) words a vector and n words a round, each round reaching the chunks
     // its last decision has in its past.
     let per_round = n / K.div_ceil(64);
     assert_eq!(stats.peak_words, per_round * K.div_ceil(64), "{stats:?}");
@@ -910,4 +914,65 @@ fn lines_agree_with_walking_the_graph() {
         let qualified = decisions.iter().filter(|d| matches!(lines.verdict(d), Some(Ok(_)))).count();
         assert!(qualified > 10 && qualified < decisions.len(), "seed {seed}: {qualified} of {}", decisions.len());
     }
+}
+
+/// Task a90865cb60db: K versions superseding the line, none another, so its policy diverges into K; D
+/// decisions written after them all find the same K. They share one list of the first DIVERGED_SHOWN,
+/// with the count, so what Lines keeps is linear in D + K, not D x K; the line's author still sees all K.
+#[test]
+fn a_diverged_policy_is_kept_once_however_many_decisions_find_it() {
+    const K: usize = 1_000;
+    const D: usize = 1_000;
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let m0 = w.tree(&alice, b"zero");
+    for _ in 0..K {
+        let version = w.record(&alice, &policy(&[&alice]));
+        w.supersede(&alice, version, w.line);
+    }
+    let decisions = w.decide_on(&alice, w.line, m0, D);
+    let lines = unchecked(&w.g);
+    assert_eq!(lines.current_versions(&w.line).len(), K);
+    let shown = |d: &ContributionId| match lines.verdict(d) {
+        Some(Err(Unqualified::PolicyDiverged { versions, count })) => (versions.clone(), *count),
+        other => panic!("{d}: {other:?}"),
+    };
+    let (first, count) = shown(&decisions[0]);
+    assert_eq!((first.len(), count), (DIVERGED_SHOWN, K));
+    assert_eq!(&first[..], &lines.current_versions(&w.line)[..DIVERGED_SHOWN]);
+    for d in &decisions[1..] {
+        assert!(Arc::ptr_eq(&shown(d).0, &first), "{d} shares the first decision's list");
+    }
+    // The one shared list: 8 versions, a pointer and two counts.
+    assert_kept(&lines, K, D);
+    assert!(lines.stats().bytes <= 32 * K + 184 * D + 128 + 8 * 32 + 32, "{:?}", lines.stats());
+}
+
+/// Task a90865cb60db: a version superseding the line, then a decision, repeated, so each decision finds one
+/// more diverged version than the one before, a different list each time. Each keeps at most
+/// DIVERGED_SHOWN, so D decisions keep at most D x DIVERGED_SHOWN versions, not D x K / 2.
+#[test]
+fn every_decision_finding_a_different_divergence_keeps_a_bounded_list() {
+    const K: usize = 150;
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let m0 = w.tree(&alice, b"zero");
+    let mut decisions = vec![];
+    for _ in 0..K {
+        let version = w.record(&alice, &policy(&[&alice]));
+        w.supersede(&alice, version, w.line);
+        decisions.push(w.record(&alice, &decision(w.line, m0, vec![], "d")));
+    }
+    let lines = w.lines();
+    for (i, d) in decisions.iter().enumerate() {
+        match lines.verdict(d) {
+            Some(Ok(q)) => assert_eq!(i, 0, "only the first, after one version, qualifies: {q:?}"),
+            Some(Err(Unqualified::PolicyDiverged { versions, count })) => {
+                assert_eq!((versions.len(), *count), ((i + 1).min(DIVERGED_SHOWN), i + 1), "{d}")
+            }
+            other => panic!("{d}: {other:?}"),
+        }
+    }
+    let lists = K - 1;
+    assert!(lines.stats().bytes <= 32 * K + 184 * K + 128 + lists * (DIVERGED_SHOWN * 32 + 32), "{:?}", lines.stats());
 }
