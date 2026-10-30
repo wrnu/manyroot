@@ -1539,13 +1539,15 @@ mod tests {
         }
         // A burst past the shedding queue still gets 503s (finding 18fe9ad99875). Silent connections fill
         // the queue, each holding the shedder for its second of linger; those that come next are answered
-        // at once. They send nothing, so the close without a linger can't reset them.
-        let silent: Vec<TcpStream> =
-            (0..SHED_QUEUE + 4).map(|_| TcpStream::connect(("127.0.0.1", a)).expect("connect")).collect();
-        std::thread::sleep(Duration::from_millis(200));
-        for _ in 0..8 {
-            let mut burst = TcpStream::connect(("127.0.0.1", a)).expect("connect");
-            burst.set_read_timeout(Some(Duration::from_secs(2))).expect("a read timeout");
+        // at once. They send nothing, so the close without a linger can't reset them. The burst connects
+        // right behind the silent ones, as the shedder frees a slot after its first linger, and a burst
+        // connection accepted then would wait in the queue (note d416610e525c). Waiting, it would get
+        // its 503 only after the 16 silent ones' lingers, and the read timeout is well short of that.
+        let connect = |_| TcpStream::connect(("127.0.0.1", a)).expect("connect");
+        let silent: Vec<TcpStream> = (0..SHED_QUEUE + 4).map(connect).collect();
+        let burst: Vec<TcpStream> = (0..8).map(connect).collect();
+        for mut burst in burst {
+            burst.set_read_timeout(Some(Duration::from_secs(8))).expect("a read timeout");
             let mut head = [0u8; 12];
             std::io::Read::read_exact(&mut burst, &mut head).expect("a 503 before the queue drains");
             assert_eq!(&head, b"HTTP/1.1 503");
