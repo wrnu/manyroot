@@ -280,6 +280,42 @@ hold all 16 sessions (no per-credential limit yet). Tokens must be long and
 random: the file holds unsalted blake3 hashes. Withholding (section 4) is
 unchanged.
 
+### The change feed
+
+Task `09bf8248e69b`, with the manager's answers in `acaa21dc780d`. It lets an agent be woken by what
+reaches the team server without syncing a whole session each time. It isn't part of the sync protocol:
+it carries contributions in the bundle format, and the caller checks them as a local read checks its
+replica.
+
+- **Request.** `POST /v1/<ground>/changes` on the same listener, with the same bearer tokens. The body
+  is JSON, at most 64 KiB: `{"since": "<cursor>", "wait_ms": N}`. The cursor is `log --since`'s
+  (comma-separated full ids, `""` for everything), and `wait_ms` is at most 25000.
+- **Reply.** A bundle of what the cursor hasn't seen, sent once something is there or the wait is over
+  (then empty). The server's imports wake waiting requests. The bundle is a prefix of those
+  contributions in topological order, at most 8 MiB and 10,000 of them, and never less than one.
+  `X-Bracken-More: 1` says there is more. **Ancestors the caller lacks come only in topological
+  order, never out of it**: every contribution's parents are seen by the cursor or earlier in the
+  same reply. So a caller with an empty replica pages in from `""`, each reply resolving against
+  those before it. The server ignores a head it doesn't hold, and names up to 64 such heads in
+  `X-Bracken-Unknown-Heads`. The caller's next cursor holds its own heads, and also the heads of
+  what it holds minus those named and everything after them. So it isn't sent again what it holds
+  already, and once the server has a named head, that head counts as seen. The named set is
+  rebuilt from each reply (finding `6552f9b16c65`).
+- **Bounds.** At most 16 requests under way; more get 429. They count toward the 64 connections.
+  These bounds are for a server on 127.0.0.1; revisit them before it is exposed.
+- **The client**, `bracken watch --follow --sync <url> --token-file <file> --feed`:
+  - It keeps a graph in memory, starting from the local replica, and never writes the replica.
+  - It checks each reply as `Store::open` checks the replica. `bundle::read` decodes each
+    contribution in canonical form and recomputes its id. The bundle's ground must be the replica's.
+    `Graph::import` checks the rest: protocol, ground, size, signature, parents, references and body
+    rules.
+  - A reply with anything rejected or unresolved is dropped whole and said on stderr. Three in a row
+    end watch with exit 1.
+  - A failed request is retried after `--interval`, as is one that came back within a second with
+    nothing new, so no mismatch becomes a hot loop.
+  - A server without the feed (404, 405 or 501) is synced with instead, as `--sync` alone does.
+  - `scripts/bk` gives `--feed` to a pinned bracken that has it.
+
 ## 3. Authentication and who may push
 
 Signatures already say who wrote each contribution. What a server still

@@ -9,7 +9,9 @@
 //! opaque and pass back what was printed.
 //!
 //! Where new contributions come from (a [`Source`]) is kept apart from filtering and printing, so a
-//! source other than the local replica can feed the same output.
+//! source other than the local replica can feed the same output. Two do: the local replica ([`Local`]),
+//! and with `--feed` a team server's change feed ([`Feed`]), whose replies are verified as a local read
+//! verifies the replica, held in memory and never written to the replica.
 //!
 //! The output is other agents' text. Lines are escaped as `log`'s are, and a harness should treat
 //! them as untrusted and check a contribution with `show` before acting on it.
@@ -80,6 +82,13 @@ pub(crate) struct WatchArgs {
     /// With --sync: read the bearer token from this file.
     #[arg(long, value_name = "PATH", requires = "sync")]
     token_file: Option<PathBuf>,
+    /// With --sync: wait on the server's change feed instead of syncing before each read, and print what
+    /// arrives as it arrives. Everything it sends is verified as a local read verifies the replica, and
+    /// kept in memory: the replica isn't written. --interval is then the wait after a failed request, or
+    /// one that came back at once with nothing new. A server without the feed is synced with instead, as
+    /// --sync alone does.
+    #[arg(long, requires = "sync")]
+    feed: bool,
     #[command(flatten)]
     out: Output,
 }
@@ -162,7 +171,10 @@ pub(crate) fn run(s: Store, agent: Option<&str>, a: WatchArgs) -> Result<ExitCod
     };
     let filter = Filter { tag: a.tag.clone(), open, me };
     let mut cursor = Cursor::new(s.graph(), a.since.as_deref())?;
-    let mut source = Local { store: s, sync, first: true };
+    let mut source: Box<dyn Source> = match sync {
+        Some((url, token)) if a.feed => Box::new(Feed::new(s, url, token)),
+        sync => Box::new(Local { store: s, sync, first: true }),
+    };
     // The cursor last printed: each round ends with one if it moved, and the first always does.
     let mut printed: Option<String> = None;
     loop {
@@ -171,7 +183,7 @@ pub(crate) fn run(s: Store, agent: Option<&str>, a: WatchArgs) -> Result<ExitCod
         if !a.follow {
             return Ok(ExitCode::SUCCESS);
         }
-        if !wait(a.interval) {
+        if if source.pause() { !wait(a.interval) } else { reader_gone() } {
             return Ok(ExitCode::SUCCESS);
         }
         if cfg!(not(unix)) {
@@ -180,10 +192,11 @@ pub(crate) fn run(s: Store, agent: Option<&str>, a: WatchArgs) -> Result<ExitCod
     }
 }
 
-/// What a [`Source`] hands over each round: a replica holding everything new, and what is new since the
-/// cursor, in causal order. Each new contribution's parents are either seen by the cursor or earlier in
-/// `new`, so the cursor can move past them one at a time.
+/// What a [`Source`] hands over each round: a graph holding everything new, the replica whose identities
+/// name authors, and what is new since the cursor, in causal order. Each new contribution's parents are
+/// either seen by the cursor or earlier in `new`, so the cursor can move past them one at a time.
 struct Batch<'a> {
+    graph: &'a Graph,
     store: &'a Store,
     new: Vec<ContributionId>,
 }
@@ -191,9 +204,15 @@ struct Batch<'a> {
 /// Where new contributions come from, kept apart from filtering and printing ([`report`]). A source only
 /// says what is new since a cursor; the cursor is heads by full id, the same on every replica, so a
 /// source elsewhere (a team server's change feed) can answer for it too. It must bring each new
-/// contribution into the replica it hands over, since filters read the graph around it.
+/// contribution into the graph it hands over, since filters read the graph around it.
 trait Source {
     fn next(&mut self, cursor: &Cursor) -> Result<Batch<'_>>;
+
+    /// Whether `--follow` waits its `--interval` before the next round. A source that waits on its own
+    /// (a long poll) says no, except to back off after a failure.
+    fn pause(&self) -> bool {
+        true
+    }
 }
 
 /// The local replica: as opened for the first round, then re-read for each one after, synced first with
@@ -207,16 +226,173 @@ struct Local {
 impl Source for Local {
     fn next(&mut self, cursor: &Cursor) -> Result<Batch<'_>> {
         if !std::mem::take(&mut self.first) {
-            self.store = Store::open(self.store.dir())?;
-            if let Some((url, token)) = &self.sync {
-                let bounds = wire::Bounds { deadline: Duration::from_secs(30), ..wire::Bounds::default() };
-                if let Err(e) = remote::sync_http(&mut self.store, url, token, bounds) {
-                    eprintln!("bracken: watch: not synced with {url} ({e:#}); reading the local replica");
+            self.reread()?;
+        }
+        Ok(Batch { graph: self.store.graph(), store: &self.store, new: unseen(self.store.graph(), cursor) })
+    }
+}
+
+impl Local {
+    fn reread(&mut self) -> Result<()> {
+        self.store = Store::open(self.store.dir())?;
+        if let Some((url, token)) = &self.sync {
+            let bounds = wire::Bounds { deadline: Duration::from_secs(30), ..wire::Bounds::default() };
+            if let Err(e) = remote::sync_http(&mut self.store, url, token, bounds) {
+                eprintln!("bracken: watch: not synced with {url} ({e:#}); reading the local replica");
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What `g` holds that the cursor hasn't seen, in causal order.
+fn unseen(g: &Graph, cursor: &Cursor) -> Vec<ContributionId> {
+    g.topo_order().into_iter().filter(|id| !cursor.seen.contains(id)).collect()
+}
+
+/// How long a change feed request waits for something to arrive: the server's longest.
+const FEED_WAIT: Duration = crate::serve::FEED_MAX_WAIT;
+
+/// Replies in a row that fail verification before watch gives up.
+const FEED_BAD_REPLIES: u32 = 3;
+
+/// A reply that adds nothing and comes back sooner than this is a server answering at once with what
+/// this side holds already: the next request waits --interval, so a mismatch can't become a hot loop
+/// (finding 6552f9b16c65).
+const FEED_QUICK: Duration = Duration::from_secs(1);
+
+/// A team server's change feed (`bracken serve`'s `POST /v1/<ground>/changes`), long-polled. Its graph
+/// starts as the local replica's, read once, and grows by what the feed sends, in memory only. Each reply
+/// is checked as [`Store::open`] checks the replica: [`manyroot::bundle::read`] decodes each contribution
+/// in canonical form and recomputes its id, and [`Graph::import`] checks the rest ([`Graph::check`]:
+/// protocol, ground, size, signature, parents, references, body rules). A reply with anything rejected or
+/// unresolved is dropped whole. If the server has no feed, this syncs as [`Local`] does, from then on.
+struct Feed {
+    local: Local,
+    url: String,
+    token: String,
+    /// While the feed serves: everything verified so far. `None` once fallen back to syncing.
+    graph: Option<Graph>,
+    /// What this graph holds that the server's last reply said it lacks (the cursor's unknown heads), and
+    /// everything after them. Rebuilt from each reply, so a head that reaches the server later counts as
+    /// on it again (finding 6552f9b16c65).
+    off_server: HashSet<ContributionId>,
+    first: bool,
+    /// The last request failed, or came back at once with nothing new, so the next waits --interval.
+    failed: bool,
+    bad_replies: u32,
+}
+
+impl Feed {
+    fn new(store: Store, url: String, token: String) -> Feed {
+        let graph = Some(store.graph().clone());
+        let local = Local { store, sync: Some((url.clone(), token.clone())), first: false };
+        Feed { local, url, token, graph, off_server: HashSet::new(), first: true, failed: false, bad_replies: 0 }
+    }
+
+    /// The cursor to send: `g`'s heads, and the heads of what it holds that the server isn't known to lack.
+    /// The server leaves out what it lacks, so the second set keeps it from sending again what is here
+    /// already. The first lets it say, in each reply, which heads it still lacks: once it has them, they
+    /// count as seen, and the request waits again.
+    fn since(&self, g: &Graph) -> String {
+        let on_server = |id: &ContributionId| !self.off_server.contains(id);
+        let parents: HashSet<ContributionId> =
+            g.iter().filter(|c| on_server(&c.id())).flat_map(|c| c.parents().iter().copied()).collect();
+        let heads: BTreeSet<String> = g
+            .iter()
+            .map(|c| c.id())
+            .filter(|id| on_server(id) && !parents.contains(id))
+            .chain(g.heads())
+            .map(|id| id.to_hex())
+            .collect();
+        heads.into_iter().collect::<Vec<_>>().join(",")
+    }
+
+    /// One request, verified into the graph. A failure is said on stderr, and only verification failing
+    /// [`FEED_BAD_REPLIES`] times in a row is an error.
+    fn poll(&mut self) -> Result<()> {
+        let g = self.graph.as_ref().expect("polled only while the feed serves");
+        let since = self.since(g);
+        let asked = Instant::now();
+        let (bundle, unknown) = match remote::changes(&self.url, &self.token, g.ground(), &since, FEED_WAIT) {
+            Ok(remote::Changes::Reply { bundle, unknown }) => (bundle, unknown),
+            Ok(remote::Changes::Unsupported(status)) => {
+                eprintln!("bracken: watch: {} has no change feed ({status}); syncing with it instead", self.url);
+                self.graph = None;
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("bracken: watch: the change feed of {} failed ({e:#}); trying again", self.url);
+                self.failed = true;
+                return Ok(());
+            }
+        };
+        self.off_server.clear();
+        for id in unknown.iter().filter(|id| g.contains(id)) {
+            let mut stack = vec![*id];
+            while let Some(id) = stack.pop() {
+                if self.off_server.insert(id) {
+                    stack.extend(g.children(&id).iter().copied());
                 }
             }
         }
-        let new = self.store.graph().topo_order().into_iter().filter(|id| !cursor.seen.contains(id)).collect();
-        Ok(Batch { store: &self.store, new })
+        match verified(g, &bundle) {
+            Ok(next) => {
+                let idle = next.len() == g.len() && asked.elapsed() < FEED_QUICK;
+                (self.graph, self.failed, self.bad_replies) = (Some(next), idle, 0);
+                Ok(())
+            }
+            Err(e) => {
+                self.bad_replies += 1;
+                ensure!(
+                    self.bad_replies < FEED_BAD_REPLIES,
+                    "the change feed of {} sent {FEED_BAD_REPLIES} replies in a row that failed verification; the last: {e:#}",
+                    self.url
+                );
+                eprintln!(
+                    "bracken: watch: dropped a change feed reply from {} that failed verification: {e:#}",
+                    self.url
+                );
+                self.failed = true;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// `g` with a change feed reply's contributions added, or why the reply fails verification, in which
+/// case none of it counts.
+fn verified(g: &Graph, bundle: &[u8]) -> Result<Graph> {
+    let (ground, contributions) = manyroot::bundle::read(bundle).context("decoding the reply")?;
+    ensure!(ground == g.ground(), "the reply is of another ground, {ground}");
+    let mut next = g.clone();
+    let report = next.import(contributions);
+    if let Some((id, why)) = report.rejected.first() {
+        anyhow::bail!("{} of its contributions rejected, the first {id}: {why}", report.rejected.len());
+    }
+    if let Some(id) = report.unresolved.first() {
+        anyhow::bail!("{} of its contributions lack a parent, the first {id}", report.unresolved.len());
+    }
+    Ok(next)
+}
+
+impl Source for Feed {
+    fn next(&mut self, cursor: &Cursor) -> Result<Batch<'_>> {
+        // The first round reads the replica as it was opened, as Local's does.
+        if !std::mem::take(&mut self.first) {
+            if self.graph.is_some() {
+                self.poll()?;
+            }
+            if self.graph.is_none() {
+                self.local.reread()?;
+            }
+        }
+        let g = self.graph.as_ref().unwrap_or(self.local.store.graph());
+        Ok(Batch { graph: g, store: &self.local.store, new: unseen(g, cursor) })
+    }
+
+    fn pause(&self) -> bool {
+        self.failed || self.graph.is_none()
     }
 }
 
@@ -225,7 +401,7 @@ impl Source for Local {
 /// contribution, in its place. With --open it is each finding the batch made open, old or new, at the
 /// batch's end ([`newly_open`]).
 fn report(batch: &Batch, filter: &Filter, cursor: &mut Cursor, json: bool, printed: &mut Option<String>) -> Result<()> {
-    let g = batch.store.graph();
+    let g = batch.graph;
     if !batch.new.is_empty() {
         for id in &batch.new {
             ensure!(g.contains(id), "a source handed over {id}, which its replica doesn't hold");

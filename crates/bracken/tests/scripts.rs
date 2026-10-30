@@ -311,6 +311,7 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
             "#!/usr/bin/env bash\n\
              if [ \"$1\" = sync ]; then\n  echo \"$*\" >>\"$T/sync.log\"\n\
                if [ -e \"$T/fail-once\" ]; then rm -f \"$T/fail-once\"; echo refused >&2; exit 1; fi\nfi\n\
+             [ \"$1\" != watch ] || echo \"$*\" >>\"$T/watch.log\"\n\
              [ \"${3:-}\" != serve ] || [ ! -e \"$T/slow-serve\" ] || sleep 2\n\
              exec \"$REAL_BRACKEN\" \"$@\"\n",
         );
@@ -409,8 +410,13 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         follow.kill().unwrap();
         follow.wait().unwrap();
         assert!(next.contains(&later) && next.contains("while alice follows"), "{scripts}: {next}");
+        // It did so on the team server's change feed (task 09bf8248e69b): bk gives --feed to a bracken
+        // that has it.
+        let watches = std::fs::read_to_string(tmp.path().join("watch.log")).unwrap();
+        let followed = watches.lines().rfind(|l| l.contains("--follow")).unwrap_or_else(|| panic!("{watches}"));
+        assert!(followed.contains(" --sync ") && followed.ends_with(" --feed"), "{scripts}: {followed}");
         // Only bk gives watch its peer, the team server: another would bring in unconfirmed work.
-        for peer in [&["--sync", "http://127.0.0.1:1"][..], &["--token-file=/dev/null"]] {
+        for peer in [&["--sync", "http://127.0.0.1:1"][..], &["--token-file=/dev/null"], &["--feed"]] {
             let args = [&["watch", "--follow"][..], peer].concat();
             for agent in [Some("alice"), Some("carol")] {
                 let out = sh(&a, "scripts/bk", &args, agent);

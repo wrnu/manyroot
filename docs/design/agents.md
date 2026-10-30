@@ -105,7 +105,9 @@ harness would have to poll `log`.
   what's new since the cursor and exits, so a harness can call it in a
   loop or a hook. With `--follow` it keeps streaming.
 - **Freshness.** Through `scripts/bk` a read pulls from the team server
-  first; `watch --follow` pulls on an interval. No server push in v0.
+  first. `watch --follow` waits on the team server's change feed, a long
+  poll, and pulls on an interval only from a server without one
+  (network-sync.md, The change feed).
 
 It works on any replica, needs no new protocol, and is useful on its own
 for people too.

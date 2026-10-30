@@ -19,6 +19,8 @@
 #     stderr. With BK_PULL=required (scripts/merge) a read fails instead.
 #   - watch is a read. With --follow it also syncs with the server before each look, on its own
 #     --interval (at least 2 seconds), through watch's --sync and --token-file, which only bk gives.
+#     If the pinned bracken has watch --feed, bk gives that too: watch then waits on the server's change
+#     feed instead, and syncs only if the server has none.
 #
 # It refuses what would reach another Ground, or bring in work the team server can't confirm: --dir in
 # any form, import, sync with anything but the team server, the weave command, and an artifact with a
@@ -59,14 +61,14 @@ for ((i = 1; i <= $#; i++)); do
     # --exec, can make -h the argument of something that really runs (finding 3e1a0454a03b).
     -h | --help) help=true ;;
     --follow) follow=true ;;
-    --sync | --sync=* | --token-file | --token-file=*) peer=true ;;
+    --sync | --sync=* | --token-file | --token-file=* | --feed) peer=true ;;
     -*) ;;
     *) [ -n "$cmd" ] || { cmd=${!i}; at=$i; } ;;
   esac
 done
 [ "$cmd" != weave ] || fail "weave is refused: the Weave Ground is reached only through scripts/weave"
 # watch syncs only with the team server, as sync does (finding 6d623aa585d9): bk gives its --sync itself.
-[ "$cmd" != watch ] || ! $peer || fail "watch's --sync and --token-file are refused: bk syncs watch --follow with the team server itself"
+[ "$cmd" != watch ] || ! $peer || fail "watch's --sync, --token-file and --feed are refused: bk syncs watch --follow with the team server itself"
 for m in ${media[@]+"${media[@]}"}; do
   ! weave_media "$m" || fail "a Weave media type is refused: Weave records go only into the Weave Ground, through scripts/weave"
 done
@@ -132,7 +134,11 @@ if $write; then
 fi
 # watch --follow syncs again before each look, even if this first pull fails.
 more=()
-[ "$cmd" = watch ] && $follow && [ -n "$token" ] && more=(--sync "$url" --token-file "$token")
+if [ "$cmd" = watch ] && $follow && [ -n "$token" ]; then
+  more=(--sync "$url" --token-file "$token")
+  # The change feed (task 09bf8248e69b), once the pinned bracken has it.
+  ! "$bin" watch --help 2>/dev/null | grep -q -- '--feed' || more+=(--feed)
+fi
 if [ -z "$token" ]; then
   err="no team token for '${who:-}'; set BRACKEN_AGENT to your identity"
   [ "$cmd" != watch ] || ! $follow || [ "${BK_PULL:-}" = required ] ||

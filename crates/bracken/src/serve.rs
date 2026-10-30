@@ -9,6 +9,13 @@
 //!
 //! The server must be the only writer of its replica while it runs: it reads the replica once,
 //! at startup.
+//!
+//! Over HTTP it also serves a change feed (task 09bf8248e69b): `POST /v1/<ground>/changes` with
+//! `{"since": "<cursor>", "wait_ms": N}` answers with a bundle of what the cursor hasn't seen, in
+//! topological order, waiting up to `wait_ms` for something to arrive. A reply is a prefix of that
+//! order, so every contribution's parents are seen by the cursor or earlier in the reply; a caller
+//! with an empty replica pages in from `""`. `X-Bracken-More: 1` says there is more. The caller
+//! verifies everything as a local read does: nothing in a reply is trusted because the server sent it.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -16,7 +23,7 @@ use std::io::{self, BufRead, BufReader, Cursor, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -55,6 +62,18 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// The longest a response may take to be written; and, in a body, the longest wait for the next
 /// bytes. A body as a whole must arrive before the session's deadline.
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The change feed's bounds, for a server on 127.0.0.1 (note acaa21dc780d): a request's body; the longest
+/// wait, under [`IO_TIMEOUT`]; a reply's bytes and contributions (it always holds at least one, which may
+/// be larger); and the requests waiting at once, which count toward [`MAX_CONNECTIONS`] too.
+const FEED_REQUEST_BYTES: u64 = 64 * 1024;
+pub const FEED_MAX_WAIT: Duration = Duration::from_secs(25);
+const FEED_REPLY_BYTES: usize = 8 << 20;
+const FEED_REPLY_COUNT: usize = 10_000;
+const MAX_FEEDS: usize = 16;
+/// The most of a cursor's unknown heads a reply names: a caller whose cursor holds work the server
+/// lacks leaves those out of its next cursor, so it isn't sent again what it holds already.
+const FEED_UNKNOWN_LISTED: usize = 64;
 
 /// One line of the first-seen log.
 #[derive(Debug, Serialize, Deserialize)]
@@ -118,6 +137,8 @@ pub struct Intake {
     store_bytes: u64,
     /// Set when the first-seen log can't be written; the server then stores nothing more.
     broken: Option<String>,
+    /// Counts the imports that added something, so a waiting change feed knows when to look again.
+    generation: u64,
 }
 
 struct FirstSeen {
@@ -133,7 +154,8 @@ impl Intake {
             bail!("a server that accepts contributions needs --first-seen");
         }
         let store_bytes = store.graph().iter().map(|c| c.encode().len() as u64).sum();
-        let mut intake = Intake { store, policy, log: None, usage: HashMap::new(), store_bytes, broken: None };
+        let mut intake =
+            Intake { store, policy, log: None, usage: HashMap::new(), store_bytes, broken: None, generation: 0 };
         if let Some(path) = first_seen {
             intake.log = Some(intake.replay(path)?);
         }
@@ -241,6 +263,9 @@ impl Intake {
                 (ImportReport { added, ..ImportReport::default() }, Some(e))
             }
         };
+        if !report.added.is_empty() {
+            self.generation += 1;
+        }
         let mut lines = Vec::new();
         for id in &report.added {
             let (author, bytes) = sizes[id];
@@ -408,10 +433,14 @@ struct Server {
     tokens: Tokens,
     ground: GroundId,
     policy: Policy,
+    /// Notified after every frame a session handles, so change feeds waiting on `intake` look again.
+    changed: Condvar,
     sessions: Mutex<HashMap<[u8; 16], Arc<Mutex<HttpSession>>>>,
     /// Opens under way, which hold a session slot before their session exists.
     opening: AtomicUsize,
     connections: AtomicUsize,
+    /// Change feed requests under way.
+    feeds: AtomicUsize,
 }
 
 /// A session slot held by an open under way, released when dropped.
@@ -433,9 +462,11 @@ pub fn serve_http(intake: Intake, tokens: Tokens, port: u16) -> Result<()> {
         tokens,
         ground,
         policy,
+        changed: Condvar::new(),
         sessions: Mutex::new(HashMap::new()),
         opening: AtomicUsize::new(0),
         connections: AtomicUsize::new(0),
+        feeds: AtomicUsize::new(0),
     });
     let mut stdout = io::stdout().lock();
     writeln!(stdout, "listening on http://{}", listener.local_addr()?)?;
@@ -471,21 +502,26 @@ pub fn linger(stream: &TcpStream) {
     let _ = io::copy(&mut (&mut input).take(1 << 20), &mut io::sink());
 }
 
-/// A successful response: the server's messages, and the session id when it opened one.
+/// A successful response's body, and its headers past the standard ones, each ending in CRLF.
 struct Reply {
-    messages: Vec<Message>,
-    session: Option<[u8; 16]>,
+    body: Vec<u8>,
+    headers: String,
+}
+
+impl Reply {
+    /// A session's reply: the server's messages, and the session id when it opened one.
+    fn frames(messages: &[Message], session: Option<[u8; 16]>) -> Result<Reply, Refused> {
+        let mut body = Vec::new();
+        write_frames(&mut body, messages).map_err(|e| Refused::new(500, format!("encoding the reply: {e}")))?;
+        let headers = session.map(|id| format!("X-Bracken-Session: {}\r\n", hex(&id))).unwrap_or_default();
+        Ok(Reply { body, headers })
+    }
 }
 
 fn respond(stream: &TcpStream, response: Result<Reply, Refused>) -> io::Result<()> {
     let mut stream = Timed::new(stream, Instant::now() + IO_TIMEOUT, None);
     let (status, mut extra, body) = match response {
-        Ok(reply) => {
-            let mut body = Vec::new();
-            write_frames(&mut body, &reply.messages)?;
-            let extra = reply.session.map(|id| format!("X-Bracken-Session: {}\r\n", hex(&id))).unwrap_or_default();
-            (200, extra, body)
-        }
+        Ok(reply) => (200, reply.headers, reply.body),
         Err(refused) => (refused.status, String::new(), format!("{}\n", refused.reason).into_bytes()),
     };
     let kind = if status == 200 { "application/octet-stream" } else { "text/plain; charset=utf-8" };
@@ -626,15 +662,85 @@ impl Server {
             .and_then(|token| self.tokens.check(token))
             .ok_or_else(|| Refused::new(401, "a valid bearer token is required"))?
             .to_owned();
-        let prefix = format!("/v1/{}/sessions", self.ground);
-        let rest = head.path.strip_prefix(&prefix).ok_or_else(|| Refused::new(404, "no such ground here"))?;
+        let ground = format!("/v1/{}/", self.ground);
+        let no_ground = || Refused::new(404, "no such ground here");
+        let rest = head.path.strip_prefix(&ground).ok_or_else(no_ground)?;
         let body = Body { stream, early, length };
+        if rest == "changes" {
+            return self.changes(body);
+        }
+        let rest = rest.strip_prefix("sessions").ok_or_else(no_ground)?;
         if rest.is_empty() {
             return self.open(&credential, body);
         }
         let id =
             rest.strip_prefix('/').and_then(parse_session_id).ok_or_else(|| Refused::new(404, "no such session"))?;
-        Ok(Reply { messages: self.round(id, &credential, body)?, session: None })
+        Reply::frames(&self.round(id, &credential, body)?, None)
+    }
+
+    /// The change feed: what the request's cursor hasn't seen, once something is there or its wait is over.
+    fn changes(&self, body: Body) -> Result<Reply, Refused> {
+        if body.length > FEED_REQUEST_BYTES {
+            return Err(Refused::new(413, "a change feed request is at most 64 KiB"));
+        }
+        if self.feeds.fetch_add(1, Ordering::SeqCst) >= MAX_FEEDS {
+            self.feeds.fetch_sub(1, Ordering::SeqCst);
+            return Err(Refused::new(429, "too many change feed requests under way; try again later"));
+        }
+        let _slot = Reservation(&self.feeds);
+        let mut text = Vec::new();
+        let stream = Timed::new(body.stream, Instant::now() + IO_TIMEOUT, None);
+        Cursor::new(body.early)
+            .chain(stream)
+            .take(body.length)
+            .read_to_end(&mut text)
+            .map_err(|_| Refused::new(408, "the body didn't arrive in time"))?;
+        if text.len() as u64 != body.length {
+            return Err(Refused::new(400, "the body is shorter than its Content-Length"));
+        }
+        let request: FeedRequest =
+            serde_json::from_slice(&text).map_err(|e| Refused::new(400, format!("bad change feed request: {e}")))?;
+        let wait = Duration::from_millis(request.wait_ms);
+        if wait > FEED_MAX_WAIT {
+            return Err(Refused::new(400, "wait_ms is at most 25000"));
+        }
+        let mut heads = Vec::new();
+        for part in request.since.split(',').filter(|p| !p.is_empty()) {
+            heads.push(
+                part.parse::<ContributionId>().map_err(|_| Refused::new(400, "since: not a cursor of full ids"))?,
+            );
+        }
+        let until = Instant::now() + wait;
+        let mut intake = lock(&self.intake);
+        let mut looked = intake.generation;
+        let mut page = Page::past(intake.store.graph(), &heads);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            if !page.contributions.is_empty() || left.is_zero() {
+                break;
+            }
+            intake = match self.changed.wait_timeout(intake, left) {
+                Ok((guard, _)) => guard,
+                Err(poisoned) => poisoned.into_inner().0,
+            };
+            if intake.generation != looked {
+                looked = intake.generation;
+                page = Page::past(intake.store.graph(), &heads);
+            }
+        }
+        drop(intake);
+        let mut headers = String::new();
+        if page.more {
+            headers.push_str("X-Bracken-More: 1\r\n");
+        }
+        if !page.unknown.is_empty() {
+            let ids: Vec<String> = page.unknown.iter().take(FEED_UNKNOWN_LISTED).map(ContributionId::to_hex).collect();
+            headers.push_str(&format!("X-Bracken-Unknown-Heads: {}\r\n", ids.join(",")));
+        }
+        let mut bundle = Vec::new();
+        manyroot::bundle::write(&mut bundle, self.ground, page.contributions)
+            .map_err(|e| Refused::new(500, format!("encoding the reply: {e}")))?;
+        Ok(Reply { body: bundle, headers })
     }
 
     /// Drops sessions past their deadline or idle too long, then reserves a slot for a new one if
@@ -666,7 +772,7 @@ impl Server {
             let session = HttpSession { side, credential: credential.to_owned(), last_seen: Instant::now() };
             lock(&self.sessions).insert(id, Arc::new(Mutex::new(session)));
         }
-        Ok(Reply { messages, session: Some(id) })
+        Reply::frames(&messages, Some(id))
     }
 
     fn round(&self, id: [u8; 16], credential: &str, body: Body) -> Result<Vec<Message>, Refused> {
@@ -702,7 +808,10 @@ impl Server {
         let mut replies: Vec<Message> = Vec::new();
         while let Some(frame) = side.read_frame(&mut reader).map_err(refusal)? {
             let mut replica = Locked { intake: lock(&self.intake), credential };
-            replies.extend(side.handle(&mut replica, &frame).map_err(refusal)?);
+            let handled = side.handle(&mut replica, &frame);
+            drop(replica);
+            self.changed.notify_all();
+            replies.extend(handled.map_err(refusal)?);
             // A response carries at most one batch, so its size is bounded by the batch limit. A
             // client that follows the protocol never asks for more: it answers each batch it
             // receives with one result, and it receives at most one per response. Only results
@@ -715,6 +824,50 @@ impl Server {
             return Err(Refused::new(400, "the body is shorter than its Content-Length"));
         }
         Ok(replies)
+    }
+}
+
+/// A change feed request.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedRequest {
+    /// A cursor as `log --since` prints it: comma-separated full ids, "" for everything.
+    since: String,
+    wait_ms: u64,
+}
+
+/// One change feed reply: a prefix, in topological order, of what a cursor hasn't seen.
+struct Page {
+    contributions: Vec<Contribution>,
+    /// Whether the prefix stops short of everything the cursor hasn't seen.
+    more: bool,
+    /// The cursor's heads this replica doesn't hold, which are left out of what it has seen.
+    unknown: Vec<ContributionId>,
+}
+
+impl Page {
+    fn past(g: &Graph, heads: &[ContributionId]) -> Page {
+        let (mut stack, unknown): (Vec<ContributionId>, Vec<ContributionId>) =
+            heads.iter().partition(|h| g.contains(h));
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if seen.insert(id) {
+                stack.extend(g.get(&id).expect("graph ids and their parents exist").parents().iter().copied());
+            }
+        }
+        let (mut contributions, mut bytes, mut more) = (Vec::new(), 0, false);
+        for id in g.topo_order().into_iter().filter(|id| !seen.contains(id)) {
+            let c = g.get(&id).expect("ordered ids exist");
+            let size = c.encode().len();
+            if !contributions.is_empty() && (contributions.len() == FEED_REPLY_COUNT || bytes + size > FEED_REPLY_BYTES)
+            {
+                more = true;
+                break;
+            }
+            bytes += size;
+            contributions.push(c.clone());
+        }
+        Page { contributions, more, unknown }
     }
 }
 

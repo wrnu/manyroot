@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use manyroot::sync::Rejected;
-use manyroot::{Contribution, Graph, ImportReport, Store};
+use manyroot::{Contribution, ContributionId, Graph, GroundId, ImportReport, Store};
 
 use crate::serve::{parse_length, read_head_bytes};
 use crate::wire::{Bounds, Refused, Replica, Side, Timed, run_stream, write_frames};
@@ -78,7 +78,7 @@ pub fn sync_http(store: &mut Store, url: &str, token: &str, bounds: Bounds) -> R
         stream.write_all(head.as_bytes())?;
         stream.write_all(&body)?;
         stream.flush()?;
-        let (status, id, length, early) = match read_response_head(&mut stream) {
+        let Response { status, session: id, length, early, .. } = match read_response_head(&mut stream) {
             Err(_) if side.time_left().is_err() => return Err(Refused::deadline().into()),
             other => other?,
         };
@@ -108,8 +108,18 @@ pub fn sync_http(store: &mut Store, url: &str, token: &str, bounds: Bounds) -> R
     Ok(side)
 }
 
-/// A response's status, session id header, length, and the body bytes read with its head.
-fn read_response_head(stream: &mut impl Read) -> Result<(u16, Option<String>, u64, Vec<u8>)> {
+/// A server's response head, and the body bytes read with it.
+struct Response {
+    status: u16,
+    /// X-Bracken-Session.
+    session: Option<String>,
+    /// The change feed's X-Bracken-Unknown-Heads.
+    unknown: Vec<ContributionId>,
+    length: u64,
+    early: Vec<u8>,
+}
+
+fn read_response_head(stream: &mut impl Read) -> Result<Response> {
     let (bytes, early) = read_head_bytes(stream).map_err(|r| anyhow::anyhow!("reading the server's response: {r}"))?;
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut response = httparse::Response::new(&mut headers);
@@ -119,7 +129,14 @@ fn read_response_head(stream: &mut impl Read) -> Result<(u16, Option<String>, u6
     }
     let mut id = None;
     let mut length = None;
+    let mut unknown = Vec::new();
     for h in response.headers.iter() {
+        if h.name.eq_ignore_ascii_case("x-bracken-unknown-heads") {
+            let text = std::str::from_utf8(h.value).context("bad unknown heads from the server")?;
+            for part in text.split(',') {
+                unknown.push(part.trim().parse().context("bad unknown heads from the server")?);
+            }
+        }
         if h.name.eq_ignore_ascii_case("content-length") {
             length = Some(parse_length(h.value).context("bad Content-Length from the server")?);
         }
@@ -133,7 +150,65 @@ fn read_response_head(stream: &mut impl Read) -> Result<(u16, Option<String>, u6
         }
     }
     let status = response.code.context("the server's response has no status")?;
-    Ok((status, id, length.context("the server's response has no Content-Length")?, early))
+    let length = length.context("the server's response has no Content-Length")?;
+    Ok(Response { status, session: id, unknown, length, early })
+}
+
+/// The largest change feed reply this side reads: the server's 8 MiB, past which it still sends one
+/// contribution, of at most 16 MiB.
+const FEED_REPLY_LIMIT: u64 = 32 << 20;
+
+/// What a change feed request brought.
+pub enum Changes {
+    /// The server has no change feed: it answered the request with this status.
+    Unsupported(u16),
+    Reply {
+        /// A bundle, unverified. The caller asks again at once whether or not the server said it has more
+        /// (X-Bracken-More), so a reply's size doesn't matter to it.
+        bundle: Vec<u8>,
+        /// Heads of the cursor the server doesn't hold (some of them, if many).
+        unknown: Vec<ContributionId>,
+    },
+}
+
+/// Asks a server's change feed for what `since` hasn't seen, waiting up to `wait` for something to arrive
+/// (task 09bf8248e69b). What comes back is unverified: the caller checks it as a local read does.
+pub fn changes(url: &str, token: &str, ground: GroundId, since: &str, wait: Duration) -> Result<Changes> {
+    let (host, port) = loopback(url)?;
+    if token.is_empty() || token.bytes().any(|b| b.is_ascii_control()) {
+        bail!("the token is empty or holds control characters");
+    }
+    let body = serde_json::json!({"since": since, "wait_ms": wait.as_millis() as u64}).to_string();
+    let tcp = TcpStream::connect((host.as_str(), port)).with_context(|| format!("connecting to {url}"))?;
+    // The server answers within the wait, and writes its reply within its write timeout.
+    let mut stream = Timed::new(&tcp, Instant::now() + wait + Duration::from_secs(30), None);
+    let head = format!(
+        "POST /v1/{ground}/changes HTTP/1.1\r\nHost: localhost:{port}\r\nAuthorization: Bearer {token}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    stream.flush()?;
+    let Response { status, unknown, length, early, .. } = read_response_head(&mut stream)?;
+    let mut reader = Cursor::new(early).chain(&mut stream).take(length);
+    if matches!(status, 404 | 405 | 501) {
+        return Ok(Changes::Unsupported(status));
+    }
+    if status != 200 {
+        let mut text = Vec::new();
+        reader.take(1024).read_to_end(&mut text).ok();
+        bail!("the server refused the change feed request ({status}): {}", String::from_utf8_lossy(&text).trim());
+    }
+    if length > FEED_REPLY_LIMIT {
+        bail!("the server's change feed reply is {length} bytes, over the {FEED_REPLY_LIMIT} this side reads");
+    }
+    let mut bundle = Vec::new();
+    reader.read_to_end(&mut bundle).context("reading the change feed reply")?;
+    if bundle.len() as u64 != length {
+        bail!("the server's response is shorter than its Content-Length");
+    }
+    Ok(Changes::Reply { bundle, unknown })
 }
 
 /// Syncs with a server reached through a program's stdin and stdout (`ssh host bracken serve
