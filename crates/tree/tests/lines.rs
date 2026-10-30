@@ -658,12 +658,32 @@ fn only_the_authors_supersedes_relations_are_asked_about() {
     assert_eq!(with_bobs.list_entries, asked.list_entries, "bob's 50 relations aren't stored");
     // The second decision asks what the first does: alice's one relation.
     assert_eq!(with_bobs.questions, asked.questions + 1, "{asked:?} then {with_bobs:?}");
+    assert_kept(&w.lines(), 1, 2);
 }
 
-/// A line's author can make a long chain and many decisions on it cheaply. Every decision asks about every
-/// relation, but the answers are held a round at a time, within a word per contribution.
+/// What Lines' chain questions hold until its records are judged (finding 1cdb8b4dcac8): 32 bytes a
+/// relation in the lists, 64 for the lists themselves (these shapes have at most two), and 184 bytes an asker
+/// for its two entries and its verdict (177 measured on a 64-bit target). Keeping an asker's answers after its
+/// verdict would add K / 8 bytes an asker, 38 at K = 300, and a list per asker 32 K: either breaks it.
+fn assert_kept(lines: &Lines, relations: usize, askers: usize) {
+    let stats = lines.stats();
+    let bound = 32 * relations + 184 * askers + 64;
+    assert!(stats.bytes > 0 && stats.bytes <= bound, "{relations} relations, {askers} askers: {stats:?}");
+}
+
+/// Builds the lines without `checked`, whose walk per question takes most of a minute on the larger
+/// shapes; still with no question missed.
+fn unchecked(g: &Graph) -> Lines {
+    let ix = Index::build(g);
+    let lines = Lines::build(g, &ix);
+    assert_eq!((lines.stats().fallbacks, ix.ancestry_stats().fallbacks), (0, 0));
+    lines
+}
+
+/// Finding 98ce07a5e421: a line's author makes a long chain and many decisions on it. Written after the
+/// chain, the decisions share one past, so one answer vector: one round of ceil(K / 64) passes.
 #[test]
-fn a_long_chain_named_by_many_decisions_stays_within_a_word_per_contribution() {
+fn many_decisions_after_a_long_chain_share_one_answer_vector() {
     const K: usize = 300;
     const D: usize = 300;
     let mut w = World::new(counter());
@@ -671,18 +691,46 @@ fn a_long_chain_named_by_many_decisions_stays_within_a_word_per_contribution() {
     let m0 = w.tree(&alice, b"zero");
     let versions = w.chain(&alice, K);
     let decisions = w.decide_on(&alice, w.line, m0, D);
-    // Built without `checked`, whose walk per question takes most of a minute here.
-    let ix = Index::build(&w.g);
-    let lines = Lines::build(&w.g, &ix);
+    let lines = unchecked(&w.g);
     let stats = lines.stats();
-    assert_eq!((stats.fallbacks, ix.ancestry_stats().fallbacks), (0, 0));
     assert_eq!((stats.list_entries, stats.questions), (K, D * K), "{stats:?}");
-    // 5 words an asker, D of them over the budget of one word per contribution: more than one round.
-    assert!(stats.peak_words <= w.g.len() && D * K.div_ceil(64) > w.g.len(), "{stats:?}");
-    assert!(stats.passes > K.div_ceil(64), "{stats:?}");
+    // Each decision's past adds the one before, which no relation is: the same class.
+    assert_eq!((stats.vectors, stats.peak_words, stats.passes), (1, K.div_ceil(64), K.div_ceil(64)), "{stats:?}");
+    assert_kept(&lines, K, D);
     for d in &decisions {
         assert!(matches!(lines.verdict(d), Some(Ok(q)) if q.policy == versions[K]), "{d}");
     }
+}
+
+/// The batch budget (answer b2dbc4f5e810): a decision after each new version of a long chain, so every
+/// past differs. The answers are held a round at a time, within a word per contribution, and a round's
+/// passes reach only the relations written before its last decision.
+#[test]
+fn a_decision_after_each_version_is_answered_in_rounds_within_a_word_per_contribution() {
+    const K: usize = 300;
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let m0 = w.tree(&alice, b"zero");
+    let (mut newest, mut decisions) = (w.line, vec![]);
+    for _ in 0..K {
+        let next = w.record(&alice, &policy(&[&alice]));
+        w.supersede(&alice, next, newest);
+        newest = next;
+        decisions.push(w.record(&alice, &decision(w.line, m0, vec![], "d")));
+    }
+    let lines = unchecked(&w.g);
+    let stats = lines.stats();
+    let n = w.g.len();
+    assert_eq!((stats.vectors, stats.questions), (K, K * K), "{stats:?}");
+    // 5 words a vector and n words a round: ceil(5K / (5 floor(n / 5))) rounds, each reaching the chunks
+    // its last decision has in its past.
+    let per_round = n / K.div_ceil(64);
+    assert_eq!(stats.peak_words, per_round * K.div_ceil(64), "{stats:?}");
+    let reached: usize = (0..K.div_ceil(per_round)).map(|r| ((r + 1) * per_round).min(K).div_ceil(64)).sum();
+    assert_eq!(stats.passes, reached, "{stats:?}");
+    assert_kept(&lines, K, K);
+    let qualified = decisions.iter().filter(|d| matches!(lines.verdict(d), Some(Ok(_)))).count();
+    assert_eq!(qualified, K);
 }
 
 /// Finding 7c1c3b1fea29: a decision naming each version of a chain. Only the first artifact's qualify; each
@@ -698,6 +746,7 @@ fn decisions_naming_each_version_of_a_chain_store_it_once() {
         versions.iter().map(|v| w.record(&alice, &decision(*v, m0, vec![], "d"))).collect();
     let lines = w.lines();
     assert_eq!(lines.stats().list_entries, L, "{:?}", lines.stats());
+    assert_kept(&lines, L, L + 1);
     assert!(matches!(lines.verdict(&decisions[0]), Some(Ok(q)) if q.policy == versions[L]));
     for (d, v) in decisions[1..].iter().zip(&versions[1..]) {
         assert_eq!(lines.verdict(d), Some(&Err(Unqualified::NotALine(*v))), "{d}");
@@ -723,6 +772,7 @@ fn decisions_before_their_line_superseded_a_version_ask_the_whole_chain() {
         assert!(matches!(lines.verdict(d), Some(Ok(q)) if q.policy == versions[L]), "{d}");
     }
     assert_eq!(lines.verdict(&after), Some(&Err(Unqualified::NotALine(w.line))));
+    assert_kept(&lines, L + 1, D + 1);
 }
 
 /// Finding a5ac20689b4b, case 1: the line supersedes a version Lines drops (uncited, retracted, or
@@ -753,6 +803,7 @@ fn a_line_superseding_a_dropped_version_asks_the_whole_chain() {
         let decisions = w.decide_on(&alice, w.line, m0, D);
         let lines = w.lines();
         assert_eq!(lines.stats().questions, D * L, "{how}: {:?}", lines.stats());
+        assert_kept(&lines, L, D);
         for d in &decisions {
             assert!(matches!(lines.verdict(d), Some(Ok(q)) if q.policy == versions[L]), "{how}: {d}");
         }

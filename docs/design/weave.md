@@ -926,13 +926,30 @@ from its results.
     rule about which versions are first artifacts is guessed in advance.
     Each relation is in one component, so stored once. Each record keeps
     its verdict, not its answers.
-  - **The batch budget.** Chain answers are held at most one 64-bit word
+  - **Shared answers.** Records whose pasts provably hold the same
+    relations share one answer vector: a contribution keeps its parents'
+    class unless a parent is a relation asked about, or the parents'
+    classes differ. So the decisions written after a line's last policy
+    change cost one vector between them, however many there are.
+  - **The batch budget.** Answer vectors are held at most one 64-bit word
     per contribution at a time, then turned into verdicts and freed. A
-    component asked about by more records than fit takes more passes, not
-    more memory. So memory is linear in the history in every shape; a
-    line's author who makes a long chain and many decisions on it makes
-    opening quadratic in time, which is still never slower than walking
-    the graph per question, as opening did before.
+    component with more distinct pasts than fit takes more rounds, not
+    more memory, so memory is linear in the history in every shape. A
+    round's pass over 64 relations sweeps only from the first of them to
+    the round's last record, and is skipped if they all come after it.
+  - **Time.** With `K` relations in a component and `U` distinct pasts among
+    the records naming it, opening takes at most
+    `ceil(U * ceil(K / 64) / n) * ceil(K / 64)` passes over at most `n`
+    contributions, summed over components. That is cubic in what one writer adds when the writer makes
+    both `U` and `K` grow with `n`. For example, a policy change then a
+    decision, repeated, gives `U = K = n / 2`: the bound is `n^2 / 32,768`
+    passes, and the sweeps' limits halve that, to 15,750 passes and 1.3
+    seconds at `n = 32,000` (`ancestry::rounds` on a chain of `n`, release
+    build; finding `98ce07a5e421`). That is still never slower than walking
+    the graph per question, as opening did before. Decisions written after
+    the chain, the finding's other shape, share one past: 250 passes and 26
+    ms at the same size, where opening without shared answers took 31,250
+    passes and 3.1 s.
   - A question nothing asked at build would be a bug. It is answered by
     walking and counted, and fails debug builds; the tests assert the count
     is zero.

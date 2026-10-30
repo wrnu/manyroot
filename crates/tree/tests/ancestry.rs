@@ -177,8 +177,8 @@ fn a_wide_merge_of_many_roots_holds_two_words_per_contribution() {
     let askers: Vec<(ContributionId, usize)> = roots[..64].iter().chain([&merge]).map(|id| (*id, 0)).collect();
     let (answers, stats) = b.answer(&[list], &askers);
     assert!(answers[64].iter().all(|a| *a) && answers[..64].iter().all(|a| a.iter().all(|a| !*a)));
-    // 157 words an asker, 63 in a round within 10,001 words: two rounds.
-    assert_eq!(stats.passes, 2 * K.div_ceil(64), "{stats:?}");
+    // The roots share an empty past, so one vector for them and one for the merge, in one round.
+    assert_eq!((stats.vectors, stats.passes), (2, K.div_ceil(64)), "{stats:?}");
 }
 
 /// Finding 0a799e7393e9: a long chain where each contribution asks about its parent and the root, as
@@ -235,11 +235,10 @@ fn references_cost_four_bytes_and_a_bit() {
     assert_eq!(ancestry.is_ancestor(&ids[0], &ids[N - 1]), Some(true));
 }
 
-/// The batch budget (answer b2dbc4f5e810): D askers of one list of L hold at most a word per contribution
-/// at a time, so the list is answered in rounds, more passes rather than more memory; and the answers keep
-/// nothing once handed over.
+/// Finding 98ce07a5e421: D records written after a line's chain of L relations have the same past, so
+/// they share one answer vector: one round of ceil(L / 64) passes, not D * L / (64 n) rounds of them.
 #[test]
-fn a_list_asked_by_many_is_answered_in_rounds_within_a_word_per_contribution() {
+fn askers_with_the_same_past_share_one_answer_vector() {
     const L: usize = 2_000;
     const D: usize = 2_000;
     let b = Built::chain(L + D);
@@ -251,9 +250,34 @@ fn a_list_asked_by_many_is_answered_in_rounds_within_a_word_per_contribution() {
     assert!(answers.iter().all(|a| a.iter().all(|a| *a)));
     assert_eq!(stats.questions, D * L);
     assert_eq!(stats.list_entries, L, "the list once, however many ask about it");
-    // 32 words an asker, so 125 askers a round within 4,000 words: 16 rounds of 32 passes.
+    assert_eq!((stats.vectors, stats.peak_words, stats.passes), (1, L / 64 + 1, L.div_ceil(64)), "{stats:?}");
+}
+
+/// The batch budget (answer b2dbc4f5e810): when the D askers' pasts all differ (each written after one
+/// more of the L relations), they hold at most a word per contribution at a time, so the list is answered
+/// in rounds, more passes rather than more memory. A round's pass over a chunk sweeps only to its last
+/// asker, and is skipped for chunks written after it (finding 98ce07a5e421).
+#[test]
+fn distinct_pasts_are_answered_in_rounds_within_a_word_per_contribution() {
+    const L: usize = 2_000;
+    const D: usize = 2_000;
+    let b = Built::chain(L + D);
+    // Relation, asker, relation, asker...
+    let mut list: Vec<ContributionId> = b.ids.iter().step_by(2).copied().collect();
+    list.sort();
+    let askers: Vec<(ContributionId, usize)> = b.ids.iter().skip(1).step_by(2).map(|id| (*id, 0)).collect();
+    let (answers, stats) = b.answer(&[list.clone()], &askers);
+    for (k, (asker, _)) in askers.iter().enumerate() {
+        assert_eq!(answers[k].iter().filter(|a| **a).count(), k + 1, "{asker}");
+    }
+    assert_eq!(stats.vectors, D);
+    // 32 words a vector, so 125 vectors a round within 4,000 words: 16 rounds. Without pruning, each would
+    // pass over all 32 chunks; round r reaches only the chunks before its last asker, about 2(r + 1).
+    let rounds = D.div_ceil(125);
     assert_eq!(stats.peak_words, 125 * 32, "{stats:?}");
-    assert_eq!(stats.passes, D.div_ceil(125) * L.div_ceil(64), "{stats:?}");
+    let reached: usize = (0..rounds).map(|r| (2 * 125 * (r + 1) - 1).div_ceil(128).min(L.div_ceil(64))).sum();
+    assert_eq!(stats.passes, reached, "{stats:?}");
+    assert!(stats.passes < rounds * L.div_ceil(64) * 6 / 10, "{stats:?}");
 }
 
 /// Many small lists, each asked once, share passes: a pass per 64 relations, not one per list.
