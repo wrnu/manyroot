@@ -4,6 +4,7 @@
 #
 #   code-scope docs-only <base> <head>
 #   code-scope key <commit>
+#   code-scope chain <main> <head>...
 #
 # Docs are the *.md files outside crates/: crates/ holds .md files the code compiles in (the
 # experiment's prompts), so those count as code. .bracken/ is the Ground.
@@ -16,10 +17,16 @@
 # key prints a hash of <commit>'s tree without .bracken/ and docs. Two trees with the same key
 # differ only in the Ground and docs, so they build and test alike; the Ground guards, which read
 # both, must still run.
+#
+# chain prints the prefixes of a batch (decision db6f7705c0a4): P_0 = <main>, then P_i = P_(i-1)
+# merged with the i-th head, as git merge-tree computes it, which is the tree the forge's squash merge
+# of that head onto P_(i-1) produces. One line each, '<i> <commit> <key>', for i = 0..n. The merge
+# commits are made with git commit-tree, nothing else refers to them, and no ref or worktree changes.
+# A head that doesn't merge cleanly onto its prefix stops it: exit 1, naming that head.
 set -euo pipefail
 
 usage() {
-  echo "usage: code-scope docs-only <base> <head> | code-scope key <commit>" >&2
+  echo "usage: code-scope docs-only <base> <head> | code-scope key <commit> | code-scope chain <main> <head>..." >&2
   exit 2
 }
 
@@ -59,6 +66,23 @@ case "${1:-}" in
       docs "$path" && continue
       printf '%s\0' "$entry"
     done <"$listing" | git hash-object --stdin
+    ;;
+  chain)
+    [ $# -ge 3 ] || usage
+    self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+    prefix=$(git rev-parse --verify -q "$2^{commit}") || { echo "code-scope: no commit $2" >&2; exit 2; }
+    shift 2
+    echo "0 $prefix $("$self" key "$prefix")"
+    i=0
+    for head in "$@"; do
+      i=$((i + 1))
+      head=$(git rev-parse --verify -q "$head^{commit}") || { echo "code-scope: no commit $head" >&2; exit 2; }
+      tree=$(git merge-tree --write-tree "$prefix" "$head" 2>/dev/null | head -n 1) && [ -n "$tree" ] ||
+        { echo "code-scope: head $i, $head, doesn't merge cleanly onto the batch before it" >&2; exit 1; }
+      prefix=$(git -c user.name=code-scope -c user.email=code-scope@invalid commit-tree "$tree" -p "$prefix" -p "$head" \
+        -m "batch prefix $i") || exit 2
+      echo "$i $prefix $("$self" key "$prefix")"
+    done
     ;;
   *) usage ;;
 esac
