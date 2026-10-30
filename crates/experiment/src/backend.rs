@@ -419,7 +419,10 @@ pub enum Event {
     },
     /// The turn's end, with the harness's own figures for it.
     Result {
-        usage: Tokens,
+        /// Its own total, or none if it has none apart from the stream's (Pi): the turn then counts the
+        /// stream's sum, recorded as such, and there is no total to check the stream against (answer
+        /// cc34f6275877 (2)).
+        usage: Option<Tokens>,
         /// How it ended, the cost the harness estimates and how long it took: recorded as given.
         ended: Value,
         cost_usd: Value,
@@ -810,15 +813,8 @@ impl<H: Harness> HarnessBackend<H> {
                         a
                     });
                     settled = true;
-                    break self.settle(
-                        name,
-                        turn,
-                        &usage,
-                        &streamed,
-                        json!({
-                            "ended": ended, "cost_usd": cost_usd, "duration_ms": duration_ms,
-                        }),
-                    );
+                    let about = json!({"ended": ended, "cost_usd": cost_usd, "duration_ms": duration_ms});
+                    break self.settle(name, turn, usage.as_ref(), &streamed, about);
                 }
                 Event::Init(_) | Event::Other => {}
             }
@@ -841,16 +837,21 @@ impl<H: Harness> HarnessBackend<H> {
     }
 
     /// The result: counts the larger of it and the stream, and stops the run if the two disagree on
-    /// input by more than 10%. `about` holds the result's `ended`, `cost_usd` and `duration_ms`.
-    fn settle(&self, name: &str, turn: u32, result: &Tokens, streamed: &Tokens, about: Value) -> End {
-        let (a, b) = (result.input_side(), streamed.input_side());
-        let (low, high) = (a.min(b), a.max(b));
-        let gap = high > 0 && (high - low).saturating_mul(10) > high;
-        let counted = result.max(streamed);
+    /// input by more than 10%. With no result total of the harness's own, the stream's sum is the result,
+    /// the row says so, and there's nothing to check. `about` holds the result's `ended`, `cost_usd` and
+    /// `duration_ms`.
+    fn settle(&self, name: &str, turn: u32, result: Option<&Tokens>, streamed: &Tokens, about: Value) -> End {
+        let gap = result.is_some_and(|result| {
+            let (a, b) = (result.input_side(), streamed.input_side());
+            let (low, high) = (a.min(b), a.max(b));
+            high > 0 && (high - low).saturating_mul(10) > high
+        });
+        let counted = result.map_or(*streamed, |r| r.max(streamed));
+        let source = if result.is_some() { "the harness's" } else { "the stream's sum" };
         self.record(json!({
             "agent": name, "turn": turn, "ended": about["ended"], "input": counted.input,
             "cache_read": counted.cache_read, "cache_write": counted.cache_write, "output": counted.output,
-            "cost_usd": about["cost_usd"], "duration_ms": about["duration_ms"],
+            "cost_usd": about["cost_usd"], "duration_ms": about["duration_ms"], "result": source,
         }));
         // The stream's figures are already in the totals: add only the rest. A gap is counted, then stops the run.
         let capped = self.count(name, &counted.beyond(streamed));

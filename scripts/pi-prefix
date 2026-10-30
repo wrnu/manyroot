@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# pi-prefix: builds the Pi install a Pi run pins (task 68675575fd58; notes e19ff6fc8285, cc34f6275877).
+#
+#   pi-prefix <dir>     build it in <dir>, which must not exist yet
+#   pi-prefix --lock    rewrite crates/experiment/pi/package-lock.json from package.json
+#
+# The prefix is nodejs.org's node at a pinned version, its tarball checked against the sha256 below
+# before it's unpacked, and Pi's packages exactly as crates/experiment/pi/package-lock.json has them,
+# installed by that node's own npm with 'npm ci'. Never the owner's node, npm or pi, and none of
+# their configuration: npm runs with a cleared environment, no user or global npmrc, a cache of its
+# own and the public registry. Install scripts are off ('--ignore-scripts' and the matching setting);
+# the packages whose lockfile entries say they have one are listed, for review.
+#
+# Then what no turn needs goes (node's headers and docs, npm itself and the links to it), the tree
+# is made read-only, and it prints the program and the Pi CLI file a turn runs: '<dir>/bin/node
+# <cli>'. The run pins the whole tree (Pin::tree) and its plan records the hash. Upgrading Pi is a new
+# package.json version, 'pi-prefix --lock', and a new prefix.
+#
+# macOS on arm64 only: the sandbox a Pi turn runs in is sandbox-exec's.
+
+set -euo pipefail
+
+node_version=v26.13.0
+# nodejs.org's SHASUMS256.txt entry for node-v26.13.0-darwin-arm64.tar.gz, and the sha256 of a
+# download, both checked on 2026-10-30. A mismatch stops the script before anything is unpacked.
+node_sha256=d38bd5e5a2ddce6bbb5ce45e46e208337da4d51fffe611e567fd32073d6439f6
+node_tar="node-$node_version-darwin-arm64.tar.gz"
+cli=pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
+
+fail() { echo "pi-prefix: $*" >&2; exit 1; }
+
+top=$(cd "$(dirname "$0")/.." && pwd -P)
+pi="$top/crates/experiment/pi"
+[ "$(uname -s) $(uname -m)" = "Darwin arm64" ] || fail "builds for macOS on arm64 only"
+case "${1:-}" in
+  --lock) mode=lock ;;
+  ""|-*) fail "usage: pi-prefix <dir> | pi-prefix --lock" ;;
+  *) mode=build; dir=$1 ;;
+esac
+
+tmp=$(mktemp -d)
+trap 'chmod -R u+w "$tmp" 2>/dev/null; rm -rf "$tmp"' EXIT
+
+# node, unpacked into $1 once its tarball matches the pin.
+node_into() {
+  curl -fsSL --proto '=https' -o "$tmp/$node_tar" "https://nodejs.org/dist/$node_version/$node_tar" ||
+    fail "couldn't download $node_tar"
+  echo "$node_sha256  $tmp/$node_tar" | shasum -a 256 -c --quiet - >/dev/null 2>&1 ||
+    fail "$node_tar does not match its pinned sha256; not unpacking it"
+  mkdir -p "$1"
+  tar -xzf "$tmp/$node_tar" -C "$1" --strip-components 1
+}
+
+# npm, from node prefix $1, in the current directory: nothing of the owner's environment or npm
+# configuration, a private cache, the public registry, and no install scripts.
+npm_of() {
+  local prefix=$1
+  shift
+  env -i HOME="$tmp/home" PATH="$prefix/bin:/usr/bin:/bin" \
+    npm_config_userconfig="$tmp/user.npmrc" npm_config_globalconfig="$tmp/global.npmrc" npm_config_cache="$tmp/cache" \
+    npm_config_registry=https://registry.npmjs.org/ npm_config_ignore_scripts=true \
+    npm_config_audit=false npm_config_fund=false npm_config_update_notifier=false \
+    "$prefix/bin/node" "$prefix/lib/node_modules/npm/bin/npm-cli.js" "$@" --ignore-scripts
+}
+mkdir -p "$tmp/home"
+: >"$tmp/user.npmrc"
+: >"$tmp/global.npmrc"
+
+if [ "$mode" = lock ]; then
+  node_into "$tmp/node"
+  mkdir "$tmp/lock"
+  cp "$pi/package.json" "$tmp/lock/"
+  (cd "$tmp/lock" && npm_of "$tmp/node" install --package-lock-only --no-audit --no-fund >/dev/null)
+  cp "$tmp/lock/package-lock.json" "$pi/package-lock.json"
+  echo "pi-prefix: wrote $pi/package-lock.json"
+  exit 0
+fi
+
+[ ! -e "$dir" ] && [ ! -L "$dir" ] || fail "$dir exists: pi-prefix builds a new one"
+[ -f "$pi/package-lock.json" ] || fail "no $pi/package-lock.json: run pi-prefix --lock first"
+mkdir -p "$(dirname "$dir")"
+dir="$(cd "$(dirname "$dir")" && pwd -P)/$(basename "$dir")"
+node_into "$dir"
+mkdir "$dir/pi"
+cp "$pi/package.json" "$pi/package-lock.json" "$dir/pi/"
+(cd "$dir/pi" && npm_of "$dir" ci --no-audit --no-fund >/dev/null)
+scripted=$("$dir/bin/node" -e '
+  const lock = require(process.argv[1]);
+  for (const [k, v] of Object.entries(lock.packages || {})) if (v.hasInstallScript) console.log(k.replace(/^node_modules\//, ""));
+' "$dir/pi/package-lock.json")
+[ -z "$scripted" ] || echo "pi-prefix: install scripts not run, for: $(tr '\n' ' ' <<<"$scripted")" >&2
+
+# What no turn needs: node's headers and docs, and npm with the links to it.
+rm -rf "$dir/include" "$dir/share" "$dir/lib/node_modules/npm" "$dir/lib/node_modules/corepack" \
+  "$dir/bin/npm" "$dir/bin/npx" "$dir/bin/corepack"
+[ -f "$dir/$cli" ] || fail "no Pi CLI at $dir/$cli"
+chmod -R a-w "$dir"
+echo "program: $dir/bin/node"
+echo "cli: $dir/$cli"

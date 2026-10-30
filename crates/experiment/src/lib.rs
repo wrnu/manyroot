@@ -33,6 +33,7 @@ pub mod lang;
 pub mod metrics;
 pub mod mock;
 pub mod mode;
+pub mod pi;
 pub mod plan;
 pub mod prompts;
 pub mod proxy;

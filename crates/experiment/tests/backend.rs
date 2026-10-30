@@ -25,7 +25,7 @@ const SECRET: &str = "mock-secret-not-a-real-one-0123";
 
 /// A harness whose turn is `script`, run by `/bin/bash` with the turn message as `$1`. Its events, a line
 /// each: `init ok` or `init <why not>`; `call <id> <input> <output> [<call id>:<tool>...]`;
-/// `result <input> <output>`; anything else is other.
+/// `result <input> <output>`; `settled`, a result with no total of its own; anything else is other.
 struct Mock {
     script: String,
     pin: Pin,
@@ -131,9 +131,20 @@ impl Harness for Mock {
                     .collect::<Result<_, _>>()?;
                 Ok(Event::Message { id, model: json!("mock"), usage, tools })
             }
+            "settled" => Ok(Event::Result {
+                usage: None,
+                ended: json!("settled"),
+                cost_usd: Value::Null,
+                duration_ms: Value::Null,
+            }),
             "result" => {
                 let usage = Tokens { input: number(words.next())?, output: number(words.next())?, ..Tokens::default() };
-                Ok(Event::Result { usage, ended: json!("success"), cost_usd: json!(0.5), duration_ms: json!(7) })
+                Ok(Event::Result {
+                    usage: Some(usage),
+                    ended: json!("success"),
+                    cost_usd: json!(0.5),
+                    duration_ms: json!(7),
+                })
             }
             _ => Ok(Event::Other),
         }
@@ -590,6 +601,26 @@ mod macos_only {
         // The start's secret is still refused in the stream, though the harness now gives another.
         let s = switched(&format!("echo init ok; echo {SECRET}; echo result 0 1"), set(), &other);
         assert_eq!(s.turn(1), Err("the event stream held the auth value".into()));
+    }
+
+    /// A harness with no total of its own (Pi): the stream's sum is the result, the row says so, and
+    /// there's nothing to check the stream against (answer cc34f6275877 (2)).
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn a_result_without_a_total_counts_the_stream_and_says_so() {
+        let s = Setup::new("echo init ok; echo call m1 1000 5; echo call m2 1200 9; echo settled", caps());
+        s.turn(1).expect("the turn");
+        let rows = s.usage();
+        let settled = rows.iter().find(|r| r["ended"] == "settled").expect("a settled row");
+        assert_eq!(settled["result"], "the stream's sum");
+        assert_eq!((&settled["input"], &settled["output"]), (&json!(2200), &json!(14)));
+        assert_eq!(s.backend.totals("agent-0").0, Tokens { input: 2200, output: 14, ..Tokens::default() });
+        assert!(s.backend.halted().is_none());
+
+        let s = Setup::new("echo init ok; echo call m1 1000 5; echo result 1000 40", caps());
+        s.turn(1).expect("the turn");
+        let rows = s.usage();
+        assert_eq!(rows.iter().find(|r| r["ended"] == "success").expect("a result row")["result"], "the harness's");
     }
 
     #[test]

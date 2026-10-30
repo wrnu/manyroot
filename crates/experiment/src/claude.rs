@@ -96,7 +96,12 @@ impl Routing {
     }
 
     fn secret(&self) -> &str {
-        self.env.iter().find(|(k, _)| k == "ANTHROPIC_AUTH_TOKEN").map(|(_, v)| v.as_str()).unwrap_or_default()
+        self.get("ANTHROPIC_AUTH_TOKEN").unwrap_or_default()
+    }
+
+    /// One routing entry's value, for a harness in this crate.
+    pub(crate) fn get(&self, k: &str) -> Option<&str> {
+        self.env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
     }
 }
 
@@ -272,7 +277,7 @@ impl ClaudeCode {
             by_model.add(&t);
         }
         Ok(Event::Result {
-            usage: usage.max(&by_model),
+            usage: Some(usage.max(&by_model)),
             ended: event["subtype"].clone(),
             cost_usd: event["total_cost_usd"].clone(),
             duration_ms: event["duration_ms"].clone(),
