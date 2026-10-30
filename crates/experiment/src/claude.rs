@@ -306,6 +306,10 @@ impl Harness for ClaudeCode {
         Profile::Agent
     }
 
+    fn about(&self) -> Value {
+        json!({"result": "the harness's"})
+    }
+
     fn env_names(&self) -> &[&str] {
         &ENV_NAMES
     }

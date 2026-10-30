@@ -1,11 +1,11 @@
 //! `bracken-experiment`: the Phase 1 experiment's processes.
 //!
 //! - `worker` holds one store and answers the driver (started by the driver).
-//! - `shim` relays MCP between Claude Code and the driver (started by Claude Code).
+//! - `shim` relays MCP between an agent harness and the driver (started by the harness).
 //! - `guard` leads an agent turn's process group and kills it when the driver goes (started by the driver).
 //! - `mock-run` runs a whole mode with the mock backend, for a look at the run directory.
 //! - `report` measures finished runs and prints the comparison table.
-//! - `run` runs a whole mode with Claude Code playing every agent.
+//! - `run` runs a whole mode with one agent harness, Claude Code or Pi, playing every agent.
 
 use std::path::PathBuf;
 
@@ -17,6 +17,7 @@ use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routi
 use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_under};
+use bracken_experiment::pi::{PiBackend, PiConfig, PiExpect};
 use bracken_experiment::plan::PlanInputs;
 use bracken_experiment::task::Task;
 
@@ -57,7 +58,7 @@ enum Cmd {
     },
     /// Wait for standard input to close, then kill this process's group.
     Guard,
-    /// Run one mode with Claude Code into a new directory, every worker sandboxed.
+    /// Run one mode with an agent harness into a new directory, every worker sandboxed.
     Run {
         #[arg(long)]
         dir: PathBuf,
@@ -67,13 +68,24 @@ enum Cmd {
         agents: usize,
         #[arg(long, default_value_t = 8)]
         turns: u32,
-        /// The versioned Claude Code binary to pin (not a `latest` link).
-        #[arg(long)]
-        claude: PathBuf,
-        /// The `claude_code_version` it must report.
-        #[arg(long)]
-        claude_version: String,
-        /// The Claude Code settings file holding the routing entries; read for them alone.
+        // No clap default: with one, an unset `--claude` would pass `required_if_eq`.
+        /// Which agent harness plays every turn: Claude Code unless given.
+        #[arg(long, value_parser = ["claude", "pi"])]
+        harness: Option<String>,
+        /// Claude Code: the versioned binary to pin (not a `latest` link).
+        #[arg(long, required_unless_present = "harness", required_if_eq("harness", "claude"))]
+        claude: Option<PathBuf>,
+        /// Claude Code: the `claude_code_version` it must report.
+        #[arg(long, required_unless_present = "harness", required_if_eq("harness", "claude"))]
+        claude_version: Option<String>,
+        /// Pi: a prefix `scripts/pi-prefix` built, pinned whole.
+        #[arg(long, required_if_eq("harness", "pi"))]
+        pi_prefix: Option<PathBuf>,
+        /// Pi: the version the prefix must hold.
+        #[arg(long, default_value = "1.4.0")]
+        pi_version: String,
+        /// A Claude Code settings file holding the routing entries, read for them alone: either harness
+        /// sends its model calls there, with its token.
         #[arg(long)]
         settings: PathBuf,
         /// Tests only: a system prompt file in place of the reviewed prompts built into the binary.
@@ -149,8 +161,11 @@ fn main() {
             mode,
             agents,
             turns,
+            harness,
             claude,
             claude_version,
+            pi_prefix,
+            pi_version,
             settings,
             prompt_file,
             model,
@@ -158,7 +173,7 @@ fn main() {
             bracken,
             accept_rule,
             mode_token_cap,
-        } => claude_run(ClaudeRun {
+        } => agent_run(AgentRun {
             mode_token_cap,
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
             task: task_named(&task),
@@ -166,8 +181,13 @@ fn main() {
             mode,
             agents,
             turns,
-            claude,
-            claude_version,
+            harness: match harness.as_deref() {
+                Some("pi") => HarnessArgs::Pi { prefix: pi_prefix.expect("clap requires it"), version: pi_version },
+                _ => HarnessArgs::Claude {
+                    binary: claude.expect("clap requires it"),
+                    version: claude_version.expect("clap requires it"),
+                },
+            },
             settings,
             prompt_file,
             model,
@@ -200,14 +220,19 @@ fn task_named(name: &str) -> Task {
     Task::named(name).expect("the parser accepts only the tasks' names")
 }
 
-struct ClaudeRun {
+/// The harness `run` plays every turn with, and what it pins.
+enum HarnessArgs {
+    Claude { binary: PathBuf, version: String },
+    Pi { prefix: PathBuf, version: String },
+}
+
+struct AgentRun {
     task: Task,
     dir: PathBuf,
     mode: String,
     agents: usize,
     turns: u32,
-    claude: PathBuf,
-    claude_version: String,
+    harness: HarnessArgs,
     settings: PathBuf,
     prompt_file: Option<PathBuf>,
     model: String,
@@ -216,7 +241,7 @@ struct ClaudeRun {
     mode_token_cap: Vec<ModeTokenCap>,
 }
 
-fn claude_run(a: ClaudeRun) -> Result<(), String> {
+fn agent_run(a: AgentRun) -> Result<(), String> {
     let me = std::env::current_exe().map_err(|e| e.to_string())?;
     let bracken = std::fs::canonicalize(a.bracken.unwrap_or_else(|| me.with_file_name("bracken")))
         .map_err(|e| format!("no bracken: {e}"))?;
@@ -234,6 +259,11 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
     if caps.run_tokens != Caps::pilot().run_tokens {
         println!("this {} run's token cap is {} (--mode-token-cap); the plan records it", a.mode, caps.run_tokens);
     }
+    // The backend's own directory, named for its harness.
+    let backend_dir = a.dir.join(match a.harness {
+        HarnessArgs::Claude { .. } => "claude",
+        HarnessArgs::Pi { .. } => "pi",
+    });
     let plan = PlanInputs {
         task: a.task,
         model: expect.model.clone(),
@@ -243,40 +273,59 @@ fn claude_run(a: ClaudeRun) -> Result<(), String> {
         system_prompt: blake3::hash(prompt.as_bytes()).to_hex().to_string(),
         expected_stops: vec![RUN_TOKEN_CAP.into(), RUN_TIME_CAP.into()],
         accept_rule: a.accept_rule,
-        usage: std::path::absolute(a.dir.join("claude").join("usage.jsonl"))
-            .map_err(|e| e.to_string())?
-            .display()
-            .to_string(),
+        usage: std::path::absolute(backend_dir.join("usage.jsonl")).map_err(|e| e.to_string())?.display().to_string(),
         ..PlanInputs::default()
     };
-    let backend = ClaudeBackend::new(ClaudeConfig {
-        pin: Pin::of(&a.claude, &a.claude_version)?,
-        expect,
-        caps,
-        routing: Routing::from_settings(&a.settings)?,
-        dir: a.dir.join("claude"),
-        shim: me.clone(),
-        prompt,
-        turns: a.turns,
-        tools,
-        upstream: None,
-    })?;
-    let root = a.dir.join("run");
-    let cfg = RunConfig {
-        root,
-        mode: mode.name(),
-        agents: a.agents,
-        turns: a.turns,
-        worker_bin: me,
-        bracken,
-        git: git_binary()?,
-        trace: false,
-        calls_per_turn: CALLS_PER_TURN,
-        turn_limit: TURN_LIMIT,
-        plan,
-        sandbox: true,
+    let cfg = |plan: PlanInputs| -> Result<RunConfig, String> {
+        Ok(RunConfig {
+            root: a.dir.join("run"),
+            mode: mode.name(),
+            agents: a.agents,
+            turns: a.turns,
+            worker_bin: me.clone(),
+            bracken: bracken.clone(),
+            git: git_binary()?,
+            trace: false,
+            calls_per_turn: CALLS_PER_TURN,
+            turn_limit: TURN_LIMIT,
+            plan,
+            sandbox: true,
+        })
     };
-    let outcome = run(&cfg, &backend)?;
+    let routing = Routing::from_settings(&a.settings)?;
+    let outcome = match &a.harness {
+        HarnessArgs::Claude { binary, version } => {
+            let backend = ClaudeBackend::new(ClaudeConfig {
+                pin: Pin::of(binary, version)?,
+                expect,
+                caps,
+                routing,
+                dir: backend_dir,
+                shim: me.clone(),
+                prompt,
+                turns: a.turns,
+                tools,
+                upstream: None,
+            })?;
+            run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
+        }
+        HarnessArgs::Pi { prefix, version } => {
+            let backend = PiBackend::new(PiConfig {
+                prefix: prefix.clone(),
+                version: version.clone(),
+                expect: PiExpect { provider: "anthropic".into(), model: expect.model, thinking: expect.effort },
+                caps,
+                routing,
+                dir: backend_dir,
+                shim: me.clone(),
+                prompt,
+                turns: a.turns,
+                tools,
+                upstream: None,
+            })?;
+            run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
+        }
+    };
     println!("events: {}", outcome.events.display());
     Ok(())
 }

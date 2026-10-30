@@ -18,7 +18,11 @@
 //!   checked configuration, every assistant message from another provider or model stops the run, and
 //!   only the shim's tools are allowed (`--tools mcp__experiment__*`).
 //! - **Its result**: Pi gives no total of its own, so the turn's result is the stream's sum, which the
-//!   backend records as such and doesn't check against the stream (answer cc34f6275877 (2)).
+//!   backend records as such and doesn't check against the stream (answer cc34f6275877 (2)). Pi's
+//!   compaction is off, and one beginning stops the run: a summary call reports its usage only in
+//!   `compaction_end`, so its tokens would escape the totals and the caps (finding ac5a014447a1).
+//! - **The run's record** says all this ([`Harness::about`]): where results come from, compaction off,
+//!   and whether a test CA was trusted (finding 695de67678dd).
 
 use std::path::{Path, PathBuf};
 
@@ -88,7 +92,9 @@ impl HarnessBackend<Pi> {
     }
 
     /// Tests only: as [`HarnessBackend::<Pi>::new`], and node also trusts the CA in `ca` (PEM), for a
-    /// stub provider. A real run never has it (answer cc34f6275877 (3)).
+    /// stub provider. A real run never has it (answer cc34f6275877 (3)); hidden from the docs, and the
+    /// run's record says `test_ca: true` (finding 695de67678dd).
+    #[doc(hidden)]
     pub fn with_test_ca(cfg: PiConfig, ca: Vec<u8>) -> Result<PiBackend, String> {
         Self::with(cfg, Some(ca))
     }
@@ -146,7 +152,7 @@ impl Pi {
         };
         let mut files = vec![
             ("prompt.md", self.prompt.as_bytes().to_vec()),
-            ("settings.json", json(&json!({}))?),
+            ("settings.json", json(&json!({"compaction": {"enabled": false}}))?),
             ("models.json", json(&models)?),
             ("mcp.json", json(&mcp)?),
         ];
@@ -262,6 +268,10 @@ impl Harness for Pi {
         Profile::Node
     }
 
+    fn about(&self) -> Value {
+        json!({"result": "the stream's sum", "compaction": "off", "test_ca": self.test_ca.is_some()})
+    }
+
     fn env_names(&self) -> &[&str] {
         match self.test_ca {
             Some(_) => &TEST_ENV_NAMES,
@@ -309,6 +319,10 @@ impl Harness for Pi {
         }
         match event["type"].as_str() {
             Some("message_end") if event["message"]["role"] == "assistant" => self.message(&event["message"]),
+            Some("compaction_start") => Err(format!(
+                "Pi began compacting ({}), which the plan turns off: its summary call's tokens would escape the totals",
+                crate::args::short(event["reason"].as_str().unwrap_or("?"))
+            )),
             Some("agent_settled") => Ok(Event::Result {
                 usage: None,
                 ended: json!(if event["aborted"] == true { "aborted" } else { "settled" }),
@@ -491,6 +505,21 @@ mod tests {
             bad.turn_files(Path::new("/s.sock")).err(),
             Some("the Pi configuration holds `!curl evil`, which Pi would run".into())
         );
+    }
+
+    #[test]
+    fn compaction_is_off_one_beginning_stops_the_run_and_the_record_says_whether_a_ca_is_trusted() {
+        let p = pi(None);
+        let files = p.turn_files(Path::new("/s.sock")).expect("files");
+        let settings: Value = serde_json::from_slice(&files[1].1).expect("JSON");
+        assert_eq!(settings, json!({"compaction": {"enabled": false}}));
+        with_turn(|t| {
+            let line = json!({"type": "compaction_start", "reason": "overflow"}).to_string();
+            let err = p.event(&line, false, t).expect_err("refused");
+            assert!(err.starts_with("Pi began compacting (`overflow`), which the plan turns off"), "{err}");
+        });
+        assert_eq!(p.about(), json!({"result": "the stream's sum", "compaction": "off", "test_ca": false}));
+        assert_eq!(pi(Some(b"a CA".to_vec())).about()["test_ca"], true);
     }
 
     #[test]

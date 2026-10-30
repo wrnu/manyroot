@@ -93,6 +93,10 @@ impl Harness for Mock {
         self.profile
     }
 
+    fn about(&self) -> Value {
+        json!({"result": "the mock's"})
+    }
+
     fn env_names(&self) -> &[&str] {
         self.now().map_or(&self.names, |l| &l.names)
     }
@@ -570,6 +574,27 @@ fn a_changed_pinned_tree_stops_the_run_before_the_turn_starts() {
     assert!(err.starts_with("the pinned mock install changed: "), "{err}");
 }
 
+/// The first usage row is the run's record of the harness as the start took it, which metrics pass by:
+/// it has none of a counted row's fields (finding 695de67678dd).
+#[test]
+fn the_first_usage_row_records_the_harness_as_the_start_took_it() {
+    let s = Setup::new("echo init ok; echo result 0 1", caps());
+    let rows = s.usage();
+    assert_eq!(rows, [s.backend.harness_record().clone()]);
+    let r = &rows[0];
+    assert_eq!(
+        (&r["harness"], &r["profile"], &r["about"]),
+        (&json!("mock"), &json!("agent"), &json!({"result": "the mock's"}))
+    );
+    let bash = std::fs::canonicalize("/bin/bash").expect("bash");
+    assert_eq!((&r["pin"]["path"], &r["pin"]["version"]), (&json!(bash), &json!("mock")), "the pin's resolved path");
+    assert_eq!(r["pin"]["blake3"].as_str().map(str::len), Some(64));
+    assert_eq!(r["declared"], json!(["MOCK_SET", "MOCK_CONF"]));
+    for counted in ["message", "output", "output_counted_at"] {
+        assert!(r.get(counted).is_none(), "{counted}");
+    }
+}
+
 /// The tests that play a turn, which the backend runs under the agent profile: they need macOS, for
 /// sandbox-exec. Linux ignores them, and `scripts/test-table --split` runs them on the Mac by this
 /// module's name (owner decision `01a2d668b67e`).
@@ -631,7 +656,7 @@ mod macos_only {
         let s = Setup::new(script, caps());
         s.turn(1).expect("the turn");
         let rows = s.usage();
-        assert_eq!(rows[0], json!({"agent": "agent-0", "turn": 1, "gate": true}));
+        assert_eq!(rows[1], json!({"agent": "agent-0", "turn": 1, "gate": true}));
         let calls: Vec<_> = rows.iter().filter(|r| r["message"].is_string()).collect();
         assert_eq!(calls.len(), 3, "every call event is recorded: {rows:?}");
         assert_eq!(calls[0]["tools"], json!(["notes_read"]));
@@ -739,7 +764,7 @@ mod macos_only {
         let s = Setup::new("echo init the model is wrong; echo result 0 1", caps());
         let err = s.turn(1).expect_err("refused");
         assert_eq!(err, "the gate refused agent-0's turn 1: the model is wrong");
-        assert_eq!(s.usage()[0]["gate"], false);
+        assert_eq!(s.usage()[1]["gate"], false);
         assert_eq!(s.backend.halted(), Some(err.clone()));
         assert_eq!(s.turn(2), Err(err), "no further turn");
         assert!(s.transcript(2).is_none());

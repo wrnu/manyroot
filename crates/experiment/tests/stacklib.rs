@@ -493,11 +493,13 @@ fn phase_one_gives_agents_what_its_runs_were_given() {
         "9d5435906a3946ee4c02998f86241d1029d1b6d83f43fada8f488b07ddbb13e0",
         "bracken's tools"
     );
-    // A plan from before the selector names no task, and reads as Phase 1's.
+    // A plan from before the selector names no task, and reads as Phase 1's; nor its harness, read as none.
     let mut inputs = serde_json::to_value(bracken_experiment::plan::PlanInputs::default()).expect("JSON");
     inputs.as_object_mut().expect("an object").remove("task");
+    inputs.as_object_mut().expect("an object").remove("harness");
     let inputs: bracken_experiment::plan::PlanInputs = serde_json::from_value(inputs).expect("an old plan");
     assert_eq!(inputs.task, Task::Phase1);
+    assert_eq!(inputs.harness, serde_json::Value::Null);
     // Phase 2's are its own.
     assert_ne!(Task::Phase2.task_text(Version::ORIGINAL), T.task_text(Version::ORIGINAL));
     assert_ne!(mode_named("git").expect("a mode").tools(Task::Phase2).len(), 0);

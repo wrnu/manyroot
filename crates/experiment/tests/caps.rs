@@ -122,3 +122,27 @@ fn run_refuses_a_malformed_or_too_large_mode_token_cap() {
         assert!(!dir.path().join("run").exists());
     }
 }
+
+/// `run` asks each harness for its own pin, Claude Code's when none is named, before anything runs.
+#[test]
+fn run_asks_each_harness_for_its_own_pin() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_bracken-experiment"));
+    for (harness, missing, given) in [
+        (&[][..], "--claude <CLAUDE>", "--pi-prefix"),
+        (&["--harness", "claude"][..], "--claude <CLAUDE>", "--pi-prefix"),
+        (&["--harness", "pi"][..], "--pi-prefix <PI_PREFIX>", "--claude <"),
+    ] {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let out = Command::new(bin)
+            .args(["run", "--dir"])
+            .arg(dir.path().join("run"))
+            .args(["--mode", "git", "--settings", "/nonexistent"])
+            .args(harness)
+            .output()
+            .expect("the binary runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{harness:?}: {out:?}");
+        assert!(err.contains(missing) && !err.contains(given), "{harness:?}: {err}");
+        assert!(!dir.path().join("run").exists());
+    }
+}

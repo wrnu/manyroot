@@ -67,6 +67,11 @@ pub struct PlanInputs {
     /// Bracken mode's rule for which implementation counts.
     #[serde(default = "AcceptRule::before_selectable")]
     pub accept_rule: AcceptRule,
+    /// The agent harness, as its backend's record says it: name, pin, profile, declared entries and
+    /// what it says of itself, such as where a turn's result comes from. Null for the mock and for
+    /// plans from before it was recorded.
+    #[serde(default)]
+    pub harness: Value,
 }
 
 impl Default for PlanInputs {
@@ -83,6 +88,7 @@ impl Default for PlanInputs {
             usage: "usage.jsonl".into(),
             expected_stops: Vec::new(),
             accept_rule: AcceptRule::default(),
+            harness: Value::Null,
         }
     }
 }
