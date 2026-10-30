@@ -73,6 +73,9 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
 /// The most connections each listener serves at once, and of those, event streams; more are refused.
 /// Each listener has its own, so a NetBird peer can't use up the loopback listener's (finding 6e1807aa762f).
 const MAX_CONNECTIONS: usize = 64;
+
+/// Refused connections waiting for their 503 and linger, per listener; more are closed unanswered.
+const SHED_QUEUE: usize = 16;
 const MAX_STREAMS: usize = 16;
 const MAX_HEADERS: usize = 32;
 /// The longest a request's head may take to arrive, and a response's write.
@@ -569,11 +572,22 @@ impl Viewer {
 
     /// Serves one listener's connections, each on its own thread, within that listener's own budget.
     fn accept(self: &Arc<Self>, socket: &TcpListener, on: &Arc<Listener>) {
+        // A connection past the budget gets its 503 and then a linger, as every other does: closing at
+        // once would meet its request with a reset that can lose the 503 (gotcha 6b54b5d6, task
+        // c454c1095594). On one thread of its own, as a linger takes up to a second and this loop must
+        // keep accepting; past SHED_QUEUE waiting, one is closed unanswered.
+        let (shed, to_shed) = std::sync::mpsc::sync_channel::<TcpStream>(SHED_QUEUE);
+        std::thread::spawn(move || {
+            for stream in to_shed {
+                let _ = respond(&stream, &error(503, "too many connections"));
+                linger(&stream);
+            }
+        });
         for stream in socket.incoming() {
             let Ok(stream) = stream else { continue };
             if on.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
                 on.connections.fetch_sub(1, Ordering::SeqCst);
-                let _ = respond(&stream, &error(503, "too many connections"));
+                let _ = shed.try_send(stream);
                 continue;
             }
             let (viewer, on) = (Arc::clone(self), Arc::clone(on));
@@ -1504,6 +1518,18 @@ mod tests {
             held.push(TcpStream::connect(("127.0.0.1", a)).expect("connect"));
         }
         assert_eq!(status_of(a, "/api/ground"), 503, "A's connections are used up");
+        // A request that arrives after A has answered, in two writes, still gets its 503: A lingers, so the
+        // first write isn't met with a reset that fails the second (task c454c1095594).
+        for _ in 0..5 {
+            let mut late = TcpStream::connect(("127.0.0.1", a)).expect("connect");
+            std::thread::sleep(Duration::from_millis(100));
+            late.write_all(b"GET /api/ground HTTP/1.1\r\n").expect("a late request's first line");
+            std::thread::sleep(Duration::from_millis(100));
+            late.write_all(format!("Host: 127.0.0.1:{a}\r\n\r\n").as_bytes()).expect("and the rest");
+            let mut head = [0u8; 12];
+            std::io::Read::read_exact(&mut late, &mut head).expect("the 503");
+            assert_eq!(&head, b"HTTP/1.1 503");
+        }
         assert_eq!(status_of(b, "/api/ground"), 200, "B still serves");
         drop(held);
     }

@@ -86,16 +86,16 @@ fn store_for(dir: PathBuf, bracken: PathBuf, identity: &str, accept_rule: Accept
     BrackenStore { config, runs: 0, files: 0 }
 }
 
-/// A stand-in for a bracken that never stops writing, whatever its arguments: GNU `yes` would refuse
-/// bracken's options and exit at once.
 /// A stand-in that ignores bracken's arguments and writes forever, written by a child `sh` so this
 /// process never holds it open for writing: a parallel test's fork would inherit that descriptor until
 /// its exec, and spawning the file meanwhile fails on Linux with ETXTBSY, "Text file busy", an error
 /// that doesn't say "deadline" (task 1b273bf9a56c; the same as aa2ac61f8dd4).
+///
+/// A script, not `yes` itself: GNU `yes` would refuse bracken's options and exit at once.
 fn endless_writer(dir: &std::path::Path) -> PathBuf {
     let path = dir.join("endless");
     let written = Command::new("sh")
-        .args(["-c", "printf '#!/bin/sh\\nexec yes\\n' >\"$0\" && chmod 755 \"$0\""])
+        .args(["-c", "printf '#!/bin/sh\\nexec /usr/bin/yes\\n' >\"$0\" && chmod 755 \"$0\""])
         .arg(&path)
         .status()
         .expect("sh");
