@@ -1,6 +1,7 @@
 # Weave: content, integration and main as a query
 
-A design sketch, not a plan. Owner decision `af67403d89cd` asked for it and
+A design sketch, not a plan. The product spec built from it is
+[weave.md](weave.md) (task `04b85815f4a1`). Owner decision `af67403d89cd` asked for it and
 task `c053814f2efc` holds the brief; the owner's answers on 2026-10-29 shaped
 this version. Nothing here is built, and nothing here changes the protocol.
 A model run of the experiment mode at the end needs the owner's go.

@@ -163,7 +163,7 @@ Manyroot subsystems map onto modules as they come into being:
 | Roots     | Causal history                          | `manyroot::graph`                                 |
 | Proof     | Validation and acceptance               | `manyroot::validation`                            |
 | Ground    | Shared workspace                        | `manyroot::store` (local filesystem replica)      |
-| Weave     | Replication and merged state            | `manyroot::store::sync`, `manyroot::bundle`       |
+| Weave     | Replication, merged state and materialized views (first: Bracken's source trees) | `manyroot::store::sync`, `manyroot::bundle`; source trees specified in [docs/design/weave.md](docs/design/weave.md) |
 | Stewards  | Identity, permissions, governance       | Keys and signatures only (`manyroot::identity`)   |
 | Trails    | Provenance queries                      | Relations and referrers in the graph; no queries yet |
 | Rings     | Checkpoints and releases                | Not started                                       |
