@@ -2947,6 +2947,116 @@ fn owner_approve_names_a_write_the_team_server_didnt_confirm() {
     }
 }
 
+/// Finding d494f36dee9d: merge records its "merge gate" pass before it asks the forge to merge, and a
+/// live one is what tells `log --open` a PR merged. When the merge call fails, merge asks the forge
+/// (findings f1fc25380904, 3623855aa0e8). Merged at the head keeps the pass. Open, at any head, retracts
+/// it: at once after a 4xx, and after a 5xx or no reply only if it stays open while merge asks again, so a
+/// slow merge behind a proxy's timeout keeps it. Anything else stops, naming the evidence, and keeps it.
+/// When the pass is retracted, the finding against the claim stays open.
+#[test]
+fn a_failed_merge_call_retracts_the_gate_evidence_only_when_the_forge_shows_the_pr_unmerged() {
+    // The merge call's status and curl's exit code, the forge's answers to each GET after it (the
+    // last repeated), and what becomes of the pass.
+    let cases = [
+        ("refused, still open", "409", 22, &["open"][..], "retracted"),
+        ("refused, the head moved", "409", 22, &["moved"][..], "retracted"),
+        ("refused, merged at another head", "409", 22, &["merged elsewhere"][..], "unclear"),
+        ("reply lost, merged", "502", 22, &["merged"][..], "stands"),
+        ("slow merge behind a proxy", "504", 22, &["open", "merged"][..], "stands"),
+        ("proxy timeout, never merged", "504", 22, &["open"][..], "retracted"),
+        ("dropped, no answer", "000", 52, &["error"][..], "unclear"),
+    ];
+    for scripts in SCRIPTS {
+        for (case, status, exit, answers, expect) in cases {
+            let change = |dir: &Path| std::fs::write(dir.join("code.txt"), "a change\n").unwrap();
+            let (tmp, dir, mut dry) = merge_dry_run_command(scripts, |_| {}, change, |_| {}, None);
+            let out = dry.output().unwrap();
+            assert!(out.status.success(), "{scripts}: the dry run: {}", String::from_utf8_lossy(&out.stderr));
+            let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+            let claim = prs[0]["id"].as_str().unwrap().to_owned();
+            let finding = bk(&dir, &["claim", "it breaks", "--tag", "finding", "--as", "val"]);
+            bk(&dir, &["relate", &finding, "contradicts", &claim, "--as", "val"]);
+            bk(&dir, &["evidence", &finding, "fail", "--method", "triage: not a bug", "--as", "manager"]);
+            // The forge answers every GET as before until the merge call, which fails; then as the case says.
+            let stub = tmp.path().join("stubs/curl");
+            let get = std::fs::read_to_string(&stub).unwrap();
+            let get = get.lines().nth(1).unwrap().to_owned();
+            let merged = |g: &str| g.replace(r#""state":"open","merged":false"#, r#""state":"closed","merged":true"#);
+            let moved = |g: &str| g.replace(r#""head":{"sha":""#, r#""head":{"sha":"0"#);
+            let arms: String = answers
+                .iter()
+                .enumerate()
+                .map(|(k, answer)| {
+                    let reply = match *answer {
+                        "open" => get.clone(),
+                        "moved" => moved(&get),
+                        "merged" => merged(&get),
+                        "merged elsewhere" => merged(&moved(&get)),
+                        _ => "exit 22".to_owned(),
+                    };
+                    assert!(*answer == "open" || reply != get, "{case}: the stub's {answer} reply didn't change");
+                    let arm = if k + 1 == answers.len() { "*".to_owned() } else { (k + 1).to_string() };
+                    format!("{arm}) {reply}; exit ;;\n")
+                })
+                .collect();
+            let (posted, asked) = (tmp.path().join("posted"), tmp.path().join("asked"));
+            let (posted, asked) = (posted.display(), asked.display());
+            write_executable(
+                &stub,
+                &format!(
+                    "#!/bin/sh\ncase \"$*\" in *'-X POST'*) : >'{posted}'; printf {status}; exit {exit} ;; esac\n\
+                     if [ -e '{posted}' ]; then\n  n=$(($(cat '{asked}' 2>/dev/null || echo 0) + 1)); echo $n >'{asked}'\n  \
+                     case $n in\n{arms}  esac\nfi\n{get}\n"
+                ),
+            );
+            let path = format!("{}:{}", tmp.path().join("stubs").display(), std::env::var("PATH").unwrap());
+            let args = ["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--as", "manager"];
+            let out = command(&dir, "scripts/merge", &args)
+                .env("PATH", &path)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap();
+            let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let evidence: serde_json::Value =
+                serde_json::from_str(&bk(&dir, &["log", "--kind", "evidence", "--author", "manager", "--json"]))
+                    .unwrap();
+            let gate: Vec<&serde_json::Value> = evidence
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["body"]["method"].as_str().is_some_and(|m| m.starts_with("merge gate")))
+                .collect();
+            assert_eq!(gate.len(), 1, "{scripts}, {case}: {evidence}");
+            let id = gate[0]["id"].as_str().unwrap();
+            let retracted = gate[0]["retracted"] == true;
+            let said = format!("{scripts}, {case}: {stderr}{stdout}");
+            match expect {
+                "retracted" => {
+                    assert_eq!(out.status.code(), Some(1), "{said}");
+                    assert!(stderr.contains(&format!("HTTP {status}")) && stderr.contains("is retracted"), "{said}");
+                    assert!(retracted, "{said}: the pass stands");
+                }
+                "stands" => {
+                    assert!(out.status.success(), "{said}");
+                    assert!(stdout.contains(&format!("{id} stands")) && stdout.contains("merged PR #1"), "{said}");
+                    assert!(!retracted, "{said}: the merged PR's pass is retracted");
+                }
+                _ => {
+                    assert_eq!(out.status.code(), Some(1), "{said}");
+                    assert!(stderr.contains("outcome is unclear") && stderr.contains(id), "{said}");
+                    assert!(!retracted, "{said}: a pass retracted on an unclear outcome");
+                }
+            }
+            // The claim counts as open exactly when the pass is retracted: then a finding the manager
+            // confirms against it is listed.
+            bk(&dir, &["evidence", &finding, "pass", "--method", "triage: on second thought", "--as", "manager"]);
+            let open: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--open", "--json"])).unwrap();
+            let listed = open.as_array().unwrap().iter().any(|f| f["id"] == finding.as_str());
+            assert_eq!(listed, retracted, "{scripts}, {case}: {open}");
+        }
+    }
+}
+
 /// Task ec880b9c2c86: with --owner-approval, merge's owner check needs a current approval signed by owner
 /// that supports the pr claim itself. None, a manager-signed quote, a retracted one, one of a task the
 /// claim implements (finding 9e8e0c849724) or one borrowed from an earlier head through implements

@@ -1240,6 +1240,36 @@ fn log_tag_is_compact_and_since_a_date_limit_and_open_bound_it() {
     bracken(dir, &["relate", &task, "depends_on", &f, "--as", "builder"]);
     open.push(f);
 
+    // 3217747ec88b: a finding against a pr claim the manager merged (its 'merge gate' pass on it) is
+    // closed; someone else's 'merge gate' pass merges nothing.
+    let merged_pr = claim("PR #2 b @ 1", &["pr"], "builder");
+    let f = finding("against a merged head");
+    contradicts(&f, &merged_pr, "reviewer");
+    evidence(&f, "pass", "manager");
+    bracken(dir, &["evidence", &merged_pr, "pass", "--method", "merge gate @ 1", "--as", "manager"]);
+    closed.push(f);
+    // 84389638c543: a retracted merge-gate pass, a merge-gate fail, and a method that only contains
+    // 'merge gate' all leave the PR open.
+    for (n, (verdict, method, retract)) in
+        [("pass", "merge gate @ 1", true), ("fail", "merge gate @ 1", false), ("pass", "not a merge gate", false)]
+            .into_iter()
+            .enumerate()
+    {
+        let pr = claim(&format!("PR #{} d @ 1", 10 + n), &["pr"], "builder");
+        let f = finding(&format!("against a head not merged, case {n}"));
+        contradicts(&f, &pr, "reviewer");
+        let e = bracken(dir, &["evidence", &pr, verdict, "--method", method, "--as", "manager"]);
+        if retract {
+            bracken(dir, &["retract", &e, "--as", "manager"]);
+        }
+        open.push(f);
+    }
+    let other_pr = claim("PR #3 c @ 1", &["pr"], "builder");
+    let f = finding("against a head someone else calls merged");
+    contradicts(&f, &other_pr, "reviewer");
+    bracken(dir, &["evidence", &other_pr, "pass", "--method", "merge gate @ 1", "--as", "reviewer"]);
+    open.push(f);
+
     let listed = ids(dir, &["log", "--open", "--json"]);
     for f in &open {
         assert!(listed.contains(f), "{f} is open: {listed:?}");
