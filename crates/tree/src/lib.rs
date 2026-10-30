@@ -20,6 +20,7 @@
 //! | [`lines`]  | Lines and their policies, qualifying decisions, heads and forks |
 //! | [`materialize`] | Writing a manifest out without following a symlink     |
 //! | [`merge`]  | Per-file merges, conflicts and their resolutions             |
+//! | [`objections`] | Objections, their basis and answers, guardrails, open objections |
 //! | [`secrets`]| The deny-list and the key-material scan import refuses by      |
 //!
 //! Every record is a plain manyroot contribution, so nothing here changes the
@@ -35,6 +36,7 @@ pub mod import;
 pub mod lines;
 pub mod materialize;
 pub mod merge;
+pub mod objections;
 pub mod path;
 pub mod results;
 pub mod reviews;

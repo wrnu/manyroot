@@ -181,22 +181,21 @@ impl World {
     /// question walked.
     fn counted(&self, decision: &ContributionId) -> Counted {
         let (_, lines, checks) = self.checks();
-        let mut counted = checks.counted(&self.g, &lines, &self.line, decision).expect("one current policy");
+        let mut counted = checks.counted(&self.g, &lines, decision).expect("one current policy");
         assert_eq!(checks.stats().fallbacks, 0, "{:?}", checks.stats());
         counted.remove(0)
     }
 
     /// The counted results of `test` for a decision on its own manifest, over its own past, under the
-    /// policy version `version`, with no ancestor question walked.
+    /// policy in force for it, which must be `version`, with no ancestor question walked.
     fn past(&self, decision: &ContributionId, version: &ContributionId) -> Counted {
         let (ix, lines, checks) = self.checks();
         let d = lines.decision(decision).expect("a decision");
-        let policy = &lines.version(version).expect("a version").policy;
-        let query =
-            PastQuery { asker: *decision, version: *version, policy, author: d.author, manifest: d.decision.manifest };
-        let (mut counted, stats) = checks.count_in_pasts(&self.g, &ix, &[query]);
+        assert_eq!(lines.policy_in_force_for(decision).map(|v| v.id), Some(*version), "Lines gives the policy");
+        let query = PastQuery { decision: *decision, manifest: d.decision.manifest };
+        let (mut counted, stats) = checks.count_in_pasts(&self.g, &ix, &lines, &[query]);
         assert_eq!(stats.fallbacks, 0, "{stats:?}");
-        counted.remove(0).remove(0)
+        counted.remove(0).expect("a policy in force").remove(0)
     }
 }
 
@@ -486,16 +485,21 @@ fn a_decisions_count_reads_only_its_own_past() {
     let first = w.result(&bob, m, ARGV, false, 1, None);
     let d0 = w.decide(m.0, &[]);
     assert_eq!(w.past(&d0, &p0).fails, [first]);
-    // After d0: a re-run that passes, a retraction of the fail, and a new policy.
+    // After d0: a re-run that passes, and a retraction of the fail.
     let rerun = w.result(&bob, m, ARGV, true, 2, None);
     w.add(&bob, Body::Retract { target: first, reason: "flaky".into() });
-    w.change_policy(p0, ARGV);
     let seen = w.past(&d0, &p0);
     assert_eq!((seen.fails.clone(), seen.passes.len()), (vec![first], 0), "d0 still saw its fail: {seen:?}");
-    // A decision after all that sees the re-run as latest, and the fail both replaced and retracted.
+    // A decision after that sees the re-run as latest, and the fail both replaced and retracted.
     let d1 = w.decide(m.0, &[d0]);
     let later = w.past(&d1, &p0);
     assert_eq!((later.passes.clone(), later.fails.len(), later.replaced.len()), (vec![rerun], 0, 0), "{later:?}");
+    // A new policy changes neither count, and a decision under it counts afresh (the epoch).
+    let p1 = w.change_policy(p0, ARGV);
+    assert_eq!(w.past(&d0, &p0).fails, [first]);
+    assert_eq!(w.past(&d1, &p0).passes, [rerun]);
+    let d2 = w.decide(m.0, &[d1]);
+    assert!(w.past(&d2, &p1).passes.is_empty(), "the re-run is older than p1");
 }
 
 /// Within a decision's past, a validator's concurrent latest results count as one fail, and an earlier
@@ -548,15 +552,12 @@ fn many_decisions_are_counted_over_their_pasts_without_a_walk() {
         seen.push((d, r, attempt % 2 == 0));
     }
     let (ix, lines, checks) = w.checks();
-    let policy = &lines.version(&p0).expect("the line").policy;
-    let queries: Vec<PastQuery> = seen
-        .iter()
-        .map(|(d, _, _)| PastQuery { asker: *d, version: p0, policy, author: w.alice.agent_id(), manifest: m.0 })
-        .collect();
-    let (counted, stats) = checks.count_in_pasts(&w.g, &ix, &queries);
+    let queries: Vec<PastQuery> = seen.iter().map(|(d, _, _)| PastQuery { decision: *d, manifest: m.0 }).collect();
+    let (counted, stats) = checks.count_in_pasts(&w.g, &ix, &lines, &queries);
     assert_eq!(stats.fallbacks, 0, "{stats:?}");
     for ((d, r, passed), counted) in seen.iter().zip(&counted) {
-        let c = &counted[0];
+        assert_eq!(lines.policy_in_force_for(d).map(|v| v.id), Some(p0));
+        let c = &counted.as_ref().expect("a policy in force")[0];
         let latest = if *passed { &c.passes } else { &c.fails };
         assert_eq!(latest, &[*r], "{d}: {c:?}");
     }
@@ -759,4 +760,36 @@ fn a_long_chain_of_retractions_is_judged_as_the_graph_judges_it() {
     // Halfway along the chain, as a past that holds only its first 1,000 retractions sees it.
     let first: std::collections::HashSet<ContributionId> = chain[1..=1_000].iter().copied().collect();
     assert!(!ix.retractions().within(&fail, |x| first.contains(x)));
+}
+
+/// Finding eb8b992ae58f: the latest rule within decisions' pasts asks which of a key's results lie below
+/// which once per key, however many decisions are counted: ten decisions take the same passes as one.
+/// (Measured in a release build: 8,000 results on one manifest, ten decisions, about 0.3 s; weave.md
+/// section 4.)
+#[test]
+fn the_latest_rule_costs_the_same_passes_for_many_decisions_as_for_one() {
+    const N: u64 = 300;
+    let stats = |q: usize| {
+        let mut w = World::new();
+        let bob = w.bob.clone();
+        let m = w.tree(&[("a", b"0")]);
+        for attempt in 1..=N {
+            w.result(&bob, m, ARGV, false, attempt, None);
+        }
+        let mut previous = vec![];
+        let mut queries = vec![];
+        for _ in 0..q {
+            let d = w.decide(m.0, &previous);
+            previous = vec![d];
+            queries.push(PastQuery { decision: d, manifest: m.0 });
+        }
+        let (ix, lines, checks) = w.checks();
+        let (counted, stats) = checks.count_in_pasts(&w.g, &ix, &lines, &queries);
+        assert!(counted.iter().all(|c| c.as_ref().expect("a policy")[0].fails.len() == 1));
+        assert_eq!(stats.fallbacks, 0, "{stats:?}");
+        stats
+    };
+    let (one, ten) = (stats(1), stats(10));
+    assert_eq!(one.passes, ten.passes, "{one:?} {ten:?}");
+    assert_eq!(one.passes as u64, 2 * N.div_ceil(64), "a pass per 64 results for each stage: {one:?}");
 }

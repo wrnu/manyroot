@@ -24,7 +24,7 @@
 //! results lie below one another by [`ancestry::rounds`].
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use manyroot::{AgentId, ContributionId, Graph};
 
@@ -116,16 +116,13 @@ pub enum Green {
     Ambiguous(Vec<ContributionId>),
 }
 
-/// One count over a decision's own causal past: of the results on `manifest`, under policy version
-/// `version` (with its payload, `policy`), leaving out `author`'s, over `asker`'s strict causal
-/// ancestors. For qualification, `asker` is the decision being judged and `version` the policy in force
-/// for it; `manifest` is its own, or the manifest an objection it must answer objects to.
-#[derive(Debug, Clone)]
-pub struct PastQuery<'a> {
-    pub asker: ContributionId,
-    pub version: ContributionId,
-    pub policy: &'a Line,
-    pub author: AgentId,
+/// One count over a decision's own causal past: of the results on `manifest`, under the policy in force
+/// for `decision`, leaving out its author's, over its strict causal ancestors. `manifest` is its own, or
+/// the manifest an objection to it objects to. The policy and author come from [`Lines`], so a query
+/// can't pair a decision with another's policy (task 3117629ebf94).
+#[derive(Debug, Clone, Copy)]
+pub struct PastQuery {
+    pub decision: ContributionId,
     pub manifest: ContentHash,
 }
 
@@ -147,7 +144,13 @@ pub struct Checks {
 
 /// An ancestor answer from `ancestry`, or a walk, counted in `misses`, for a question nothing asked: a
 /// bug, which fails debug builds (answer b2dbc4f5e810).
-fn answer(ancestry: &Ancestry, misses: &Cell<usize>, g: &Graph, a: &ContributionId, b: &ContributionId) -> bool {
+pub(crate) fn answer(
+    ancestry: &Ancestry,
+    misses: &Cell<usize>,
+    g: &Graph,
+    a: &ContributionId,
+    b: &ContributionId,
+) -> bool {
     if !g.contains(a) {
         return false;
     }
@@ -273,19 +276,13 @@ impl Checks {
         c
     }
 
-    /// The counted results for each check of `line`'s current policy, for one of its decisions, over the
-    /// whole replica: what green reads. `None` if the line has no current policy (a diverged chain) or
-    /// `decision` isn't a decision.
-    pub fn counted(
-        &self,
-        g: &Graph,
-        lines: &Lines,
-        line: &ContributionId,
-        decision: &ContributionId,
-    ) -> Option<Vec<Counted>> {
-        let [version] = lines.current_versions(line)[..] else { return None };
-        let policy = &lines.version(&version)?.policy;
+    /// The counted results for each check of the current policy of a decision's line, over the whole
+    /// replica: what green reads. `None` if `decision` isn't a decision, or its line has no current
+    /// policy (a diverged chain, or not a line).
+    pub fn counted(&self, g: &Graph, lines: &Lines, decision: &ContributionId) -> Option<Vec<Counted>> {
         let d = lines.decision(decision)?;
+        let [version] = lines.current_versions(&d.decision.line)[..] else { return None };
+        let policy = &lines.version(&version)?.policy;
         Some(self.counted_now(g, &version, policy, &d.author, &d.decision.manifest))
     }
 
@@ -321,30 +318,48 @@ impl Checks {
             .collect()
     }
 
-    /// The counted results for each check of each query's policy, over its asker's own causal past
-    /// (weave.md section 2): a result counts only if it, and the policy version, are ancestors of the
-    /// asker, and it isn't retracted within that past by the protocol's rule; and of those, each
-    /// validator's latest within that past counts. So a later re-run, retraction or policy change,
-    /// outside the asker's past, never changes the count (finding c85337dfad09). Every ancestor question
-    /// is answered by the ancestor index: which results, the retractions below them and policy versions
-    /// lie in each asker's past by one [`Ancestry`], and
-    /// which results lie below one another, among those in some asker's past, by
-    /// [`ancestry::rounds`].
-    pub fn count_in_pasts(&self, g: &Graph, ix: &Index, queries: &[PastQuery<'_>]) -> (Vec<Vec<Counted>>, Stats) {
+    /// The counted results for each check of the policy in force for each query's decision, over that
+    /// decision's own causal past (weave.md section 2), or `None` if its line's chain gives no policy in
+    /// force. A result counts only if it, and the policy version, are ancestors of the decision, and it
+    /// isn't retracted within that past by the protocol's rule; and of those, each validator's latest
+    /// within that past counts. So a later re-run, retraction or policy change, outside the past, never
+    /// changes the count (finding c85337dfad09). Every ancestor question is answered by the ancestor
+    /// index: which results, the retractions below them and policy versions lie in each past by one
+    /// [`Ancestry`], and which results lie below one another by one [`ancestry::below_in_groups`] over
+    /// each key's results, each eligible result reading its word once for every query it is eligible in
+    /// (finding eb8b992ae58f).
+    pub fn count_in_pasts(
+        &self,
+        g: &Graph,
+        ix: &Index,
+        lines: &Lines,
+        queries: &[PastQuery],
+    ) -> (Vec<Option<Vec<Counted>>>, Stats) {
         let retractions = ix.retractions();
-        // Each query's checks, each with the validators' keys that have results.
-        let plans: Vec<Vec<(String, String, Vec<Key>)>> = queries
+        // Each query's decision, policy version and payload, author and manifest, from Lines.
+        type Resolved<'l> = Option<(ContributionId, ContributionId, &'l Line, AgentId, ContentHash)>;
+        let resolved: Vec<Resolved> = queries
             .iter()
             .map(|q| {
-                let validators: BTreeSet<&AgentId> = q.policy.validators.iter().filter(|v| **v != q.author).collect();
-                q.policy
+                let d = lines.decision(&q.decision)?;
+                let version = lines.policy_in_force_for(&q.decision)?;
+                Some((q.decision, version.id, &version.policy, d.author, q.manifest))
+            })
+            .collect();
+        // Each query's checks, each with the validators' keys that have results.
+        let plans: Vec<Vec<(String, String, Vec<Key>)>> = resolved
+            .iter()
+            .map(|q| {
+                let Some((_, _, policy, author, manifest)) = q else { return vec![] };
+                let validators: BTreeSet<&AgentId> = policy.validators.iter().filter(|v| *v != author).collect();
+                policy
                     .checks
                     .iter()
                     .map(|(name, argv)| {
                         let method = CheckDefinition { name, argv }.method();
                         let keys = validators
                             .iter()
-                            .map(|v| (**v, q.manifest, method.clone()))
+                            .map(|v| (**v, *manifest, method.clone()))
                             .filter(|k| self.by_key.contains_key(k))
                             .collect();
                         (name.clone(), method, keys)
@@ -355,104 +370,94 @@ impl Checks {
         // Stage one: whether each result, and each retraction below it, is in the asker's past, and
         // whether the policy version is in the result's.
         let mut refs: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
-        for (q, plan) in queries.iter().zip(&plans) {
+        for (q, plan) in resolved.iter().zip(&plans) {
+            let Some((asker, version, ..)) = q else { continue };
             for key in plan.iter().flat_map(|(_, _, keys)| keys) {
                 for r in &self.by_key[key] {
-                    let asked = refs.entry(q.asker).or_default();
+                    let asked = refs.entry(*asker).or_default();
                     asked.push(*r);
                     asked.extend(retractions.below(r));
-                    refs.entry(*r).or_default().push(q.version);
+                    refs.entry(*r).or_default().push(*version);
                 }
             }
         }
         let past = Ancestry::build(g, &refs, &[]);
         let misses = Cell::new(0);
         let ask = |a: &ContributionId, b: &ContributionId| answer(&past, &misses, g, a, b);
-        // Each query's eligible results per key: in its past, not retracted there by the protocol's rule
+        // Stage two: the keys asked about, each a group of its results; and per query, check and key, a
+        // sink that its eligible results read into: in its past, not retracted there by the protocol's rule
         // (a retraction in the past that isn't itself retracted there), in the epoch.
-        let eligible: Vec<Vec<Vec<Vec<ContributionId>>>> = queries
+        let mut group_of: HashMap<&Key, usize> = HashMap::new();
+        let mut groups: Vec<Vec<ContributionId>> = Vec::new();
+        let mut sinks: Vec<Vec<Vec<usize>>> = Vec::new();
+        // Each sink's group, and its eligible results by slot in that group.
+        let mut sink_slots: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut sink_at: Vec<Vec<Vec<usize>>> = Vec::new();
+        for (q, plan) in resolved.iter().zip(&plans) {
+            let mut mine = Vec::new();
+            let Some((asker, version, ..)) = q else {
+                sink_at.push(mine);
+                continue;
+            };
+            for (_, _, keys) in plan {
+                let mut per_key = Vec::new();
+                for key in keys {
+                    let next = groups.len();
+                    let k = *group_of.entry(key).or_insert(next);
+                    if k == next {
+                        groups.push(self.by_key[key].clone());
+                        sinks.push(vec![Vec::new(); self.by_key[key].len()]);
+                    }
+                    let sink = sink_slots.len();
+                    let eligible: Vec<usize> = groups[k]
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, r)| ask(r, asker) && !retractions.within(r, |x| ask(x, asker)) && ask(version, r))
+                        .map(|(slot, _)| slot)
+                        .collect();
+                    for slot in &eligible {
+                        sinks[k][*slot].push(sink);
+                    }
+                    sink_slots.push((k, eligible));
+                    per_key.push(sink);
+                }
+                mine.push(per_key);
+            }
+            sink_at.push(mine);
+        }
+        let (below, latest_stats) = ancestry::below_in_groups(g, &groups, &sinks, sink_slots.len());
+        let counted = resolved
             .iter()
             .zip(&plans)
-            .map(|(q, plan)| {
-                plan.iter()
-                    .map(|(_, _, keys)| {
-                        keys.iter()
-                            .map(|key| {
-                                let in_past = |r: &&ContributionId| {
-                                    ask(r, &q.asker)
-                                        && !retractions.within(r, |x| ask(x, &q.asker))
-                                        && ask(&q.version, r)
-                                };
-                                self.by_key[key].iter().filter(in_past).copied().collect()
-                            })
-                            .collect()
-                    })
-                    .collect()
-            })
-            .collect();
-        // Stage two: each eligible result, once, asks which results of its key lie below it, and marks
-        // them below the latest for every query it is eligible in.
-        let mut list_of: HashMap<&Key, usize> = HashMap::new();
-        let mut lists: Vec<Vec<ContributionId>> = Vec::new();
-        let mut readers: BTreeMap<ContributionId, Vec<(usize, usize, usize)>> = BTreeMap::new();
-        for (qi, plan) in plans.iter().enumerate() {
-            for (ci, (_, _, keys)) in plan.iter().enumerate() {
-                for (ki, key) in keys.iter().enumerate() {
-                    let next = lists.len();
-                    if *list_of.entry(key).or_insert(next) == next {
-                        let mut list = self.by_key[key].clone();
-                        list.sort();
-                        lists.push(list);
-                    }
-                    for r in &eligible[qi][ci][ki] {
-                        readers.entry(*r).or_default().push((qi, ci, ki));
-                    }
-                }
-            }
-        }
-        let mut below: HashMap<(usize, usize, usize), HashSet<ContributionId>> = HashMap::new();
-        let askers: Vec<(ContributionId, usize)> = readers
-            .keys()
-            .map(|r| {
-                let r_ = &self.results[r];
-                (*r, list_of[&(r_.author, r_.manifest, r_.method.clone())])
-            })
-            .collect();
-        let rounds = ancestry::rounds(g, &lists, &askers, |k, answers| {
-            let (reader, list) = askers[k];
-            for at in &readers[&reader] {
-                let marked = below.entry(*at).or_default();
-                marked.extend(lists[list].iter().filter(|r| answers.get(r) == Some(true)));
-            }
-        });
-        let counted = plans
-            .iter()
-            .enumerate()
-            .map(|(qi, plan)| {
-                plan.iter()
-                    .enumerate()
-                    .map(|(ci, (name, method, keys))| {
-                        let per_validator = (0..keys.len()).map(|ki| {
-                            let eligible = eligible[qi][ci][ki].clone();
-                            let marked = below.get(&(qi, ci, ki));
-                            let latest =
-                                eligible.iter().filter(|r| marked.is_none_or(|m| !m.contains(r))).copied().collect();
-                            (latest, eligible)
+            .zip(&sink_at)
+            .map(|((q, plan), sink_at)| {
+                q.as_ref()?;
+                let per_check = plan
+                    .iter()
+                    .zip(sink_at)
+                    .map(|((name, method, _), sinks)| {
+                        let per_validator = sinks.iter().map(|sink| {
+                            let (k, eligible) = &sink_slots[*sink];
+                            let ids = |slots: &mut dyn Iterator<Item = &usize>| -> Vec<ContributionId> {
+                                slots.map(|slot| groups[*k][*slot]).collect()
+                            };
+                            let latest = ids(&mut eligible.iter().filter(|slot| !below[*sink][**slot]));
+                            (latest, ids(&mut eligible.iter()))
                         });
                         self.tally(name, method.clone(), per_validator.collect::<Vec<_>>().into_iter())
                     })
-                    .collect()
+                    .collect();
+                Some(per_check)
             })
             .collect();
         let first = past.stats();
         let stats = Stats {
-            passes: first.passes + rounds.passes,
-            ors: first.ors + rounds.ors,
-            questions: first.questions + rounds.questions,
+            passes: first.passes + latest_stats.passes,
+            ors: first.ors + latest_stats.ors,
+            questions: first.questions + latest_stats.questions,
             bytes: first.bytes,
-            peak_words: rounds.peak_words,
-            fallbacks: misses.get() + rounds.fallbacks,
-            ..rounds
+            fallbacks: misses.get() + latest_stats.fallbacks,
+            ..latest_stats
         };
         (counted, stats)
     }

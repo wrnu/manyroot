@@ -2,10 +2,10 @@
 //! versions and manifests by content hash, the marker that counts, what each
 //! contribution is, and what `weave check` lists.
 //!
-//! Retracted records are left out of every view, except that a retracted manifest
-//! artifact still names its manifest, for the results and reviews on it. An invalid payload makes
-//! no contribution invalid: Weave just ignores it, and [`Index::problems`] lists
-//! it.
+//! Retracted records are left out of every view, except file versions and
+//! manifests: they are content, named by hash, so they are held retracted or not.
+//! An invalid payload makes no contribution invalid: Weave just ignores it, and
+//! [`Index::problems`] lists it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -39,11 +39,11 @@ pub enum Problem {
 /// An index of one replica's Weave records.
 #[derive(Debug, Default)]
 pub struct Index {
-    /// File versions by content hash: artifact ids, ascending.
+    /// File versions by content hash: artifact ids, retracted or not, ascending.
     files: BTreeMap<ContentHash, Vec<ContributionId>>,
     /// Each held file version's size, by content hash: the same bytes under every id.
     sizes: BTreeMap<ContentHash, u64>,
-    /// Valid manifests by content hash: artifact ids, ascending, and the manifest.
+    /// Valid manifests by content hash: artifact ids, retracted or not, ascending, and the manifest.
     manifests: BTreeMap<ContentHash, (Vec<ContributionId>, Manifest)>,
     /// Valid markers, ascending.
     markers: Vec<ContributionId>,
@@ -141,6 +141,9 @@ pub struct GoalLink {
     pub goal: ContributionId,
     /// The goal claim's author.
     pub author: AgentId,
+    /// The `refines` relation's author: a goal binds only through a link a goal setter wrote (task
+    /// 8ff95e0b756f).
+    pub linker: AgentId,
     pub to: ContributionId,
     /// The relation or the goal claim is retracted now, by the protocol's rule.
     pub retracted: bool,
@@ -200,7 +203,6 @@ impl Index {
         let mut refs: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
         // Evidence, each with its target; kept as results once the valid manifests are known.
         let mut evidence: Vec<(ContributionId, ContributionId)> = Vec::new();
-        let mut retracted_manifests: Vec<(ContributionId, ContentHash)> = Vec::new();
         for id in ids {
             let c = g.get(&id).expect("listed by the graph");
             match c.body() {
@@ -222,20 +224,21 @@ impl Index {
                         && matches!(goal.body(), Body::Claim { tags, .. } if tags.iter().any(|t| t == GOAL_TAG))
                     {
                         let retracted = g.is_retracted(&id) || g.is_retracted(from);
-                        index.goals.push(GoalLink { id, goal: *from, author: goal.author(), to: *to, retracted });
+                        let (author, linker) = (goal.author(), c.author());
+                        index.goals.push(GoalLink { id, goal: *from, author, linker, to: *to, retracted });
                     }
                 }
                 _ => {}
             }
             let Body::Artifact { media_type, content, .. } = c.body() else { continue };
-            // A retracted manifest artifact still names its manifest: results on it attach to the
-            // manifest, not to the artifact, so retracting it can't clear them (finding 348e506fce4c).
-            if media_type == MANIFEST_MEDIA_TYPE && g.is_retracted(&id) {
-                retracted_manifests.push((id, ContentHash::of(content)));
-            }
-            if !media_type.starts_with(MEDIA_TYPE_PREFIX) || g.is_retracted(&id) {
+            if !media_type.starts_with(MEDIA_TYPE_PREFIX) {
                 continue;
             }
+            // File versions and manifests are content, named by hash: retracting one artifact retracts
+            // that artifact, not its content, which other artifacts may carry and decisions name. So they
+            // are held retracted or not, and a later retraction never changes what a decision's manifest
+            // resolves to (answer 2c28892e9701; v0 has no content takedown).
+            let retracted = g.is_retracted(&id);
             if media_type == FILE_MEDIA_TYPE {
                 let hash = ContentHash::of(content);
                 index.files.entry(hash).or_default().push(id);
@@ -254,10 +257,14 @@ impl Index {
                     Ok(manifest) => {
                         index.manifests.insert(hash, (vec![id], manifest));
                     }
-                    Err(error) => {
+                    Err(error) if !retracted => {
                         found.push(Err(Problem::InvalidPayload { id, media_type: media_type.clone(), error }))
                     }
+                    Err(_) => {}
                 }
+                continue;
+            }
+            if retracted {
                 continue;
             }
             match references(media_type, content) {
@@ -279,20 +286,9 @@ impl Index {
         }
         // Every manifest artifact names its manifest, retracted or not: results and reviews on it attach
         // to the manifest, so retracting one artifact clears none of them (findings 348e506fce4c and
-        // 06bbc6a34636). A manifest whose every artifact is retracted is decoded once to tell it's valid.
+        // 06bbc6a34636).
         index.manifest_of =
             index.manifests.iter().flat_map(|(hash, (ids, _))| ids.iter().map(|id| (*id, *hash))).collect();
-        let mut valid: HashMap<ContentHash, bool> = HashMap::new();
-        for (id, hash) in retracted_manifests {
-            let is_valid = index.manifests.contains_key(&hash)
-                || *valid.entry(hash).or_insert_with(|| match g.get(&id).map(|c| c.body()) {
-                    Some(Body::Artifact { content, .. }) => Manifest::decode_with(content, &mut paths).is_ok(),
-                    _ => false,
-                });
-            if is_valid {
-                index.manifest_of.insert(id, hash);
-            }
-        }
         for (id, target) in evidence {
             let Some(manifest) = index.manifest_of.get(&target).copied() else { continue };
             let c = g.get(&id).expect("listed by the graph");
