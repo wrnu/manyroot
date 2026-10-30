@@ -26,7 +26,7 @@ pub fn system_prompt(mode: &str) -> Result<String, String> {
 
 /// The first message of each turn: which turn of how many, and who the agent is.
 pub fn turn_message(turn: u32, turns: u32, name: &str) -> String {
-    crate::claude::TURN_MESSAGE
+    crate::backend::TURN_MESSAGE
         .replace("{turns}", &turns.to_string())
         .replace("{turn}", &turn.to_string())
         .replace("{name}", name)

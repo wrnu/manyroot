@@ -131,10 +131,13 @@ It drops the bracken-versus-git-versus-crdt comparison. Instead it runs one
 task under different Weave configurations (who integrates, guardrails,
 windows, which head agents build on, test cadence) and compares them.
 
-The backend becomes an interface: start a turn with a prompt and an
-environment, stream events, report usage, stop. Claude Code is the first
-backend (today's `claude.rs`), Pi the second. Running the same
-configuration under both is also the neutrality test above.
+The backend is an interface: start a turn with a prompt and an
+environment, stream events, report usage, stop. `crates/experiment/src/backend.rs`
+holds it: a `Harness` says how to start a turn and read its events, and
+the backend does the gate, the accounting, the caps, the process group and
+the transcripts the same way for every harness. Claude Code (`claude.rs`)
+is the first harness, Pi the second. Running the same configuration under
+both is also the neutrality test above.
 
 ## Order
 
