@@ -73,7 +73,7 @@ impl Mode for CrdtMode {
             ),
             tool(
                 "edit",
-                "Replace lines start..end (inclusive) of a module file or NOTES.md with text; end = start - 1 inserts before start",
+                "Replace lines start..end (inclusive) of a module file or NOTES.md with text; end = start - 1 inserts before start. Each definition is one line: `def <name> <arity> : <program>`",
                 json!({"file": editable, "start": line, "end": {"type": "integer", "minimum": 0, "maximum": 100_000}, "text": text}),
                 &["file", "start", "end", "text"],
             ),

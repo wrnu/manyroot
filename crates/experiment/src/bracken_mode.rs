@@ -138,7 +138,7 @@ impl Mode for BrackenMode {
             ),
             tool(
                 "artifact",
-                "Contribute an implementation: the definition of one task function, as stacklib text of at most 2000 bytes. It may define helpers, each named starting with the function's name (e.g. `median3lo`), but no other task function. Relate it with `implements` to its spec claim",
+                "Contribute an implementation: the definition of one task function, as stacklib text of at most 2000 bytes. It may define helpers, each named starting with the function's name (e.g. `median3lo`), but no other task function. Relate it with `implements` to its spec claim. Each definition is one line: `def <name> <arity> : <program>`",
                 json!({"function": text, "content": text}),
                 &["function", "content"],
             ),

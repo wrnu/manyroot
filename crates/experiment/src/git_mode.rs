@@ -74,7 +74,7 @@ impl Mode for GitMode {
             ),
             tool(
                 "edit",
-                "Replace lines start..end (inclusive) of a module file with text; end = start - 1 inserts before start",
+                "Replace lines start..end (inclusive) of a module file with text; end = start - 1 inserts before start. Each definition is one line: `def <name> <arity> : <program>`",
                 json!({"file": module, "start": line, "end": {"type": "integer", "minimum": 0, "maximum": 100_000}, "text": text}),
                 &["file", "start", "end", "text"],
             ),
