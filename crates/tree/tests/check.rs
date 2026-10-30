@@ -237,20 +237,22 @@ mod macos_only {
         s.assert_cleaned_up();
     }
 
+    /// Whether a process holds `pid`: `kill -0` sends no signal, only checks.
+    fn alive(pid: &str) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", pid])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("kill")
+            .success()
+    }
+
     // The timeout kills the check's whole process group, and so does a normal end: nothing it
     // started outlives it.
     #[test]
     fn the_process_group_is_killed_at_the_timeout_and_at_the_end() {
         let mut s = Setup::new();
         s.runner.timeout = Duration::from_secs(1);
-        let alive = |pid: &str| {
-            std::process::Command::new("/bin/kill")
-                .args(["-0", pid])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("kill")
-                .success()
-        };
         let started = Instant::now();
         let out = s.run(&["sh", "-c", "sleep 30 & echo $!; sleep 30"], &[]).expect("runs");
         assert_eq!(out.exit, Exit::TimedOut);
@@ -271,14 +273,6 @@ mod macos_only {
     #[test]
     fn a_check_cant_leave_its_process_group() {
         let s = Setup::new();
-        let alive = |pid: &str| {
-            std::process::Command::new("/bin/kill")
-                .args(["-0", pid])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("kill")
-                .success()
-        };
         let escapes = [
             ("setsid", "perl -MPOSIX -e 'my $p = fork; if (!$p) { POSIX::setsid(); sleep 30; exit } print \"$p\\n\"'"),
             ("set -m", "set -m; sleep 30 & echo $!"),
@@ -306,18 +300,8 @@ mod macos_only {
     fn a_posix_spawn_setsid_child_is_found_killed_and_fails_the_run() {
         let mut s = Setup::new();
         s.runner.timeout = Duration::from_secs(3);
-        let alive = |pid: i32| {
-            std::process::Command::new("/bin/kill")
-                .args(["-0", &pid.to_string()])
-                .stderr(std::process::Stdio::null())
-                .status()
-                .expect("kill")
-                .success()
-        };
         let python = PYTHON;
-        if !Path::new(python).exists() {
-            panic!("this test needs the Command Line Tools' python3 at {python}");
-        }
+        assert!(Path::new(python).exists(), "this test needs the Command Line Tools' python3 at {python}");
         let spawn = format!(
             "{python} -c 'import os, sys, time; p = os.posix_spawn(\"/bin/sleep\", [\"sleep\", \"60\"], {{}}, setsid=True); \
              print(p, os.getpgid(p) != os.getpgrp(), flush=True); time.sleep(60)'"
@@ -333,7 +317,7 @@ mod macos_only {
             assert_eq!(out.exit, Exit::LeftGroup(vec![pid]), "{what}: {tail}");
             assert!(!out.exit.passed());
             assert!(out.exit.to_string().contains("left the process group"), "{}", out.exit);
-            assert!(!alive(pid), "{what}: the child {pid} outlived the check");
+            assert!(!alive(&pid.to_string()), "{what}: the child {pid} outlived the check");
         }
         s.assert_cleaned_up();
     }
@@ -470,25 +454,36 @@ mod macos_only {
     }
 
     // Finding 91a14a75ae16: the guard kills a process it saw running, and not one holding a pid it
-    // recorded with another start time, as a reused pid would be.
+    // recorded with another start time, as a reused pid would be. Each sleep is killed and reaped when
+    // the test ends, even if an assert fails, and the last assert builds no guard, as one for an exited
+    // pid could kill whatever took it (finding 39cd8d65bd09).
     #[test]
     fn the_kill_guard_kills_only_the_processes_it_saw() {
-        let spawn = || std::process::Command::new("/bin/sleep").arg("60").spawn().expect("a sleep");
+        let spawn = || Reaped(std::process::Command::new("/bin/sleep").arg("60").spawn().expect("a sleep"));
         let (mut seen, mut reused) = (spawn(), spawn());
-        let guard = KillOnDrop::of(&[seen.id() as i32]);
+        let guard = KillOnDrop::of(&[seen.0.id() as i32]);
         assert_eq!(guard.0.len(), 1, "the running sleep is recorded");
         drop(guard);
-        let status = seen.wait().expect("the sleep's status");
+        let status = seen.0.wait().expect("the sleep's status");
         assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(9), "{status}");
-        drop(KillOnDrop(vec![(reused.id() as i32, "Thu Jan  1 00:00:00 1970".to_owned())]));
+        drop(KillOnDrop(vec![(reused.0.id() as i32, "Thu Jan  1 00:00:00 1970".to_owned())]));
         std::thread::sleep(Duration::from_millis(200));
         assert!(
-            reused.try_wait().expect("the other sleep's status").is_none(),
+            reused.0.try_wait().expect("the other sleep's status").is_none(),
             "a pid that isn't the one seen was killed"
         );
-        reused.kill().expect("the other sleep killed");
-        let _ = reused.wait();
-        assert!(KillOnDrop::of(&[seen.id() as i32]).0.is_empty(), "an exited process isn't recorded");
+        assert!(started(&[seen.0.id() as i32]).is_empty(), "an exited process isn't recorded");
+    }
+
+    /// A child that is killed and reaped when dropped. Once reaped, `Child::kill` sends nothing, so a
+    /// pid taken since isn't signalled.
+    struct Reaped(std::process::Child);
+
+    impl Drop for Reaped {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
     }
 
     // A panic inside the run (here, the file source) still removes the fresh directory.
