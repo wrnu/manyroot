@@ -16,6 +16,7 @@ use std::io::{self, Write};
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::TrySendError;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,10 +74,11 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
 /// The most connections each listener serves at once, and of those, event streams; more are refused.
 /// Each listener has its own, so a NetBird peer can't use up the loopback listener's (finding 6e1807aa762f).
 const MAX_CONNECTIONS: usize = 64;
-
-/// Refused connections waiting for their 503 and linger, per listener; more are closed unanswered.
-const SHED_QUEUE: usize = 16;
 const MAX_STREAMS: usize = 16;
+
+/// Refused connections waiting for their 503 and linger, per listener; more are answered at once,
+/// without a linger.
+const SHED_QUEUE: usize = 16;
 const MAX_HEADERS: usize = 32;
 /// The longest a request's head may take to arrive, and a response's write.
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
@@ -575,7 +577,9 @@ impl Viewer {
         // A connection past the budget gets its 503 and then a linger, as every other does: closing at
         // once would meet its request with a reset that can lose the 503 (gotcha 6b54b5d6, task
         // c454c1095594). On one thread of its own, as a linger takes up to a second and this loop must
-        // keep accepting; past SHED_QUEUE waiting, one is closed unanswered.
+        // keep accepting. Past SHED_QUEUE waiting, or if that thread has died, it gets its 503 at once,
+        // without blocking: about 700 bytes into a just-accepted socket's empty send buffer (finding
+        // 18fe9ad99875).
         let (shed, to_shed) = std::sync::mpsc::sync_channel::<TcpStream>(SHED_QUEUE);
         std::thread::spawn(move || {
             for stream in to_shed {
@@ -587,7 +591,10 @@ impl Viewer {
             let Ok(stream) = stream else { continue };
             if on.connections.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
                 on.connections.fetch_sub(1, Ordering::SeqCst);
-                let _ = shed.try_send(stream);
+                if let Err(TrySendError::Full(stream) | TrySendError::Disconnected(stream)) = shed.try_send(stream) {
+                    let _ = stream.set_nonblocking(true);
+                    let _ = respond(&stream, &error(503, "too many connections"));
+                }
                 continue;
             }
             let (viewer, on) = (Arc::clone(self), Arc::clone(on));
@@ -1530,6 +1537,20 @@ mod tests {
             std::io::Read::read_exact(&mut late, &mut head).expect("the 503");
             assert_eq!(&head, b"HTTP/1.1 503");
         }
+        // A burst past the shedding queue still gets 503s (finding 18fe9ad99875). Silent connections fill
+        // the queue, each holding the shedder for its second of linger; those that come next are answered
+        // at once. They send nothing, so the close without a linger can't reset them.
+        let silent: Vec<TcpStream> =
+            (0..SHED_QUEUE + 4).map(|_| TcpStream::connect(("127.0.0.1", a)).expect("connect")).collect();
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..8 {
+            let mut burst = TcpStream::connect(("127.0.0.1", a)).expect("connect");
+            burst.set_read_timeout(Some(Duration::from_secs(2))).expect("a read timeout");
+            let mut head = [0u8; 12];
+            std::io::Read::read_exact(&mut burst, &mut head).expect("a 503 before the queue drains");
+            assert_eq!(&head, b"HTTP/1.1 503");
+        }
+        drop(silent);
         assert_eq!(status_of(b, "/api/ground"), 200, "B still serves");
         drop(held);
     }
