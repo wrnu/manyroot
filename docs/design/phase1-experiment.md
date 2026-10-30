@@ -773,6 +773,19 @@ was accepted. The check sentence is true in every mode, even one with no
 check step. Runs before and after the change aren't strictly comparable, and
 the owner accepted that.
 
+Before the Git and CRDT Pi runs, the check sentence was made mode-neutral
+(task `eca3770b7ae4`, finding `26aeb8d5d0e1`). It first said "another agent's
+check", which is Bracken's word for its gate: a Git agent could follow it
+literally, run `check` on a pull request's branch and never approve, and a
+CRDT agent was told to spend calls on checks that integrate nothing. It now
+names the verdict each mode counts, "a pass, or an approval", and asks for
+others' work that waits for such a verdict to be checked first and the verdict
+recorded, which is vacuous in CRDT, where nothing waits. In the same change,
+each mode's tool that writes a definition (Bracken's `artifact`, Git's and
+CRDT's `edit`) ends with the same sentence, "Each definition is one line:
+`def <name> <arity> : <program>`": in the second Pi run (outcome
+`e7034ccbf48f`), 8 artifacts left the `def` line out.
+
 What the three share word for word: the base prompt, the turn message, the
 core tools (`sync`, `notes_read`, `notes_write`), and the fourth sentence. The
 mode tools' descriptions differ because the tools do (section 2). Each says
@@ -1152,7 +1165,7 @@ Each layer stops a run's use on its own:
    the pilot data, Bracken agents saved notes in 7 to 19 of 80 turns against
    Git's 64 to 71, so turns at the cap lost their notes. A second
    `notes_write` is refused like any other call. The count is also taken from
-   the event stream (the `tool_use` blocks): from the 26th, the turn has a
+   the event stream (the `tool_use` blocks): from the 51st, the turn has a
    grace of 60 seconds and 3 more model calls to end with its own `result`
    event, which is then counted as any other turn's. Past the grace the
    driver ends the process, and the turn counts at the output ceiling below,

@@ -93,16 +93,18 @@ mod tests {
     }
 
     /// Every mode's prompt says, in the shared words, that an author's own check never counts, so
-    /// others' current work is checked first, and that inputs are a, b and c whatever the
-    /// specification calls them (task `6b3f9afbdcf2`, approval `e0ff76633d31`, analysis `61e53d61b843`).
+    /// others' current work that waits for a verdict is checked first and the verdict recorded, and
+    /// that inputs are a, b and c whatever the specification calls them (task `6b3f9afbdcf2`,
+    /// approval `e0ff76633d31`, analysis `61e53d61b843`). The verdict is named in each mode's form,
+    /// a pass or an approval, so no mode's word stands for the others' (finding `26aeb8d5d0e1`).
     #[test]
     fn every_prompt_says_whose_check_counts_and_what_inputs_are_named() {
         let rules = [
             "A function's inputs are always named a, b and c, in the order its specification lists them, whatever \
              names the specification gives them.",
             "Your own check of your own work never counts as anyone else's: where the library needs another \
-             agent's check before work counts, only theirs does. So when others' current work is there, check it \
-             first, before you write more of your own.",
+             agent's verdict before work counts (a pass, or an approval), only theirs does. So when others' current \
+             work waits for such a verdict, check it first and record yours, before you write more of your own.",
         ];
         for name in ["bracken", "git", "crdt"] {
             let prompt = system_prompt(name).expect("a prompt");
@@ -113,6 +115,22 @@ mod tests {
         for name in ["bracken", "git", "crdt"] {
             assert!(!section(name).expect("a section").contains("a, b and c"), "{name}: the base says it, once");
         }
+    }
+
+    /// Each mode shows the definition form once, in the same words, in the tool that writes a
+    /// definition: the artifact in Bracken, an edit in Git and CRDT (task `eca3770b7ae4`; the second
+    /// Pi run's outcome `e7034ccbf48f` had 8 writes without it).
+    #[test]
+    fn each_mode_shows_the_definition_form_once_in_its_writing_tool() {
+        let form = "Each definition is one line: `def <name> <arity> : <program>`";
+        for (name, writer) in [("bracken", "artifact"), ("git", "edit"), ("crdt", "edit")] {
+            for task in [Task::Phase1, Task::Phase2] {
+                let tools = mode_named(name).expect("a mode").tools(task);
+                let showing: Vec<_> = tools.iter().filter(|t| t.description.contains(form)).map(|t| t.name).collect();
+                assert_eq!(showing, [writer], "{name}, {task:?}");
+            }
+        }
+        assert!(!BASE.contains(form));
     }
 
     /// Nothing tells an agent it is measured, or that other modes exist (design section 4).

@@ -462,7 +462,9 @@ fn huge_modules_and_words_give_short_errors() {
 
 /// The task texts and tool lists Phase 1's runs were given, as their plans recorded them (replicate 3,
 /// 2026-10-28): the selector's Phase 1 is the task those runs ran, byte for byte, and Bracken mode's tools
-/// under Phase 1's acceptance rule are the ones those runs had.
+/// under Phase 1's acceptance rule are the ones those runs had. Since task `eca3770b7ae4`, each mode's
+/// writing tool also shows the definition form, so the tool lists' hashes are new; replicate 3's were
+/// git ac51023e70ea, crdt fc8960a43a54 and bracken 9d5435906a39. The task texts are unchanged.
 #[test]
 fn phase_one_gives_agents_what_its_runs_were_given() {
     use bracken_experiment::driver::core_tools;
@@ -477,8 +479,8 @@ fn phase_one_gives_agents_what_its_runs_were_given() {
         "e4ec815192c7564890748ef1ca5d82fb6246bc0bd3096202890f9c9fb2eb39ba"
     );
     for (mode, want) in [
-        ("git", "ac51023e70eaa804cf65da7c351ceda9972f31121957eb11a6c373fa14f2b8d2"),
-        ("crdt", "fc8960a43a54e25b2508e87b630deecbe756eb922d385bba5ac075dbed75f12b"),
+        ("git", "737faabdc25141702533857115ac26595673d87b8477d30434b7941ead2e20ba"),
+        ("crdt", "f8ae44c91c7eb3eb4169257ddf2e38293e16c7a155f410d595c94ba377427310"),
     ] {
         let mut tools = mode_named(mode).expect("a mode").tools(T);
         tools.extend(core_tools());
@@ -490,7 +492,7 @@ fn phase_one_gives_agents_what_its_runs_were_given() {
     tools.extend(core_tools());
     assert_eq!(
         hash(&serde_json::to_vec(&tools).expect("JSON")),
-        "9d5435906a3946ee4c02998f86241d1029d1b6d83f43fada8f488b07ddbb13e0",
+        "66ef404128e044561f1490daec3151d86913aef50e61a23a5a97013d12485722",
         "bracken's tools"
     );
     // A plan from before the selector names no task, and reads as Phase 1's; nor its harness, read as none.
