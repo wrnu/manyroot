@@ -2,7 +2,7 @@
 # test-table: the whole test table, as the manager counts it, in one command.
 #
 #   test-table
-#   test-table --remote
+#   test-table --remote [-p <package>]...
 #   test-table --split
 #
 # Runs, from the top of the checkout it lives in, stopping at the first that fails:
@@ -36,6 +36,11 @@
 # list them) is deleted by id. A Ctrl-C before boat prints the id leaves the deletion to boat run
 # alone. In the box, the guards use the bracken cargo just built.
 #
+# --remote -p <package>... runs only 'cargo test --locked -p <package>...' in the box, after the same
+# setup, for a builder's scoped tests (decision ef5b807d3196 (1)) when this machine is loaded. It isn't
+# the table, and it never counts as it: scripts/merge and bk-evidence --reuse take only exactly
+# scripts/test-table or scripts/test-table --split.
+#
 # --split is the manager's counted run (owner decision 01a2d668b67e): the whole table in one box, as
 # --remote runs it, and at the same time, here, only the tests that need macOS, which Linux skips:
 # every test in a 'mod macos_only' (cargo test --workspace -- macos_only::). It passes only if both
@@ -68,7 +73,11 @@ delete_box() {
 # The box boat announced ("bx_… ready") in output file $1, not any id the box's own output mentions.
 box_in() { grep -oE '^bx_[a-z0-9]+ ready' "$1" 2>/dev/null | head -1 | cut -d' ' -f1 || true; }
 
-# The table in one boat box, for HEAD; $1, if given, runs in the box after it.
+# The packages --remote -p names: the box runs only their tests, not the table.
+packages=()
+
+# The table in one boat box, for HEAD, or only the tests of $packages; $1, if given, runs in the box
+# after it.
 remote() {
   local rc line
   command -v boat >/dev/null || fail "--remote needs boat (reference ea41264b3c38)"
@@ -105,8 +114,17 @@ setup $sudo apt-get install -y -qq git b3sum
 git init -q tree
 cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
-git checkout -q tested
+git checkout -q tested'
+  local what="the table"
+  if [ ${#packages[@]} -gt 0 ]; then
+    what="cargo test --locked$(printf ' -p %s' "${packages[@]}")"
+    inner="$inner
+$what"
+  else
+    # shellcheck disable=SC2016 # expanded in the box
+    inner="$inner"'
 BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table'
+  fi
   inner="$inner${1:+
 $1}"
   set +e
@@ -120,7 +138,11 @@ $1}"
     echo "test-table: the box's table exited $rc" >&2
     exit "$rc"
   fi
-  echo "test-table: all passed at $(git rev-parse HEAD), in a box"
+  if [ ${#packages[@]} -gt 0 ]; then
+    echo "test-table: $what passed at $(git rev-parse HEAD), in a box; not the whole table"
+  else
+    echo "test-table: all passed at $(git rev-parse HEAD), in a box"
+  fi
 }
 
 # The tests a 'cargo test -- --list' printed, as sorted '<test binary>|<test>' lines: the binary is the
@@ -282,12 +304,24 @@ echo "LIST end ignored"'
 
 case "${1:-}" in
   '') ;;
-  --remote) remote; exit 0 ;;
+  --remote)
+    shift
+    while [ $# -gt 0 ]; do
+      [ "$1" = -p ] && [ $# -ge 2 ] || fail "usage: test-table --remote [-p <package>]..."
+      # A name goes into the box's script: a letter or digit, then letters, digits, - and _ only, as
+      # cargo's package names, so never an option or anything the box's shell would read.
+      [[ $2 =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "-p takes a package name, not '$2'"
+      packages+=("$2")
+      shift 2
+    done
+    remote
+    exit 0
+    ;;
   --split)
     # A docs-only head runs the local docs-only table below: nothing for a box to do.
     "$here/code-scope" docs-only origin/main HEAD >/dev/null 2>&1 || { split; exit 0; }
     ;;
-  *) fail "usage: test-table [--remote | --split]" ;;
+  *) fail "usage: test-table [--remote [-p <package>]... | --split]" ;;
 esac
 
 step() {
