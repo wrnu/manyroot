@@ -213,7 +213,8 @@ impl CrdtStore {
 
     fn sync(&mut self, socket: &Path, peers: &[String], hub: bool) -> Result<Value, String> {
         let rules = self.rules(peers, hub)?;
-        let mut stream = UnixStream::connect(socket).map_err(|e| format!("connecting to {}: {e}", socket.display()))?;
+        let mut stream =
+            UnixStream::connect(socket).map_err(|e| crate::driver::socket_error("connecting to", socket, &e))?;
         let result = self.session(&mut stream, &rules, !hub, wire::Bounds::default());
         let _ = stream.shutdown(std::net::Shutdown::Both);
         let tally = result?;

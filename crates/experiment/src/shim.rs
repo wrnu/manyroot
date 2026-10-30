@@ -11,7 +11,7 @@ pub fn run(socket: &Path) -> Result<(), String> {
     if std::env::vars_os().next().is_some() {
         return Err("the shim must start with an empty environment".into());
     }
-    let stream = UnixStream::connect(socket).map_err(|e| format!("connecting to {}: {e}", socket.display()))?;
+    let stream = UnixStream::connect(socket).map_err(|e| crate::driver::socket_error("connecting to", socket, &e))?;
     let mut to_driver = stream.try_clone().map_err(|e| e.to_string())?;
     let up = std::thread::spawn(move || {
         let _ = relay(&mut std::io::stdin().lock(), &mut to_driver);

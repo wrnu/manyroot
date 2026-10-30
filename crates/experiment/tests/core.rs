@@ -9,7 +9,8 @@ use std::time::SystemTime;
 use serde_json::Value;
 
 use bracken_experiment::driver::{
-    Backend, CALLS_PER_TURN, MAX_MCP_LINE, RunConfig, TURN_LIMIT, git_binary, run, sync_session,
+    Backend, CALLS_PER_TURN, MAX_MCP_LINE, RunConfig, SOCKET_PATH_MAX, TURN_LIMIT, check_socket_room, git_binary, run,
+    socket_error, sync_session,
 };
 use bracken_experiment::grader::{HiddenCases, grade};
 use bracken_experiment::lang::Library;
@@ -232,6 +233,96 @@ fn a_run_refuses_a_directory_that_exists() {
     .err()
     .expect("refused");
     assert!(err.contains("already exists"));
+}
+
+/// A run directory `<tmp>/x/<padding>/run`, not yet made, reached through `tmp`'s own path, unresolved (on
+/// macOS /var is a symlink to /private/var), whose last agent's socket among `agents` is `bytes` bytes long
+/// once resolved; and that socket's resolved path.
+fn run_dir_for_socket(tmp: &Path, agents: usize, bytes: usize) -> (PathBuf, PathBuf) {
+    let real = std::fs::canonicalize(tmp).expect("resolved");
+    let tail = format!("/run/sockets/a{}.sock", agents - 1);
+    let pad = "r".repeat(bytes - real.as_os_str().len() - "/x/".len() - tail.len());
+    let socket = PathBuf::from(format!("{}/x/{pad}{tail}", real.display()));
+    assert_eq!(socket.as_os_str().len(), bytes);
+    (tmp.join("x").join(pad).join("run"), socket)
+}
+
+/// Gotcha 1229c27456e6: a run directory too long for its sockets would fail every turn, so it is refused
+/// before anything is made, by run and by both commands, with the socket's length and the limit.
+#[test]
+fn a_run_directory_too_long_for_its_sockets_is_refused_before_anything_is_made() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let (fits, _) = run_dir_for_socket(tmp.path(), 3, SOCKET_PATH_MAX);
+    check_socket_room(&fits, 3).expect("a socket path of the most bytes fits");
+    let (long, socket) = run_dir_for_socket(tmp.path(), 3, SOCKET_PATH_MAX + 1);
+    let err = check_socket_room(&long, 3).expect_err("one more byte is refused");
+    let says =
+        [format!("{} would be {} bytes", socket.display(), SOCKET_PATH_MAX + 1), format!("at most {SOCKET_PATH_MAX}")];
+    assert!(says.iter().all(|s| err.contains(s.as_str())), "{err}");
+    assert!(err.contains("mktemp -d ~/"), "a shorter directory is suggested: {err}");
+
+    let cfg = RunConfig {
+        root: long.clone(),
+        mode: "bracken",
+        agents: 3,
+        turns: 1,
+        worker_bin: bin(),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        trace: false,
+        calls_per_turn: CALLS_PER_TURN,
+        turn_limit: TURN_LIMIT,
+        plan: PlanInputs::default(),
+        sandbox: false,
+    };
+    let err = run(&cfg, &MockBackend { task: Task::Phase1, seed: 1, ..MockBackend::default() }).err().expect("refused");
+    assert!(says.iter().all(|s| err.contains(s.as_str())), "{err}");
+
+    let mock_run = Command::new(bin())
+        .arg("mock-run")
+        .arg("--dir")
+        .arg(&long)
+        .arg("--bracken")
+        .arg(bracken())
+        .output()
+        .expect("mock-run runs");
+    // `run` makes its run directory at <dir>/run.
+    let agent_run = Command::new(bin())
+        .arg("run")
+        .arg("--dir")
+        .arg(long.parent().expect("a parent"))
+        .args(["--mode", "bracken", "--agents", "3", "--turns", "1", "--claude-version", "2.1.311"])
+        .args(["--claude", "/nonexistent/claude", "--settings", "/nonexistent/settings.json"])
+        .arg("--bracken")
+        .arg(bracken())
+        .output()
+        .expect("run runs");
+    for (what, out) in [("mock-run", &mock_run), ("run", &agent_run)] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{what}: {stderr}");
+        assert!(stderr.contains(&says[0]), "{what}: {stderr}");
+    }
+    assert!(!tmp.path().join("x").exists(), "nothing was made");
+}
+
+/// The same gotcha: a bind or connect that the system refuses for the path's length says which path, how
+/// long it is and the most it may be; other errors name the path alone.
+#[test]
+fn a_socket_error_names_the_path_and_when_too_long_its_length() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let long = std::fs::canonicalize(tmp.path()).expect("resolved").join("s".repeat(SOCKET_PATH_MAX));
+    let bytes = long.as_os_str().len();
+    let too_long = format!("{}: ", long.display());
+    let hint = format!("(the path is {bytes} bytes, and a Unix socket's may have at most {SOCKET_PATH_MAX} here)");
+    let bound = std::os::unix::net::UnixListener::bind(&long).map(drop).map_err(|e| socket_error("binding", &long, &e));
+    let bound = bound.expect_err("too long to bind");
+    assert!(bound.starts_with(&format!("binding {too_long}")) && bound.ends_with(&hint), "{bound}");
+    let connected = Client::connect(&long, None).err().expect("too long to connect");
+    assert!(connected.starts_with(&format!("connecting to {too_long}")) && connected.ends_with(&hint), "{connected}");
+    let missing = tmp.path().join("none.sock");
+    let connected = Client::connect(&missing, None).err().expect("no socket");
+    assert!(connected.starts_with(&format!("connecting to {}: ", missing.display())), "{connected}");
+    assert!(!connected.contains("at most"), "{connected}");
 }
 
 /// Each turn, one claim; agent 0 instead sends an MCP line over the driver's cap, if `hostile`.

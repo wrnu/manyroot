@@ -174,6 +174,57 @@ fn digest(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex()[..16].to_string()
 }
 
+/// The most bytes a Unix socket's path may have: `sun_path` (108 on Linux, 104 on macOS and the BSDs) less
+/// its closing NUL.
+pub const SOCKET_PATH_MAX: usize = if cfg!(target_os = "linux") { 107 } else { 103 };
+
+/// Refuses a run directory too long for the agents' sockets in its `sockets/`: binding one would fail
+/// every turn (gotcha `1229c27456e6`). `root` needn't exist yet: it is resolved as [`run`] resolves it
+/// once made, through its deepest existing ancestor.
+pub fn check_socket_room(root: &Path, agents: usize) -> Result<(), String> {
+    // `a`, `c` and `h` sockets have names of the same length; the last agent's is the longest.
+    let longest = resolved(root)?.join("sockets").join(format!("a{}.sock", agents.saturating_sub(1)));
+    let bytes = longest.as_os_str().len();
+    if bytes > SOCKET_PATH_MAX {
+        return Err(format!(
+            "the run directory {} is too long for its sockets: {} would be {bytes} bytes, and a Unix socket's \
+             path may have at most {SOCKET_PATH_MAX} here. Choose a shorter directory, such as one made with \
+             mktemp -d ~/run.XXXX",
+            root.display(),
+            longest.display()
+        ));
+    }
+    Ok(())
+}
+
+/// `path` made absolute, with its deepest existing ancestor's symlinks resolved.
+fn resolved(path: &Path) -> Result<PathBuf, String> {
+    let path = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    for base in path.ancestors() {
+        if let Ok(real) = std::fs::canonicalize(base) {
+            let rest = path.strip_prefix(base).expect("an ancestor is a prefix");
+            return Ok(if rest.as_os_str().is_empty() { real } else { real.join(rest) });
+        }
+    }
+    Ok(path)
+}
+
+/// A bind's or a connect's error on the socket at `path`, naming it. When the system refused the path
+/// itself (ENAMETOOLONG, EINVAL, or std's own check of its length), it adds the path's length and the
+/// most it may have.
+pub fn socket_error(doing: &str, path: &Path, e: &std::io::Error) -> String {
+    use std::io::ErrorKind::{InvalidFilename, InvalidInput};
+    if matches!(e.kind(), InvalidInput | InvalidFilename) {
+        let bytes = path.as_os_str().len();
+        format!(
+            "{doing} {}: {e} (the path is {bytes} bytes, and a Unix socket's may have at most {SOCKET_PATH_MAX} here)",
+            path.display()
+        )
+    } else {
+        format!("{doing} {}: {e}", path.display())
+    }
+}
+
 fn make_dir(path: &Path) -> Result<(), String> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -211,6 +262,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     if cfg.root.exists() {
         return Err(format!("{} already exists", cfg.root.display()));
     }
+    check_socket_room(&cfg.root, cfg.agents)?;
     make_dir(&cfg.root)?;
     let root = std::fs::canonicalize(&cfg.root).map_err(|e| e.to_string())?;
     for sub in ["agents", "sockets"] {
@@ -552,7 +604,7 @@ impl Run<'_> {
     /// that one connection until it closes.
     fn serve_turn(&self, i: usize, turn: u32, socket: &Path, backend: &dyn Backend) -> Result<(), String> {
         let _ = std::fs::remove_file(socket);
-        let listener = UnixListener::bind(socket).map_err(|e| format!("binding {}: {e}", socket.display()))?;
+        let listener = UnixListener::bind(socket).map_err(|e| socket_error("binding", socket, &e))?;
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let name = self.names[i].clone();
@@ -728,7 +780,7 @@ pub fn sync_session(hub: &mut Worker, copy: &mut Worker, sockets: &Path, session
     let end = |side: &str| -> Result<(PathBuf, UnixListener), String> {
         let path = sockets.join(format!("{side}{i}.sock"));
         let _ = std::fs::remove_file(&path);
-        let l = UnixListener::bind(&path).map_err(|e| format!("binding {}: {e}", path.display()))?;
+        let l = UnixListener::bind(&path).map_err(|e| socket_error("binding", &path, &e))?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
         l.set_nonblocking(true).map_err(|e| e.to_string())?;
         Ok((path, l))

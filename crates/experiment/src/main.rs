@@ -15,7 +15,9 @@ use clap::{CommandFactory, Parser, Subcommand};
 use bracken_experiment::backend::{Caps, ModeTokenCap, RUN_TIME_CAP, RUN_TOKEN_CAP};
 use bracken_experiment::bracken_mode::AcceptRule;
 use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routing};
-use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
+use bracken_experiment::driver::{
+    CALLS_PER_TURN, RunConfig, TURN_LIMIT, check_socket_room, core_tools, git_binary, run,
+};
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_under};
 use bracken_experiment::pi::{PiBackend, PiConfig, PiCredential, PiExpect};
@@ -354,6 +356,8 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
     let bracken = std::fs::canonicalize(a.bracken.unwrap_or_else(|| me.with_file_name("bracken")))
         .map_err(|e| format!("no bracken: {e}"))?;
     bracken_demo::safety::refuse_git_checkout(&a.dir, false, &bracken_demo::safety::DEMO).map_err(|e| e.to_string())?;
+    // Before the backend makes its own directory: `run` checks again before making the run's.
+    check_socket_room(&a.dir.join("run"), a.agents)?;
     let mode = mode_under(&a.mode, a.accept_rule).ok_or("no such mode")?;
     let tools = mode.tools(a.task).into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect();
     let prompt = match &a.prompt_file {
