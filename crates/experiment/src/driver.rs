@@ -30,8 +30,10 @@ use crate::worker::{Lines, Request, Worker};
 /// Phase 1's: turns used, as a share of all turns, before the change requests are released (design
 /// section 1). Phase 2 releases in waves, after the turns [`crate::task::Task::wave_turns`] gives.
 pub const RELEASE_AT: f64 = 0.4;
-/// Tool calls an agent may make in one turn (design section 5); the driver refuses the next.
-pub const CALLS_PER_TURN: u32 = 25;
+/// Tool calls an agent may make in one turn (design section 5); the driver refuses the next. 50 since
+/// owner decision `63f4fd5cab66` (the pilot's was 25): it only guards against a runaway turn, and the
+/// token caps guard too.
+pub const CALLS_PER_TURN: u32 = 50;
 /// The most contributions one tool call can add in any mode: a Bracken claim superseding 8 of its own adds 9.
 pub const CONTRIBUTIONS_PER_CALL: u64 = 9;
 /// The most bytes one contribution can hold: the largest free text and its envelope.
