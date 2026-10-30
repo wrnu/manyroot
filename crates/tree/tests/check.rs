@@ -401,7 +401,7 @@ mod macos_only {
         let mut kill = KillOnDrop(Vec::new());
         loop {
             if kill.0.is_empty() {
-                kill.0 = escapee_pids(&base);
+                kill = KillOnDrop::of(&escapee_pids(&base));
             }
             match finished.recv_timeout(Duration::from_millis(50)) {
                 Ok((s, out)) => {
@@ -419,7 +419,9 @@ mod macos_only {
         }
     }
 
-    /// The pids an escapee wrote to `escapee.pids` in a run's tree, in `base`; none until it has.
+    /// The pids an escapee wrote to `escapee.pids` in a run's tree, in `base`; none until it has. Only
+    /// those above 1: `kill` takes 0 and -1 as the caller's group and every process it may signal
+    /// (finding 91a14a75ae16).
     fn escapee_pids(base: &Path) -> Vec<i32> {
         let Ok(entries) = std::fs::read_dir(base) else { return Vec::new() };
         for entry in entries.flatten() {
@@ -428,7 +430,7 @@ mod macos_only {
                 continue;
             }
             if let Ok(text) = std::fs::read_to_string(entry.path().join("w/tree/escapee.pids")) {
-                return text.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+                return text.split_whitespace().filter_map(|p| p.parse().ok()).filter(|&p| p > 1).collect();
             }
         }
         Vec::new()
@@ -465,6 +467,28 @@ mod macos_only {
         assert_eq!(out.exit, Exit::HeldOutput, "{}", out.exit);
         assert!(took < ESCAPEE_RUN_LIMIT, "the run waited on the escapees: {took:?}");
         s.assert_cleaned_up();
+    }
+
+    // Finding 91a14a75ae16: the guard kills a process it saw running, and not one holding a pid it
+    // recorded with another start time, as a reused pid would be.
+    #[test]
+    fn the_kill_guard_kills_only_the_processes_it_saw() {
+        let spawn = || std::process::Command::new("/bin/sleep").arg("60").spawn().expect("a sleep");
+        let (mut seen, mut reused) = (spawn(), spawn());
+        let guard = KillOnDrop::of(&[seen.id() as i32]);
+        assert_eq!(guard.0.len(), 1, "the running sleep is recorded");
+        drop(guard);
+        let status = seen.wait().expect("the sleep's status");
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(9), "{status}");
+        drop(KillOnDrop(vec![(reused.id() as i32, "Thu Jan  1 00:00:00 1970".to_owned())]));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            reused.try_wait().expect("the other sleep's status").is_none(),
+            "a pid that isn't the one seen was killed"
+        );
+        reused.kill().expect("the other sleep killed");
+        let _ = reused.wait();
+        assert!(KillOnDrop::of(&[seen.id() as i32]).0.is_empty(), "an exited process isn't recorded");
     }
 
     // A panic inside the run (here, the file source) still removes the fresh directory.
@@ -560,15 +584,48 @@ fn a_tail_holding_a_key_is_withheld() {
     }
 }
 
-/// Kills processes by pid when dropped, so a test leaves no escapee behind even when it fails.
+/// Kills processes by pid when dropped, so a test leaves no escapee behind even when it fails. Each pid
+/// is kept with its process's start time, and is killed only if the process holding it then started at
+/// that same time: the escapees may have exited by then, and a reused pid isn't theirs (finding
+/// 91a14a75ae16). The start time, not the command, as a background child may not have run its exec yet.
 #[cfg(target_os = "macos")]
-struct KillOnDrop(Vec<i32>);
+struct KillOnDrop(Vec<(i32, String)>);
+
+#[cfg(target_os = "macos")]
+impl KillOnDrop {
+    /// A guard for those of `pids` that are running now.
+    fn of(pids: &[i32]) -> KillOnDrop {
+        KillOnDrop(started(pids))
+    }
+}
+
+/// Each of `pids` still running, with its start time, as `ps` gives it.
+#[cfg(target_os = "macos")]
+fn started(pids: &[i32]) -> Vec<(i32, String)> {
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    let list = pids.iter().map(i32::to_string).collect::<Vec<_>>().join(",");
+    // `ps` exits 1 when a pid isn't running, and still lists the others.
+    let Ok(out) = std::process::Command::new("/bin/ps").args(["-o", "pid=,lstart=", "-p", &list]).output() else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, start) = line.trim().split_once(' ')?;
+            Some((pid.parse().ok()?, start.trim().to_owned()))
+        })
+        .filter(|(pid, _)| pids.contains(pid))
+        .collect()
+}
 
 #[cfg(target_os = "macos")]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        for pid in &self.0 {
-            let _ = std::process::Command::new("/bin/kill").args(["-KILL", &pid.to_string()]).status();
+        let pids: Vec<i32> = self.0.iter().map(|(pid, _)| *pid).collect();
+        for still in started(&pids).iter().filter(|p| self.0.contains(p)) {
+            let _ = std::process::Command::new("/bin/kill").args(["-KILL", &still.0.to_string()]).status();
         }
     }
 }
