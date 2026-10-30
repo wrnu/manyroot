@@ -630,9 +630,19 @@ or commit them first. On top of git's view:
   - `id_rsa`, `id_dsa`, `id_ecdsa` or `id_ed25519`, with or without a
     suffix;
   - content holding a PEM private-key header
-    (`-----BEGIN ... PRIVATE KEY-----`);
-  - content holding a Bracken identity's key: a `"secret_key"` field with
-    a 64-hex-digit value;
+    (`-----BEGIN ... PRIVATE KEY-----`), whose label is made of capital
+    letters, digits and spaces as in real PEM, so prose that quotes the
+    header with an ellipsis, as this line does, isn't refused;
+  - content holding an armored PGP private key block
+    (`-----BEGIN PGP ... BLOCK-----`), an RFC 4716 SSH2 private-key header
+    (`---- BEGIN SSH2 ... ----`), or a PuTTY key file's header (a line
+    starting `PuTTY-User-Key-File-<n>:`), with labels read the same way
+    (finding `ecfbb7d52203`);
+  - content holding a Bracken identity's key: a `secret_key` field with a
+    64-hex-digit value, in JSON (`"secret_key": "<hex>"`) or as a YAML or
+    TOML line (`secret_key: <hex>`, `secret_key = "<hex>"`). A key embedded
+    as an escaped JSON string isn't matched; the exact-key rule below still
+    catches either Ground's own;
   - content holding the exact key of any identity in either Ground's
     `identities/` directory, in hex, as `contribute()` already refuses for
     its own Ground. That catches a raw hex key without the JSON field. The
