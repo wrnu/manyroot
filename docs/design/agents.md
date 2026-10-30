@@ -133,9 +133,13 @@ windows, which head agents build on, test cadence) and compares them.
 
 The backend is an interface: start a turn with a prompt and an
 environment, stream events, report usage, stop. `crates/experiment/src/backend.rs`
-holds it: a `Harness` says how to start a turn and read its events, and
-the backend does the gate, the accounting, the caps, the process group and
-the transcripts the same way for every harness. Claude Code (`claude.rs`)
+holds it. A `Harness` declares its pinned program, its turn configuration
+and the environment entries it may add, and gives each turn's arguments and
+how to read its events. The backend owns the guarantees, the same for every
+harness: it builds the process (the sandbox, an environment cleared to its
+base plus only the declared entries, stdin closed), checks the pin and the
+configuration before every turn, and does the gate, the accounting, the
+caps, the process group and the transcripts. Claude Code (`claude.rs`)
 is the first harness, Pi the second. Running the same configuration under
 both is also the neutrality test above.
 

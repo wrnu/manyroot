@@ -1,14 +1,13 @@
 //! The Claude Code harness (design sections 3 and 5): plays each agent turn
-//! with one headless Claude Code process under the agent profile, behind the
-//! harness-neutral [`crate::backend`], which does the accounting, caps,
-//! process groups and transcripts.
+//! with one headless Claude Code process, behind the harness-neutral
+//! [`crate::backend`], which builds and sandboxes the process and does the
+//! checks, accounting, caps, process groups and transcripts.
 //!
-//! - **Started as section 3 says**: the pinned binary (path and blake3 checked
-//!   before every turn), fixed arguments, a turn configuration the agent
-//!   profile can read but not write (checked before every turn), and an
-//!   environment of exactly the agent's own directories, a minimal `PATH`,
-//!   `HTTPS_PROXY` at the driver's forwarding proxy, non-essential traffic off,
-//!   and the owner's routing entries.
+//! - **Started as section 3 says**: the pinned binary, fixed arguments, a turn
+//!   configuration (the system prompt, the shim's MCP entry and the settings),
+//!   and beyond the backend's base environment only Claude Code's
+//!   configuration and temporary directories inside the agent's own,
+//!   non-essential traffic off, and the owner's routing entries ([`ENV_NAMES`]).
 //! - **The gate**: the first event must be `init`, showing exactly what the
 //!   plan expects.
 //! - **Its event stream** (`stream-json`): every assistant message's usage and
@@ -16,25 +15,32 @@
 //!   `usage` and its `modelUsage`.
 
 use std::collections::BTreeSet;
-use std::fs::{File, OpenOptions};
-use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use serde_json::{Value, json};
 
+use crate::backend::{BackendConfig, Event, Harness, HarnessBackend, Launch, Turn, make_dir};
 // Re-exported where the tests and the binaries have always found them.
-use crate::backend::{BackendConfig, Event, Harness, HarnessBackend, Turn, make_dir};
 pub use crate::backend::{
-    Caps, ModeTokenCap, REPLICATE_TOKENS, RUN_TIME_CAP, RUN_TOKEN_CAP, TURN_MESSAGE, Tokens, guard,
+    Caps, ModeTokenCap, Pin, REPLICATE_TOKENS, RUN_TIME_CAP, RUN_TOKEN_CAP, TURN_MESSAGE, Tokens, guard,
 };
 use crate::proxy::Route;
-use crate::sandbox::{AgentPaths, Sandbox, resolved};
+use crate::sandbox::resolved;
 
 /// The only entries the owner's settings may hold under `env`; any other stops the run before it starts.
 pub const ROUTING_KEYS: [&str; 3] =
     ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"];
+
+/// The environment entries Claude Code adds to the backend's base: its own directories, non-essential
+/// traffic off, and the routing entries.
+pub const ENV_NAMES: [&str; 6] = [
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_TMPDIR",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    ROUTING_KEYS[0],
+    ROUTING_KEYS[1],
+    ROUTING_KEYS[2],
+];
 
 /// The MCP server name the shim is registered under: its tools are `mcp__experiment__<tool>`.
 pub const SERVER: &str = "experiment";
@@ -92,40 +98,6 @@ impl Routing {
     fn secret(&self) -> &str {
         self.env.iter().find(|(k, _)| k == "ANTHROPIC_AUTH_TOKEN").map(|(_, v)| v.as_str()).unwrap_or_default()
     }
-}
-
-/// The pinned Claude Code binary.
-#[derive(Debug, Clone)]
-pub struct Pin {
-    /// Its real path: the versioned binary, not a package manager's `latest` link.
-    pub path: PathBuf,
-    /// blake3 of its bytes, hex.
-    pub blake3: String,
-    /// The `claude_code_version` its `init` event must show.
-    pub version: String,
-}
-
-impl Pin {
-    /// Pins the binary at `path` as it is now.
-    pub fn of(path: &Path, version: &str) -> Result<Pin, String> {
-        let path = std::fs::canonicalize(path).map_err(|e| format!("resolving {}: {e}", path.display()))?;
-        Ok(Pin { blake3: file_hash(&path)?, path, version: version.into() })
-    }
-
-    fn check(&self) -> Result<(), String> {
-        let real = std::fs::canonicalize(&self.path).map_err(|e| format!("the pinned binary: {e}"))?;
-        if real != self.path || file_hash(&real)? != self.blake3 {
-            return Err("the pinned Claude Code binary changed".into());
-        }
-        Ok(())
-    }
-}
-
-fn file_hash(path: &Path) -> Result<String, String> {
-    let mut h = blake3::Hasher::new();
-    let mut f = File::open(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    std::io::copy(&mut f, &mut h).map_err(|e| format!("reading {}: {e}", path.display()))?;
-    Ok(h.finalize().to_hex().to_string())
 }
 
 /// What the `init` event must show, from the plan.
@@ -200,8 +172,8 @@ pub type ClaudeBackend = HarnessBackend<ClaudeCode>;
 impl HarnessBackend<ClaudeCode> {
     pub fn new(cfg: ClaudeConfig) -> Result<ClaudeBackend, String> {
         let ClaudeConfig { pin, expect, caps, routing, dir, shim, prompt, turns, tools, upstream } = cfg;
-        let backend = BackendConfig { caps: caps.clone(), dir: dir.clone(), guard: shim.clone(), turns };
-        HarnessBackend::start(ClaudeCode { pin, expect, caps, routing, dir, shim, prompt, tools, upstream }, backend)
+        let backend = BackendConfig { caps: caps.clone(), dir, shim: shim.clone(), turns };
+        HarnessBackend::start(ClaudeCode { pin, expect, caps, routing, shim, prompt, tools, upstream }, backend)
     }
 }
 
@@ -211,7 +183,6 @@ pub struct ClaudeCode {
     expect: Expect,
     caps: Caps,
     routing: Routing,
-    dir: PathBuf,
     shim: PathBuf,
     prompt: String,
     tools: Vec<String>,
@@ -232,35 +203,6 @@ impl ClaudeCode {
             ("mcp.json", serde_json::to_vec_pretty(&mcp).map_err(|e| e.to_string())?),
             ("settings.json", serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?),
         ])
-    }
-
-    fn turn_dir(&self, name: &str) -> PathBuf {
-        self.dir.join("turn").join(name)
-    }
-
-    /// Writes the agent's turn configuration if it isn't there yet, and checks it is exactly the plan's.
-    fn turn_config(&self, name: &str, socket: &Path) -> Result<(), String> {
-        let dir = self.turn_dir(name);
-        let files = self.turn_files(socket)?;
-        if !dir.exists() {
-            make_dir(&dir)?;
-            for (file, bytes) in &files {
-                let mut f = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o400)
-                    .open(dir.join(file))
-                    .map_err(|e| format!("writing {file}: {e}"))?;
-                f.write_all(bytes).map_err(|e| format!("writing {file}: {e}"))?;
-            }
-        }
-        for (file, bytes) in &files {
-            let now = std::fs::read(dir.join(file)).map_err(|e| format!("reading {file}: {e}"))?;
-            if blake3::hash(&now) != blake3::hash(bytes) {
-                return Err(format!("the turn configuration's {file} changed"));
-            }
-        }
-        Ok(())
     }
 
     /// The gate: the `init` event must show exactly the plan.
@@ -351,59 +293,40 @@ impl Harness for ClaudeCode {
         self.routing.secret()
     }
 
-    fn setup(&self) -> Result<(), String> {
-        make_dir(&self.dir.join("turn"))?;
-        self.pin.check()
+    fn pin(&self) -> &Pin {
+        &self.pin
     }
 
-    fn check(&self, turn: &Turn) -> Result<(), String> {
-        self.pin.check().and_then(|()| self.turn_config(turn.name, turn.socket))
+    fn env_names(&self) -> &[&str] {
+        &ENV_NAMES
     }
 
-    fn command(&self, turn: &Turn) -> Result<Command, String> {
-        let (own, turn_dir) = (turn.own, self.turn_dir(turn.name));
-        let (home, config, tmp) = (own.join("home"), own.join("config"), own.join("tmp"));
-        for d in [own, &home, &config, &tmp] {
-            make_dir(d)?;
-        }
-        let pin = &self.pin;
-        let install = pin.path.parent().ok_or("the pinned binary has no directory")?;
-        let sandbox = Sandbox::agent(&AgentPaths {
-            claude: &pin.path,
-            install,
-            own,
-            turn: &turn_dir,
-            shim: &self.shim,
-            socket: turn.socket,
-            proxy_port: turn.proxy_port,
-        })?;
-        let mut cmd = sandbox.command(&pin.path);
-        cmd.arg("-p").arg(turn.message);
-        cmd.args(["--model", &self.expect.model, "--effort", &self.expect.effort]);
-        cmd.arg("--system-prompt-file").arg(turn_dir.join("prompt.md"));
-        cmd.args(["--tools", "", "--strict-mcp-config", "--mcp-config"]).arg(turn_dir.join("mcp.json"));
-        cmd.args(["--setting-sources", "", "--settings"]).arg(turn_dir.join("settings.json"));
-        cmd.args(["--permission-mode", &self.expect.permission_mode, "--no-session-persistence"]);
-        cmd.args(["--output-format", "stream-json", "--verbose"]);
+    fn config(&self, _name: &str, socket: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+        self.turn_files(socket)
+    }
+
+    fn launch(&self, turn: &Turn) -> Result<Launch, String> {
+        let config = turn.own.join("config");
+        make_dir(&config)?;
+        let mut l = Launch::default();
+        l.arg("-p").arg(turn.message);
+        l.args(["--model", &self.expect.model, "--effort", &self.expect.effort]);
+        l.arg("--system-prompt-file").arg(turn.config.join("prompt.md"));
+        l.args(["--tools", "", "--strict-mcp-config", "--mcp-config"]).arg(turn.config.join("mcp.json"));
+        l.args(["--setting-sources", "", "--settings"]).arg(turn.config.join("settings.json"));
+        l.args(["--permission-mode", &self.expect.permission_mode, "--no-session-persistence"]);
+        l.args(["--output-format", "stream-json", "--verbose"]);
         if let Some(usd) = self.caps.turn_budget_usd {
-            cmd.arg("--max-budget-usd").arg(format!("{usd}"));
+            l.arg("--max-budget-usd").arg(format!("{usd}"));
         }
         // Claude Code writes /tmp/claude-<uid> unless CLAUDE_CODE_TMPDIR says otherwise (note 24aa40160488).
-        let tmp = resolved(&tmp)?;
-        cmd.env_clear()
-            .env("HOME", resolved(&home)?)
-            .env("CLAUDE_CONFIG_DIR", resolved(&config)?)
-            .env("TMPDIR", &tmp)
-            .env("CLAUDE_CODE_TMPDIR", &tmp)
-            .env("PATH", "/usr/bin:/bin")
-            .env("HTTPS_PROXY", format!("http://127.0.0.1:{}", turn.proxy_port))
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-            .envs(self.routing.env.iter().map(|(k, v)| (k, v)))
-            .current_dir(resolved(&home)?)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        Ok(cmd)
+        l.env("CLAUDE_CONFIG_DIR", resolved(&config)?)
+            .env("CLAUDE_CODE_TMPDIR", turn.tmp)
+            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
+        for (k, v) in &self.routing.env {
+            l.env(k, v);
+        }
+        Ok(l)
     }
 
     fn event(&self, line: &str, first: bool, turn: &Turn) -> Result<Event, String> {

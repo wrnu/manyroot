@@ -1,10 +1,18 @@
 //! The agent backend, harness-neutral (docs/design/agents.md, Evaluating
 //! configurations): plays each agent turn with one process of some agent
-//! harness, and reads its event stream as it arrives. A [`Harness`] says how
-//! to start a turn with a prompt and an environment and how to read its
-//! events; [`HarnessBackend`] does the rest, the same for every harness.
-//! Claude Code ([`crate::claude`]) is the first harness.
+//! harness, and reads its event stream as it arrives. A [`Harness`] declares
+//! its pinned program, its turn configuration and the environment entries it
+//! may add, and gives each turn's arguments and how to read its events;
+//! [`HarnessBackend`] does the rest, the same for every harness, so no
+//! harness can leave a guarantee out. Claude Code ([`crate::claude`]) is the
+//! first harness.
 //!
+//! - **The process**: the backend builds it. The pinned program (path and
+//!   blake3 checked before every turn) under the agent sandbox profile; the
+//!   turn configuration written read-only and checked before every turn; an
+//!   environment cleared, then [`BASE_ENV`] (a home and temporary directory
+//!   inside the agent's own, a minimal `PATH`, `HTTPS_PROXY` at the forwarding
+//!   proxy) and only the entries the harness declared; standard input null.
 //! - **The gate**: the first event must be the harness's start event, showing
 //!   exactly what the plan expects; anything else ends the turn and the run.
 //! - **Token accounting**: every model call's usage and the tools it asked
@@ -22,6 +30,7 @@
 //! - **The forwarding proxy**: the agent's only way out, to the harness's route.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -36,7 +45,17 @@ use serde_json::{Value, json};
 
 use crate::driver::Backend;
 use crate::proxy::{Attempt, Proxy, Route};
+use crate::sandbox::{AgentPaths, Sandbox, resolved};
 use crate::worker::Lines;
+
+/// The environment every turn's process gets from the backend, the same for every harness: `HOME` and
+/// `TMPDIR` inside the agent's own directory, `PATH` of the system's directories only, and `HTTPS_PROXY`
+/// at the forwarding proxy. A harness may add only names it declares ([`Harness::env_names`]), never these.
+pub const BASE_ENV: [&str; 4] = ["HOME", "TMPDIR", "PATH", "HTTPS_PROXY"];
+
+/// The shortest secret a harness may give ([`Harness::secret`]): a shorter one would match too much to
+/// check transcripts for.
+pub const MIN_SECRET: usize = 8;
 
 /// The run's own caps (design section 5): stops a plan expects, which the driver logs by name.
 pub const RUN_TOKEN_CAP: &str = "the run's token cap is reached";
@@ -201,6 +220,41 @@ impl Tokens {
     }
 }
 
+/// A harness's pinned program.
+#[derive(Debug, Clone)]
+pub struct Pin {
+    /// Its real path: the versioned binary, not a package manager's `latest` link.
+    pub path: PathBuf,
+    /// blake3 of its bytes, hex.
+    pub blake3: String,
+    /// The version its start event must show.
+    pub version: String,
+}
+
+impl Pin {
+    /// Pins the binary at `path` as it is now.
+    pub fn of(path: &Path, version: &str) -> Result<Pin, String> {
+        let path = std::fs::canonicalize(path).map_err(|e| format!("resolving {}: {e}", path.display()))?;
+        Ok(Pin { blake3: file_hash(&path)?, path, version: version.into() })
+    }
+
+    /// Whether the binary is still the pinned one; `harness` names it in the error.
+    fn check(&self, harness: &str) -> Result<(), String> {
+        let real = std::fs::canonicalize(&self.path).map_err(|e| format!("the pinned binary: {e}"))?;
+        if real != self.path || file_hash(&real)? != self.blake3 {
+            return Err(format!("the pinned {harness} binary changed"));
+        }
+        Ok(())
+    }
+}
+
+fn file_hash(path: &Path) -> Result<String, String> {
+    let mut h = blake3::Hasher::new();
+    let mut f = File::open(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    std::io::copy(&mut f, &mut h).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    Ok(h.finalize().to_hex().to_string())
+}
+
 /// One agent turn, as the backend starts it.
 pub struct Turn<'a> {
     pub name: &'a str,
@@ -209,11 +263,41 @@ pub struct Turn<'a> {
     pub message: &'a str,
     /// The agent's socket to the driver, which the harness's MCP client reaches through the shim.
     pub socket: &'a Path,
-    /// The agent's own directory under the backend's, for its home, configuration and temporary files.
-    /// The harness creates what it needs inside.
+    /// The agent's own directory under the backend's, the only one it may write. The harness may make
+    /// more directories inside it.
     pub own: &'a Path,
+    /// `HOME` and `TMPDIR`, inside `own`, made and resolved.
+    pub home: &'a Path,
+    pub tmp: &'a Path,
+    /// The turn configuration ([`Harness::config`]), read-only and checked, resolved.
+    pub config: &'a Path,
     /// The forwarding proxy's port on 127.0.0.1: the agent's only way out.
     pub proxy_port: u16,
+}
+
+/// What a harness adds to the process the backend builds for a turn: its arguments, and environment
+/// entries, each named in [`Harness::env_names`].
+#[derive(Debug, Default)]
+pub struct Launch {
+    args: Vec<OsString>,
+    env: Vec<(String, OsString)>,
+}
+
+impl Launch {
+    pub fn arg(&mut self, arg: impl AsRef<OsStr>) -> &mut Launch {
+        self.args.push(arg.as_ref().to_os_string());
+        self
+    }
+
+    pub fn args<I: IntoIterator<Item = S>, S: AsRef<OsStr>>(&mut self, args: I) -> &mut Launch {
+        self.args.extend(args.into_iter().map(|a| a.as_ref().to_os_string()));
+        self
+    }
+
+    pub fn env(&mut self, name: &str, value: impl AsRef<OsStr>) -> &mut Launch {
+        self.env.push((name.to_string(), value.as_ref().to_os_string()));
+        self
+    }
 }
 
 /// What the backend reads from a harness's event stream.
@@ -251,19 +335,26 @@ pub trait Harness: Sync {
     /// Where its model calls go: the forwarding proxy lets the agent reach this and nothing else.
     fn route(&self) -> Route;
 
-    /// What no transcript or standard error kept may hold: its credential. Never empty.
+    /// What no transcript or standard error kept may hold: its credential. At least [`MIN_SECRET`]
+    /// bytes, or the backend doesn't start.
     fn secret(&self) -> &str;
 
-    /// Called once, with the backend's directory just made, before any turn. An error and there is no run.
-    fn setup(&self) -> Result<(), String>;
+    /// The program that plays every turn, checked before each; the sandbox lets it start nothing else
+    /// but the shim (and `/usr/bin/env`, which the shim is started through).
+    fn pin(&self) -> &Pin;
 
-    /// Checked before every turn (its binary, its configuration); an error stops the run.
-    fn check(&self, turn: &Turn) -> Result<(), String>;
+    /// The environment entries it may add beyond [`BASE_ENV`], by name, fixed for the run. One of
+    /// [`BASE_ENV`] here and the backend doesn't start.
+    fn env_names(&self) -> &[&str];
 
-    /// The process that plays the turn: the prompt, the arguments and the whole environment, standard
-    /// input null and standard output and error piped. Its standard output is the event stream, a line
-    /// an event.
-    fn command(&self, turn: &Turn) -> Result<Command, String>;
+    /// An agent's turn configuration: (file name, bytes). The backend writes it read-only into
+    /// [`Turn::config`] before the agent's first turn, and before every turn checks it is unchanged and
+    /// still what this gives; either failing stops the run.
+    fn config(&self, name: &str, socket: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String>;
+
+    /// The turn's arguments and environment entries. Its standard output is the event stream, a line an
+    /// event. An entry not named in [`Harness::env_names`] stops the run.
+    fn launch(&self, turn: &Turn) -> Result<Launch, String>;
 
     /// Reads one line of the event stream, the turn's first if `first`, which must be [`Event::Init`].
     /// An error stops the run.
@@ -273,11 +364,11 @@ pub trait Harness: Sync {
 /// What the backend needs beside its harness, fixed before the run.
 pub struct BackendConfig {
     pub caps: Caps,
-    /// The backend's own directory, outside every store: agents' directories, transcripts and
-    /// `usage.jsonl`, and whatever the harness keeps there. Must not exist yet.
+    /// The backend's own directory, outside every store: agents' directories, turn configurations,
+    /// transcripts and `usage.jsonl`. Must not exist yet.
     pub dir: PathBuf,
-    /// The `bracken-experiment` binary, started as each turn's guard.
-    pub guard: PathBuf,
+    /// The `bracken-experiment` binary: each turn's guard, and the shim the sandbox lets the agent start.
+    pub shim: PathBuf,
     /// Each agent's turns in the run, for the turn message.
     pub turns: u32,
 }
@@ -312,15 +403,26 @@ pub struct HarnessBackend<H> {
 }
 
 impl<H: Harness> HarnessBackend<H> {
-    /// Makes the backend's directory, sets up the harness and starts the forwarding proxy.
+    /// Checks what the harness declares, makes the backend's directory, checks the pin and starts the
+    /// forwarding proxy.
     pub fn start(harness: H, cfg: BackendConfig) -> Result<HarnessBackend<H>, String> {
+        let name = harness.name();
+        let secret = harness.secret().len();
+        if secret < MIN_SECRET {
+            return Err(format!(
+                "{name}'s secret is {secret} bytes, under {MIN_SECRET}: too short to check transcripts for"
+            ));
+        }
+        if let Some(n) = harness.env_names().iter().find(|n| BASE_ENV.contains(n)) {
+            return Err(format!("{name} declares {n}, which the backend sets"));
+        }
         if cfg.dir.exists() {
             return Err(format!("{} already exists", cfg.dir.display()));
         }
-        for sub in ["", "agents", "transcripts"] {
+        for sub in ["", "agents", "turn", "transcripts"] {
             make_dir(&cfg.dir.join(sub))?;
         }
-        harness.setup()?;
+        harness.pin().check(name)?;
         let proxy = Proxy::start(harness.route(), cfg.caps.turn_time)?;
         let usage = private_file(&cfg.dir.join("usage.jsonl"))?;
         Ok(HarnessBackend {
@@ -380,14 +482,32 @@ impl<H: Harness> HarnessBackend<H> {
 
     /// Plays one turn and says how it ended.
     fn play(&self, name: &str, turn: u32, socket: &Path) -> Result<End, String> {
+        let config = self.cfg.dir.join("turn").join(name);
+        let h = &self.harness;
+        h.pin().check(h.name()).and_then(|()| self.turn_config(&config, name, socket)).map_err(|e| self.halting(e))?;
         let message = crate::prompts::turn_message(turn, self.cfg.turns, name);
         let own = self.cfg.dir.join("agents").join(name);
-        let t = Turn { name, turn, message: &message, socket, own: &own, proxy_port: self.proxy.port() };
-        self.harness.check(&t).map_err(|e| self.halting(e))?;
-        let mut cmd = self.harness.command(&t)?;
+        let (home, tmp) = (own.join("home"), own.join("tmp"));
+        for d in [&own, &home, &tmp] {
+            make_dir(d)?;
+        }
+        let (home, tmp, config) = (resolved(&home)?, resolved(&tmp)?, resolved(&config)?);
+        let t = Turn {
+            name,
+            turn,
+            message: &message,
+            socket,
+            own: &own,
+            home: &home,
+            tmp: &tmp,
+            config: &config,
+            proxy_port: self.proxy.port(),
+        };
+        let launch = h.launch(&t)?;
+        let mut cmd = self.command(&t, launch)?;
         let path = self.cfg.dir.join("transcripts").join(format!("{name}-{turn}.jsonl"));
-        let mut transcript = Transcript::create(&path, self.harness.secret())?;
-        let group = Group::start(&self.cfg.guard, &mut cmd, self.harness.name())?;
+        let mut transcript = Transcript::create(&path, h.secret())?;
+        let group = Group::start(&self.cfg.shim, &mut cmd, h.name())?;
         let (lines, stderr) = (read_lines(group.stdout), read_stderr(group.stderr));
         let end = self.watch(&t, &lines, &mut transcript);
         drop(group.guard); // kills the group
@@ -405,6 +525,65 @@ impl<H: Harness> HarnessBackend<H> {
     fn halting(&self, why: String) -> String {
         self.stop(&why);
         why
+    }
+
+    /// Writes the agent's turn configuration into `dir` if it isn't there yet, and checks it is exactly
+    /// what the harness gives.
+    fn turn_config(&self, dir: &Path, name: &str, socket: &Path) -> Result<(), String> {
+        let files = self.harness.config(name, socket)?;
+        if !dir.exists() {
+            make_dir(dir)?;
+            for (file, bytes) in &files {
+                let mut f = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o400)
+                    .open(dir.join(file))
+                    .map_err(|e| format!("writing {file}: {e}"))?;
+                f.write_all(bytes).map_err(|e| format!("writing {file}: {e}"))?;
+            }
+        }
+        for (file, bytes) in &files {
+            let now = std::fs::read(dir.join(file)).map_err(|e| format!("reading {file}: {e}"))?;
+            if blake3::hash(&now) != blake3::hash(bytes) {
+                return Err(format!("the turn configuration's {file} changed"));
+            }
+        }
+        Ok(())
+    }
+
+    /// The turn's process: the pinned program under the agent profile, with the harness's arguments, an
+    /// environment of [`BASE_ENV`] and the harness's declared entries only, and standard input null.
+    fn command(&self, t: &Turn, launch: Launch) -> Result<Command, String> {
+        let h = &self.harness;
+        if let Some((k, _)) = launch.env.iter().find(|(k, _)| !h.env_names().contains(&k.as_str())) {
+            let why = format!("{} set {}, an environment entry it didn't declare", h.name(), crate::args::short(k));
+            return Err(self.halting(why));
+        }
+        let pin = h.pin();
+        let install = pin.path.parent().ok_or("the pinned binary has no directory")?;
+        let sandbox = Sandbox::agent(&AgentPaths {
+            program: &pin.path,
+            install,
+            own: t.own,
+            turn: t.config,
+            shim: &self.cfg.shim,
+            socket: t.socket,
+            proxy_port: t.proxy_port,
+        })?;
+        let mut cmd = sandbox.command(&pin.path);
+        cmd.args(&launch.args)
+            .env_clear()
+            .env("HOME", t.home)
+            .env("TMPDIR", t.tmp)
+            .env("PATH", "/usr/bin:/bin")
+            .env("HTTPS_PROXY", format!("http://127.0.0.1:{}", t.proxy_port))
+            .envs(launch.env)
+            .current_dir(t.home)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        Ok(cmd)
     }
 
     /// Reads the event stream until the turn ends.
@@ -716,7 +895,9 @@ impl<'a> Transcript<'a> {
     /// Keeps the transcript, with `stderr` beside it, only if neither holds the secret; else removes it.
     fn finish(mut self, stderr: &[u8]) -> Result<(), String> {
         let written = self.file.flush().and_then(|()| std::fs::read(&self.path));
-        let leaked = |b: &[u8]| b.windows(self.secret.len()).any(|w| w == self.secret.as_bytes());
+        // An empty secret can't be looked for: counted as leaked, never a panic on windows(0).
+        let leaked =
+            |b: &[u8]| self.secret.is_empty() || b.windows(self.secret.len()).any(|w| w == self.secret.as_bytes());
         if !written.is_ok_and(|b| !leaked(&b) && !leaked(stderr)) {
             let _ = std::fs::remove_file(&self.path);
             return Err("a transcript held the auth value, or couldn't be read back; it was removed".into());
