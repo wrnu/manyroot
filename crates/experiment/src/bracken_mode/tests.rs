@@ -88,11 +88,18 @@ fn store_for(dir: PathBuf, bracken: PathBuf, identity: &str, accept_rule: Accept
 
 /// A stand-in for a bracken that never stops writing, whatever its arguments: GNU `yes` would refuse
 /// bracken's options and exit at once.
+/// A stand-in that ignores bracken's arguments and writes forever, written by a child `sh` so this
+/// process never holds it open for writing: a parallel test's fork would inherit that descriptor until
+/// its exec, and spawning the file meanwhile fails on Linux with ETXTBSY, "Text file busy", an error
+/// that doesn't say "deadline" (task 1b273bf9a56c; the same as aa2ac61f8dd4).
 fn endless_writer(dir: &std::path::Path) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = dir.join("endless");
-    std::fs::write(&path, "#!/bin/sh\nexec /usr/bin/yes\n").expect("the stand-in");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("executable");
+    let written = Command::new("sh")
+        .args(["-c", "printf '#!/bin/sh\\nexec yes\\n' >\"$0\" && chmod 755 \"$0\""])
+        .arg(&path)
+        .status()
+        .expect("sh");
+    assert!(written.success(), "writing the stand-in");
     path
 }
 
@@ -539,7 +546,7 @@ fn a_sync_session_ends_at_its_deadline_whatever_bracken_does() {
     });
     let started = std::time::Instant::now();
     let result = s.sync_server(&socket, &session);
-    assert!(result.is_err_and(|e| e.contains("deadline")));
+    assert!(result.as_ref().is_err_and(|e| e.contains("deadline")), "{result:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(60), "{:?}", started.elapsed());
     tx.send(()).ok();
     held.join().expect("the peer");
@@ -560,7 +567,8 @@ fn a_sync_session_that_never_ends_by_itself_is_stopped_at_its_deadline() {
         while peer.read(&mut buf).is_ok_and(|n| n > 0) {}
     });
     let started = std::time::Instant::now();
-    assert!(s.sync_server(&socket, &session).is_err_and(|e| e.contains("deadline")));
+    let result = s.sync_server(&socket, &session);
+    assert!(result.as_ref().is_err_and(|e| e.contains("deadline")), "{result:?}");
     assert!(started.elapsed() < std::time::Duration::from_secs(60), "{:?}", started.elapsed());
     reader.join().expect("the peer");
 }
