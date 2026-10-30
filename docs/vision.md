@@ -181,7 +181,7 @@ The protocol's subsystems:
 | Ground   | Shared workspace       | A bounded domain with its own participants, permissions and state          |
 | Seed     | Contribution           | An immutable, typed contribution: code, hypothesis, test, observation, evidence |
 | Roots    | Causal history         | The append-only graph of dependencies and how contributions evolved        |
-| Weave    | Convergence            | Replication, and materializing merged state (such as a file tree) from the graph |
+| Weave    | Convergence            | Replication, and materializing merged state from the graph: materialized views (first: Bracken's source trees) |
 | Trails   | Provenance             | Authorship, derivations, evidence and relations between contributions      |
 | Proof    | Validation             | Tests, constraints and acceptance policies                                 |
 | Rings    | Versioning             | Reproducible checkpoints, snapshots and published releases                 |
