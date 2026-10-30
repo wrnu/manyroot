@@ -368,26 +368,70 @@ mod macos_only {
         assert_eq!(out.output_bytes, 18);
     }
 
+    /// The check's timeout for an escapee's run: room for a slow setup on a loaded machine (finding
+    /// be74fee20f83), and still well inside [`ESCAPEE_RUN_LIMIT`].
+    const ESCAPEE_CHECK_TIMEOUT: Duration = Duration::from_secs(90);
+
     /// Runs `escapee` (bash, with bash's default PATH) as a process that leaves the check's group with
     /// posix_spawn's setsid, so the sweep can't find it once its spawner is gone, after the commands in
-    /// `before`. Returns the outcome and how long the run took.
-    fn orphaned(s: &Setup, before: &str, escapee: &str) -> (bracken_tree::check::Outcome, Duration) {
+    /// `before`. The escapee first writes the pids to kill (its own, and any it starts) to `escapee.pids`
+    /// in the tree, which this reads while the run goes on. The run is on a thread of its own: past
+    /// [`ESCAPEE_RUN_LIMIT`] (a reader that didn't stop), those processes are killed, which frees it, and
+    /// the test fails rather than hangs (finding be74fee20f83). Returns the setup, the outcome, how long
+    /// the run took, and a guard that kills the escapee's processes.
+    fn orphaned(
+        mut s: Setup,
+        before: &str,
+        escapee: &str,
+    ) -> (Setup, bracken_tree::check::Outcome, Duration, KillOnDrop) {
         let python = PYTHON;
         assert!(Path::new(python).exists(), "this test needs the Command Line Tools' python3 at {python}");
+        s.runner.timeout = ESCAPEE_CHECK_TIMEOUT;
         let script = format!(
-            "{before}{python} -c 'import os, sys; p = os.posix_spawn(\"/bin/bash\", [\"bash\", \"-c\", sys.argv[1]], {{}}, \
-             setsid=True); print(\"pid\", p, flush=True)' '{escapee}'"
+            "{before}{python} -c 'import os, sys; os.posix_spawn(\"/bin/bash\", [\"bash\", \"-c\", sys.argv[1]], {{}}, \
+             setsid=True)' '{escapee}'"
         );
+        let base = s.path();
+        let (done, finished) = std::sync::mpsc::channel();
         let started = Instant::now();
-        let out = s.run(&["bash", "-c", &script], &[]).expect("runs");
-        (out, started.elapsed())
+        std::thread::spawn(move || {
+            let out = s.run(&["bash", "-c", &script], &[]).expect("runs");
+            let _ = done.send((s, out));
+        });
+        let mut kill = KillOnDrop(Vec::new());
+        loop {
+            if kill.0.is_empty() {
+                kill.0 = escapee_pids(&base);
+            }
+            match finished.recv_timeout(Duration::from_millis(50)) {
+                Ok((s, out)) => {
+                    assert!(!kill.0.is_empty(), "the escapee wrote no pids: {}", String::from_utf8_lossy(&out.tail));
+                    return (s, out, started.elapsed(), kill);
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if started.elapsed() < ESCAPEE_RUN_LIMIT => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    drop(kill);
+                    let _ = finished.recv_timeout(Duration::from_secs(30));
+                    panic!("the run was still reading the escapee's output after {ESCAPEE_RUN_LIMIT:?}");
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!("the run's thread panicked"),
+            }
+        }
     }
 
-    /// The escapee's pid, as the spawner printed it.
-    fn printed_pid(out: &bracken_tree::check::Outcome) -> KillOnDrop {
-        let tail = String::from_utf8_lossy(&out.tail).into_owned();
-        let pid = tail.lines().find_map(|l| l.strip_prefix("pid ")?.trim().parse().ok());
-        KillOnDrop(Some(pid.unwrap_or_else(|| panic!("no pid in {tail:?}"))))
+    /// The pids an escapee wrote to `escapee.pids` in a run's tree, in `base`; none until it has.
+    fn escapee_pids(base: &Path) -> Vec<i32> {
+        let Ok(entries) = std::fs::read_dir(base) else { return Vec::new() };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("weave-check-") || name.ends_with(".removing") {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(entry.path().join("w/tree/escapee.pids")) {
+                return text.split_whitespace().filter_map(|p| p.parse().ok()).collect();
+            }
+        }
+        Vec::new()
     }
 
     // Finding 234b9aad594d and the reviewer's asks: the documented gap, an escapee orphaned before
@@ -400,12 +444,10 @@ mod macos_only {
     // is inside the renamed tree.
     #[test]
     fn an_orphaned_escapee_cant_hold_the_reader_or_recreate_the_directory() {
-        let s = Setup::new();
         let bulk =
             format!("mkdir bulk && {PYTHON} -c 'for i in range(20000): open(\"bulk/%d\" % i, \"w\").close()' && ");
-        let escapee = r#"F=$(cd ../.. && pwd); i=0; while :; do i=$((i+1)); mkdir -p "$F/w/l$i/x" 2>/dev/null && chmod 000 "$F/w/l$i" 2>/dev/null; mkdir "r$i" 2>/dev/null; echo x > "../f$i" 2>/dev/null; done"#;
-        let (out, took) = orphaned(&s, &bulk, escapee);
-        let _kill = printed_pid(&out);
+        let escapee = r#"echo $$ > p.tmp && mv p.tmp escapee.pids; F=$(cd ../.. && pwd); i=0; while :; do i=$((i+1)); mkdir -p "$F/w/l$i/x" 2>/dev/null && chmod 000 "$F/w/l$i" 2>/dev/null; mkdir "r$i" 2>/dev/null; echo x > "../f$i" 2>/dev/null; done"#;
+        let (s, out, took, _kill) = orphaned(Setup::new(), &bulk, escapee);
         assert_eq!(out.exit, Exit::HeldOutput, "{}", out.exit);
         assert!(!out.exit.passed());
         assert!(took < ESCAPEE_RUN_LIMIT, "the run waited on the escapee: {took:?}");
@@ -415,33 +457,11 @@ mod macos_only {
 
     // Task 6b8a1b5a6108: orphaned escapees that write without pause, eight at once, still can't keep the
     // reader going: it stops when told, and the run fails as held. (Whether the pipe ever runs dry here is
-    // up to the scheduler; check.rs's own test gives the reader a pipe that never does.) The run is on a
-    // thread of its own: if it hangs, the writers are killed after the limit, which frees it, and the test
-    // fails.
+    // up to the scheduler; check.rs's own test gives the reader a pipe that never does.)
     #[test]
     fn orphaned_escapees_writing_without_pause_cant_hold_the_reader() {
-        let s = Setup::new();
-        // Their output fills the tail, so they're found by a word of their own.
-        let word = format!(
-            "escapee-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("after 1970").as_nanos()
-        );
-        let _kill = PkillOnDrop(word.clone());
-        let writers = format!("for i in 1 2 3 4 5 6 7 8; do /bin/cat /dev/zero {word} & done; wait");
-        let (done, finished) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (out, took) = orphaned(&s, "", &writers);
-            let _ = done.send((s, out, took));
-        });
-        let (s, out, took) = match finished.recv_timeout(ESCAPEE_RUN_LIMIT) {
-            Ok(result) => result,
-            Err(_) => {
-                drop(_kill);
-                let _ = finished.recv_timeout(Duration::from_secs(30));
-                panic!("the run was still reading the escapees' output after {ESCAPEE_RUN_LIMIT:?}");
-            }
-        };
+        let writers = "for i in 1 2 3 4 5 6 7 8; do /bin/cat /dev/zero & echo $! >> p.tmp; done; echo $$ >> p.tmp; mv p.tmp escapee.pids; wait";
+        let (s, out, took, _kill) = orphaned(Setup::new(), "", writers);
         assert_eq!(out.exit, Exit::HeldOutput, "{}", out.exit);
         assert!(took < ESCAPEE_RUN_LIMIT, "the run waited on the escapees: {took:?}");
         s.assert_cleaned_up();
@@ -540,25 +560,14 @@ fn a_tail_holding_a_key_is_withheld() {
     }
 }
 
-/// Kills every process whose command line holds this word when dropped.
+/// Kills processes by pid when dropped, so a test leaves no escapee behind even when it fails.
 #[cfg(target_os = "macos")]
-struct PkillOnDrop(String);
-
-#[cfg(target_os = "macos")]
-impl Drop for PkillOnDrop {
-    fn drop(&mut self) {
-        let _ = std::process::Command::new("/usr/bin/pkill").args(["-KILL", "-f", &self.0]).status();
-    }
-}
-
-/// Kills a process by pid when dropped, so a test leaves no escapee behind even when it fails.
-#[cfg(target_os = "macos")]
-struct KillOnDrop(Option<i32>);
+struct KillOnDrop(Vec<i32>);
 
 #[cfg(target_os = "macos")]
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
+        for pid in &self.0 {
             let _ = std::process::Command::new("/bin/kill").args(["-KILL", &pid.to_string()]).status();
         }
     }
