@@ -7,6 +7,7 @@
 | [demo.md](demo.md) | The agent demo harness: how to run it and what its report measures |
 | [development.md](development.md) | This repo's values for the team process: profile, models, risky classes, tool mapping, Forge commands. The process itself is [process.md](../.claude/skills/agent-team-kickoff/process.md) |
 | [builder.md](builder.md) | One-page role card for builders |
+| [design/agents.md](design/agents.md) | Decided (2026-10-30): how agents relate to Bracken and Weave: Bracken owns the record and the work queue, harnesses launch agents, `bracken watch`, CLI first, and the experiment crate repurposed to evaluate Weave configurations with Claude Code and Pi |
 | [design/acceptance-follows-changes.md](design/acceptance-follows-changes.md) | Decided (2026-10-29): an accepted contribution whose dependencies changed after its evidence shows as needs re-check, under an opt-in policy; class, cost, and its effect on the Phase 2 pilot |
 | [design/network-sync.md](design/network-sync.md) | Network sync design, decided in part (2026-10-27): syncing Grounds over a network, and what it retires from the process |
 | [design/phase1-experiment.md](design/phase1-experiment.md) | Proposal (2026-10-27): the first Phase 1 experiment, 10 agents under Git, CRDT and Bracken modes: task, setup, driver, metrics, cost, build steps |
