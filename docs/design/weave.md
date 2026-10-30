@@ -739,13 +739,17 @@ nothing else runs a check on a Weave manifest (security note
 - Before running, it prints the policy version's id and the argv. It runs
   that argv, never through a shell. `argv[0]` is resolved against the fixed
   `PATH` below before the change of directory, so a relative entry can't
-  let the tree pick the binary.
+  let the tree pick the binary. A bare name is never looked up in the tree;
+  a name with a `/` (`./scripts/test.sh`) is a path inside the tree, and one
+  that is absolute or has a `..` component is refused.
 - Its environment is minimal, and every `BRACKEN_*` variable and every
   token path is dropped, so a test that runs bracken can't reach the live
   Weave Ground:
   - `PATH` is fixed: the system's directories and the toolchain's `bin`;
   - `LANG`, and a fresh `HOME` and `TMPDIR` inside the temporary directory;
   - `RUSTUP_HOME` is the owner's rustup directory, read-only;
+  - `DEVELOPER_DIR` is the Command Line Tools, so the linker finds its SDK
+    there and not in an Xcode the profile doesn't allow;
   - `CARGO_HOME` is a fresh directory inside the temporary directory, whose
     `config.toml` points cargo at a read-only vendor directory,
     `~/bracken-weave/vendor`, and sets `offline = true`.
@@ -766,12 +770,29 @@ nothing else runs a check on a Weave manifest (security note
     directory, the main checkout's `.bracken/` or `$main/.bracken-team`,
     `~/.ssh`, the forge CLI's credentials, git's credential stores, or
     cargo's `credentials*` and `config*` files;
+    Metadata (`stat`) stays readable everywhere, as in the experiment's
+    profile, since tools resolve their paths through directories they can't
+    read; listing or reading those directories is still refused;
   - writes are allowed only inside the temporary directory;
   - exec is allowed only from the temporary directory, the toolchain and
     the system's directories;
   - all network is denied, loopback and unix sockets included, and so are
     mach-lookup and other IPC, so `open` or `osascript` can't hand work to
     a process outside the sandbox;
+  - listing the process table (`sysctl kern.proc`) is denied, and so are
+    `setsid` and `setpgid`. `posix_spawn` with a new session or group can
+    still leave the process group, so on every exit path the runner stops
+    the group, finds the check's descendants by parent pid (again until no
+    new ones appear), stops and kills each, and fails the run if any had
+    left the group. The gap that remains: a process that left the group and
+    was orphaned (its parent exited, so launchd adopted it) before the walk
+    can't be found. It closes with the dedicated check user of deferred task
+    `fd68bfe3c07c`, whose every process can be killed. What
+    the profile can't deny on macOS: given another process's pid, a check
+    can still read its path, its `proc_pidinfo`, and its argv
+    (`KERN_PROCARGS2`), though not its environment. So nothing secret goes
+    in an argv on this machine. The full fix, a dedicated user for checks,
+    is deferred task `fd68bfe3c07c` and needs the owner's go;
   - each check has a timeout, and its whole process group is killed when it
     ends or times out.
 - **No sandbox, no run.** If the profile can't be applied, on another OS or
