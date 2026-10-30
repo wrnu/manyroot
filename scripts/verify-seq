@@ -299,19 +299,30 @@ start_run() {
 }
 
 # end_run <name> <commit> <pid> [stop]: waits for the run (stopping it first with stop, which records
-# nothing for it), prints its last lines and removes its worktree if the run left it clean. Sets
-# ran_verdict (pass, fail, or empty if nothing was recorded) and ran_id.
+# nothing for it), prints its last lines and removes its worktree if the run left it clean. A run whose
+# job died without its .done file may have left the rest of its process group running (its bk-evidence,
+# test-table and box): that group gets SIGINT too, which stops them as a Ctrl-C would. A run without its
+# .done file, stopped or dead, has its group waited for, up to 60 s, before its output is read and its
+# worktree removed: what is still stopping may still write there (finding fa85e1368475). A group still
+# there after that leaves its worktree. Sets ran_verdict (pass, fail, or empty if nothing was recorded)
+# and ran_id.
 end_run() {
-  local name=$1 commit=$2 pid=$3 out v="${TMPDIR:-/tmp}/verify-spec-$2"
+  local name=$1 commit=$2 pid=$3 out v="${TMPDIR:-/tmp}/verify-spec-$2" n=0 left=''
   ran_verdict='' ran_id=''
   [ "${4:-}" != stop ] || kill -INT -- "-$pid" 2>/dev/null || true
   while kill -0 "$pid" 2>/dev/null; do wait "$pid" 2>/dev/null; done
+  if [ ! -e "$logs/$name.done" ]; then
+    [ "${4:-}" = stop ] || kill -INT -- "-$pid" 2>/dev/null || true
+    while kill -0 -- "-$pid" 2>/dev/null && [ $((n += 1)) -le 600 ]; do sleep 0.1; done
+    ! kill -0 -- "-$pid" 2>/dev/null || left=y
+  fi
   tail -n 2 "$logs/$name.out"
   out=$(grep -E '^bk-evidence: recorded (pass|fail) [0-9a-f]{64} ' "$logs/$name.out" | tail -n 1 || true)
   if [ "${4:-}" != stop ] && [[ $out =~ ^bk-evidence:\ recorded\ (pass|fail)\ ([0-9a-f]{64}) ]]; then
     ran_verdict=${BASH_REMATCH[1]} ran_id=${BASH_REMATCH[2]}
   fi
-  if [ -z "$(git -C "$v" status --porcelain 2>/dev/null)" ]; then git worktree remove "$v"; else echo "LEFT $v (dirty)"; fi
+  if [ -n "$left" ]; then echo "LEFT $v (its run's process group $pid still running after 60 s)"
+  elif [ -z "$(git -C "$v" status --porcelain 2>/dev/null)" ]; then git worktree remove "$v"; else echo "LEFT $v (dirty)"; fi
 }
 
 run_speculative() {
