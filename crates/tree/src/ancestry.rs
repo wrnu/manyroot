@@ -41,6 +41,8 @@ pub struct Stats {
     pub bytes: usize,
     /// Answer vectors [`rounds`] computed: one per list and class of askers' pasts.
     pub vectors: usize,
+    /// Passes [`rounds`] skipped, as no reader of a chunk could have its targets below it.
+    pub skipped: usize,
     /// The most answer words held at once by [`rounds`]; never more than one per contribution.
     pub peak_words: usize,
     /// Contributions stored in the shared lists [`rounds`] asks about.
@@ -91,12 +93,12 @@ impl Passes {
     /// next pass, [`Passes::below`] gives each contribution up to position `last` the bits of the owners
     /// that are its strict ancestors. Nothing before the first owner can have one, so the pass sweeps
     /// only from there to `last`, and not at all if that is empty.
-    pub(crate) fn run(&mut self, owners: &[(usize, u64)], last: usize) {
+    pub(crate) fn run(&mut self, owners: &[(usize, u64)], last: usize) -> bool {
         let first = owners.iter().map(|(at, _)| *at).min().unwrap_or(self.len());
         let last = last.min(self.len().saturating_sub(1));
         self.swept = (first, last);
         if first >= last {
-            return;
+            return false;
         }
         for (at, b) in owners {
             self.own[*at] |= b;
@@ -117,6 +119,7 @@ impl Passes {
             self.own[*at] = 0;
         }
         self.passes += 1;
+        true
     }
 
     pub(crate) fn below(&self, at: usize) -> u64 {
@@ -126,20 +129,35 @@ impl Passes {
     }
 
     /// A class for each contribution, such that two of the same class have the same `targets` among
-    /// their strict ancestors: a contribution is in its parents' class if they all share one and none is
-    /// a target, and starts a new class otherwise. Roots are class 0, with none.
+    /// their strict ancestors. A contribution's targets below are those of its parents, and those of them
+    /// that are targets; so its class is fixed by its parents' classes, leaving out class 0 (roots and
+    /// whatever has no target below), and its target parents. With one such class and no target parent
+    /// it is that class; otherwise the class of that combination, made when first seen, so honest merges
+    /// of the same history share one (finding 6c8ea309c1e2). The combinations held while classing are
+    /// linear in the parent links.
     fn classes(&self, targets: &[bool]) -> Vec<u32> {
         let mut class = vec![0u32; self.len()];
-        let mut next = 1;
+        let mut combinations: HashMap<Vec<u64>, u32> = HashMap::new();
         for at in 0..self.len() {
             let parents = &self.parents[self.starts[at] as usize..self.starts[at + 1] as usize];
-            let Some(first) = parents.first() else { continue };
-            let c = class[*first as usize];
-            class[at] = if parents.iter().all(|p| class[*p as usize] == c && !targets[*p as usize]) {
-                c
-            } else {
-                next += 1;
-                next - 1
+            // Classes as themselves, target parents above every class.
+            let mut key: Vec<u64> = parents
+                .iter()
+                .map(|p| match targets[*p as usize] {
+                    true => (1 << 32) | u64::from(*p),
+                    false => u64::from(class[*p as usize]),
+                })
+                .filter(|k| *k != 0)
+                .collect();
+            key.sort_unstable();
+            key.dedup();
+            class[at] = match key.as_slice() {
+                [] => 0,
+                [one] if *one < 1 << 32 => *one as u32,
+                _ => {
+                    let next = combinations.len() as u32 + 1;
+                    *combinations.entry(key).or_insert(next)
+                }
             };
         }
         class
@@ -359,7 +377,7 @@ pub fn rounds(
     }
     vectors.sort_by_key(|(l, at, _)| (*l, *at));
     let words_for = |l: usize| lists[l].len().div_ceil(64);
-    let mut peak = 0;
+    let (mut peak, mut skipped) = (0, 0);
     let mut first = 0;
     while first < vectors.len() {
         // A round: the next vectors, in list order, while they fit the budget.
@@ -394,12 +412,17 @@ pub fn rounds(
                 low += 1;
             }
             let high = low + round[low..].iter().take_while(|(l, _, _)| offsets[*l] < stop).count();
-            let Some(last) = round[low..high].iter().filter_map(|(_, at, _)| *at).max() else { continue };
+            let Some(last) = round[low..high].iter().filter_map(|(_, at, _)| *at).max() else {
+                skipped += 1;
+                continue;
+            };
             let owners: Vec<(usize, u64)> = (start..stop)
                 .filter(|t| targets[*t] != u32::MAX)
                 .map(|t| (targets[t] as usize, 1 << (t % 64)))
                 .collect();
-            passes.run(&owners, last);
+            if !passes.run(&owners, last) {
+                skipped += 1;
+            }
             for (i, (l, at, _)) in round.iter().enumerate().take(high).skip(low) {
                 let Some(at) = at else { continue };
                 let word = passes.below(*at);
@@ -419,5 +442,12 @@ pub fn rounds(
         first = end;
     }
     let questions = askers.iter().map(|(_, l)| lists[*l].len()).sum();
-    Stats { questions, vectors: vectors.len(), peak_words: peak, list_entries: targets.len(), ..passes.stats() }
+    Stats {
+        questions,
+        vectors: vectors.len(),
+        skipped,
+        peak_words: peak,
+        list_entries: targets.len(),
+        ..passes.stats()
+    }
 }

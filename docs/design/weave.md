@@ -927,29 +927,44 @@ from its results.
     Each relation is in one component, so stored once. Each record keeps
     its verdict, not its answers.
   - **Shared answers.** Records whose pasts provably hold the same
-    relations share one answer vector: a contribution keeps its parents'
-    class unless a parent is a relation asked about, or the parents'
-    classes differ. So the decisions written after a line's last policy
-    change cost one vector between them, however many there are.
+    relations share one answer vector. A contribution's class is fixed by
+    its parents' classes, leaving out the class of contributions with no
+    relation below, and by which parents are relations asked about: with
+    one such class and no such parent it keeps that class, and otherwise
+    it gets the class of that combination, made when first seen. So the
+    decisions written after a line's last policy change cost one vector
+    between them, however many there are, and so do honest merges of the
+    same history (finding `6c8ea309c1e2`). Records whose pasts are equal
+    but reached through different combinations still get different
+    vectors: a writer can make one per record with a side branch that
+    holds a relation of its own.
   - **The batch budget.** Answer vectors are held at most one 64-bit word
     per contribution at a time, then turned into verdicts and freed. A
-    component with more distinct pasts than fit takes more rounds, not
-    more memory, so memory is linear in the history in every shape. A
-    round's pass over 64 relations sweeps only from the first of them to
-    the round's last record, and is skipped if they all come after it.
-  - **Time.** With `K` relations in a component and `U` distinct pasts among
-    the records naming it, opening takes at most
-    `ceil(U * ceil(K / 64) / n) * ceil(K / 64)` passes over at most `n`
-    contributions, summed over components. That is cubic in what one writer adds when the writer makes
-    both `U` and `K` grow with `n`. For example, a policy change then a
-    decision, repeated, gives `U = K = n / 2`: the bound is `n^2 / 32,768`
-    passes, and the sweeps' limits halve that, to 15,750 passes and 1.3
-    seconds at `n = 32,000` (`ancestry::rounds` on a chain of `n`, release
-    build; finding `98ce07a5e421`). That is still never slower than walking
-    the graph per question, as opening did before. Decisions written after
-    the chain, the finding's other shape, share one past: 250 passes and 26
-    ms at the same size, where opening without shared answers took 31,250
-    passes and 3.1 s.
+    component with more vectors than fit takes more rounds, not more
+    memory, so memory is linear in the history in every shape. A round's
+    pass over 64 relations sweeps only from the first of them to the
+    round's last record, and is skipped if they all come after it.
+  - **Time.** With `K` relations in a component and `U` answer vectors
+    among the records naming it (at most one per record), opening takes
+    at most `ceil(U * ceil(K / 64) / n) * ceil(K / 64)` passes over at
+    most `n` contributions, summed over components. That is cubic in what
+    one writer adds when the writer makes both `U` and `K` grow with `n`.
+    For example, a policy change then a decision, repeated, gives
+    `U = K = n / 2`: the bound is `n^2 / 32,768` passes, and the sweeps'
+    limits halve that, to 15,750 passes and 1.3 seconds at `n = 32,000`
+    (`ancestry::rounds` on a chain of `n`, release build; finding
+    `98ce07a5e421`). That is still never slower than walking the graph per
+    question, as opening did before. Decisions written after the chain,
+    the finding's other shape, share one vector: 250 passes and 26 ms at
+    the same size, where opening without shared answers took 31,250 passes
+    and 3.1 s.
+  - **A diverged policy's versions.** A decision whose line's policy has
+    diverged keeps the count and at most the first 8 versions
+    (`DIVERGED_SHOWN`), as one list shared by every decision that found
+    the same ones; `Lines::current_versions` lists them all. Otherwise a
+    line's author who adds a diverging version then a decision, repeated,
+    would make each decision keep its own longer list: about `K^2 / 2`
+    versions (task `a90865cb60db`).
   - A question nothing asked at build would be a bug. It is answered by
     walking and counted, and fails debug builds; the tests assert the count
     is zero.

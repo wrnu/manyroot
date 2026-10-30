@@ -120,21 +120,37 @@ fn ancestry_agrees_with_walking_the_graph() {
         }
         assert_eq!(ancestry.below_a_marker(&ContributionId([9; 32])), None);
 
-        // Seven random lists of different sizes, each asked by random askers.
-        let lists: Vec<Vec<ContributionId>> = (0..7)
-            .map(|l| {
-                let mut list: Vec<ContributionId> = (0..l * 30).map(|_| ids[rng.below(ids.len())]).collect();
-                list.sort();
-                list.dedup();
-                list
-            })
-            .collect();
+        // Seven random lists of different sizes, an id the graph doesn't hold in one, and a sparse one of
+        // early contributions (finding 09c403532fc9). Each is asked by random askers.
+        let n = ids.len();
+        let mut lists: Vec<Vec<ContributionId>> =
+            (0..7).map(|l| (0..l * 30).map(|_| ids[rng.below(n)]).collect()).collect();
+        let order = b.g.topo_order();
+        lists.push((0..8).map(|_| order[rng.below(n / 10)]).collect());
+        lists[3].push(ContributionId([9; 32]));
+        for list in &mut lists {
+            list.sort();
+            list.dedup();
+        }
         let askers: Vec<(ContributionId, usize)> =
-            (0..200).map(|_| (ids[rng.below(ids.len())], rng.below(7))).collect();
-        let (answers, _) = b.answer(&lists, &askers);
-        for (k, (asker, l)) in askers.iter().enumerate() {
-            let walked: Vec<bool> = lists[*l].iter().map(|t| b.g.is_ancestor(t, asker)).collect();
-            assert_eq!(answers[k], walked, "seed {seed}: asker {asker}, list {l}");
+            (0..400).map(|_| (ids[rng.below(n)], rng.below(lists.len()))).collect();
+        let (answers, stats) = b.answer(&lists, &askers);
+        // Askers that share a past share a vector, and passes start at their first target.
+        assert!(stats.vectors < askers.len(), "seed {seed}: {stats:?}");
+        assert!(stats.ors < stats.passes * (n + b.links), "seed {seed}: {stats:?}");
+        // A list of late contributions, alone in its chunk, asked only by early askers: its pass is skipped.
+        lists.push((0..8).map(|_| order[n - 1 - rng.below(n / 10)]).collect());
+        lists.last_mut().expect("pushed").sort();
+        lists.last_mut().expect("pushed").dedup();
+        let early: Vec<(ContributionId, usize)> = (0..20).map(|_| (order[rng.below(n / 2)], 0)).collect();
+        let late = &lists[lists.len() - 1..];
+        let (early_answers, skipping) = b.answer(late, &early);
+        assert!(skipping.skipped > 0 && skipping.passes == 0, "seed {seed}: {skipping:?}");
+        // Each compared against the walk.
+        let all = askers.iter().zip(&answers).map(|((a, l), x)| (a, &lists[*l], x));
+        for (asker, list, answer) in all.chain(early.iter().zip(&early_answers).map(|((a, _), x)| (a, &late[0], x))) {
+            let walked: Vec<bool> = list.iter().map(|t| b.g.is_ancestor(t, asker)).collect();
+            assert_eq!(answer, &walked, "seed {seed}: asker {asker}");
         }
     }
 }
@@ -251,6 +267,32 @@ fn askers_with_the_same_past_share_one_answer_vector() {
     assert_eq!(stats.questions, D * L);
     assert_eq!(stats.list_entries, L, "the list once, however many ask about it");
     assert_eq!((stats.vectors, stats.peak_words, stats.passes), (1, L / 64 + 1, L.div_ceil(64)), "{stats:?}");
+}
+
+/// Finding 6c8ea309c1e2: askers whose parents are the one before and a side root, which holds no target,
+/// have the same past, and share a vector; so do merges of two branches of the same history.
+#[test]
+fn merges_of_the_same_targets_share_one_answer_vector() {
+    const L: usize = 500;
+    const D: usize = 500;
+    let mut b = Built::chain(L);
+    let relations = b.ids.clone();
+    let side = b.add(vec![]);
+    let mut askers: Vec<ContributionId> = vec![];
+    for _ in 0..D {
+        let previous = *askers.last().unwrap_or(&relations[L - 1]);
+        askers.push(b.add(vec![previous, side]));
+    }
+    // Two branches from the last asker, each a claim, then their merge.
+    let last = *askers.last().expect("an asker");
+    let (left, right) = (b.add(vec![last]), b.add(vec![last]));
+    askers.push(b.add(vec![left, right]));
+    let mut list = relations;
+    list.sort();
+    let askers: Vec<(ContributionId, usize)> = askers.iter().map(|id| (*id, 0)).collect();
+    let (answers, stats) = b.answer(&[list], &askers);
+    assert!(answers.iter().all(|a| a.iter().all(|a| *a)));
+    assert_eq!((stats.vectors, stats.passes), (1, L.div_ceil(64)), "{stats:?}");
 }
 
 /// The batch budget (answer b2dbc4f5e810): when the D askers' pasts all differ (each written after one
