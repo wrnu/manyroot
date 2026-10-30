@@ -6,10 +6,12 @@
 //! no contribution invalid: Weave just ignores it, and [`Index::problems`] lists
 //! it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use manyroot::{Body, Contribution, ContributionId, Graph};
 
+use crate::ancestry::{Ancestry, Stats};
 use crate::format::{
     DECISION_MEDIA_TYPE, Decision, FILE_MEDIA_TYPE, FormatError, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE,
     MARKER_MEDIA_TYPE, MEDIA_TYPE_PREFIX, Manifest, Marker, PROPOSAL_MEDIA_TYPE, Proposal, RESOLUTION_MEDIA_TYPE,
@@ -48,6 +50,10 @@ pub struct Index {
     /// The marker that counts.
     counted: Option<ContributionId>,
     problems: Vec<Problem>,
+    /// The answers to every record's references, and each marker's bit.
+    ancestry: Ancestry,
+    /// Questions [`Index::is_ancestor`] answered by walking, because nothing asked them at build.
+    fallbacks: AtomicUsize,
 }
 
 /// The ContributionIds a record's payload refers to, which must be its causal
@@ -87,6 +93,10 @@ impl Index {
         let mut ids: Vec<ContributionId> = g.iter().map(|c| c.id()).collect();
         ids.sort();
         let mut paths = PathCache::new();
+        // Each record's problem, or its references, in id order; the references are checked once every
+        // record's are known.
+        let mut found: Vec<Result<ContributionId, Problem>> = Vec::new();
+        let mut refs: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
         for id in ids {
             let c = g.get(&id).expect("listed by the graph");
             let Body::Artifact { media_type, content, .. } = c.body() else { continue };
@@ -112,22 +122,19 @@ impl Index {
                         index.manifests.insert(hash, (vec![id], manifest));
                     }
                     Err(error) => {
-                        index.problems.push(Problem::InvalidPayload { id, media_type: media_type.clone(), error })
+                        found.push(Err(Problem::InvalidPayload { id, media_type: media_type.clone(), error }))
                     }
                 }
                 continue;
             }
             match references(media_type, content) {
                 Err(error) => {
-                    index.problems.push(Problem::InvalidPayload { id, media_type: media_type.clone(), error });
+                    found.push(Err(Problem::InvalidPayload { id, media_type: media_type.clone(), error }));
                     continue;
                 }
-                Ok(refs) => {
-                    for reference in refs {
-                        if !g.is_ancestor(&reference, &id) {
-                            index.problems.push(Problem::NotAnAncestor { id, reference });
-                        }
-                    }
+                Ok(named) => {
+                    refs.insert(id, named);
+                    found.push(Ok(id));
                 }
             }
             if media_type == MARKER_MEDIA_TYPE {
@@ -135,6 +142,19 @@ impl Index {
             }
             if media_type == RESOLUTION_MEDIA_TYPE {
                 index.resolutions.insert(id, Resolution::decode(content).expect("decoded above"));
+            }
+        }
+        index.ancestry = Ancestry::build(g, &refs, &index.markers);
+        for record in found {
+            match record {
+                Err(problem) => index.problems.push(problem),
+                Ok(id) => {
+                    for reference in &refs[&id] {
+                        if !index.is_ancestor(g, reference, &id) {
+                            index.problems.push(Problem::NotAnAncestor { id, reference: *reference });
+                        }
+                    }
+                }
             }
         }
         for (hash, (ids, manifest)) in &index.manifests {
@@ -145,8 +165,7 @@ impl Index {
         }
         // Decision 049d02449a94: the marker that counts has no other valid marker in its causal past,
         // so one written after it has been seen never takes over. Among concurrent ones, the smallest id.
-        index.counted =
-            index.markers.iter().find(|m| !index.markers.iter().any(|other| g.is_ancestor(other, m))).copied();
+        index.counted = index.markers.iter().find(|m| index.ancestry.below_a_marker(m) == Some(false)).copied();
         if let Some(counted) = index.counted {
             for id in index.markers.iter().filter(|id| **id != counted) {
                 index.problems.push(Problem::ExtraMarker { id: *id, counted });
@@ -159,6 +178,27 @@ impl Index {
     /// marker among its causal ancestors, the smallest id if several are concurrent.
     pub fn counted_marker(&self) -> Option<ContributionId> {
         self.counted
+    }
+
+    /// Whether `a` is a strict causal ancestor of `b`, where `b` is a valid record that names `a`: the
+    /// answer built at open. Anything else is a missed question, a bug, answered by walking the graph
+    /// and counted (answer b2dbc4f5e810).
+    pub(crate) fn is_ancestor(&self, g: &Graph, a: &ContributionId, b: &ContributionId) -> bool {
+        if !g.contains(a) {
+            return false;
+        }
+        let answer = self.ancestry.is_ancestor(a, b);
+        debug_assert!(answer.is_some(), "{b} didn't name {a} when the index was built");
+        answer.unwrap_or_else(|| {
+            self.fallbacks.fetch_add(1, Ordering::Relaxed);
+            g.is_ancestor(a, b)
+        })
+    }
+
+    /// What answering the references and markers did, and how many questions fell back to a walk since.
+    #[doc(hidden)]
+    pub fn ancestry_stats(&self) -> Stats {
+        Stats { fallbacks: self.fallbacks.load(Ordering::Relaxed), ..self.ancestry.stats() }
     }
 
     /// Whether this replica holds a file version with this content hash.

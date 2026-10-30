@@ -7,6 +7,7 @@
 //!
 //! | Module     | Holds                                                         |
 //! |------------|---------------------------------------------------------------|
+//! | [`ancestry`] | The ancestor rule, answered without a walk per question |
 //! | [`check`]  | The check runner: a named check in a fresh directory, under the sandbox |
 //! | [`ground`] | Weave's records in a Ground: an index, kinds, and what check lists |
 //! | [`hash`]   | Content hashes, labelled `blake3:` in text                    |
@@ -22,6 +23,7 @@
 //! Every record is a plain manyroot contribution, so nothing here changes the
 //! protocol.
 
+pub mod ancestry;
 pub mod check;
 pub mod diff;
 pub mod format;

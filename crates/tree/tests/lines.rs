@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
 use bracken_tree::format::{
-    Change, Decision, FILE_MEDIA_TYPE, Guardrails, Line, Manifest, Marker, Proposal, Record, VERSION,
+    Change, DECISION_MEDIA_TYPE, Decision, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line, Manifest, Marker,
+    Proposal, Record, VERSION,
 };
 use bracken_tree::ground::Index;
 use bracken_tree::lines::{InvalidProposal, Lines, Unqualified};
@@ -93,7 +94,7 @@ impl World {
     }
 
     fn lines(&self) -> Lines {
-        Lines::build(&self.g, &Index::build(&self.g))
+        checked(&self.g)
     }
 
     fn head_labels(&self) -> BTreeSet<&'static str> {
@@ -106,6 +107,24 @@ impl World {
             other => panic!("expected {id} not to qualify, got {other:?}"),
         }
     }
+}
+
+/// Lines built from the index, checked against Lines built by walking the graph for every question: the
+/// same verdict for every decision and proposal, and no question missed (answer b2dbc4f5e810).
+fn checked(g: &Graph) -> Lines {
+    let ix = Index::build(g);
+    let lines = Lines::build(g, &ix);
+    let walked = Lines::build_by_walking(g, &ix);
+    for c in g.iter() {
+        let id = c.id();
+        assert_eq!(lines.verdict(&id), walked.verdict(&id), "decision {id}");
+        let verdict = |l: &Lines| l.proposal(&id).map(|p| p.verdict.clone());
+        assert_eq!(verdict(&lines), verdict(&walked), "proposal {id}");
+    }
+    assert_eq!(ix.ancestry_stats().fallbacks, 0, "{:?}", ix.ancestry_stats());
+    assert_eq!(lines.stats().fallbacks, 0, "{:?}", lines.stats());
+    assert!(lines.stats().peak_words <= g.len().max(1), "{:?}", lines.stats());
+    lines
 }
 
 fn artifact<R: Record>(record: &R) -> Body {
@@ -582,4 +601,262 @@ fn a_policy_version_without_an_owner_decision_counts_only_as_weave_inits_main() 
     let main = w.record(&alice, &uncited("main", &[&alice]));
     let lines = w.lines();
     assert!(lines.line(&main).is_some() && !lines.ignored_versions().contains(&main));
+}
+
+// The ancestor index's shapes (design note e93d47ad8a20): each is checked against walking the graph, with no
+// question missed, by `checked`.
+
+/// A deterministic random number source.
+struct Lcg(u64);
+
+impl Lcg {
+    fn below(&mut self, n: usize) -> usize {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as usize) % n
+    }
+}
+
+impl World {
+    /// `n` more versions of the main line, each superseding the one before; returns them, the line first.
+    fn chain(&mut self, who: &Identity, n: usize) -> Vec<ContributionId> {
+        let mut versions = vec![self.line];
+        for _ in 0..n {
+            let next = self.record(who, &policy(&[who]));
+            self.supersede(who, next, *versions.last().expect("a version"));
+            versions.push(next);
+        }
+        versions
+    }
+
+    /// `n` decisions naming `line`, each after every head.
+    fn decide_on(
+        &mut self,
+        who: &Identity,
+        line: ContributionId,
+        manifest: ContentHash,
+        n: usize,
+    ) -> Vec<ContributionId> {
+        (0..n).map(|_| self.record(who, &decision(line, manifest, vec![], "d"))).collect()
+    }
+}
+
+/// Finding 83f757301c59: supersedes relations that someone other than the author signs never become
+/// questions, as Lines never counts them.
+#[test]
+fn only_the_authors_supersedes_relations_are_asked_about() {
+    let mut w = World::new(counter());
+    let (alice, bob) = (w.alice.clone(), w.bob.clone());
+    let m0 = w.tree(&alice, b"zero");
+    let versions = w.chain(&alice, 1);
+    w.decide(&alice, "d", m0, &[], None);
+    let asked = w.lines().stats();
+    for _ in 0..50 {
+        w.supersede(&bob, versions[1], w.line);
+    }
+    w.decide(&alice, "e", m0, &[], None);
+    let with_bobs = w.lines().stats();
+    assert_eq!(with_bobs.list_entries, asked.list_entries, "bob's 50 relations aren't stored");
+    // The second decision asks what the first does: alice's one relation.
+    assert_eq!(with_bobs.questions, asked.questions + 1, "{asked:?} then {with_bobs:?}");
+}
+
+/// A line's author can make a long chain and many decisions on it cheaply. Every decision asks about every
+/// relation, but the answers are held a round at a time, within a word per contribution.
+#[test]
+fn a_long_chain_named_by_many_decisions_stays_within_a_word_per_contribution() {
+    const K: usize = 300;
+    const D: usize = 300;
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let m0 = w.tree(&alice, b"zero");
+    let versions = w.chain(&alice, K);
+    let decisions = w.decide_on(&alice, w.line, m0, D);
+    // Built without `checked`, whose walk per question takes most of a minute here.
+    let ix = Index::build(&w.g);
+    let lines = Lines::build(&w.g, &ix);
+    let stats = lines.stats();
+    assert_eq!((stats.fallbacks, ix.ancestry_stats().fallbacks), (0, 0));
+    assert_eq!((stats.list_entries, stats.questions), (K, D * K), "{stats:?}");
+    // 5 words an asker, D of them over the budget of one word per contribution: more than one round.
+    assert!(stats.peak_words <= w.g.len() && D * K.div_ceil(64) > w.g.len(), "{stats:?}");
+    assert!(stats.passes > K.div_ceil(64), "{stats:?}");
+    for d in &decisions {
+        assert!(matches!(lines.verdict(d), Some(Ok(q)) if q.policy == versions[K]), "{d}");
+    }
+}
+
+/// Finding 7c1c3b1fea29: a decision naming each version of a chain. Only the first artifact's qualify; each
+/// relation is stored once, however many versions are named.
+#[test]
+fn decisions_naming_each_version_of_a_chain_store_it_once() {
+    const L: usize = 300;
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let m0 = w.tree(&alice, b"zero");
+    let versions = w.chain(&alice, L);
+    let decisions: Vec<ContributionId> =
+        versions.iter().map(|v| w.record(&alice, &decision(*v, m0, vec![], "d"))).collect();
+    let lines = w.lines();
+    assert_eq!(lines.stats().list_entries, L, "{:?}", lines.stats());
+    assert!(matches!(lines.verdict(&decisions[0]), Some(Ok(q)) if q.policy == versions[L]));
+    for (d, v) in decisions[1..].iter().zip(&versions[1..]) {
+        assert_eq!(lines.verdict(d), Some(&Err(Unqualified::NotALine(*v))), "{d}");
+    }
+}
+
+/// Finding a5ac20689b4b, case 2: decisions made before their line superseded a version still find their
+/// policy from the whole component, with nothing walked; one made after doesn't count the line.
+#[test]
+fn decisions_before_their_line_superseded_a_version_ask_the_whole_chain() {
+    const L: usize = 200;
+    const D: usize = 50;
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let m0 = w.tree(&alice, b"zero");
+    let versions = w.chain(&alice, L);
+    let decisions = w.decide_on(&alice, w.line, m0, D);
+    let y = w.record(&alice, &Line { name: "y".into(), ..policy(&[&alice]) });
+    w.supersede(&alice, w.line, y);
+    let after = w.record(&alice, &decision(w.line, m0, vec![], "after"));
+    let lines = w.lines();
+    for d in &decisions {
+        assert!(matches!(lines.verdict(d), Some(Ok(q)) if q.policy == versions[L]), "{d}");
+    }
+    assert_eq!(lines.verdict(&after), Some(&Err(Unqualified::NotALine(w.line))));
+}
+
+/// Finding a5ac20689b4b, case 1: the line supersedes a version Lines drops (uncited, retracted, or
+/// undecodable). Lines builds its questions after dropping it, so the line is a first artifact and its
+/// decisions ask about its chain, with nothing walked.
+#[test]
+fn a_line_superseding_a_dropped_version_asks_the_whole_chain() {
+    const L: usize = 100;
+    const D: usize = 30;
+    for how in ["uncited", "retracted", "undecodable"] {
+        let mut w = World::new(counter());
+        let alice = w.alice.clone();
+        let m0 = w.tree(&alice, b"zero");
+        let y = match how {
+            "uncited" => w.record(&alice, &Line { owner_decision: None, name: "y".into(), ..policy(&[&alice]) }),
+            "retracted" => {
+                let y = w.record(&alice, &Line { name: "y".into(), ..policy(&[&alice]) });
+                w.add(&alice, Body::Retract { target: y, reason: "wrong".into() });
+                y
+            }
+            _ => w.add(
+                &alice,
+                Body::Artifact { name: "y".into(), media_type: LINE_MEDIA_TYPE.into(), content: b"no cbor".to_vec() },
+            ),
+        };
+        w.supersede(&alice, w.line, y);
+        let versions = w.chain(&alice, L);
+        let decisions = w.decide_on(&alice, w.line, m0, D);
+        let lines = w.lines();
+        assert_eq!(lines.stats().questions, D * L, "{how}: {:?}", lines.stats());
+        for d in &decisions {
+            assert!(matches!(lines.verdict(d), Some(Ok(q)) if q.policy == versions[L]), "{how}: {d}");
+        }
+    }
+}
+
+/// Many markers: one target, a bit each, and the first counts.
+#[test]
+fn many_markers_are_answered_without_a_walk() {
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let first = Index::build(&w.g).counted_marker().expect("alice's marker");
+    for _ in 0..200 {
+        w.record(&alice, &Marker { v: VERSION, purpose: "test".into(), in_place: None });
+    }
+    let ix = Index::build(&w.g);
+    assert_eq!(ix.counted_marker(), Some(first));
+    assert_eq!(ix.ancestry_stats().fallbacks, 0);
+    assert_eq!(ix.problems().len(), 200, "the rest are extra");
+    w.lines();
+}
+
+/// Random Grounds of lines, versions by two authors, cited and not, relations by either, retractions,
+/// concurrent decisions and proposals: every verdict is the one walking the graph gives, with nothing
+/// walked (answer b2dbc4f5e810).
+#[test]
+fn lines_agree_with_walking_the_graph() {
+    for seed in 0..4 {
+        let mut rng = Lcg(seed);
+        let mut w = World::new(counter());
+        let (alice, bob) = (w.alice.clone(), w.bob.clone());
+        let m0 = w.tree(&alice, b"zero");
+        let proposed = manifest(b"one");
+        w.tree(&alice, b"one");
+        let change = Change::between(&manifest(b"zero"), &proposed).hash();
+        let mut all: Vec<ContributionId> = w.g.iter().map(|c| c.id()).collect();
+        let mut versions = vec![w.line];
+        let mut decisions = vec![];
+        let mut relations = vec![];
+        let mut authors: std::collections::HashMap<ContributionId, Rc<Identity>> =
+            all.iter().map(|id| (*id, alice.clone())).collect();
+        for _ in 0..300 {
+            let mut who = if rng.below(4) == 0 { bob.clone() } else { alice.clone() };
+            // After a few random contributions, so writes are often concurrent.
+            let after: Vec<ContributionId> =
+                (0..1 + rng.below(3)).map(|_| all[all.len() - 1 - rng.below(all.len().min(12))]).collect();
+            let body = match rng.below(10) {
+                0..=1 => {
+                    let mut line = policy(&[&alice, &bob]);
+                    if rng.below(5) == 0 {
+                        line.owner_decision = None;
+                    }
+                    artifact(&line)
+                }
+                2..=3 if versions.len() > 1 => {
+                    let (new, old) = (versions[rng.below(versions.len())], versions[rng.below(versions.len())]);
+                    if new == old {
+                        continue;
+                    }
+                    Body::Relation { from: new, kind: RelationKind::Supersedes, to: old, note: String::new() }
+                }
+                4 if rng.below(3) == 0 => {
+                    let pool = [&versions, &relations, &decisions][rng.below(3)];
+                    match pool.is_empty() {
+                        true => continue,
+                        false => {
+                            let target = pool[rng.below(pool.len())];
+                            who = authors[&target].clone();
+                            Body::Retract { target, reason: "r".into() }
+                        }
+                    }
+                }
+                5 if !decisions.is_empty() => {
+                    let base = decisions[rng.below(decisions.len())];
+                    artifact(&proposal(versions[rng.below(versions.len())], base, &proposed, change))
+                }
+                _ => {
+                    // Often on the main line with no parents, so that some qualify.
+                    let parents = match decisions.is_empty() || rng.below(2) == 0 {
+                        true => vec![],
+                        false => vec![decisions[rng.below(decisions.len())]],
+                    };
+                    let line = if rng.below(2) == 0 { w.line } else { versions[rng.below(versions.len())] };
+                    artifact(&decision(line, m0, parents, "d"))
+                }
+            };
+            let kind = match &body {
+                Body::Artifact { media_type, .. } if media_type == LINE_MEDIA_TYPE => 0,
+                Body::Relation { .. } => 1,
+                Body::Artifact { media_type, .. } if media_type == DECISION_MEDIA_TYPE => 2,
+                _ => 3,
+            };
+            let id = w.add_after(&who, after, body);
+            authors.insert(id, who);
+            match kind {
+                0 => versions.push(id),
+                1 => relations.push(id),
+                2 => decisions.push(id),
+                _ => {}
+            }
+            all.push(id);
+        }
+        let lines = w.lines();
+        let qualified = decisions.iter().filter(|d| matches!(lines.verdict(d), Some(Ok(_)))).count();
+        assert!(qualified > 10 && qualified < decisions.len(), "seed {seed}: {qualified} of {}", decisions.len());
+    }
 }
