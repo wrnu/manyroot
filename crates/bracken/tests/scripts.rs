@@ -381,6 +381,16 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         assert!(shown.contains("from bob") && stderr.is_empty(), "{scripts}: {shown} {stderr}");
         let (shown, _) = ok(sh(&b, "scripts/bk", &["show", alice.trim()], Some("bob")), "bob reads");
         assert!(shown.contains("from alice"), "{scripts}: {shown}");
+        // An intent is a write too (task 065b221bfdad): pushed and confirmed like a claim, so the other
+        // replica sees it on its next read.
+        let before = syncs().lines().count();
+        let (intent, _) = ok(sh(&b, "scripts/bk", &["intend", &alice, "--as", "bob"], None), "bob's intent");
+        let new: Vec<String> = syncs().lines().skip(before).map(String::from).collect();
+        assert!(new.len() == 1 && new[0].contains(" --confirm"), "{scripts}: bob's intent synced as {new:?}");
+        let intent = common::bare_ids(intent.trim().to_owned());
+        let intent = intent.lines().next().unwrap();
+        let (shown, _) = ok(sh(&a, "scripts/bk", &["show", intent], Some("alice")), "alice reads the intent");
+        assert!(shown.contains("intent: working on"), "{scripts}: {shown}");
         // bk-evidence's reads and its write go through the server too.
         let evidence = [&alice[..12], "--as", "bob", "--any-head", "--", "/usr/bin/true"];
         let (_, stderr) = ok(sh(&b, "scripts/bk-evidence", &evidence, None), "bk-evidence");
