@@ -27,8 +27,11 @@
 #      root .gitattributes) applies, and guard 1 leaves none inside it; the copy must
 #      also hold exactly the files <head> committed;
 #   4. docs/vision.md differs from its latest artifact in the committed Ground
-#      (process section 1: each change to the file adds a new artifact in the same PR).
-# 3 and 4 run only when <head> has a Ground. Progress goes to stdout; a failure is the
+#      (process section 1: each change to the file adds a new artifact in the same PR);
+#   5. the committed Ground holds a contribution with a Weave media type, retracted or
+#      not: until the join, Weave records go only into the Weave Ground, through
+#      scripts/weave (docs/design/weave.md, A checkpoint tripwire).
+# 3 to 5 run only when <head> has a Ground. Progress goes to stdout; a failure is the
 # last line starting "ground-guards:" on stderr, naming its guard. A guard that can't
 # check says so and fails.
 #
@@ -127,4 +130,16 @@ if [ -n "$(git ls-tree --full-tree --name-only "$head" -- "$doc")" ]; then
     fail "vision document: $doc differs from its latest artifact in the Ground ($id); add the new version and supersede it"
   echo "ground-guards: $doc matches artifact $id"
 fi
+# 5. No Weave records. The same test as scripts/bk's and scripts/ground-checkpoint's.
+weave_media() { [[ $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') == application/vnd.bracken.weave* ]]; }
+command -v jq >/dev/null || fail "no Weave records: needs jq to read the Ground's artifacts; can't check"
+weave=()
+# Each media type as a JSON string less its opening quote, so a newline in one can't split a line.
+while read -r id m; do
+  ! weave_media "$m" || weave+=("$id")
+done < <(g log --kind artifact --json | jq -r '.[] | "\(.id) \(.body.media_type | @json | .[1:])"')
+[ ${#weave[@]} -eq 0 ] ||
+  fail "no Weave records: the committed Ground holds contributions with a Weave media type, which go only into the Weave Ground; tell the owner:
+$(printf '%s\n' "${weave[@]}")"
+echo "ground-guards: no Weave records"
 echo "ground-guards: all guards pass at $head"

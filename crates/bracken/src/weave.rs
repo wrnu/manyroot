@@ -209,12 +209,21 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
                 (manifest_hash(s, &ix, &a, "the first manifest")?, manifest_hash(s, &ix, &b, "the second manifest")?);
             let (ma, mb) = (held_manifest(&ix, &ha)?, held_manifest(&ix, &hb)?);
             let diffs = diff::manifests(ma, mb);
+            // A changed file whose version this replica doesn't hold has no text diff: say which.
+            let unheld = |d: &diff::FileDiff| -> Vec<String> {
+                [d.before, d.after]
+                    .into_iter()
+                    .flatten()
+                    .filter(|v| !ix.holds_file(&v.hash))
+                    .map(|v| v.hash.to_string())
+                    .collect()
+            };
             if out.json {
                 let files: Vec<Value> = diffs
                     .iter()
                     .map(|d| {
                         json!({"path": d.path, "change": d.kind.as_str(), "before": d.before.map(file_value_json),
-                               "after": d.after.map(file_value_json)})
+                               "after": d.after.map(file_value_json), "not_held": unheld(d)})
                     })
                     .collect();
                 print_json(&json!({"a": ha.to_string(), "b": hb.to_string(), "files": files}));
@@ -233,6 +242,11 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
                     _ => String::new(),
                 };
                 println!("{letter} {}{modes}", crate::terminal::printable(&d.path));
+                let missing = unheld(d);
+                if d.kind == diff::Kind::Modified && !missing.is_empty() {
+                    println!("  (no text: this Ground doesn't hold {})", missing.join(" or "));
+                    continue;
+                }
                 if let (diff::Kind::Modified, Some(x), Some(y)) = (d.kind, d.before, d.after) {
                     let (old, new) = (ix.file(g, &x.hash), ix.file(g, &y.hash));
                     if let (Some(old), Some(new)) = (old, new)
