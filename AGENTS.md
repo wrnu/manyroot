@@ -19,11 +19,23 @@
 
 ## Tests
 
-Run all three before every `pr` claim. This table is the CI: the forge's workflow runs only by hand, and the manager's counted run of the table on the exact head is what a merge waits for (decision `20a06f9b815e`, [docs/development.md](docs/development.md)).
+This table is the CI: the forge's workflow runs only by hand, and the manager's counted run of the whole table on the exact head is what a merge waits for (decision `20a06f9b815e`, [docs/development.md](docs/development.md)).
 
 | Package | Test | Lint | Format |
 |---|---|---|---|
 | workspace | `cargo test --workspace` | `cargo clippy --all-targets -- -D warnings` | `cargo fmt --check` |
+
+Builders don't run the whole `cargo test --workspace` (decision `ef5b807d3196`): the manager's counted run does. Before every `pr` claim, run the lint and format checks, and `cargo test` with the packages for every row your branch touches (a package's dependents include the crates whose tests run the `bracken` binary):
+
+| You changed | Test |
+|---|---|
+| root `Cargo.toml` or `Cargo.lock` | `--workspace` |
+| `crates/manyroot` | `--workspace` |
+| `crates/tree` | `-p bracken-tree -p bracken` |
+| `crates/bracken`, `scripts/`, `.claude/skills/` | `-p bracken`, plus `-p bracken-demo -p bracken-experiment` if you change a command's arguments, output, or what it records, accepts, syncs or refuses |
+| `crates/demo` or `crates/experiment` | `-p bracken -p bracken-demo -p bracken-experiment` |
+| anything else except `rustfmt.toml` (docs, root files, `.forgejo/`) | `-p bracken-tree -p bracken`: their tests import every tracked file |
+| `rustfmt.toml` | the format check alone |
 
 ## Releases
 
