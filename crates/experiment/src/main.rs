@@ -93,8 +93,10 @@ enum Cmd {
         /// --settings; openrouter goes to Pi's own OpenRouter URL with the key in --pi-auth.
         #[arg(long, value_parser = ["anthropic", "openrouter"])]
         pi_provider: Option<String>,
-        /// Pi with openrouter: a Pi auth.json (Pi's /login writes one) holding the OpenRouter API key.
-        /// Only that entry is read, into memory; a key Pi would get by running a command is refused.
+        /// Pi with openrouter: a Pi auth.json (Pi's /login writes one) holding an OpenRouter API key or
+        /// an OpenRouter login. Only that entry's type and key, or its login's access and expiry, are read,
+        /// into memory. A login expiring before the run's time cap and a 30-minute margin is refused; it
+        /// is never refreshed, and nothing writes the file.
         #[arg(long)]
         pi_auth: Option<PathBuf>,
         /// Pi: the thinking level asked for [default: the plan's effort, medium]. Pick one the model
@@ -428,7 +430,11 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
         HarnessArgs::Pi { prefix, version, provider, .. } => {
             let credential = match provider {
                 PiProvider::Anthropic { settings } => PiCredential::anthropic(&Routing::from_settings(settings)?)?,
-                PiProvider::OpenRouter { auth } => PiCredential::openrouter(auth)?,
+                // A login must last the whole run and a margin (decision 467e1c8dbc09).
+                PiProvider::OpenRouter { auth } => {
+                    let until = std::time::SystemTime::now() + caps.run_time + bracken_experiment::pi::LOGIN_MARGIN;
+                    PiCredential::openrouter(auth, until)?
+                }
             };
             let backend = PiBackend::new(PiConfig {
                 prefix: prefix.clone(),

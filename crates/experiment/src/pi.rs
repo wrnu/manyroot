@@ -25,10 +25,12 @@
 //!   and whether a test CA was trusted (finding 695de67678dd).
 //! - **Its provider** ([`PiCredential`]): `anthropic`, routed by the owner's Claude Code settings, or
 //!   `openrouter` at Pi's own base URL for it, with the key from a Pi `auth.json` (task 19228e53a342,
-//!   note ea4e2f77d70e). Either way the forwarding proxy reaches only that host, and the key reaches Pi
+//!   note ea4e2f77d70e): a stored API key, or the key Pi's OpenRouter login holds as `access` (decision
+//!   467e1c8dbc09, note 9c39dc45be07), which Pi sends exactly as it sends an API key. Either way the forwarding proxy reaches only that host, and the key reaches Pi
 //!   only in the one environment entry Pi reads for the provider.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -49,6 +51,28 @@ pub const PROVIDERS: [(&str, &str); 2] = [("anthropic", "ANTHROPIC_AUTH_TOKEN"),
 
 /// OpenRouter's API, Pi 1.4.0's base URL for its `openrouter` provider.
 pub const OPENROUTER_BASE_URL: &str = "https://openrouter.ai/api/v1";
+
+/// How much longer than the run's time cap an OpenRouter login must stay valid, so that one expiring
+/// during the run is refused at the start too (decision 467e1c8dbc09).
+pub const LOGIN_MARGIN: Duration = Duration::from_secs(30 * 60);
+
+/// A Pi `auth.json`, as far as the run reads it: the `openrouter` entry's type, and its stored key or
+/// its login's `access` and `expires`. The parser skips everything else, the login's `refresh` and
+/// every other provider included, without keeping it.
+#[derive(serde::Deserialize)]
+struct AuthFile {
+    openrouter: Option<AuthEntry>,
+}
+
+#[derive(serde::Deserialize)]
+struct AuthEntry {
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    key: Option<String>,
+    access: Option<String>,
+    /// Milliseconds since the epoch, as Pi writes it.
+    expires: Option<serde_json::Number>,
+}
 
 /// The session header version Pi 1.4.0 writes.
 pub const HEADER_VERSION: u64 = 3;
@@ -125,24 +149,49 @@ impl PiCredential {
         PiCredential::new("anthropic", url, key.to_string())
     }
 
-    /// OpenRouter at Pi's own base URL for it ([`OPENROUTER_BASE_URL`]), with the API key Pi's `/login`
-    /// saved in the `auth.json` at `path`. Only that entry is read; a key Pi would get by running a
-    /// command (`!…`) is refused, not run.
-    pub fn openrouter(path: &Path) -> Result<PiCredential, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let auth: Value = serde_json::from_str(&text).map_err(|_| format!("{} is not JSON", path.display()))?;
-        let entry = &auth["openrouter"];
-        if entry.is_null() {
-            return Err(format!("{} has no openrouter entry", path.display()));
-        }
-        if entry["type"] != "api_key" {
-            return Err(format!("{}'s openrouter entry isn't an API key", path.display()));
-        }
-        let key = entry["key"].as_str().ok_or_else(|| format!("{}'s openrouter entry has no key", path.display()))?;
+    /// OpenRouter at Pi's own base URL for it ([`OPENROUTER_BASE_URL`]), with the key in the
+    /// `openrouter` entry of the Pi `auth.json` at `path`: a stored API key (`type: api_key`), or the
+    /// key Pi's OpenRouter login holds (`type: oauth`), its `access`, used as it is. Pi sends either as
+    /// the same bearer (note 9c39dc45be07). A login must stay valid until `until`; one that won't is
+    /// refused, never refreshed, and nothing writes the file (decision 467e1c8dbc09). A key Pi would
+    /// run or expand (`!…`, `$…`), or one with a character a transcript could hold escaped, is refused
+    /// (finding b85965153a9b). No error quotes a value.
+    pub fn openrouter(path: &Path, until: SystemTime) -> Result<PiCredential, String> {
+        let p = path.display();
+        let text = std::fs::read_to_string(path).map_err(|e| format!("reading {p}: {e}"))?;
+        // A fixed message: the parser's own can quote a value.
+        let auth: AuthFile = serde_json::from_str(&text)
+            .map_err(|_| format!("{p} isn't a Pi auth.json with a readable openrouter entry"))?;
+        let entry = auth.openrouter.ok_or_else(|| format!("{p} has no openrouter entry"))?;
+        let key = match entry.kind.as_deref() {
+            Some("api_key") => entry.key.ok_or_else(|| format!("{p}'s openrouter entry has no key"))?,
+            Some("oauth") => {
+                let access = entry.access.filter(|a| !a.is_empty());
+                let access = access.ok_or_else(|| format!("{p}'s OpenRouter login holds no access key"))?;
+                let expires = entry.expires.and_then(|n| n.as_f64());
+                let expires =
+                    expires.ok_or_else(|| format!("{p}'s OpenRouter login says nothing of when it expires"))?;
+                let until = until.duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?.as_millis() as f64;
+                if expires < until {
+                    return Err(format!(
+                        "{p}'s OpenRouter login has expired or would expire before the run could end: log in \
+                         to Pi again (/login openrouter), then start the run again"
+                    ));
+                }
+                access
+            }
+            _ => return Err(format!("{p}'s openrouter entry is neither an API key nor an OpenRouter login")),
+        };
         if key.starts_with('!') {
-            return Err(format!("{}'s openrouter key is a command, which the run won't run", path.display()));
+            return Err(format!("{p}'s openrouter key is a command, which the run won't run"));
         }
-        PiCredential::new("openrouter", OPENROUTER_BASE_URL, key.to_string())
+        if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) {
+            return Err(format!(
+                "{p}'s openrouter key holds a character outside A-Z, a-z, 0-9, '.', '_' and '-' ('$', say, which \
+                 Pi would expand), so the run can't check transcripts for it"
+            ));
+        }
+        PiCredential::new("openrouter", OPENROUTER_BASE_URL, key)
     }
 
     pub fn provider(&self) -> &str {
@@ -624,8 +673,9 @@ mod tests {
     #[test]
     fn openrouter_takes_its_key_from_a_pi_auth_file_and_goes_to_pis_own_url() {
         let tmp = tempfile::tempdir().expect("a temp dir");
-        let c = PiCredential::openrouter(&auth(tmp.path(), json!({"type": "api_key", "key": TOKEN})))
-            .expect("a credential");
+        let c =
+            PiCredential::openrouter(&auth(tmp.path(), json!({"type": "api_key", "key": TOKEN})), SystemTime::now())
+                .expect("a credential");
         assert_eq!((c.provider(), c.host.as_str(), c.port), ("openrouter", "openrouter.ai", 443));
         assert!(!format!("{c:?}").contains(TOKEN), "its Debug never shows the key");
 
@@ -649,25 +699,77 @@ mod tests {
         });
     }
 
+    /// Milliseconds since the epoch at `t`, as Pi writes `expires`.
+    fn ms(t: SystemTime) -> u64 {
+        t.duration_since(UNIX_EPOCH).expect("after the epoch").as_millis() as u64
+    }
+
+    #[test]
+    fn an_openrouter_login_gives_its_access_key_as_it_is_while_it_lasts_past_the_run() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let until = SystemTime::now() + Duration::from_secs(5400);
+        // As Pi's OpenRouter login writes it: a permanent key, no refresh, and the largest safe expiry.
+        let login = json!({"type": "oauth", "access": TOKEN, "refresh": "", "expires": 9007199254740991_u64});
+        let c = PiCredential::openrouter(&auth(tmp.path(), login), until).expect("a credential");
+        assert_eq!((c.provider(), c.key_name, c.key.as_str()), ("openrouter", "OPENROUTER_API_KEY", TOKEN));
+        let p = with_credential(c, "deepseek/deepseek-v4.1-flash", None);
+        assert_eq!(p.secret(), TOKEN, "the access key goes to Pi exactly as a stored key would");
+
+        // A login lasting just past `until` serves; one ending just before it, or already over, doesn't.
+        let refresh = "refresh-value-never-read-0123456789";
+        let lasting = |expires: u64| json!({"type": "oauth", "access": TOKEN, "refresh": refresh, "expires": expires});
+        let after = ms(until) + 1_000;
+        assert!(PiCredential::openrouter(&auth(tmp.path(), lasting(after)), until).is_ok());
+        for expires in [ms(until) - 1_000, ms(SystemTime::now()) - 60_000] {
+            let e = PiCredential::openrouter(&auth(tmp.path(), lasting(expires)), until).expect_err("refused");
+            assert!(e.contains("log in to Pi again (/login openrouter)"), "{e}");
+            for value in [TOKEN, refresh, &expires.to_string()] {
+                assert!(!e.contains(value), "the error quotes a value: {e}");
+            }
+        }
+    }
+
     #[test]
     fn a_pi_auth_file_without_a_plain_openrouter_key_is_refused_and_never_quoted() {
         let tmp = tempfile::tempdir().expect("a temp dir");
-        let refused = |entry: Value| PiCredential::openrouter(&auth(tmp.path(), entry)).expect_err("refused");
+        let now = SystemTime::now();
+        let refused = |entry: Value| PiCredential::openrouter(&auth(tmp.path(), entry), now).expect_err("refused");
         let path = tmp.path().join("auth.json").display().to_string();
+        let later = ms(now) + 3_600_000;
         let cases = [
             (Value::Null, "has no openrouter entry"),
-            (json!({"type": "oauth", "key": TOKEN}), "openrouter entry isn't an API key"),
+            (json!({"type": "device", "key": TOKEN}), "neither an API key nor an OpenRouter login"),
+            (json!({"key": TOKEN}), "neither an API key nor an OpenRouter login"),
             (json!({"type": "api_key"}), "openrouter entry has no key"),
+            (json!({"type": "oauth", "expires": later}), "login holds no access key"),
+            (json!({"type": "oauth", "access": "", "expires": later}), "login holds no access key"),
+            (json!({"type": "oauth", "access": TOKEN}), "says nothing of when it expires"),
+            (json!({"type": "oauth", "access": TOKEN, "expires": "never"}), "readable openrouter entry"),
+            (json!({"type": "api_key", "key": 7}), "readable openrouter entry"),
+            (json!(TOKEN), "readable openrouter entry"),
             (json!({"type": "api_key", "key": format!("!security find-generic-password {TOKEN}")}), "is a command"),
+            (json!({"type": "oauth", "access": format!("!{TOKEN}"), "expires": later}), "is a command"),
             (json!({"type": "api_key", "key": "short"}), "too short"),
         ];
-        for (entry, says) in cases {
+        // Pi expands $NAME and ${NAME}, and a transcript holds a quote or a backslash escaped.
+        let odd = [
+            "$OR_KEY",
+            "${OR_KEY}",
+            &format!("{TOKEN}$"),
+            &format!("{TOKEN}\""),
+            &format!("{TOKEN}\\"),
+            &format!("{TOKEN} x"),
+        ];
+        let odd = odd.iter().map(|k| (json!({"type": "api_key", "key": k}), "holds a character outside"));
+        let odd_login =
+            (json!({"type": "oauth", "access": format!("${TOKEN}"), "expires": later}), "holds a character outside");
+        for (entry, says) in cases.into_iter().chain(odd).chain([odd_login]) {
             let e = refused(entry.clone());
             assert!(e.contains(says), "{entry}: {e}");
-            assert!(!e.contains(TOKEN), "{entry}: the error quotes the key: {e}");
+            assert!(!e.contains(TOKEN) && !e.contains("OR_KEY"), "{entry}: the error quotes the key: {e}");
             assert!(says == "too short" || e.contains(&path), "{e}");
         }
-        let missing = PiCredential::openrouter(&tmp.path().join("none.json")).expect_err("no file");
+        let missing = PiCredential::openrouter(&tmp.path().join("none.json"), now).expect_err("no file");
         assert!(missing.starts_with("reading "), "{missing}");
         let e = PiCredential::new("openai", OPENROUTER_BASE_URL, TOKEN.into()).expect_err("not a provider");
         assert_eq!(e, "Pi's provider `openai` isn't one a run may use");
