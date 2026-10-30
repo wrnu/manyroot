@@ -73,6 +73,8 @@ A Pi run pins one install of Pi and the node that runs it, not the owner's: `scr
 
 Two tests in `crates/experiment/tests/pi.rs` need it and are ignored otherwise: one runs its node under the Node sandbox profile, and one plays a whole Pi turn through the forwarding proxy to a stub provider, with a test CA made at test time. No model is called. Run them with `EXPERIMENT_PI_PREFIX=<dir> cargo nextest run -p bracken-experiment --test pi --run-ignored only`. The counted run doesn't build the prefix (answer `8064daa71ddf` (3)).
 
+`bracken-experiment run --harness pi --pi-prefix <dir>` plays every turn with that prefix in place of `--claude`, routed by the same `--settings` file; `--pi-version` (1.4.0 by default) is the version the prefix must hold. Pi's compaction is off, and a compaction beginning stops the run, since its summary call's tokens would escape the caps (finding `ac5a014447a1`). The first usage row and the plan's `harness` field record the harness: its pin, profile, declared entries, where a turn's result comes from, and whether a test CA was trusted (finding `695de67678dd`). A real run calls a model, so it needs the owner's go.
+
 To upgrade Pi, change the version in `crates/experiment/pi/package.json`, run `scripts/pi-prefix --lock`, and review the new lockfile as a dependency change: a supply-chain check in security review (answer `cc34f6275877` (1)).
 
 ## Team server

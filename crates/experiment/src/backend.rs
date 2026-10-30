@@ -453,6 +453,12 @@ pub trait Harness: Sync {
     /// Which of the backend's sandbox profiles its turns run under. Read once, at the start.
     fn profile(&self) -> Profile;
 
+    /// What the run's record should say about it beyond its pin and profile, such as where a turn's
+    /// result comes from: the first usage row and the plan hold it ([`HarnessBackend::harness_record`]).
+    fn about(&self) -> Value {
+        json!({})
+    }
+
     /// The environment entries it may add beyond [`BASE_ENV`], by name, fixed for the run: read once, at
     /// the start. Each must be a plain name, and none may be one of [`BASE_ENV`] or a proxy setting, in
     /// any case ([`declared_name`]), or the backend doesn't start.
@@ -511,6 +517,8 @@ pub struct HarnessBackend<H> {
     pin: Pin,
     profile: Profile,
     env_names: Vec<String>,
+    /// What the run's record says of the harness, as the start took it.
+    record: Value,
     cfg: BackendConfig,
     proxy: Proxy,
     totals: Mutex<Totals>,
@@ -544,19 +552,35 @@ impl<H: Harness> HarnessBackend<H> {
         pin.check(name)?;
         let proxy = Proxy::start(harness.route(), cfg.caps.turn_time)?;
         let usage = private_file(&cfg.dir.join("usage.jsonl"))?;
-        Ok(HarnessBackend {
+        let record = json!({
+            "harness": name,
+            "pin": {"path": pin.path, "blake3": pin.blake3, "version": pin.version, "tree": pin.tree},
+            "profile": profile.name(),
+            "declared": env_names,
+            "about": harness.about(),
+        });
+        let backend = HarnessBackend {
             harness,
             secret,
             pin,
             profile,
             env_names,
+            record,
             cfg,
             proxy,
             totals: Mutex::new(Totals::default()),
             halt: Mutex::new(None),
             usage: Mutex::new(usage),
             started: Instant::now(),
-        })
+        };
+        backend.record(backend.record.clone());
+        Ok(backend)
+    }
+
+    /// What the run's record says of the harness: its name, pin, profile, declared entries and
+    /// [`Harness::about`]. The first usage row holds it, and a run's plan carries it.
+    pub fn harness_record(&self) -> &Value {
+        &self.record
     }
 
     pub fn harness(&self) -> &H {

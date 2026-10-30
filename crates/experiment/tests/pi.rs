@@ -277,6 +277,9 @@ fn a_pi_turn_runs_through_the_proxy_to_a_stub_provider() {
         .lines()
         .map(|l| serde_json::from_str(l).expect("JSON"))
         .collect();
+    // The run's record of the harness comes first, and says this run trusted a test CA (finding 695de67678dd).
+    assert_eq!(usage[0], *backend.harness_record());
+    assert_eq!((&usage[0]["harness"], &usage[0]["about"]["test_ca"]), (&json!("Pi"), &json!(true)));
     assert!(usage.iter().any(|r| r["gate"] == true), "the gate passed: {usage:#?}");
     let settled = usage.iter().find(|r| r["result"].is_string()).unwrap_or_else(|| {
         panic!(
