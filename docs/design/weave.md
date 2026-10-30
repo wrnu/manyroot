@@ -402,10 +402,12 @@ never writes a `supersedes` relation for another author's artifact.
   validate` and `weave integrate --run`, section 3). Their `details` start
   with the manifest's content hash, then the attempt number, the argv that
   ran, the exit code and the output tail (section 3). Results attach to
-  the configuration (the manifest), not to a decision. So a candidate that
-  never becomes a decision keeps its failures on record (finding
-  `91b3c74acc47`), and a decision whose manifest was already checked, a
-  fast-forward say, needs no new run.
+  the configuration (the manifest), not to a decision, nor to one artifact
+  of it: retracting the artifact a result targets doesn't remove the result
+  (finding `348e506fce4c`). So a candidate that never becomes a decision
+  keeps its failures on record (finding `91b3c74acc47`), and a decision
+  whose manifest was already checked, a fast-forward say, needs no new
+  run.
 
   Nothing proves the check ran on that manifest: under shared keys, a
   result is a report, not a proof.
@@ -416,6 +418,12 @@ never writes a `supersedes` relation for another author's artifact.
     that manifest hash;
   - a proposal, which reviews every proposal on the same line with the
     same `change`, so it survives a rebase that leaves the change as it was.
+
+  A target resolves to what it names whether or not it is retracted: a
+  manifest artifact to its manifest hash, a proposal to its line and
+  `change`. So retracting the artifact a review targets clears nothing
+  while the manifest or the change stands through another (finding
+  `06bbc6a34636`).
 
   Agreement is shown (`weave review`) but not required in v0. Objections
   bind integrators (section 2, rule 5).
@@ -448,7 +456,9 @@ decision's causal ancestors). A check result on manifest hash `H` is
   (finding `4189811f3cdd`). This is tested first, before the epoch and the
   latest-result rule, so a result for a different definition never takes
   part in either. In particular it can't replace a real failure;
-- it is in `S`, and no retraction of it is in `S`;
+- it is in `S`, and it isn't retracted in `S`: no retraction of it in
+  `S` stands there, by the protocol's rule, so a retracted retraction
+  restores it (finding `1c584afefc50`);
 - its author is in `P`'s `validators`;
 - its author isn't `D`'s author. So the integrator's own results never
   count, including the ones `weave integrate --run` records;
@@ -965,6 +975,19 @@ from its results.
     line's author who adds a diverging version then a decision, repeated,
     would make each decision keep its own longer list: about `K^2 / 2`
     versions (task `a90865cb60db`).
+  - **Check results** (build step 7). Only results by a validator under
+    some policy version are asked about, so nobody else's evidence costs
+    anything. The latest result of each validator per manifest and check
+    takes a pass per 64 results: each result reads its own word and marks
+    the results of its group below it, keeping a bit per result. The
+    policy epoch is one more reference per result, to the current policy
+    version of each line whose checks it names. Counting over a decision's
+    own past, under the policy in force for it, asks which of the results
+    and their retractions are in that past, and whether the policy version
+    is in each result's: references, a bit each. Which of those results
+    lie below one another is a list per validator, check and manifest,
+    answered in rounds within the batch budget; so a later re-run or
+    retraction never changes what the decision saw.
   - A question nothing asked at build would be a bug. It is answered by
     walking and counted, and fails debug builds; the tests assert the count
     is zero.
