@@ -2,9 +2,9 @@
 //! runs under one that allows only its row of the process table and denies
 //! everything else.
 //!
-//! - **agent**: Claude Code and the shim it starts. Reads the system, the
-//!   installation, its own directory and the turn configuration; writes only
-//!   its own directory; starts only the pinned binary, `/usr/bin/env` and the
+//! - **agent**: the harness (Claude Code) and the shim it starts. Reads the
+//!   system, the installation, its own directory and the turn configuration;
+//!   writes only its own directory; starts only the pinned binary, `/usr/bin/env` and the
 //!   shim; connects only to the forwarding proxy's port and its one socket.
 //!   No mach service at all, so no keychain.
 //! - **tools**: one agent's worker. Reads and writes only that agent's copy;
@@ -89,13 +89,13 @@ impl Git {
     }
 }
 
-/// What an agent's Claude Code may touch.
+/// What an agent's harness may touch.
 pub struct AgentPaths<'a> {
-    /// The pinned binary.
-    pub claude: &'a Path,
+    /// The harness's pinned binary.
+    pub program: &'a Path,
     /// The directory it was installed in: it reads its own files there.
     pub install: &'a Path,
-    /// Its own directory: `HOME`, `CLAUDE_CONFIG_DIR` and the temporary directories are inside.
+    /// Its own directory: `HOME`, the temporary directory and the harness's own are inside.
     pub own: &'a Path,
     /// The turn configuration, read-only.
     pub turn: &'a Path,
@@ -143,7 +143,7 @@ impl Sandbox {
     /// The agent profile.
     pub fn agent(p: &AgentPaths) -> Result<Sandbox, String> {
         let params = vec![
-            param("CLAUDE", p.claude)?,
+            param("CLAUDE", p.program)?,
             param("INSTALL", p.install)?,
             param("OWN", p.own)?,
             param("TURN", p.turn)?,
