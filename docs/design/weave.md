@@ -909,10 +909,33 @@ from its results.
   decisions by default and never prints payloads. Loading payloads lazily
   is left for later (section 8).
 - **What opening costs.** Opening checks each distinct path once, however
-  many manifests list it. The ancestor rule still walks the history once
-  per reference, and the 1,024-reference cap bounds how many walks one
-  record can cause (finding `1873f4834edd`). An index that answers the
-  rule without walking is its own design task (decision `41670d761ba6`).
+  many manifests list it, and answers every ancestor question without a
+  walk per question (design note `e93d47ad8a20`, answer `b2dbc4f5e810`).
+  Questions are answered 64 contributions at a time: one pass over the
+  history in causal order per 64, with two words per contribution reused
+  by every pass.
+  - A record's references are each kept as a 4-byte index and a bit, and
+    the 1,024-reference cap bounds them by the record's size (finding
+    `1873f4834edd`). All markers together are one more target, so each
+    marker keeps one bit: is another marker a strict ancestor?
+  - Lines asks its own chain questions, after it has dropped the versions
+    that count for nothing. A decision or proposal naming a version asks
+    about every supersedes relation in that version's component: the
+    versions the relations Lines counts join, whichever way. Lines only
+    follows those relations from the line, so it asks nothing else, and no
+    rule about which versions are first artifacts is guessed in advance.
+    Each relation is in one component, so stored once. Each record keeps
+    its verdict, not its answers.
+  - **The batch budget.** Chain answers are held at most one 64-bit word
+    per contribution at a time, then turned into verdicts and freed. A
+    component asked about by more records than fit takes more passes, not
+    more memory. So memory is linear in the history in every shape; a
+    line's author who makes a long chain and many decisions on it makes
+    opening quadratic in time, which is still never slower than walking
+    the graph per question, as opening did before.
+  - A question nothing asked at build would be a bug. It is answered by
+    walking and counted, and fails debug builds; the tests assert the count
+    is zero.
 - **Compaction is left open.** Signed history can't be shortened without
   losing what it signs. A later checkpoint scheme (Rings, protocol.md *Not
   yet specified*) is where it belongs.
