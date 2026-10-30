@@ -88,11 +88,24 @@ else
   tags=(--tag approval)
 fi
 
-written=$(bk claim "$statement" "${tags[@]}" --as owner) || fail "the approval wasn't written"
-# The first line's last word: 'claim <id>' (task d4e958fd6719), or a bare id from an older pinned binary.
+# The id comes first, bk's status second: bk exits 1 after a local write the team server didn't confirm,
+# and that write is real (task 8b650f99aacd). The id is the first line's last word: 'claim <id>' (task
+# d4e958fd6719), or a bare id from an older pinned binary.
+status=0
+written=$(bk claim "$statement" "${tags[@]}" --as owner) || status=$?
 approval=${written%%$'\n'*}
 approval=${approval##* }
 [[ $approval =~ ^[0-9a-f]{64}$ ]] || fail "the approval wasn't written"
-bk relate "$approval" supports "$full" --as owner >/dev/null ||
-  fail "approval $approval is written but its supports relation isn't; run: scripts/bk relate $approval supports $full --as owner"
+[ "$status" -eq 0 ] ||
+  fail "approval $approval is written locally but not confirmed by the team server; to finish, run: scripts/bk heads --as owner (which pushes it), then: scripts/bk relate $approval supports $full --as owner"
+status=0
+related=$(bk relate "$approval" supports "$full" --as owner) || status=$?
+if [ "$status" -ne 0 ]; then
+  relation=${related%%$'\n'*}
+  relation=${relation#relation }
+  relation=${relation%% *}
+  [[ $relation =~ ^[0-9a-f]{64}$ ]] ||
+    fail "approval $approval is written but its supports relation isn't; run: scripts/bk relate $approval supports $full --as owner"
+  fail "approval $approval and its supports relation $relation are written locally but not confirmed by the team server; to finish, run: scripts/bk heads --as owner (which pushes them)"
+fi
 echo "$approval"

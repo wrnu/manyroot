@@ -2767,6 +2767,74 @@ fn owner_approve_signs_as_owner_only_on_a_terminal_and_never_prints_a_key() {
     }
 }
 
+/// Task 8b650f99aacd: scripts/bk exits 1 after a local write the team server didn't confirm. A stub bk
+/// does that for one command ($UNCONFIRMED): owner-approve then says the approval (and, for relate, its
+/// supports relation) is written locally but not confirmed, names it, and prints the commands to
+/// finish, never that it wasn't written.
+#[test]
+fn owner_approve_names_a_write_the_team_server_didnt_confirm() {
+    for scripts in SCRIPTS {
+        let approve = repo_root().join(scripts).join("owner-approve");
+        let real = repo_root().join("scripts/bk");
+        let (tmp, dir) = repo(
+            &[("scripts/owner-approve", &approve), ("scripts/bk.real", &real)],
+            ".bracken/\n",
+            |dir| {
+                write_executable(
+                    &dir.join("scripts/bk"),
+                    "#!/usr/bin/env bash\n\"$(dirname \"$0\")/bk.real\" \"$@\" || exit\n\
+                 if [ \"$1\" = \"${UNCONFIRMED:-}\" ]; then\n\
+                 echo \"bk: written to the local replica, but the team server didn't confirm it (stub)\" >&2; exit 1\nfi\n",
+                );
+            },
+        );
+        let _ = &tmp;
+        bk(&dir, &["init", "--name", "unconfirmed"]);
+        bk(&dir, &["id", "new", "owner"]);
+        bk(&dir, &["id", "new", "manager"]);
+        let task = bk(&dir, &["claim", "Task: a model run", "--tag", "task", "--as", "manager"]);
+        let approve = |unconfirmed: &str, yes: &str| {
+            let args = [&task[..12], "run it", "--delegated", yes, "--as", "owner"];
+            let mut c = command(&dir, "scripts/owner-approve", &args);
+            let out = c.env("UNCONFIRMED", unconfirmed).stdin(std::process::Stdio::null()).output().unwrap();
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {}", String::from_utf8_lossy(&out.stdout));
+            String::from_utf8_lossy(&out.stderr).into_owned()
+        };
+        let approvals = || -> Vec<serde_json::Value> {
+            serde_json::from_str::<serde_json::Value>(&bk(&dir, &["log", "--tag", "approval", "--json"]))
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+        let supports = |id: &str| {
+            let shown: serde_json::Value = serde_json::from_str(&bk(&dir, &["show", id, "--json"])).unwrap();
+            shown["referrers"].as_array().unwrap().iter().filter(|r| r["body"]["kind"] == "supports").count()
+        };
+
+        let stderr = approve("claim", "yes once");
+        let written = approvals();
+        assert_eq!(written.len(), 1, "{scripts}: {stderr}");
+        let id = written[0]["id"].as_str().unwrap();
+        assert!(!stderr.contains("wasn't written"), "{scripts}: {stderr}");
+        assert!(stderr.contains(&format!("approval {id} is written locally but not confirmed")), "{scripts}: {stderr}");
+        assert!(stderr.contains(&format!("scripts/bk relate {id} supports {task} --as owner")), "{scripts}: {stderr}");
+        assert!(stderr.contains("scripts/bk heads --as owner"), "{scripts}: {stderr}");
+        assert_eq!(supports(id), 0, "{scripts}");
+
+        let stderr = approve("relate", "yes twice");
+        let written = approvals();
+        assert_eq!(written.len(), 2, "{scripts}: {stderr}");
+        let id = written[1]["id"].as_str().unwrap();
+        assert_eq!(supports(id), 1, "{scripts}: the relation is written locally");
+        assert!(
+            stderr.contains(&format!("approval {id} and its supports relation ")) && stderr.contains("not confirmed"),
+            "{scripts}: {stderr}"
+        );
+        assert!(stderr.contains("scripts/bk heads --as owner"), "{scripts}: {stderr}");
+    }
+}
+
 /// Task ec880b9c2c86: with --owner-approval, merge's owner check needs a current approval signed by owner
 /// that supports the pr claim itself. None, a manager-signed quote, a retracted one, one of a task the
 /// claim implements (finding 9e8e0c849724) or one borrowed from an earlier head through implements
