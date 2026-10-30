@@ -297,10 +297,13 @@ replica.
   order, never out of it**: every contribution's parents are seen by the cursor or earlier in the
   same reply. So a caller with an empty replica pages in from `""`, each reply resolving against
   those before it. The server ignores a head it doesn't hold, and names up to 64 such heads in
-  `X-Bracken-Unknown-Heads`. The caller's next cursor holds its own heads, and also the heads of
-  what it holds minus those named and everything after them. So it isn't sent again what it holds
-  already, and once the server has a named head, that head counts as seen. The named set is
-  rebuilt from each reply (finding `6552f9b16c65`).
+  `X-Bracken-Unknown-Heads`. `watch --feed` keeps what it knows the server holds: everything replies
+  have brought. A reply of only what it holds already means the server lacked every head it sent,
+  perhaps because it was restored with less. Such a reply replaces that knowledge rather than adding
+  to it (finding `2e421e838287`). Its next cursor holds its own heads and the heads of what the
+  server holds. So a chain of its own work the server lacks costs one reply of what it holds already,
+  not one every round. And once the server has one of those heads, the head counts as seen (findings
+  `6552f9b16c65`, `d4f10edc63fb`).
 - **Bounds.** At most 16 requests under way; more get 429. They count toward the 64 connections.
   These bounds are for a server on 127.0.0.1; revisit them before it is exposed.
 - **The client**, `bracken watch --follow --sync <url> --token-file <file> --feed`:
@@ -311,8 +314,8 @@ replica.
     rules.
   - A reply with anything rejected or unresolved is dropped whole and said on stderr. Three in a row
     end watch with exit 1.
-  - A failed request is retried after `--interval`, as is one that came back within a second with
-    nothing new, so no mismatch becomes a hot loop.
+  - A failed request is retried after `--interval`. So is a reply of only what the client holds
+    already, and an empty one that came back within a second, so no mismatch becomes a hot loop.
   - A server without the feed (404, 405 or 501) is synced with instead, as `--sync` alone does.
   - `scripts/bk` gives `--feed` to a pinned bracken that has it.
 

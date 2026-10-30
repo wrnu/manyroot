@@ -1272,10 +1272,10 @@ fn counting_proxy(port: u16) -> (String, std::sync::Arc<std::sync::atomic::Atomi
     (url, count)
 }
 
-/// Finding 6552f9b16c65: a head of the watching replica that the server lacks is named in the reply and
-/// left out of the next cursor, so the request waits instead of bringing back what is here already; and
-/// once the head reaches the server, it counts as seen and the request still waits, rather than coming
-/// back at once, again and again.
+/// Finding 6552f9b16c65: with a head of the watching replica that the server lacks, the first reply brings
+/// back what is here already, and from what it brought the next cursor holds the server's heads too, so
+/// the request waits; and once the head reaches the server, it counts as seen and the request still
+/// waits, rather than coming back at once, again and again.
 #[test]
 fn watch_feed_waits_while_and_after_a_local_head_reaches_the_server() {
     let g = grounds();
@@ -1302,4 +1302,95 @@ fn watch_feed_waits_while_and_after_a_local_head_reaches_the_server() {
     watch.kill().unwrap();
     watch.wait().unwrap();
     assert!(after <= 3, "{after} requests once the head reached the server");
+}
+
+/// Finding d4f10edc63fb: with a chain of a's own work the server lacks, watch learns what the server
+/// holds from the one reply that re-sends it, and from then on waits. It doesn't forget, so the server
+/// isn't asked from the start again: two requests in eight seconds, the second still waiting.
+#[test]
+fn watch_feed_with_an_unpushed_chain_resends_once_then_waits() {
+    let g = grounds();
+    let server = g.http(&[]);
+    for i in 0..5 {
+        claim(&g.a, "alice", &format!("on both {i}"));
+    }
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // Each claim's parents are the replica's heads, so these two make a chain.
+    claim(&g.a, "alice", "not pushed yet");
+    claim(&g.a, "alice", "nor this, after it");
+    let (url, requests) = counting_proxy(server.port);
+    let token = g.tmp.join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let (mut watch, _lines) = watch_feed(&g.a, &url, &token, "");
+    std::thread::sleep(Duration::from_secs(8));
+    let count = requests.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(watch.try_wait().unwrap().is_none(), "watch stopped");
+    watch.kill().unwrap();
+    watch.wait().unwrap();
+    assert_eq!(count, 2, "requests with an unpushed chain of two");
+}
+
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+}
+
+/// Finding 2e421e838287: a server restarted with less (from a copy taken before the last push) lacks the
+/// head watch knew it held. Its one reply of what watch holds already replaces what watch knew, so the
+/// request after it waits again, rather than bringing the same back every --interval; and what reaches
+/// the server next is printed.
+#[test]
+fn watch_feed_recovers_when_the_server_restarts_with_less() {
+    let g = grounds();
+    for i in 0..3 {
+        claim(&g.a, "alice", &format!("shared {i}"));
+    }
+    let server = g.http(&[]);
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    // A copy of the server's replica, and the watching replica, both before the last push.
+    let (before, w) = (g.tmp.join("b-before"), g.tmp.join("w"));
+    copy_dir(&g.b, &before);
+    copy_dir(&g.b, &w);
+    claim(&g.a, "alice", "the last push");
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let (url, requests) = counting_proxy(server.port);
+    let token = g.tmp.join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let (mut watch, lines) = watch_feed(&w, &url, &token, "");
+    // First what w holds, then the last push, from the feed.
+    while next_contribution(&lines, Duration::from_secs(20)).expect("the last push, from the feed")["contribution"]["body"]
+        ["statement"]
+        != "the last push"
+    {}
+    // The server comes back on the same port from the copy: it lacks the last push.
+    let port = server.port.to_string();
+    drop(server);
+    let server = g.http_for(&before, &["--port", &port]);
+    let restarted = requests.load(std::sync::atomic::Ordering::SeqCst);
+    // The waiting request fails, the next brings back what watch holds, and the one after waits:
+    // each of the first two is followed by --interval, 2 s.
+    std::thread::sleep(Duration::from_secs(10));
+    let count = requests.load(std::sync::atomic::Ordering::SeqCst) - restarted;
+    assert!(count <= 3, "{count} requests in 10 s against the server with less");
+    // New work reaching it is printed.
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let new = claim(&g.a, "alice", "after the restart");
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let printed = next_contribution(&lines, Duration::from_secs(20)).expect("new work, after the restart");
+    assert_eq!(printed["contribution"]["id"], new.as_str());
+    watch.kill().unwrap();
+    watch.wait().unwrap();
 }

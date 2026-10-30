@@ -71,8 +71,8 @@ pub const FEED_MAX_WAIT: Duration = Duration::from_secs(25);
 const FEED_REPLY_BYTES: usize = 8 << 20;
 const FEED_REPLY_COUNT: usize = 10_000;
 const MAX_FEEDS: usize = 16;
-/// The most of a cursor's unknown heads a reply names: a caller whose cursor holds work the server
-/// lacks leaves those out of its next cursor, so it isn't sent again what it holds already.
+/// The most of a cursor's unknown heads a reply names, for the caller's information: `watch --feed`
+/// keeps what the server holds from what replies bring instead.
 const FEED_UNKNOWN_LISTED: usize = 64;
 
 /// One line of the first-seen log.

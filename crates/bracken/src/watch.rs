@@ -85,8 +85,8 @@ pub(crate) struct WatchArgs {
     /// With --sync: wait on the server's change feed instead of syncing before each read, and print what
     /// arrives as it arrives. Everything it sends is verified as a local read verifies the replica, and
     /// kept in memory: the replica isn't written. --interval is then the wait after a failed request, or
-    /// one that came back at once with nothing new. A server without the feed is synced with instead, as
-    /// --sync alone does.
+    /// one that brought only what watch held already. A server without the feed is synced with instead,
+    /// as --sync alone does.
     #[arg(long, requires = "sync")]
     feed: bool,
     #[command(flatten)]
@@ -256,9 +256,9 @@ const FEED_WAIT: Duration = crate::serve::FEED_MAX_WAIT;
 /// Replies in a row that fail verification before watch gives up.
 const FEED_BAD_REPLIES: u32 = 3;
 
-/// A reply that adds nothing and comes back sooner than this is a server answering at once with what
-/// this side holds already: the next request waits --interval, so a mismatch can't become a hot loop
-/// (finding 6552f9b16c65).
+/// An empty reply that comes back sooner than this didn't wait as a long poll does: the next request
+/// waits --interval, as it does after any reply of only what this side holds already, so no mismatch
+/// can become a hot loop (findings 6552f9b16c65, d4f10edc63fb).
 const FEED_QUICK: Duration = Duration::from_secs(1);
 
 /// A team server's change feed (`bracken serve`'s `POST /v1/<ground>/changes`), long-polled. Its graph
@@ -273,10 +273,11 @@ struct Feed {
     token: String,
     /// While the feed serves: everything verified so far. `None` once fallen back to syncing.
     graph: Option<Graph>,
-    /// What this graph holds that the server's last reply said it lacks (the cursor's unknown heads), and
-    /// everything after them. Rebuilt from each reply, so a head that reaches the server later counts as
-    /// on it again (finding 6552f9b16c65).
-    off_server: HashSet<ContributionId>,
+    /// What this graph holds that the server is known to hold, because a reply brought it, with all its
+    /// ancestors. It grows with each reply (finding d4f10edc63fb), except one of only what is here
+    /// already: the server lacked every head sent, so it may hold less than this said (restored from a
+    /// backup, or re-created), and that reply's own contributions replace it (finding 2e421e838287).
+    held: HashSet<ContributionId>,
     first: bool,
     /// The last request failed, or came back at once with nothing new, so the next waits --interval.
     failed: bool,
@@ -287,21 +288,34 @@ impl Feed {
     fn new(store: Store, url: String, token: String) -> Feed {
         let graph = Some(store.graph().clone());
         let local = Local { store, sync: Some((url.clone(), token.clone())), first: false };
-        Feed { local, url, token, graph, off_server: HashSet::new(), first: true, failed: false, bad_replies: 0 }
+        Feed { local, url, token, graph, held: HashSet::new(), first: true, failed: false, bad_replies: 0 }
     }
 
-    /// The cursor to send: `g`'s heads, and the heads of what it holds that the server isn't known to lack.
-    /// The server leaves out what it lacks, so the second set keeps it from sending again what is here
-    /// already. The first lets it say, in each reply, which heads it still lacks: once it has them, they
-    /// count as seen, and the request waits again.
+    /// Records that the server holds `id`, and so everything before it.
+    fn hold(&mut self, g: &Graph, id: ContributionId) {
+        let mut stack = vec![id];
+        while let Some(id) = stack.pop() {
+            if self.held.insert(id) {
+                stack.extend(g.get(&id).expect("graph ids and their parents exist").parents().iter().copied());
+            }
+        }
+    }
+
+    /// The cursor to send: `g`'s heads, and the heads of what the server is known to hold. The server
+    /// leaves out heads it lacks, so the second set keeps it from sending again what is here already,
+    /// however long a chain of this side's work it lacks. The first lets it say, in each reply, which
+    /// heads it still lacks: once it has them, they count as seen.
     fn since(&self, g: &Graph) -> String {
-        let on_server = |id: &ContributionId| !self.off_server.contains(id);
-        let parents: HashSet<ContributionId> =
-            g.iter().filter(|c| on_server(&c.id())).flat_map(|c| c.parents().iter().copied()).collect();
-        let heads: BTreeSet<String> = g
+        let parents: HashSet<ContributionId> = self
+            .held
             .iter()
-            .map(|c| c.id())
-            .filter(|id| on_server(id) && !parents.contains(id))
+            .flat_map(|id| g.get(id).expect("held ids are the graph's").parents().iter().copied())
+            .collect();
+        let heads: BTreeSet<String> = self
+            .held
+            .iter()
+            .filter(|id| !parents.contains(id))
+            .copied()
             .chain(g.heads())
             .map(|id| id.to_hex())
             .collect();
@@ -314,8 +328,8 @@ impl Feed {
         let g = self.graph.as_ref().expect("polled only while the feed serves");
         let since = self.since(g);
         let asked = Instant::now();
-        let (bundle, unknown) = match remote::changes(&self.url, &self.token, g.ground(), &since, FEED_WAIT) {
-            Ok(remote::Changes::Reply { bundle, unknown }) => (bundle, unknown),
+        let bundle = match remote::changes(&self.url, &self.token, g.ground(), &since, FEED_WAIT) {
+            Ok(remote::Changes::Reply { bundle }) => bundle,
             Ok(remote::Changes::Unsupported(status)) => {
                 eprintln!("bracken: watch: {} has no change feed ({status}); syncing with it instead", self.url);
                 self.graph = None;
@@ -327,18 +341,18 @@ impl Feed {
                 return Ok(());
             }
         };
-        self.off_server.clear();
-        for id in unknown.iter().filter(|id| g.contains(id)) {
-            let mut stack = vec![*id];
-            while let Some(id) = stack.pop() {
-                if self.off_server.insert(id) {
-                    stack.extend(g.children(&id).iter().copied());
-                }
-            }
-        }
         match verified(g, &bundle) {
-            Ok(next) => {
-                let idle = next.len() == g.len() && asked.elapsed() < FEED_QUICK;
+            Ok((next, brought)) => {
+                // Nothing new: either a server sending what is here already (a cursor whose every head it
+                // lacked), or an empty reply that didn't wait.
+                let resent = next.len() == g.len() && !brought.is_empty();
+                let idle = resent || (next.len() == g.len() && asked.elapsed() < FEED_QUICK);
+                if resent {
+                    self.held.clear();
+                }
+                for id in brought {
+                    self.hold(&next, id);
+                }
                 (self.graph, self.failed, self.bad_replies) = (Some(next), idle, 0);
                 Ok(())
             }
@@ -360,11 +374,12 @@ impl Feed {
     }
 }
 
-/// `g` with a change feed reply's contributions added, or why the reply fails verification, in which
-/// case none of it counts.
-fn verified(g: &Graph, bundle: &[u8]) -> Result<Graph> {
+/// `g` with a change feed reply's contributions added, and the ids of all it brought; or why the reply
+/// fails verification, in which case none of it counts.
+fn verified(g: &Graph, bundle: &[u8]) -> Result<(Graph, Vec<ContributionId>)> {
     let (ground, contributions) = manyroot::bundle::read(bundle).context("decoding the reply")?;
     ensure!(ground == g.ground(), "the reply is of another ground, {ground}");
+    let brought = contributions.iter().map(Contribution::id).collect();
     let mut next = g.clone();
     let report = next.import(contributions);
     if let Some((id, why)) = report.rejected.first() {
@@ -373,7 +388,7 @@ fn verified(g: &Graph, bundle: &[u8]) -> Result<Graph> {
     if let Some(id) = report.unresolved.first() {
         anyhow::bail!("{} of its contributions lack a parent, the first {id}", report.unresolved.len());
     }
-    Ok(next)
+    Ok((next, brought))
 }
 
 impl Source for Feed {
