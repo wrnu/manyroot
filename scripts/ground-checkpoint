@@ -13,6 +13,8 @@
 #   - a new file contains the value of a key in .bracken/identities/ written as
 #     hex, in any case (a re-encoded key, such as base64, isn't detected);
 #   - the Ground doesn't open;
+#   - the Ground holds a contribution with a Weave media type, retracted or not: until
+#     the join, Weave records go only into the Weave Ground (docs/design/weave.md);
 #   - what got staged isn't exactly the new files that were checked;
 #   - (on main, with an origin remote) origin's main, freshly fetched, has commits
 #     the local main doesn't and they fail scripts/ground-guards from the local
@@ -116,6 +118,17 @@ $leaked"
 fi
 
 "$here/bk" log >/dev/null || stop "the Ground doesn't open; don't commit a broken replica"
+# The same test as scripts/bk's and scripts/ground-guards'.
+weave_media() { [[ $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') == application/vnd.bracken.weave* ]]; }
+command -v jq >/dev/null || stop "needs jq to check the Ground for Weave records; nothing was committed"
+artifacts=$("$here/bk" log --kind artifact --json) || stop "couldn't list the Ground's artifacts; nothing was committed"
+weave=()
+while read -r id m; do
+  ! weave_media "$m" || weave+=("$id")
+done < <(jq -r '.[] | "\(.id) \(.body.media_type | @json | .[1:])"' <<<"$artifacts")
+[ ${#weave[@]} -eq 0 ] ||
+  stop "the Ground holds contributions with a Weave media type, which go only into the Weave Ground; nothing was committed. Tell the owner:
+$(printf '%s\n' "${weave[@]}")"
 
 printf '%s\n' "$new" | git add --pathspec-from-file=-
 staged=$(git diff --cached --name-status)

@@ -376,6 +376,11 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         for id in [&alice, &bob] {
             assert!(id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit()), "{scripts}: {id:?}");
         }
+        // bk refuses sync with any other peer, but not with the team server (finding 6d623aa585d9).
+        let url = std::fs::read_to_string(team.join("url")).unwrap();
+        let token = team.join("tokens/alice");
+        let args = ["sync", url.trim(), "--token-file", token.to_str().unwrap()];
+        ok(sh(&a, "scripts/bk", &args, Some("alice")), "sync with the team server");
         // Each sees the other's: alice's replica learns bob's claim only by pulling.
         let (shown, stderr) = ok(sh(&a, "scripts/bk", &["show", bob.trim()], Some("alice")), "alice reads");
         assert!(shown.contains("from bob") && stderr.is_empty(), "{scripts}: {shown} {stderr}");
@@ -817,6 +822,16 @@ fn ground_guards_refuse_each_way_a_head_can_hide_or_break_the_ground() {
                 ["main", "pr"],
                 Box::new(|dir| stage(dir, "100644", "docs/vision.md", "another vision\n")),
                 "vision document: docs/vision.md differs",
+            ),
+            (
+                "a Weave record",
+                ".",
+                ["main", "pr"],
+                Box::new(|dir| {
+                    weave_artifact(dir, "Application/VND.Bracken.Weave.ground+cbor");
+                    assert!(run(dir, "git", &["add", "-A"]).status.success());
+                }),
+                "no Weave records",
             ),
             (
                 "head is the base",
@@ -2950,5 +2965,306 @@ fn merge_with_owner_approval_needs_an_owner_signed_approval_of_the_pr_claim_itse
         bk(&dir, &["relate", &delegated, "supports", &claim, "--as", "owner"]);
         let (code, line) = owner(&mut merge);
         assert!(code == Some(0) && line.contains("on the owner's delegation"), "{scripts}: {line}");
+    }
+}
+
+/// Writes an artifact with `media_type` into `dir`'s Ground with the real binary, past scripts/bk's
+/// refusal, as an agent running bracken by hand could, signed by a new identity `hand`.
+fn weave_artifact(dir: &Path, media_type: &str) {
+    let real = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_bracken"))
+            .args(["--dir", ".bracken"])
+            .args(args)
+            .current_dir(dir)
+            .env_remove("BRACKEN_DIR")
+            .env_remove("BRACKEN_AGENT")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    std::fs::write(dir.join("../marker.cbor"), b"anything").unwrap();
+    real(&["id", "new", "hand"]);
+    real(&["artifact", "../marker.cbor", "--name", "weave", "--media-type", media_type, "--as", "hand"]);
+}
+
+/// Weave build step 4 (docs/design/weave.md, Keeping the two scripts apart) and task 5fd7de6b61b6:
+/// scripts/bk refuses --dir in both forms, the weave command found past --as, an artifact with a Weave
+/// media type in either form and any case, and sync with a replica directory or --exec, writing and
+/// receiving nothing. Other artifacts still go through.
+#[test]
+fn bk_refuses_dir_weave_weave_media_types_and_sync_with_other_peers() {
+    for scripts in SCRIPTS {
+        let bk_copy = repo_root().join(scripts).join("bk");
+        let (tmp, dir) = repo(&[("scripts/bk", &bk_copy)], ".bracken/\n", |_| {});
+        bk(&dir, &["init", "--name", "team"]);
+        bk(&dir, &["id", "new", "alice"]);
+        std::fs::write(dir.join("doc.md"), "a doc\n").unwrap();
+        // A replica directory holding a claim the team's Ground doesn't have.
+        let seed = tmp.path().join("seed.mrb");
+        bk(&dir, &["export", seed.to_str().unwrap()]);
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let real = |args: &[&str]| {
+            let out = Command::new(env!("CARGO_BIN_EXE_bracken"))
+                .args(args)
+                .current_dir(&other)
+                .env_remove("BRACKEN_DIR")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        real(&["join", seed.to_str().unwrap()]);
+        real(&["id", "new", "bob"]);
+        real(&["claim", "theirs", "--as", "bob"]);
+        let other_ground = other.join(".bracken");
+        let prog = tmp.path().join("prog");
+        write_executable(&prog, "#!/bin/sh\ntouch \"$0.ran\"\n");
+        let peer_exec =
+            format!("BRACKEN_DIR={} {} serve --stdio", other_ground.display(), env!("CARGO_BIN_EXE_bracken"));
+        let before = bk(&dir, &["log", "--json"]);
+        let cases: Vec<(Vec<&str>, &str)> = vec![
+            (vec!["--dir", other_ground.to_str().unwrap(), "log"], "--dir is refused"),
+            (vec!["log", "--dir=/tmp/elsewhere"], "--dir is refused"),
+            (vec!["weave", "check"], "weave is refused"),
+            (vec!["--as", "alice", "weave", "import"], "weave is refused"),
+            (vec!["--as=alice", "weave", "init"], "weave is refused"),
+            (
+                vec![
+                    "artifact",
+                    "doc.md",
+                    "--media-type",
+                    "application/vnd.bracken.weave.manifest+cbor",
+                    "--as",
+                    "alice",
+                ],
+                "a Weave media type is refused",
+            ),
+            (
+                vec!["--as", "alice", "artifact", "doc.md", "--media-type=APPLICATION/VND.BRACKEN.WEAVE.ground+cbor"],
+                "a Weave media type is refused",
+            ),
+            (
+                vec!["artifact", "doc.md", "--media-type", "Application/Vnd.Bracken.Weave.line+cbor", "--as", "alice"],
+                "a Weave media type is refused",
+            ),
+            (vec!["sync", other.to_str().unwrap()], "sync is refused"),
+            (vec!["sync", "--deadline", "5", other_ground.to_str().unwrap()], "sync is refused"),
+            (
+                vec!["--as", "alice", "sync", "--exec", env!("CARGO_BIN_EXE_bracken"), "serve", "--stdio"],
+                "sync is refused",
+            ),
+            (vec!["sync", "--exec=/bin/true"], "sync is refused"),
+            // Findings 26650dedc33e and 3e1a0454a03b: a trailing -h is --exec's program's argument.
+            (vec!["sync", "--exec", prog.to_str().unwrap(), "-h"], "sync is refused"),
+            (vec!["sync", "--exec", "sh", "-c", &peer_exec, "-h"], "sync is refused"),
+            (vec!["--help", "sync", other.to_str().unwrap()], "sync is refused"),
+            (vec!["weave", "-h"], "weave is refused"),
+            (vec!["log", "--dir", "x", "--help"], "--dir is refused"),
+            (vec!["artifact", "doc.md", "--media-type", "application/vnd.bracken.weave.x", "-h"], "a Weave media type"),
+        ];
+        for (args, expected) in cases {
+            let out = run(&dir, "scripts/bk", &args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {args:?}: {stderr}");
+            assert!(stderr.contains(expected), "{scripts}: {args:?}: expected {expected:?} in {stderr}");
+        }
+        assert_eq!(bk(&dir, &["log", "--json"]), before, "{scripts}: a refused command wrote or received");
+        assert!(!tmp.path().join("prog.ran").exists(), "{scripts}: --exec's program ran");
+        let out = bk(&dir, &["artifact", "doc.md", "--media-type", "text/markdown", "--as", "alice"]);
+        assert!(out.len() == 64 && out.bytes().all(|b| b.is_ascii_hexdigit()), "{scripts}: {out}");
+        // Help still works for a command that isn't refused.
+        assert!(run(&dir, "scripts/bk", &["log", "--help"]).status.success(), "{scripts}: log --help");
+
+        // With a team server configured (none listening): the one peer must be its URL exactly, wherever
+        // --as is, and --as's value is never the peer (finding bf1a2d50d9d0).
+        let url = "http://127.0.0.1:9";
+        let team = tmp.path().join("team");
+        std::fs::create_dir_all(&team).unwrap();
+        std::fs::write(team.join("url"), url).unwrap();
+        std::fs::write(dir.join(".bracken-team"), team.to_str().unwrap()).unwrap();
+        let before = bk(&dir, &["log", "--json"]);
+        for args in [
+            &["sync", "--as", url, other.to_str().unwrap()][..],
+            &["--as", url, "sync", other.to_str().unwrap()],
+            &["sync", url, other.to_str().unwrap()],
+            &["sync", "--", other.to_str().unwrap()],
+            &["sync", "--as=alice", "--token-file", url, other.to_str().unwrap()],
+            &["sync", "http://127.0.0.1:9/"],
+        ] {
+            let out = run(&dir, "scripts/bk", args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {args:?}: {stderr}");
+            assert!(stderr.contains("sync is refused"), "{scripts}: {args:?}: {stderr}");
+        }
+        assert_eq!(bk(&dir, &["log", "--json"]), before, "{scripts}: a refused sync received");
+        for args in
+            [&["sync", "--as", "alice", url, "--deadline", "1"][..], &["--as=alice", "sync", url, "--deadline=1"]]
+        {
+            let out = run(&dir, "scripts/bk", args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!stderr.contains("sync is refused"), "{scripts}: {args:?} was refused: {stderr}");
+        }
+    }
+}
+
+/// The Weave tripwire in ground-checkpoint: a Weave record in the local Ground stops the commit, naming
+/// it, whatever the media type's case.
+#[test]
+fn ground_checkpoint_refuses_a_ground_holding_a_weave_record() {
+    for scripts in SCRIPTS {
+        let file = |name: &str| repo_root().join(scripts).join(name);
+        let (checkpoint, guards) = (file("ground-checkpoint"), file("ground-guards"));
+        let files = [("scripts/ground-checkpoint", &checkpoint), ("scripts/ground-guards", &guards)];
+        let (_tmp, dir) = repo(&files.map(|(to, from)| (to, from.as_path())), ".bracken/identities/\n", |_| {});
+        bk(&dir, &["init", "--name", "checkpoint"]);
+        bk(&dir, &["id", "new", "val"]);
+        bk(&dir, &["claim", "first", "--tag", "note", "--as", "val"]);
+        weave_artifact(&dir, "application/VND.bracken.weave.manifest+cbor");
+        let head = run(&dir, "git", &["rev-parse", "HEAD"]).stdout;
+        let out = run(&dir, "scripts/ground-checkpoint", &[]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(stderr.contains("Weave media type") && stderr.contains("Tell the owner"), "{scripts}: {stderr}");
+        assert_eq!(run(&dir, "git", &["rev-parse", "HEAD"]).stdout, head, "{scripts}: a commit was made");
+        assert!(run(&dir, "git", &["diff", "--cached", "--quiet"]).status.success(), "{scripts}: left staged");
+    }
+}
+
+/// A repository holding scripts/weave, with a throwaway HOME beside it, and a stub bracken that prints
+/// the BRACKEN_DIR it was given and its arguments.
+fn weave_repo() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    let weave = repo_root().join("scripts/weave");
+    let (tmp, dir) = repo(&[("scripts/weave", &weave)], ".bracken/\n", |_| {});
+    bk(&dir, &["init", "--name", "coordination"]);
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let stub = tmp.path().join("stub");
+    write_executable(&stub, "#!/bin/sh\necho \"BRACKEN_DIR=$BRACKEN_DIR $*\"\n");
+    (tmp, dir, home, stub)
+}
+
+fn weave(dir: &Path, script: &str, home: &Path, bin: Option<&Path>, args: &[&str]) -> Output {
+    let mut c = command(dir, script, args);
+    c.env("HOME", home).env("BRACKEN_DIR", "/inherited/and/ignored");
+    if let Some(bin) = bin {
+        c.env("BRACKEN_BIN", bin);
+    }
+    c.output().unwrap()
+}
+
+/// Weave build step 4: scripts/weave creates and opens only ~/bracken-weave/manyroot, by its real path,
+/// which it exports. It refuses --dir in both forms; evidence, sync and serve, found past --as;
+/// --as weave-runner for anything but weave validate, which isn't built yet; and a Ground that resolves
+/// into a git checkout or has the coordination Ground's id.
+#[test]
+fn weave_opens_only_the_weave_ground_and_refuses_what_it_must() {
+    let (tmp, dir, home, stub) = weave_repo();
+    let script = "scripts/weave";
+    let prog = tmp.path().join("prog");
+    write_executable(&prog, "#!/bin/sh\ntouch \"$0.ran\"\n");
+    let refused = |home: &Path, args: &[&str], expected: &str| {
+        let out = weave(&dir, script, home, Some(&stub), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}{}", String::from_utf8_lossy(&out.stdout));
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr}");
+    };
+    refused(&home, &["weave", "check"], "no Weave Ground at");
+    refused(&home, &["weave", "init", "--as", "weave-integrator"], "bracken-weave doesn't exist");
+
+    // weave init creates the Ground with the real binary; then it opens.
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let out = weave(&dir, script, &home, None, &["weave", "init", "--as", "weave-integrator"]);
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    let ground = home.join("bracken-weave/manyroot");
+    assert!(ground.join("ground.json").is_file());
+    let out = weave(&dir, script, &home, None, &["weave", "check"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "no problems", "{}", String::from_utf8_lossy(&out.stderr));
+    refused(&home, &["weave", "init", "--as", "weave-integrator"], "already exists");
+
+    for (args, expected) in [
+        (&["--dir", ".bracken", "log"][..], "--dir is refused"),
+        (&["log", "--dir=.bracken"], "--dir is refused"),
+        (&["evidence", "abc", "--verdict", "pass"], "evidence is refused"),
+        (&["--as", "alice", "evidence", "abc"], "evidence is refused"),
+        (&["--as=alice", "sync", "/tmp/x"], "sync is refused"),
+        (&["serve", "--stdio"], "serve is refused"),
+        (&["--as", "weave-runner", "weave", "check"], "only for weave validate"),
+        (&["--as=weave-runner", "claim", "x"], "only for weave validate"),
+        (&["--as", "weave-runner", "weave", "validate"], "isn't built yet"),
+        // Findings 26650dedc33e and 3e1a0454a03b: -h and --help get no early exit.
+        (&["sync", "--exec", prog.to_str().unwrap(), "--help"], "sync is refused"),
+        (&["-h", "sync", "--exec", prog.to_str().unwrap()], "sync is refused"),
+        (&["evidence", "-h"], "evidence is refused"),
+        (&["--dir", ".bracken", "--help"], "--dir is refused"),
+        (&["weave", "line", "create", "x", "--help"], "needs --owner-decision"),
+    ] {
+        refused(&home, args, expected);
+    }
+    assert!(!tmp.path().join("prog.ran").exists(), "--exec's program ran");
+    // Help reaches bracken only for a command that isn't refused, with the Weave Ground as BRACKEN_DIR.
+    let out = weave(&dir, script, &home, Some(&stub), &["weave", "check", "--help"]);
+    let real_ground = ground.canonicalize().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("BRACKEN_DIR={} weave check --help", real_ground.display())
+    );
+    // BRACKEN_AGENT names the identity too.
+    let out = command(&dir, script, &["weave", "check"])
+        .env("HOME", &home)
+        .env("BRACKEN_AGENT", "weave-runner")
+        .env("BRACKEN_BIN", &stub)
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("only for weave validate"));
+
+    // A symlinked path is followed: it opens the real path and exports that.
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::rename(&ground, elsewhere.join("manyroot")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.join("manyroot"), &ground).unwrap();
+    let out = weave(&dir, script, &home, Some(&stub), &["weave", "check"]);
+    let real = elsewhere.join("manyroot").canonicalize().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("BRACKEN_DIR={} weave check", real.display()));
+
+    // ... but never into a git checkout, the coordination Ground included.
+    let into_repo = tmp.path().join("home-repo");
+    std::fs::create_dir_all(into_repo.join("bracken-weave")).unwrap();
+    std::os::unix::fs::symlink(dir.join(".bracken"), into_repo.join("bracken-weave/manyroot")).unwrap();
+    refused(&into_repo, &["weave", "check"], "inside the git checkout");
+    let linked_home = tmp.path().join("home-linked");
+    std::fs::create_dir_all(&linked_home).unwrap();
+    std::os::unix::fs::symlink(&dir, linked_home.join("bracken-weave")).unwrap();
+    refused(&linked_home, &["weave", "init", "--as", "x"], "inside the git checkout");
+
+    // ... and not a Ground with the coordination Ground's id, wherever it is.
+    let copy = tmp.path().join("home-copy");
+    std::fs::create_dir_all(copy.join("bracken-weave/manyroot")).unwrap();
+    std::fs::copy(dir.join(".bracken/ground.json"), copy.join("bracken-weave/manyroot/ground.json")).unwrap();
+    refused(&copy, &["weave", "check"], "has the coordination Ground's id");
+}
+
+/// scripts/weave refuses a line write without a non-empty --owner-decision (answer 2a620fd0b0dc).
+#[test]
+fn weave_needs_an_owner_decision_for_line_writes() {
+    let (_tmp, dir, home, stub) = weave_repo();
+    std::fs::create_dir_all(home.join("bracken-weave/manyroot")).unwrap();
+    let run_with = |args: &[&str]| weave(&dir, "scripts/weave", &home, Some(&stub), args);
+    for args in [
+        &["weave", "line", "create", "main", "--as", "a"][..],
+        &["--as", "a", "weave", "line", "policy", "x"],
+        &["weave", "line", "create", "main", "--owner-decision", ""],
+        &["weave", "line", "policy", "x", "--owner-decision="],
+    ] {
+        let out = run_with(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("needs --owner-decision"), "{args:?}");
+    }
+    for args in [
+        &["weave", "line", "create", "main", "--owner-decision", "abc", "--as", "a"][..],
+        &["weave", "line", "policy", "x", "--owner-decision=abc"],
+        &["weave", "check"],
+    ] {
+        let out = run_with(args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 }

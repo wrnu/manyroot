@@ -17,6 +17,11 @@
 #     until a later sync pushes it.
 #   - a read pulls first, with a short timeout, and falls back to the local replica, saying so on
 #     stderr. With BK_PULL=required (scripts/merge) a read fails instead.
+#
+# It refuses what would reach another Ground, or bring in work the team server can't confirm: --dir in
+# any form, import, sync with anything but the team server, the weave command, and an artifact with a
+# Weave media type (docs/design/weave.md, Keeping the two scripts apart). The Weave Ground is reached
+# only through scripts/weave.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -33,19 +38,31 @@ if [ ! -x "$bin" ]; then
   echo "bk: the manager installs it (agent-team-kickoff skill, SKILL.md section 2.1)" >&2
   exit 1
 fi
+fail() { echo "bk: $*" >&2; exit 1; }
+# A Weave media type, in any case. scripts/ground-guards and scripts/ground-checkpoint use the same test.
+weave_media() { [[ $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') == application/vnd.bracken.weave* ]]; }
 # The command, and whose token: --as before any '--', else BRACKEN_AGENT. What follows '--' is the
 # command's own (evidence --run -- <cmd> ...), so an --as there isn't bk's (note 6b211180ec3a).
-cmd='' who=${BRACKEN_AGENT:-}
+cmd='' who=${BRACKEN_AGENT:-} at=0 help=false
+media=()
 for ((i = 1; i <= $#; i++)); do
   case "${!i}" in
     --) break ;;
     --as) j=$((i + 1)); who=${!j:-}; i=$j ;;
     --as=*) who=${!i#--as=} ;;
-    --dir) i=$((i + 1)) ;;
-    -h | --help) exec "$bin" "$@" ;;
+    --dir | --dir=*) fail "--dir is refused: bk always uses the team's Ground. Test with your branch's binary and BRACKEN_DIR=\$(mktemp -d)/g instead" ;;
+    --media-type) j=$((i + 1)); media+=("${!j:-}"); i=$j ;;
+    --media-type=*) media+=("${!i#--media-type=}") ;;
+    # Help runs only after every refusal: an option that takes the rest of the line, such as sync's
+    # --exec, can make -h the argument of something that really runs (finding 3e1a0454a03b).
+    -h | --help) help=true ;;
     -*) ;;
-    *) [ -n "$cmd" ] || cmd=${!i} ;;
+    *) [ -n "$cmd" ] || { cmd=${!i}; at=$i; } ;;
   esac
+done
+[ "$cmd" != weave ] || fail "weave is refused: the Weave Ground is reached only through scripts/weave"
+for m in ${media[@]+"${media[@]}"}; do
+  ! weave_media "$m" || fail "a Weave media type is refused: Weave records go only into the Weave Ground, through scripts/weave"
 done
 # import adds whole bundles, other authors' work included, which the team server can't confirm: it
 # never goes into the team's Ground through bk (finding 410e2e5d0239).
@@ -54,9 +71,31 @@ if [ "$cmd" = import ]; then
   exit 1
 fi
 marker="$main/.bracken-team"
-[ -f "$marker" ] || exec "$bin" "$@"
-team=$(cat "$marker")
-url=$(cat "$team/url")
+url=''
+if [ -f "$marker" ]; then
+  team=$(cat "$marker")
+  url=$(cat "$team/url")
+fi
+# sync with a replica directory or --exec would bring in other authors' work unconfirmed: only the team
+# server is a peer (finding 6d623aa585d9). Its arguments are parsed as clap does, past the global --as
+# and the options that take a value (finding bf1a2d50d9d0): exactly one peer, the team server's URL.
+if [ "$cmd" = sync ]; then
+  peers=()
+  for ((i = 1; i <= $#; i++)); do
+    [ "$i" -ne "$at" ] || continue
+    case "${!i}" in
+      --) peers+=("${@:i+1}"); break ;;
+      --exec | --exec=*) peers+=(--exec); break ;;
+      --as | --token-file | --deadline | --budget | --id-budget | --batch-bytes) i=$((i + 1)) ;;
+      -*) ;;
+      *) peers+=("${!i}") ;;
+    esac
+  done
+  [ -n "$url" ] && [ ${#peers[@]} -eq 1 ] && [ "${peers[0]}" = "$url" ] ||
+    fail "sync is refused except with the team server${url:+ ($url)}: another peer would bring in work the team server can't confirm"
+fi
+! $help || exec "$bin" "$@"
+[ -n "$url" ] || exec "$bin" "$@"
 
 case "$cmd" in
   claim | artifact | relate | evidence | retract | intend) write=true ;;
@@ -65,7 +104,6 @@ case "$cmd" in
 esac
 token="$team/tokens/$who"
 [[ $who =~ ^[a-z0-9_-]{1,64}$ ]] && [ -f "$token" ] || token=
-fail() { echo "bk: $*" >&2; exit 1; }
 # sync_team <deadline> [--confirm]: the sync's last line of errors in $err, if it fails.
 sync_team() {
   local out

@@ -401,6 +401,35 @@ fn diff_lists_each_changed_file_with_a_unified_diff() {
         [("edit.txt", "modified"), ("gone.txt", "deleted"), ("new.txt", "added"), ("tool", "mode changed")]
     );
     assert_eq!(json["files"][3]["after"]["mode"], "100755");
+    assert_eq!(json["files"][0]["not_held"], serde_json::json!([]));
+}
+
+// The reviewer's note (c) in 8bf75740cafb: a changed file whose version isn't
+// held is named, not silently left without its text.
+#[test]
+fn diff_names_the_file_versions_it_does_not_hold() {
+    let w = Weave::initialized();
+    w.write("edit.txt", b"one\n");
+    w.commit();
+    let a = w.import();
+    // A valid manifest naming a version of edit.txt this Ground doesn't hold.
+    let entry = bracken_tree::Entry {
+        path: "edit.txt".to_owned(),
+        mode: bracken_tree::Mode::File,
+        hash: bracken_tree::ContentHash::of(b"two\n"),
+        size: 4,
+    };
+    let bytes = w._tmp.path().join("manifest.cbor");
+    fs::write(&bytes, bracken_tree::Record::encode(&bracken_tree::Manifest::new(vec![entry]))).expect("write");
+    let media_type = "application/vnd.bracken.weave.manifest+cbor";
+    w.ok(&["artifact", bytes.to_str().expect("UTF-8"), "--name", "manifest", "--media-type", media_type, "--as", AS]);
+    let b = format!("{}", bracken_tree::ContentHash::of(&fs::read(&bytes).expect("read")));
+    let missing = format!("{}", bracken_tree::ContentHash::of(b"two\n"));
+
+    let out = w.ok(&["weave", "diff", &a, &b]);
+    assert_eq!(out, format!("M edit.txt\n  (no text: this Ground doesn't hold {missing})\n"));
+    let json = w.json(&["weave", "diff", &a, &b, "--json"]);
+    assert_eq!(json["files"][0]["not_held"], serde_json::json!([missing]));
 }
 
 #[test]
