@@ -274,9 +274,18 @@ policy:
   that allows this version (text, because the two Grounds can't reference
   each other until P3). The policy argv is code this machine runs, so
   `scripts/weave` refuses a line write (`weave line create` or `weave line
-  policy`) without a non-empty `--owner-decision`, and `weave check` lists
-  versions that lack it. Only the `main` line that `weave init` writes may
-  carry null.
+  policy`) unless `--owner-decision` names a claim tagged `decision`, not
+  retracted, that it finds in the coordination Ground through the main
+  checkout's `scripts/bk` (finding `3cd6cd19f9a0`), and `weave check` lists
+  versions that lack one. Only the `main` line that `weave init` writes may
+  carry null: a first version named `main` by the counted marker's author.
+  Views ignore every other version with a null `owner_decision`, as if it
+  weren't there, so it neither starts a line nor changes one, and its
+  supersedes relations count for nothing (finding `12643881ac59`). The
+  binary's `weave line create` and `weave line policy` require
+  `--owner-decision` too, as 12 to 64 lowercase hex digits, since a version
+  without one would count for nothing. The binary can't reach the
+  coordination Ground, so it checks only the shape.
 - A line is identified by the ContributionId of its first artifact. The name
   is only a label.
 - A policy change is a new line artifact by the same author, which
@@ -537,7 +546,10 @@ qualifying descendant on `L`.
 **Merge base.** For two decisions, it is their common ancestors in the
 decision graph that aren't ancestors of another common ancestor. In v0 there
 must be exactly one. With several (a criss-cross merge), `line merge`
-refuses, lists them, and needs `--base`.
+refuses, lists them, and needs `--base`, which must name one of them. With
+one, `--base` may only repeat it, and with none (no shared history) the
+heads can't be merged. So `--base` never brings in another tree (finding
+`506c2ad3283b`).
 
 **Per-file merge.** A file's value is its file value, or absent. Comparing
 base `B` with sides `X` and `Y`:
@@ -546,9 +558,19 @@ base `B` with sides `X` and `Y`:
 - Otherwise it is a **conflict**, including added on both sides with
   different content or mode, and deleted on one side while changed on the
   other.
-  - A resolution with the key `(path, B, {X, Y})` settles it. If there are
-    several, `weave merge` offers the one with the smallest id first, and
-    the decision lists the one it used in `resolutions`.
+  - A resolution with the key `(path, B, {X, Y})` settles it, if an
+    integrator of the target line, under its current policy, wrote it. If
+    there are several, a merge or integrate applies the one with the
+    smallest id, and the decision lists it in `resolutions`.
+  - Resolutions by anyone else are only offered: the listing names each,
+    with its author and result. An integrator adopts one by writing their
+    own resolution with the same result, `resolve --take <resolution id>`.
+    Whoever wrote first, or ground a small id, can't put content on
+    neither side into a decision the integrator signs (decision
+    `91c12b4da2ad`, finding `0a45dfffcd48`).
+  - Any conflict may get another resolution, even one that already has
+    one. Every merge lists the resolutions it used, with author and
+    result, in its text and its `--json`.
   - A rename is a delete plus an add.
 
 A merged tree is a candidate like any other. It moves a line only through
@@ -667,12 +689,21 @@ or commit them first. On top of git's view:
 - **`--dry-run`** lists what would be written: paths, modes, sizes, content
   hashes, and what is new to the Ground. It also lists what is excluded and
   what is refused, and writes nothing. `propose` and `resolve` take it too.
+- **`resolve` finds the conflict to settle** by rebuilding the merge step
+  by step. It takes the first conflict at the path that no integrator's
+  resolution settles, applying and passing a step whose conflict there is
+  settled. So with several proposals that conflict at one path in turn,
+  each gets its resolution (finding `90de879d935c`).
 - **`resolve --file <f>`** takes a file from disk, so it has extra
   refusals. `<f>`, after `realpath`, must be inside the current git
   checkout's working tree and outside its `.git/` and every `.bracken*`
   root entry, and its path there must pass the deny-list above. So
   `--file .env`, `--file ~/.ssh/id_ed25519` and a merged copy in `/tmp`
-  are all refused. The content scan then runs on its bytes.
+  are all refused. The file is then opened once, directory by directory
+  from the checkout's top with `openat` and `O_NOFOLLOW`, and its type,
+  size and bytes all come from that one open file. So a symlink swapped in
+  after the path was checked is refused (finding `0bbc434b2588`). The
+  content scan then runs on its bytes.
 
 If a secret reaches the Weave Ground anyway, treat it as leaked: rotate it
 first, since rotation is the only real fix, and tell the owner. The Ground
@@ -708,19 +739,19 @@ never write outside the target directory, and never follow a symlink
 | `weave import [--from-git <rev> \| --index] [--dry-run]` | Records the tree as file versions (only those whose content hash is new) and one manifest. Prints the manifest's hash. |
 | `weave status [--index] [--at D]` | The index or `HEAD` against main's manifest (or `D`'s, which a forked line needs): added, changed, deleted, mode changed. |
 | `weave diff <a> <b>` | Per-file difference between two manifests or decisions. Text files show a unified diff. |
-| `weave propose [--line L] [--base D] [--from-git <rev> \| --index] [--dry-run]` | Imports the tree and writes a proposal against `base` (default: the line's head). |
-| `weave integrate [--line L] [--proposals ...] [--run]` | Integrator: builds the candidate and writes the decision, in the order below. Runs no checks unless `--run` is given. Refuses if the result wouldn't qualify. Without proposals it records a given tree, `--from-git <rev>` (the default is `HEAD`, named in the decision's `source`), `--index` or `--manifest H`, with every head of the line as a parent, so on a forked line it settles the fork. |
+| `weave propose [--line L] [--base D] [--from-git <rev> \| --index] [--summary text] [--dry-run]` | Imports the tree and writes a proposal against `base` (default: the line's head), which must be a qualifying decision on the line. Refuses a tree equal to the base's. |
+| `weave integrate [--line L] [--proposals ...] [--run]` | Integrator: builds the candidate and writes the decision, in the order below. Runs no checks unless `--run` is given. Refuses if the result wouldn't qualify. Without proposals it records a given tree, `--from-git <rev>` (the default is `HEAD`, named in the decision's `source`), `--index` or `--manifest H`, with every head of the line as a parent, so on a forked line it settles the fork. With `--proposals P...` it merges each valid proposal in turn onto the line's single head, against the proposal's own base, applies the resolutions the Ground holds, and writes the decision listing the proposals and the resolutions it used. The line defaults to the proposals'. A conflict without a resolution stops it: it lists the conflicts and writes nothing. Until rule 5 lands (step 7), it checks no objections (answer `12000ab70ae5`). |
 | `weave validate --manifest H [--check <name>]... [--again]` | Validator: runs the line's named checks (default: all of them) on manifest `H` through the check runner, and records each result. Refuses a check it already has a latest result for on `H` unless `--again`. |
 | `weave review [--line L] [<proposal or decision>]` | Reviews and open objections, with what each would need as an answer. |
 | `weave head [--line L]`, `weave green [--line L]` | The head, or the fork's heads, and green, with the manifest hash. |
 | `weave log [--line L] [--limit N] [--since D]` | Decisions on a line, newest first in causal order, with their checks and breakage. At most 20 unless `--limit` says otherwise; never prints payloads. |
 | `weave slice [--at D] <path or prefix>...` | Those paths' contents at a decision or manifest, for an agent that needs a part, not the whole. |
 | `weave checkout [--at D] <dir>` | Materializes a manifest into an empty directory, or updates a directory that is clean against it. If writing fails part way, it removes what it wrote, or names what it couldn't remove. |
-| `weave line create <name> [--integrator ...] [--owner-decision <id>]`, `weave line policy <line> ... --owner-decision <id>` | Creates a line, or writes a new policy version that supersedes the current one. Under `scripts/weave`, a non-empty `--owner-decision` is required. |
-| `weave line merge <from> --into <line> [--base D]` | Builds the merge candidate and lists its conflicts. |
-| `weave resolve <path> --take <side>\|--delete\|--file <f> [--mode m] [--dry-run]` | Writes a resolution for one conflict. `--file` has the refusals above. |
+| `weave line create <name> [--dry-run] [--integrator ...] [--validator ...] [--goal-setter ...] [--check NAME=ARGV ...] [--max-known N] [--max-age N] [--protected P ...] --owner-decision <id>`, `weave line policy <line> [--dry-run] [--from <version>] [--name n] [--clear <field>]... ... --owner-decision <id>` | Creates a line (with no integrator or goal setter given, its author is the only one), or writes a new policy version, starting from the current one, that supersedes every current version, so it also settles a diverged chain. On a diverged chain it refuses, listing the current versions, unless `--from` names the one to start from (finding `4eead6290997`). Only the line's author can change a policy. `--owner-decision` is required, as 12 to 64 hex digits. Prints `line <id>`, then `relation <id> (supersedes)` for each relation. `--dry-run` shows the policy, and what it would supersede, and writes nothing. |
+| `weave line merge <from> --into <line> [--base D] [--dry-run] [--note text]` | Integrator: merges `<from>`'s head into `<line>`'s, file by file against the merge base (`--base` only chooses among several). With every conflict resolved by an integrator's resolution, it writes the merged manifest and a decision on `<line>` whose parents are both heads, judged by rules 1-4, so its author must be an integrator of `<line>`. With a conflict unresolved, or with `--dry-run`, it lists the conflicts, with the resolutions offered for each, and writes nothing. It lists the resolutions it used. A line with no decision yet starts from `<from>`'s head, its first decision having that head as its only parent (answer `12000ab70ae5`). |
+| `weave resolve <path> (--into L --from L2 [--base D] \| --proposals P... [--line L]) (--take into\|from\|<resolution> \| --delete \| --file <f>) [--mode m] [--dry-run]` | Writes a resolution for the conflict at `<path>`. It takes the selector of the command that listed the conflict (`line merge`'s `--into`, `--from` and `--base`, or `integrate`'s `--proposals`), rebuilds that merge, and recomputes the key, so nobody types file values. `into` is the line's side, `from` the side merged in, and a resolution id adopts that resolution's result. A conflict may get another resolution even if it has one. `--file` has the refusals above (answer `12000ab70ae5`). |
 | `weave verify --git <rev> [--at D \| --manifest H]` | Compares a manifest with a git commit's tree: the same paths, modes and bytes, with the excluded root entries left out. Used throughout the dogfood. |
-| `weave check` | Lists Weave payloads that are invalid or break the ancestor rule, manifests not yet complete, and markers past the one that counts. It exits non-zero when it lists any. |
+| `weave check` | Lists Weave payloads that are invalid or break the ancestor rule, manifests not yet complete, markers past the one that counts, and policy versions ignored for citing no owner decision. It exits non-zero when it lists any. |
 
 Plain commands work on Weave records too: `relate ... supports` or
 `contradicts` reviews a decision, proposal or manifest, and `claim --tag
@@ -993,6 +1024,13 @@ overrides `BRACKEN_DIR`, and anyone can write a Weave marker with a plain
   below.
 - **`scripts/weave` refuses `evidence`**, so check results come only from
   the check runner (section 3).
+- **`scripts/weave` refuses Weave records made by hand**: an `artifact`
+  with a Weave media type, matched as `scripts/bk` matches it, and `relate`
+  with `supersedes` among any of its arguments, those after `--` included,
+  since bracken still reads the kind there (finding `56dadb600ba2`). Only `bracken weave` writes Weave records, and only
+  `weave line policy` writes a line's supersedes relations, so the
+  owner-decision rule can't be bypassed (finding `12643881ac59`). This
+  applies only under `scripts/weave`, against the Weave Ground.
 - **`scripts/weave` checks the Ground it opens.** It uses the same pinned
   binary. Before running anything, it resolves `~/bracken-weave/manyroot`
   with `realpath`, exports that resolved path as `BRACKEN_DIR`, so the path

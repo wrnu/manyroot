@@ -4,9 +4,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use bracken_tree::format::{Decision, FILE_MEDIA_TYPE, Guardrails, Line, Manifest, Marker, Record, VERSION};
+use bracken_tree::format::{
+    Change, Decision, FILE_MEDIA_TYPE, Guardrails, Line, Manifest, Marker, Proposal, Record, VERSION,
+};
 use bracken_tree::ground::Index;
-use bracken_tree::lines::{Lines, Unqualified};
+use bracken_tree::lines::{InvalidProposal, Lines, Unqualified};
 use bracken_tree::{ContentHash, Entry, Mode};
 use manyroot::{Body, Contribution, ContributionId, Graph, GroundId, Identity, RelationKind};
 
@@ -136,7 +138,7 @@ fn policy(integrators: &[&Identity]) -> Line {
         goal_setters: vec![],
         checks: BTreeMap::new(),
         guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
-        owner_decision: None,
+        owner_decision: Some("decision 0123456789ab".into()),
     }
 }
 
@@ -492,4 +494,92 @@ fn a_version_used_in_the_window_before_its_relation_doesnt_stay_the_default() {
     let mains: Vec<_> = lines.lines().filter(|v| v.policy.name == "main").map(|v| v.id).collect();
     assert_eq!(mains, [w.line], "one current line is named main");
     assert_eq!(lines.heads(&w.line), [d0]);
+}
+
+#[test]
+fn merge_bases_are_the_newest_common_decisions_and_a_criss_cross_has_two() {
+    let (mut w, [d0, d1, d2]) = fork(counter());
+    let alice = w.alice.clone();
+    let lines = w.lines();
+    assert_eq!(lines.merge_bases(&d1, &d0), [d0], "an ancestor is the base");
+    assert_eq!(lines.merge_bases(&d1, &d2), [d0], "a fork's base is where it forked");
+    assert_eq!(lines.merge_bases(&d1, &d1), [d1]);
+    drop(lines);
+    // Two merges of the same two heads, each listing both: a criss-cross.
+    let m = w.tree(&alice, b"merged");
+    let at = w.heads();
+    let m1 = w.decide(&alice, "m1", m, &[d1, d2], Some(at.clone()));
+    let m2 = w.decide(&alice, "m2", m, &[d1, d2], Some(at));
+    let mut both = vec![d1, d2];
+    both.sort();
+    assert_eq!(w.lines().merge_bases(&m1, &m2), both);
+    // A root of its own shares no history.
+    let other = w.decide(&alice, "other root", m, &[], None);
+    assert!(w.lines().merge_bases(&other, &d1).is_empty());
+}
+
+fn proposal(line: ContributionId, base: ContributionId, manifest: &Manifest, change: ContentHash) -> Proposal {
+    Proposal { v: VERSION, line, base, manifest: manifest.content_hash(), change, summary: "p".into() }
+}
+
+#[test]
+fn a_proposal_is_valid_only_with_its_change_recomputed_from_a_qualifying_base() {
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let m0 = w.tree(&alice, b"zero");
+    let d0 = w.decide(&alice, "d0", m0, &[], None);
+    let proposed = manifest(b"one");
+    w.tree(&alice, b"one");
+    let change = Change::between(&manifest(b"zero"), &proposed).hash();
+    let good = w.record(&alice, &proposal(w.line, d0, &proposed, change));
+    let wrong = w.record(&alice, &proposal(w.line, d0, &proposed, ContentHash::of(b"another change")));
+    let lines = w.lines();
+    assert_eq!(lines.proposal(&good).expect("decoded").verdict, Ok(()));
+    assert!(matches!(lines.proposal(&wrong).expect("decoded").verdict, Err(InvalidProposal::Change { .. })));
+    assert_eq!(lines.proposals_on(&w.line).map(|p| p.id).collect::<Vec<_>>(), [good]);
+    drop(lines);
+
+    // A base that isn't a qualifying decision, or isn't in the proposal's past.
+    let stray = w.decide(&w.bob.clone(), "bob's", m0, &[], None);
+    let not_qualifying = w.record(&alice, &proposal(w.line, stray, &proposed, change));
+    let at = w.heads();
+    let later = w.decide(&alice, "later", m0, &[d0], None);
+    let p = artifact(&proposal(w.line, later, &proposed, change));
+    let not_before = w.add_after(&alice, at, p);
+    let lines = w.lines();
+    for id in [not_qualifying, not_before] {
+        assert!(matches!(lines.proposal(&id).expect("decoded").verdict, Err(InvalidProposal::Base(_))), "{id}");
+    }
+}
+
+#[test]
+fn a_policy_version_without_an_owner_decision_counts_only_as_weave_inits_main() {
+    // Finding 12643881ac59: a version that cites no owner decision is ignored, except a first artifact
+    // named main by the counted marker's author, which is what weave init writes.
+    let mut w = World::new(counter());
+    let (alice, bob) = (w.alice.clone(), w.bob.clone());
+    let m0 = w.tree(&alice, b"zero");
+    let uncited = |name: &str, who: &[&Identity]| Line { owner_decision: None, name: name.into(), ..policy(who) };
+
+    // A version adding bob, with no owner decision, changes nothing.
+    let version = w.record(&alice, &uncited("main", &[&alice, &bob]));
+    w.supersede(&alice, version, w.line);
+    let d = w.decide(&bob, "bob's", m0, &[], None);
+    assert!(matches!(w.unqualified(&d), Unqualified::NotAnIntegrator { policy, .. } if policy == w.line));
+    // Nor does bob's own uncited line, or alice's uncited line by another name.
+    let bobs = w.record(&bob, &uncited("main", &[&bob]));
+    let other = w.record(&alice, &uncited("other", &[&alice]));
+    let lines = w.lines();
+    for id in [version, bobs, other] {
+        assert!(lines.version(&id).is_none() && lines.ignored_versions().contains(&id), "{id}");
+    }
+    assert_eq!(lines.ignored_versions().len(), 3);
+    drop(lines);
+
+    // weave init's main itself, uncited, counts.
+    let mut w = World::new(counter());
+    let alice = w.alice.clone();
+    let main = w.record(&alice, &uncited("main", &[&alice]));
+    let lines = w.lines();
+    assert!(lines.line(&main).is_some() && !lines.ignored_versions().contains(&main));
 }

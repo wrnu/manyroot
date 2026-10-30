@@ -16,6 +16,7 @@ use crate::format::{
     Record, Resolution,
 };
 use crate::hash::ContentHash;
+use crate::merge::Resolutions;
 
 /// Something `weave check` reports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +42,8 @@ pub struct Index {
     manifests: BTreeMap<ContentHash, (Vec<ContributionId>, Manifest)>,
     /// Valid markers, ascending.
     markers: Vec<ContributionId>,
+    /// Valid resolutions, by key.
+    resolutions: Resolutions,
     /// The marker that counts.
     counted: Option<ContributionId>,
     problems: Vec<Problem>,
@@ -128,6 +131,9 @@ impl Index {
             if media_type == MARKER_MEDIA_TYPE {
                 index.markers.push(id);
             }
+            if media_type == RESOLUTION_MEDIA_TYPE {
+                index.resolutions.insert(id, Resolution::decode(content).expect("decoded above"));
+            }
         }
         for (hash, (ids, manifest)) in &index.manifests {
             let missing = index.missing(manifest);
@@ -187,6 +193,16 @@ impl Index {
         } else {
             None
         }
+    }
+
+    /// Every valid resolution, by the key of the conflict it settles.
+    pub fn resolutions(&self) -> &Resolutions {
+        &self.resolutions
+    }
+
+    /// A held file version's size.
+    pub fn file_size(&self, hash: &ContentHash) -> Option<u64> {
+        self.sizes.get(hash).copied()
     }
 
     /// Every problem `weave check` lists, in the order found.

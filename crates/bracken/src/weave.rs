@@ -1,6 +1,6 @@
 //! `bracken weave`: Bracken's source trees on Weave: manifests, lines and
 //! decisions, heads and forks (docs/design/weave.md, section 3; build steps 3
-//! and 5).
+//! and 5). Policies, proposals and merges are in [`merge`] (step 6).
 //!
 //! Every write checks that the Ground holds a counted Weave marker, and prints
 //! one labelled line per record (`manifest blake3:<hex>`, `file blake3:<hex>
@@ -27,6 +27,8 @@ use manyroot::{Body, Contribution, ContributionId, Identity, Store};
 use serde_json::{Value, json};
 
 use super::{Output, contribute, decide, print_json, write_stdout};
+
+mod merge;
 
 #[derive(Subcommand)]
 pub(crate) enum WeaveCommand {
@@ -102,7 +104,8 @@ pub(crate) enum WeaveCommand {
         out: Output,
     },
     /// List Weave payloads that are invalid or break the ancestor rule, manifests not yet complete,
-    /// and markers past the one that counts. Exits non-zero when it lists any.
+    /// markers past the one that counts, and policy versions ignored for citing no owner decision. Exits
+    /// non-zero when it lists any.
     Check {
         #[command(flatten)]
         out: Output,
@@ -164,6 +167,11 @@ pub(crate) enum WeaveCommand {
         /// Record a manifest this Ground already holds: blake3:<hex>.
         #[arg(long, value_name = "HASH")]
         manifest: Option<String>,
+        /// Merge these proposals onto the line's head, in order, file by file against each one's base,
+        /// with the resolutions this Ground holds. A conflict without one stops it, listed, and nothing is
+        /// written. The line defaults to the proposals'.
+        #[arg(long, value_name = "PROPOSAL", num_args = 1.., conflicts_with_all = ["from_git", "index", "manifest"])]
+        proposals: Vec<String>,
         /// What the decision does, in words.
         #[arg(long, default_value = "")]
         note: String,
@@ -173,6 +181,17 @@ pub(crate) enum WeaveCommand {
         #[command(flatten)]
         out: Output,
     },
+    /// Line policies, and merges between lines.
+    Line {
+        #[command(subcommand)]
+        command: merge::LineCommand,
+    },
+    /// Record a tree (git's view, with import's refusals) and a proposal to integrate it onto a line,
+    /// against a base decision: by default the line's head.
+    Propose(merge::ProposeArgs),
+    /// Write a resolution for the conflict at one path of a merge, named as `line merge` (--into, --from)
+    /// or `integrate` (--proposals) names it.
+    Resolve(merge::ResolveArgs),
 }
 
 /// `weave init`, which creates its Ground and so runs before any is opened.
@@ -352,7 +371,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
                 (Some(at), _) => decision_manifest(s, &lines, &at, "--at")?,
                 (None, Some(manifest)) => manifest_hash(s, &ix, &manifest, "--manifest")?,
                 (None, None) => {
-                    let line = resolve_line(s, &lines, line.as_deref())?;
+                    let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
                     lines.decision(&single_head(&lines, &line)?).expect("a head is a decision").decision.manifest
                 }
             };
@@ -376,7 +395,13 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         }
         WeaveCommand::Check { out } => {
             let ix = Index::build(s.graph());
-            let rows: Vec<Value> = ix.problems().iter().map(problem_json).collect();
+            let mut rows: Vec<Value> = ix.problems().iter().map(problem_json).collect();
+            for id in Lines::build(s.graph(), &ix).ignored_versions() {
+                rows.push(json!({
+                    "problem": "no_owner_decision", "id": id,
+                    "text": format!("policy version {id} cites no owner decision, so it counts for nothing; only the main line weave init writes may"),
+                }));
+            }
             if out.json {
                 print_json(&json!({"marker": ix.counted_marker(), "problems": rows}));
             } else if rows.is_empty() {
@@ -391,7 +416,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         WeaveCommand::Head { line, out } => {
             let ix = Index::build(s.graph());
             let lines = Lines::build(s.graph(), &ix);
-            let line = resolve_line(s, &lines, line.as_deref())?;
+            let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
             let name = &lines.line(&line).expect("resolved").policy.name;
             let heads: Vec<(ContributionId, ContentHash)> = lines
                 .heads(&line)
@@ -418,7 +443,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         WeaveCommand::Log { line, limit, since, out } => {
             let ix = Index::build(s.graph());
             let lines = Lines::build(s.graph(), &ix);
-            let line = resolve_line(s, &lines, line.as_deref())?;
+            let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
             let since = since.map(|d| decision_id(s, &lines, &d, "--since")).transpose()?;
             let all = lines.log(s.graph(), &line, since.as_ref());
             let shown = &all[..all.len().min(limit)];
@@ -458,7 +483,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             let at = match at {
                 Some(at) => Some(decision_id(s, &lines, &at, "--at")?),
                 None => {
-                    let line = resolve_line(s, &lines, line.as_deref())?;
+                    let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
                     match lines.heads(&line).as_slice() {
                         [] => None,
                         [one] => Some(*one),
@@ -499,7 +524,13 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             }
             Ok(ExitCode::SUCCESS)
         }
-        WeaveCommand::Integrate { line, from_git, index, manifest, note, repo, out } => {
+        WeaveCommand::Integrate { line, proposals, note, out, .. } if !proposals.is_empty() => {
+            merge::integrate_proposals(s, agent, line.as_deref(), &proposals, note, out)
+        }
+        WeaveCommand::Line { command } => merge::line(s, agent, command),
+        WeaveCommand::Propose(args) => merge::propose(s, agent, args),
+        WeaveCommand::Resolve(args) => merge::resolve(s, agent, args),
+        WeaveCommand::Integrate { line, from_git, index, manifest, note, repo, out, .. } => {
             let source = match (manifest, index) {
                 (Some(m), _) => Given::Manifest(m),
                 (None, true) => Given::Git(Source::Index),
@@ -532,7 +563,7 @@ fn integrate(
         );
     }
     let lines = Lines::build(s.graph(), &ix);
-    let line = resolve_line(s, &lines, line)?;
+    let line = resolve_line(s, &lines, line, "--line")?;
     let who = super::signer(s, agent)?;
     let parents = lines.heads(&line);
     let draft = |manifest: ContentHash, source: Option<String>| Decision {
@@ -646,12 +677,13 @@ fn decision_json(d: &DecisionRecord, names: &super::Names) -> Value {
         r.breakage.iter().map(|b| json!({"check": b.check, "detail": b.detail, "paths": b.paths})).collect();
     json!({"decision": d.id, "author": d.author.to_string(), "author_name": names.display(&d.author),
            "manifest": r.manifest.to_string(), "parents": r.parents, "breakage": breakage,
+           "proposals": r.proposals, "resolutions": r.resolutions,
            "source": r.source.as_ref().map(|s| json!({"git": s.git})), "note": r.note})
 }
 
 /// A line named on the command line, by its id (or a prefix) or its name; the
 /// default line if none is given.
-fn resolve_line(s: &Store, lines: &Lines, given: Option<&str>) -> Result<ContributionId> {
+fn resolve_line(s: &Store, lines: &Lines, given: Option<&str>, what: &str) -> Result<ContributionId> {
     let Some(given) = given else {
         return lines
             .default_line()
@@ -662,18 +694,18 @@ fn resolve_line(s: &Store, lines: &Lines, given: Option<&str>) -> Result<Contrib
             return Ok(id);
         }
         if lines.version(&id).is_some() {
-            bail!("--line: {} is a later version of a line's policy; name the line by its first artifact", id.short());
+            bail!("{what}: {} is a later version of a line's policy; name the line by its first artifact", id.short());
         }
         let c = s.graph().get(&id).expect("resolved ids exist");
-        bail!("--line: {} is a {}, not a line", id.short(), kind_of(c));
+        bail!("{what}: {} is a {}, not a line", id.short(), kind_of(c));
     }
     let named: Vec<ContributionId> = lines.lines().filter(|v| v.policy.name == given).map(|v| v.id).collect();
     match named.as_slice() {
         [one] => Ok(*one),
-        [] => bail!("--line: no line is named {given:?}"),
+        [] => bail!("{what}: no line is named {given:?}"),
         many => {
             let ids: Vec<String> = many.iter().map(ContributionId::short).collect();
-            bail!("--line: {} lines are named {given:?} ({}); name one by its id", many.len(), ids.join(", "))
+            bail!("{what}: {} lines are named {given:?} ({}); name one by its id", many.len(), ids.join(", "))
         }
     }
 }

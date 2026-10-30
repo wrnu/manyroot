@@ -16,8 +16,14 @@
 #   - sync and serve: the Weave Ground never syncs in v0, and this never reads .bracken-team;
 #   - --as weave-runner, for anything but weave validate;
 #   - weave validate, which isn't built yet (Weave build step 7);
-#   - a line write (weave line create or weave line policy) without a non-empty --owner-decision: a policy
-#     is code this machine runs, so each version cites the owner's decision (weave.md section 1).
+#   - a line write (weave line create or weave line policy) whose --owner-decision isn't a claim tagged
+#     decision, not retracted, in the coordination Ground (read with the main checkout's scripts/bk): a
+#     policy is code this machine runs, so each version cites the owner's decision (weave.md section 1,
+#     finding 3cd6cd19f9a0);
+#   - artifact with a Weave media type, in any case, and relate with supersedes anywhere in its arguments,
+#     after '--' too: Weave records are written only by bracken weave, which checks them, and a hand-made
+#     line version or supersedes relation would go round that check (answer 12000ab70ae5, finding
+#     56dadb600ba2).
 # Creating the Weave Ground (weave init) waits for the owner's go.
 set -euo pipefail
 
@@ -34,6 +40,7 @@ bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
 
 # The command and its subcommands, found past global options; --as before any '--', else BRACKEN_AGENT.
 words=() who=${BRACKEN_AGENT:-} owner_decision=
+media=()
 for ((i = 1; i <= $#; i++)); do
   case "${!i}" in
     --) break ;;
@@ -42,6 +49,8 @@ for ((i = 1; i <= $#; i++)); do
     --dir | --dir=*) fail "--dir is refused: scripts/weave always uses the Weave Ground, ~/bracken-weave/manyroot" ;;
     --owner-decision) j=$((i + 1)); owner_decision=${!j:-}; i=$j ;;
     --owner-decision=*) owner_decision=${!i#--owner-decision=} ;;
+    --media-type) j=$((i + 1)); media+=("${!j:-}"); i=$j ;;
+    --media-type=*) media+=("${!i#--media-type=}") ;;
     # -h and --help get no early exit: they reach bracken only after every refusal and check below, as an
     # option that takes the rest of the line can make them another program's argument (3e1a0454a03b).
     -*) ;;
@@ -54,10 +63,31 @@ case "$cmd" in
   evidence) fail "evidence is refused: a check result on a Weave record comes only from the check runner (weave validate)" ;;
   sync | serve) fail "$cmd is refused: the Weave Ground never syncs in v0" ;;
 esac
+if [ "$cmd" = artifact ]; then
+  for m in ${media[@]+"${media[@]}"}; do
+    [[ $(printf '%s' "$m" | tr '[:upper:]' '[:lower:]') != application/vnd.bracken.weave* ]] ||
+      fail "artifact with a Weave media type is refused: bracken weave writes Weave records, and checks them"
+  done
+fi
+# Every argument, past '--' too, where bracken still reads the kind: an option's value or a '--' can't hide it.
+if [ "$cmd" = relate ]; then
+  for arg in "$@"; do
+    [ "$(printf '%s' "$arg" | tr '[:upper:]' '[:lower:]')" != supersedes ] ||
+      fail "relate ... supersedes is refused: weave line policy writes a line's new version and its supersedes relations"
+  done
+fi
 [ "$who" != weave-runner ] || [ "$sub" = validate ] || fail "--as weave-runner is only for weave validate"
 [ "$sub" != validate ] || fail "weave validate isn't built yet (Weave build step 7)"
-if [ "$sub" = line ] && [[ $subsub == create || $subsub == policy ]] && [ -z "$owner_decision" ]; then
-  fail "weave line $subsub needs --owner-decision <id>: the id of the owner's decision, in the coordination Ground, that allows this policy"
+if [ "$sub" = line ] && [[ $subsub == create || $subsub == policy ]]; then
+  [ -n "$owner_decision" ] ||
+    fail "weave line $subsub needs --owner-decision <id>: the id of the owner's decision, in the coordination Ground, that allows this policy"
+  [[ $owner_decision =~ ^[0-9a-f]{12,64}$ ]] ||
+    fail "--owner-decision $owner_decision: give the decision claim's id, 12 to 64 lowercase hex digits"
+  shown=$(env -u BRACKEN_AGENT "$main/scripts/bk" show "$owner_decision" --json 2>/dev/null) ||
+    fail "--owner-decision $owner_decision: the coordination Ground has no such contribution"
+  jq -e '.kind == "claim" and (.retracted | not) and ((.body.tags // []) | index("decision") != null)' \
+    <<<"$shown" >/dev/null 2>&1 ||
+    fail "--owner-decision $owner_decision: it isn't a claim tagged decision, not retracted, in the coordination Ground"
 fi
 
 # The Weave Ground's real path. weave init creates it, so for init its parent must exist instead.
