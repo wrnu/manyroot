@@ -1606,6 +1606,66 @@ fn test_table_remote_runs_one_box_and_leaves_none_behind() {
     }
 }
 
+/// `test-table --remote -p <package>...` (task `57c9181daa96`, decision `2a9e444218d6`), with a stub `boat`:
+/// the box gets the same setup but runs only `cargo test --locked -p ...` for the packages named, never the
+/// table, and says it wasn't the whole table. A name that isn't a package name, a `-p` without one, or
+/// anything else after `--remote` is refused before any box.
+#[test]
+fn test_table_remote_p_runs_only_the_named_packages_tests() {
+    for scripts in SCRIPTS {
+        let table = repo_root().join(scripts).join("test-table");
+        let (tmp, dir) = repo(&[("scripts/test-table", &table)], ".bracken/\n", |_| {});
+        assert!(run(&dir, "git", &["update-ref", "refs/remotes/origin/main", "HEAD"]).status.success());
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        // run: records its arguments, one a line except the box's script, the last, kept whole in $T/inner.
+        write_executable(
+            &stubs.join("boat"),
+            "#!/bin/bash\n\
+             case \"$1\" in\n\
+             run) printf '%s\\n' \"${@:1:$#-1}\" >\"$T/args\"; printf '%s' \"${!#}\" >\"$T/inner\"\n\
+               echo 'bx_stub01 ready in 1.0s'; echo 'exit 0 · 1m 00s · default · $0.0010 · bx_stub01 deleted' ;;\n\
+             list) echo '{\"sandboxes\":[]}' ;;\n\
+             esac\n",
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let remote = |args: &[&str]| {
+            let _ = std::fs::remove_file(tmp.path().join("inner"));
+            let mut c = command(&dir, "scripts/test-table", args);
+            c.env("PATH", &path).env("T", tmp.path());
+            c.output().unwrap()
+        };
+        let inner = || std::fs::read_to_string(tmp.path().join("inner")).unwrap_or_default();
+
+        let out = remote(&["--remote", "-p", "bracken", "-p", "bracken-tree"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        let script = inner();
+        assert!(script.ends_with("\ncargo test --locked -p bracken -p bracken-tree"), "{scripts}: {script}");
+        assert!(script.contains("git checkout -q tested"), "{scripts}: the same setup: {script}");
+        assert!(!script.contains("scripts/test-table"), "{scripts}: the box ran the table: {script}");
+        assert!(stdout.contains("cargo test --locked -p bracken -p bracken-tree passed at "), "{scripts}: {stdout}");
+        assert!(stdout.contains("in a box; not the whole table"), "{scripts}: {stdout}");
+
+        // Without -p, the box runs the table as before.
+        let out = remote(&["--remote"]);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(inner().ends_with("\nBRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table"), "{scripts}");
+
+        for bad in [
+            &["--remote", "-p", "bracken; touch $T/ran"][..],
+            &["--remote", "-p", "-p"],
+            &["--remote", "-p"],
+            &["--remote", "bracken"],
+        ] {
+            let out = remote(bad);
+            assert!(!out.status.success(), "{scripts}: {bad:?} passed");
+            assert!(inner().is_empty(), "{scripts}: {bad:?} started a box");
+            assert!(!tmp.path().join("ran").exists(), "{scripts}: {bad:?} ran in the shell");
+        }
+    }
+}
+
 /// test-table on a docs-only change (owner decision 642a47c04a10): when everything the head changed since
 /// it left origin/main is *.md outside crates/, only fmt and the Ground guards run, and it says so. A change
 /// that also touches code, renames or deletes a file that isn't docs, touches a .md under crates/ (the
