@@ -1394,3 +1394,54 @@ fn watch_feed_recovers_when_the_server_restarts_with_less() {
     watch.kill().unwrap();
     watch.wait().unwrap();
 }
+
+/// Finding ab41112b47f2: a catch-up of several pages, each of only what watch holds already, adds each
+/// page to what watch knows the server holds; replacing it with each page dropped an earlier one, and
+/// paging cycled. Three concurrent 5 MiB artifacts (one per 8 MiB page) and a claim merging them, which
+/// the watching replica holds along with work of its own the server lacks: once it has paged through
+/// them, new work reaching the server is printed.
+#[test]
+fn watch_feed_pages_through_a_catch_up_of_concurrent_large_contributions() {
+    let g = grounds();
+    let server = g.http(&[]);
+    let sync = |dir: &Path| {
+        let out = sync_http(dir, &server.url, TOKEN, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+    };
+    claim(&g.a, "alice", "the root");
+    sync(&g.a);
+    // Each artifact is made on its own copy of a, so none is the others' parent.
+    for (i, byte) in b"xyz".iter().copied().enumerate() {
+        let copy = g.tmp.join(format!("a{i}"));
+        copy_dir(&g.a, &copy);
+        let file = g.tmp.join(format!("big{i}"));
+        std::fs::write(&file, vec![byte; 5 << 20]).unwrap();
+        ok(&copy, &["artifact", file.to_str().unwrap(), "--as", "alice"]);
+        sync(&copy);
+    }
+    sync(&g.a);
+    claim(&g.a, "alice", "merging the three");
+    sync(&g.a);
+    let w = g.tmp.join("w");
+    copy_dir(&g.a, &w);
+    claim(&w, "alice", "not pushed yet");
+    let token = g.tmp.join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let (mut watch, lines) = watch_feed(&w, &server.url, &token, "");
+    // The pages take a few rounds of --interval (2 s); then the request waits, and new work wakes it.
+    std::thread::sleep(Duration::from_secs(12));
+    let new = claim(&g.a, "alice", "after the catch-up");
+    sync(&g.a);
+    let end = Instant::now() + Duration::from_secs(40);
+    let printed = loop {
+        let left = end.saturating_duration_since(Instant::now());
+        match next_contribution(&lines, left) {
+            Some(v) if v["contribution"]["id"] == new.as_str() => break true,
+            Some(_) => continue,
+            None => break false,
+        }
+    };
+    watch.kill().unwrap();
+    watch.wait().unwrap();
+    assert!(printed, "new work never arrived: the catch-up didn't finish");
+}

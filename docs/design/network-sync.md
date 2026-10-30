@@ -299,8 +299,9 @@ replica.
   those before it. The server ignores a head it doesn't hold, and names up to 64 such heads in
   `X-Bracken-Unknown-Heads`. `watch --feed` keeps what it knows the server holds: everything replies
   have brought. A reply of only what it holds already means the server lacked every head it sent,
-  perhaps because it was restored with less. Such a reply replaces that knowledge rather than adding
-  to it (finding `2e421e838287`). Its next cursor holds its own heads and the heads of what the
+  perhaps because it was restored with less. The first such reply in a row replaces that knowledge
+  rather than adding to it (finding `2e421e838287`); the ones after it are the next pages of the
+  same catch-up, so they add to it, and paging can't cycle (finding `ab41112b47f2`). Its next cursor holds its own heads and the heads of what the
   server holds. So a chain of its own work the server lacks costs one reply of what it holds already,
   not one every round. And once the server has one of those heads, the head counts as seen (findings
   `6552f9b16c65`, `d4f10edc63fb`).
