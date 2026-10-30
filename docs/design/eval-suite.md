@@ -73,6 +73,79 @@ independent review and the owner approving each one before use. Their
 review records only ids and verdicts in the Ground, never test content, and
 agents that drafted or reviewed a project never run on it.
 
+## Project format
+
+As built (task `9345098e82aa`, split note `842c4f4821e9`; owner decision
+`594307ea44a2`, manager's answers `c008b959c572`). A project is a directory
+under `crates/experiment/projects/<name>/`, all of which agents may read;
+`crates/experiment/tests/fixtures/project-tiny` is a small example.
+
+```
+<name>/
+  project.json     the manifest, below
+  spec.md          what to build, the public interface, the open choices
+  items/<id>.md    one work item each, written as an issue
+  seed/            the starting repository, the run's first tree
+    <package>/     the code: Python 3.12, standard library only
+    tests/         the public tests, test_*.py, standard library unittest
+```
+
+`project.json` (format 1) holds:
+- `name`; `python`, the minor version, such as `"3.12"` (the host's
+  pinned interpreter must match it; the project names no path); `package`,
+  the importable package under the seed; and `spec`, `seed` and
+  `public_tests` (default `<seed>/tests`), paths inside the project.
+- `items`, each with `id`, `kind` (feature, refactor, fix or change),
+  `title`, `text` (its issue's path) and `release`: `{"at": "start"}`, or
+  `{"after_share": x}` with 0 < x < 1, the share of the run's agent-turns
+  used before it reaches the agents. A change, never released at the start,
+  lists in `revises` the items whose requirement it changes. Each item is
+  revised by one change at most.
+- `limits` on each run of agent code: `cpu_seconds`, `memory_mb`,
+  `output_bytes` and `wall_seconds`, by default 10, 512, 1 MiB and 60.
+- `hidden`: `{"id", "digest"}`, a reference only. The digest is blake3 over
+  every entry of the hidden set in path order: each directory, empty ones
+  included, by its path, and each file by its path and the blake3 of its
+  bytes. So the grader refuses any set but the approved one. No path, test
+  name or count is in the project.
+
+**The private store** holds a project's hidden set at `<store>/<hidden.id>/`
+and is given to the grader by path when it grades. The set must be a
+directory, not a symlink, and is refused if it, or the store, overlaps the
+project, is inside a git checkout, or holds a `.git` anywhere. So it never
+enters this repository, a Ground or a run directory:
+
+```
+<hidden.id>/
+  hidden.json      format 1; project; groups: [{item, file, applies}]
+  tests/*.py       the hidden tests, standard library unittest
+  golden/          the golden solution, laid out like seed/
+```
+
+A group judges one item with one test file. `applies` is `always`, or, for
+an item a change revises, `before-change` or `after-change`: its old tests
+until the change is released, its new ones after.
+
+Tests are standard library `unittest`, public and hidden alike, with
+property tests as seeded loops, so the sandbox needs only the pinned
+interpreter (decision `c008b959c572`).
+
+`bracken-experiment project check <dir>` checks a project: every path a plain
+relative path inside it, no symlink or special file anywhere, every item's
+issue present, ids unique, changes released after the start and revising
+existing items, limits in range, and a seed holding the package and the
+public tests. With `--hidden <store>` it checks the hidden set too: the
+digest, the manifest's project and items, each group's file under `tests/`,
+and the golden solution's package. It prints counts only: groups, test
+files, golden files, and items no hidden test judges. `--json` prints the
+same as JSON.
+
+The set is read once. Each file is opened and checked to be the regular file
+the walk found, and the manifest is parsed, and each group's file looked up,
+from the very bytes the digest covers, which the grader is given too.
+Errors about the set name nothing inside it: they say what kind of problem,
+and give a group by its index.
+
 ## Configurations
 
 What a run varies, taken from weave.md's configurations and agents.md:
