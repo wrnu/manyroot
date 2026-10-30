@@ -1,0 +1,15 @@
+{
+  "format": 1,
+  "name": "tiny",
+  "python": "3.12",
+  "package": "tiny",
+  "spec": "spec.md",
+  "seed": "seed",
+  "items": [
+    {"id": "sum", "kind": "feature", "title": "Add sum", "text": "items/sum.md", "release": {"at": "start"}},
+    {"id": "mean-empty", "kind": "fix", "title": "mean of no numbers", "text": "items/mean-empty.md", "release": {"at": "start"}},
+    {"id": "decimals", "kind": "change", "title": "Numbers become decimals", "text": "items/decimals.md", "release": {"after_share": 0.5}, "revises": ["sum"]}
+  ],
+  "limits": {"cpu_seconds": 5, "wall_seconds": 30},
+  "hidden": {"id": "tiny@1", "digest": "0000000000000000000000000000000000000000000000000000000000000000"}
+}

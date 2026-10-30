@@ -6,6 +6,7 @@
 //! - `mock-run` runs a whole mode with the mock backend, for a look at the run directory.
 //! - `report` measures finished runs and prints the comparison table.
 //! - `run` runs a whole mode with one agent harness, Claude Code or Pi, playing every agent.
+//! - `project check` checks an evaluation project, and its hidden set in a private store if given.
 
 use std::path::PathBuf;
 
@@ -151,6 +152,9 @@ enum Cmd {
         #[arg(long, default_value = "one-pass", value_parser = AcceptRule::NAMES)]
         accept_rule: String,
     },
+    /// Evaluation projects (docs/design/eval-suite.md, Project format).
+    #[command(subcommand)]
+    Project(ProjectCmd),
     /// Measure finished runs, one column each.
     Report {
         #[arg(required = true)]
@@ -231,6 +235,7 @@ fn main() {
             };
             mock_run(dir, &mode, agents, turns, bracken, sandbox, plan)
         }
+        Cmd::Project(ProjectCmd::Check { dir, hidden, json }) => project_check(&dir, hidden.as_deref(), json),
         Cmd::Report { dirs, usage, json } => report(&dirs, usage.as_deref(), json),
     };
     if let Err(e) = result {
@@ -523,6 +528,67 @@ fn harness_commit() -> String {
         (Some(head), _) => head,
         _ => "unknown".into(),
     }
+}
+
+#[derive(Subcommand)]
+enum ProjectCmd {
+    /// Check a project; with --hidden, also its hidden set in the private store. Says only counts of what
+    /// the store holds.
+    Check {
+        dir: PathBuf,
+        /// The private store holding the project's hidden set.
+        #[arg(long)]
+        hidden: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn project_check(dir: &std::path::Path, hidden: Option<&std::path::Path>, json: bool) -> Result<(), String> {
+    use bracken_experiment::project::{HiddenSet, Kind, Project};
+    let project = Project::load(dir)?;
+    let store = hidden.map(|store| HiddenSet::open(&project, store).map(|s| s.summary(&project))).transpose()?;
+    let kinds = [Kind::Feature, Kind::Refactor, Kind::Fix, Kind::Change]
+        .map(|k| (k.name(), project.items.iter().filter(|i| i.kind == k).count()));
+    let later = project.items.len() - project.released(0.0).count();
+    let (seed, tests) = (project.seed_files()?.len(), project.public_test_files()?.len());
+    if json {
+        let value = serde_json::json!({
+            "name": project.name,
+            "python": project.python,
+            "items": project.items.len(),
+            "kinds": kinds.iter().map(|(k, n)| (k.to_string(), serde_json::json!(n))).collect::<serde_json::Map<_, _>>(),
+            "released_later": later,
+            "seed_files": seed,
+            "public_test_files": tests,
+            "limits": project.limits,
+            "hidden": {"id": project.hidden.id, "checked": store},
+        });
+        println!("{value}");
+        return Ok(());
+    }
+    let kinds: Vec<String> = kinds.iter().filter(|(_, n)| *n > 0).map(|(k, n)| format!("{n} {k}")).collect();
+    println!(
+        "{}: python {}, {} items ({}), {later} released later",
+        project.name,
+        project.python,
+        project.items.len(),
+        kinds.join(", ")
+    );
+    println!("seed: {seed} files, {tests} public test files");
+    match store {
+        Some(s) => {
+            println!(
+                "hidden {}: digest matches; {} groups in {} test files; golden solution {} files",
+                project.hidden.id, s.groups, s.test_files, s.golden_files
+            );
+            if !s.items_without_tests.is_empty() {
+                println!("items no hidden test judges: {}", s.items_without_tests.join(", "));
+            }
+        }
+        None => println!("hidden {}: not checked (no --hidden)", project.hidden.id),
+    }
+    Ok(())
 }
 
 fn report(dirs: &[PathBuf], usage: Option<&std::path::Path>, json: bool) -> Result<(), String> {

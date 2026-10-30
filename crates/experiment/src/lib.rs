@@ -35,6 +35,7 @@ pub mod mock;
 pub mod mode;
 pub mod pi;
 pub mod plan;
+pub mod project;
 pub mod prompts;
 pub mod proxy;
 pub mod sandbox;
