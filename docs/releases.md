@@ -53,6 +53,8 @@ If the new binary can't open the Ground, reinstall the previous commit's binary 
 
 **Upgrade after merging task c3d2a3297a71** (`log --current`, `claim --supersedes`, `--as` accepted everywhere). The docs and skill use these as soon as it merges, but `scripts/bk` runs the pinned binary, so upgrade it right after the merge. Until then the old recipes still apply: to find the current entry, read `scripts/bk log --tag <tag>`, drop the lines marked `(retracted)` and take the last one; to supersede, contribute the claim, then `relate <new> supersedes <old>`; and leave `--as` off read commands.
 
+**Upgrade after merging task d4e958fd6719** (labelled ids from every write, `--json` on writes). `scripts/bk-evidence` and `scripts/merge` read either form, so they work before and after the upgrade. Until it, writes print bare ids, the claim's first and then its relation's, one per line.
+
 **Upgrade after merging task e75a246bf541** (`evidence --details-file`). From that merge, `scripts/bk-evidence` passes the output tail through a file, and it refuses to run, naming this step, until the pinned binary has `--details-file`. Upgrade right after the merge. Until then, wait for the upgrade (it takes minutes) rather than record evidence by hand, which would put the output back on a command line and lose the real exit code.
 
 ## Protocol and storage migrations

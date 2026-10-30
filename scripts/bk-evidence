@@ -233,8 +233,11 @@ method="$(printf '%q ' "$@")@ $sha"
 [ -z "$on" ] || method="$method on $onto tree $key"
 [ -z "$reused" ] || method="$method reuses $reused"
 ! $docs_only || method="$method docs-only"
-if id=$("$here/bk" evidence "$claim" "$verdict" --method "$method" --details-file "$details" --as "$agent"); then
-  echo "bk-evidence: recorded $verdict $id (exit $code)" >&2
+if written=$("$here/bk" evidence "$claim" "$verdict" --method "$method" --details-file "$details" --as "$agent"); then
+  # The id is the first line's last word: 'evidence <id>' (task d4e958fd6719), or a bare id from an older
+  # pinned binary.
+  id=${written%%$'\n'*}
+  echo "bk-evidence: recorded $verdict ${id##* } (exit $code)" >&2
   exit "$code"
 fi
 echo "bk-evidence: the command exited $code, but recording the evidence failed" >&2

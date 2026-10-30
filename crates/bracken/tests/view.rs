@@ -2,6 +2,8 @@
 //! hostile text JSON-escaped under the CSP on every response, paging and the cursor, the shapes of
 //! docs/design/visualizer.md section 1, and the event stream.
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
@@ -22,7 +24,7 @@ const HOSTILE: &str = "</script><img src=x onerror=alert(1)> & \u{1b}[2K\r\n\u{2
 fn ok(dir: &Path, args: &[&str]) -> String {
     let out = Command::new(BIN).args(args).env("BRACKEN_DIR", dir).env_remove("BRACKEN_AGENT").output().unwrap();
     assert!(out.status.success(), "bracken {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned())
 }
 
 fn json(dir: &Path, args: &[&str]) -> Value {

@@ -88,7 +88,10 @@ else
   tags=(--tag approval)
 fi
 
-approval=$(bk claim "$statement" "${tags[@]}" --as owner | head -1)
+written=$(bk claim "$statement" "${tags[@]}" --as owner) || fail "the approval wasn't written"
+# The first line's last word: 'claim <id>' (task d4e958fd6719), or a bare id from an older pinned binary.
+approval=${written%%$'\n'*}
+approval=${approval##* }
 [[ $approval =~ ^[0-9a-f]{64}$ ]] || fail "the approval wasn't written"
 bk relate "$approval" supports "$full" --as owner >/dev/null ||
   fail "approval $approval is written but its supports relation isn't; run: scripts/bk relate $approval supports $full --as owner"

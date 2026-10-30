@@ -40,9 +40,11 @@ bracken init --name auth
 bracken id new alice && bracken id new val
 export BRACKEN_AGENT=alice           # or pass --as on each command
 
-REQ=$(bracken claim "Sessions need bounded token lifetimes" --tag auth)
-# The artifact and its implements relation in one call; it prints both ids, the artifact's first.
-IMPL=$(bracken artifact src/session.rs --media-type text/x-rust --implements $REQ | head -1)
+# A write prints one labelled line per record, the primary first: `claim <id>`, `relation <id> (implements)`.
+# --json gives {"id": <primary>, "written": [...]}, for scripts.
+REQ=$(bracken claim "Sessions need bounded token lifetimes" --tag auth --json | jq -r .id)
+# The artifact and its implements relation in one call.
+IMPL=$(bracken artifact src/session.rs --media-type text/x-rust --implements $REQ --json | jq -r .id)
 bracken evidence $IMPL pass --method "cargo test" --as val
 bracken evidence $IMPL fail --method "read it" --depends-on $OTHER --as val  # blocked until $OTHER is accepted
 # Or check and record in one step: pass if the command exits 0, else fail.

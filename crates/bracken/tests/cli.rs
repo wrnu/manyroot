@@ -1,3 +1,5 @@
+mod common;
+
 use std::path::Path;
 use std::process::Command;
 
@@ -12,7 +14,7 @@ fn bracken(dir: &Path, args: &[&str]) -> String {
         .output()
         .unwrap();
     assert!(out.status.success(), "bracken {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned())
 }
 
 fn bracken_fails(dir: &Path, args: &[&str]) -> String {
@@ -165,6 +167,125 @@ fn claim_supersedes_replaces_only_your_own_claims() {
     let err = bracken_fails(dir, &["claim", "Goal: v3", "--supersedes", relation, "--as", "alice"]);
     assert!(err.contains("not a claim"), "{err}");
     assert_eq!(ids(dir, &["log", "--json"]).len(), before, "a refused claim writes nothing");
+}
+
+/// Every write command prints one labelled line per record it creates, the primary first: `claim <id>`,
+/// `relation <id> (supersedes)` and so on, so two ids are never told apart by their order alone (task
+/// `d4e958fd6719`). With --json: `{"id": <primary>, "written": [{"id", "kind", "relation"?}]}`.
+#[test]
+fn write_commands_print_one_labelled_line_per_record() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "alice"]);
+    bracken(dir, &["id", "new", "val"]);
+    // The printed text itself, without the tests' bare_ids.
+    let raw = |args: &[&str]| -> Vec<String> {
+        let out = Command::new(env!("CARGO_BIN_EXE_bracken"))
+            .args(args)
+            .current_dir(dir)
+            .env_remove("BRACKEN_DIR")
+            .env_remove("BRACKEN_AGENT")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "bracken {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().lines().map(str::to_owned).collect()
+    };
+    let id_in = |line: &str, kind: &str| -> String {
+        let id = line.strip_prefix(&format!("{kind} ")).unwrap_or_else(|| panic!("not a {kind} line: {line}"));
+        let id = id.split(' ').next().unwrap();
+        assert_eq!(id.len(), 64, "{line}");
+        id.to_owned()
+    };
+    let shown = |id: &str| json(dir, &["show", id, "--json"]);
+
+    let old = raw(&["claim", "v1", "--as", "alice"]);
+    assert_eq!(old.len(), 1);
+    let old = id_in(&old[0], "claim");
+    let lines = raw(&["claim", "v2", "--supersedes", &old, "--as", "alice"]);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let new = id_in(&lines[0], "claim");
+    assert!(lines[1].ends_with(" (supersedes)"), "{lines:?}");
+    let relation = id_in(&lines[1], "relation");
+    assert_eq!(
+        (shown(&relation)["body"]["from"].as_str(), shown(&relation)["body"]["to"].as_str()),
+        (Some(&*new), Some(&*old))
+    );
+
+    std::fs::write(dir.join("f.rs"), "fn f() {}\n").unwrap();
+    let lines = raw(&["artifact", "f.rs", "--implements", &new, "--as", "alice"]);
+    let artifact = id_in(&lines[0], "artifact");
+    assert!(lines.len() == 2 && lines[1].ends_with(" (implements)"), "{lines:?}");
+    let lines = raw(&["relate", &artifact, "supports", &new, "--as", "alice"]);
+    assert!(lines.len() == 1 && lines[0].ends_with(" (supports)"), "{lines:?}");
+    let lines = raw(&["evidence", &artifact, "fail", "--method", "review", "--depends-on", &old, "--as", "val"]);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let evidence = id_in(&lines[0], "evidence");
+    assert!(lines[1].ends_with(" (depends_on)"), "{lines:?}");
+    let lines = raw(&["evidence", &artifact, "--run", "--as", "val", "--", "true"]);
+    id_in(&lines[0], "evidence");
+    let lines = raw(&["intend", &new, "--as", "val"]);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    id_in(&lines[0], "claim");
+    assert!(lines[1].ends_with(" (refines)"), "{lines:?}");
+    let lines = raw(&["retract", &evidence, "--as", "val"]);
+    assert_eq!(lines.len(), 1);
+    id_in(&lines[0], "retract");
+
+    // --json: the primary's id, then everything written, in order, with each relation's kind.
+    let v = json(dir, &["claim", "v3", "--supersedes", &new, "--as", "alice", "--json"]);
+    let written = v["written"].as_array().unwrap();
+    assert_eq!(written.len(), 2, "{v}");
+    assert_eq!(v["id"], written[0]["id"]);
+    assert_eq!((written[0]["kind"].as_str(), written[0].get("relation")), (Some("claim"), None));
+    assert_eq!((written[1]["kind"].as_str(), written[1]["relation"].as_str()), (Some("relation"), Some("supersedes")));
+    assert_eq!(shown(written[1]["id"].as_str().unwrap())["body"]["to"], new.as_str());
+    let v = json(dir, &["retract", v["id"].as_str().unwrap(), "--as", "alice", "--json"]);
+    assert_eq!(v["written"][0]["kind"], "retract");
+}
+
+/// A write that fails part way, its claim recorded and its supersedes relation not, fails even when
+/// its reader has stopped (finding `58def77d1d97`): the status is decided before the claim's line is
+/// printed. The relation is made to fail by a file-size limit between the claim's object (under 300
+/// bytes) and the relation's (about 390), with SIGXFSZ ignored so the write returns an error.
+#[test]
+fn a_write_that_fails_part_way_fails_with_its_reader_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "alice"]);
+    let old = bracken(dir, &["claim", "v1", "--as", "alice"]);
+    let limited = |closed: bool| {
+        let limit = "import os, resource, signal, sys; signal.signal(signal.SIGXFSZ, signal.SIG_IGN); \
+                     resource.setrlimit(resource.RLIMIT_FSIZE, (330, 330)); os.execv(sys.argv[1], sys.argv[1:])";
+        let mut child = Command::new("python3")
+            .args(["-c", limit, env!("CARGO_BIN_EXE_bracken"), "claim", "v2", "--supersedes", &old, "--as", "alice"])
+            .current_dir(dir)
+            .env_remove("BRACKEN_DIR")
+            .env_remove("BRACKEN_AGENT")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        if closed {
+            drop(child.stdout.take());
+        }
+        child.wait_with_output().unwrap()
+    };
+    let claims = || ids(dir, &["log", "--kind", "claim", "--json"]).len();
+    let relations = || ids(dir, &["log", "--kind", "relation", "--json"]).len();
+
+    let out = limited(false);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("was recorded, but not all its supersedes relations"), "{stderr}");
+    let printed = String::from_utf8(out.stdout).unwrap();
+    assert!(printed.starts_with("claim ") && printed.lines().count() == 1, "the claim written is named: {printed}");
+    assert_eq!((claims(), relations()), (2, 0));
+
+    let out = limited(true);
+    assert_eq!(out.status.code(), Some(1), "a closed reader made it succeed: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!((claims(), relations()), (3, 0));
 }
 
 #[test]
@@ -374,8 +495,8 @@ fn evidence_details_come_from_a_file_or_stdin() {
     std::io::Write::write_all(&mut child.stdin.take().unwrap(), b"exit 2\nfrom stdin\n").unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success());
-    let from_stdin = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(details(from_stdin.trim()), "exit 2\nfrom stdin\n");
+    let from_stdin = common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned());
+    assert_eq!(details(&from_stdin), "exit 2\nfrom stdin\n");
 
     let before = ids(dir, &["log", "--json"]).len();
     let err = bracken_fails(
@@ -411,8 +532,8 @@ fn evidence_run_records_the_commands_result() {
             .unwrap()
     };
     let body = |out: &std::process::Output| {
-        let id = String::from_utf8(out.stdout.clone()).unwrap();
-        json(dir, &["show", id.trim(), "--json"])["body"].clone()
+        let id = common::bare_ids(String::from_utf8(out.stdout.clone()).unwrap().trim().to_owned());
+        json(dir, &["show", &id, "--json"])["body"].clone()
     };
 
     let pass = run(&["evidence", &c, "--run", "--as", "val", "--", "sh", "-c", "echo 'all 7 passed'"]);
