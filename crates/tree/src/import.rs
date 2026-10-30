@@ -97,6 +97,8 @@ impl FileVersion {
 /// What an import would do. Nothing is written.
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
+    /// The commit whose tree this is, in full, for a [`Source::Rev`].
+    pub commit: Option<String>,
     /// The manifest's entries, in path order.
     pub entries: Vec<Entry>,
     /// One file version per content hash in the tree, in order of first path.
@@ -159,7 +161,8 @@ fn output_error(command: &str, detail: impl Into<String>) -> ImportError {
 
 /// Lists git's view: `ls-tree` of a tree, or `ls-files --stage` of the index,
 /// both run at the top of the working tree so paths are from its root.
-fn list(top: &Path, source: &Source) -> Result<Vec<GitEntry>, ImportError> {
+fn list(top: &Path, source: &Source) -> Result<(Option<String>, Vec<GitEntry>), ImportError> {
+    let mut resolved = None;
     let (command, raw) = match source {
         Source::Rev(rev) => {
             if rev.starts_with('-') || rev.is_empty() {
@@ -169,7 +172,9 @@ fn list(top: &Path, source: &Source) -> Result<Vec<GitEntry>, ImportError> {
             let commit = run(top, &["rev-parse", "--verify", "--quiet", "--end-of-options", &spec])
                 .map_err(|_| ImportError::BadRev(rev.clone()))?;
             let commit = String::from_utf8_lossy(&commit).trim().to_owned();
-            ("ls-tree", run(top, &["ls-tree", "-r", "-z", "--full-tree", &commit])?)
+            let raw = run(top, &["ls-tree", "-r", "-z", "--full-tree", &commit])?;
+            resolved = Some(commit);
+            ("ls-tree", raw)
         }
         Source::Index => ("ls-files", run(top, &["ls-files", "--stage", "-z"])?),
     };
@@ -193,7 +198,7 @@ fn list(top: &Path, source: &Source) -> Result<Vec<GitEntry>, ImportError> {
         let mode = u32::from_str_radix(mode, 8).map_err(|_| output_error(command, format!("mode {mode:?}")))?;
         entries.push(GitEntry { mode, oid: oid.to_owned(), path: path.to_vec() });
     }
-    Ok(entries)
+    Ok((resolved, entries))
 }
 
 /// A blob from git's object store, or the size of one over [`MAX_FILE_BYTES`],
@@ -274,8 +279,8 @@ pub fn plan(repo: &Path, source: &Source, known: &KnownKeys) -> Result<Plan, Imp
     let top = run(repo, &["rev-parse", "--show-toplevel"])?;
     let top = String::from_utf8(top).map_err(|_| output_error("rev-parse", "the top level isn't UTF-8"))?;
     let top = PathBuf::from(top.trim_end_matches('\n'));
-    let listed = list(&top, source)?;
-    let mut plan = Plan::default();
+    let (commit, listed) = list(&top, source)?;
+    let mut plan = Plan { commit, ..Plan::default() };
     let mut wanted: Vec<(String, Mode, &str)> = Vec::new();
     for entry in &listed {
         let Ok(path) = std::str::from_utf8(&entry.path) else {

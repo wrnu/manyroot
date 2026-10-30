@@ -366,7 +366,8 @@ enum Command {
         #[command(flatten)]
         policy: PolicyArgs,
     },
-    /// Bracken's source trees on Weave: import from git, manifests, checkout, diff and verify.
+    /// Bracken's source trees on Weave: import from git, manifests, lines and their heads, integrate, checkout,
+    /// diff and verify.
     #[command(subcommand)]
     Weave(weave::WeaveCommand),
     /// Write every contribution to a bundle file ("-" for stdout).
