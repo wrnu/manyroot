@@ -223,3 +223,41 @@ fn run_asks_each_pi_provider_for_its_own_key() {
         assert!(!dir.path().join("run").exists());
     }
 }
+
+/// An expired OpenRouter login in `--pi-auth` stops `run` before anything starts, asks for a new Pi
+/// login, and quotes no value (decision `467e1c8dbc09`); so does one lasting 70 minutes, past the run's
+/// 60-minute cap but not its 30-minute margin. The tokens are fake.
+#[test]
+fn run_refuses_an_expired_openrouter_login_before_anything_starts() {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("now").as_millis() as u64;
+    for expires in [1, now + 70 * 60 * 1000] {
+        refuses_the_login(expires);
+    }
+}
+
+fn refuses_the_login(expires: u64) {
+    let bin = Path::new(env!("CARGO_BIN_EXE_bracken-experiment"));
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let (access, refresh) = ("fake-access-not-a-key-0123456789", "fake-refresh-not-a-key-0123456789");
+    let auth = dir.path().join("auth.json");
+    let login =
+        serde_json::json!({"openrouter": {"type": "oauth", "access": access, "refresh": refresh, "expires": expires}});
+    std::fs::write(&auth, login.to_string()).expect("auth.json");
+    let prefix = dir.path().join("no-prefix");
+    let out = Command::new(bin)
+        .args(["run", "--dir"])
+        .arg(dir.path().join("run"))
+        .args(["--mode", "git", "--harness", "pi", "--pi-provider", "openrouter", "--pi-auth"])
+        .arg(&auth)
+        .arg("--pi-prefix")
+        .arg(&prefix)
+        .output()
+        .expect("the binary runs");
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert!(!out.status.success(), "{out:?}");
+    assert!(stderr.contains("log in to Pi again (/login openrouter)"), "{stderr}");
+    for value in [access, refresh] {
+        assert!(!stdout.contains(value) && !stderr.contains(value), "a value printed: {stdout}{stderr}");
+    }
+    assert!(!dir.path().join("run").exists());
+}

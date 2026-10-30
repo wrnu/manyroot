@@ -30,7 +30,7 @@ use serde_json::{Value, json};
 
 use crate::candidates::phase2::UNSETTLED;
 use crate::candidates::{candidates, correct_programs};
-use crate::driver::Backend;
+use crate::driver::{Backend, socket_error};
 use crate::task::{Spec, Task, Version, change_tag};
 
 pub struct MockBackend {
@@ -102,7 +102,7 @@ impl Client {
     pub fn connect(socket: &Path, shim: Option<&Path>) -> Result<Client, String> {
         let (reader, writer, child): (Box<dyn Read + Send>, Box<dyn Write + Send>, _) = match shim {
             None => {
-                let s = UnixStream::connect(socket).map_err(|e| format!("connecting: {e}"))?;
+                let s = UnixStream::connect(socket).map_err(|e| socket_error("connecting to", socket, &e))?;
                 (Box::new(s.try_clone().map_err(|e| e.to_string())?), Box::new(s), None)
             }
             Some(bin) => {

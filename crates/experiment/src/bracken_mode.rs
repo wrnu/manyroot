@@ -613,7 +613,7 @@ impl Store for BrackenStore {
         // given: one log per agent gives each agent its own quota (finding 57acf0d9ce57).
         let first_seen = self.config.dir.join(format!("first-seen-{}.jsonl", session.agent));
         let stream = std::os::unix::net::UnixStream::connect(socket)
-            .map_err(|e| format!("connecting to {}: {e}", socket.display()))?;
+            .map_err(|e| crate::driver::socket_error("connecting to", socket, &e))?;
         let seconds = if session.sync_seconds > 0 { session.sync_seconds } else { SYNC_DEADLINE };
         self.runs += 1;
         let mut child = Command::new(&self.config.bracken)
