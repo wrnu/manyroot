@@ -32,7 +32,8 @@
 //!   are found by parent pid (again until no new ones appear) and stopped
 //!   too, and then all are killed. If any had left the group, the run fails
 //!   with [`Exit::LeftGroup`]. An orphan reparented to launchd before the walk
-//!   can't be found (weave.md section 3);
+//!   can't be found (weave.md section 3). If one still holds the output open two
+//!   seconds after the check ended, the run fails with [`Exit::HeldOutput`];
 //! - **no sandbox, no run**: off macOS, or if the profile isn't applied (a
 //!   probe must run under it and be refused a read outside the fresh
 //!   directory), [`Runner::run`] refuses and runs nothing.
@@ -123,6 +124,9 @@ pub enum Exit {
     /// These processes of the check had left its process group; they were found and killed, and
     /// the run fails whatever its exit.
     LeftGroup(Vec<i32>),
+    /// Two seconds after the check's processes were killed, something still held its output open: a
+    /// process that escaped before the sweep could find it. The run fails whatever its exit.
+    HeldOutput,
 }
 
 impl std::fmt::Display for Exit {
@@ -134,6 +138,7 @@ impl std::fmt::Display for Exit {
             Exit::LeftGroup(pids) => {
                 write!(f, "failed: {} of its processes left the process group, and were killed ({pids:?})", pids.len())
             }
+            Exit::HeldOutput => write!(f, "failed: a process it started still held its output open after it ended"),
         }
     }
 }
@@ -496,6 +501,9 @@ mod run {
 
     use super::{CheckError, Exit, io};
 
+    /// How long the output may stay open after the check's processes are killed.
+    const OUTPUT_GRACE: Duration = Duration::from_secs(2);
+
     /// The last `cap` bytes written, and how many there were.
     #[derive(Default)]
     struct Tail {
@@ -632,26 +640,8 @@ mod run {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let reading = {
             let (tail, stop) = (Arc::clone(&tail), Arc::clone(&stop));
-            let mut reader = reader;
             std::thread::spawn(move || {
-                let mut buf = [0u8; 8192];
-                loop {
-                    let n = match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && !stop.load(Ordering::Relaxed) => {
-                            std::thread::sleep(Duration::from_millis(10));
-                            continue;
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break,
-                    };
-                    let mut t = tail.lock().expect("the tail's lock isn't poisoned: nothing panics holding it");
-                    t.total += n as u64;
-                    t.bytes.extend(&buf[..n]);
-                    let excess = t.bytes.len().saturating_sub(cap);
-                    t.bytes.drain(..excess);
-                }
+                read_into(reader, &tail, &stop, cap);
                 let _ = done_tx.send(());
             })
         };
@@ -675,20 +665,46 @@ mod run {
         }
         // Whether it ended or timed out, nothing it started outlives it.
         let (status, left) = group.finish()?;
+        // A process the sweep couldn't find may still hold the pipe: wait for it only briefly, then stop
+        // the reader, which ends before its next read, and join it. A held pipe fails the run.
+        let held = done_rx.recv_timeout(OUTPUT_GRACE).is_err();
+        stop.store(true, Ordering::Relaxed);
+        let _ = reading.join();
         let exit = if !left.is_empty() {
             Exit::LeftGroup(left)
+        } else if held {
+            Exit::HeldOutput
         } else if timed_out {
             Exit::TimedOut
         } else {
             exit_of(status)
         };
-        // A process the sweep couldn't find may still hold the pipe: wait for it only briefly, then stop
-        // the reader, which ends at its next poll, and join it.
-        let _ = done_rx.recv_timeout(Duration::from_secs(2));
-        stop.store(true, Ordering::Relaxed);
-        let _ = reading.join();
         let t = tail.lock().expect("the tail's lock isn't poisoned: nothing panics holding it");
         Ok((exit, t.bytes.iter().copied().collect(), t.total))
+    }
+
+    /// Reads `reader` (non-blocking) into `tail`, keeping its last `cap` bytes, until end-of-file, an
+    /// error, or `stop`. The flag is checked before every read, so a writer that keeps the pipe full
+    /// can't keep the reader going (task 6b8a1b5a6108).
+    fn read_into(mut reader: impl Read, tail: &Mutex<Tail>, stop: &AtomicBool, cap: usize) {
+        let mut buf = [0u8; 8192];
+        while !stop.load(Ordering::Relaxed) {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            let mut t = tail.lock().expect("the tail's lock isn't poisoned: nothing panics holding it");
+            t.total += n as u64;
+            t.bytes.extend(&buf[..n]);
+            let excess = t.bytes.len().saturating_sub(cap);
+            t.bytes.drain(..excess);
+        }
     }
 
     fn exit_of(status: ExitStatus) -> Exit {
@@ -696,6 +712,40 @@ mod run {
             return Exit::Signal(signal);
         }
         Exit::Code(status.code().unwrap_or(-1))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// A pipe that never runs dry.
+        struct Full;
+
+        impl Read for Full {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(b'y');
+                Ok(buf.len())
+            }
+        }
+
+        // Task 6b8a1b5a6108: told to stop, the reader stops, though every read finds output.
+        #[test]
+        fn the_reader_stops_when_told_even_while_the_pipe_stays_full() {
+            let (tail, stop) = (Arc::new(Mutex::new(Tail::default())), Arc::new(AtomicBool::new(false)));
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            {
+                let (tail, stop) = (Arc::clone(&tail), Arc::clone(&stop));
+                std::thread::spawn(move || {
+                    read_into(Full, &tail, &stop, 16);
+                    let _ = done_tx.send(());
+                });
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            stop.store(true, Ordering::Relaxed);
+            assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "the reader kept reading after the stop");
+            let t = tail.lock().expect("not poisoned");
+            assert!(t.total > 0 && t.bytes.len() == 16, "{} read, {} kept", t.total, t.bytes.len());
+        }
     }
 }
 
