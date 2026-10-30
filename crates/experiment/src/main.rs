@@ -11,10 +11,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use bracken_experiment::backend::{Caps, ModeTokenCap, RUN_TIME_CAP, RUN_TOKEN_CAP};
 use bracken_experiment::bracken_mode::AcceptRule;
-use bracken_experiment::claude::{
-    Caps, ClaudeBackend, ClaudeConfig, Expect, ModeTokenCap, Pin, RUN_TIME_CAP, RUN_TOKEN_CAP, Routing,
-};
+use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routing};
 use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, core_tools, git_binary, run};
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_under};
@@ -144,7 +143,7 @@ fn main() {
             )
         }
         Cmd::Shim { socket } => bracken_experiment::shim::run(&socket),
-        Cmd::Guard => bracken_experiment::claude::guard(),
+        Cmd::Guard => bracken_experiment::backend::guard(),
         Cmd::Run {
             dir,
             mode,

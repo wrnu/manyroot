@@ -7,7 +7,8 @@
 //! its [`worker`]s, the [`shim`] and the [`mock`] backend) and Bracken mode
 //! ([`bracken_mode`]); step 3 is Git mode ([`git_mode`]); step 4 is CRDT mode
 //! ([`crdt_mode`]), on Automerge; all behind the same [`mode`] interface. Step 6
-//! is the [`claude`] backend, with its [`sandbox`] profiles and forwarding [`proxy`].
+//! is the agent [`backend`], with its forwarding [`proxy`], and Claude Code as its
+//! first harness ([`claude`]), with its [`sandbox`] profiles.
 //! Step 5 measures a run: the [`plan`] fixed before it, and the six [`metrics`]
 //! over its records.
 //!
@@ -20,6 +21,7 @@
 //! return.
 
 pub mod args;
+pub mod backend;
 pub mod bracken_mode;
 pub mod candidates;
 pub mod claude;

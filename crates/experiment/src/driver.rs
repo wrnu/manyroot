@@ -303,7 +303,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     }
     if let Some(why) = backend.halted() {
         // Only the backend's own cap stops are named: any other reason could quote what an agent sent.
-        let cap = [crate::claude::RUN_TOKEN_CAP, crate::claude::RUN_TIME_CAP].into_iter().find(|c| *c == why);
+        let cap = [crate::backend::RUN_TOKEN_CAP, crate::backend::RUN_TIME_CAP].into_iter().find(|c| *c == why);
         run.events.log(None, "run_stopped", json!({"bytes": why.len(), "digest": digest(why.as_bytes()), "cap": cap}));
         return Err(format!("the run stopped: {why}"));
     }

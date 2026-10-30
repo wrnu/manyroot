@@ -403,7 +403,7 @@ fn a_turn_refused_for_a_spent_budget_counts_nothing() {
 
 #[test]
 fn a_run_stopped_by_its_own_cap_is_measured_only_if_the_plan_expects_it() {
-    let cap = crate::claude::RUN_TOKEN_CAP;
+    let cap = crate::backend::RUN_TOKEN_CAP;
     let mut log = Log::new("git");
     log.snap(0, None, &[right("max2")]).start(1, "a", 1).ev(2, Some("a"), "turn_end", json!({"turn": 1}));
     log.turn_usage("a", 1, 10, 1).ev(3, None, "run_stopped", json!({"cap": cap}));
@@ -545,7 +545,7 @@ fn a_phase2_turn_without_a_readable_checkpoint_is_refused() {
     log.turn_usage("a", 1, 10, 1).turn_usage("a", 2, 10, 1);
     assert_eq!(incomplete(&log.records(), &[], p2).as_deref(), Some("turn 2 has no checkpoint"));
     // An expected stop excuses only a turn it cut short: this one ended, so its checkpoint is missing.
-    let cap = crate::claude::RUN_TOKEN_CAP;
+    let cap = crate::backend::RUN_TOKEN_CAP;
     log.events.pop();
     log.ev(6, None, "run_stopped", json!({"cap": cap}));
     assert_eq!(incomplete(&log.records(), &[cap.to_string()], p2).as_deref(), Some("turn 2 has no checkpoint"));
@@ -560,7 +560,7 @@ fn a_phase2_turn_without_a_readable_checkpoint_is_refused() {
 /// turns. Each turn it cut short, one that some agent never ended, has no checkpoint and needs none.
 #[test]
 fn an_expected_stop_excuses_every_turn_it_cut_short() {
-    let cap = crate::claude::RUN_TOKEN_CAP;
+    let cap = crate::backend::RUN_TOKEN_CAP;
     let expected = [cap.to_string()];
     // Three agents: all end turn 1; turn 2 is ended by a and b only; turn 3, by a only. Then the cap stops c
     // in turn 2 and b in turn 3.
