@@ -1267,7 +1267,8 @@ fn merge_clears_the_attributes_checked_variable_for_ground_guards() {
 }
 
 /// test-table runs exactly the table, in order, from the checkout's top, and stops at the first
-/// failure with its exit status non-zero. A `cargo` stub logs each call, and a `ground-guards` stub its
+/// failure with its exit status non-zero. The tests run under nextest, then the doctests under cargo test
+/// (decision `4bf44934cb67` (4)), after a check that nextest is there. A `cargo` stub logs each call, and a `ground-guards` stub its
 /// arguments.
 #[test]
 fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
@@ -1303,18 +1304,26 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(
             calls,
-            "cargo fmt --check\n\
+            "cargo nextest --version\n\
+             cargo fmt --check\n\
              cargo clippy --locked --all-targets -- -D warnings\n\
              cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings\n\
-             cargo test --locked --workspace\n\
+             cargo nextest run --locked --workspace --no-fail-fast\n\
+             cargo test --locked --doc --workspace\n\
              ground-guards origin/main HEAD\n",
             "{scripts}"
         );
 
         let (out, calls) = table_run("--target x86_64");
         assert!(!out.status.success(), "{scripts}: a failing step passed");
-        assert_eq!(calls.lines().count(), 3, "{scripts}: went on after a failure: {calls}");
+        assert_eq!(calls.lines().count(), 4, "{scripts}: went on after a failure: {calls}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("failed: cargo clippy"), "{scripts}");
+
+        // Without cargo-nextest the table stops before its first step, saying what it needs.
+        let (out, calls) = table_run("nextest --version");
+        assert!(!out.status.success(), "{scripts}: ran without nextest");
+        assert_eq!(calls, "cargo nextest --version\n", "{scripts}: went on without nextest");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("needs cargo-nextest"), "{scripts}");
     }
 }
 
@@ -1674,16 +1683,91 @@ fn test_table_remote_p_runs_only_the_named_packages_tests() {
     }
 }
 
+/// The box's nextest (decision `4bf44934cb67` (4), answer `92eacabfd720`): the script test-table sends a box
+/// downloads the pinned release and checks it against the sha256 in test-table before unpacking it, and a
+/// tarball that doesn't match stops the box before it unpacks anything or checks out the tree. The script
+/// runs here with stubs for the box's system tools: `curl` writes the payload asked for, `sha256sum` checks
+/// with this Mac's shasum, and `tar` and `git` log that they ran.
+#[test]
+fn test_table_box_refuses_a_nextest_tarball_that_doesnt_match_its_pin() {
+    for scripts in SCRIPTS {
+        let table = repo_root().join(scripts).join("test-table");
+        let (tmp, dir) = repo(&[("scripts/test-table", &table)], ".bracken/\n", |_| {});
+        assert!(run(&dir, "git", &["update-ref", "refs/remotes/origin/main", "HEAD"]).status.success());
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        // boat run: keeps the box's script, its last argument, whole in $T/inner.
+        write_executable(
+            &stubs.join("boat"),
+            "#!/bin/bash\n\
+             case \"$1\" in\n\
+             run) printf '%s' \"${!#}\" >\"$T/inner\"; echo 'exit 0 · 1m 00s · default · $0.0010 · bx_stub01 deleted' ;;\n\
+             list) echo '{\"sandboxes\":[]}' ;;\n\
+             esac\n",
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let out = command(&dir, "scripts/test-table", &["--remote"]).env("PATH", &path).env("T", tmp.path()).output();
+        assert!(out.unwrap().status.success(), "{scripts}");
+        let inner = std::fs::read_to_string(tmp.path().join("inner")).unwrap();
+        let pinned = "b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f";
+        assert!(inner.starts_with(&format!("nextest_version=0.9.150 nextest_sha256={pinned}\n")), "{scripts}: {inner}");
+
+        // The box's tools, for running its script here.
+        let tools = tmp.path().join("box-tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        for (name, body) in [
+            ("sudo", "exec \"$@\""),
+            ("add-apt-repository", "exit 0"),
+            ("apt-get", "exit 0"),
+            ("curl", "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\nprintf %s \"$PAYLOAD\" >\"$out\""),
+            (
+                "sha256sum",
+                "[ -z \"$SHA_OK\" ] || exit 0\nread -r want file\n[ \"$(shasum -a 256 \"$file\" | cut -d' ' -f1)\" = \"$want\" ]",
+            ),
+            ("tar", "echo tar >>\"$T/ran\""),
+            ("git", "echo git >>\"$T/ran\""),
+        ] {
+            write_executable(&tools.join(name), &format!("#!/bin/bash\n{body}\n"));
+        }
+        let boxed = tmp.path().join("box");
+        std::fs::create_dir_all(&boxed).unwrap();
+        let boxed_run = |sha_ok: &str| {
+            let _ = std::fs::remove_file(tmp.path().join("ran"));
+            let out = Command::new("/bin/bash")
+                .args(["-c", &inner])
+                .current_dir(&boxed)
+                .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+                .env("T", tmp.path())
+                .env("PAYLOAD", "not the pinned release")
+                .env("SHA_OK", sha_ok)
+                .output()
+                .unwrap();
+            (out, std::fs::read_to_string(tmp.path().join("ran")).unwrap_or_default())
+        };
+        // The control: a check that passes goes on to unpack, so the stubs would show a run that went on.
+        let (_, ran) = boxed_run("1");
+        assert!(ran.starts_with("tar\n"), "{scripts}: the control didn't unpack: {ran}");
+
+        let (out, ran) = boxed_run("");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(stderr.contains("does not match its pinned sha256; not running it"), "{scripts}: {stderr}");
+        assert!(ran.is_empty(), "{scripts}: went on after a mismatch: {ran}");
+    }
+}
+
 /// test-table on a docs-only change (owner decision 642a47c04a10): when everything the head changed since
 /// it left origin/main is *.md outside crates/, only fmt and the Ground guards run, and it says so. A change
 /// that also touches code, renames or deletes a file that isn't docs, touches a .md under crates/ (the
 /// code compiles some in), or changes nothing runs the whole table.
 #[test]
 fn test_table_skips_clippy_and_cargo_test_only_for_a_docs_only_change() {
-    let full = "cargo fmt --check\n\
+    let full = "cargo nextest --version\n\
+                cargo fmt --check\n\
                 cargo clippy --locked --all-targets -- -D warnings\n\
                 cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings\n\
-                cargo test --locked --workspace\n\
+                cargo nextest run --locked --workspace --no-fail-fast\n\
+                cargo test --locked --doc --workspace\n\
                 ground-guards origin/main HEAD\n";
     let docs = "cargo fmt --check\nground-guards origin/main HEAD\n";
     let git = |dir: &Path, args: &[&str]| assert!(run(dir, "git", args).status.success(), "git {args:?}");
@@ -1857,6 +1941,19 @@ fn bk_evidence_reuses_a_whole_table_pass_of_the_same_merged_tree_on_the_same_pr(
         for args in [
             &[&claim[..12], "--as", "val", "--reuse", "--", "scripts/test-table"][..],
             &[&claim[..12], "--as", "val", "--on", "main", "--reuse", "--", "scripts/test-table", "--remote"],
+            &[
+                &claim[..12],
+                "--as",
+                "val",
+                "--on",
+                "main",
+                "--reuse",
+                "--",
+                "scripts/test-table",
+                "--remote",
+                "-p",
+                "bracken",
+            ],
             &[&claim[..12], "--as", "val", "--on", "main", "--reuse", "--", "/usr/bin/true"],
         ] {
             let out = run(&dir, "scripts/bk-evidence", args);
@@ -1980,9 +2077,10 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
 }
 
 /// `test-table --split` (owner decision `01a2d668b67e`), with a stub `boat` and `cargo`: the whole table in
-/// one box, as --remote runs it, and here only `cargo test --workspace -- macos_only::`; it passes only if
-/// both do, and ends with both parts' last lines. Which tests need macOS comes from the code: a test that
-/// runs here but is missing or ignored on Linux, by the two sides' `--list`s, must be in a macos_only module.
+/// one box, as --remote runs it, and here only the macos_only tests, under nextest; it passes only if both
+/// do, and ends with both parts' last lines. Which tests need macOS comes from the code: a test that runs
+/// here but is missing or ignored on Linux, by the two sides' lists (nextest's, and cargo test --doc's for
+/// doctests), must be in a macos_only module.
 /// A failure here stops the box and deletes it; a docs-only head uses no box.
 #[test]
 fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
@@ -2015,47 +2113,59 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
              delete) echo \"$*\" >>\"$T/deleted\"; rm -f \"$T/left\" ;;\n\
              esac\n",
         );
-        // cargo: logs its arguments; prints this Mac's lists ($T/mac-all, $T/mac-ignored) for --list, or
-        // with $HANG_LIST hangs in them; the filtered run waits for the box to start, then passes, or fails
-        // with $FAIL_HERE. With $HANG its child hangs; with $SURVIVE it leaves a process in timeout's group;
-        // with $IGNORE_TERM its child ignores SIGTERM.
+        // cargo: says nextest is there; logs its other arguments; prints this Mac's lists for nextest list
+        // ($T/mac-{all,ignored}.nextest) and for cargo test --doc's --list ($T/mac-{all,ignored}.doc), or with
+        // $HANG_LIST hangs in them; the filtered run waits for the box to start, then passes, or fails with
+        // $FAIL_HERE. With $HANG its child hangs; with $SURVIVE it leaves a process in timeout's group; with
+        // $IGNORE_TERM its child ignores SIGTERM.
         write_executable(
             &stubs.join("cargo"),
-            "#!/bin/bash\necho \"cargo $*\" >>\"$LOG\"\n\
-             if [ -n \"$HANG_LIST\" ] && [[ $* == *--list* ]]; then touch \"$T/listing\"; sleep 600 & echo $! >>\"$T/pids\"; wait; fi\n\
+            "#!/bin/bash\n[ \"$*\" != 'nextest --version' ] || exit 0\necho \"cargo $*\" >>\"$LOG\"\n\
+             if [ -n \"$HANG_LIST\" ] && [[ $* == *list* ]]; then touch \"$T/listing\"; sleep 600 & echo $! >>\"$T/pids\"; wait; fi\n\
              case \"$*\" in\n\
-             *'--list --ignored'*) cat \"$T/mac-ignored\" ;;\n\
-             *--list*) cat \"$T/mac-all\" ;;\n\
+             *'nextest list'*'--run-ignored only'*) cat \"$T/mac-ignored.nextest\" ;;\n\
+             *'nextest list'*) cat \"$T/mac-all.nextest\" ;;\n\
+             *'--list --ignored'*) cat \"$T/mac-ignored.doc\" ;;\n\
+             *--list*) cat \"$T/mac-all.doc\" ;;\n\
              *macos_only::*) while [ ! -e \"$T/ready\" ]; do sleep 0.1; done\n\
                if [ -n \"$HANG\" ]; then sleep 600 & echo $! >>\"$T/pids\"; wait; fi\n\
                if [ -n \"$IGNORE_TERM\" ]; then (trap '' TERM; exec sleep 600) & echo $! >>\"$T/pids\"; touch \"$T/ignoring\"; wait; fi\n\
                if [ -n \"$SURVIVE\" ]; then sleep 60 >/dev/null 2>&1 & echo $! >\"$T/survivor\"; fi\n\
-               echo 'test result: ok. 1 passed; 0 failed; 0 ignored'; [ -z \"$FAIL_HERE\" ] || exit \"$FAIL_HERE\" ;;\n\
+               echo '     Summary [   1.000s] 1 test run: 1 passed, 0 skipped'; [ -z \"$FAIL_HERE\" ] || exit \"$FAIL_HERE\" ;;\n\
              esac\n",
         );
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
         let log = tmp.path().join("log");
         let t = |name: &str| tmp.path().join(name);
         let read = |name: &str| std::fs::read_to_string(t(name)).unwrap_or_default();
-        // A list as cargo prints it: a binary's Running line, then its tests.
-        let list = |prefix: &str, tests: &[&str]| {
-            let mut s = format!("{prefix}     Running tests/agent.rs (target/debug/deps/agent-0123abcd)\n");
-            for name in tests {
-                s.push_str(&format!("{prefix}{name}: test\n"));
+        // The lists as each side prints them: the tests of the binary `agent` as cargo nextest list
+        // --message-format oneline does, then the doctests (names starting doc:) of the crate `demo` as cargo
+        // test --doc -- --list does: its Doc-tests line, then each test.
+        let nextest = |prefix: &str, tests: &[&str]| {
+            tests.iter().filter(|n| !n.starts_with("doc:")).map(|n| format!("{prefix}agent {n}\n")).collect::<String>()
+        };
+        let doc = |prefix: &str, tests: &[&str]| {
+            let mut s = format!("{prefix}   Doc-tests demo\n");
+            for name in tests.iter().filter_map(|n| n.strip_prefix("doc:")) {
+                s.push_str(&format!("{prefix}src/lib.rs - {name} (line 1): test\n"));
             }
             s
         };
-        let both = ["plain", "macos_only::sandboxed"];
+        let both = ["plain", "macos_only::sandboxed", "doc:f"];
         let setup = |mac_all: &[&str], mac_ign: &[&str], linux_all: &[&str], linux_ign: &[&str]| {
             for name in ["args", "deleted", "ready", "left", "linux"] {
                 let _ = std::fs::remove_file(t(name));
             }
             let _ = std::fs::remove_file(&log);
-            std::fs::write(t("mac-all"), list("", mac_all)).unwrap();
-            std::fs::write(t("mac-ignored"), list("", mac_ign)).unwrap();
-            let linux = list("LIST all ", linux_all)
+            std::fs::write(t("mac-all.nextest"), nextest("", mac_all)).unwrap();
+            std::fs::write(t("mac-ignored.nextest"), nextest("", mac_ign)).unwrap();
+            std::fs::write(t("mac-all.doc"), doc("", mac_all)).unwrap();
+            std::fs::write(t("mac-ignored.doc"), doc("", mac_ign)).unwrap();
+            let linux = nextest("LIST all nextest ", linux_all)
+                + &doc("LIST all doc ", linux_all)
                 + "LIST end all\n"
-                + &list("LIST ignored ", linux_ign)
+                + &nextest("LIST ignored nextest ", linux_ign)
+                + &doc("LIST ignored doc ", linux_ign)
                 + "LIST end ignored\n";
             std::fs::write(t("linux"), linux).unwrap();
         };
@@ -2114,11 +2224,12 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         assert!(alive.success(), "{scripts}: a passing run killed {survivor} in timeout's old group");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("== the box, last lines") && stdout.contains("== here, last lines"), "{scripts}");
-        assert!(stdout.contains("exit 0 · 5m 00s") && stdout.contains("test result: ok. 1 passed"), "{scripts}");
+        assert!(stdout.contains("exit 0 · 5m 00s") && stdout.contains("1 test run: 1 passed"), "{scripts}: {stdout}");
         assert!(stdout.contains("the whole table in a box, and the macOS-only tests here"), "{scripts}");
         assert!(!stdout.contains("LIST "), "{scripts}: printed the box's lists");
         let calls = std::fs::read_to_string(&log).unwrap();
-        assert!(calls.lines().any(|l| l == "cargo test --locked --workspace -- macos_only::"), "{scripts}: {calls}");
+        let here = "cargo nextest run --locked --workspace --no-fail-fast -E test(~macos_only::)";
+        assert!(calls.lines().any(|l| l == here), "{scripts}: {calls}");
         assert!(
             !calls.contains("clippy") && !calls.contains("ground-guards"),
             "{scripts}: the box runs those: {calls}"
@@ -2126,19 +2237,34 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         let args = read("args");
         assert!(args.lines().any(|a| a == "--no-env") && !args.contains("--env"), "{scripts}: {args}");
 
-        // A test that runs here but not on Linux, outside macos_only, is named, whichever way Linux skips it.
-        for (what, mac_all, linux_all, linux_ign) in [
+        // A test that runs here but not on Linux, outside macos_only, is named, whichever way Linux skips it,
+        // and a doctest as well as a test in a test binary.
+        for (what, mac_all, linux_all, linux_ign, escaped) in [
             (
                 "compiled out on Linux",
-                &["plain", "acl", "macos_only::sandboxed"][..],
+                &["plain", "acl", "macos_only::sandboxed", "doc:f"][..],
                 &both[..],
                 &["macos_only::sandboxed"][..],
+                "agent|acl",
             ),
-            ("ignored only on Linux", &both[..], &both[..], &["plain", "macos_only::sandboxed"][..]),
+            ("ignored only on Linux", &both[..], &both[..], &["plain", "macos_only::sandboxed"][..], "agent|plain"),
+            (
+                "a doctest compiled out on Linux",
+                &["plain", "macos_only::sandboxed", "doc:f", "doc:g"][..],
+                &both[..],
+                &["macos_only::sandboxed"][..],
+                "doc:demo|src/lib.rs - g (line 1)",
+            ),
+            (
+                "a doctest ignored only on Linux",
+                &both[..],
+                &both[..],
+                &["macos_only::sandboxed", "doc:f"][..],
+                "doc:demo|src/lib.rs - f (line 1)",
+            ),
         ] {
             setup(mac_all, &[], linux_all, linux_ign);
             let out = split("0", "0", "");
-            let escaped = if mac_all.contains(&"acl") { "agent|acl" } else { "agent|plain" };
             assert_eq!(out.status.code(), Some(1), "{scripts}: {what}: {}", text(&out));
             assert!(text(&out).contains("neither part runs them") && text(&out).contains(escaped), "{scripts}: {what}");
         }
@@ -2157,7 +2283,10 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
         assert!(text(&out).contains("lists didn't finish"), "{scripts}: {}", text(&out));
         setup(&both, &[], &both, &[]);
-        let cut = list("LIST all ", &both) + "LIST end all\n" + &list("LIST ignored ", &[]);
+        let cut = nextest("LIST all nextest ", &both)
+            + &doc("LIST all doc ", &both)
+            + "LIST end all\n"
+            + &nextest("LIST ignored nextest ", &[]);
         std::fs::write(t("linux"), cut).unwrap();
         let out = split("0", "0", "");
         assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
@@ -2261,7 +2390,8 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
 
 /// The split counted run counts as the whole table: merge takes a manager pass of
 /// `scripts/test-table --split` on the merge, main ahead in code, as it takes `scripts/test-table`'s;
-/// a pass of `--remote` alone doesn't count.
+/// a pass of `--remote` alone doesn't count, nor one of `--remote -p`, a builder's scoped tests in a box
+/// (finding 4a25ddba5d49).
 #[test]
 fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
     let code = |dir: &Path| put(dir, "code.txt", "a change\n");
@@ -2272,6 +2402,8 @@ fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
             ("scripts/test-table --split", tree, true),
             ("scripts/test-table --split", "", true),
             ("scripts/test-table --remote", tree, false),
+            ("scripts/test-table --remote -p bracken", tree, false),
+            ("scripts/test-table --remote -p bracken", "", false),
         ] {
             let pass = Tested { command, suffix, ..tested("manager", "main") };
             let out = merge_dry_run_on(scripts, |_| {}, code, lib, Some(pass));
@@ -2491,10 +2623,10 @@ fn verify_seq_interrupted(term: bool) {
              delete) echo \"$*\" >>\"$T/deleted\"; rm -f \"$T/live-$3\" ;;\n\
              esac\n",
         );
-        // cargo: the tests here run 10 minutes; their pid goes to $T/pids.
+        // cargo: says nextest is there; otherwise the tests here run 10 minutes, their pid in $T/pids.
         write_executable(
             &stubs.join("cargo"),
-            "#!/bin/bash\necho $$ >>\"$T/pids\"; touch \"$T/here-$$\"\nexec sleep 600\n",
+            "#!/bin/bash\n[ \"$*\" != 'nextest --version' ] || exit 0\necho $$ >>\"$T/pids\"; touch \"$T/here-$$\"\nexec sleep 600\n",
         );
         let count = |prefix: &str| {
             std::fs::read_dir(&t)

@@ -9,7 +9,8 @@
 #   cargo fmt --check
 #   cargo clippy --locked --all-targets -- -D warnings
 #   cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
-#   timeout 1800 cargo test --locked --workspace
+#   timeout 1800 cargo nextest run --locked --workspace --no-fail-fast
+#   timeout 1800 cargo test --locked --doc --workspace
 #   scripts/ground-guards origin/main HEAD
 # That's AGENTS.md's table plus the checks the manager adds (the Linux-target lint, since nothing
 # runs on Linux now, and the Ground guards). scripts/merge accepts main ahead of a head in code only
@@ -22,8 +23,14 @@
 # test', which bk-evidence then records in its method. Anything else, no origin/main, or no change
 # at all runs the whole table.
 #
-# Needs the x86_64-unknown-linux-gnu target (rustup target add x86_64-unknown-linux-gnu), and
-# timeout (gtimeout on macOS, from coreutils).
+# The tests run under cargo-nextest (decision 4bf44934cb67 (4)): every test, each in its own process,
+# all of the workspace's test binaries at once, then the doctests, which nextest doesn't run, under
+# cargo test --doc. Nothing is left out: nextest's default profile has no filter, and the fast profile
+# in .config/nextest.toml is for builders only.
+#
+# Needs the x86_64-unknown-linux-gnu target (rustup target add x86_64-unknown-linux-gnu), timeout
+# (gtimeout on macOS, from coreutils), and cargo-nextest (reference 4f8a96525a1e) where the tests run
+# here. A box gets its own (below).
 #
 # --remote runs the same table, unchanged, in one boat.dev box instead of on this machine (owner
 # decision 25c1e3543e76): HEAD and origin/main go in as a git bundle, the box checks HEAD out with
@@ -43,10 +50,12 @@
 #
 # --split is the manager's counted run (owner decision 01a2d668b67e): the whole table in one box, as
 # --remote runs it, and at the same time, here, only the tests that need macOS, which Linux skips:
-# every test in a 'mod macos_only' (cargo test --workspace -- macos_only::). It passes only if both
-# pass. Which tests need macOS comes from the code: the box also lists the tests Linux has and
+# every test in a 'mod macos_only' (cargo nextest run -E 'test(~macos_only::)'). It passes only if
+# both pass. Which tests need macOS comes from the code: the box also lists the tests Linux has and
 # ignores, this Mac lists its own, and any test that runs here but is missing or ignored on Linux
 # must be in a macos_only module, or the run fails naming it, so no test is skipped on both sides.
+# Each side lists its tests twice over: cargo nextest list for the tests in test binaries, and cargo
+# test --doc -- --list for the doctests (answer 92eacabfd720).
 # It ends with the last lines of both parts. A docs-only head (below) runs locally, with no box. A
 # Ctrl-C or a failure here stops the box, and the box is deleted as --remote deletes it.
 set -euo pipefail
@@ -72,6 +81,19 @@ delete_box() {
 }
 # The box boat announced ("bx_… ready") in output file $1, not any id the box's own output mentions.
 box_in() { grep -oE '^bx_[a-z0-9]+ ready' "$1" 2>/dev/null | head -1 | cut -d' ' -f1 || true; }
+
+# cargo-nextest for a box (decision 4bf44934cb67 (4), answer 92eacabfd720): its pinned Linux release,
+# checked against this sha256 before it's unpacked, and a mismatch stops the box. The hash is the one
+# nextest publishes beside the tarball on its GitHub release (cargo-nextest-0.9.150-x86_64-unknown-
+# linux-gnu.sha256), which matched GitHub's own digest of the asset and the sha256 of a download, all
+# three checked on 2026-10-30. The tarball holds one file, cargo-nextest.
+nextest_version=0.9.150
+nextest_sha256=b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
+
+# Fails unless cargo can run nextest here.
+need_nextest() {
+  cargo nextest --version >/dev/null 2>&1 || fail "needs cargo-nextest (cargo install --locked cargo-nextest; reference 4f8a96525a1e)"
+}
 
 # The packages --remote -p names: the box runs only their tests, not the table.
 packages=()
@@ -110,7 +132,14 @@ setup() {
   "$@" >"$log" 2>&1 || { rc=$?; echo "test-table: box setup failed (exit $rc): $*" >&2; cat "$log" >&2; exit "$rc"; }
 }
 setup $sudo add-apt-repository -y ppa:git-core/ppa
-setup $sudo apt-get install -y -qq git b3sum
+setup $sudo apt-get install -y -qq git b3sum curl
+nextest_tar=cargo-nextest-$nextest_version-x86_64-unknown-linux-gnu.tar.gz
+nextest_dir=$(mktemp -d)
+setup curl -fsSL -o "$nextest_dir/$nextest_tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/$nextest_tar"
+echo "$nextest_sha256  $nextest_dir/$nextest_tar" | sha256sum -c --quiet - >/dev/null 2>&1 ||
+  { echo "test-table: $nextest_tar does not match its pinned sha256; not running it" >&2; exit 1; }
+setup tar -xzf "$nextest_dir/$nextest_tar" -C "$nextest_dir" cargo-nextest
+export PATH="$nextest_dir:$PATH"
 git init -q tree
 cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
@@ -125,7 +154,8 @@ $what"
     inner="$inner"'
 BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table'
   fi
-  inner="$inner${1:+
+  inner="nextest_version=$nextest_version nextest_sha256=$nextest_sha256
+$inner${1:+
 $1}"
   set +e
   # tee -i: a Ctrl-C must not stop the copy before boat has printed the box it's deleting.
@@ -153,6 +183,12 @@ tests_listed() {
     /Doc-tests / { t = $0; sub(/.*Doc-tests /, "doc:", t); next }
     /: test$/ && t != "" { n = $0; sub(/: test$/, "", n); print t "|" n }
   ' | LC_ALL=C sort -u
+}
+
+# The tests a 'cargo nextest list --message-format oneline' printed ('<binary id> <test>' a line), as
+# sorted '<binary id>|<test>' lines. Doctests come from tests_listed.
+nextest_listed() {
+  awk 'NF == 2 { print $1 "|" $2 }' | LC_ALL=C sort -u
 }
 
 # Stops the process group of job $1, if it still runs: SIGINT, which boat takes as a Ctrl-C and
@@ -212,17 +248,25 @@ bounded() {
 # The macOS-only tests here, then this Mac's lists of the tests it has and ignores, each bounded.
 here_part() {
   trap pass_on INT TERM
-  bounded "$here_limit" cargo test --locked --workspace -- macos_only:: > >(tee -i "$split_tmp/here") 2>&1 || exit
-  bounded 300 cargo test --locked --workspace -- --list >"$split_tmp/mac-all.out" 2>&1 || exit
-  bounded 300 cargo test --locked --workspace -- --list --ignored >"$split_tmp/mac-ignored.out" 2>&1 || exit
-  tests_listed <"$split_tmp/mac-all.out" >"$split_tmp/mac-all"
-  tests_listed <"$split_tmp/mac-ignored.out" >"$split_tmp/mac-ignored"
+  bounded "$here_limit" cargo nextest run --locked --workspace --no-fail-fast -E 'test(~macos_only::)' \
+    > >(tee -i "$split_tmp/here") 2>&1 || exit
+  local which rc
+  for which in all only; do
+    bounded 300 cargo nextest list --locked --workspace --run-ignored "$which" --message-format oneline \
+      >"$split_tmp/mac-$which.nextest" 2>"$split_tmp/mac-$which.err" ||
+      { rc=$?; cat "$split_tmp/mac-$which.err" >&2; exit "$rc"; }
+  done
+  bounded 300 cargo test --locked --doc --workspace -- --list >"$split_tmp/mac-all.doc" 2>&1 || exit
+  bounded 300 cargo test --locked --doc --workspace -- --list --ignored >"$split_tmp/mac-only.doc" 2>&1 || exit
+  { nextest_listed <"$split_tmp/mac-all.nextest"; tests_listed <"$split_tmp/mac-all.doc"; } | LC_ALL=C sort -u >"$split_tmp/mac-all"
+  { nextest_listed <"$split_tmp/mac-only.nextest"; tests_listed <"$split_tmp/mac-only.doc"; } | LC_ALL=C sort -u >"$split_tmp/mac-ignored"
 }
 
 # The whole table in a box and the macOS-only tests here, at once.
 split() {
   local rc=0 here_rc=0 escaped
   command -v boat >/dev/null || fail "--split needs boat (reference ea41264b3c38)"
+  need_nextest
   [ -z "$(git status --porcelain)" ] || fail "--split tests HEAD: commit or set aside the changes first"
   git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
   # split_tmp, box_job and here_job are globals: the EXIT trap runs after this function has returned.
@@ -234,13 +278,17 @@ split() {
     fail "TEST_TABLE_HERE_LIMIT must be 1 to 1800 seconds, not '$here_limit'"
   box_job='' here_job=''
   # Each list ends with a line saying it was whole; under pipefail a failed cargo fails the box, and a
-  # list without its end line fails the run, so a list cut short can't hide a test.
+  # list without its end line fails the run, so a list cut short can't hide a test. nextest's lines and
+  # the doctests' are marked apart, each read by its own parser; nextest's build output goes to
+  # standard error, unmarked, so it's never read as a test.
   # shellcheck disable=SC2016 # expanded in the box
   local lists='set -o pipefail
 echo "test-table: the tests Linux has, and those it ignores"
-cargo test --locked --workspace -- --list 2>&1 | sed "s/^/LIST all /"
+cargo nextest list --locked --workspace --run-ignored all --message-format oneline | sed "s/^/LIST all nextest /"
+cargo test --locked --doc --workspace -- --list 2>&1 | sed "s/^/LIST all doc /"
 echo "LIST end all"
-cargo test --locked --workspace -- --list --ignored 2>&1 | sed "s/^/LIST ignored /"
+cargo nextest list --locked --workspace --run-ignored only --message-format oneline | sed "s/^/LIST ignored nextest /"
+cargo test --locked --doc --workspace -- --list --ignored 2>&1 | sed "s/^/LIST ignored doc /"
 echo "LIST end ignored"'
   # Stops both parts on every way out, then deletes the box by id if boat left it: a killed box part
   # can't. Both run as jobs with job control (set -m): each in its own process group, with SIGINT
@@ -282,12 +330,17 @@ echo "LIST end ignored"'
   fi
   wait "$box_job" || rc=$?
   box_job=''
-  sed -n 's/^LIST all //p' "$split_tmp/box" | tests_listed >"$split_tmp/linux-all"
-  sed -n 's/^LIST ignored //p' "$split_tmp/box" | tests_listed >"$split_tmp/linux-ignored"
+  local which
+  for which in all ignored; do
+    {
+      sed -n "s/^LIST $which nextest //p" "$split_tmp/box" | nextest_listed
+      sed -n "s/^LIST $which doc //p" "$split_tmp/box" | tests_listed
+    } | LC_ALL=C sort -u >"$split_tmp/linux-$which"
+  done
   echo "== the box, last lines"
   grep -v '^LIST ' "$split_tmp/box" | tail -n 15
   echo "== here, last lines"
-  grep -E '^test result: |^test-table: ' "$split_tmp/here" | grep -v ' 0 passed;' | tail -n 8 || true
+  grep -E '^ *Summary \[|^test-table: ' "$split_tmp/here" | tail -n 8 || true
   [ "$rc" -eq 0 ] || { echo "test-table: the box's table exited $rc" >&2; exit "$rc"; }
   { grep -qx 'LIST end all' "$split_tmp/box" && grep -qx 'LIST end ignored' "$split_tmp/box"; } ||
     fail "the box's test lists didn't finish, so which tests need macOS is unknown"
@@ -336,9 +389,11 @@ if scope=$("$here/code-scope" docs-only origin/main HEAD 2>&1); then
   echo "test-table: all passed at $(git rev-parse HEAD), docs-only"
   exit 0
 fi
+need_nextest
 step cargo fmt --check
 step cargo clippy --locked --all-targets -- -D warnings
 step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
-step "$timeout" 1800 cargo test --locked --workspace
+step "$timeout" 1800 cargo nextest run --locked --workspace --no-fail-fast
+step "$timeout" 1800 cargo test --locked --doc --workspace
 step scripts/ground-guards origin/main HEAD
 echo "test-table: all passed at $(git rev-parse HEAD)"
