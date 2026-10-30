@@ -38,7 +38,8 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 
 | What | How |
 |---|---|
-| Decision | claim `--tag decision`, quoting the owner with the date |
+| Decision | claim `--tag decision`, quoting the owner with the date (choices that aren't gated) |
+| Approval of a gated action | the owner signs it with `scripts/owner-approve <id> "<what>"`, or the manager with `--delegated "<the owner's yes>"` after asking for that one approval; never another agent ([docs/development.md](docs/development.md), Owner approvals) |
 | Task | claim `--tag task` holding the brief (manager) |
 | Note, discovery, dead end | claim `--tag note`, related to the task |
 | Question to the manager | claim `--tag question`, related to the task; the answer `refines` it |

@@ -2629,3 +2629,184 @@ fn cleanup_outside_a_checkout_refuses_rather_than_cleaning_the_callers_repo() {
         assert!(out.stdout.is_empty() && stderr.contains("isn't in a git checkout"), "{scripts}: {stderr}");
     }
 }
+
+/// Runs a command on a pseudo-terminal of its own and types `answer` when it asks, or (`answer` None) in a
+/// new session with no terminal at all. Prints what the terminal showed and exits with the command's code.
+const ON_A_TERMINAL: &str = r#"import os, pty, signal, sys
+answer, argv = sys.argv[1], sys.argv[2:]
+signal.alarm(120)
+if answer == "-":
+    os.setsid()
+    os.execvp(argv[0], argv)
+pid, fd = pty.fork()
+if pid == 0:
+    os.execvp(argv[0], argv)
+out, sent = b"", False
+while True:
+    try:
+        data = os.read(fd, 1024)
+    except OSError:
+        break
+    if not data:
+        break
+    out += data
+    if not sent and b"Type approve" in out:
+        os.write(fd, answer.encode() + b"\n")
+        sent = True
+_, status = os.waitpid(pid, 0)
+sys.stdout.buffer.write(out)
+sys.exit(os.waitstatus_to_exitcode(status))
+"#;
+
+/// Task ec880b9c2c86: owner-approve signs, as owner and only on a terminal where the owner types
+/// `approve`, an approval claim naming the full id, related supports it, and prints its id and no key.
+/// As anyone else, without a terminal, for an unknown id, or without `approve`, it writes nothing. With
+/// --delegated it asks nothing and the approval says it was signed on the owner's delegation, quoting
+/// the yes; the same yes can't sign a second approval.
+#[test]
+fn owner_approve_signs_as_owner_only_on_a_terminal_and_never_prints_a_key() {
+    for scripts in SCRIPTS {
+        let approve = repo_root().join(scripts).join("owner-approve");
+        let (tmp, dir) = repo(&[("scripts/owner-approve", &approve)], ".bracken/\n", |_| {});
+        bk(&dir, &["init", "--name", "owner-approve"]);
+        bk(&dir, &["id", "new", "owner"]);
+        bk(&dir, &["id", "new", "manager"]);
+        let task = bk(&dir, &["claim", "Task: a model run", "--tag", "task", "--as", "manager"]);
+        let helper = tmp.path().join("on-a-terminal.py");
+        std::fs::write(&helper, ON_A_TERMINAL).unwrap();
+        let on_a_terminal = |answer: &str, args: &[&str]| {
+            let mut all = vec!["-I", helper.to_str().unwrap(), answer, "scripts/owner-approve"];
+            all.extend(args);
+            run(&dir, "python3", &all)
+        };
+        let approvals = || bk(&dir, &["log", "--tag", "approval", "--json"]);
+        let refused = |out: &Output, says: &str| {
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {text}");
+            assert!(text.contains(says), "{scripts}: wanted {says:?}: {text}");
+            assert_eq!(approvals(), "[]", "{scripts}: wrote an approval: {text}");
+        };
+        let words = "run replicate 2 on the pilot settings";
+
+        let mut as_agent = command(&dir, "scripts/owner-approve", &[&task[..12], words]);
+        refused(&as_agent.env("BRACKEN_AGENT", "manager").output().unwrap(), "only the owner approves");
+        refused(&run(&dir, "scripts/owner-approve", &[&task[..12], words, "--as", "val"]), "only the owner approves");
+        refused(&on_a_terminal("-", &[&task[..12], words]), "needs a terminal");
+        refused(&on_a_terminal("approve", &["0123456789ab", words]), "no contribution");
+        refused(&on_a_terminal("yes", &[&task[..12], words]), "not approved");
+
+        let out = on_a_terminal("approve", &[&task[..12], words]);
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{scripts}: {text}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(text.contains(&task) && text.contains("Task: a model run"), "{scripts}: didn't show it: {text}");
+        let id = text.lines().map(str::trim).rfind(|l| l.len() == 64).unwrap_or_else(|| panic!("{scripts}: {text}"));
+        let shown: serde_json::Value = serde_json::from_str(&bk(&dir, &["show", id, "--json"])).unwrap();
+        assert_eq!(shown["author_name"], "owner", "{scripts}");
+        assert_eq!(shown["body"]["tags"], serde_json::json!(["approval"]), "{scripts}");
+        let statement = shown["body"]["statement"].as_str().unwrap();
+        assert!(statement.starts_with("Approval (owner, ") && statement.ends_with(&format!(" of {task}: {words}")));
+        assert!(statement.contains(", run by the owner) of "), "{scripts}: {statement}");
+        let supports = shown["referrers"].as_array().unwrap().iter().any(|r| {
+            r["author_name"] == "owner" && r["body"]["kind"] == "supports" && r["body"]["to"] == task.as_str()
+        });
+        assert!(supports, "{scripts}: no supports relation from owner: {shown}");
+        // No hex run from the owner's identity file (its keys) reached the terminal.
+        let key = std::fs::read_to_string(dir.join(".bracken/identities/owner.json")).unwrap();
+        for run in key.split(|c: char| !c.is_ascii_hexdigit()).filter(|r| r.len() >= 32) {
+            assert!(!text.contains(run), "{scripts}: printed part of the owner's identity file");
+        }
+
+        // Delegated: the manager, as owner, with no terminal; the approval quotes the owner's yes.
+        let yes = "yes, run replicate 2";
+        let delegated = |args: &[&str]| {
+            let mut all = vec![&task[..12], words, "--delegated", yes];
+            all.extend(args);
+            let mut c = command(&dir, "scripts/owner-approve", &all);
+            c.env("BRACKEN_AGENT", "manager").stdin(std::process::Stdio::null()).output().unwrap()
+        };
+        let count = || serde_json::from_str::<serde_json::Value>(&approvals()).unwrap().as_array().unwrap().len();
+        let out = delegated(&[]);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: signed as manager");
+        assert_eq!(count(), 1, "{scripts}");
+        let out = delegated(&["--as", "owner"]);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{scripts}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+        let shown: serde_json::Value = serde_json::from_str(&bk(&dir, &["show", stdout.trim(), "--json"])).unwrap();
+        assert_eq!(shown["author_name"], "owner", "{scripts}");
+        assert_eq!(shown["body"]["tags"], serde_json::json!(["approval", "delegated"]), "{scripts}");
+        let statement = shown["body"]["statement"].as_str().unwrap();
+        let says = format!(
+            "signed by the manager on the owner's delegation for this approval only; the owner said: '{yes}') of {task}: {words}"
+        );
+        assert!(statement.contains(&says), "{scripts}: {statement}");
+        let again = delegated(&["--as", "owner"]);
+        let stderr = String::from_utf8_lossy(&again.stderr);
+        assert!(again.status.code() == Some(1) && stderr.contains("its own yes"), "{scripts}: {stderr}");
+        assert_eq!(count(), 2, "{scripts}: the same yes signed twice");
+        // Retracting the approval doesn't free its yes (finding 8d9cc19d0568).
+        bk(&dir, &["retract", stdout.trim(), "--as", "owner"]);
+        let again = delegated(&["--as", "owner"]);
+        let stderr = String::from_utf8_lossy(&again.stderr);
+        assert!(again.status.code() == Some(1) && stderr.contains("its own yes"), "{scripts}: reused: {stderr}");
+        assert_eq!(count(), 2, "{scripts}: a retracted approval's yes signed again");
+    }
+}
+
+/// Task ec880b9c2c86: with --owner-approval, merge's owner check needs a current approval signed by owner
+/// that supports the pr claim itself. None, a manager-signed quote, a retracted one, one of a task the
+/// claim implements (finding 9e8e0c849724) or one borrowed from an earlier head through implements
+/// (finding fb07d1777cf6) fails; without the flag there's no owner check.
+#[test]
+fn merge_with_owner_approval_needs_an_owner_signed_approval_of_the_pr_claim_itself() {
+    for scripts in SCRIPTS {
+        let change = |dir: &Path| std::fs::write(dir.join("code.txt"), "a change\n").unwrap();
+        let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, |_| {}, change, |_| {}, None);
+        let plain = merge.output().unwrap();
+        assert!(plain.status.success(), "{scripts}: {}", String::from_utf8_lossy(&plain.stderr));
+        assert!(!String::from_utf8_lossy(&plain.stdout).contains(" owner "), "{scripts}: an owner check unasked");
+        merge.arg("--owner-approval");
+        let owner = |merge: &mut Command| {
+            let out = merge.output().unwrap();
+            (out.status.code(), check_line(&out, "owner"))
+        };
+        bk(&dir, &["id", "new", "owner"]);
+        let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+        let claim = prs[0]["id"].as_str().unwrap().to_owned();
+        let task = bk(&dir, &["claim", "Task: publish it", "--tag", "task", "--as", "manager"]);
+        bk(&dir, &["relate", &claim, "implements", &task, "--as", "builder"]);
+
+        let (code, line) = owner(&mut merge);
+        assert!(code == Some(1) && line.starts_with("FAIL") && line.contains("owner-approve"), "{scripts}: {line}");
+        let quote = bk(&dir, &["claim", "Owner, today: 'merge it'", "--tag", "approval", "--as", "manager"]);
+        bk(&dir, &["relate", &quote, "supports", &claim, "--as", "manager"]);
+        let (code, line) = owner(&mut merge);
+        assert!(code == Some(1) && line.starts_with("FAIL"), "{scripts}: a manager quote counted: {line}");
+
+        let of_task = bk(&dir, &["claim", "Approval (owner): publish", "--tag", "approval", "--as", "owner"]);
+        bk(&dir, &["relate", &of_task, "supports", &task, "--as", "owner"]);
+        let (code, line) = owner(&mut merge);
+        assert!(code == Some(1) && line.starts_with("FAIL"), "{scripts}: a task's approval counted: {line}");
+
+        // An approval of an earlier head, which the builder relates the current claim implements.
+        let old = bk(&dir, &["claim", "PR #1 pr @ 0000: an earlier head", "--tag", "pr", "--as", "builder"]);
+        let of_old = bk(&dir, &["claim", "Approval (owner): the earlier head", "--tag", "approval", "--as", "owner"]);
+        bk(&dir, &["relate", &of_old, "supports", &old, "--as", "owner"]);
+        bk(&dir, &["relate", &claim, "implements", &old, "--as", "builder"]);
+        let (code, line) = owner(&mut merge);
+        assert!(code == Some(1) && line.starts_with("FAIL"), "{scripts}: an earlier head's approval counted: {line}");
+
+        let of_pr = bk(&dir, &["claim", "Approval (owner): merge #1", "--tag", "approval", "--as", "owner"]);
+        bk(&dir, &["relate", &of_pr, "supports", &claim, "--as", "owner"]);
+        let (code, line) = owner(&mut merge);
+        assert!(code == Some(0) && line.contains("supports the pr claim"), "{scripts}: {line}");
+        bk(&dir, &["retract", &of_pr, "--as", "owner"]);
+        let (code, line) = owner(&mut merge);
+        assert!(code == Some(1) && line.starts_with("FAIL"), "{scripts}: a retracted approval counted: {line}");
+
+        let tags = ["--tag", "approval", "--tag", "delegated", "--as", "owner"];
+        let delegated = bk(&dir, &[&["claim", "Approval (owner, delegated): merge #1"][..], &tags].concat());
+        bk(&dir, &["relate", &delegated, "supports", &claim, "--as", "owner"]);
+        let (code, line) = owner(&mut merge);
+        assert!(code == Some(0) && line.contains("on the owner's delegation"), "{scripts}: {line}");
+    }
+}

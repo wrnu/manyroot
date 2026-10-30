@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# owner-approve: the owner signs an approval as owner (decision 61e1d6c6cf8d, task ec880b9c2c86).
+#
+#   owner-approve <id> "<what is approved>" [--as owner]
+#   owner-approve <id> "<what is approved>" --delegated "<the owner's yes, quoted>" --as owner
+#
+# Run by the owner, in a terminal. <id> names what's approved: a task, a pr claim, a run's claim. It
+# shows that contribution, asks you to type "approve", then contributes, as owner, a claim tagged
+# approval, "Approval (owner, <date>, run by the owner) of <full id>: <your words>", and relates it
+# supports <id>, as process section 4.1 records an approval. It prints the approval's id, which you give
+# the manager.
+#
+# --delegated: the manager runs it as owner on the owner's delegation (decision 49cb2097aeeb), only after
+# asking the owner for this one approval and getting an explicit yes in chat. It asks nothing, and the
+# approval says so: tagged approval and delegated, "Approval (owner, <date>, signed by the manager on
+# the owner's delegation for this approval only; the owner said: '<quote>') of <full id>: <words>". One
+# approval per run, never a standing grant: a quote that any approval ever held, retracted or superseded
+# too, is refused, so each approval needs its own yes (finding 8d9cc19d0568). The approval rests on the
+# manager's account of the owner's yes: nothing here can check the quote.
+#
+# It refuses to run as anyone but owner (--as or BRACKEN_AGENT, when set, must be owner), without a
+# terminal to ask on (unless --delegated), and for an id the Ground doesn't hold. It never reads or
+# prints a key: bk signs.
+#
+# In v0 every agent on this machine can read every identity's key, owner's included, so an owner-signed
+# approval records the owner's intent, not proof that the owner gave it. The terminal check stops an
+# agent signing as owner by accident, not on purpose.
+set -euo pipefail
+
+usage() { echo 'usage: owner-approve <id> "<what is approved>" [--delegated "<the owner'"'"'s yes>"] [--as owner]' >&2; exit 2; }
+fail() { echo "owner-approve: $*" >&2; exit 1; }
+
+who=${BRACKEN_AGENT:-owner}
+delegated=""
+args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --as) [ $# -ge 2 ] || usage; who=$2; shift 2 ;;
+    --delegated) [ $# -ge 2 ] || usage; delegated=$2
+      [[ $delegated =~ [^[:space:]] ]] || fail "--delegated needs the owner's yes, quoted"; shift 2 ;;
+    -*) usage ;;
+    *) args+=("$1"); shift ;;
+  esac
+done
+[ ${#args[@]} -eq 2 ] || usage
+target=${args[0]}
+words=${args[1]}
+[ "$who" = owner ] || fail "only the owner approves; this runs as owner, not '$who' (agents ask the manager, process section 3)"
+[[ $target =~ ^[0-9a-f]{8,64}$ ]] || fail "'$target' isn't a contribution id (8 to 64 hex characters)"
+[[ $words =~ [^[:space:]] ]] || fail "say what you approve, in your own words"
+[[ $words != *$'\n'* ]] || fail "keep what you approve to one line"
+[[ $delegated != *$'\n'* ]] || fail "keep the owner's quote to one line"
+
+command -v jq >/dev/null || fail "needs jq"
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+bk() { BRACKEN_AGENT=owner "$here/bk" "$@"; }
+
+shown=$(bk show "$target" --json 2>/dev/null) || fail "no contribution $target in the Ground"
+full=$(jq -r '.id' <<<"$shown")
+summary=$(jq -r '"\(.kind) by \(.author_name // .author[:12]): \(.body.statement // .body.kind // .body.verdict // "")"' <<<"$shown" |
+  LC_ALL=C tr -d '\000-\037\177' | cut -c 1-300)
+
+today=$(date -u +%Y-%m-%d)
+if [ -n "$delegated" ]; then
+  # One yes, one approval. Every approval ever written counts, not only current ones: retracting or
+  # superseding one mustn't free its yes for another.
+  said="the owner said: '$delegated')"
+  used=$(bk log --tag approval --json | jq -r --arg s "$said" '[.[] | select(.body.statement | contains($s))
+    | .id[:12]] | join(" ")')
+  [ -z "$used" ] || fail "approval $used already held that quote (retracted or not); each delegated approval needs its own yes from the owner"
+  statement="Approval (owner, $today, signed by the manager on the owner's delegation for this approval only; $said of $full: $words"
+  tags=(--tag approval --tag delegated)
+  echo "Signing, as owner on the owner's delegation, an approval of $full ($summary)" >&2
+else
+  # Asked on the terminal itself, not stdin, so nothing piped in can answer.
+  { exec 3<>/dev/tty; } 2>/dev/null || fail "needs a terminal: the owner runs this, and types the answer (the manager passes --delegated)"
+  {
+    echo "You're approving, as owner:"
+    echo "  $full"
+    echo "  $summary"
+    echo "with: $words"
+    printf 'Type approve to sign it: '
+  } >&3
+  IFS= read -r answer <&3 || answer=""
+  exec 3<&-
+  [ "$answer" = approve ] || fail "not approved; nothing was written"
+  statement="Approval (owner, $today, run by the owner) of $full: $words"
+  tags=(--tag approval)
+fi
+
+approval=$(bk claim "$statement" "${tags[@]}" --as owner | head -1)
+[[ $approval =~ ^[0-9a-f]{64}$ ]] || fail "the approval wasn't written"
+bk relate "$approval" supports "$full" --as owner >/dev/null ||
+  fail "approval $approval is written but its supports relation isn't; run: scripts/bk relate $approval supports $full --as owner"
+echo "$approval"

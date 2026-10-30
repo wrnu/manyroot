@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # merge: the manager's merge step (process section 5, step 8), checked and recorded.
 #
-#   merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--dry-run]
+#   merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--owner-approval] [--dry-run]
 #
 # Only the manager merges, so it runs only as manager (a dry run defaults to it), and
 # triage and deferrals count only when manager wrote them.
@@ -34,7 +34,13 @@
 #      proves too little;
 #   6. scripts/ground-guards passes on the sha against main's tip: no keys or stray
 #      files under .bracken/, the Ground append-only, the Ground opens, and
-#      docs/vision.md matches it.
+#      docs/vision.md matches it;
+#   7. with --owner-approval, for a PR whose class needs the owner's go (docs/development.md, Owner
+#      approvals): a current claim tagged approval, written by owner (scripts/owner-approve), that owner
+#      related supports this pr claim itself, by its full id. An approval of a task, another PR or an
+#      earlier head doesn't count (findings 9e8e0c849724, fb07d1777cf6): each head needs its own. A
+#      manager-signed quote doesn't count. In v0 keys are shared, so this checks recorded intent, not
+#      proof (task ec880b9c2c86).
 # If all pass, it records manager evidence "merge gate @ <sha>" on the claim, then
 # squash-merges through the forge API with head_commit_id set to the sha, so the
 # forge refuses the merge if the branch moved after the check. --dry-run runs every
@@ -54,7 +60,7 @@ set +ax
 unset token
 
 usage() {
-  echo "usage: merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--dry-run]" >&2
+  echo "usage: merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--owner-approval] [--dry-run]" >&2
   exit 2
 }
 fail() { echo "merge: $*" >&2; exit 1; }
@@ -68,6 +74,7 @@ shift 2
 agent=${BRACKEN_AGENT:-}
 min_passes=
 dry_run=false
+owner_approval=false
 policy=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -75,6 +82,7 @@ while [ $# -gt 0 ]; do
     --min-passes) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]*$ ]] || usage; min_passes=$2; shift 2 ;;
     --as) [ $# -ge 2 ] || usage; agent=$2; shift 2 ;;
     --dry-run) dry_run=true; shift ;;
+    --owner-approval) owner_approval=true; shift ;;
     *) usage ;;
   esac
 done
@@ -313,6 +321,29 @@ else
   check FAIL guards "$( (grep '^ground-guards:' <<<"$guards" || tail -1 <<<"$guards") | tail -1)"
 fi
 
+# 7. The owner's own approval, when the class needs it.
+owner_case="not required for this class"
+if $owner_approval; then
+  approvals=$(bk log --tag approval --current --json)
+  approved=""
+  for a in $(jq -r --arg t "$full" '.referrers[] | select(.kind == "relation" and .retracted == false
+    and .author_name == "owner" and .body.kind == "supports" and .body.to == $t) | .body.from' <<<"$shown"); do
+    if jq -e --arg a "$a" 'any(.[]; .id == $a and .author_name == "owner" and .retracted == false
+      and (.superseded_by_others | length) == 0)' <<<"$approvals" >/dev/null; then
+      approved="${a:0:12} supports the pr claim"
+      ! jq -e --arg a "$a" 'any(.[]; .id == $a and (.body.tags | index("delegated")))' <<<"$approvals" >/dev/null ||
+        approved="$approved, signed by the manager on the owner's delegation"
+      break
+    fi
+  done
+  if [ -n "$approved" ]; then
+    owner_case="owner-signed approval $approved"
+    check ok owner "$owner_case"
+  else
+    check FAIL owner "no current owner-signed approval supports pr claim $claim itself (one of a task or an earlier head doesn't count); the owner signs one with scripts/owner-approve $claim \"<what>\" (a manager-signed quote doesn't count)"
+  fi
+fi
+
 [ "$failed" = 0 ] || fail "not merging PR #$pr: a check failed"
 
 body=$(mktemp)
@@ -326,8 +357,8 @@ if $dry_run; then
   exit 0
 fi
 
-printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\nforge head: %s (PR #%s open against main)\nmain: %s\nguards: %s\n' \
-  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" >"$details"
+printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\nforge head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nowner: %s\n' \
+  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$owner_case" >"$details"
 id=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
   fail "couldn't record the merge-gate evidence; not merging"
 echo "recorded merge gate evidence $id"
