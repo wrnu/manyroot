@@ -8,6 +8,8 @@ use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
@@ -30,6 +32,17 @@ struct Mock {
     /// What it declares, and what it sets each turn.
     names: Vec<&'static str>,
     env: Vec<(&'static str, String)>,
+    /// Its turn configuration's file names, each holding 'conf for <agent>'.
+    files: Vec<&'static str>,
+    /// What it says once `switched` is set, after the start: another secret, pin and names.
+    later: Option<Later>,
+    switched: Arc<AtomicBool>,
+}
+
+struct Later {
+    secret: String,
+    pin: Pin,
+    names: Vec<&'static str>,
 }
 
 impl Mock {
@@ -40,7 +53,15 @@ impl Mock {
             secret: SECRET.into(),
             names: vec!["MOCK_SET", "MOCK_CONF"],
             env: vec![("MOCK_SET", "yes".into())],
+            files: vec!["mock.conf"],
+            later: None,
+            switched: Arc::default(),
         }
+    }
+
+    /// What it says now: its later declarations once switched, else its first.
+    fn now(&self) -> Option<&Later> {
+        self.later.as_ref().filter(|_| self.switched.load(Ordering::SeqCst))
     }
 }
 
@@ -58,19 +79,19 @@ impl Harness for Mock {
     }
 
     fn secret(&self) -> &str {
-        &self.secret
+        self.now().map_or(&self.secret, |l| &l.secret)
     }
 
     fn pin(&self) -> &Pin {
-        &self.pin
+        self.now().map_or(&self.pin, |l| &l.pin)
     }
 
     fn env_names(&self) -> &[&str] {
-        &self.names
+        self.now().map_or(&self.names, |l| &l.names)
     }
 
     fn config(&self, name: &str, _socket: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
-        Ok(vec![("mock.conf", format!("conf for {name}").into_bytes())])
+        Ok(self.files.iter().map(|f| (*f, format!("conf for {name}").into_bytes())).collect())
     }
 
     fn launch(&self, turn: &Turn) -> Result<Launch, String> {
@@ -207,6 +228,92 @@ fn a_harness_may_not_declare_the_backends_own_entries() {
 }
 
 #[test]
+fn a_harness_may_not_declare_a_proxy_setting_a_base_entry_in_another_case_or_a_name_that_isnt_one() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let refused = |name: &'static str| {
+        let mock = Mock { names: vec!["MOCK_SET", name], ..Mock::new("echo init ok") };
+        HarnessBackend::start(mock, backend_config(tmp.path(), caps())).err().expect("refused")
+    };
+    for name in ["HTTP_PROXY", "http_proxy", "NO_PROXY", "no_proxy", "all_proxy", "npm_config_proxy"] {
+        let want = format!(
+            "mock declares {name}, a proxy setting: only the backend's HTTPS_PROXY says where the agent connects"
+        );
+        assert_eq!(refused(name), want);
+    }
+    for name in ["home", "Path", "tmpdir", "https_proxy", "Https_Proxy"] {
+        assert_eq!(refused(name), format!("mock declares {name}, which the backend sets"));
+    }
+    for (name, shown) in
+        [("BAD-NAME", "`BAD-NAME`"), ("", "``"), ("1ST", "`1ST`"), ("A=B", "`A=B`"), ("A\nB", "`A\\nB`")]
+    {
+        assert_eq!(refused(name), format!("mock declares {shown}, which isn't an environment variable name"));
+    }
+    assert!(!tmp.path().join("backend").exists(), "refused before anything was made");
+    let mock = Mock { names: vec!["MOCK_SET", "MOCK_CONF", "_x1", "my_Proxy_host"], ..Mock::new("echo init ok") };
+    let err = HarnessBackend::start(mock, backend_config(tmp.path(), caps())).err().expect("refused");
+    assert!(err.contains("my_Proxy_host, a proxy setting"), "any name holding PROXY, in any case: {err}");
+    let mock = Mock { names: vec!["MOCK_SET", "MOCK_CONF", "_x1", "Mixed_Case"], ..Mock::new("echo init ok") };
+    HarnessBackend::start(mock, backend_config(tmp.path(), caps())).expect("plain names are fine");
+}
+
+#[test]
+fn a_turn_configuration_file_name_that_isnt_one_plain_name_stops_the_run_before_anything_is_written() {
+    let cases: [(Vec<&'static str>, &str); 12] = [
+        (vec!["../x"], "the turn configuration's file name `../x` isn't one plain name"),
+        (vec!["/abs"], "the turn configuration's file name `/abs` isn't one plain name"),
+        (vec!["a/b"], "the turn configuration's file name `a/b` isn't one plain name"),
+        (vec![""], "the turn configuration's file name `` isn't one plain name"),
+        (vec!["."], "the turn configuration's file name `.` isn't one plain name"),
+        (vec!["mock.conf", ".."], "the turn configuration's file name `..` isn't one plain name"),
+        (vec!["mock.conf", "mock.conf"], "the turn configuration names mock.conf twice"),
+        (vec!["mock.conf", "Mock.CONF"], "the turn configuration names Mock.CONF twice (as mock.conf)"),
+        (vec!["a\0b"], "the turn configuration's file name `a\\0b` isn't one plain name"),
+        (vec!["caf\u{e9}"], "the turn configuration's file name `caf\u{e9}` isn't one plain name"),
+        (vec!["cafe\u{301}"], "the turn configuration's file name `cafe\u{301}` isn't one plain name"),
+        (vec!["a b"], "the turn configuration's file name `a b` isn't one plain name"),
+    ];
+    for (files, want) in cases {
+        let s = Setup::with(Mock { files, ..Mock::new("echo init ok; echo result 0 1") }, caps());
+        assert_eq!(s.turn(1), Err(want.into()));
+        assert!(s.backend.halted().is_some());
+        assert!(s.transcript(1).is_none(), "nothing started");
+        assert!(!s.dir.join("turn/agent-0").exists(), "nothing written");
+        assert!(!s.dir.join("turn/x").exists() && !s.dir.join("x").exists(), "nothing written outside");
+    }
+}
+
+/// A backend started with `script` and `set` as the mock's entries, whose mock then declares another
+/// secret, a pin of `other`, and `LATER` as well as its names.
+fn switched(script: &str, set: Vec<(&'static str, String)>, other: &Path) -> Setup {
+    let later = Later {
+        secret: "a different secret".into(),
+        pin: Pin::of(other, "mock").expect("a pin"),
+        names: vec!["MOCK_SET", "MOCK_CONF", "LATER"],
+    };
+    let mock = Mock { env: set, later: Some(later), ..Mock::new(script) };
+    let flag = mock.switched.clone();
+    let s = Setup::with(mock, caps());
+    flag.store(true, Ordering::SeqCst);
+    s
+}
+
+/// Another file, which the mock's later pin names.
+fn other(tmp: &tempfile::TempDir) -> PathBuf {
+    let other = tmp.path().join("other");
+    std::fs::write(&other, "not a program").expect("another file");
+    other
+}
+
+#[test]
+fn an_entry_declared_only_after_the_start_is_still_one_the_harness_didnt_declare() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let set = vec![("MOCK_SET", "yes".to_string()), ("LATER", "1".into())];
+    let s = switched("echo init ok; echo result 0 1", set, &other(&tmp));
+    assert_eq!(s.turn(1), Err("mock set `LATER`, an environment entry it didn't declare".into()));
+    assert!(s.transcript(1).is_none(), "nothing started");
+}
+
+#[test]
 fn a_secret_under_8_bytes_is_refused_at_the_start() {
     let tmp = tempfile::tempdir().expect("a temp dir");
     for secret in ["", "a", "1234567"] {
@@ -236,6 +343,33 @@ fn a_changed_pin_stops_the_run_before_the_turn_starts() {
 /// module's name (owner decision `01a2d668b67e`).
 mod macos_only {
     use super::*;
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn plain_turn_configuration_file_names_dotted_or_not_are_written() {
+        let mock = Mock { files: vec!["mock.conf", ".hidden", "a..b"], ..Mock::new("echo init ok; echo result 0 1") };
+        let s = Setup::with(mock, caps());
+        s.turn(1).expect("plain names, dotted or not, are fine");
+        assert!(s.dir.join("turn/agent-0/.hidden").exists());
+    }
+
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn the_run_keeps_the_secret_and_pin_the_start_checked() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let other = other(&tmp);
+        let set = || vec![("MOCK_SET", "yes".to_string())];
+
+        // The pinned bash still plays the turn and is what's checked, though the harness now names a file
+        // that can't run and no longer matches its own pin.
+        let s = switched("echo init ok; echo result 0 1", set(), &other);
+        std::fs::write(&other, "changed").expect("changed");
+        s.turn(1).expect("the start's pin");
+
+        // The start's secret is still refused in the stream, though the harness now gives another.
+        let s = switched(&format!("echo init ok; echo {SECRET}; echo result 0 1"), set(), &other);
+        assert_eq!(s.turn(1), Err("the event stream held the auth value".into()));
+    }
 
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
