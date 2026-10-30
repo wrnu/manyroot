@@ -37,7 +37,7 @@ Always use `scripts/bk`, never a `bracken` binary built from your branch. The ta
   - the command isn't an executable file: a shell builtin such as `true` or `echo` counts, so pass its path (`/usr/bin/true`) or wrap it in `bash -c '…'`;
   - the pinned `bracken` is too old to read details from a file: ask the manager to upgrade it.
 
-  Your own evidence is recorded but never counts toward the merge gate; the manager re-runs the checks.
+  Your own evidence is recorded but never counts toward the merge gate; the manager re-runs the checks. So run only the packages [AGENTS.md](../AGENTS.md#tests) lists for what your branch changes, never the whole workspace's tests.
 - **A test you think is wrong:** never delete, skip or weaken it. Contribute a claim that `contradicts` it, with your reasoning.
 - **Review findings:** answer each confirmed finding by fixing it in a new head, proposing a deferral (a `question` claim saying what would fix it and when; if the manager agrees, it records the deferred task itself), or disputing it (a claim that `contradicts` it).
 
