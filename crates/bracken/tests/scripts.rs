@@ -2122,14 +2122,14 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
              delete) echo \"$*\" >>\"$T/deleted\"; rm -f \"$T/left\" ;;\n\
              esac\n",
         );
-        // cargo: says nextest is there; logs its other arguments; prints this Mac's lists for nextest list
+        // cargo: says nextest is there, unless $NO_NEXTEST; logs its other arguments; prints this Mac's lists for nextest list
         // ($T/mac-{all,ignored}.nextest) and for cargo test --doc's --list ($T/mac-{all,ignored}.doc), or with
         // $HANG_LIST hangs in them; the filtered run waits for the box to start, then passes, or fails with
         // $FAIL_HERE. With $HANG its child hangs; with $SURVIVE it leaves a process in timeout's group; with
         // $IGNORE_TERM its child ignores SIGTERM.
         write_executable(
             &stubs.join("cargo"),
-            "#!/bin/bash\n[ \"$*\" != 'nextest --version' ] || exit 0\necho \"cargo $*\" >>\"$LOG\"\n\
+            "#!/bin/bash\n[ \"$*\" != 'nextest --version' ] || exit \"${NO_NEXTEST:-0}\"\necho \"cargo $*\" >>\"$LOG\"\n\
              if [ -n \"$HANG_LIST\" ] && [[ $* == *list* ]]; then touch \"$T/listing\"; sleep 600 & echo $! >>\"$T/pids\"; wait; fi\n\
              case \"$*\" in\n\
              *'nextest list'*'--run-ignored only'*) cat \"$T/mac-ignored.nextest\" ;;\n\
@@ -2184,7 +2184,7 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
             let mut c = command(&dir, "scripts/test-table", &["--split"]);
             c.env("PATH", &path).env("T", tmp.path()).env("LOG", &log).env("EXIT", exit).env("SLEEP", sleep);
             c.env("FAIL_HERE", fail_here).env("TEST_TABLE_HERE_LIMIT", "3");
-            for name in ["HANG", "HANG_LIST", "SURVIVE", "IGNORE_TERM"] {
+            for name in ["HANG", "HANG_LIST", "SURVIVE", "IGNORE_TERM", "NO_NEXTEST"] {
                 c.env(name, env.iter().find(|(n, _)| *n == name).map_or("", |(_, v)| *v));
             }
             // Files, not pipes: a process the run left behind would hold a pipe open, and reading it would hang.
@@ -2245,6 +2245,14 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         );
         let args = read("args");
         assert!(args.lines().any(|a| a == "--no-env") && !args.contains("--env"), "{scripts}: {args}");
+
+        // Without cargo-nextest it refuses to start, saying what it needs: no box, and no tests here.
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        let out = split_with("0", "0", "", &[("NO_NEXTEST", "101")], None);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("needs cargo-nextest"), "{scripts}: {}", text(&out));
+        assert!(read("args").is_empty(), "{scripts}: started a box without nextest");
+        assert!(read("log").is_empty(), "{scripts}: ran cargo without nextest: {}", read("log"));
 
         // A test that runs here but not on Linux, outside macos_only, is named, whichever way Linux skips it,
         // and a doctest as well as a test in a test binary.
@@ -3752,7 +3760,9 @@ fn weave_refuses_hand_made_weave_records_but_line_writes_work() {
 /// With `$T/flaky`, the table's next run fails, once; with `$T/flaky-tree`, the next run whose a*.rs files
 /// are those it lists (as `a1.rs a2.rs `) does. With `$T/slow`, each run waits 10 minutes before its
 /// result; with `$T/slow-tree`, only the run of the tree it lists does. With `$T/die-tree`, that tree's run
-/// kills its verify-seq job's leader (SIGKILL), so the job ends without its .done file, once. With
+/// kills its verify-seq job's leader (SIGKILL), so the job ends without its .done file, once, and goes on
+/// in the job's process group, its pid in `$T/orphan`, for 10 minutes; a SIGINT stops it 3 s later, once
+/// it has made `$T/orphan-stopped`. With
 /// `$T/hook-<n>`, the forge runs it at the
 /// `$T/hook-at-<n>`'th GET of /pulls/<n>. With `$T/post-502-<n>`, the POST of #n merges but answers 502,
 /// as a proxy can while the forge merges anyway.
@@ -3793,7 +3803,7 @@ impl Batch {
                  if [ -e \"$T/slow\" ]; then sleep 600; fi\n\
                  if [ -e \"$T/slow-tree\" ] && [ \"$(cat \"$T/slow-tree\")\" = \"$tree\" ]; then sleep 600; fi\n\
                  if [ -e \"$T/die-tree\" ] && [ \"$(cat \"$T/die-tree\")\" = \"$tree\" ]; then rm \"$T/die-tree\"\n\
-                   kill -9 \"$(ps -o pgid= -p $$ | tr -d ' ')\"; sleep 5; fi\n\
+                   echo $$ >\"$T/orphan\"; trap 'sleep 3; touch \"$T/orphan-stopped\"; exit 130' INT; kill -9 \"$(ps -o pgid= -p $$ | tr -d ' ')\"; sleep 600; fi\n\
                  if [ -e broken ]; then echo 'test result: FAILED'; exit 1; fi\necho 'test-table: all passed'\n",
             );
             if main_broken {
@@ -4677,7 +4687,9 @@ fn a_speculative_queue_that_cant_write_a_pass_or_a_pin_says_so_and_fails() {
 }
 
 /// Finding 18c1a991466b: a run whose job dies without its .done file doesn't hang the queue. Its run
-/// recorded nothing by then, so the queue stops there, exit 1.
+/// recorded nothing by then, so the queue stops there, exit 1. What the job left running in its process
+/// group (its test-table, here) is stopped too (task 1d950948aa3f), and waited for, though it takes a
+/// moment to stop, before its worktree is removed (finding fa85e1368475).
 #[test]
 fn a_speculative_run_that_dies_without_its_done_file_doesnt_hang() {
     for scripts in SCRIPTS {
@@ -4688,7 +4700,19 @@ fn a_speculative_run_that_dies_without_its_done_file_doesnt_hang() {
         assert!(started.elapsed() < std::time::Duration::from_secs(60), "{scripts}: hung");
         assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
         assert!(text(&out).contains("prefix 1's run recorded nothing"), "{scripts}: {}", text(&out));
-        // The orphaned run's bk-evidence ends a few seconds later; let it, before the Ground goes.
-        std::thread::sleep(std::time::Duration::from_secs(8));
+        assert!(b.tmp.path().join("orphan-stopped").exists(), "{scripts}: didn't wait for the group: {}", text(&out));
+        assert_eq!(b.worktrees(), 1, "{scripts}: a worktree was left: {}", text(&out));
+        let orphan = std::fs::read_to_string(b.tmp.path().join("orphan")).unwrap();
+        let alive = || {
+            Command::new("/bin/kill").args(["-0", orphan.trim()]).stderr(std::process::Stdio::null()).status().unwrap()
+        };
+        let since = std::time::Instant::now();
+        while alive().success() && since.elapsed() < std::time::Duration::from_secs(20) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if alive().success() {
+            let _ = Command::new("/bin/kill").args(["-KILL", orphan.trim()]).status();
+            panic!("{scripts}: the dead job's test-table {} was left running", orphan.trim());
+        }
     }
 }

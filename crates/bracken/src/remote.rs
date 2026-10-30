@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use manyroot::sync::Rejected;
-use manyroot::{Contribution, ContributionId, Graph, GroundId, ImportReport, Store};
+use manyroot::{Contribution, Graph, GroundId, ImportReport, Store};
 
 use crate::serve::{parse_length, read_head_bytes};
 use crate::wire::{Bounds, Refused, Replica, Side, Timed, run_stream, write_frames};
@@ -113,8 +113,6 @@ struct Response {
     status: u16,
     /// X-Bracken-Session.
     session: Option<String>,
-    /// The change feed's X-Bracken-Unknown-Heads.
-    unknown: Vec<ContributionId>,
     length: u64,
     early: Vec<u8>,
 }
@@ -129,14 +127,7 @@ fn read_response_head(stream: &mut impl Read) -> Result<Response> {
     }
     let mut id = None;
     let mut length = None;
-    let mut unknown = Vec::new();
     for h in response.headers.iter() {
-        if h.name.eq_ignore_ascii_case("x-bracken-unknown-heads") {
-            let text = std::str::from_utf8(h.value).context("bad unknown heads from the server")?;
-            for part in text.split(',') {
-                unknown.push(part.trim().parse().context("bad unknown heads from the server")?);
-            }
-        }
         if h.name.eq_ignore_ascii_case("content-length") {
             length = Some(parse_length(h.value).context("bad Content-Length from the server")?);
         }
@@ -151,7 +142,7 @@ fn read_response_head(stream: &mut impl Read) -> Result<Response> {
     }
     let status = response.code.context("the server's response has no status")?;
     let length = length.context("the server's response has no Content-Length")?;
-    Ok(Response { status, session: id, unknown, length, early })
+    Ok(Response { status, session: id, length, early })
 }
 
 /// The largest change feed reply this side reads: the server's 8 MiB, past which it still sends one
@@ -166,8 +157,6 @@ pub enum Changes {
         /// A bundle, unverified. The caller asks again at once whether or not the server said it has more
         /// (X-Bracken-More), so a reply's size doesn't matter to it.
         bundle: Vec<u8>,
-        /// Heads of the cursor the server doesn't hold (some of them, if many).
-        unknown: Vec<ContributionId>,
     },
 }
 
@@ -190,7 +179,7 @@ pub fn changes(url: &str, token: &str, ground: GroundId, since: &str, wait: Dura
     stream.write_all(head.as_bytes())?;
     stream.write_all(body.as_bytes())?;
     stream.flush()?;
-    let Response { status, unknown, length, early, .. } = read_response_head(&mut stream)?;
+    let Response { status, length, early, .. } = read_response_head(&mut stream)?;
     let mut reader = Cursor::new(early).chain(&mut stream).take(length);
     if matches!(status, 404 | 405 | 501) {
         return Ok(Changes::Unsupported(status));
@@ -208,7 +197,7 @@ pub fn changes(url: &str, token: &str, ground: GroundId, since: &str, wait: Dura
     if bundle.len() as u64 != length {
         bail!("the server's response is shorter than its Content-Length");
     }
-    Ok(Changes::Reply { bundle, unknown })
+    Ok(Changes::Reply { bundle })
 }
 
 /// Syncs with a server reached through a program's stdin and stdout (`ssh host bracken serve
