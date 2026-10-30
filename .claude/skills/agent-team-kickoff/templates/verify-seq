@@ -2,8 +2,9 @@
 # verify-seq: the manager's counted runs of the test table, one PR head at a time, so the runs
 # don't compete for the machine.
 #
-#   [ON=origin/main] verify-seq [--split [-j 2]] <pr claim>:<sha> ...
+#   [ON=origin/main] verify-seq [--split [-j N]] <pr claim>:<sha> ...
 #   [ON=origin/main] verify-seq [--split] --batch <pr claim>:<sha> ...
+#   [ON=origin/main] verify-seq --split [-j N] --speculative <pr claim>:<sha> ...
 #
 # For each pair, in a scratch worktree at <sha> (removed afterwards if the run left it clean), this
 # checkout's bk-evidence records a run of scripts/test-table on <claim> as manager, and the last two
@@ -12,12 +13,13 @@
 # already has the manager's pass of the whole table on a pr claim of the same PR, only the Ground
 # guards run, and the evidence cites that pass (owner decision 642a47c04a10). So re-verifying after
 # main moved only in docs or the Ground costs the guards alone. The main checkout's
-# .git/verify-seq.sh calls this one.
+# .git/verify-seq.sh calls this one. A PR whose worktree can't be made, or whose run records nothing
+# (bk-evidence refused, or a write it couldn't confirm), is named, and verify-seq exits 1.
 #
 # --split runs scripts/test-table --split instead (owner decision 01a2d668b67e): the whole table in a
-# boat box and the macOS-only tests here, one evidence per PR. With it, -j 2 runs two PRs at once, a
-# box each (the trial allows 2 boxes), and prints each one's lines when it ends. Without --split the
-# runs share this machine, so -j is refused.
+# boat box and the macOS-only tests here, one evidence per PR. With it, -j N runs N PRs at once, a box
+# each, 1 to 8 and 4 by default (decision 2a9e444218d6, answer c3e60ba8b879), and prints each one's lines
+# when it ends. Without --split the runs share this machine, so they go one at a time and -j is refused.
 #
 # --batch (decision db6f7705c0a4) tests the heads together, in the order given: one run of the table on
 # the tree main (ON, default origin/main) merged with each head in turn, the tree scripts/merge --batch
@@ -29,25 +31,45 @@
 # the same way) to the first prefix that fails after one that passed, runs that prefix once more, and
 # only if it fails again records a fail on that member, its method ending 'pinned' and its details naming
 # the members before it (finding 663c221a4c20: a flaky fail would otherwise land on an innocent member).
-# If main alone fails, the rerun passes, or a run is interrupted, no member gets anything. A head that doesn't merge cleanly onto the heads before it, or a batch that changes only docs,
+# If main alone fails, the rerun passes, or a run is interrupted, no member gets anything. A head that
+# doesn't merge cleanly onto the heads before it, or a batch that changes only docs,
 # runs nothing.
+#
+# --speculative (task 74fb85858e88, proposal b4ebad7274a6, answer c3e60ba8b879) tests the heads A1..An as a
+# merge queue, in the order given: every prefix, main plus A1..Ai, is an ordinary batch of i on the same
+# main (a claim tagged batch and speculative, in --batch's form), and up to -j of them run at once, each a
+# --split run of its own. Passes are recorded in order: once prefix i and every prefix before it passed,
+# each of its members gets --batch's pass for it. So the plain 'scripts/merge Ai' accepts Ai by its
+# exact-key rule once main is main plus A1..A(i-1), and 'merge --batch <prefix i>' merges A1..Ai at once.
+# The first prefix f that fails is run once more (with main alone too, if f is 1). If the rerun passes, it
+# counts as a pass of that tree, and a note on the prefix's claim names the first fail as a suspected
+# flake. If it fails again, Af gets --batch's pinned fail; the prefixes after it, which all hold it, are
+# stopped and dropped, and the members after it are tested again without it, as new prefixes on the same
+# main (a member that no longer merges without it is named, not run). If main alone fails, or a run
+# records nothing, nothing more is recorded. A member that changes only docs, or doesn't merge onto the
+# members before it, is refused up front, by name, before anything runs. It ends by listing what passed,
+# in merge order, what was pinned and what wasn't verified, and exits 0 only if every member passed. A
+# pass or pin that can't be written isn't reported as done: the queue stops there and exits 1, as it does
+# when a run's job ends without recording anything.
 #
 # A Ctrl-C or SIGTERM stops every running run, each box deleted, and records no evidence for them;
 # it exits 130.
 set -uo pipefail
 
-usage() { echo "usage: [ON=<main>] verify-seq [--split [-j 2]] [--batch] <pr claim>:<sha> ..." >&2; exit 2; }
+usage() { echo "usage: [ON=<main>] verify-seq [--split [-j N]] [--batch | --speculative] <pr claim>:<sha> ..." >&2; exit 2; }
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 cd "$main" || exit 1
 table=(scripts/test-table)
-jobs=1
+jobs=''
 batch=false
+speculative=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --split) table=(scripts/test-table --split); shift ;;
     --batch) batch=true; shift ;;
-    -j) [ $# -ge 2 ] && [[ $2 =~ ^[12]$ ]] || { echo "verify-seq: -j takes 1 or 2 (the trial's boxes)" >&2; exit 2; }
+    --speculative) speculative=true; shift ;;
+    -j) [ $# -ge 2 ] && [[ $2 =~ ^[1-8]$ ]] || { echo "verify-seq: -j takes 1 to 8 (boxes at once)" >&2; exit 2; }
       jobs=$2; shift 2 ;;
     --) shift; break ;;
     -*) usage ;;
@@ -76,8 +98,17 @@ elif [ "$min_gb" -gt 0 ]; then
 fi
 
 [ $# -ge 1 ] || usage
-[ "$jobs" -eq 1 ] || [ ${#table[@]} -eq 2 ] || { echo "verify-seq: -j 2 needs --split: local runs would compete" >&2; exit 2; }
-! $batch || [ "$jobs" -eq 1 ] || { echo "verify-seq: --batch runs one tree at a time; -j doesn't apply" >&2; exit 2; }
+split=false
+[ ${#table[@]} -eq 1 ] || split=true
+[ -z "$jobs" ] || [ "$jobs" -eq 1 ] || $split || { echo "verify-seq: -j needs --split: local runs would compete" >&2; exit 2; }
+! $batch || [ -z "$jobs" ] || { echo "verify-seq: --batch runs one tree at a time; -j doesn't apply" >&2; exit 2; }
+! $batch || ! $speculative || { echo "verify-seq: --batch and --speculative don't go together" >&2; exit 2; }
+! $speculative || $split || { echo "verify-seq: --speculative needs --split: its runs go in boxes at once" >&2; exit 2; }
+# Boxes at once (decision 2a9e444218d6, answer c3e60ba8b879): 4 by default with --split; one run at a
+# time without it, or with --batch.
+if [ -z "$jobs" ]; then
+  if $split && ! $batch; then jobs=4; else jobs=1; fi
+fi
 
 # One pair, start to end, its lines printed together. Its run's output goes to a file, not a pipe:
 # a reader killed by a Ctrl-C would kill the run's cleanup with SIGPIPE. The job outlives a signal
@@ -90,7 +121,7 @@ verify() {
   local v="${TMPDIR:-/tmp}/verify-$h"
   trap 'stopped=true' INT TERM
   echo "== $claim @ ${h:0:7}"
-  git worktree add -q --detach "$v" "$h" || { echo "worktree add failed"; return; }
+  # The worktree is made before the fork, one at a time (see the loop below).
   cd "$v" || return
   if $stopped; then
     cd "$main" && git worktree remove "$v"
@@ -98,6 +129,9 @@ verify() {
     return
   fi
   "$here/bk-evidence" "$claim" --as manager ${ON:+--on "$ON" --reuse} -- "${table[@]}" >"$logs/$claim.out" 2>&1
+  # Recorded only if bk-evidence says so; anything else (a changed checkout, an unconfirmed write) is a PR
+  # not run, and verify-seq exits 1 (finding f764c35b1147).
+  ! grep -qE '^bk-evidence: recorded (pass|fail) [0-9a-f]{64} ' "$logs/$claim.out" || touch "$logs/$claim.ok"
   cd "$main" || return
   tail -n 2 "$logs/$claim.out"
   if [ -z "$(git -C "$v" status --porcelain)" ]; then git worktree remove "$v" && echo "removed $v"; else echo "LEFT $v (dirty)"; fi
@@ -146,10 +180,10 @@ run_prefix() {
   if [ -z "$(git -C "$v" status --porcelain)" ]; then git worktree remove "$v"; else echo "LEFT $v (dirty)"; fi
 }
 
-run_batch() {
-  local on=${ON:-origin/main} m pair claim sha shown statement n i j
-  local -a claims=() heads=() prs=() commits=() keys=()
-  m=$(git rev-parse --verify -q "$on^{commit}") || { echo "verify-seq: no commit '$on' (nothing run)" >&2; return 1; }
+# read_pairs <pr claim>:<sha> ...: checks that each names that sha's pr claim, and sets the caller's prs,
+# claims (full ids) and heads, in order.
+read_pairs() {
+  local pair claim sha shown statement
   for pair in "$@"; do
     [[ $pair =~ ^([0-9a-f]{12,64}):([0-9a-f]{40})$ ]] || { echo "verify-seq: '$pair' isn't <pr claim>:<full sha>" >&2; return 2; }
     claim=${BASH_REMATCH[1]} sha=${BASH_REMATCH[2]}
@@ -159,6 +193,13 @@ run_batch() {
       { echo "verify-seq: $claim isn't the pr claim for $sha (nothing run)" >&2; return 1; }
     prs+=("${BASH_REMATCH[1]}") claims+=("$(jq -r .id <<<"$shown")") heads+=("$sha")
   done
+}
+
+run_batch() {
+  local on=${ON:-origin/main} m statement n i j
+  local -a claims=() heads=() prs=() commits=() keys=()
+  m=$(git rev-parse --verify -q "$on^{commit}") || { echo "verify-seq: no commit '$on' (nothing run)" >&2; return 1; }
+  read_pairs "$@" || return
   local chain
   chain=$("$here/code-scope" chain "$m" "${heads[@]}") || { echo "verify-seq: the batch doesn't merge (nothing run)" >&2; return 1; }
   while read -r i c k; do commits[i]=$c keys[i]=$k; done <<<"$chain"
@@ -239,6 +280,285 @@ run_batch() {
   return 1
 }
 
+# The speculative queue (task 74fb85858e88, proposal b4ebad7274a6, answer c3e60ba8b879): every prefix of
+# the queue, main plus the first i heads, is an ordinary batch of i on the same main, tested at once.
+
+# start_run <name> <commit> <claim>: starts a run of the table on <commit>, in a scratch worktree, its
+# evidence on <claim>, as a job of its own (see the job notes above), and sets run_pid. Its output goes
+# to $logs/<name>.out, and $logs/<name>.done appears when it ends by itself.
+start_run() {
+  local name=$1 commit=$2 claim=$3 v="${TMPDIR:-/tmp}/verify-spec-$2"
+  echo "== $name @ ${commit:0:7}"
+  rm -f "$logs/$name.done"
+  git worktree add -q --detach "$v" "$commit" || { echo "worktree add failed"; return 1; }
+  set -m
+  (cd "$v" && trap 'exit 130' INT TERM && "$here/bk-evidence" "$claim" --as manager --any-head -- "${table[@]}" &&
+    touch "$logs/$name.done" || { touch "$logs/$name.done"; exit 1; }) >"$logs/$name.out" 2>&1 &
+  run_pid=$!
+  set +m
+}
+
+# end_run <name> <commit> <pid> [stop]: waits for the run (stopping it first with stop, which records
+# nothing for it), prints its last lines and removes its worktree if the run left it clean. Sets
+# ran_verdict (pass, fail, or empty if nothing was recorded) and ran_id.
+end_run() {
+  local name=$1 commit=$2 pid=$3 out v="${TMPDIR:-/tmp}/verify-spec-$2"
+  ran_verdict='' ran_id=''
+  [ "${4:-}" != stop ] || kill -INT -- "-$pid" 2>/dev/null || true
+  while kill -0 "$pid" 2>/dev/null; do wait "$pid" 2>/dev/null; done
+  tail -n 2 "$logs/$name.out"
+  out=$(grep -E '^bk-evidence: recorded (pass|fail) [0-9a-f]{64} ' "$logs/$name.out" | tail -n 1 || true)
+  if [ "${4:-}" != stop ] && [[ $out =~ ^bk-evidence:\ recorded\ (pass|fail)\ ([0-9a-f]{64}) ]]; then
+    ran_verdict=${BASH_REMATCH[1]} ran_id=${BASH_REMATCH[2]}
+  fi
+  if [ -z "$(git -C "$v" status --porcelain 2>/dev/null)" ]; then git worktree remove "$v"; else echo "LEFT $v (dirty)"; fi
+}
+
+run_speculative() {
+  local on=${ON:-origin/main} m i j p q n details statement prefix line c k
+  local -a claims=() heads=() prs=() active=() bad=()
+  m=$(git rev-parse --verify -q "$on^{commit}") || { echo "verify-seq: no commit '$on' (nothing run)" >&2; return 1; }
+  read_pairs "$@" || return
+
+  # Refused up front, naming each (answer c3e60ba8b879, Q3): a member that changes only docs (docs-only
+  # PRs keep their own fast path), and one that doesn't merge onto the prefix before it.
+  prefix=$m
+  for i in "${!heads[@]}"; do
+    if "$here/code-scope" docs-only "$m" "${heads[i]}" >/dev/null 2>&1; then
+      bad+=("#${prs[i]} changes only docs: verify it on its own")
+      continue
+    fi
+    line=$("$here/code-scope" chain "$prefix" "${heads[i]}" 2>/dev/null | sed -n '2p')
+    if [ -z "$line" ]; then
+      bad+=("#${prs[i]} doesn't merge onto main with the members before it")
+      continue
+    fi
+    prefix=$(cut -d' ' -f2 <<<"$line")
+  done
+  if [ ${#bad[@]} -gt 0 ]; then
+    printf 'verify-seq: refused (nothing run): %s\n' "${bad[@]}" >&2
+    return 1
+  fi
+  for i in "${!heads[@]}"; do active+=("$i"); done
+
+  # Per prefix p of the current round (1..n): its commit, key and batch claim; its first run's job, verdict
+  # and evidence; its rerun's. Prefixes 1..done passed in an earlier round and stay as they are; frontier
+  # is the last prefix whose pass is recorded on its members.
+  local -a pcommit=() pkey=() pclaim=() fpid=() fres=() fev=() rpid=() rres=() rev=() started=() pinned=() dropped=()
+  local done=0 frontier=0 next=1 running mpid='' mres='' mev='' abort=''
+  details=$(mktemp)
+  while ! $interrupted; do
+    # A round: the prefixes of the members still in the queue, each a batch claim of its own.
+    n=${#active[@]}
+    [ "$done" -lt "$n" ] || break
+    prefix=$m
+    [ "$done" -eq 0 ] || prefix=${pcommit[done]}
+    for ((p = done + 1; p <= n; p++)); do
+      i=${active[p - 1]}
+      line=$("$here/code-scope" chain "$prefix" "${heads[i]}" 2>/dev/null | sed -n '2p')
+      if [ -z "$line" ]; then
+        # Only after a member was pinned and taken out: this one needed it.
+        dropped+=("#${prs[i]} doesn't merge onto main without ${pinned[*]}: verify it again")
+        active=("${active[@]:0:p-1}" "${active[@]:p}")
+        n=${#active[@]}
+        p=$((p - 1))
+        continue
+      fi
+      read -r _ c k <<<"$line"
+      pcommit[p]=$c pkey[p]=$k prefix=$c
+      statement="Batch of $p on main $m tree $k, tested in this order:"
+      for ((j = 0; j < p; j++)); do
+        statement="$statement $((j + 1)) PR #${prs[active[j]]} ${claims[active[j]]} @ ${heads[active[j]]};"
+      done
+      pclaim[p]=$(bk claim "${statement%;}" --tag batch --tag speculative --as manager --json | jq -r .id) && [ -n "${pclaim[p]}" ] ||
+        { abort="couldn't record prefix $p's batch claim"; break 2; }
+      fpid[p]='' fres[p]='' fev[p]='' rpid[p]='' rres[p]='' rev[p]='' started[p]=''
+      echo "prefix $p: batch ${pclaim[p]}, #${prs[i]} on the ones before it, tree $k"
+    done
+    [ "$done" -lt "$n" ] || break
+    next=$((done + 1)) frontier=$done
+
+    while ! $interrupted; do
+      # Ended runs: their .done file, or their job gone without one (killed, say: finding 18c1a991466b).
+      for ((p = frontier + 1; p <= n; p++)); do
+        if [ -n "${fpid[p]}" ] && ended "p$p" "${fpid[p]}"; then
+          end_run "p$p" "${pcommit[p]}" "${fpid[p]}"
+          fres[p]=${ran_verdict:-none} fev[p]=$ran_id fpid[p]=''
+        fi
+        if [ -n "${rpid[p]}" ] && ended "r$p" "${rpid[p]}"; then
+          end_run "r$p" "${pcommit[p]}" "${rpid[p]}"
+          rres[p]=${ran_verdict:-none} rev[p]=$ran_id rpid[p]=''
+        fi
+      done
+      if [ -n "$mpid" ] && ended main "$mpid"; then
+        end_run main "$m" "$mpid"
+        mres=${ran_verdict:-none} mev=$ran_id mpid=''
+      fi
+
+      # The frontier moves through passes in order, so no member gets a pass from a tree that holds a
+      # member pinned before it.
+      local want_rerun='' want_main=false pin=''
+      while [ "$frontier" -lt "$n" ]; do
+        q=$((frontier + 1))
+        case "${fres[q]}" in
+          pass)
+            # A pass not written isn't done (finding 8bfb7f457462): the frontier stays, and it ends here.
+            record_passes "$q" "${fev[q]}" || { abort="couldn't record prefix $q's passes on all its members"; break; }
+            frontier=$q
+            continue ;;
+          none) abort="prefix $q's run recorded nothing"; break ;;
+          fail) ;;
+          *) break ;;
+        esac
+        # Its first run failed: run it once more (and, for the first prefix, main alone).
+        [ -n "${started[q]}" ] || want_rerun=$q
+        [ "$q" -ne 1 ] || [ -n "$mres$mpid" ] || want_main=true
+        case "${rres[q]}" in
+          pass)
+            # Answer c3e60ba8b879, Q2: the rerun's pass is a pass of that exact tree; the first fail is
+            # noted on the prefix claim as a suspected flake.
+            note_flake "$q"
+            record_passes "$q" "${rev[q]}" || { abort="couldn't record prefix $q's passes on all its members"; break; }
+            frontier=$q
+            continue ;;
+          none) abort="prefix $q's rerun recorded nothing"; break ;;
+          fail)
+            if [ "$q" -eq 1 ]; then
+              case "$mres" in
+                pass) ;;
+                fail | none) abort="main alone ($m) doesn't pass ($([ -n "$mev" ] && echo "evidence $mev" || echo "nothing recorded")); nothing pinned"; break ;;
+                *) break ;;
+              esac
+            fi
+            pin=$q
+            break ;;
+        esac
+        break
+      done
+      [ -z "$abort" ] || break 2
+
+      if [ -n "$pin" ]; then
+        if ! pin_fail "$pin"; then
+          abort="couldn't record the pinned fail on #${prs[active[pin - 1]]}; nothing pinned"
+          break 2
+        fi
+        # Its later prefixes all hold it: stop them, drop what they found, and test those members again
+        # without it.
+        for ((p = pin + 1; p <= n; p++)); do
+          [ -z "${fpid[p]}" ] || end_run "p$p" "${pcommit[p]}" "${fpid[p]}" stop
+          [ -z "${rpid[p]}" ] || end_run "r$p" "${pcommit[p]}" "${rpid[p]}" stop
+          fpid[p]='' rpid[p]=''
+        done
+        i=${active[pin - 1]}
+        pinned+=("#${prs[i]}")
+        active=("${active[@]:0:pin-1}" "${active[@]:pin}")
+        done=$((pin - 1))
+        continue 2
+      fi
+      [ "$frontier" -lt "$n" ] || break
+
+      # Free boxes: a rerun or main alone first, then the next prefix.
+      running=0
+      for ((p = 1; p <= n; p++)); do
+        [ -z "${fpid[p]}" ] || running=$((running + 1))
+        [ -z "${rpid[p]}" ] || running=$((running + 1))
+      done
+      [ -z "$mpid" ] || running=$((running + 1))
+      if [ -n "$want_rerun" ] && [ "$running" -lt "$jobs" ]; then
+        start_run "r$want_rerun" "${pcommit[want_rerun]}" "${pclaim[want_rerun]}" || { abort="couldn't start prefix $want_rerun's rerun"; break 2; }
+        rpid[want_rerun]=$run_pid started[want_rerun]=1 running=$((running + 1))
+      fi
+      if $want_main && [ "$running" -lt "$jobs" ]; then
+        start_run main "$m" "${pclaim[1]}" || { abort="couldn't start main alone"; break 2; }
+        mpid=$run_pid running=$((running + 1))
+      fi
+      while [ "$next" -le "$n" ] && [ "$running" -lt "$jobs" ] && ! $interrupted; do
+        start_run "p$next" "${pcommit[next]}" "${pclaim[next]}" || { abort="couldn't start prefix $next"; break 3; }
+        fpid[next]=$run_pid running=$((running + 1)) next=$((next + 1))
+      done
+      sleep 1
+    done
+    break
+  done
+
+  # Whatever is still running stops, recording nothing.
+  for ((p = 1; p <= ${#active[@]}; p++)); do
+    [ -z "${fpid[p]:-}" ] || end_run "p$p" "${pcommit[p]}" "${fpid[p]}" stop
+    [ -z "${rpid[p]:-}" ] || end_run "r$p" "${pcommit[p]}" "${rpid[p]}" stop
+  done
+  [ -z "$mpid" ] || end_run main "$m" "$mpid" stop
+  rm -f "$details"
+
+  echo "speculative queue on main ${m:0:7}:"
+  if [ "$frontier" -gt 0 ]; then
+    for ((p = 1; p <= frontier; p++)); do
+      i=${active[p - 1]}
+      echo "  passed: #${prs[i]} as prefix $p (batch ${pclaim[p]:0:12}): scripts/merge ${prs[i]} ${claims[i]:0:12}"
+    done
+    echo "  merge them in that order, or at once: scripts/merge --batch ${pclaim[frontier]:0:12}"
+  fi
+  [ ${#pinned[@]} -eq 0 ] || echo "  pinned: ${pinned[*]}"
+  [ ${#dropped[@]} -eq 0 ] || printf '  %s\n' "${dropped[@]}"
+  [ -z "$abort" ] || echo "verify-seq: stopped: $abort" >&2
+  for ((p = frontier + 1; p <= ${#active[@]}; p++)); do echo "  not verified: #${prs[active[p - 1]]}"; done
+  $interrupted && return 130
+  [ "$frontier" -eq "${#active[@]}" ] && [ ${#pinned[@]} -eq 0 ] && [ ${#dropped[@]} -eq 0 ] && [ -z "$abort" ]
+}
+
+# ended <name> <pid>: whether a run has ended: its .done file, or its job gone without writing one.
+ended() { [ -e "$logs/$1.done" ] || ! kill -0 "$2" 2>/dev/null; }
+
+# record_passes <prefix> <run>: every member of the prefix gets #115's batch pass for its claim. Fails if
+# any of those writes does: a pass bk doesn't confirm isn't recorded (finding 8bfb7f457462).
+record_passes() {
+  local q=$1 run=$2 j i ok=true
+  for ((j = 0; j < q; j++)); do
+    i=${active[j]}
+    printf 'speculative queue, prefix %s (batch %s), member %s of %s: the whole table passed on main %s merged with the members up to it in order (commit %s, evidence %s)\n' \
+      "$q" "${pclaim[q]}" $((j + 1)) "$q" "$m" "${pcommit[q]}" "$run" >"$details"
+    bk evidence "${claims[i]}" pass --method "${table[*]} @ ${heads[i]} batch ${pclaim[q]} on $m tree ${pkey[q]} run $run" \
+      --details-file "$details" --as manager >/dev/null ||
+      { echo "verify-seq: couldn't record the pass on ${claims[i]:0:12}" >&2; ok=false; }
+  done
+  $ok || return 1
+  echo "prefix $q passed: recorded on its $q members"
+}
+
+# note_flake <prefix>: says on the prefix's batch claim that its first fail is a suspected flake.
+note_flake() {
+  local q=$1 note
+  note=$(bk claim "Suspected flake (verify-seq --speculative): prefix $q's first run failed (evidence ${fev[q]}), and its rerun of the same tree passed (evidence ${rev[q]}), so the prefix counts as passed (answer c3e60ba8b879)." \
+    --tag note --as manager --json | jq -r .id) && [ -n "$note" ] && bk relate "$note" refines "${pclaim[q]}" --as manager >/dev/null ||
+    echo "verify-seq: couldn't note the suspected flake on prefix $q" >&2
+  echo "prefix $q: first run failed, rerun passed: suspected flake, noted"
+}
+
+# pin_fail <prefix>: its last member gets #115's pinned fail: with the members before it the table
+# passed, and with it added it failed twice. Fails if the write does.
+pin_fail() {
+  local q=$1 i j before='' lo
+  i=${active[q - 1]}
+  for ((j = 0; j < q - 1; j++)); do before="${before:+$before }#${prs[active[j]]}"; done
+  lo=$([ "$q" -eq 1 ] && echo "main alone (evidence $mev)" || echo "prefix $((q - 1)) (commit ${pcommit[q - 1]})")
+  printf 'speculative queue, prefix %s (batch %s): main with the members before it (%s) passed, as %s; with #%s added it failed twice (commit %s, evidence %s and %s). It fails after those members, not necessarily alone.\n' \
+    "$q" "${pclaim[q]}" "${before:- none}" "$lo" "${prs[i]}" "${pcommit[q]}" "${fev[q]}" "${rev[q]}" >"$details"
+  if ! bk evidence "${claims[i]}" fail --method "${table[*]} @ ${heads[i]} batch ${pclaim[q]} on $m tree ${pkey[q]} run ${rev[q]} pinned" \
+    --details-file "$details" --as manager >/dev/null; then
+    echo "verify-seq: couldn't record the fail on ${claims[i]:0:12}" >&2
+    return 1
+  fi
+  echo "fail recorded on PR #${prs[i]} (${claims[i]:0:12}): its addition fails the table"
+}
+
+if $speculative; then
+  command -v jq >/dev/null || { echo "verify-seq: --speculative needs jq" >&2; exit 2; }
+  run_speculative "$@"
+  code=$?
+  git worktree prune
+  ! $interrupted || exit 130
+  exit "$code"
+fi
+
 if $batch; then
   command -v jq >/dev/null || { echo "verify-seq: --batch needs jq" >&2; exit 2; }
   run_batch "$@"
@@ -248,6 +568,7 @@ if $batch; then
   exit "$code"
 fi
 
+not_run=()
 while [ $# -gt 0 ] && ! $interrupted; do
   batch=("$@")
   batch=("${batch[@]:0:$jobs}")
@@ -256,16 +577,38 @@ while [ $# -gt 0 ] && ! $interrupted; do
   for k in "${!batch[@]}"; do
     # A signal before this fork starts no more; one after it reaches this job through jobs -p.
     $interrupted && break
+    # Each worktree is made here, before its fork, one at a time: two jobs adding worktrees at once can
+    # fail on Linux, which skipped a PR while verify-seq still exited 0 (PR #122's first Linux run,
+    # evidence b588cf3bd3a6). One that can't be made is said, and verify-seq exits 1.
+    pair=${batch[$k]}
+    if ! git worktree add -q --detach "${TMPDIR:-/tmp}/verify-${pair#*:}" "${pair#*:}"; then
+      echo "verify-seq: couldn't make a worktree for ${pair%%:*} @ ${pair#*:}; nothing run or recorded for it" >&2
+      not_run+=("$pair")
+      continue
+    fi
+    if $interrupted; then
+      git worktree remove "${TMPDIR:-/tmp}/verify-${pair#*:}"
+      break
+    fi
     set -m
-    verify "${batch[$k]}" >"$logs/$k" 2>&1 &
+    verify "$pair" >"$logs/$k" 2>&1 &
     pids+=($!)
     set +m
   done
   for k in "${!pids[@]}"; do
     # A signal's trap interrupts wait: wait again until the job has ended.
     while kill -0 "${pids[$k]}" 2>/dev/null; do wait "${pids[$k]}" 2>/dev/null; done
+  done
+  for k in "${!batch[@]}"; do
+    [ -e "$logs/$k" ] || continue
     cat "$logs/$k"
+    rm -f "$logs/$k"
+    # A run that recorded nothing, for any reason but an interrupt, is a PR not run (finding f764c35b1147).
+    pair=${batch[$k]}
+    [ -e "$logs/${pair%%:*}.ok" ] || $interrupted || not_run+=("$pair")
+    rm -f "$logs/${pair%%:*}.ok"
   done
 done
 git worktree prune
 ! $interrupted || exit 130
+[ ${#not_run[@]} -eq 0 ] || { echo "verify-seq: not run: ${not_run[*]}" >&2; exit 1; }

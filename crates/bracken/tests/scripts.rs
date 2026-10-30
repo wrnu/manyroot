@@ -2053,7 +2053,10 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
     for scripts in SCRIPTS {
         let seq = repo_root().join(scripts).join("verify-seq");
         let (tmp, dir) = repo(&[("scripts/verify-seq", &seq)], ".bracken/\n", |dir| {
-            write_executable(&dir.join("scripts/bk-evidence"), "#!/bin/sh\necho \"$PWD|$*\" >>\"$LOG\"\n");
+            write_executable(
+                &dir.join("scripts/bk-evidence"),
+                "#!/bin/sh\necho \"$PWD|$*\" >>\"$LOG\"\necho bk-evidence: recorded pass aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '(exit 0)' >&2\n",
+            );
         });
         let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
         let log = tmp.path().join("log");
@@ -2420,7 +2423,8 @@ fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
 }
 
 /// verify-seq --split runs the split counted run, and with -j 2 two PRs at once, each its own evidence; -j
-/// takes at most 2 (the trial's boxes) and only with --split. A stub bk-evidence logs when each starts and ends.
+/// takes 1 to 8 boxes, 4 by default with --split (answer c3e60ba8b879), and only with --split. A stub
+/// bk-evidence logs when each starts and ends.
 #[test]
 fn verify_seq_runs_two_split_runs_at_once() {
     for scripts in SCRIPTS {
@@ -2428,7 +2432,7 @@ fn verify_seq_runs_two_split_runs_at_once() {
         let (tmp, dir) = repo(&[("scripts/verify-seq", &seq)], ".bracken/\n", |dir| {
             write_executable(
                 &dir.join("scripts/bk-evidence"),
-                "#!/bin/sh\necho \"start $1 $*\" >>\"$LOG\"\nsleep 2\necho \"end $1\" >>\"$LOG\"\n",
+                "#!/bin/sh\necho \"start $1 $*\" >>\"$LOG\"\nsleep 2\necho \"end $1\" >>\"$LOG\"\n[ -e \"$LOG.silent-$1\" ] || echo bk-evidence: recorded pass aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '(exit 0)' >&2\n",
             );
         });
         let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?}");
@@ -2461,11 +2465,40 @@ fn verify_seq_runs_two_split_runs_at_once() {
         }
         let worktrees = String::from_utf8(run(&dir, "git", &["worktree", "list"]).stdout).unwrap();
         assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
-        for args in [&["-j", "2", &a][..], &["--split", "-j", "3", &a]] {
+        // --split alone: up to 4 at once, so both start before either ends.
+        let out = seq_run(&["--split", &a, &b]);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        let lines = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = lines.lines().collect();
+        assert!(lines.len() == 4 && lines[..2].iter().all(|l| l.starts_with("start ")), "{scripts}: {lines:?}");
+        for args in [&["-j", "2", &a][..], &["--split", "-j", "9", &a], &["--split", "-j", "0", &a]] {
             let out = seq_run(args);
             assert_eq!(out.status.code(), Some(2), "{scripts}: {args:?}");
             assert!(!log.exists(), "{scripts}: ran with {args:?}");
         }
+        // A worktree that can't be made (a file in its way) is said, the other PR still runs, and
+        // verify-seq exits 1: never a PR skipped with exit 0 (evidence b588cf3bd3a6).
+        let blocker = scratch.join(format!("verify-{first}"));
+        std::fs::write(&blocker, "in the way\n").unwrap();
+        let out = seq_run(&["--split", &a, &b]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(
+            stderr.contains("couldn't make a worktree for aaa111") && stderr.contains("not run: aaa111"),
+            "{scripts}: {stderr}"
+        );
+        let lines = std::fs::read_to_string(&log).unwrap();
+        assert!(lines.contains("start bbb222") && !lines.contains("start aaa111"), "{scripts}: {lines}");
+        std::fs::remove_file(&blocker).unwrap();
+        // A run that records nothing (bk-evidence refused, say) is a PR not run: exit 1, naming it
+        // (finding f764c35b1147).
+        let silent = tmp.path().join("log.silent-aaa111");
+        std::fs::write(&silent, "").unwrap();
+        let out = seq_run(&["--split", &a, &b]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(stderr.contains("not run: aaa111") && !stderr.contains("bbb222"), "{scripts}: {stderr}");
+        std::fs::remove_file(&silent).unwrap();
     }
 }
 
@@ -3716,7 +3749,11 @@ fn weave_refuses_hand_made_weave_records_but_line_writes_work() {
 /// file named `broken`, and a local forge whose `curl` stub answers GET /pulls/<n> and does POST
 /// /pulls/<n>/merge as a squash merge (git merge-tree onto main). PR #n adds `a<n>.rs`, and `broken` too
 /// if it is in `broken`. With `$T/tamper` holding n, the forge's merge of #n leaves main's tree as it was.
-/// With `$T/flaky`, the table's next run fails, once. With `$T/hook-<n>`, the forge runs it at the
+/// With `$T/flaky`, the table's next run fails, once; with `$T/flaky-tree`, the next run whose a*.rs files
+/// are those it lists (as `a1.rs a2.rs `) does. With `$T/slow`, each run waits 10 minutes before its
+/// result; with `$T/slow-tree`, only the run of the tree it lists does. With `$T/die-tree`, that tree's run
+/// kills its verify-seq job's leader (SIGKILL), so the job ends without its .done file, once. With
+/// `$T/hook-<n>`, the forge runs it at the
 /// `$T/hook-at-<n>`'th GET of /pulls/<n>. With `$T/post-502-<n>`, the POST of #n merges but answers 502,
 /// as a proxy can while the forge merges anyway.
 struct Batch {
@@ -3729,6 +3766,20 @@ struct Batch {
 
 impl Batch {
     fn new(scripts: &str, prs: usize, broken: &[usize], main_broken: bool) -> Batch {
+        Batch::shaped(scripts, prs, broken, main_broken, &|_| {}, &|_| 0, &|_, _| {})
+    }
+
+    /// As `new`, with `on_main` adding to main's first commit, PR #n branching from PR #`base(n)`'s branch
+    /// (0 for main), and `extra(dir, n)` adding to PR #n before its commit.
+    fn shaped(
+        scripts: &str,
+        prs: usize,
+        broken: &[usize],
+        main_broken: bool,
+        on_main: &dyn Fn(&Path),
+        base: &dyn Fn(usize) -> usize,
+        extra: &dyn Fn(&Path, usize),
+    ) -> Batch {
         let file = |name: &str| repo_root().join(scripts).join(name);
         let names = ["merge", "ground-guards", "code-scope", "verify-seq", "bk-evidence"];
         let paths: Vec<(String, PathBuf)> = names.iter().map(|n| (format!("scripts/{n}"), file(n))).collect();
@@ -3736,13 +3787,19 @@ impl Batch {
         let (tmp, dir) = repo(&files, ".bracken/identities/\n", |dir| {
             write_executable(
                 &dir.join("scripts/test-table"),
-                "#!/bin/sh\necho \"run $(ls a*.rs 2>/dev/null | tr '\\n' ' ')\" >>\"$LOG\"\n\
+                "#!/bin/sh\ntree=$(ls a*.rs 2>/dev/null | tr '\\n' ' ')\necho \"run $tree\" >>\"$LOG\"\n\
                  if [ -e \"$T/flaky\" ]; then rm \"$T/flaky\"; echo 'test result: FAILED (flaky)'; exit 1; fi\n\
+                 if [ -e \"$T/flaky-tree\" ] && [ \"$(cat \"$T/flaky-tree\")\" = \"$tree\" ]; then rm \"$T/flaky-tree\"; echo 'test result: FAILED (flaky)'; exit 1; fi\n\
+                 if [ -e \"$T/slow\" ]; then sleep 600; fi\n\
+                 if [ -e \"$T/slow-tree\" ] && [ \"$(cat \"$T/slow-tree\")\" = \"$tree\" ]; then sleep 600; fi\n\
+                 if [ -e \"$T/die-tree\" ] && [ \"$(cat \"$T/die-tree\")\" = \"$tree\" ]; then rm \"$T/die-tree\"\n\
+                   kill -9 \"$(ps -o pgid= -p $$ | tr -d ' ')\"; sleep 5; fi\n\
                  if [ -e broken ]; then echo 'test result: FAILED'; exit 1; fi\necho 'test-table: all passed'\n",
             );
             if main_broken {
                 put(dir, "broken", "on main\n");
             }
+            on_main(dir);
         });
         let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
         bk(&dir, &["init", "--name", "batch"]);
@@ -3753,11 +3810,16 @@ impl Batch {
         commit_all(&dir, "ground");
         let mut shas = Vec::new();
         for n in 1..=prs {
-            git(&["switch", "-qc", &format!("pr{n}"), "main"]);
+            let from = match base(n) {
+                0 => "main".to_owned(),
+                b => format!("pr{b}"),
+            };
+            git(&["switch", "-qc", &format!("pr{n}"), &from]);
             put(&dir, &format!("a{n}.rs"), &format!("pr {n}\n"));
             if broken.contains(&n) {
                 put(&dir, "broken", &format!("by pr {n}\n"));
             }
+            extra(&dir, n);
             commit_all(&dir, &format!("pr {n}"));
             shas.push(String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned());
         }
@@ -3832,6 +3894,25 @@ impl Batch {
             .env_remove("MERGE_BATCH")
             .env_remove("MERGE_BATCH_PRECHECK");
         c
+    }
+
+    /// `verify-seq --split --speculative -j <jobs>` over these pairs, in order.
+    fn speculative(&self, pairs: &[String], jobs: &str) -> Output {
+        let mut args = vec!["--split", "--speculative", "-j", jobs];
+        args.extend(pairs.iter().map(String::as_str));
+        self.command("scripts/verify-seq", &args).output().unwrap()
+    }
+
+    /// PR #n's pair, `<claim>:<sha>`.
+    fn pair(&self, n: usize) -> String {
+        format!("{}:{}", &self.claims[n - 1][..12], self.shas[n - 1])
+    }
+
+    /// The table's runs, sorted: parallel runs log in any order.
+    fn sorted_runs(&self) -> Vec<String> {
+        let mut runs = self.runs();
+        runs.sort();
+        runs
     }
 
     fn verify(&self, members: &[usize]) -> Output {
@@ -4239,5 +4320,375 @@ fn merge_batch_refuses_when_a_findings_read_fails() {
             assert!(said.contains(&format!("couldn't read finding {finding}")), "{scripts}: {form}: {said}");
             assert!(b.merged().is_empty(), "{scripts}: {form}: merged past an unread finding");
         }
+    }
+}
+
+impl Batch {
+    /// The manager's passes on PR #n's claim, by the batch claim each names.
+    fn passes_by_batch(&self, n: usize) -> Vec<String> {
+        self.evidence(n)
+            .iter()
+            .filter(|(v, _)| v == "pass")
+            .filter_map(|(_, m)| m.split(" batch ").nth(1).map(|r| r[..64].to_owned()))
+            .collect()
+    }
+
+    /// The speculative batch claims, by their member count.
+    fn speculative_claims(&self) -> Vec<(usize, String)> {
+        let log: serde_json::Value =
+            serde_json::from_str(&bk(&self.dir, &["log", "--tag", "speculative", "--json"])).unwrap();
+        log.as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                let statement = c["body"]["statement"].as_str().unwrap();
+                let n = statement.strip_prefix("Batch of ").unwrap().split(' ').next().unwrap().parse().unwrap();
+                (n, c["id"].as_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+}
+
+/// The speculative queue (task 74fb85858e88): every prefix main+A1..Ai is tested at once, each an ordinary
+/// batch, and every member of a passing prefix gets its batch pass. The plain merge then takes A1, A2 and
+/// A3 in order, each by the exact-key rule, as main reaches the prefix before it.
+#[test]
+fn a_speculative_queue_tests_every_prefix_at_once_and_the_plain_merge_takes_them_in_order() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 3, &[], false);
+        let out = b.speculative(&[b.pair(1), b.pair(2), b.pair(3)], "4");
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert_eq!(
+            b.sorted_runs(),
+            ["run a1.rs ", "run a1.rs a2.rs ", "run a1.rs a2.rs a3.rs "],
+            "{scripts}: each prefix once"
+        );
+        let mut claims = b.speculative_claims();
+        claims.sort();
+        assert_eq!(claims.iter().map(|(n, _)| *n).collect::<Vec<_>>(), [1, 2, 3], "{scripts}");
+        // PR #i is a member of prefixes i..3, and has a pass for each.
+        for (n, want) in [(1, 3), (2, 2), (3, 1)] {
+            let passes = b.passes_by_batch(n);
+            assert_eq!(passes.len(), want, "{scripts}: PR #{n}: {:?}", b.evidence(n));
+            assert!(claims[n - 1..].iter().all(|(_, c)| passes.contains(c)), "{scripts}: PR #{n}");
+        }
+        assert!(text(&out).contains(&format!("scripts/merge --batch {}", &claims[2].1[..12])), "{scripts}");
+
+        for n in 1..=3 {
+            let out = b.merge(&[&n.to_string(), &b.claims[n - 1][..12]]);
+            assert!(out.status.success(), "{scripts}: merging #{n}: {}", text(&out));
+            assert!(check_line(&out, "main").contains("tested exactly this head merged with main"), "{scripts}");
+        }
+        assert_eq!(b.merged(), [1, 2, 3], "{scripts}");
+    }
+}
+
+/// A member whose prefix fails twice is pinned with #115's fail. The prefixes before it keep their passes,
+/// and the members after it are tested again without it, so the plain merge takes #1 and then #3.
+#[test]
+fn a_speculative_queue_pins_a_failing_member_and_retests_the_later_ones_without_it() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 3, &[2], false);
+        let out = b.speculative(&[b.pair(1), b.pair(2), b.pair(3)], "4");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("pinned: #2"), "{scripts}: {}", text(&out));
+        let runs = b.sorted_runs();
+        let count = |r: &str| runs.iter().filter(|x| x.as_str() == r).count();
+        assert_eq!(count("run a1.rs a2.rs "), 2, "{scripts}: the failing prefix and its rerun: {runs:?}");
+        assert_eq!(count("run a1.rs a3.rs "), 1, "{scripts}: #3 again without #2: {runs:?}");
+        assert_eq!(count("run a1.rs "), 1, "{scripts}: prefix 1 isn't rerun: {runs:?}");
+
+        let two = b.evidence(2);
+        assert!(two.len() == 1 && two[0].0 == "fail" && two[0].1.ends_with(" pinned"), "{scripts}: {two:?}");
+        assert_eq!(b.passes_by_batch(3).len(), 1, "{scripts}: #3's pass, from main+#1+#3: {:?}", b.evidence(3));
+        assert!(b.evidence(3).iter().all(|(v, _)| v == "pass"), "{scripts}");
+        // #1's passes are prefix 1's and main+#1+#3's, never one of a tree holding #2.
+        assert_eq!(b.passes_by_batch(1).len(), 2, "{scripts}: {:?}", b.evidence(1));
+        let worktrees = String::from_utf8(run(&b.dir, "git", &["worktree", "list"]).stdout).unwrap();
+        assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
+
+        for n in [1, 3] {
+            let out = b.merge(&[&n.to_string(), &b.claims[n - 1][..12]]);
+            assert!(out.status.success(), "{scripts}: merging #{n}: {}", text(&out));
+        }
+        assert_eq!(b.merged(), [1, 3], "{scripts}");
+    }
+}
+
+/// Answer c3e60ba8b879, Q2: a prefix whose first run fails and whose rerun passes counts as passed. The
+/// rerun's pass is recorded, a note on the prefix's claim names the suspected flake, and the queue goes on.
+#[test]
+fn a_speculative_prefix_that_passes_its_rerun_counts_and_notes_the_flake() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 3, &[], false);
+        std::fs::write(b.tmp.path().join("flaky-tree"), "a1.rs a2.rs ").unwrap();
+        let out = b.speculative(&[b.pair(1), b.pair(2), b.pair(3)], "4");
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert_eq!(b.runs().iter().filter(|r| r.as_str() == "run a1.rs a2.rs ").count(), 2, "{scripts}");
+        assert!((1..=3).all(|n| b.evidence(n).iter().all(|(v, _)| v == "pass")), "{scripts}: no fail on a member");
+        assert_eq!(b.passes_by_batch(2).len(), 2, "{scripts}: {:?}", b.evidence(2));
+        let mut claims = b.speculative_claims();
+        claims.sort();
+        let shown: serde_json::Value = serde_json::from_str(&bk(&b.dir, &["show", &claims[1].1, "--json"])).unwrap();
+        let noted = shown["referrers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["kind"] == "relation" && r["body"]["kind"] == "refines" && r["author_name"] == "manager");
+        assert!(noted, "{scripts}: no note on prefix 2's claim: {shown}");
+        let notes = bk(&b.dir, &["log", "--tag", "note", "--full"]);
+        assert!(notes.contains("Suspected flake") && notes.contains("prefix 2"), "{scripts}: {notes}");
+    }
+}
+
+/// Answer c3e60ba8b879, Q3: a member that doesn't merge onto the ones before it, or that changes only docs,
+/// is refused up front by name, and nothing runs or is written. And the queue's options: --split is
+/// needed, --batch isn't allowed with it, and -j takes 1 to 8.
+#[test]
+fn a_speculative_queue_refuses_conflicting_and_docs_only_members_up_front() {
+    for scripts in SCRIPTS {
+        // #1 and #2 both add `broken`, differently: #2 doesn't merge onto #1.
+        let b = Batch::new(scripts, 3, &[1, 2], false);
+        let git = |args: &[&str]| assert!(run(&b.dir, "git", args).status.success(), "git {args:?}");
+        // Only the doc: the fixture's Ground is tracked, and committing it here would take it off main.
+        git(&["switch", "-qc", "docs", "main"]);
+        put(&b.dir, "notes.md", "docs only\n");
+        git(&["add", "notes.md"]);
+        git(&["commit", "-qm", "docs only"]);
+        let docs = String::from_utf8(run(&b.dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
+        git(&["switch", "-q", "main"]);
+        let claim = bk(&b.dir, &["claim", &format!("PR #9 docs @ {docs}: notes"), "--tag", "pr", "--as", "builder"]);
+        let docs_pair = format!("{}:{docs}", &claim[..12]);
+
+        let before = bk(&b.dir, &["log", "--json"]);
+        let out = b.speculative(&[b.pair(1), b.pair(2), docs_pair.clone(), b.pair(3)], "4");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        let said = text(&out);
+        assert!(said.contains("#2 doesn't merge onto main with the members before it"), "{scripts}: {said}");
+        assert!(said.contains("#9 changes only docs"), "{scripts}: {said}");
+        assert!(!said.contains("#3 "), "{scripts}: #3 merges and changes code: {said}");
+        assert!(b.runs().is_empty(), "{scripts}: ran {:?}", b.runs());
+        assert_eq!(bk(&b.dir, &["log", "--json"]), before, "{scripts}: wrote to the Ground");
+
+        for args in [
+            &["--speculative", &b.pair(1)[..]][..],
+            &["--split", "--batch", "--speculative", &b.pair(1)],
+            &["--split", "--speculative", "-j", "9", &b.pair(1)],
+        ] {
+            let out = b.command("scripts/verify-seq", args).output().unwrap();
+            assert_eq!(out.status.code(), Some(2), "{scripts}: {args:?}: {}", text(&out));
+        }
+        assert!(b.runs().is_empty(), "{scripts}");
+    }
+}
+
+/// A Ctrl-C to the queue's process group, or a SIGTERM to verify-seq alone (finding 30d7d14cd54f (5)),
+/// stops every prefix's run, records nothing on any member or prefix, leaves no worktree, and exits 130.
+#[test]
+fn a_speculative_queue_interrupted_stops_every_run_and_records_nothing() {
+    for (scripts, signal) in SCRIPTS.iter().flat_map(|s| [(*s, "-INT"), (*s, "-TERM")]) {
+        let b = Batch::new(scripts, 3, &[], false);
+        std::fs::write(b.tmp.path().join("slow"), "").unwrap();
+        let mut args = vec!["--split".to_owned(), "--speculative".to_owned(), "-j".to_owned(), "4".to_owned()];
+        args.extend((1..=3).map(|n| b.pair(n)));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let mut c = b.command("scripts/verify-seq", &args);
+        std::os::unix::process::CommandExt::process_group(&mut c, 0);
+        let mut child = c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let started = std::time::Instant::now();
+        while b.runs().len() < 3 {
+            assert!(child.try_wait().unwrap().is_none(), "{scripts}: verify-seq ended before its runs started");
+            assert!(started.elapsed() < std::time::Duration::from_secs(120), "{scripts}: the runs never started");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let group = format!("-{}", child.id());
+        let target = if signal == "-INT" { group.clone() } else { child.id().to_string() };
+        assert!(Command::new("kill").args([signal, "--", &target]).status().unwrap().success());
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if started.elapsed() > std::time::Duration::from_secs(180) {
+                let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+                panic!("{scripts}: verify-seq kept running after a Ctrl-C");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        assert_eq!(status.code(), Some(130), "{scripts}");
+        assert!((1..=3).all(|n| b.evidence(n).is_empty()), "{scripts}: recorded on a member");
+        for (_, claim) in b.speculative_claims() {
+            let shown: serde_json::Value = serde_json::from_str(&bk(&b.dir, &["show", &claim, "--json"])).unwrap();
+            let evidence = shown["referrers"].as_array().unwrap().iter().filter(|r| r["kind"] == "evidence").count();
+            assert_eq!(evidence, 0, "{scripts}: recorded on prefix claim {claim}");
+        }
+        let worktrees = String::from_utf8(run(&b.dir, "git", &["worktree", "list"]).stdout).unwrap();
+        assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
+    }
+}
+
+impl Batch {
+    /// The manager's evidence on a batch claim, as (verdict, method) pairs.
+    fn claim_evidence(&self, claim: &str) -> Vec<(String, String)> {
+        let shown: serde_json::Value = serde_json::from_str(&bk(&self.dir, &["show", claim, "--json"])).unwrap();
+        shown["referrers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["kind"] == "evidence")
+            .map(|r| {
+                (r["body"]["verdict"].as_str().unwrap().to_owned(), r["body"]["method"].as_str().unwrap().to_owned())
+            })
+            .collect()
+    }
+
+    /// The bracken every script here runs refuses to write evidence on any claim listed in `$T/refuse`.
+    fn refuse_evidence_on(&self, claims: &[&str]) {
+        std::fs::write(self.tmp.path().join("refuse"), claims.join("\n") + "\n").unwrap();
+        write_executable(
+            &self.tmp.path().join("bracken"),
+            "#!/usr/bin/env bash\nset -o pipefail\n\
+             if [ \"$1\" = evidence ] && grep -qxF -- \"$2\" \"$T/refuse\"; then echo 'refused for the test' >&2; exit 1; fi\n\
+             \"$REAL_BRACKEN\" \"$@\" | cat\n",
+        );
+    }
+
+    fn worktrees(&self) -> usize {
+        String::from_utf8(run(&self.dir, "git", &["worktree", "list"]).stdout).unwrap().lines().count()
+    }
+}
+
+/// Finding 30d7d14cd54f (1) and (4). When prefix 1 fails twice, main alone runs: if main passes, A1 is pinned
+/// and A2 is tested without it; if main fails too, nothing is pinned. With -j 1 the runs go one at a time, a
+/// rerun before main alone, and those before the next prefix.
+#[test]
+fn a_speculative_queue_pins_the_first_member_only_when_main_alone_passes() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 2, &[1], false);
+        let out = b.speculative(&[b.pair(1), b.pair(2)], "1");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert_eq!(
+            b.runs(),
+            ["run a1.rs ", "run a1.rs ", "run ", "run a2.rs "],
+            "{scripts}: prefix 1, its rerun, main alone, then #2 without #1: {}",
+            text(&out)
+        );
+        let one = b.evidence(1);
+        assert!(one.len() == 1 && one[0].0 == "fail" && one[0].1.ends_with(" pinned"), "{scripts}: {one:?}");
+        assert!(text(&out).contains("pinned: #1"), "{scripts}: {}", text(&out));
+        assert_eq!(b.passes_by_batch(2).len(), 1, "{scripts}: {:?}", b.evidence(2));
+
+        // Main itself fails: every prefix fails, and nothing is pinned on a member.
+        let b = Batch::new(scripts, 2, &[], true);
+        let out = b.speculative(&[b.pair(1), b.pair(2)], "4");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(
+            text(&out).contains("main alone") && text(&out).contains("nothing pinned"),
+            "{scripts}: {}",
+            text(&out)
+        );
+        assert!(!text(&out).contains("pinned: #"), "{scripts}: {}", text(&out));
+        assert!(b.evidence(1).is_empty() && b.evidence(2).is_empty(), "{scripts}");
+        assert_eq!(b.worktrees(), 1, "{scripts}");
+    }
+}
+
+/// Finding 30d7d14cd54f (2): at a pin, a later prefix still running is stopped. It records nothing, its
+/// worktree goes, and the queue doesn't wait for it.
+#[test]
+fn a_speculative_pin_stops_a_later_prefix_that_is_still_running() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 3, &[2], false);
+        std::fs::write(b.tmp.path().join("slow-tree"), "a1.rs a2.rs a3.rs ").unwrap();
+        let started = std::time::Instant::now();
+        let out = b.speculative(&[b.pair(1), b.pair(2), b.pair(3)], "4");
+        assert!(started.elapsed() < std::time::Duration::from_secs(120), "{scripts}: waited for the slow prefix");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(b.runs().iter().any(|r| r == "run a1.rs a2.rs a3.rs "), "{scripts}: prefix 3 never started");
+        let mut claims = b.speculative_claims();
+        claims.sort();
+        let three = &claims.iter().find(|(n, _)| *n == 3).unwrap().1;
+        assert!(
+            b.claim_evidence(three).is_empty(),
+            "{scripts}: the stopped run recorded {:?}",
+            b.claim_evidence(three)
+        );
+        assert!(text(&out).contains("pinned: #2"), "{scripts}: {}", text(&out));
+        assert_eq!(b.passes_by_batch(3).len(), 1, "{scripts}: #3 again without #2: {:?}", b.evidence(3));
+        assert_eq!(b.worktrees(), 1, "{scripts}");
+    }
+}
+
+/// Finding 30d7d14cd54f (3): a later member that merges only on top of the pinned one is named and not run,
+/// and the exit is 1. #1 and #2 make the same change to `y`, so they merge; #3, built on #2, changes it
+/// again, which merges onto main+#1+#2 but conflicts with main+#1 once #2 is out.
+#[test]
+fn a_speculative_queue_names_a_member_that_no_longer_merges_without_the_pinned_one() {
+    for scripts in SCRIPTS {
+        let b = Batch::shaped(
+            scripts,
+            3,
+            &[2],
+            false,
+            &|dir| put(dir, "y", "1\n2\n3\n"),
+            &|n| if n == 3 { 2 } else { 0 },
+            &|dir, n| match n {
+                1 | 2 => put(dir, "y", "X\n2\n3\n"),
+                _ => put(dir, "y", "Y\n2\n3\n"),
+            },
+        );
+        let out = b.speculative(&[b.pair(1), b.pair(2), b.pair(3)], "4");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        let said = text(&out);
+        assert!(said.contains("pinned: #2"), "{scripts}: {said}");
+        assert!(said.contains("#3 doesn't merge onto main without #2: verify it again"), "{scripts}: {said}");
+        assert!(b.evidence(3).is_empty(), "{scripts}: {:?}", b.evidence(3));
+        assert_eq!(b.passes_by_batch(1).len(), 1, "{scripts}: prefix 1 only: {:?}", b.evidence(1));
+        assert_eq!(b.worktrees(), 1, "{scripts}");
+    }
+}
+
+/// Finding 8bfb7f457462: a pass or a pin that isn't written isn't reported as done, and the exit is 1.
+#[test]
+fn a_speculative_queue_that_cant_write_a_pass_or_a_pin_says_so_and_fails() {
+    for scripts in SCRIPTS {
+        // #2's pass is refused: #1 passed, #2 isn't listed as passed, and nothing after it is either.
+        let b = Batch::new(scripts, 3, &[], false);
+        let refused = b.claims[1].clone();
+        b.refuse_evidence_on(&[&refused]);
+        let out = b.speculative(&[b.pair(1), b.pair(2), b.pair(3)], "4");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        let said = text(&out);
+        assert!(said.contains("couldn't record prefix 2's passes"), "{scripts}: {said}");
+        assert!(
+            said.contains("passed: #1 ") && !said.contains("passed: #2 ") && !said.contains("passed: #3 "),
+            "{scripts}: {said}"
+        );
+
+        // The pinned fail on #2 is refused: it isn't listed as pinned.
+        let b = Batch::new(scripts, 2, &[2], false);
+        let refused = b.claims[1].clone();
+        b.refuse_evidence_on(&[&refused]);
+        let out = b.speculative(&[b.pair(1), b.pair(2)], "4");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        let said = text(&out);
+        assert!(said.contains("couldn't record the pinned fail on #2; nothing pinned"), "{scripts}: {said}");
+        assert!(!said.contains("pinned: #2"), "{scripts}: {said}");
+    }
+}
+
+/// Finding 18c1a991466b: a run whose job dies without its .done file doesn't hang the queue. Its run
+/// recorded nothing by then, so the queue stops there, exit 1.
+#[test]
+fn a_speculative_run_that_dies_without_its_done_file_doesnt_hang() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 2, &[], false);
+        std::fs::write(b.tmp.path().join("die-tree"), "a1.rs ").unwrap();
+        let started = std::time::Instant::now();
+        let out = b.speculative(&[b.pair(1), b.pair(2)], "4");
+        assert!(started.elapsed() < std::time::Duration::from_secs(60), "{scripts}: hung");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("prefix 1's run recorded nothing"), "{scripts}: {}", text(&out));
+        // The orphaned run's bk-evidence ends a few seconds later; let it, before the Ground goes.
+        std::thread::sleep(std::time::Duration::from_secs(8));
     }
 }

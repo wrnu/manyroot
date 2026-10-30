@@ -8,7 +8,8 @@
 //! first harness.
 //!
 //! - **The process**: the backend builds it. The pinned program (path and
-//!   blake3 checked before every turn) under the agent sandbox profile; the
+//!   blake3, of the binary or of its whole install, checked before every turn)
+//!   under the agent sandbox profile the harness names; the
 //!   turn configuration written read-only and checked before every turn; an
 //!   environment cleared, then [`BASE_ENV`] (a home and temporary directory
 //!   inside the agent's own, a minimal `PATH`, `HTTPS_PROXY` at the forwarding
@@ -45,7 +46,7 @@ use serde_json::{Value, json};
 
 use crate::driver::Backend;
 use crate::proxy::{Attempt, Proxy, Route};
-use crate::sandbox::{AgentPaths, Sandbox, resolved};
+use crate::sandbox::{AgentPaths, Profile, Sandbox, resolved};
 use crate::worker::Lines;
 
 /// The environment every turn's process gets from the backend, the same for every harness: `HOME` and
@@ -220,32 +221,132 @@ impl Tokens {
     }
 }
 
-/// A harness's pinned program.
+/// A harness's pinned program: one binary ([`Pin::of`]), or a program and the whole tree it runs from
+/// ([`Pin::tree`]). Its fields are private, so only those two make one, and [`Pin::check`] re-asserts
+/// what they established (finding ab0192deac8f).
 #[derive(Debug, Clone)]
 pub struct Pin {
     /// Its real path: the versioned binary, not a package manager's `latest` link.
-    pub path: PathBuf,
-    /// blake3 of its bytes, hex.
-    pub blake3: String,
+    path: PathBuf,
+    /// What it reads its own files from, resolved: the tree a tree pin covers, else the binary's
+    /// directory, which the sandbox lets it read but isn't hashed.
+    install: PathBuf,
+    /// blake3, hex: of the binary's bytes, or of the tree's manifest ([`tree_hash`]).
+    blake3: String,
     /// The version its start event must show.
-    pub version: String,
+    version: String,
+    tree: bool,
 }
 
 impl Pin {
     /// Pins the binary at `path` as it is now.
     pub fn of(path: &Path, version: &str) -> Result<Pin, String> {
         let path = std::fs::canonicalize(path).map_err(|e| format!("resolving {}: {e}", path.display()))?;
-        Ok(Pin { blake3: file_hash(&path)?, path, version: version.into() })
+        let install = path.parent().ok_or("the pinned binary has no directory")?.to_path_buf();
+        Ok(Pin { blake3: file_hash(&path)?, path, install, version: version.into(), tree: false })
     }
 
-    /// Whether the binary is still the pinned one; `harness` names it in the error.
+    /// Pins `program` and everything under `root`, which must hold it, as they are now: for a program an
+    /// interpreter runs from its own packages, such as Node.js and Pi's (security note `b8bbcf81bc17` (d)).
+    pub fn tree(program: &Path, root: &Path, version: &str) -> Result<Pin, String> {
+        let install = std::fs::canonicalize(root).map_err(|e| format!("resolving {}: {e}", root.display()))?;
+        let path = std::fs::canonicalize(program).map_err(|e| format!("resolving {}: {e}", program.display()))?;
+        if !path.starts_with(&install) || !path.is_file() {
+            return Err(format!("{} isn't a file inside {}", program.display(), install.display()));
+        }
+        Ok(Pin { blake3: tree_hash(&install)?, path, install, version: version.into(), tree: true })
+    }
+
+    /// blake3, hex: of the binary's bytes, or of the tree's manifest.
+    pub fn blake3(&self) -> &str {
+        &self.blake3
+    }
+
+    /// Whether the program, and a tree pin's whole tree, is still the pinned one; `harness` names it in
+    /// the error.
     fn check(&self, harness: &str) -> Result<(), String> {
+        // What the constructors established, asserted again before every turn: a tree pin's program is
+        // inside its tree, and a binary's install is its own directory.
+        let held = match self.tree {
+            true => self.path.starts_with(&self.install),
+            false => self.path.parent() == Some(self.install.as_path()),
+        };
+        if !held {
+            return Err(format!("the pinned {harness} program isn't inside its install"));
+        }
         let real = std::fs::canonicalize(&self.path).map_err(|e| format!("the pinned binary: {e}"))?;
-        if real != self.path || file_hash(&real)? != self.blake3 {
-            return Err(format!("the pinned {harness} binary changed"));
+        if !self.tree {
+            if real != self.path || file_hash(&real)? != self.blake3 {
+                return Err(format!("the pinned {harness} binary changed"));
+            }
+            return Ok(());
+        }
+        // The program is inside the tree, so a tree that now resolves elsewhere moves it too.
+        let changed = |why: String| format!("the pinned {harness} install changed: {why}");
+        if real != self.path {
+            return Err(changed("its program resolves elsewhere".into()));
+        }
+        if tree_hash(&self.install).map_err(changed)? != self.blake3 {
+            return Err(changed("its manifest's hash differs".into()));
         }
         Ok(())
     }
+}
+
+/// blake3, hex, of the manifest of every entry under `root`, `root` included, in path order. An entry
+/// is its kind and path relative to `root`, then a directory's mode, a file's mode and contents' blake3,
+/// or a symbolic link's target as written, never followed; each field ends in NUL, which no path or
+/// target holds. Refuses a tree an entry could reach outside of: a symbolic link that leads anywhere but
+/// through the tree to something in it ([`beneath`]), a file with another hard link, or anything but a
+/// file, directory or link.
+fn tree_hash(root: &Path) -> Result<String, String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let mut h = blake3::Hasher::new();
+    let mut field = |b: &[u8]| {
+        h.update(b);
+        h.update(b"\0");
+    };
+    let mut todo = vec![PathBuf::new()];
+    while let Some(rel) = todo.pop() {
+        let path = root.join(&rel);
+        let shown = || format!("{}", rel.display());
+        let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+        let mode = format!("{:o}", meta.mode() & 0o7777);
+        let kind = meta.file_type();
+        if kind.is_dir() {
+            field(b"d");
+            field(rel.as_os_str().as_bytes());
+            field(mode.as_bytes());
+            let mut names = Vec::new();
+            for e in std::fs::read_dir(&path).map_err(|e| format!("reading {}: {e}", path.display()))? {
+                names.push(e.map_err(|e| format!("reading {}: {e}", path.display()))?.file_name());
+            }
+            // Popped in reverse, so the tree is read in name order, each directory before what it holds:
+            // read_dir's own order is the file system's, which on some (tmpfs) is the order of making.
+            names.sort_by(|a, b| b.as_bytes().cmp(a.as_bytes()));
+            todo.extend(names.into_iter().map(|n| rel.join(n)));
+        } else if kind.is_file() {
+            if meta.nlink() > 1 {
+                return Err(format!("{} has another hard link", shown()));
+            }
+            field(b"f");
+            field(rel.as_os_str().as_bytes());
+            field(mode.as_bytes());
+            field(file_hash(&path)?.as_bytes());
+        } else if kind.is_symlink() {
+            let to = std::fs::read_link(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+            if let Err(why) = beneath(root, &rel) {
+                return Err(format!("{} links to {}, {why}", shown(), to.display()));
+            }
+            field(b"l");
+            field(rel.as_os_str().as_bytes());
+            field(to.as_os_str().as_bytes());
+        } else {
+            return Err(format!("{} isn't a file, directory or symbolic link", shown()));
+        }
+    }
+    Ok(h.finalize().to_hex().to_string())
 }
 
 fn file_hash(path: &Path) -> Result<String, String> {
@@ -273,6 +374,8 @@ pub struct Turn<'a> {
     pub config: &'a Path,
     /// The forwarding proxy's port on 127.0.0.1: the agent's only way out.
     pub proxy_port: u16,
+    /// The pinned version, as the start took it: what the harness's start event must show.
+    pub version: &'a str,
 }
 
 /// What a harness adds to the process the backend builds for a turn: its arguments, and environment
@@ -339,9 +442,13 @@ pub trait Harness: Sync {
     /// bytes, or the backend doesn't start. Read once, at the start: the run checks what it gave then.
     fn secret(&self) -> &str;
 
-    /// The program that plays every turn, checked before each; the sandbox lets it start nothing else
-    /// but the shim (and `/usr/bin/env`, which the shim is started through). Read once, at the start.
+    /// The program that plays every turn, and for a tree pin all it runs from, checked before each; the
+    /// sandbox lets it start nothing else but the shim (and `/usr/bin/env`, which the shim is started
+    /// through). Read once, at the start.
     fn pin(&self) -> &Pin;
+
+    /// Which of the backend's sandbox profiles its turns run under. Read once, at the start.
+    fn profile(&self) -> Profile;
 
     /// The environment entries it may add beyond [`BASE_ENV`], by name, fixed for the run: read once, at
     /// the start. Each must be a plain name, and none may be one of [`BASE_ENV`] or a proxy setting, in
@@ -399,6 +506,7 @@ pub struct HarnessBackend<H> {
     /// What the harness declared, as the start checked it: the run uses these, never asking again.
     secret: String,
     pin: Pin,
+    profile: Profile,
     env_names: Vec<String>,
     cfg: BackendConfig,
     proxy: Proxy,
@@ -413,7 +521,7 @@ impl<H: Harness> HarnessBackend<H> {
     /// forwarding proxy.
     pub fn start(harness: H, cfg: BackendConfig) -> Result<HarnessBackend<H>, String> {
         let name = harness.name();
-        let (secret, pin) = (harness.secret().to_string(), harness.pin().clone());
+        let (secret, pin, profile) = (harness.secret().to_string(), harness.pin().clone(), harness.profile());
         let env_names: Vec<String> = harness.env_names().iter().map(|n| n.to_string()).collect();
         if secret.len() < MIN_SECRET {
             return Err(format!(
@@ -437,6 +545,7 @@ impl<H: Harness> HarnessBackend<H> {
             harness,
             secret,
             pin,
+            profile,
             env_names,
             cfg,
             proxy,
@@ -513,6 +622,7 @@ impl<H: Harness> HarnessBackend<H> {
             tmp: &tmp,
             config: &config,
             proxy_port: self.proxy.port(),
+            version: &self.pin.version,
         };
         let launch = h.launch(&t)?;
         let mut cmd = self.command(&t, launch)?;
@@ -576,7 +686,7 @@ impl<H: Harness> HarnessBackend<H> {
         Ok(())
     }
 
-    /// The turn's process: the pinned program under the agent profile, with the harness's arguments, an
+    /// The turn's process: the pinned program under the harness's profile, with its arguments, an
     /// environment of [`BASE_ENV`] and the harness's declared entries only, and standard input null.
     fn command(&self, t: &Turn, launch: Launch) -> Result<Command, String> {
         let h = &self.harness;
@@ -585,16 +695,18 @@ impl<H: Harness> HarnessBackend<H> {
             return Err(self.halting(why));
         }
         let pin = &self.pin;
-        let install = pin.path.parent().ok_or("the pinned binary has no directory")?;
-        let sandbox = Sandbox::agent(&AgentPaths {
-            program: &pin.path,
-            install,
-            own: t.own,
-            turn: t.config,
-            shim: &self.cfg.shim,
-            socket: t.socket,
-            proxy_port: t.proxy_port,
-        })?;
+        let sandbox = Sandbox::agent(
+            self.profile,
+            &AgentPaths {
+                program: &pin.path,
+                install: &pin.install,
+                own: t.own,
+                turn: t.config,
+                shim: &self.cfg.shim,
+                socket: t.socket,
+                proxy_port: t.proxy_port,
+            },
+        )?;
         let mut cmd = sandbox.command(&pin.path);
         cmd.args(&launch.args)
             .env_clear()
@@ -812,6 +924,63 @@ fn plain_file_name(file: &str) -> bool {
     !file.is_empty() && file != "." && file != ".." && file.bytes().all(|b| b.is_ascii_graphic() && b != b'/')
 }
 
+/// Follows the link at `rel`, under `root`, one component at a time as the kernel would, each link's own
+/// target in turn, and refuses any step that leaves `root`: an absolute target anywhere on the way, a
+/// `..` above the root, a component that doesn't exist, or over 40 links. Its final destination alone
+/// isn't enough: a link out of the tree and back in leads through what nothing hashes (finding
+/// 79e50adb4032), and a `..` after a link inside the tree can climb above the root though the target's
+/// text doesn't.
+fn beneath(root: &Path, rel: &Path) -> Result<(), String> {
+    use std::ffi::OsString;
+    use std::path::Component;
+    enum Step {
+        Up,
+        Name(OsString),
+    }
+    // A target's steps, last first, to be popped.
+    let steps = |to: &Path| -> Result<Vec<Step>, String> {
+        let mut out = Vec::new();
+        for c in to.components() {
+            match c {
+                Component::RootDir | Component::Prefix(_) => return Err("which leads to an absolute path".into()),
+                Component::CurDir => {}
+                Component::ParentDir => out.push(Step::Up),
+                Component::Normal(n) => out.push(Step::Name(n.to_os_string())),
+            }
+        }
+        out.reverse();
+        Ok(out)
+    };
+    let outside = || "which isn't inside the tree".to_string();
+    let link = |at: &Path| std::fs::read_link(root.join(at)).map_err(|_| outside());
+    // Where the walk is, as components under `root`: it starts in the link's own directory, which the
+    // tree's walk reached without following anything.
+    let mut at: Vec<OsString> = rel.parent().into_iter().flatten().map(|c| c.to_os_string()).collect();
+    let mut todo = steps(&link(rel)?)?;
+    let mut links = 1;
+    while let Some(step) = todo.pop() {
+        match step {
+            Step::Up => {
+                at.pop().ok_or_else(outside)?;
+            }
+            Step::Name(n) => {
+                at.push(n);
+                let here: PathBuf = at.iter().collect();
+                let meta = std::fs::symlink_metadata(root.join(&here)).map_err(|_| outside())?;
+                if meta.file_type().is_symlink() {
+                    links += 1;
+                    if links > 40 {
+                        return Err(outside());
+                    }
+                    at.pop();
+                    todo.extend(steps(&link(&here)?)?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Makes `path` and its parents, private to this user.
 pub fn make_dir(path: &Path) -> Result<(), String> {
     std::fs::DirBuilder::new()
@@ -959,5 +1128,30 @@ impl<'a> Transcript<'a> {
         }
         let err_path = self.path.with_extension("stderr");
         private_file(&err_path)?.write_all(stderr).map_err(|e| format!("writing {}: {e}", err_path.display()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// What a harness could do if Pin's fields were its to set (finding ab0192deac8f): the check
+    /// refuses either, though each pin's own file and hash still match.
+    #[test]
+    fn a_pin_whose_program_left_its_install_fails_its_check() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = tmp.path().join("root");
+        std::fs::create_dir(&root).expect("a tree");
+        std::fs::write(root.join("prog"), "the program").expect("a program");
+        let mut tree = Pin::tree(&root.join("prog"), &root, "1").expect("a pin");
+        tree.check("mock").expect("as pinned");
+        tree.path = std::fs::canonicalize("/bin/sh").expect("/bin/sh");
+        tree.blake3 = tree_hash(&tree.install).expect("the tree's hash, unchanged");
+        assert_eq!(tree.check("mock"), Err("the pinned mock program isn't inside its install".into()));
+
+        let mut binary = Pin::of(&root.join("prog"), "1").expect("a pin");
+        binary.check("mock").expect("as pinned");
+        binary.install = PathBuf::from("/");
+        assert_eq!(binary.check("mock"), Err("the pinned mock program isn't inside its install".into()));
     }
 }

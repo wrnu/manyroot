@@ -25,7 +25,7 @@ pub use crate::backend::{
     Caps, ModeTokenCap, Pin, REPLICATE_TOKENS, RUN_TIME_CAP, RUN_TOKEN_CAP, TURN_MESSAGE, Tokens, guard,
 };
 use crate::proxy::Route;
-use crate::sandbox::resolved;
+use crate::sandbox::{Profile, resolved};
 
 /// The only entries the owner's settings may hold under `env`; any other stops the run before it starts.
 pub const ROUTING_KEYS: [&str; 3] =
@@ -206,7 +206,7 @@ impl ClaudeCode {
     }
 
     /// The gate: the `init` event must show exactly the plan.
-    fn gate(&self, init: &Value, own: &Path) -> Result<(), String> {
+    fn gate(&self, init: &Value, turn: &Turn) -> Result<(), String> {
         let e = &self.expect;
         let field = |k: &str| init.get(k).cloned().unwrap_or(Value::Null);
         let eq = |k: &str, want: &str| {
@@ -215,7 +215,7 @@ impl ClaudeCode {
         if field("type") != "system" || field("subtype") != "init" {
             return Err("the first event isn't init".into());
         }
-        eq("claude_code_version", &self.pin.version)?;
+        eq("claude_code_version", turn.version)?;
         eq("model", &e.model)?;
         eq("permissionMode", &e.permission_mode)?;
         eq("apiKeySource", &e.api_key_source)?;
@@ -238,7 +238,7 @@ impl ClaudeCode {
             return Err("the init event's plugins aren't the bundled ones".into());
         }
         let memory = init["memory_paths"]["auto"].as_str().ok_or("the init event has no memory path")?;
-        if !Path::new(memory).starts_with(resolved(own)?) || memory.contains("..") {
+        if !Path::new(memory).starts_with(resolved(turn.own)?) || memory.contains("..") {
             return Err("the init event's memory path is outside the agent's directory".into());
         }
         Ok(())
@@ -297,6 +297,10 @@ impl Harness for ClaudeCode {
         &self.pin
     }
 
+    fn profile(&self) -> Profile {
+        Profile::Agent
+    }
+
     fn env_names(&self) -> &[&str] {
         &ENV_NAMES
     }
@@ -334,7 +338,7 @@ impl Harness for ClaudeCode {
             return Err("an event that isn't JSON".into());
         };
         if first {
-            return Ok(Event::Init(self.gate(&event, turn.own)));
+            return Ok(Event::Init(self.gate(&event, turn)));
         }
         match event["type"].as_str() {
             Some("assistant") => ClaudeCode::message(&event["message"]),
