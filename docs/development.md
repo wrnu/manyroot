@@ -35,7 +35,7 @@ the same PR (process section 8, "Keeping the skill current").
 | `<vision>` | Build Manyroot, a global, decentralized network where knowledge accumulates through independent contributions from humans and AI agents, starting with Bracken, so that software, and later any kind of knowledge, can grow together. The team's own work is Bracken's first proving ground. See [vision.md](vision.md) |
 | `<risky classes>` | **protocol** (encoding, ids, signatures and validity rules: `crates/manyroot/src/{contribution,graph,id,identity}.rs`, `docs/protocol.md`); **storage** (`store.rs`, `bundle.rs`); **crypto** (cryptography and crypto dependencies); **merge-gate tooling** (all of `scripts/` and `.forgejo/`, and the pinned-binary procedure) |
 | `<project-specific gated actions>` | Delegated to the manager (decision `adcb78b88c6c`), including protocol-class merges and pinned-binary upgrades, each logged as an `owner-review` claim (process section 3). Still the owner's go: making the repository public; publishing crates (crates.io or the Forge cargo index); licence changes; granting access or changing branch protection; deleting or rewriting history or data (force-push, deleting branches others use, removing Ground files); creating, exposing or moving credentials and secrets; spending money; new outside services, infrastructure or schedules; sending data somewhere new |
-| `<default>` model | Claude Opus 5.5 (`claudeAgent` / `claude-opus-5-5`) |
+| `<default>` model | Claude Opus 5.5 (`claudeAgent` / `claude-opus-5-5`) at **medium** effort, for every role: builders, reviewer, security and any delegate (owner, 2026-10-30, decision `2374b097e5b9`). No other provider |
 | `<reviewer>` model | Also Claude Opus 5.5, by the owner's decision (`20764b76ad3e`). Same-model review is weaker, so reviewers always start from a fresh context and never see the author's conclusions |
 
 ## Owner approvals
@@ -53,8 +53,8 @@ Decision `61e1d6c6cf8d` (task `d162a81b9411`). Until then every owner decision w
 
 | Operation | Here |
 |---|---|
-| **launch-builder** | `t3_thread_launch` with `workspaceStrategy: {type: "worktree", baseRef: "main", branch: "<branch>", startFromOrigin: true}`, model `claudeAgent` / `claude-opus-5-5`. The project's worktree script warms the Rust build |
-| **delegate** | `delegate_task` with target `claudeAgent` / `claude-opus-5-5`, and a new `clientRequestId` for each review round |
+| **launch-builder** | `t3_thread_launch` with `workspaceStrategy: {type: "worktree", baseRef: "main", branch: "<branch>", startFromOrigin: true}`, model `claudeAgent` / `claude-opus-5-5`, effort `medium`. The project's worktree script warms the Rust build |
+| **delegate** | `delegate_task` with target `claudeAgent` / `claude-opus-5-5` and `options.effort: "medium"`, and a new `clientRequestId` for each review round |
 | **send** | `t3_thread_send` to the thread id, carrying Ground ids |
 | **read-thread** | `t3_thread_read` |
 | **watch-pr** | `watch_pull_request` (T3 recognizes this Forgejo repo). Fallback: `fj --host forge.jx.rs pr view <n>` |
