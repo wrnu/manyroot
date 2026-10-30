@@ -65,8 +65,10 @@ impl Weave {
         serde_json::from_str(&self.ok(args)).expect("JSON")
     }
 
+    /// How many contributions the Ground holds. Without --limit or --since, `log --json` prints a bare
+    /// array; anything else is a test bug, not zero (task 234434d9002c).
     fn contributions(&self) -> usize {
-        self.json(&["log", "--json", "--limit", "100000"]).as_array().map_or(0, Vec::len)
+        self.json(&["log", "--json"]).as_array().expect("log --json prints an array").len()
     }
 
     fn git(&self, args: &[&str]) -> String {
