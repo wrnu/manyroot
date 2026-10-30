@@ -325,6 +325,48 @@ fn a_socket_error_names_the_path_and_when_too_long_its_length() {
     assert!(!connected.contains("at most"), "{connected}");
 }
 
+/// Finding eb0336194453: the `.` and `..` in the part of a run directory not yet made are measured as
+/// the directory is made, so `<tmp>/x/./nope/../<pad>/run` counts as `<tmp>/x/<pad>/run`.
+#[test]
+fn the_unmade_part_of_a_run_directory_is_measured_with_its_dots_resolved() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    for (bytes, fits) in [(SOCKET_PATH_MAX, true), (SOCKET_PATH_MAX + 1, false)] {
+        let (root, _) = run_dir_for_socket(tmp.path(), 3, bytes);
+        let pad = root.parent().and_then(Path::file_name).expect("the padding");
+        let dotted = tmp.path().join("x/./nope/..").join(pad).join("run");
+        assert_eq!(check_socket_room(&dotted, 3).is_ok(), fits, "{} at {bytes} bytes", dotted.display());
+    }
+}
+
+/// Fails each turn: agent 0 with an error naming its socket, agent 1 with one naming none.
+struct Failing;
+
+impl Backend for Failing {
+    fn turn(&self, agent: usize, _name: &str, _turn: u32, socket: &Path) -> Result<(), String> {
+        match agent {
+            0 => Err(format!("connecting to {}: refused", socket.display())),
+            _ => Err("no socket here".into()),
+        }
+    }
+}
+
+/// Gotcha 1229c27456e6: a turn's error that names the agent's own socket logs that socket's path beside its
+/// size and digest; one that names none logs neither its text nor a socket.
+#[test]
+fn a_turn_error_naming_the_agents_socket_logs_its_path() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let outcome = run(&config(dir.path(), 2, 1), &Failing).expect("the run goes on");
+    let errors: Vec<Value> = events(&outcome.events)
+        .into_iter()
+        .filter(|e| e["event"] == "turn_error" && e["data"]["step"] == "play")
+        .collect();
+    let root = std::fs::canonicalize(dir.path().join("run")).expect("the run directory");
+    let socket = |agent: &str| errors.iter().find(|e| e["agent"] == agent).map(|e| e["data"]["socket"].clone());
+    assert_eq!(socket("agent-0"), Some(Value::from(root.join("sockets/a0.sock").display().to_string())), "{errors:?}");
+    assert_eq!(socket("agent-1"), Some(Value::Null), "{errors:?}");
+    assert!(errors.iter().all(|e| !e.to_string().contains("refused") && !e.to_string().contains("no socket here")));
+}
+
 /// Each turn, one claim; agent 0 instead sends an MCP line over the driver's cap, if `hostile`.
 struct Claiming {
     hostile: bool,

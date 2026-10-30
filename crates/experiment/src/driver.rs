@@ -14,7 +14,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -197,13 +197,23 @@ pub fn check_socket_room(root: &Path, agents: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// `path` made absolute, with its deepest existing ancestor's symlinks resolved.
+/// `path` made absolute, with its deepest existing ancestor's symlinks resolved, and the `.` and `..` of
+/// the rest resolved lexically: the rest is made as directories, none a symlink, so `<base>/nope/../r` is
+/// made as `<base>/r` (finding `eb0336194453`).
 fn resolved(path: &Path) -> Result<PathBuf, String> {
     let path = std::path::absolute(path).map_err(|e| format!("{}: {e}", path.display()))?;
     for base in path.ancestors() {
-        if let Ok(real) = std::fs::canonicalize(base) {
-            let rest = path.strip_prefix(base).expect("an ancestor is a prefix");
-            return Ok(if rest.as_os_str().is_empty() { real } else { real.join(rest) });
+        if let Ok(mut real) = std::fs::canonicalize(base) {
+            for part in path.strip_prefix(base).expect("an ancestor is a prefix").components() {
+                match part {
+                    Component::ParentDir => {
+                        real.pop();
+                    }
+                    Component::CurDir => {}
+                    part => real.push(part),
+                }
+            }
+            return Ok(real);
         }
     }
     Ok(path)
@@ -418,8 +428,15 @@ impl Run<'_> {
             let ended = self.sync(i);
             for (step, r) in [("play", played.err()), ("sync", ended.err())] {
                 if let Some(e) = r {
-                    // Sizes and digests only: an error can quote what the agent sent.
-                    let data = json!({"turn": turn, "step": step, "bytes": e.len(), "digest": digest(e.as_bytes())});
+                    // Sizes and digests only: an error can quote what the agent sent. And the agent's own
+                    // socket the error names, if any: a path the driver chose, so a socket's failure says
+                    // where (gotcha `1229c27456e6`).
+                    let mut data =
+                        json!({"turn": turn, "step": step, "bytes": e.len(), "digest": digest(e.as_bytes())});
+                    let own = ["a", "c", "h"].map(|side| self.sockets.join(format!("{side}{i}.sock")));
+                    if let Some(named) = own.iter().find(|s| e.contains(&*s.to_string_lossy())) {
+                        data["socket"] = json!(named);
+                    }
                     self.events.log(Some(name), "turn_error", data);
                 }
             }
