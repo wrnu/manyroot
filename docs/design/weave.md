@@ -104,19 +104,33 @@ root. A file has bytes and a mode.
 
 **Paths.** A path is valid only if all of these hold:
 - it is UTF-8, uses `/` as the separator, and isn't empty;
+- it is at most 4096 bytes, and each component at most 255 bytes. These
+  limits are checked before anything is folded, so checking a path costs
+  time and memory linear in its length (finding `d65749f2b45d`);
 - it has no leading or trailing `/`, no `.` or `..` component, and no NUL;
+- no component holds a `:` or a `\`. Windows reads a name before `:` as a
+  drive, whatever the name (`C:x`, `1:x`; git's CVE-2019-1351), and a name
+  after it as a stream (`.git:x`), and NTFS can't hold one in a name
+  (findings `6f00787d66b9` and `044cd093a6bf`);
 - no component is blank: empty, or made only of the White_Space characters
   of protocol.md's rule 8. So a path is never blank, and can be an
   artifact's `name`;
 - no component is `.git`, or starts with `.bracken`, after folding;
 - it passes git's `core.protectHFS` and `core.protectNTFS` component checks
   (ignorable code points, trailing dots and spaces, 8.3 short names).
+  Refusing `:` covers its stream names.
 
-**Folding.** To fold a path, normalize it to Unicode NFC, apply full case
-folding, and drop default-ignorable code points, as git's `protectHFS`
-does. It is how macOS's APFS and HFS+ and Windows' NTFS compare names.
-Folding applies to the component rules above and to the collision rules in
-*Manifests*.
+**Folding.** To fold a path, drop default-ignorable code points, as git's
+`protectHFS` does, then take Unicode's canonical caseless match form
+(definition D145): `NFD(casefold(NFD(s)))`, with full case folding. Case
+folding can leave combining marks out of canonical order, or split a
+composed letter into a base and a mark, so the second normalization is what
+makes canonically equivalent names fold alike (finding `cc6570efb144`). It
+is how macOS's APFS and HFS+ and Windows' NTFS compare names. Folding
+applies to the component rules above, the `.bracken` prefix test included,
+and to the collision rules in *Manifests*. The Unicode tables it uses are
+pinned in the format guard, so a dependency that changes them is reviewed
+as protocol class.
 
 **Modes.** Three, as git stores them:
 - `0o100644`: a file;

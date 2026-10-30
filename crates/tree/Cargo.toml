@@ -1,0 +1,21 @@
+[package]
+name = "bracken-tree"
+description = "Bracken's code layer on Weave: source trees as manifests of content-hashed files, lines and decisions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+blake3.workspace = true
+ciborium.workspace = true
+hex.workspace = true
+icu_casemap.workspace = true
+manyroot.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+unicode-normalization.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
