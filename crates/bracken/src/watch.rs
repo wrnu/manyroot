@@ -274,15 +274,14 @@ struct Feed {
     /// While the feed serves: everything verified so far. `None` once fallen back to syncing.
     graph: Option<Graph>,
     /// What this graph holds that the server is known to hold, because a reply brought it, with all its
-    /// ancestors. It grows with each reply (finding d4f10edc63fb), except the first of a run of replies of
-    /// only what is here already: the server lacked every head sent, so it may hold less than this said
-    /// (restored from a backup, or re-created), and that reply's own contributions replace it (finding
-    /// 2e421e838287). The replies after it in the run are the next pages of the same catch-up, so they
-    /// add to it: replacing it on each could drop an earlier page, and paging would cycle (finding
-    /// ab41112b47f2).
+    /// ancestors. It grows with each reply (finding d4f10edc63fb), except a reply of only what is here
+    /// already that brings something in it: the server leaves out everything before the heads it holds,
+    /// and this is closed under parents, so it lacked one of this set's heads. It holds less than this
+    /// said (restored from a backup, or re-created), and that reply's own contributions replace it
+    /// (findings 2e421e838287 and 51c88ccc4ba3). The next pages of the same catch-up bring nothing in it,
+    /// so they add to it: replacing it on each could drop an earlier page, and paging would cycle
+    /// (finding ab41112b47f2).
     held: HashSet<ContributionId>,
-    /// The last reply brought only what is here already.
-    resending: bool,
     first: bool,
     /// The last request failed, or came back at once with nothing new, so the next waits --interval.
     failed: bool,
@@ -294,7 +293,7 @@ impl Feed {
         let graph = Some(store.graph().clone());
         let local = Local { store, sync: Some((url.clone(), token.clone())), first: false };
         let held = HashSet::new();
-        Feed { local, url, token, graph, held, resending: false, first: true, failed: false, bad_replies: 0 }
+        Feed { local, url, token, graph, held, first: true, failed: false, bad_replies: 0 }
     }
 
     /// Records that the server holds `id`, and so everything before it.
@@ -353,10 +352,9 @@ impl Feed {
                 // lacked), or an empty reply that didn't wait.
                 let resent = next.len() == g.len() && !brought.is_empty();
                 let idle = resent || (next.len() == g.len() && asked.elapsed() < FEED_QUICK);
-                if resent && !self.resending {
+                if resent && brought.iter().any(|id| self.held.contains(id)) {
                     self.held.clear();
                 }
-                self.resending = resent;
                 for id in brought {
                     self.hold(&next, id);
                 }

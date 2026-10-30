@@ -1395,6 +1395,67 @@ fn watch_feed_recovers_when_the_server_restarts_with_less() {
     watch.wait().unwrap();
 }
 
+/// Finding 51c88ccc4ba3: the server is restarted with less right after a reply that re-sent what watch
+/// holds (watch holds work of its own the server lacks, and nothing new arrived since). The next reply
+/// re-sends something watch knew the server held, which proves the server lost it, so it replaces what
+/// watch knew, as in finding 2e421e838287, rather than adding to it: the request after it waits, rather
+/// than bringing the same back every --interval, and what reaches the server next is printed.
+#[test]
+fn watch_feed_recovers_when_the_server_restarts_with_less_right_after_a_resend() {
+    let g = grounds();
+    claim(&g.a, "alice", "shared");
+    let server = g.http(&[]);
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let before = g.tmp.join("b-before");
+    copy_dir(&g.b, &before);
+    claim(&g.a, "alice", "lost in the restart");
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let w = g.tmp.join("w");
+    copy_dir(&g.a, &w);
+    claim(&w, "alice", "never pushed");
+    let (url, requests) = counting_proxy(server.port);
+    let count = || requests.load(std::sync::atomic::Ordering::SeqCst);
+    let token = g.tmp.join("token");
+    std::fs::write(&token, TOKEN).unwrap();
+    let (mut watch, lines) = watch_feed(&w, &url, &token, "");
+    // The first reply re-sends both shared claims; after --interval (2 s) the second request waits.
+    let end = Instant::now() + Duration::from_secs(20);
+    while count() < 2 {
+        assert!(Instant::now() < end, "no second request");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    // The server comes back on the same port from the copy: it lacks "lost in the restart".
+    let port = server.port.to_string();
+    drop(server);
+    let server = g.http_for(&before, &["--port", &port]);
+    let restarted = count();
+    // The waiting request fails, the next re-sends "shared", and the one after waits: each of the first
+    // two is followed by --interval, 2 s.
+    std::thread::sleep(Duration::from_secs(10));
+    let after = count() - restarted;
+    assert!(after <= 3, "{after} requests in 10 s against the server with less");
+    // New work reaching it is printed.
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let new = claim(&g.a, "alice", "after the restart");
+    let out = sync_http(&g.a, &server.url, TOKEN, &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let end = Instant::now() + Duration::from_secs(20);
+    let printed = loop {
+        match next_contribution(&lines, end.saturating_duration_since(Instant::now())) {
+            Some(v) if v["contribution"]["id"] == new.as_str() => break true,
+            Some(_) => continue,
+            None => break false,
+        }
+    };
+    watch.kill().unwrap();
+    watch.wait().unwrap();
+    assert!(printed, "new work never arrived after the restart");
+}
+
 /// Finding ab41112b47f2: a catch-up of several pages, each of only what watch holds already, adds each
 /// page to what watch knows the server holds; replacing it with each page dropped an earlier one, and
 /// paging cycled. Three concurrent 5 MiB artifacts (one per 8 MiB page) and a claim merging them, which
