@@ -192,7 +192,9 @@ enum Command {
         /// it. A cursor is comma-separated ids, the causal heads `log --since` printed last ("" for
         /// everything). Prints the next cursor after the list, or adds it to the JSON as "cursor". A cursor
         /// means the same only under the same filters: new work the filters hid is past it all the same.
-        #[arg(long, value_name = "CURSOR")]
+        /// Or a date, `2026-10-29` (from its start, UTC) or `2026-10-29T18:27:00Z`: contributions stamped
+        /// then or later. A timestamp is the author's clock, so this is a rough cut; a cursor is exact.
+        #[arg(long, value_name = "CURSOR|DATE")]
         since: Option<String>,
         /// Only the most recent N, after every other filter. Says how many earlier ones it left out (in the
         /// JSON as "omitted"); the cursor is still the heads, so the next --since starts after all of them.
@@ -201,12 +203,23 @@ enum Command {
         /// One short line each, at most 200 characters (counted as chars, not display columns): the
         /// shortest unique id prefix (at least 8 digits), author, kind and tags, and the statement or name
         /// cut to one line. Control characters print as escapes such as \u{1b}, as in every log line.
-        /// The default with --since.
+        /// The default with --since, --tag or --open; `show <id>` prints an entry in full.
         #[arg(long, conflicts_with_all = ["json", "full"])]
         compact: bool,
-        /// With --since: full lines, as without it.
-        #[arg(long, conflicts_with = "json", requires = "since")]
+        /// With --since, --tag or --open: full lines, as without them.
+        #[arg(long, conflicts_with = "json")]
         full: bool,
+        /// Only open findings: those `scripts/merge` would block a current head on (process 4.2). Any
+        /// contribution, whatever its tags (finding `8c90edd63f5c`), not retracted, with a contradicts relation to something current that still
+        /// counts (live, or retracted by someone other than the finding's author and the triager), that
+        /// the triager hasn't triaged (no live evidence of theirs on it) or has confirmed (a live pass of
+        /// theirs, whatever else they or anyone gave) and not deferred (a depends_on of theirs from a
+        /// current task of theirs tagged `deferred`). Anyone else's evidence doesn't triage.
+        #[arg(long)]
+        open: bool,
+        /// With --open: the identity whose evidence triages findings.
+        #[arg(long, value_name = "NAME", default_value = "manager", requires = "open")]
+        triager: String,
         #[command(flatten)]
         out: Output,
     },
@@ -584,19 +597,33 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
             w.add(&mut s, &who, Body::Retract { target, reason })?;
             w.finish();
         }
-        Command::Log { kind, tag, author, current, since, limit, compact, full, out } => {
-            let compact = compact || (since.is_some() && !full);
+        Command::Log { kind, tag, author, current, since, limit, compact, full, open, triager, out } => {
+            ensure!(
+                !full || since.is_some() || tag.is_some() || open,
+                "--full only undoes the compact form of --since, --tag or --open"
+            );
+            let compact = compact || ((since.is_some() || tag.is_some() || open) && !full);
             let names = Names::load(&s)?;
             let author = author.map(|a| names.resolve(&a)).transpose()?;
             let g = s.graph();
-            let seen = since.as_deref().map(|c| listing::seen(g, c)).transpose()?;
+            let since_filter = since.as_deref().map(|c| listing::Since::parse(g, c)).transpose()?;
             let order = g.topo_order();
-            let view = current.then(|| CurrentView::new(g, &order));
+            let view = (current || open).then(|| CurrentView::new(g, &order));
+            let triager = if open {
+                Some(names.resolve(&triager).with_context(|| format!("--open: who triages? no identity {triager}"))?)
+            } else {
+                None
+            };
             let rows: Vec<&Contribution> = order
                 .iter()
-                .filter(|id| seen.as_ref().is_none_or(|s| !s.contains(id)))
-                .filter(|id| view.as_ref().is_none_or(|v| !v.hidden.contains(id)))
+                // --open alone keeps a finding its author superseded, as scripts/merge does: it hides only
+                // the retracted.
+                .filter(|id| !current || view.as_ref().is_none_or(|v| !v.hidden.contains(id)))
                 .map(|id| g.get(id).expect("ordered ids exist"))
+                .filter(|c| since_filter.as_ref().is_none_or(|s| s.admits(c)))
+                .filter(|c| {
+                    triager.is_none_or(|t| open_finding(g, view.as_ref().expect("--open builds the view"), t, c))
+                })
                 .filter(|c| kind.is_none_or(|k| c.body().kind() == k))
                 .filter(|c| author.is_none_or(|a| c.author() == a))
                 .filter(|c| {
@@ -654,11 +681,16 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                         Some(p) => compact_line(g, &names, p, c),
                         None => line(g, &names, c),
                     };
-                    for (by, author) in view.as_ref().map_or(&[][..], |v| v.by_others(&c.id())) {
-                        text.push_str(&superseded_by_suffix(&names, by, author));
-                    }
-                    if compact {
-                        text = listing::cap_line(text);
+                    let by_others = view.as_ref().map_or(&[][..], |v| v.by_others(&c.id()));
+                    if compact && !by_others.is_empty() {
+                        // The text gives way to the marks, so they're never what's cut.
+                        let marks = compact_marks(&names, by_others);
+                        text = listing::cap_to(text, listing::COMPACT_LINE_CHARS - marks.chars().count());
+                        text.push_str(&marks);
+                    } else {
+                        for (by, author) in by_others {
+                            text.push_str(&superseded_by_suffix(&names, by, author));
+                        }
                     }
                     println!("{text}");
                 }
@@ -1657,6 +1689,45 @@ fn age(ms: u64) -> String {
 }
 
 /// What `log --current` shows.
+/// A finding `log --open` lists, whatever its kind or tags: one `scripts/merge`'s findings check (section
+/// 3) would block a current head on, under the same rules, which this mirrors; change both together (findings `090f4645800f`,
+/// `7c38339206c5`). Not retracted; with a contradicts relation from it to a contribution `view` shows that
+/// still counts: live, or retracted by someone other than the finding's author and `triager` (a retract
+/// is always its relation's author's); untriaged (no live evidence of `triager`'s on it) or confirmed (a
+/// live pass of theirs, which a fail beside it doesn't undo) and not deferred (no live depends_on of
+/// theirs from a task of theirs that `view` shows, tagged `deferred`). Others' evidence doesn't triage.
+fn open_finding(g: &Graph, view: &CurrentView, triager: AgentId, c: &Contribution) -> bool {
+    if g.is_retracted(&c.id()) {
+        return false;
+    }
+    let (mut against_current, mut triaged, mut confirmed, mut deferred) = (false, false, false, false);
+    for r in g.referrers(&c.id()) {
+        let live = !g.is_retracted(&r.id());
+        match r.body() {
+            Body::Relation { from, kind: RelationKind::Contradicts, to, .. } if *from == c.id() => {
+                let counts = live || (r.author() != c.author() && r.author() != triager);
+                against_current |= counts && g.get(to).is_some() && !view.hidden.contains(to);
+            }
+            Body::Evidence { target, verdict, .. } if *target == c.id() && live && r.author() == triager => {
+                triaged = true;
+                confirmed |= *verdict == Verdict::Pass;
+            }
+            Body::Relation { from, kind: RelationKind::DependsOn, to, .. }
+                if *to == c.id() && live && r.author() == triager =>
+            {
+                deferred |= g.get(from).is_some_and(|t| {
+                    t.author() == triager
+                        && !view.hidden.contains(from)
+                        && matches!(t.body(), Body::Claim { tags, .. } if tags.iter().any(|x| x == "task")
+                            && tags.iter().any(|x| x == "deferred"))
+                });
+            }
+            _ => {}
+        }
+    }
+    against_current && (!triaged || (confirmed && !deferred))
+}
+
 struct CurrentView {
     /// Omitted: retracted contributions; claims and artifacts with a supersession that counts under
     /// docs/protocol.md (written by their own author, with a live newer side, whoever wrote it); and
@@ -1788,6 +1859,26 @@ impl PolicyArgs {
 /// (security evidence cb1a56001700).
 fn superseded_by_suffix(names: &Names, by: &ContributionId, author: &AgentId) -> String {
     format!("  (superseded by {} {})", terminal::printable(&names.display(author)), by.short())
+}
+
+/// The compact form's marks, within `listing::COMPACT_MARKS_CHARS`: each `(superseded by <author> <id>)`
+/// with the author's name cut to `listing::COMPACT_MARK_NAME_CHARS`, so a long name can't push out its
+/// id or the marks after it (finding `69725885c7fb`), and `(+N more)` for those that don't fit. The
+/// first always does.
+fn compact_marks(names: &Names, by_others: &[(ContributionId, AgentId)]) -> String {
+    let mut out = String::new();
+    for (i, (by, author)) in by_others.iter().enumerate() {
+        let name = listing::cap_to(terminal::printable(&names.display(author)), listing::COMPACT_MARK_NAME_CHARS);
+        let mark = format!("  (superseded by {name} {})", by.short());
+        let rest = by_others.len() - i;
+        let room = if rest > 1 { format!("  (+{} more)", rest - 1).chars().count() } else { 0 };
+        if i > 0 && out.chars().count() + mark.chars().count() + room > listing::COMPACT_MARKS_CHARS {
+            out.push_str(&format!("  (+{rest} more)"));
+            break;
+        }
+        out.push_str(&mark);
+    }
+    out
 }
 
 /// Local names for agents. Agents without a local identity show by key.

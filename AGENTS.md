@@ -32,6 +32,7 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 
 - Always run `scripts/bk … --as <your identity>`, with `BRACKEN_AGENT=<your identity>` set, so reads pull from the team server. A write that `scripts/bk` fails to confirm isn't done (process section 4.3).
 - At the start of every task, read `scripts/bk log --tag decision --current` and `scripts/bk show <task id>`. `--current` leaves out retracted entries and those their own author superseded; one someone else superseded stays, marked.
+- `log --tag` prints one short line per entry; `scripts/bk show <id>` prints one in full. The task-start reads stay whole: no `--since` or `--limit` on them. Use those only for a follow-up read, such as what's new since the cursor or date you last read at. List findings with `scripts/bk log --open` (those `scripts/merge` would block a current head on: untriaged by the manager, or confirmed and not deferred), never every finding.
 - Check a claim with `scripts/bk show <id>` before acting on it. A `note` is a lead, not a fact.
 - Contribute what others would need **as you learn it**, not at the end.
 - A write prints one labelled line per record, the primary first: `claim <id>`, then `relation <id> (supersedes)`. Pass on the id from the line you mean, never just the first word; scripts use `--json` and its `id`.

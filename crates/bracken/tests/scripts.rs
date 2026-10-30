@@ -938,11 +938,15 @@ fn ground_checkpoint_runs_the_ground_guards_on_what_it_would_pull() {
         let (code, text) = checkpoint(&["--attributes-checked", &clean]);
         assert_eq!(code, Some(1), "{}: took another sha: {text}", case("attributes"));
         assert!(text.contains("isn't origin's main"), "{}: {text}", case("attributes"));
-        assert!(!bk(&dir, &["log", "--tag", "note"]).contains("--attributes-checked"), "{}", case("attributes"));
+        assert!(
+            !bk(&dir, &["log", "--tag", "note", "--full"]).contains("--attributes-checked"),
+            "{}",
+            case("attributes")
+        );
         let (code, text) = checkpoint(&["--attributes-checked", &attributes]);
         assert_eq!(code, Some(0), "{}: {text}", case("attributes"));
         assert!(text.contains(&format!("git merge --no-edit {attributes}")), "{}: {text}", case("attributes"));
-        let notes = bk(&dir, &["log", "--tag", "note"]);
+        let notes = bk(&dir, &["log", "--tag", "note", "--full"]);
         assert!(notes.contains("manager") && notes.contains("--attributes-checked"), "{}: {notes}", case("attributes"));
         assert!(
             git(&["status", "--porcelain", "--", ".bracken"]).is_empty(),

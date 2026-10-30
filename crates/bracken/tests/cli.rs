@@ -333,6 +333,41 @@ fn log_current_keeps_what_another_author_superseded() {
     assert_eq!(row[0]["superseded_by_others"][0]["author_name"], "builder");
     let text = bracken(dir, &["log", "--tag", "finding", "--current"]);
     assert!(text.contains(&format!("(superseded by builder {})", &addressed[..12])), "{text}");
+    // However long the line, and however its escapes lengthen it, the compact form (the default with
+    // --tag) keeps the whole mark within its 200 characters (finding c80965f348d5).
+    for statement in ["x".repeat(130), "a\t".repeat(75)] {
+        let long = bracken(dir, &["claim", &statement, "--tag", "long", "--as", "security"]);
+        let by = bracken(dir, &["claim", "instead", "--as", "builder"]);
+        bracken(dir, &["relate", &by, "supersedes", &long, "--as", "builder"]);
+        let line = bracken(dir, &["log", "--tag", "long", "--current", "--limit", "1"]);
+        let line = line.lines().next().unwrap();
+        assert!(line.chars().count() <= 200, "{} characters: {line}", line.chars().count());
+        assert!(line.starts_with(&long[..8]), "{line}");
+        assert!(line.ends_with(&format!("  (superseded by builder {})", &by[..12])), "{line}");
+    }
+    // A name as long as names go (64) is cut inside its own mark, so its id and the next mark stay
+    // (finding 69725885c7fb); marks past what fits are counted.
+    let long_name = "z".repeat(64);
+    bracken(dir, &["id", "new", &long_name]);
+    let decision = bracken(dir, &["claim", "a decision", "--tag", "marked", "--as", "security"]);
+    let mut by = Vec::new();
+    for who in [long_name.as_str(), "builder"] {
+        let b = bracken(dir, &["claim", "instead", "--as", who]);
+        bracken(dir, &["relate", &b, "supersedes", &decision, "--as", who]);
+        by.push(b);
+    }
+    let line = bracken(dir, &["log", "--tag", "marked", "--current"]);
+    assert!(line.chars().count() <= 200, "{line}");
+    let short = format!("{}…", "z".repeat(15));
+    assert!(line.contains(&format!("  (superseded by {short} {})", &by[0][..12])), "{line}");
+    assert!(line.ends_with(&format!("  (superseded by builder {})", &by[1][..12])), "{line}");
+    let b = bracken(dir, &["claim", "instead", "--as", "builder"]);
+    bracken(dir, &["relate", &b, "supersedes", &decision, "--as", "builder"]);
+    let line = bracken(dir, &["log", "--tag", "marked", "--current"]);
+    assert!(line.contains(&format!("  (superseded by {short} {})", &by[0][..12])), "{line}");
+    assert!(line.contains(&format!("  (superseded by builder {})", &by[1][..12])), "{line}");
+    assert!(line.ends_with("  (+1 more)") && line.chars().count() <= 200, "{line}");
+    assert_eq!(bracken(dir, &["log", "--tag", "marked", "--current", "--full"]).matches("(superseded by").count(), 3);
     // Nor does it silence the finding in `conflicts` (task 780f658d4b84).
     let conflicts = json(dir, &["conflicts", "--json"]);
     assert_eq!(conflicts.as_array().unwrap().len(), 1, "{conflicts}");
@@ -1057,6 +1092,169 @@ fn compact_lines_stay_short_and_limit_keeps_the_cursor() {
     let out = bracken(dir, &["log", "--since", &cursor, "--limit", "5", "--full"]);
     assert_eq!(out.lines().count(), 2, "{out}");
     assert!(out.starts_with(&next[..12]) && out.ends_with(&format!("cursor: {next}")), "{out}");
+}
+
+/// Bounded task-start reads (task `f5231b1cde7f`): `log --tag` prints the compact form by default and
+/// `--full` the full one; `--since` takes a date as well as a cursor; `--limit` keeps the newest N; and
+/// `--open` lists only the findings still open.
+#[test]
+fn log_tag_is_compact_and_since_a_date_limit_and_open_bound_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "bounded"]);
+    bracken(dir, &["id", "new", "alice"]);
+    let long = format!("Decision: {}", "a long reason ".repeat(40));
+    let d = bracken(dir, &["claim", &long, "--tag", "decision", "--as", "alice"]);
+    let compact = bracken(dir, &["log", "--tag", "decision"]);
+    assert!(compact.lines().count() == 1 && compact.chars().count() <= 200, "{compact}");
+    assert!(compact.starts_with(&d[..8]) && compact.ends_with('…'), "{compact}");
+    let full = bracken(dir, &["log", "--tag", "decision", "--full"]);
+    assert!(full.contains(&long), "{full}");
+    assert!(bracken(dir, &["log"]).contains(&long), "a plain log stays full");
+    let err = bracken_fails(dir, &["log", "--full"]);
+    assert!(err.contains("--full only undoes"), "{err}");
+
+    // --since a date, by the contributions' stamps: two days apart, written straight to the store.
+    let mut store = manyroot::Store::open(&dir.join(".bracken")).unwrap();
+    let alice = store.identity("alice").unwrap();
+    let ground = store.info().ground;
+    let day = |n: u64| 1_793_145_600_000 + n * 86_400_000; // 2026-10-28T00:00:00Z, then days on
+    let mut stamped = Vec::new();
+    for (n, ms) in [(0, day(0) + 3_600_000), (1, day(1) + 66_000_000), (2, day(2) + 1)] {
+        let heads: Vec<_> = store.graph().heads().collect();
+        let body = manyroot::Body::Claim { statement: format!("dated {n}"), tags: vec!["dated".into()] };
+        let c = manyroot::Contribution::create(ground, &alice, heads, ms, body);
+        stamped.push(c.id().to_hex());
+        store.add(c).unwrap();
+    }
+    drop(store);
+    let since = |date: &str| -> Vec<String> {
+        let v = json(dir, &["log", "--tag", "dated", "--since", date, "--json"]);
+        v["contributions"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap().to_owned()).collect()
+    };
+    assert_eq!(since("2026-10-28"), stamped);
+    assert_eq!(since("2026-10-29"), stamped[1..]);
+    assert_eq!(since("2026-10-29T18:20:00Z"), stamped[1..], "stamped at the time itself counts");
+    assert_eq!(since("2026-10-29T18:20:01Z"), stamped[2..], "a time, not only a day");
+    assert_eq!(since("2026-10-31"), Vec::<String>::new());
+    let text = bracken(dir, &["log", "--tag", "dated", "--since", "2026-10-29"]);
+    assert_eq!(text.lines().count(), 3, "two compact lines and the cursor: {text}");
+    let err = bracken_fails(dir, &["log", "--since", "2026-13-40"]);
+    assert!(err.contains("neither a cursor nor a date"), "{err}");
+
+    // --limit with --tag: the newest N.
+    let out = bracken(dir, &["log", "--tag", "dated", "--limit", "1"]);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 2, "{out}");
+    assert!(stamped[2].starts_with(lines[0].split(' ').next().unwrap()), "{out}");
+    assert_eq!(lines[1], "omitted: 2 earlier (--limit)");
+
+    // --open: the findings scripts/merge would block a current head on, by its rules (process 4.2): only
+    // the triager's evidence triages, their pass stays confirmed, and a contradicts link retracted by
+    // anyone but the finding's author or the triager still counts.
+    for who in ["builder", "reviewer", "manager"] {
+        bracken(dir, &["id", "new", who]);
+    }
+    let claim = |text: &str, tags: &[&str], who: &str| {
+        let mut args = vec!["claim", text, "--as", who];
+        for t in tags {
+            args.extend(["--tag", t]);
+        }
+        bracken(dir, &args).lines().next().unwrap().to_owned()
+    };
+    let finding = |text: &str| claim(text, &["finding"], "reviewer");
+    let contradicts = |f: &str, pr: &str, who: &str| bracken(dir, &["relate", f, "contradicts", pr, "--as", who]);
+    let evidence = |f: &str, verdict: &str, who: &str| {
+        bracken(dir, &["evidence", f, verdict, "--method", "triage", "--as", who]);
+    };
+    let old_pr = claim("PR #1 a @ 1", &["pr"], "builder");
+    let new_pr = bracken(dir, &["claim", "PR #1 a @ 2", "--tag", "pr", "--supersedes", &old_pr, "--as", "builder"]);
+    let pr = new_pr.lines().next().unwrap().to_owned();
+    let on_pr = |text: &str| {
+        let f = finding(text);
+        contradicts(&f, &pr, "reviewer");
+        f
+    };
+    let mut open = Vec::new();
+    let mut closed = Vec::new();
+
+    open.push(on_pr("untriaged"));
+    let f = on_pr("confirmed by the manager");
+    evidence(&f, "pass", "manager");
+    open.push(f);
+    let f = finding("confirmed, on the old head only");
+    contradicts(&f, &old_pr, "reviewer");
+    evidence(&f, "pass", "manager");
+    closed.push(f);
+    let f = on_pr("rejected by the manager");
+    evidence(&f, "fail", "manager");
+    closed.push(f);
+    let f = on_pr("withdrawn");
+    bracken(dir, &["retract", &f, "--as", "reviewer"]);
+    closed.push(f);
+    closed.push(finding("contradicting nothing"));
+    // 090f4645800f: a builder's fail doesn't triage, and doesn't undo the manager's pass; nor does the
+    // manager's own fail beside their pass.
+    let f = on_pr("a builder's fail, no manager evidence");
+    evidence(&f, "fail", "builder");
+    open.push(f);
+    let f = on_pr("the manager's pass, then a builder's fail");
+    evidence(&f, "pass", "manager");
+    evidence(&f, "fail", "builder");
+    open.push(f);
+    let f = on_pr("the manager's pass and fail");
+    evidence(&f, "pass", "manager");
+    evidence(&f, "fail", "manager");
+    open.push(f);
+    let f = on_pr("its author's own pass only");
+    evidence(&f, "pass", "reviewer");
+    open.push(f);
+    // 7c38339206c5: the builder links it and then retracts the link: it still counts. The finding's
+    // author retracting their own link drops it.
+    let f = finding("linked by the builder, who retracts the link");
+    let link = contradicts(&f, &pr, "builder");
+    evidence(&f, "pass", "manager");
+    bracken(dir, &["retract", &link, "--as", "builder"]);
+    open.push(f);
+    let f = finding("its author retracts their own link");
+    let link = contradicts(&f, &pr, "reviewer");
+    evidence(&f, "pass", "manager");
+    bracken(dir, &["retract", &link, "--as", "reviewer"]);
+    closed.push(f);
+    // Deferred by the manager: a current task of theirs tagged deferred depends on it. Someone else's
+    // deferral doesn't count.
+    let f = on_pr("confirmed and deferred");
+    evidence(&f, "pass", "manager");
+    let task = claim("later", &["task", "deferred"], "manager");
+    bracken(dir, &["relate", &task, "depends_on", &f, "--as", "manager"]);
+    closed.push(f);
+    // 8c90edd63f5c: a contradiction is open whatever its tags, as scripts/merge counts it.
+    for tags in [&["note"][..], &[][..]] {
+        let f = claim("a disagreement, not tagged finding", tags, "builder");
+        contradicts(&f, &pr, "builder");
+        open.push(f);
+    }
+    let f = on_pr("confirmed, deferred by the builder");
+    evidence(&f, "pass", "manager");
+    let task = claim("later", &["task", "deferred"], "builder");
+    bracken(dir, &["relate", &task, "depends_on", &f, "--as", "builder"]);
+    open.push(f);
+
+    let listed = ids(dir, &["log", "--open", "--json"]);
+    for f in &open {
+        assert!(listed.contains(f), "{f} is open: {listed:?}");
+    }
+    for f in &closed {
+        assert!(!listed.contains(f), "{f} is closed: {listed:?}");
+    }
+    assert_eq!(listed.len(), open.len(), "{listed:?}");
+    let text = bracken(dir, &["log", "--open"]);
+    assert_eq!(text.lines().count(), open.len(), "compact by default: {text}");
+    // Another triager: only their evidence triages, so the manager's verdicts count for nothing.
+    let by_builder = ids(dir, &["log", "--open", "--triager", "builder", "--json"]);
+    assert!(by_builder.contains(&closed[1]), "the manager's fail doesn't triage for the builder");
+    let err = bracken_fails(dir, &["log", "--open", "--triager", "nobody"]);
+    assert!(err.contains("who triages"), "{err}");
 }
 
 /// Other agents write the text a log prints, so no statement, tag or note may reach the terminal with a
