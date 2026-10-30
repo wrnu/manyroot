@@ -386,6 +386,44 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         assert!(shown.contains("from bob") && stderr.is_empty(), "{scripts}: {shown} {stderr}");
         let (shown, _) = ok(sh(&b, "scripts/bk", &["show", alice.trim()], Some("bob")), "bob reads");
         assert!(shown.contains("from alice"), "{scripts}: {shown}");
+        // watch is a read: it pulls first. With --follow it syncs again on its interval, so a write from
+        // the other replica shows up while it runs.
+        let (out, _) = ok(sh(&a, "scripts/bk", &["watch"], Some("alice")), "alice watches");
+        let at = out.trim().strip_prefix("cursor: ").unwrap_or_else(|| panic!("{scripts}: {out}")).to_owned();
+        let (late, _) = ok(sh(&b, "scripts/bk", &["claim", "while alice watches", "--as", "bob"], None), "bob");
+        let late = common::bare_ids(late.trim().to_owned());
+        let (out, stderr) = ok(sh(&a, "scripts/bk", &["watch", "--since", &at], Some("alice")), "alice watches");
+        assert!(out.starts_with(&late[..8]) && stderr.is_empty(), "{scripts}: {out} {stderr}");
+        let mut follow = command(&a, "scripts/bk", &["watch", "--follow", "--interval", "2s", "--json"]);
+        follow.env("BRACKEN_BIN", &wrapper).env("T", tmp.path()).env("PATH", &path).env("BRACKEN_AGENT", "alice");
+        let mut follow = follow.stdout(std::process::Stdio::piped()).spawn().unwrap();
+        let mut lines = std::io::BufRead::lines(std::io::BufReader::new(follow.stdout.take().unwrap()));
+        let first = lines.next().unwrap().unwrap();
+        assert!(first.starts_with("{\"cursor\""), "{scripts}: {first}");
+        let (later, _) = ok(sh(&b, "scripts/bk", &["claim", "while alice follows", "--as", "bob"], None), "bob");
+        let later = common::bare_ids(later.trim().to_owned());
+        let next = lines.next().unwrap().unwrap();
+        follow.kill().unwrap();
+        follow.wait().unwrap();
+        assert!(next.contains(&later) && next.contains("while alice follows"), "{scripts}: {next}");
+        // Only bk gives watch its peer, the team server: another would bring in unconfirmed work.
+        for peer in [&["--sync", "http://127.0.0.1:1"][..], &["--token-file=/dev/null"]] {
+            let args = [&["watch", "--follow"][..], peer].concat();
+            for agent in [Some("alice"), Some("carol")] {
+                let out = sh(&a, "scripts/bk", &args, agent);
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(!out.status.success() && stderr.contains("refused"), "{scripts}: {args:?}: {stderr}");
+            }
+        }
+        // Without a team token, watch --follow says at once that it only reads the local replica.
+        let mut local = command(&a, "scripts/bk", &["watch", "--follow", "--interval", "2s"]);
+        local.env("BRACKEN_BIN", &wrapper).env("T", tmp.path()).env("PATH", &path).env("BRACKEN_AGENT", "carol");
+        let mut local = local.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let said = std::io::BufRead::lines(std::io::BufReader::new(local.stderr.take().unwrap())).next();
+        local.kill().unwrap();
+        local.wait().unwrap();
+        let said = said.unwrap().unwrap();
+        assert!(said.contains("won't sync") && said.contains("only the local replica"), "{scripts}: {said}");
         // An intent is a write too (task 065b221bfdad): pushed and confirmed like a claim, so the other
         // replica sees it on its next read.
         let before = syncs().lines().count();

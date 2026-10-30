@@ -65,7 +65,7 @@ With only the CLI and a short instructions file, an agent must be able to:
 | Get a workspace | `weave checkout` of a head | manifests only: `weave checkout --manifest`; heads come in step 5 |
 | Contribute | `weave propose`; claims, evidence and relations | proposals come in step 6 |
 | Respond | read findings and objections against its work | findings: `status --as` puts contradictions of its own claims first, `log --open` lists all open ones; objections come in step 7 |
-| Be woken | `watch` (below) | **no** |
+| Be woken | `watch` (below) | yes |
 | Finish | a report that `implements` the task | yes |
 
 The **neutrality test**: an agent in a harness we didn't build for (Pi

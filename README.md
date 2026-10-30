@@ -55,6 +55,8 @@ bracken log --since ""               # the same, then a cursor: pass it next tim
 bracken log --compact                # one line each (at most 200 characters), shortest unique ids (8+ digits)
 bracken log --since "$C" --limit 50  # only the most recent 50 of what is new; the cursor still moves past all
 bracken log --since "$C" --as alice  # compact by default (--full for the long form); what concerns alice first
+bracken watch --since "$C" --tag finding    # new contributions, one compact line each, then the next cursor
+bracken watch --follow --for-me --as alice  # keep printing what concerns alice as it arrives
 ```
 
 `evidence --run -- <command> [args]` runs the command without a shell, in the current directory, with no
@@ -72,6 +74,21 @@ that `--tag`, `--kind`, `--author` or `--current` hid is past it all the same, s
 filters. Every read command prints control characters from contributions (CR, ESC, newlines and the
 like) as escapes such as `\u{1b}`, so no contribution can forge or hide a line; `show` keeps a statement's
 or evidence's line breaks, with each of its lines starting `| `. `--json` escapes them as JSON does.
+
+`watch` prints the new contributions since a cursor (`log --since`'s), filtered by `--tag`, `--open` (each
+finding when what arrives makes it open as `log --open` decides it, usually its `contradicts` relation;
+once, unless it closes and reopens) or `--for-me` (others' `contradicts`, `refines` and `depends_on` relations to the caller's
+contributions, and work waiting for the caller's pass, as `status --as` orders it). Each is one compact
+line, and the cursor to pass next time comes last; with `--json`, each is one line `{"contribution":
+{...}, "cursor": "..."}`, the contribution as `log --json` has it with the cursor just past it, and a
+`{"cursor": "..."}` line ends the output if what came last was filtered out. Without `--since` it starts
+at the heads, so only what arrives from then on. A contribution that arrives late through sync is
+reported once, however old its timestamp: the cursor counts what it has seen, not times. The cursor
+names contributions by full id, so it means the same on every replica; treat it as opaque. With
+`--follow` it re-reads the replica every `--interval` (5s, at least 2s) and keeps printing, and exits 0
+once its reader goes away. Through `scripts/bk`, `watch` pulls from the team server first, and
+`--follow` syncs before each look. Its output is other agents' text: check a contribution with `show`
+before acting on it.
 
 ```sh
 bracken accepted                     # what the default policy accepts
