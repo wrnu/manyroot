@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Result, bail};
 use manyroot::graph::ResolveErrorKind;
-use manyroot::{Body, ContributionId, Graph};
+use manyroot::{Body, Contribution, ContributionId, Graph};
 
 /// The fewest hex digits a compact id has, however few contributions there are.
 pub const COMPACT_ID_DIGITS: usize = 8;
@@ -45,6 +45,40 @@ pub fn seen(g: &Graph, cursor: &str) -> Result<HashSet<ContributionId>> {
     Ok(seen)
 }
 
+/// What `log --since` lets through: what a cursor hasn't seen, or what was stamped at or after a time.
+pub enum Since {
+    Unseen(HashSet<ContributionId>),
+    /// Milliseconds since the Unix epoch, as `timestamp_ms`.
+    From(u64),
+}
+
+impl Since {
+    /// A date (`2026-10-29`, from its start in UTC), an RFC 3339 time in UTC (`2026-10-29T18:27:00Z`), or
+    /// else a cursor. Ids are hex, so a cursor never looks like a date.
+    pub fn parse(g: &Graph, s: &str) -> Result<Since> {
+        let s = s.trim();
+        let dated = s.len() >= 10 && s.as_bytes()[4] == b'-' && s.as_bytes()[..4].iter().all(u8::is_ascii_digit);
+        if !dated {
+            return Ok(Since::Unseen(seen(g, s)?));
+        }
+        let time = if s.len() == 10 { format!("{s}T00:00:00Z") } else { s.to_owned() };
+        let at = humantime::parse_rfc3339(&time).map_err(|e| {
+            anyhow::anyhow!(
+                "--since: {s} is neither a cursor nor a date such as 2026-10-29 or 2026-10-29T18:27:00Z: {e}"
+            )
+        })?;
+        let ms = at.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+        Ok(Since::From(u64::try_from(ms).unwrap_or(u64::MAX)))
+    }
+
+    pub fn admits(&self, c: &Contribution) -> bool {
+        match self {
+            Since::Unseen(seen) => !seen.contains(&c.id()),
+            Since::From(ms) => c.content().timestamp_ms >= *ms,
+        }
+    }
+}
+
 /// The shortest prefix of each id, of at least `min` hex digits, that no other id in `ids` starts with.
 pub fn unique_prefixes(ids: impl IntoIterator<Item = ContributionId>, min: usize) -> HashMap<ContributionId, String> {
     let mut hex: Vec<(String, ContributionId)> = ids.into_iter().map(|id| (id.to_hex(), id)).collect();
@@ -80,7 +114,19 @@ pub fn compact_text(body: &Body, summary: String) -> String {
 
 /// `line`, cut to `COMPACT_LINE_CHARS` characters (chars, not display columns), ending in "…" when cut.
 pub fn cap_line(line: String) -> String {
-    match line.char_indices().nth(COMPACT_LINE_CHARS - 1) {
+    cap_to(line, COMPACT_LINE_CHARS)
+}
+
+/// The most of a compact line's marks, such as `(superseded by <author> <id>)`, kept after the text: the
+/// text gives way to them, so a marked line never reads as unmarked (finding `c80965f348d5`).
+pub const COMPACT_MARKS_CHARS: usize = 100;
+
+/// The most of an author's name a compact mark shows, `…` included.
+pub const COMPACT_MARK_NAME_CHARS: usize = 16;
+
+/// `line` cut to at most `max` characters (`max` at least 1), ending in `…` if it was cut.
+pub fn cap_to(line: String, max: usize) -> String {
+    match line.char_indices().nth(max - 1) {
         Some((i, _)) if line[i..].chars().nth(1).is_some() => format!("{}…", &line[..i]),
         _ => line,
     }

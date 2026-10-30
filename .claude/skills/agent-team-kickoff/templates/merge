@@ -163,6 +163,7 @@ fi
 # 3. Findings: every contribution that contradicts the claim. A contradicts relation stops
 # counting only when it's retracted by the finding's author or the triager (a retract is always
 # by the relation's author), so no one else can drop a finding by retracting their own link to it.
+# `bracken log --open` (open_finding in crates/bracken/src/main.rs) mirrors these rules: change both.
 triager=manager
 contradicts=$(jq -c --arg id "$full" '[.referrers[] | select(.kind == "relation"
   and .body.kind == "contradicts" and .body.to == $id)]' <<<"$shown")
