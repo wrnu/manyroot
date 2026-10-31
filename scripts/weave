@@ -15,6 +15,8 @@
 #   - evidence: check results come only from the check runner (weave.md section 3);
 #   - sync and serve: the Weave Ground never syncs in v0, and this never reads .bracken-team;
 #   - --as weave-runner, for anything but weave validate;
+#   - weave integrate and weave line merge, which move a line, for anyone but --as weave-integrator: builders
+#     propose (scripts/weave-propose), and only the integrator merges (stage 2a, task 87a1bcba025d);
 #   - weave validate for an identity that isn't one of the line's validators, read from the pinned binary's
 #     own plan (weave validate --dry-run --json) before anything runs, and weave validate with a '--';
 #   - a line write (weave line create or weave line policy) whose --owner-decision isn't a claim tagged
@@ -79,6 +81,10 @@ if [ "$cmd" = relate ]; then
   done
 fi
 [ "$who" != weave-runner ] || [ "$sub" = validate ] || fail "--as weave-runner is only for weave validate"
+if [ "$sub" = integrate ] || { [ "$sub" = line ] && [ "$subsub" = merge ]; }; then
+  [ "$who" = weave-integrator ] ||
+    fail "weave integrate and weave line merge move a line, so they're only --as weave-integrator: builders propose (scripts/weave-propose)"
+fi
 if [ "$sub" = line ] && [[ $subsub == create || $subsub == policy ]]; then
   [ -n "$owner_decision" ] ||
     fail "weave line $subsub needs --owner-decision <id>: the id of the owner's decision, in the coordination Ground, that allows this policy"

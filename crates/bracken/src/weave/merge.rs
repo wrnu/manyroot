@@ -368,7 +368,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             }
             let lines = super::lines_for(s, &ix, &[Some(&into), Some(&from), base.as_deref()]);
             let target = lines_target(s, &lines, &ix, &into, &from, base.as_deref())?;
-            write_merge(s, agent, &ix, &lines, target, note, dry_run, None, &Default::default(), out)
+            write_merge(s, agent, &ix, &lines, target, note, dry_run, None, None, &Default::default(), out)
         }
     }
 }
@@ -564,13 +564,21 @@ pub(crate) fn propose(s: &mut Store, agent: Option<&str>, args: ProposeArgs) -> 
     Ok(ExitCode::SUCCESS)
 }
 
-/// `weave integrate --proposals`.
+/// The git commit a merge mirrors (`integrate --mirrors`), and its tree as import would record it.
+struct Mirror {
+    commit: String,
+    manifest: Manifest,
+}
+
+/// `weave integrate --proposals`, and with `mirrors` (a revision and the repository it's in), the git
+/// commit the merge must equal.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn integrate_proposals(
     s: &mut Store,
     agent: Option<&str>,
     line: Option<&str>,
     proposals: &[String],
+    mirrors: Option<(&str, &Path)>,
     note: String,
     run: Option<&checks::Run>,
     decide_args: &super::review::DecideArgs,
@@ -581,7 +589,21 @@ pub(crate) fn integrate_proposals(
     let named: Vec<Option<&str>> = proposals.iter().map(|p| Some(p.as_str())).chain([line]).collect();
     let lines = super::lines_for(s, &ix, &named);
     let target = proposals_target(s, &lines, &ix, line, proposals)?;
-    write_merge(s, agent, &ix, &lines, target, note, false, run, decide_args, out)
+    let mirror = match mirrors {
+        None => None,
+        Some((rev, repo)) => {
+            let plan = import::plan(repo, &Source::Rev(rev.to_owned()), &known_keys(s, repo)?)?;
+            let Some(manifest) = plan.manifest() else {
+                bail!(
+                    "--mirrors {rev}: import refuses {} of its files, so it can't be mirrored; nothing was written",
+                    plan.refused.len()
+                );
+            };
+            let commit = plan.commit.clone().context("import names the commit it read")?;
+            Some(Mirror { commit, manifest })
+        }
+    };
+    write_merge(s, agent, &ix, &lines, target, note, false, run, mirror, decide_args, out)
 }
 
 /// One step of a merge: `from` merged into the tree so far, against `base`.
@@ -802,6 +824,7 @@ fn write_merge(
     note: String,
     dry_run: bool,
     run: Option<&checks::Run>,
+    mirror: Option<Mirror>,
     decide_args: &super::review::DecideArgs,
     out: Output,
 ) -> Result<ExitCode> {
@@ -867,6 +890,24 @@ fn write_merge(
         Err((step, e)) => bail!("merging {}: {e}; nothing was written", target.steps[step].label),
     };
     let hash = resolved.manifest.content_hash();
+    // Mirroring a git commit, the merge must come out as git's tree, or nothing is written: never forced.
+    if let Some(m) = &mirror
+        && m.manifest.content_hash() != hash
+    {
+        let differs = diff::manifests(&m.manifest, &resolved.manifest);
+        if out.json {
+            let rows: Vec<Value> = differs.iter().map(|d| json!({"path": d.path, "change": d.kind.as_str()})).collect();
+            print_json(&json!({"merge": target.about, "mirrors": m.commit, "differs": rows,
+                               "manifest": hash.to_string(), "decision": Value::Null}));
+        } else {
+            println!("the merge differs from {}:", m.commit);
+            for d in &differs {
+                println!("{} {}", d.kind.as_str(), crate::terminal::printable(&d.path));
+            }
+        }
+        decide(false);
+        bail!("the merged tree differs from {}'s at {} paths, so nothing was written", m.commit, differs.len());
+    }
     let held = ix.manifest(&hash).is_some();
     let missing = ix.missing(&resolved.manifest);
     if !missing.is_empty() {
@@ -886,7 +927,7 @@ fn write_merge(
         answers: vec![],
         resolutions: resolved.used.clone(),
         goals: vec![],
-        source: None,
+        source: mirror.map(|m| bracken_tree::format::Source { git: m.commit }),
         note,
     };
     decide_args.apply(s, ix, lines, &mut decision)?;

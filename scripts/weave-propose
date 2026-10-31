@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# weave-propose: Weave dogfood stage 2a (docs/design/weave.md, section 6 row 10a; docs/builder.md; task
+# 87a1bcba025d). After each push, a builder proposes the pushed commit to the Weave Ground, through
+# scripts/weave. Nothing is checked or merged here: after git merges the PR, the manager's scripts/weave-shadow
+# --proposal <id> merges it in Weave.
+#
+#   scripts/weave-propose --pr <n> [--as <identity>]
+#       Proposes the current branch's HEAD, which must be what was pushed (refs/remotes/origin/<branch>), to
+#       the default line, main. Its base is the decision on main that mirrors the branch's merge-base with
+#       origin/main, or the nearest first-parent ancestor of it the shadow recorded, so the proposal's change
+#       is the branch's own (against Weave's head, a branch behind main would propose undoing what was
+#       merged since). Run the main checkout's copy, "$main/scripts/weave-propose", from the branch's
+#       worktree. The summary is 'PR #<n> <branch> @ <sha>'. Prints
+#       'proposal <id>': name it in the pr claim as 'Weave proposal <id>'. The identity (default
+#       BRACKEN_AGENT) is created in the Weave Ground the first time.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+fail() { echo "weave-propose: $*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/{/^#/s/^# \{0,1\}//p;}' "${BASH_SOURCE[0]}"; }
+weave="$here/weave"
+
+pr='' who=${BRACKEN_AGENT:-}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pr) [ $# -ge 2 ] || fail "--pr needs a number"; pr=$2; shift ;;
+    --pr=*) pr=${1#*=} ;;
+    --as) [ $# -ge 2 ] || fail "--as needs an identity"; who=$2; shift ;;
+    --as=*) who=${1#*=} ;;
+    -h | --help) usage; exit 0 ;;
+    *) fail "unknown argument $1; see --help" ;;
+  esac
+  shift
+done
+[[ $pr =~ ^[1-9][0-9]*$ ]] || fail "--pr <n>: the PR's number"
+[ -n "$who" ] || fail "who proposes? give --as <identity> or set BRACKEN_AGENT"
+case $who in weave-integrator | weave-runner) fail "--as $who: a builder proposes under its own name" ;; esac
+
+repo=$(git rev-parse --show-toplevel 2>/dev/null) || fail "not inside a git checkout"
+branch=$(git -C "$repo" symbolic-ref -q --short HEAD) || fail "HEAD isn't on a branch"
+sha=$(git -C "$repo" rev-parse HEAD)
+pushed=$(git -C "$repo" rev-parse -q --verify "refs/remotes/origin/$branch") ||
+  fail "origin has no $branch yet: push first, then propose what was pushed"
+[ "$pushed" = "$sha" ] || fail "HEAD $sha isn't what origin/$branch has ($pushed): propose only the pushed commit"
+git -C "$repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no refs/remotes/origin/main"
+fork=$(git -C "$repo" merge-base HEAD refs/remotes/origin/main) || fail "$branch shares no history with origin/main"
+
+# The base: the decision on main mirroring the merge-base or, failing that, its nearest first-parent
+# ancestor the shadow recorded (finding da532127b55f). A merge-base can be a forge squash the shadow never
+# records itself, since it records the local merge that brings it in.
+mirrored=$("$weave" weave log --limit 100000 --json |
+  jq -r '.decisions[] | select(.source.git != null) | "\(.source.git) \(.decision)"')
+base=''
+for c in $(git -C "$repo" rev-list --first-parent --max-count 1000 "$fork"); do
+  base=$(awk -v c="$c" '$1 == c { print $2; exit }' <<<"$mirrored")
+  [ -z "$base" ] || break
+done
+[ -n "$base" ] ||
+  fail "no decision on main mirrors $fork, $branch's merge-base with origin/main, or a first-parent ancestor of it; propose again once the shadow has recorded it"
+
+jq -e --arg n "$who" 'any(.[]; .name == $n and .can_sign)' <<<"$("$weave" id list --json)" >/dev/null ||
+  "$weave" id new "$who" >/dev/null
+out=$("$weave" weave propose --from-git "$sha" --base "$base" --summary "PR #$pr $branch @ $sha" --repo "$repo" \
+  --as "$who" --json)
+id=$(jq -r '.proposal // empty' <<<"$out")
+[ -n "$id" ] || fail "weave propose wrote no proposal: $out"
+echo "proposal $id"

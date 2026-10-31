@@ -174,6 +174,12 @@ pub(crate) enum WeaveCommand {
         /// written. The line defaults to the proposals'.
         #[arg(long, value_name = "PROPOSAL", num_args = 1.., conflicts_with_all = ["from_git", "index", "manifest"])]
         proposals: Vec<String>,
+        /// With --proposals: the git commit this merge mirrors, while dogfooding (stage 2a). The decision
+        /// names it as its source, and nothing is written unless the merged tree equals the commit's tree
+        /// as import would record it; otherwise the paths that differ are listed. Nothing is imported
+        /// from the commit.
+        #[arg(long, value_name = "REV", requires = "proposals")]
+        mirrors: Option<String>,
         /// What the decision does, in words.
         #[arg(long, default_value = "")]
         note: String,
@@ -550,9 +556,12 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             }
             Ok(ExitCode::SUCCESS)
         }
-        WeaveCommand::Integrate { line, proposals, note, run, timeout, decide, out, .. } if !proposals.is_empty() => {
+        WeaveCommand::Integrate { line, proposals, mirrors, note, run, timeout, repo, decide, out, .. }
+            if !proposals.is_empty() =>
+        {
             let run = if run { Some(checks::Run::new(s, timeout)?) } else { None };
-            merge::integrate_proposals(s, agent, line.as_deref(), &proposals, note, run.as_ref(), &decide, out)
+            let mirrors = mirrors.as_deref().map(|rev| (rev, repo.as_path()));
+            merge::integrate_proposals(s, agent, line.as_deref(), &proposals, mirrors, note, run.as_ref(), &decide, out)
         }
         WeaveCommand::Green(args) => review::green(s, args),
         WeaveCommand::Review(args) => review::review(s, args),
