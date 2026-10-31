@@ -164,6 +164,11 @@ fn a_copy_works_on_the_tree_through_weave() {
     s.ok(0, "write_file", json!({"path": "tiny/total.py", "text": "def total(xs):\n    return sum(xs)\n"}));
     let changes = s.ok(0, "changes", json!({}));
     assert!(changes["diff"].as_str().expect("a diff").contains("+def total(xs):"), "{changes}");
+    // A top-level file named base is a path, never the tag changes diffs against (finding 0fe23b26f83e).
+    s.ok(0, "write_file", json!({"path": "base", "text": "a file\n"}));
+    let changes = s.ok(0, "changes", json!({}));
+    assert!(changes["files"].as_array().expect("files").iter().any(|f| f == "A\tbase"), "{changes}");
+    s.ok(0, "delete_file", json!({"path": "base"}));
     let head = s.ok(0, "head", json!({}));
     assert_eq!(head["unproposed_edits"], true, "{head}");
     assert_eq!(head["heads"][0]["decision"], head["base"], "{head}");
@@ -279,13 +284,24 @@ fn a_fork_is_settled_by_a_merge_that_keeps_both_heads() {
     }
     let marked = std::fs::read_to_string(s.trees[0].join("tiny/stats.py")).expect("stats");
     assert!(marked.contains("<<<<<<<") && marked.contains("# zero") && marked.contains("# one"), "{marked}");
-    let err = s.tool(0, "integrate", json!({"note": "still marked"})).expect_err("markers left");
+    // A conflict is open until resolve settles it, so one with no markers to find (a binary file's) never
+    // passes unsettled (finding e26a1c74e007); a file still marked can't be settled as it stands.
+    let err = s.tool(0, "integrate", json!({"note": "still marked"})).expect_err("unsettled");
+    assert!(err.contains("isn't settled"), "{err}");
+    let err = s.tool(0, "resolve", json!({"path": "tiny/stats.py", "take": "tree"})).expect_err("markers left");
     assert!(err.contains("conflict markers"), "{err}");
+    for bad in [json!({"path": "tiny/zero.py", "take": "tree"}), json!({"path": "tiny/stats.py", "take": "from"})] {
+        assert!(s.tool(0, "resolve", bad.clone()).is_err(), "{bad}");
+    }
     s.ok(
         0,
         "write_file",
         json!({"path": "tiny/stats.py", "text": stats.replace(&line, &format!("{line}  # zero and one"))}),
     );
+    let err = s.tool(0, "integrate", json!({"note": "settled, not said"})).expect_err("not resolved");
+    assert!(err.contains("isn't settled"), "{err}");
+    let resolved = s.ok(0, "resolve", json!({"path": "tiny/stats.py", "take": "tree"}));
+    assert_eq!(resolved["conflicts"], json!([]), "{resolved}");
     let settled = s.ok(0, "integrate", json!({"note": "both heads, settled"}));
     assert_eq!(settled["parents"].as_array().expect("parents").len(), 2, "{settled}");
     s.sync(0);

@@ -118,7 +118,7 @@ impl Mode for WeaveMode {
             ),
             tool(
                 "merge",
-                "On a forked line: make your working tree every head merged, file by file against where they parted. A file the heads changed differently is left with conflict markers (<<<<<<< and >>>>>>>) for you to settle; then integrate with no proposals. Refused while you have edits not yet proposed",
+                "On a forked line: make your working tree every head merged, file by file against where they parted. Each file the heads changed differently is listed as a conflict, left with conflict markers (<<<<<<< and >>>>>>>) where it is text; settle each with resolve, giving no proposals, then integrate with no proposals. Refused while you have edits not yet proposed",
                 json!({}),
                 &[],
             ),
@@ -130,13 +130,13 @@ impl Mode for WeaveMode {
             ),
             tool(
                 "resolve",
-                "Settle the conflict at `path` that integrating `proposals` (in that order) stopped at: `take` the line's side (into), the proposal's (from), your working tree's file at that path (tree), or delete it (delete). Then integrate the same proposals",
+                "Settle a conflict at `path`. With `proposals`, one that integrating them (in that order) stopped at: `take` the line's side (into), the proposal's (from), your working tree's file at that path (tree), or delete it (delete); then integrate the same proposals. With none, one your merge reported: keep your working tree's file as you've settled it (tree, refused while it holds conflict markers) or delete it (delete)",
                 json!({
-                    "proposals": {"type": "array", "items": id, "minItems": 1},
+                    "proposals": {"type": "array", "items": id},
                     "path": path,
                     "take": {"type": "string", "enum": ["into", "from", "tree", "delete"]},
                 }),
-                &["proposals", "path", "take"],
+                &["path", "take"],
             ),
         ]
     }
@@ -622,10 +622,11 @@ impl WeaveStore {
     /// `24bae8fdb48a`).
     fn changes(&mut self) -> Result<Value, String> {
         self.git(&["add", "-A"])?;
-        let files =
-            self.git(&["diff", "--cached", "--name-status", "base"]).map(|o| String::from_utf8_lossy(&o).into_owned());
+        let files = self
+            .git(&["diff", "--cached", "--name-status", "refs/tags/base", "--"])
+            .map(|o| String::from_utf8_lossy(&o).into_owned());
         let diff = self
-            .git(&["diff", "--cached", "--no-color", "--no-ext-diff", "base"])
+            .git(&["diff", "--cached", "--no-color", "--no-ext-diff", "refs/tags/base", "--"])
             .map(|o| String::from_utf8_lossy(&o).into_owned());
         self.git(&["reset", "-q"])?;
         let (files, diff) = (files?, diff?);
@@ -765,16 +766,16 @@ impl WeaveStore {
                         ids.len()
                     ));
                 }
+                // Each conflict is settled by resolve, so one with no markers to find, such as a binary file's,
+                // never passes unsettled (finding e26a1c74e007).
                 let conflicts = self.saved("conflicts.txt").unwrap_or_default();
-                for path in conflicts.lines().filter(|l| !l.is_empty()) {
-                    let Ok(file) = self.file(path) else { continue };
-                    let text = std::fs::read(&file).unwrap_or_default();
-                    let text = String::from_utf8_lossy(&text);
-                    if text.lines().any(|l| l.starts_with("<<<<<<<") || l.starts_with(">>>>>>>")) {
-                        return Err(format!("{} still holds conflict markers: settle it first", short(path)));
-                    }
+                match conflicts.lines().find(|l| !l.is_empty()) {
+                    Some(path) => Err(format!(
+                        "your merge's conflict at {} isn't settled: settle it, then resolve it with no proposals",
+                        short(path)
+                    )),
+                    None => Ok(()),
                 }
-                Ok(())
             }
         }
     }
@@ -793,13 +794,37 @@ impl WeaveStore {
         }
         let decisions = self.decisions()?;
         let keep = self.git_line(&["rev-parse", "HEAD"])?;
-        let commits = match self.mirror(&decisions, &ids) {
-            Ok(c) => c,
-            Err(e) => {
-                self.git(&["reset", "-q", "--hard", &keep])?;
-                return Err(e);
-            }
-        };
+        // Whatever happens after the mirror, the tree goes back to its own commit (finding e26a1c74e007).
+        let merged = self.merge_heads(&decisions, &ids);
+        self.git(&["reset", "-q", "--hard", &keep])?;
+        let (tree, conflicts) = merged?;
+        let count = self
+            .git(&["ls-tree", "-r", "--name-only", &tree])?
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .count();
+        if count > MAX_FILES {
+            return Err(format!("the heads merged hold {count} files, more than a tree may ({MAX_FILES})"));
+        }
+        // The merged files over the tree's own commit, unstaged: edits not yet proposed.
+        let applied = self.git(&["read-tree", "--reset", "-u", &tree]).and_then(|_| self.git(&["reset", "-q"]));
+        if let Err(e) = applied {
+            self.git(&["reset", "-q", "--hard", &keep])?;
+            return Err(e);
+        }
+        self.save("merge.txt", &ids.join("\n"))?;
+        self.save("conflicts.txt", &conflicts.join("\n"))?;
+        Ok(json!({"heads": ids, "conflicts": conflicts}))
+    }
+
+    /// The heads `ids` merged in order, as git's tree id, and the paths that conflicted. Leaves the working
+    /// tree wherever the mirror left it; [`WeaveStore::merge`] restores it.
+    fn merge_heads(
+        &mut self,
+        decisions: &std::collections::BTreeMap<String, (String, Vec<String>)>,
+        ids: &[String],
+    ) -> Result<(String, Vec<String>), String> {
+        let commits = self.mirror(decisions, ids)?;
         let mut merged = commits[0].clone();
         let mut conflicts = std::collections::BTreeSet::new();
         let mut tree = String::new();
@@ -812,29 +837,11 @@ impl WeaveStore {
             match out.status.code() {
                 Some(0) => {}
                 Some(1) => conflicts.extend(lines.take_while(|l| !l.is_empty()).map(str::to_string)),
-                _ => {
-                    self.git(&["reset", "-q", "--hard", &keep])?;
-                    return Err(format!("git merge-tree: {}", short(String::from_utf8_lossy(&out.stderr).trim())));
-                }
+                _ => return Err(format!("git merge-tree: {}", short(String::from_utf8_lossy(&out.stderr).trim()))),
             }
             merged = self.git_line(&["commit-tree", &tree, "-p", &merged, "-p", other, "-m", "merged"])?;
         }
-        // Back to the tree's own commit, then the merged files over it, unstaged: edits not yet proposed.
-        self.git(&["reset", "-q", "--hard", &keep])?;
-        let count = self
-            .git(&["ls-tree", "-r", "--name-only", &tree])?
-            .split(|b| *b == b'\n')
-            .filter(|l| !l.is_empty())
-            .count();
-        if count > MAX_FILES {
-            return Err(format!("the heads merged hold {count} files, more than a tree may ({MAX_FILES})"));
-        }
-        self.git(&["read-tree", "--reset", "-u", &tree])?;
-        self.git(&["reset", "-q"])?;
-        self.save("merge.txt", &ids.join("\n"))?;
-        let conflicts: Vec<String> = conflicts.into_iter().collect();
-        self.save("conflicts.txt", &conflicts.join("\n"))?;
-        Ok(json!({"heads": ids, "conflicts": conflicts}))
+        Ok((tree, conflicts.into_iter().collect()))
     }
 
     /// Each of `heads` as a git commit whose history is the line's: every decision in their past becomes a
@@ -886,6 +893,9 @@ impl WeaveStore {
     /// The `resolve` tool: a resolution of the conflict at `path` that integrating `proposals` stopped at.
     fn resolve(&mut self, proposals: Vec<String>, path: &str, take: &str) -> Result<Value, String> {
         plain_path(path)?;
+        if proposals.is_empty() {
+            return self.settle(path, take);
+        }
         let me = self.config.identity.clone();
         let mut argv = vec!["weave".to_string(), "resolve".into(), format!("--as={me}"), "--json".into()];
         match take {
@@ -905,6 +915,34 @@ impl WeaveStore {
         argv.extend(["--".into(), path.into()]);
         let out = self.bracken(&argv)?;
         serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))
+    }
+
+    /// Settles a conflict the agent's merge reported at `path`: its working tree's file as it stands (`tree`),
+    /// with no conflict marker left, or the file deleted (`delete`).
+    fn settle(&mut self, path: &str, take: &str) -> Result<Value, String> {
+        let conflicts = self.saved("conflicts.txt").unwrap_or_default();
+        if !conflicts.lines().any(|l| l == path) {
+            return Err(format!("your merge reported no conflict at {} to settle", short(path)));
+        }
+        let file = self.file(path)?;
+        match take {
+            "tree" => {
+                let bytes = std::fs::read(&file).map_err(|_| format!("no file {} in your tree", short(path)))?;
+                let text = String::from_utf8_lossy(&bytes);
+                if text.lines().any(|l| l.starts_with("<<<<<<<") || l.starts_with(">>>>>>>")) {
+                    return Err(format!("{} still holds conflict markers: settle them first", short(path)));
+                }
+            }
+            "delete" => {
+                if std::fs::symlink_metadata(&file).is_ok() {
+                    self.delete_file(path)?;
+                }
+            }
+            other => return Err(format!("take {}: a merge's conflict takes tree or delete", short(other))),
+        }
+        let left: Vec<&str> = conflicts.lines().filter(|l| !l.is_empty() && *l != path).collect();
+        self.save("conflicts.txt", &left.join("\n"))?;
+        Ok(json!({"settled": path, "conflicts": left}))
     }
 }
 
@@ -1076,9 +1114,6 @@ impl Store for WeaveStore {
             "resolve" => {
                 let a = Args::new(args, &["proposals", "path", "take"])?;
                 let proposals: Vec<String> = a.ids("proposals")?.into_iter().map(str::to_string).collect();
-                if proposals.is_empty() {
-                    return Err("give the proposals, in the order integrate was given them".into());
-                }
                 self.resolve(proposals, a.text("path")?, a.text("take")?)
             }
             other => Err(format!("no tool {}", short(other))),

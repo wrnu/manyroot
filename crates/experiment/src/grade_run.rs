@@ -32,7 +32,12 @@ pub struct Point {
     pub manifest: String,
     /// Whether the line was forked then: other heads weren't graded.
     pub forked: bool,
-    pub grade: Grade,
+    /// The grade, or why the tree couldn't be graded (finding aad6a4f0057b): one tree's failure, such as a
+    /// checkout refused, is that point's, and every other tree is still graded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grade: Option<Grade>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// What grading a run did, with nothing of the hidden set but counts.
@@ -43,10 +48,14 @@ pub struct Summary {
     pub points: usize,
     /// Points whose tree passes all that applies to it.
     pub all_pass: usize,
+    /// Points whose tree couldn't be graded.
+    pub errors: usize,
 }
 
 /// Grades the project run in `dir` with the hidden set in `store`, writing one [`Point`] a line to `grades`, a
-/// new file. `bracken` checks each tree out of the run's hub.
+/// new file: written beside it under another name, and linked to its name, never replacing a file, only once
+/// every tree is graded, so a failure leaves nothing at `grades`. `bracken` checks each tree out of the run's
+/// hub.
 pub fn grade_run(dir: &Path, store: &Path, grades: &Path, bracken: &Path) -> Result<Summary, String> {
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()));
     let plan_bytes = read(&dir.join("plan.json"))?;
@@ -54,7 +63,9 @@ pub fn grade_run(dir: &Path, store: &Path, grades: &Path, bracken: &Path) -> Res
     let project_plan = plan.inputs.project.as_ref().ok_or("not a project run: its plan names no project")?;
     let pin = plan.inputs.python.as_ref().ok_or("the plan has no Python pin")?;
     let project = project_plan.load()?;
-    check_grades_path(grades, &[("the run", dir), ("the project", &project.dir), ("the private store", store)])?;
+    // The file is written by the path checked, its parent resolved (finding aad6a4f0057b).
+    let grades =
+        check_grades_path(grades, &[("the run", dir), ("the project", &project.dir), ("the private store", store)])?;
     let set = HiddenSet::open(&project, store)?;
     let python = Python::from_plan(pin, &project.python)?;
     let events = String::from_utf8(read(&dir.join("events.jsonl"))?).map_err(|e| format!("the events: {e}"))?;
@@ -66,24 +77,23 @@ pub fn grade_run(dir: &Path, store: &Path, grades: &Path, bracken: &Path) -> Res
     if logged != Some(blake3::hash(&plan_bytes).to_hex().as_str()) {
         return Err("plan.json isn't the plan the run logged at setup".into());
     }
-    let mut out = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(grades)
-        .map_err(|e| format!("creating {}: {e}", grades.display()))?;
+    let partial = Partial::create(&grades)?;
+    let mut out = &partial.file;
     let hub = dir.join("hub").join(".bracken");
-    let (mut points, mut all_pass, mut graded) = (0, 0, BTreeMap::<(String, bool), Grade>::new());
+    let (mut points, mut all_pass, mut errors) = (0, 0, 0);
+    let mut graded = BTreeMap::<(String, bool), Result<Grade, String>>::new();
     for logged in trees(&events, plan.turns)? {
         let key = (logged.manifest.clone(), logged.change_released);
         let g = match graded.get(&key) {
             // The same tree under the same groups: the grade it already has.
             Some(g) => g.clone(),
             None => {
-                let scratch = Scratch::new()?;
-                let tree = scratch.dir.join("tree");
-                checkout(bracken, &hub, &logged.manifest, &tree)?;
-                let share = if logged.change_released { 1.0 } else { 0.0 };
-                let g = grade(&python, &project, &set, Tree::Dir(&tree), share)?;
+                let g = Scratch::new().and_then(|scratch| {
+                    let tree = scratch.dir.join("tree");
+                    checkout(bracken, &hub, &logged.manifest, &tree)?;
+                    let share = if logged.change_released { 1.0 } else { 0.0 };
+                    grade(&python, &project, &set, Tree::Dir(&tree), share)
+                });
                 graded.insert(key, g.clone());
                 g
             }
@@ -92,7 +102,12 @@ pub fn grade_run(dir: &Path, store: &Path, grades: &Path, bracken: &Path) -> Res
             Value::Number(n) => n.as_f64().unwrap_or(0.0) / f64::from(plan.turns.max(1)),
             _ => 1.0,
         };
-        all_pass += usize::from(g.all_pass());
+        all_pass += usize::from(g.as_ref().is_ok_and(Grade::all_pass));
+        errors += usize::from(g.is_err());
+        let (grade, error) = match g {
+            Ok(g) => (Some(g), None),
+            Err(e) => (None, Some(crate::args::short(&e))),
+        };
         let point = Point {
             at: logged.at,
             turn_share,
@@ -100,14 +115,52 @@ pub fn grade_run(dir: &Path, store: &Path, grades: &Path, bracken: &Path) -> Res
             decision: logged.decision,
             manifest: logged.manifest,
             forked: logged.forked,
-            grade: g,
+            grade,
+            error,
         };
         writeln!(out, "{}", serde_json::to_string(&point).expect("a point is plain JSON"))
-            .map_err(|e| format!("writing {}: {e}", grades.display()))?;
+            .map_err(|e| format!("writing the grades: {e}"))?;
         points += 1;
     }
-    out.sync_all().map_err(|e| format!("writing {}: {e}", grades.display()))?;
-    Ok(Summary { project: project.name.clone(), hidden: project.hidden.id.clone(), points, all_pass })
+    out.flush().map_err(|e| format!("writing the grades: {e}"))?;
+    partial.finish(&grades)?;
+    Ok(Summary { project: project.name.clone(), hidden: project.hidden.id.clone(), points, all_pass, errors })
+}
+
+/// A grades file being written, beside its name: removed unless [`Partial::finish`] links it to its name.
+struct Partial {
+    path: PathBuf,
+    file: std::fs::File,
+    done: bool,
+}
+
+impl Partial {
+    fn create(grades: &Path) -> Result<Partial, String> {
+        let name = grades.file_name().expect("checked to name a file").to_string_lossy();
+        let path = grades.with_file_name(format!(".{name}.{}.partial", std::process::id()));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|e| format!("creating {}: {e}", path.display()))?;
+        Ok(Partial { path, file, done: false })
+    }
+
+    /// Gives the file its name, refusing to replace one there now, and removes the other name.
+    fn finish(mut self, grades: &Path) -> Result<(), String> {
+        self.file.sync_all().map_err(|e| format!("writing the grades: {e}"))?;
+        std::fs::hard_link(&self.path, grades).map_err(|e| format!("naming the grades {}: {e}", grades.display()))?;
+        self.done = true;
+        std::fs::remove_file(&self.path).map_err(|e| format!("removing {}: {e}", self.path.display()))
+    }
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// A tree a run logged: where (a checkpoint's turn, or `"end"`), whether the change had gone out before it, and
@@ -183,7 +236,7 @@ fn checkout(bracken: &Path, hub: &Path, manifest: &str, to: &Path) -> Result<(),
 /// Refuses a grades file that exists, or would be inside any of `inside` (the run, the project, the store, each
 /// named by what it is, so no error says the store's path), a Ground or a git checkout: grades are kept apart
 /// from everything a run or an agent reads.
-pub fn check_grades_path(grades: &Path, inside: &[(&str, &Path)]) -> Result<(), String> {
+pub fn check_grades_path(grades: &Path, inside: &[(&str, &Path)]) -> Result<PathBuf, String> {
     if std::fs::symlink_metadata(grades).is_ok() {
         return Err(format!("{} already exists; grades go to a new file", grades.display()));
     }
@@ -212,5 +265,6 @@ pub fn check_grades_path(grades: &Path, inside: &[(&str, &Path)]) -> Result<(), 
         ));
     }
     let advice = bracken_demo::safety::Advice { checkout: "write grades outside any repository", env: "unset it" };
-    bracken_demo::safety::refuse_git_checkout(&parent, false, &advice).map_err(|e| e.to_string())
+    bracken_demo::safety::refuse_git_checkout(&parent, false, &advice).map_err(|e| e.to_string())?;
+    Ok(real)
 }

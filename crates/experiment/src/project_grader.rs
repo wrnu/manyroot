@@ -27,6 +27,9 @@ const SERVER: &str = include_str!("project_grader/server.py");
 const CLI: &str = include_str!("project_grader/cli.py");
 /// The host's CPU and wall time are the project's times this: it runs a whole file, waiting on every call.
 const HOST_TIMES: u32 = 4;
+
+/// The most tests a group's file may hold, as its host says: more are counted as this many.
+const MAX_TESTS: u32 = 100_000;
 /// What the host may print (its own test runner's output, discarded) and use.
 const HOST_OUTPUT: u64 = 16 << 20;
 const HOST_MEMORY_MB: u32 = 1024;
@@ -236,27 +239,40 @@ fn run_group(
     let mut running = python.start(&scratch, &args, &host_limits)?;
     let deadline = Instant::now() + Duration::from_secs(host_limits.wall_seconds.into());
     let mut server = Server { python, project, set, tree, running: None, generation: 0 };
-    // What the host has said as it went (finding e7d128464936): the number of tests, each outcome, each test's end.
+    // What the host has said as it went (finding e7d128464936): the number of tests, each test's start (its index),
+    // each outcome, each test's end.
     let (mut total, mut done, mut so_far, mut counts) = (0u32, 0u32, Counts::default(), None);
-    // Each ended test's outcome, and the worst so far of the one running.
-    let (mut outcomes, mut running_test) = (Vec::new(), None::<Outcome>);
+    // Each test's outcome by index, the worst it reported; the test running; and the worst outcome reported
+    // outside any test, such as a class fixture's error (finding bcecc7c3f6e3).
+    let (mut outcomes, mut current, mut outside) = (Vec::<Option<Outcome>>::new(), None::<usize>, None::<Outcome>);
     while let Some(line) = running.next(deadline) {
         let reply = match line.split_once(' ') {
             Some(("S", request)) => server.ask(request, deadline)?,
             Some(("C", request)) => command(python, project, set, tree, request)?,
             Some(("N", n)) => {
-                total = n.parse().unwrap_or(0);
+                total = n.parse::<u32>().unwrap_or(0).min(MAX_TESTS);
+                outcomes = vec![None; total as usize];
+                continue;
+            }
+            Some(("B", i)) => {
+                current = i.parse::<usize>().ok().filter(|i| *i < outcomes.len());
                 continue;
             }
             Some(("O", kind)) => {
                 so_far.add_one(kind);
-                running_test = running_test.max(Some(Outcome::named(kind)));
+                let o = Some(Outcome::named(kind));
+                match current {
+                    Some(i) => outcomes[i] = outcomes[i].max(o),
+                    None => outside = outside.max(o),
+                }
                 continue;
             }
             Some(("D", _)) => {
                 done += 1;
                 // A test that said nothing, which unittest doesn't do, counts as an error.
-                outcomes.push(running_test.take().unwrap_or(Outcome::Error));
+                if let Some(i) = current.take() {
+                    outcomes[i].get_or_insert(Outcome::Error);
+                }
                 continue;
             }
             Some(("R", result)) => {
@@ -271,14 +287,19 @@ fn run_group(
     }
     server.end();
     let exit = running.finish();
-    let unended = usize::try_from(total.saturating_sub(done)).expect("a u32 fits a usize");
-    if counts.is_none() && unended > 0 {
-        // The tests that hadn't ended when the host did are failures, the one that was running among them.
-        outcomes.push(running_test.take().map_or(Outcome::Fail, |o| o.max(Outcome::Fail)));
-        outcomes.extend(std::iter::repeat_n(Outcome::Fail, unended - 1));
+    // A test that never ended: a failure if the host ended early, as the counts have it (the one running among
+    // them); else, never started, it is what stopped it, the error outside any test, such as its class's fixture.
+    if counts.is_none()
+        && let Some(i) = current
+    {
+        outcomes[i] = outcomes[i].max(Some(Outcome::Fail));
     }
-    // An outcome outside any test: the file failed to load.
-    outcomes.extend(running_test);
+    let never = if counts.is_none() { Outcome::Fail } else { outside.unwrap_or(Outcome::Error) };
+    let mut outcomes: Vec<Outcome> = outcomes.into_iter().map(|o| o.unwrap_or(never)).collect();
+    // A file that failed to load has no tests: its one outcome is that error.
+    if outcomes.is_empty() {
+        outcomes.extend(outside);
+    }
     Ok(match counts {
         Some(counts) => (counts, outcomes, None),
         // The tests that hadn't ended when the host did count as failures.
