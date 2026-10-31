@@ -149,6 +149,11 @@ int main(int argc, char **argv) {
   got = proc_pidinfo(parent, PROC_PIDTBSDINFO, 0, &info, sizeof info);
   if (got > 0) printf("proc_pidinfo open %d bytes\n", got);
   else printf("proc_pidinfo denied %d\n", errno);
+  // Whether the parent is live, and its group and session.
+  if (getpgid(parent) >= 0) printf("getpgid open\n");
+  else printf("getpgid denied %d\n", errno);
+  if (getsid(parent) >= 0) printf("getsid open\n");
+  else printf("getsid denied %d\n", errno);
 
   char command[128];
   snprintf(command, sizeof command, "/bin/ps -E -ww -o command= -p %d 2>/dev/null", (int)parent);

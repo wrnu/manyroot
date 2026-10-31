@@ -33,6 +33,9 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// without the `kern.proc` prefix, `KERN_PROCARGS2` still reads its arguments and environment, a parent's
 /// secrets included, and `process-info*` must be unqualified, since `(target others)` leaves out the process
 /// group. A process may still read its own, as the check runner's profile found cargo needs (#160).
+/// `getpgid` and `getsid` are denied too, which would otherwise tell which pids are live and their groups
+/// and sessions (task 72fd057d4b33): for any pid, its own included, since the rule can't tell them apart.
+/// `getpgrp` stays.
 const BASE: &str = r#"(version 1)
 (deny default)
 (allow process-fork)
@@ -40,6 +43,7 @@ const BASE: &str = r#"(version 1)
 (deny sysctl-read (sysctl-name-prefix "kern.proc"))
 (deny process-info*)
 (allow process-info* (target self))
+(deny syscall-unix (syscall-number SYS_getpgid SYS_getsid))
 (allow file-read-metadata)
 (allow file-read*
   (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random")

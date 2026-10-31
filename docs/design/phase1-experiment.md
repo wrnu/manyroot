@@ -854,7 +854,9 @@ The layers, each of which holds if another fails:
    information, nor list processes. That takes both `(deny sysctl-read
    (sysctl-name-prefix "kern.proc"))` and an unqualified `(deny
    process-info*)` (note `116ae2144d9d`); a process may still read its own
-   (task `e23f87035615`).
+   (task `e23f87035615`). `getpgid` and `getsid`, which would tell which
+   pids are live, are denied for every pid, its own included (task
+   `72fd057d4b33`).
 
    `sandbox-exec` is deprecated but still works on current macOS. Step 6
    proves each profile with tests that try each forbidden access from inside

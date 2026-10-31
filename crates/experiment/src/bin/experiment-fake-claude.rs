@@ -297,8 +297,9 @@ fn probe(spec: &Value) -> BTreeMap<String, &'static str> {
 }
 
 /// The ways [`process_reads`] tries: the arguments and environment by number and by name, the
-/// process table, one process's entry, the list of pids, a process's path and its BSD info.
-pub const PROCESS_WAYS: [&str; 9] = [
+/// process table, one process's entry, the list of pids, a process's path and its BSD info, and its
+/// process group and session.
+pub const PROCESS_WAYS: [&str; 11] = [
     "procargs2-mib",
     "procargs-mib",
     "procargs2-name",
@@ -308,6 +309,8 @@ pub const PROCESS_WAYS: [&str; 9] = [
     "listallpids",
     "pidpath",
     "pidinfo",
+    "getpgid",
+    "getsid",
 ];
 
 /// Elsewhere this probe has nothing to try.
@@ -391,7 +394,9 @@ fn process_reads(pid: i32, plant: &[u8]) -> Vec<(&'static str, &'static str)> {
     let mut info = [0u8; PROC_BSDINFO_SIZE];
     let info =
         verdict(unsafe { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), info.len() as i32) } > 0);
-    let got = [procargs2, procargs, procargs2_name, procargs_name, all, one, pids, path, info];
+    let pgid = verdict(rustix::process::getpgid(rustix::process::Pid::from_raw(pid)).is_ok());
+    let sid = verdict(rustix::process::getsid(rustix::process::Pid::from_raw(pid)).is_ok());
+    let got = [procargs2, procargs, procargs2_name, procargs_name, all, one, pids, path, info, pgid, sid];
     PROCESS_WAYS.iter().copied().zip(got).collect()
 }
 
