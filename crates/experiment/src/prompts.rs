@@ -8,20 +8,26 @@
 /// The prompt every mode shares.
 pub const BASE: &str = include_str!("../prompts/base.md");
 
+/// The prompt of a project run (Weave mode), in place of [`BASE`]: a project, not a library of functions.
+pub const PROJECT_BASE: &str = include_str!("../prompts/project.md");
+
 /// A mode's "Where things are" section.
 pub fn section(mode: &str) -> Option<&'static str> {
     match mode {
         "bracken" => Some(include_str!("../prompts/bracken.md")),
         "git" => Some(include_str!("../prompts/git.md")),
         "crdt" => Some(include_str!("../prompts/crdt.md")),
+        "weave" => Some(include_str!("../prompts/weave.md")),
         _ => None,
     }
 }
 
-/// The system prompt for `mode`: the base prompt, then the mode's section.
+/// The system prompt for `mode`: the base prompt, then the mode's section. Weave mode's runs are of a
+/// project, so its base is [`PROJECT_BASE`].
 pub fn system_prompt(mode: &str) -> Result<String, String> {
     let section = section(mode).ok_or_else(|| format!("no prompt for mode {mode}"))?;
-    Ok(format!("{BASE}\n{section}"))
+    let base = if mode == "weave" { PROJECT_BASE } else { BASE };
+    Ok(format!("{base}\n{section}"))
 }
 
 /// The first message of each turn: which turn of how many, and who the agent is.
@@ -46,6 +52,9 @@ mod tests {
             assert!(prompt.starts_with(BASE) && prompt.ends_with(section(name).expect("a section")));
             assert!(seen.insert(prompt), "{name}'s prompt is its own");
         }
+        let weave = system_prompt("weave").expect("a prompt");
+        assert!(weave.starts_with(PROJECT_BASE) && weave.ends_with(section("weave").expect("a section")));
+        assert!(seen.insert(weave), "weave's prompt is its own");
         assert!(system_prompt("other").is_err());
         assert_eq!(
             turn_message(3, 8, "agent-1"),
@@ -136,8 +145,8 @@ mod tests {
     /// Nothing tells an agent it is measured, or that other modes exist (design section 4).
     #[test]
     fn the_prompts_never_mention_the_experiment() {
-        let mut texts = vec![BASE.to_string(), turn_message(1, 8, "agent-0")];
-        for name in ["bracken", "git", "crdt"] {
+        let mut texts = vec![BASE.to_string(), PROJECT_BASE.to_string(), turn_message(1, 8, "agent-0")];
+        for name in ["bracken", "git", "crdt", "weave"] {
             texts.push(section(name).expect("a section").to_string());
             let mode = mode_named(name).expect("a mode");
             texts.push(serde_json::to_string(&mode.tools(Task::Phase1)).expect("JSON"));

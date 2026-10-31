@@ -266,6 +266,37 @@ struct Run<'a> {
     lockstep: Option<(Mutex<Lockstep>, Condvar)>,
     /// The digest of the hub's integrated library at the last snapshot.
     integrated: Mutex<String>,
+    /// A project run's project, its interpreter pinned from the plan, and when its change goes out.
+    project: Option<ProjectRun>,
+}
+
+/// What the driver holds of a project run (Weave mode).
+struct ProjectRun {
+    project: crate::project::Project,
+    python: crate::python::Python,
+    /// The change's share of the run's agent-turns, and the agent-turns used before it goes out.
+    change: Option<(f64, u32)>,
+}
+
+/// The project a run's plan names, loaded and checked against the plan, and its pinned interpreter; None for a
+/// run of a task. Weave mode needs both: a project, and the Python pin every run of agent code uses (answer
+/// `5e40cacdbfb4`); no other mode takes a project.
+fn project_run(cfg: &RunConfig, mode: &dyn Mode) -> Result<Option<ProjectRun>, String> {
+    let weave = mode.name() == "weave";
+    let Some(plan) = &cfg.plan.project else {
+        return if weave { Err("weave mode needs a project (--project)".into()) } else { Ok(None) };
+    };
+    if !weave {
+        return Err(format!("{} mode takes no project; give --mode weave", mode.name()));
+    }
+    let pin =
+        cfg.plan.python.as_ref().ok_or("a project run needs the Python pin (--python), which its plan records")?;
+    let project = plan.load()?;
+    let python = crate::python::Python::from_plan(pin, &project.python)?;
+    let shares: Vec<f64> = plan.items.iter().map(|(_, s)| *s).collect();
+    let change = crate::weave_mode::change_share(&shares)?
+        .map(|s| (s, crate::weave_mode::release_after(s, cfg.turns, cfg.agents)));
+    Ok(Some(ProjectRun { change, project, python }))
 }
 
 /// Runs a whole mode with `backend` playing every agent.
@@ -275,6 +306,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         return Err(format!("{} already exists", cfg.root.display()));
     }
     check_socket_room(&cfg.root, cfg.agents)?;
+    let project = project_run(cfg, mode)?;
     make_dir(&cfg.root)?;
     let root = std::fs::canonicalize(&cfg.root).map_err(|e| e.to_string())?;
     for sub in ["agents", "sockets"] {
@@ -295,9 +327,9 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     };
 
     let sockets = root.join("sockets");
-    // Only Git mode's workers may run git: its binary and the helpers in its exec path.
+    // Only Git and Weave mode's workers may run git: its binary and the helpers in its exec path.
     let git = match mode.name() {
-        "git" if cfg.sandbox => Some(Git::of(&cfg.git)?),
+        "git" | "weave" if cfg.sandbox => Some(Git::of(&cfg.git)?),
         _ => None,
     };
     let profile = |dir: &Path, sockets: &[PathBuf], hub: bool| -> Result<Option<Sandbox>, String> {
@@ -313,6 +345,11 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     let hub_profile = profile(&root.join("hub"), &hub_sockets, true)?;
     let hub_store = store(root.join("hub"), "setter");
     let mut hub = Worker::spawn_in(&cfg.worker_bin, mode.name(), &hub_store, hub_profile.as_ref())?;
+    if let Some(p) = &project {
+        let integrator = cfg.plan.integrator.as_deref().unwrap_or(crate::weave_mode::ANY_AGENT);
+        let data = crate::weave_mode::hub_data(&p.project, integrator)?;
+        hub.ok(&Request { op: "project".into(), args: data, ..Request::default() })?;
+    }
     hub.ok(&Request { op: "setup".into(), ..Request::default() })?;
     let seed = Worker::bytes(&hub.ok(&Request { op: "export".into(), ..Request::default() })?)?;
     let names: Vec<String> = (0..cfg.agents).map(|i| format!("agent-{i}")).collect();
@@ -326,6 +363,9 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
             peers.push(key.to_string());
         }
         copies.push(Mutex::new(w));
+    }
+    if project.is_some() {
+        hub.ok(&Request { op: "peers".into(), args: json!({"keys": peers}), ..Request::default() })?;
     }
     let plan = blake3::hash(&plan).to_hex().to_string();
     events.log(None, "setup", json!({"mode": mode.name(), "agents": cfg.agents, "turns": cfg.turns, "plan": plan}));
@@ -349,6 +389,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
             .lockstep()
             .then(|| (Mutex::new(Lockstep { next: 0, stopped: vec![false; cfg.agents] }), Condvar::new())),
         integrated: Mutex::new(String::new()),
+        project,
     };
     run.snapshot(&mut run.hub(), None, "setup");
     // A wave due after turn 0 goes out before anyone plays.
@@ -371,9 +412,17 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         run.events.log(None, "run_stopped", json!({"bytes": why.len(), "digest": digest(why.as_bytes()), "cap": cap}));
         return Err(format!("the run stopped: {why}"));
     }
-    let reply = run.hub().ok(&Request { op: "integrated".into(), ..Request::default() })?;
+    let (reply, line) = {
+        let mut hub = run.hub();
+        let reply = hub.ok(&Request { op: "integrated".into(), ..Request::default() })?;
+        (reply, run.line(&mut hub))
+    };
     let modules: Vec<(String, String)> = serde_json::from_value(reply.result).map_err(|e| e.to_string())?;
-    run.events.log(None, "integrated", json!({"modules": modules.iter().map(|(m, t)| json!({"module": m, "bytes": t.len(), "digest": digest(t.as_bytes())})).collect::<Vec<_>>()}));
+    let mut data = json!({"modules": modules.iter().map(|(m, t)| json!({"module": m, "bytes": t.len(), "digest": digest(t.as_bytes())})).collect::<Vec<_>>()});
+    if let Some(line) = line {
+        data["line"] = line;
+    }
+    run.events.log(None, "integrated", data);
     if run.events.failed.load(Ordering::SeqCst) {
         return Err("writing the event log failed".into());
     }
@@ -503,7 +552,7 @@ impl Run<'_> {
     /// read and its entry. The measures then grade the library under the specs it was read under: those
     /// released before its entry.
     fn checkpoint(&self, turn: u32, backend: &dyn Backend) {
-        if self.cfg.plan.task.waves().is_empty() {
+        if self.cfg.plan.task.waves().is_empty() && self.project.is_none() {
             return;
         }
         {
@@ -518,9 +567,16 @@ impl Run<'_> {
         let modules = hub
             .ok(&Request { op: "integrated".into(), ..Request::default() })
             .and_then(|r| serde_json::from_value::<Vec<(String, String)>>(r.result).map_err(|e| e.to_string()));
+        let line = self.line(&mut hub);
         backend.checkpoint_read(turn);
         match modules {
-            Ok(modules) => self.events.log(None, "checkpoint", json!({"turn": turn, "modules": modules})),
+            Ok(modules) => {
+                let mut data = json!({"turn": turn, "modules": modules});
+                if let Some(line) = line {
+                    data["line"] = line;
+                }
+                self.events.log(None, "checkpoint", data)
+            }
             Err(e) => {
                 let data = json!({"turn": turn, "bytes": e.len(), "digest": digest(e.as_bytes())});
                 self.events.log(None, "checkpoint_failed", data);
@@ -536,7 +592,10 @@ impl Run<'_> {
         let task = self.cfg.plan.task;
         let waves = task.wave_turns(self.cfg.turns);
         loop {
-            let due = if waves.is_empty() {
+            let due = if let Some(p) = &self.project {
+                // A project's one change: once its share of all agent-turns is used.
+                released.is_empty() && p.change.is_some_and(|(_, after)| done >= after)
+            } else if waves.is_empty() {
                 released.is_empty() && f64::from(done) >= RELEASE_AT * f64::from(self.cfg.turns * agents)
             } else {
                 waves.get(released.len()).is_some_and(|turn| done >= turn * agents)
@@ -548,7 +607,9 @@ impl Run<'_> {
             // The release and its entry are one step at the hub, as a checkpoint's read and entry are.
             let mut hub = self.hub();
             let reply = hub.ok(&Request { op: "release".into(), args: json!({"wave": wave}), ..Request::default() })?;
-            let data = if waves.is_empty() {
+            let data = if let Some((share, _)) = self.project.as_ref().and_then(|p| p.change) {
+                json!({"turns_done": done, "share": share, "released": reply.result["released"]})
+            } else if waves.is_empty() {
                 json!({"turns_done": done, "result": reply.result})
             } else {
                 json!({"turns_done": done, "wave": wave, "result": reply.result})
@@ -557,6 +618,36 @@ impl Run<'_> {
             self.snapshot(&mut hub, None, "release");
             released.push(done);
         }
+    }
+
+    /// A project run's `run_tests`: the project's public tests on agent `i`'s working tree, run here under the
+    /// Python profile with the interpreter pinned from the plan, since a sandboxed worker can't start another
+    /// sandbox. Public tests only; never a hidden one.
+    fn run_tests(&self, i: usize) -> Result<Value, String> {
+        let p = self.project.as_ref().ok_or("not a project run")?;
+        let reply = self.copy(i).ok(&Request { op: "tree".into(), ..Request::default() })?;
+        let files: Vec<(String, String)> = serde_json::from_value(reply.result).map_err(|e| e.to_string())?;
+        let scratch = crate::python::Scratch::new()?;
+        let tree = scratch.dir.join("tree");
+        for (rel, bytes) in files {
+            crate::weave_mode::plain_path(&rel)?;
+            let file = tree.join(&rel);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&file, hex::decode(bytes).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        }
+        let run = crate::python::run_tests(&p.python, &p.project, &tree)?;
+        let count = |o: &str| run.count(o);
+        Ok(json!({
+            "reported": run.reported,
+            "passed": count("pass"),
+            "failed": count("fail"),
+            "errors": count("error"),
+            "skipped": count("skip"),
+            "tests": run.tests.iter().map(|(id, o)| json!({"test": id, "outcome": o})).collect::<Vec<_>>(),
+            "output": run.output,
+        }))
     }
 
     /// What the hub takes from agent `i`, and as whom.
@@ -614,9 +705,24 @@ impl Run<'_> {
         let now = digest(serde_json::to_string(&modules).unwrap_or_default().as_bytes());
         let mut last = self.integrated.lock().unwrap_or_else(|e| e.into_inner());
         if *last != now {
-            self.events.log(agent, "snapshot", json!({"after": after, "modules": modules}));
+            let mut data = json!({"after": after, "modules": modules});
+            if let Some(line) = self.line(hub) {
+                data["line"] = line;
+            }
+            self.events.log(agent, "snapshot", data);
             *last = now;
         }
+    }
+
+    /// A project run's line at the hub (finding `01e0ce2648ad`): each head's decision and manifest id, and
+    /// whether it is forked, so a tree logged with it can be checked out of the hub's Ground by its id. None
+    /// for a run of a task; on a failure, the failure's size and digest, never its text.
+    fn line(&self, hub: &mut Worker) -> Option<Value> {
+        self.project.as_ref()?;
+        Some(match hub.ok(&Request { op: "line".into(), ..Request::default() }) {
+            Ok(reply) => reply.result,
+            Err(e) => json!({"failed": {"bytes": e.len(), "digest": digest(e.as_bytes())}}),
+        })
     }
 
     /// Opens the agent's socket, lets the backend play its turn on it, and serves
@@ -719,7 +825,7 @@ impl Run<'_> {
         let args_text = args.to_string();
         let name = &self.names[i];
         // Bug reports, for the measures: private notes are no one else's to read.
-        let reports: Vec<(String, Vec<i64>)> = if tool == "notes_write" {
+        let reports: Vec<(String, Vec<i64>)> = if tool == "notes_write" || self.project.is_some() {
             Vec::new()
         } else {
             strings(&args).flat_map(|t| bug_reports(self.cfg.plan.task, t)).collect()
@@ -732,6 +838,8 @@ impl Run<'_> {
         let mut record = Value::Null;
         let result = if tool == "sync" {
             crate::args::Args::new(&args, &[]).and_then(|_| self.sync(i))
+        } else if tool == "run_tests" && self.project.is_some() {
+            crate::args::Args::new(&args, &[]).and_then(|_| self.run_tests(i))
         } else if self.mode.hub_tools().contains(&tool.as_str()) {
             // The agent's own worker checks the values; the hub runs the checked form, as this agent.
             let req = Request { op: "validate".into(), tool: Some(tool.clone()), args, ..Request::default() };

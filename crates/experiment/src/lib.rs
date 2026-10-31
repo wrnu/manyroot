@@ -13,7 +13,8 @@
 //! over its records.
 //!
 //! A run chooses its task ([`task::Task`]): Phase 1's, or Phase 2's larger
-//! one with open contracts (`docs/design/phase2-task.md`).
+//! one with open contracts (`docs/design/phase2-task.md`). Or, in Weave mode
+//! ([`weave_mode`]), an evaluation [`project`] (`docs/design/eval-suite.md`).
 //!
 //! What an agent may see goes through [`task`] only: the language, the specs,
 //! the change requests, the public cases and the public check. [`grader`]
@@ -43,4 +44,5 @@ pub mod python;
 pub mod sandbox;
 pub mod shim;
 pub mod task;
+pub mod weave_mode;
 pub mod worker;

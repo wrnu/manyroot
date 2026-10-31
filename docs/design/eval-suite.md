@@ -365,6 +365,68 @@ approved.
 [--json]` grades a tree, or runs the approval check. It prints counts per
 item only.
 
+## Running a project
+
+As built so far (task `e4970250b3e4`, design note `43554a820efb`, answer
+`07959d6d9bc0`): `bracken-experiment run --mode weave --project <dir>
+--python <path> [--python-digest <digest>]`, and `mock-run` the same way,
+runs a project's agents through **Weave mode** (`src/weave_mode.rs`). Grading
+the run comes next, after it, by a separate command.
+
+- **The plan** records the project (its directory, a digest of all of it,
+  each item's release share, its hidden reference and the hash of each text
+  agents get), the pinned interpreter, and the configuration's
+  **integrator setting**: for now `any-agent`, every agent an integrator.
+  The run refuses a project without `--python`, Weave mode without a
+  project, and any other mode with one. Neither the plan nor anything else
+  in the run holds the private store's path.
+- **The hub** is a throwaway Weave Ground under the run directory, never
+  `~/bracken-weave`. The driver reads the project and gives the hub its
+  files, so no worker reads the project directory. The setter imports the
+  seed as `main`'s first decision, so the seed is the run's first tree;
+  states the spec and the items released at the start as claims; records
+  the integrator setting as a decision claim; and, once every copy has a
+  key, writes `main`'s policy naming the setter and every agent as
+  integrators, citing that claim.
+- **An agent's copy** is a replica of the hub's Ground, synced as Bracken
+  mode syncs, beside a git working tree that only the store touches. Its
+  tools: `task` (the spec and the items released so far: only claims the
+  setter's key signs, the seed's author as the copy joined), `list_files`,
+  `read_file`, `write_file`, `edit_file` and `delete_file` on its working
+  tree, every path a plain relative one with no symlink on the way and none
+  in `.git` or `.bracken`; `run_tests`; `changes`, its tree against the
+  decision it started from, proposed or not; `head`, every head of the line;
+  `update`, its tree replaced by a head, refused while it has edits not yet
+  proposed; `propose`; `proposals`; `diff`; `integrate`, which merges
+  proposals onto the head; `resolve`, which settles a conflict that stopped
+  such a merge, with the line's side, the proposal's, the agent's own file
+  or a deletion; and `merge`, on a forked line.
+- **Recording a tree:** `integrate` given no proposals records the agent's
+  tree, with every head as a parent, only if nothing would be lost (finding
+  `9f4e48c4c547`): the tree started from the line's one head, or, on a
+  forked line, it is the agent's `merge` of exactly the heads there now,
+  with no conflict markers left in the files that conflicted. `merge` makes
+  the tree every head merged by git's three-way merge, against where the
+  heads parted, through any earlier merge: the store mirrors the line's
+  decisions as git commits, once each. A tree from a head that is no longer
+  the line's reaches it as a proposal, which merges.
+- **`run_tests`** runs the public tests on the agent's working tree, in the
+  Python profile with the interpreter pinned from the plan. The driver runs
+  it, not the agent's worker, since a sandboxed process can't start another
+  sandbox.
+- **The change:** the items not released at the start go out together once
+  their share of the run's agent-turns is used, rounded up after rounding
+  the product to 1e-9, so 0.1 of 3 turns of 10 agents is 3 (finding
+  `d8167e497c9d`) (owner decision
+  `de365aae05fd`: at most one release after the start), and the hub states
+  them as claims. The event records the agent-turns used, the share and the
+  item ids.
+- **Checkpoints:** after every turn of all agents, and at the end, the event
+  log holds the line's head as files (on a forked line, its first head), and
+  every head's decision and manifest id with whether the line is forked
+  (finding `01e0ce2648ad`); so do snapshots and the final `integrated`
+  event.
+
 ## Cost estimate
 
 From Phase 1 and 2's measured use, and Candidate B's estimates for Python

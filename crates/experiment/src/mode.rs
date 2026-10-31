@@ -95,6 +95,27 @@ pub trait Store {
     fn release_changes(&mut self, wave: usize) -> Result<Value, String>;
     /// The hub only: the integrated library, as `(module, text)` pairs.
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String>;
+    /// The hub of a project run only: the line's heads, by decision and manifest id, and whether it is forked.
+    fn line_head(&mut self) -> Result<Value, String> {
+        Err(not_this_mode())
+    }
+    /// The hub of a project run only: the project as the driver read it ([`crate::weave_mode::hub_data`]),
+    /// before [`Store::setup`], so no worker reads the project directory.
+    fn project(&mut self, _data: &Value) -> Result<Value, String> {
+        Err(not_this_mode())
+    }
+    /// The hub of a project run only: every agent's public key, once each copy has one.
+    fn peers(&mut self, _keys: &[String]) -> Result<Value, String> {
+        Err(not_this_mode())
+    }
+    /// How many release waves the run has, where the store knows it rather than the task.
+    fn releases(&self) -> Option<usize> {
+        None
+    }
+    /// A copy's working tree, as `(path, bytes)`, for the tools the driver serves on it (`run_tests`).
+    fn tree_files(&mut self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        Err(not_this_mode())
+    }
     /// What the measures need to know about a tool call that just succeeded, for the event log only
     /// (never the agent): `writes`, the `[function, definition]` pairs it created or changed;
     /// `blocks`, the definitions a verdict against them stops; `conflict`, a merge that stopped.
@@ -165,6 +186,7 @@ pub fn mode_named(name: &str) -> Option<&'static dyn Mode> {
         "bracken" => Some(&crate::bracken_mode::BrackenMode::ONE_PASS),
         "crdt" => Some(&crate::crdt_mode::CrdtMode),
         "git" => Some(&crate::git_mode::GitMode),
+        "weave" => Some(&crate::weave_mode::WeaveMode),
         _ => None,
     }
 }

@@ -119,14 +119,35 @@ fn handle(store: &mut dyn Store, notes: &Path, task: Task, req: Request) -> Repl
             recorded(store, &name, args, result)
         }
         "record_sync" => Reply::from(store.record_sync()),
-        "release" => Reply::from(
-            req.args["wave"]
-                .as_u64()
-                .filter(|w| (1..=task.releases() as u64).contains(w))
-                .ok_or_else(|| format!("release needs a wave, from 1 to {}", task.releases()))
-                .and_then(|w| store.release_changes(w as usize)),
+        "release" => {
+            let releases = store.releases().unwrap_or_else(|| task.releases()) as u64;
+            Reply::from(
+                req.args["wave"]
+                    .as_u64()
+                    .filter(|w| (1..=releases).contains(w))
+                    .ok_or_else(|| format!("release needs a wave, from 1 to {releases}"))
+                    .and_then(|w| store.release_changes(w as usize)),
+            )
+        }
+        "project" => Reply::from(store.project(&req.args)),
+        "peers" => Reply::from(
+            serde_json::from_value::<Vec<String>>(req.args["keys"].clone()).map_err(|e| e.to_string()).and_then(
+                |keys| {
+                    if keys.iter().all(|k| k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit())) {
+                        store.peers(&keys)
+                    } else {
+                        Err("peers are public keys".into())
+                    }
+                },
+            ),
+        ),
+        "tree" => Reply::from(
+            store
+                .tree_files()
+                .map(|files| json!(files.into_iter().map(|(p, b)| json!([p, hex::encode(b)])).collect::<Vec<_>>())),
         ),
         "integrated" => Reply::from(store.integrated().map(|m| json!(m))),
+        "line" => Reply::from(store.line_head()),
         "tool" => {
             let name = req.tool.unwrap_or_default();
             match name.as_str() {
