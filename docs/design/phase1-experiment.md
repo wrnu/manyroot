@@ -849,6 +849,13 @@ The layers, each of which holds if another fails:
      runs only `git` (as above) and `bracken`, never a shell; no network but
      its socket; no keychain.
 
+   No profile can read another process: not its arguments or environment
+   (`KERN_PROCARGS2`, where a parent's secrets would be), its path or its
+   information, nor list processes. That takes both `(deny sysctl-read
+   (sysctl-name-prefix "kern.proc"))` and an unqualified `(deny
+   process-info*)` (note `116ae2144d9d`); a process may still read its own
+   (task `e23f87035615`).
+
    `sandbox-exec` is deprecated but still works on current macOS. Step 6
    proves each profile with tests that try each forbidden access from inside
    it, including a hostile tool call that tries the owner's home, another

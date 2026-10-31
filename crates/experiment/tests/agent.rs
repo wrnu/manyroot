@@ -21,7 +21,7 @@ use bracken_experiment::driver::{
 use bracken_experiment::mode::mode_named;
 use bracken_experiment::plan::{PlanInputs, report};
 use bracken_experiment::proxy::Attempt;
-use bracken_experiment::sandbox::{Git, Sandbox, WorkerPaths, resolved};
+use bracken_experiment::sandbox::{AgentPaths, Git, Profile, Sandbox, WorkerPaths, resolved};
 use bracken_experiment::task::Task;
 
 const FAKE_AUTH: &str = "fake-auth-value-not-a-secret-0123456789";
@@ -201,6 +201,43 @@ fn assert_verdicts(report: &Value, want: &[(&str, &str)]) {
     for (key, verdict) in want {
         assert_eq!(report[*key], *verdict, "{key} in {report:#}");
     }
+}
+
+/// The variable planted in the environment the probe's parent is started with.
+const PLANTED: &str = "BRACKEN_PROBE_PLANTED_NAME";
+
+/// The ways `experiment-fake-claude` tries to read another process (its `PROCESS_WAYS`).
+const PROCESS_WAYS: [&str; 9] = [
+    "procargs2-mib",
+    "procargs-mib",
+    "procargs2-name",
+    "procargs-name",
+    "kern.proc.all",
+    "kern.proc.pid",
+    "listallpids",
+    "pidpath",
+    "pidinfo",
+];
+
+/// `cmd` probing every way of reading its parent, the fake's `spawn`, whose environment as it was
+/// started holds [`PLANTED`]. Not a shell: macOS shows no system program's environment, so only a
+/// parent such as this shows a leak. The probe says only whether each way read anything, and whether
+/// the plant was in what it read.
+fn probe_planted_parent(cmd: &Command) -> Value {
+    let spec = json!({"process": ["parent"], "plant": PLANTED});
+    let out = Command::new(fake())
+        .arg("spawn")
+        .arg(cmd.get_program())
+        .args(cmd.get_args())
+        .arg("probe")
+        .arg(spec.to_string())
+        .env_clear()
+        .env(PLANTED, "1")
+        .stdin(Stdio::null())
+        .output()
+        .expect("the probe");
+    assert!(out.status.success(), "probe: {}", String::from_utf8_lossy(&out.stderr));
+    serde_json::from_slice::<Value>(&out.stdout).expect("JSON")["results"].clone()
 }
 
 // ---- The agent profile ----
@@ -736,6 +773,51 @@ mod macos_only {
         ];
         let want: Vec<(&str, &str)> = want.iter().map(|(k, v)| (k.as_str(), *v)).collect();
         assert_verdicts(&r, &want);
+    }
+
+    /// Under the agent, tools and hub profiles, a process reads nothing of another (task e23f87035615,
+    /// note 116ae2144d9d): not its parent's arguments or environment, by number or by name, nor the
+    /// process table, the list of pids, a path or info. Unsandboxed, the same probe reads them all, the
+    /// parent's planted variable among them.
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn no_profile_reads_another_process() {
+        let open = probe_planted_parent(&Command::new(fake()));
+        for way in PROCESS_WAYS {
+            assert_eq!(open[format!("{way}:parent")], "allowed", "{way} unsandboxed: {open:#}");
+        }
+        let st = stores();
+        let s = Setup::new();
+        let own = s.dir.join("own");
+        let turn = s.dir.join("turn");
+        std::fs::create_dir_all(&own).expect("own");
+        std::fs::create_dir_all(&turn).expect("turn");
+        let fake = fake();
+        let install = fake.parent().expect("the fake's directory");
+        let agent = Sandbox::agent(
+            Profile::Agent,
+            &AgentPaths {
+                program: &fake,
+                install,
+                own: &own,
+                turn: &turn,
+                shim: &bin(),
+                socket: &s.dir.join("agent.sock"),
+                proxy_port: 9,
+            },
+        )
+        .expect("the agent profile");
+        let bracken = bracken();
+        let tools = WorkerPaths { store: &st.copy, worker: &fake, bracken: &bracken, git: None, sockets: &[] };
+        let tools = Sandbox::tools(&tools).expect("the tools profile");
+        let hub = WorkerPaths { store: &st.hub, worker: &fake, bracken: &bracken, git: None, sockets: &[] };
+        let hub = Sandbox::hub(&hub).expect("the hub profile");
+        for (name, sandbox) in [("agent", agent), ("tools", tools), ("hub", hub)] {
+            let r = probe_planted_parent(&sandbox.command(&fake));
+            for way in PROCESS_WAYS {
+                assert_eq!(r[format!("{way}:parent")], "denied", "{way} under the {name} profile: {r:#}");
+            }
+        }
     }
 
     #[test]
