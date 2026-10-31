@@ -295,6 +295,20 @@ fn check_items(items: &[Item]) -> Result<(), String> {
             return Err(format!("item {:?} has no title", item.id));
         }
     }
+    // A project releases its items at the start and at most once more (decision de365aae05fd).
+    let mut later = items.iter().filter_map(|i| match i.release {
+        Release::AfterShare(at) => Some((i, at)),
+        Release::Start => None,
+    });
+    if let Some((first, at)) = later.next()
+        && let Some((other, _)) = later.find(|(_, b)| b.to_bits() != at.to_bits())
+    {
+        return Err(format!(
+            "items {:?} and {:?} are released at different shares: a project releases items at the start \
+             and at one share after it",
+            first.id, other.id
+        ));
+    }
     let mut revised = BTreeMap::new();
     for item in items {
         if item.kind != Kind::Change {

@@ -98,9 +98,11 @@ under `crates/experiment/projects/<name>/`, all of which agents may read;
 - `items`, each with `id`, `kind` (feature, refactor, fix or change),
   `title`, `text` (its issue's path) and `release`: `{"at": "start"}`, or
   `{"after_share": x}` with 0 < x < 1, the share of the run's agent-turns
-  used before it reaches the agents. A change, never released at the start,
-  lists in `revises` the items whose requirement it changes. Each item is
-  revised by one change at most.
+  used before it reaches the agents. Every item not released at the start
+  has the same share: a project releases items at the start and at one share
+  after it, no more (owner decision `de365aae05fd`). A change, never released
+  at the start, lists in `revises` the items whose requirement it changes.
+  Each item is revised by one change at most.
 - `limits` on each run of agent code: `cpu_seconds`, `memory_mb`,
   `output_bytes`, `wall_seconds` and `scratch_mb`, by default 10, 512,
   1 MiB, 60 and 256.
@@ -350,7 +352,9 @@ message. The tests and the code under test never share a process:
   whole file, waiting on each call. The host reports the number of tests,
   each outcome and each test's end as they happen, so a group whose host
   ends early keeps them: it is unfinished, with how it ended, and the tests
-  that hadn't ended count as failures (finding `e7d128464936`).
+  that hadn't ended count as failures (finding `e7d128464936`). A group's
+  grade also lists one outcome per test, in the order they ran, the worst of
+  the test's own and its subtests': by index, never by name.
 
 A group applies at a share of the run only once its item is released, and a
 before- or after-change group only on its side of its change. **The approval
@@ -369,9 +373,9 @@ item only.
 
 As built so far (task `e4970250b3e4`, design note `43554a820efb`, answer
 `07959d6d9bc0`): `bracken-experiment run --mode weave --project <dir>
---python <path> [--python-digest <digest>]`, and `mock-run` the same way,
-runs a project's agents through **Weave mode** (`src/weave_mode.rs`). Grading
-the run comes next, after it, by a separate command.
+--python <path> [--python-digest <digest>] [--hold-change]`, and `mock-run`
+the same way, runs a project's agents through **Weave mode**
+(`src/weave_mode.rs`). `grade-run` grades the run after it ends.
 
 - **The plan** records the project (its directory, a digest of all of it,
   each item's release share, its hidden reference and the hash of each text
@@ -420,12 +424,29 @@ the run comes next, after it, by a separate command.
   `d8167e497c9d`) (owner decision
   `de365aae05fd`: at most one release after the start), and the hub states
   them as claims. The event records the agent-turns used, the share and the
-  item ids.
+  item ids. `--hold-change` holds them back: the plan records it, with no
+  change point and no held item's text among what agents get; the hub is
+  never given those items, and nothing is released.
 - **Checkpoints:** after every turn of all agents, and at the end, the event
   log holds the line's head as files (on a forked line, its first head), and
   every head's decision and manifest id with whether the line is forked
   (finding `01e0ce2648ad`); so do snapshots and the final `integrated`
   event.
+- **Grading:** `bracken-experiment grade-run --dir <run> --hidden <store>
+  --grades <file> [--bracken <path>] [--json]` grades each checkpoint's
+  tree, and the line at the end as `end`, with the hidden set
+  (`src/grade_run.rs`), checking each out of the run's hub by the manifest
+  id its event names (on a forked line, the first head's, and the grade says
+  it was forked). It takes
+  the project and the interpreter from the plan, refusing a project changed
+  since, and the store only from `--hidden`, which it checks against the
+  project's digest. A tree is graded at share 1 if the change had gone out
+  before it, else at share 0, so the change's groups apply only once agents
+  had it. Each tree is one line of the grades file: the checkpoint's turn or
+  `end`, the share of turns done, whether the change was out, the decision
+  and manifest graded and its grade, groups and tests by index alone. The grades file
+  must be new, and outside the run, the project, the store, any Ground and
+  any git checkout; no run reads it, and nothing records the store's path.
 
 ## Cost estimate
 

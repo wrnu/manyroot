@@ -84,6 +84,10 @@ pub struct PlanInputs {
     /// [`crate::weave_mode::ANY_AGENT`]. None outside Weave mode, and then not written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrator: Option<String>,
+    /// A project run that holds its change back (`--hold-change`, decision `de365aae05fd`): only the items
+    /// released at the start go out. Not written when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold_change: bool,
 }
 
 /// A project as a plan records it: where it is, a digest of all of it, and what agents are given of it. No
@@ -156,6 +160,7 @@ impl Default for PlanInputs {
             python: None,
             project: None,
             integrator: None,
+            hold_change: false,
         }
     }
 }
@@ -224,12 +229,17 @@ impl Plan {
         ]);
         let mut change_after = None;
         if let Some(project) = &cfg.plan.project {
-            // A project's texts take the task's place.
-            prompts.extend(project.texts.clone());
+            // A project's texts take the task's place: those agents are given, so a held change's not.
+            let held = |key: &String| {
+                cfg.plan.hold_change
+                    && project.items.iter().any(|(id, share)| *share > 0.0 && *key == format!("item-{id}"))
+            };
+            prompts.extend(project.texts.iter().filter(|(k, _)| !held(k)).map(|(k, v)| (k.clone(), v.clone())));
             let shares: Vec<f64> = project.items.iter().map(|(_, s)| *s).collect();
             change_after = crate::weave_mode::change_share(&shares)
                 .ok()
                 .flatten()
+                .filter(|_| !cfg.plan.hold_change)
                 .map(|s| crate::weave_mode::release_after(s, cfg.turns, cfg.agents));
         } else {
             prompts.insert("task-original".into(), hash(task.task_text(Version::ORIGINAL).as_bytes()));

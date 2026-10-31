@@ -294,6 +294,8 @@ mod macos_only {
                     \x20   def test_d_an_object_of_the_crashed_server(self):\n        three()\n";
         let g = graded(stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
         assert_eq!(g.counts, Counts { pass: 2, error: 2, ..Counts::default() }, "{g:#?}");
+        use Outcome::*;
+        assert_eq!(g.outcomes, [Error, Pass, Pass, Error], "one per test, in the order they ran");
     }
 
     /// Each call has one run's CPU time, not the group a total (finding 5f5c3b4b25a9): calls that use most of
@@ -329,5 +331,8 @@ mod macos_only {
         let c = g.counts;
         assert_eq!((c.pass, c.pass + c.fail + c.error), (3, 9), "{g:#?}");
         assert!(c.fail > 0 && c.error > 0, "{g:#?}");
+        assert_eq!(g.outcomes.len(), 9, "every test has an outcome, those that never ended too: {g:#?}");
+        assert!(g.outcomes[..3].iter().all(|o| *o == Outcome::Pass), "{g:#?}");
+        assert_eq!(g.outcomes.last(), Some(&Outcome::Fail), "{g:#?}");
     }
 }
