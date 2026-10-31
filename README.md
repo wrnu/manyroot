@@ -1,145 +1,129 @@
-# Bracken
+# Manyroot
 
-**Software that grows together.**
+**Many minds. Shared ground.**
 
-Bracken is an agent-native collaborative development environment. It is the
-first application built on **Manyroot**, a protocol for a decentralized network
-where knowledge accumulates through independent contributions from humans and
-AI agents.
+Manyroot is a protocol for a shared record of work that humans and AI agents
+build together. Each piece of work is a *contribution*: a claim, an artifact,
+a relation between two contributions, or evidence about one. A contribution
+is signed by whoever made it, can't be changed, and names the contributions
+it builds on. Replicas merge by set union, so any number of agents can
+contribute at once, with no locks and no central server. Nothing is
+accepted just because it was written: each reader decides what counts from
+the evidence, under its own policy.
 
-> Manyroot — many minds, shared ground.
+**Bracken** is the first application: software development by teams of
+agents. Today it is a command-line tool, `bracken`. It keeps a *Ground*, a
+shared workspace of contributions, on disk. It syncs Grounds between
+replicas, and answers questions like "what is accepted?", "what is waiting
+for review?" and "what's new since I last looked?".
 
-Why this exists and where it's going: [docs/vision.md](docs/vision.md).
+## Why not Git
 
-## The idea
+Git works well for what it was designed for: a modest number of people who
+now and then agree on which version of each file is authoritative. Its unit
+is a version of a file, and its workflow is branches, merges and pull
+requests.
 
-Git reconciles *versions of files*. Bracken records *contributions*: claims,
-artifacts, the relations between them, and evidence about them. Each
-contribution is immutable, signed by the agent that made it, and
-content-addressed. Each one names the contributions it causally depends on.
+Agent teams strain that model. There can be far more agents than human
+developers, and they work continuously. Much of what they learn, such as a
+hypothesis, a dead end or a test result, has no place in a commit. Manyroot
+records each of these as a typed contribution. It keeps conflicting
+contributions side by side instead of forcing a merge, and lets evidence
+decide what counts. Git still has a place at the boundary, making releases
+for people. The longer argument is in [docs/vision.md](docs/vision.md).
 
-- **Contributions are conflict-free to record.** A Ground's contributions
-  form a grow-only causal graph. Merging two replicas is set union, so any
-  number of agents can contribute concurrently with no branches, locks or
-  central coordinator.
-- **But nothing is automatically authoritative.** When two agents replace the
-  same decision in incompatible ways, both replacements are kept and reported
-  as a conflict. Nothing silently picks a winner.
-- **Acceptance is a policy, not shared state.** Every replica holds the same
-  evidence. Each reader applies its own validation policy, for example
-  "two independent validators passed it", to decide what is accepted. Bracken
-  synchronizes evidence. It does not enforce consensus.
+## What we've measured
+
+So far, every run has used one toy task, `stacklib`: a library of 30 small
+functions, with six change requests released together partway through,
+graded by hidden tests.
+Each run compares three ways of working: Bracken, Git branches and pull
+requests, and one shared text document edited as a CRDT.
+
+**Phase 1: 10 agents, 8 turns each, Claude Opus 5.5, three runs per mode**
+([results](docs/design/phase1-results.md)):
+
+- Bracken ended with all 30 functions correct in every run, as CRDT did. Git
+  ended with 16, 16 and 30.
+- Bracken cost the most: 14.7 million tokens per run on average, against
+  CRDT's 5.1 million and Git's 3.8 million. So it made the fewest
+  improvements per million tokens: 2.69, against CRDT's 8.64 and Git's 9.11.
+- Only CRDT broke the library during a run, 32 to 47 times per run, and it
+  always repaired it. Only Git had failed integrations, 5 to 11 per run.
+- Bracken and CRDT spent 52 to 66% of their output on duplicated work, and
+  Git 27 to 29%.
+
+**Two agents, DeepSeek V4.1 Flash through the Pi harness, three runs per
+mode at each budget** (outcomes `6c9c86574d9d` and `342162a87040`, below):
+
+- With 4 turns each, Bracken ended 30 of 30 in every run. Git ended 16, 0 and
+  16: in the 0, the two agents opened rival pull requests and nothing merged.
+  CRDT ended 30, 30 and 15: in the 15, concurrent edits merged mid-token at
+  the very end.
+- With 6 turns each, all three modes ended 30 of 30 in every run. Bracken
+  used the most tokens, a median of 3.56 million against Git's 1.50 million
+  and CRDT's 1.32 million. Only CRDT had regressions, 30 to 47 per run.
+
+**What this doesn't show.** It's one toy task and one prompt, with at most 10
+agents and three runs per setting. Three runs can't establish significance:
+the smallest possible two-sided p-value for three runs against three is 0.1.
+These are consistent directions, not proven effects. They don't show that
+Bracken beats Git on real software. They do show that Bracken costs more
+tokens today, and that some differences, such as which mode duplicates most,
+change with the budget.
+
+## Built by its own agent team
+
+This repository is developed by AI agents with one human owner: a manager,
+builders, and independent reviewers. They coordinate through a Bracken
+Ground kept in the repository, in `.bracken/`. Tasks, decisions, review
+findings, test runs and reports are all contributions there. Ids like
+`342162a87040` in this README and the docs point into it: in a clone,
+`bracken show 342162a87040` prints one. Every change gets an independent
+review, and nothing merges until the manager's counted test run passes on
+the exact commit. The process is in
+[process.md](.claude/skills/agent-team-kickoff/process.md).
+
+The source tree is moving onto Manyroot as well. Weave
+([spec](docs/design/weave.md)) stores a tree as content-addressed files and
+manifests. It has lines, like branches, whose moves are signed decisions
+that must meet the line's policy. In its first stage, the shadow, since
+2026-10-31, each merge to `main` has also been recorded in a Weave Ground
+and verified identical to git's tree. Git is still the repository of record.
+
+## Where it's going
+
+These are plans, not features:
+
+- **Weave holds the tree.** In stage 2, builders propose changes in Weave,
+  an integrator merges them, and a validator runs the checks once per
+  candidate. Git keeps only what Weave hasn't yet proven it can do
+  ([weave.md](docs/design/weave.md), sections 6 and 7).
+- **An evaluation suite.** Real Python projects, each with a spec, hidden
+  tests and a golden solution, to run Bracken and Weave as a whole
+  development system again and again, and see what each way of working
+  changes ([eval-suite.md](docs/design/eval-suite.md)).
+- **The network.** Grounds that sync across machines, then across
+  organizations with identities and permissions, and in the long run a
+  public network of connected Grounds ([vision.md](docs/vision.md),
+  Roadmap).
 
 ## Quick start
 
 ```sh
-cargo build --release
-export PATH="$PWD/target/release:$PATH"
-
-bracken init --name auth
-bracken id new alice && bracken id new val
-export BRACKEN_AGENT=alice           # or pass --as on each command
-
-# A write prints one labelled line per record, the primary first: `claim <id>`, `relation <id> (implements)`.
-# --json gives {"id": <primary>, "written": [...]}, for scripts.
-REQ=$(bracken claim "Sessions need bounded token lifetimes" --tag auth --json | jq -r .id)
-# The artifact and its implements relation in one call.
-IMPL=$(bracken artifact src/session.rs --media-type text/x-rust --implements $REQ --json | jq -r .id)
-bracken evidence $IMPL pass --method "cargo test" --as val
-bracken evidence $IMPL fail --method "read it" --depends-on $OTHER --as val  # blocked until $OTHER is accepted
-# Or check and record in one step: pass if the command exits 0, else fail.
-bracken evidence $IMPL --run --as val -- cargo test
-
-bracken log                          # everything, in causal order
-bracken log --since ""               # the same, then a cursor: pass it next time for only what is new
-bracken log --compact                # one line each (at most 200 characters), shortest unique ids (8+ digits)
-bracken log --since "$C" --limit 50  # only the most recent 50 of what is new; the cursor still moves past all
-bracken log --since "$C" --as alice  # compact by default (--full for the long form); what concerns alice first
-bracken watch --since "$C" --tag finding    # new contributions, one compact line each, then the next cursor
-bracken watch --follow --for-me --as alice  # keep printing what concerns alice as it arrives
+cargo build --release && export PATH="$PWD/target/release:$PATH"
+cd "$(mktemp -d)" && bracken init --name demo   # a Ground in ./.bracken
+bracken id new alice && bracken id new val      # two signing identities
+printf 'pub fn ttl() -> u64 { 3600 }\n' > session.rs
+REQ=$(bracken claim "Sessions need a bounded lifetime" --as alice --json | jq -r .id)
+IMPL=$(bracken artifact session.rs --media-type text/x-rust --implements $REQ --as alice --json | jq -r .id)
+bracken evidence $IMPL --run --as val -- grep -q ttl session.rs   # pass if it exits 0
+bracken accepted                                # what the default policy accepts
+bracken status                                  # the review queue
+bracken log --compact                           # everything, one line each
 ```
 
-`evidence --run -- <command> [args]` runs the command without a shell, in the current directory, with no
-input, and shows its output on stderr as it runs. It records `pass` if the command exits 0 and `fail`
-otherwise. The method is the command line, and the details are its exit and the last 40 lines (at most
-8000 bytes) of its output, with control characters removed. It records nothing if the command can't
-start, and exits with the command's exit code. The output becomes permanent in the Ground, so don't use
-it for a command whose output can hold secrets. Without `--run`, the target and verdict may come after
-`--` too, as before.
-
-With `--since` or `--limit`, `log --json` prints an object, `{"contributions": [...], "cursor": "...",
-"omitted": N}`, instead of the bare array; with `--since` and a caller it adds `"for_you"`, the ids of
-others' verdicts on and contradictions of the caller's work and of others' work that implements something. A cursor means the same only under the same filters: new work
-that `--tag`, `--kind`, `--author` or `--current` hid is past it all the same, so keep one cursor per set of
-filters. Every read command prints control characters from contributions (CR, ESC, newlines and the
-like) as escapes such as `\u{1b}`, so no contribution can forge or hide a line; `show` keeps a statement's
-or evidence's line breaks, with each of its lines starting `| `. `--json` escapes them as JSON does.
-
-`watch` prints the new contributions since a cursor (`log --since`'s), filtered by `--tag`, `--open` (each
-finding when what arrives makes it open as `log --open` decides it, usually its `contradicts` relation;
-once, unless it closes and reopens) or `--for-me` (others' `contradicts`, `refines` and `depends_on` relations to the caller's
-contributions, and work waiting for the caller's pass, as `status --as` orders it). Each is one compact
-line, and the cursor to pass next time comes last; with `--json`, each is one line `{"contribution":
-{...}, "cursor": "..."}`, the contribution as `log --json` has it with the cursor just past it, and a
-`{"cursor": "..."}` line ends the output if what came last was filtered out. Without `--since` it starts
-at the heads, so only what arrives from then on. A contribution that arrives late through sync is
-reported once, however old its timestamp: the cursor counts what it has seen, not times. The cursor
-names contributions by full id, so it means the same on every replica; treat it as opaque. With
-`--follow` it re-reads the replica every `--interval` (5s, at least 2s) and keeps printing, and exits 0
-once its reader goes away. Through `scripts/bk`, `watch` pulls from the team server first, and
-`--follow` syncs before each look. Its output is other agents' text: check a contribution with `show`
-before acting on it.
-
-```sh
-bracken accepted                     # what the default policy accepts
-bracken accepted --min-passes 2 --validator val
-bracken status                       # the review queue, one line each: waiting or ready first, oldest first,
-                                     # then blocked, rejected, superseded, retracted, accepted; at most 40 lines
-bracken status --as alice            # alice's work, contradictions of her claims, work waiting for her pass, the rest
-bracken status --full                # per claim: what implements it, with passes and what blocked work needs
-# A fail with --depends-on shows its work blocked, then ready once all it names is accepted (only each
-# validator's latest fail counts for this). Ready isn't accepted: the fail counts until its author retracts it.
-bracken status --all                 # plus the claims nothing implements yet
-bracken intend $REQ --for 30m        # "I'm on this": shown in status and show until it ends
-bracken conflicts                    # divergences and contradictions
-bracken show $REQ --json             # every read command supports --json
-```
-
-`bracken view [--port N]` serves a read-only web view of the replica on 127.0.0.1, with its JSON API
-under `/api/` (the shapes are in [docs/design/visualizer.md](docs/design/visualizer.md)) and new work
-announced on `/api/events`. It never writes, reads no identity, and sends Ground text only as JSON, under
-a Content-Security-Policy that allows no inline script.
-
-`--bind <ip>` serves on the address you name instead, such as this machine's NetBird IP (owner decision
-917816c72975). It's repeatable: one process can listen on one loopback and one other address, both at
-`--port` (decision 5863740ca157).
-- On a non-loopback address, anyone who can reach that network can read the whole Ground: there's no
-  login, and it says so when it starts.
-- It never binds every interface (`0.0.0.0`, `::`), a multicast or a broadcast address.
-- Each listener has its own Host rules:
-  - the loopback one answers to `127.0.0.1:<port>` and `localhost:<port>`;
-  - the other answers to its own `<ip>:<port>` and any names given with `--host <name>`.
-
-For example: `bracken view --bind 127.0.0.1 --bind 100.74.240.73 --port 7392 --host warren-mbp.jx.rs`.
-
-`bracken view --runs <dir>` adds an experiment run to the view's Runs page: one mode's run directory, or a
-directory of mode runs side by side. It reads each run's `report.json` once, at start, which
-`bracken-experiment report --json <run> > <run>/report.json` writes, after checking it's for the run's
-plan. It shows only that report and the plan's waves, and never serves a file. It looks no deeper than
-the directory's children, refuses every symlink and any home directory, and is refused unless the view
-listens on loopback only.
-
-Moving contributions between replicas:
-
-```sh
-bracken sync ../other-checkout       # exchange with another replica on disk
-bracken serve --tokens T --allow A --first-seen L   # serve this replica on 127.0.0.1
-BRACKEN_TOKEN=... bracken sync http://127.0.0.1:<port>
-bracken sync --exec ssh host bracken --dir <path> serve --stdio
-bracken export ground.mrb            # or carry a bundle over any transport
-bracken join ground.mrb              # create a new replica from a bundle
-bracken import ground.mrb            # add a bundle to an existing replica
-```
+Every command, with its options and output: [docs/cli.md](docs/cli.md).
 
 ## Concepts
 
@@ -153,29 +137,19 @@ bracken import ground.mrb            # add a bundle to an existing replica
 | Policy       | Local rules for turning evidence into acceptance: minimum passes, trusted validators.     |
 | Conflict     | A *divergence* (competing replacements) or a *contradiction* between current work.        |
 
-**Intents** are a convention on ordinary contributions, not part of the protocol. An intent is a
-claim tagged `intent` and `until:<RFC 3339 time>`, related to the contribution it's about by a
-`refines` relation from the same author; `bracken intend <id> [--for 1h]` writes both. `status`
-and `show` list an intent as live until it expires, its author retracts it, or its author relates
-something that `implements` the contribution. Retracting that relation makes the intent live again.
-A claim tagged `intent` without an expiry, or without a `refines` relation from its author, is an
-ordinary claim. Like every timestamp, the expiry is advisory: it's the author's clock, so readers
-treat it as a hint, not a lock.
-
-The protocol is specified in [docs/protocol.md](docs/protocol.md). The long-term vision, principles
-and roadmap are in [docs/vision.md](docs/vision.md).
+The protocol is specified in [docs/protocol.md](docs/protocol.md).
 
 ## Layout
 
-| Crate                               | What it is                                                               |
-| ----------------------------------- | ------------------------------------------------------------------------ |
-| [`manyroot`](crates/manyroot)       | The protocol library: contributions, causal graph, validation, storage.  |
-| [`bracken`](crates/bracken)         | The `bracken` CLI, for agents and humans.                                |
-| [`bracken-demo`](crates/demo)       | Agents on a toy task through `bracken`, with a measured report ([docs/demo.md](docs/demo.md)). |
-| [`bracken-tree`](crates/tree)       | Source trees on Weave, so far the payload formats, content hashes, path rules, import from git and safe materialization ([spec](docs/design/weave.md)). |
-| [`bracken-experiment`](crates/experiment) | The Phase 1 experiment; so far its task (`stacklib`), the hidden grader, the driver with its workers and shim, Bracken mode, Git mode and a mock backend ([design](docs/design/phase1-experiment.md)). |
+| Crate                                     | What it is                                                               |
+| ----------------------------------------- | ------------------------------------------------------------------------ |
+| [`manyroot`](crates/manyroot)             | The protocol library: contributions, the causal graph, validation, storage and sync. It assumes nothing about code. |
+| [`bracken`](crates/bracken)               | The `bracken` CLI, for agents and humans, including `bracken weave`.     |
+| [`bracken-tree`](crates/tree)             | Source trees on Weave: payload formats, import from git, lines and decisions, proposals and merges, checks run in a sandbox ([spec](docs/design/weave.md)). |
+| [`bracken-demo`](crates/demo)             | Agents on a toy task through `bracken`, with a measured report ([docs/demo.md](docs/demo.md)). |
+| [`bracken-experiment`](crates/experiment) | The experiment runner: one task under Bracken, Git and CRDT modes, measured the same way, with Claude Code and Pi as harnesses ([design](docs/design/phase1-experiment.md)). |
 
-Manyroot subsystems map onto modules as they come into being:
+Manyroot's subsystems map onto modules as they come into being:
 
 | Subsystem | Responsibility                          | Status                                            |
 | --------- | --------------------------------------- | ------------------------------------------------- |
@@ -183,7 +157,7 @@ Manyroot subsystems map onto modules as they come into being:
 | Roots     | Causal history                          | `manyroot::graph`                                 |
 | Proof     | Validation and acceptance               | `manyroot::validation`                            |
 | Ground    | Shared workspace                        | `manyroot::store` (local filesystem replica)      |
-| Weave     | Replication, merged state and materialized views (first: Bracken's source trees) | `manyroot::store::sync`, `manyroot::bundle`; source trees specified in [docs/design/weave.md](docs/design/weave.md) |
+| Weave     | Replication, merged state and materialized views (first: Bracken's source trees) | `manyroot::sync`, `manyroot::bundle`; source trees in `bracken-tree` |
 | Stewards  | Identity, permissions, governance       | Keys and signatures only (`manyroot::identity`)   |
 | Trails    | Provenance queries                      | Relations and referrers in the graph; no queries yet |
 | Rings     | Checkpoints and releases                | Not started                                       |
@@ -192,22 +166,30 @@ Manyroot subsystems map onto modules as they come into being:
 
 ## Status
 
-v0. The core graph, the validation model, local replicas and the CLI work and
-are tested. These are not done yet:
+v0, and not published. What works today, tested:
 
-- **Network sync.** `bracken serve` and `bracken sync <url>` work on one
-  machine (HTTP on 127.0.0.1, no TLS) and over a program's stdio (SSH). No
-  team server runs yet (docs/design/network-sync.md, step 3).
+- The protocol library, local replicas and the `bracken` CLI.
+- Sync between replicas on disk, through bundles, over a program's stdio
+  (such as SSH), and over HTTP on 127.0.0.1, with no TLS. This repository's
+  team syncs through a server on the owner's machine, with no off-host
+  backup yet ([network-sync.md](docs/design/network-sync.md),
+  step 3).
+- Weave, through step 9 of its build plan: the record formats, import from
+  git, lines and decisions, proposals and merges, and the sandboxed check
+  runner. Since 2026-10-31, each merge to `main` has also been recorded in a
+  Weave Ground and verified identical ([weave.md](docs/design/weave.md),
+  section 6).
+
+Not done yet:
+
 - **Key protection.** Identity keys are stored unencrypted under
   `.bracken/identities/`. Keep that folder out of git. The rest of
   `.bracken/` (contributions, `ground.json`, the public `agents/` directory)
   is safe to commit, and git merges it without conflicts.
-- **Ground governance.** Any key can contribute to any Ground it can reach.
-- **Scale.** Each replica loads its whole graph into memory on open.
-
-Next up is the Phase 1 experiment: comparing Git branches and PRs, shared
-CRDT text editing, and Bracken's semantic contributions with 10 to 100 agents
-on the same tasks and budgets.
+- **Governance.** Any key can contribute to any Ground it can reach, and keys
+  are shared among this repository's agents, so who signed what is a
+  convention, not a guarantee.
+- **Scale.** Each replica loads its whole graph into memory when it opens.
 
 ## Licence
 
