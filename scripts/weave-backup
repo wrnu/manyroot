@@ -1,0 +1,207 @@
+#!/usr/bin/env bash
+# weave-backup: copy the Weave Ground, ~/bracken-weave/manyroot, identities included, before stage 2
+# (docs/design/weave.md, sections 5 and 8; task 5b81f744a0ea). Run by hand, by the manager, only to the
+# destination the owner approved: nothing schedules it, and a schedule waits for the owner's go too.
+#
+#   scripts/weave-backup --owner-decision <id> [--keep <n>] <dest>
+#       Copies the Ground to <dest>/<UTC time, as 20261031T120000Z>/. <id> is the owner's go for <dest>: a
+#       claim tagged approval and signed by owner (scripts/owner-approve), not retracted, in the coordination
+#       Ground, whose text names <dest>'s real path as one word. The copy is made under
+#       <dest>/.partial-<time>/ and moved into place only once the pinned binary opens it (so no
+#       contribution lacks an ancestor) and it holds at least every contribution the Ground held when the
+#       copy began. While the counts differ, it copies again, up to 5 passes; once they agree, the copy must
+#       hold the same heads and identities too. A Ground written to throughout all 5 gives a copy that opens
+#       and holds at least what the Ground held at the start, and says so on stderr. Then it keeps the
+#       newest <n> copies (default 20), the new one among them, and deletes older ones: only directories
+#       named by a time before the new copy's that hold a copy of the Weave Ground.
+#       <dest> must be a directory of yours at mode 0700, with no ACL, not a symlink, outside every git
+#       checkout and outside ~/bracken-weave, and no directory above it may be writable by group or others
+#       unless it is sticky. If it doesn't exist, it is created at 0700. A name in it with a time later than
+#       now (a clock that ran fast) stops it.
+#
+#   scripts/weave-backup --verify <copy>
+#       Opens a copy with the pinned binary and checks it is one of the Weave Ground: the same Ground id,
+#       when the Weave Ground exists.
+#
+# It prints counts only: never a file's contents, and never key material.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+  echo "weave-backup: $here is not inside a git repository" >&2
+  exit 1
+}
+main=$(dirname "$common")
+fail() { echo "weave-backup: $*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/{/^#/s/^# \{0,1\}//p;}' "${BASH_SOURCE[0]}"; }
+
+bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
+[ -x "$bin" ] || fail "no pinned bracken at $bin; the manager installs it (agent-team-kickoff skill, SKILL.md section 2.1)"
+
+keep=20 verify='' dest='' owner=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --keep) [ $# -ge 2 ] || fail "--keep needs a number"; keep=$2; shift ;;
+    --keep=*) keep=${1#*=} ;;
+    --owner-decision) [ $# -ge 2 ] || fail "--owner-decision needs an id"; owner=$2; shift ;;
+    --owner-decision=*) owner=${1#*=} ;;
+    --verify) verify=1 ;;
+    -h | --help) usage; exit 0 ;;
+    -*) fail "unknown option $1; see --help" ;;
+    *) [ -z "$dest" ] || fail "one directory at a time"; dest=$1 ;;
+  esac
+  shift
+done
+[ -n "$dest" ] || fail "where to? see --help"
+[[ $keep =~ ^[1-9][0-9]*$ ]] || fail "--keep $keep: give a whole number, 1 or more"
+
+home=${HOME:?HOME is not set}
+# The Weave Ground's real path, as scripts/weave resolves it; empty if there is none.
+ground=$(cd -P "$home/bracken-weave/manyroot" 2>/dev/null && pwd -P) || ground=''
+weave_dir=$(cd -P "$home/bracken-weave" 2>/dev/null && pwd -P) || weave_dir=''
+
+# What a replica holds: "<contributions> <heads> <identities that can sign>" on the first line, then the
+# heads, then the identities (name, public key, whether it can sign), sorted. It fails if the pinned binary
+# can't open it. `held` reads the Weave Ground through scripts/weave; `held <dir>` reads a copy.
+held() {
+  local log heads ids run
+  if [ $# -eq 0 ]; then run=(env -u BRACKEN_AGENT "$here/weave"); else run=(env -u BRACKEN_AGENT BRACKEN_DIR="$1" "$bin"); fi
+  log=$("${run[@]}" log --json --limit 0 2>/dev/null) || return 1
+  heads=$("${run[@]}" heads --json 2>/dev/null) || return 1
+  ids=$("${run[@]}" id list --json 2>/dev/null) || return 1
+  jq -r --argjson h "$heads" --argjson i "$ids" '
+    "\(.omitted) \($h | length) \($i | map(select(.can_sign)) | length)",
+    ($h | map(.id) | sort | .[]),
+    ($i | map("\(.name) \(.agent) \(.can_sign)") | sort | .[])' <<<"$log"
+}
+ground_id() { jq -r '.ground // empty' "$1/ground.json" 2>/dev/null; }
+say() { # "<contributions> <heads> <identities>" as words
+  read -r c h i <<<"$1"
+  echo "$c contributions, $h heads, $i identities"
+}
+mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
+if [ -n "$verify" ]; then
+  [ -z "$owner" ] || fail "--owner-decision goes with a backup, not --verify"
+  [ ! -L "$dest" ] || fail "$dest is a symlink"
+  [ -f "$dest/ground.json" ] || fail "$dest holds no Ground"
+  copy=$(cd -P "$dest" && pwd -P)
+  [ "$copy" != "$ground" ] || fail "$dest is the Weave Ground itself, not a copy"
+  if [ -n "$ground" ]; then
+    [ "$(ground_id "$copy")" = "$(ground_id "$ground")" ] || fail "$dest is a copy of another Ground, not the Weave Ground"
+  fi
+  got=$(held "$copy") || fail "the pinned binary can't open $dest: it isn't a complete copy"
+  echo "verified $dest: $(say "$(head -n 1 <<<"$got")")"
+  exit 0
+fi
+
+[ -n "$ground" ] || fail "no Weave Ground at $home/bracken-weave/manyroot to back up"
+[ -f "$ground/ground.json" ] || fail "$ground holds no Ground"
+
+# The destination: checked by its real path before anything is created in it.
+[ ! -L "$dest" ] || fail "$dest is a symlink; give the directory itself"
+[ "$(basename "$dest")" != . ] && [ "$(basename "$dest")" != .. ] || fail "$dest: name the directory"
+parent=$(cd -P "$(dirname "$dest")" 2>/dev/null && pwd -P) || fail "$(dirname "$dest") doesn't exist"
+real="${parent%/}/$(basename "$dest")"
+d=$real
+while :; do
+  [ ! -e "$d/.git" ] || fail "$dest is inside the git checkout $d; a copy holds private keys, so never there"
+  [ "$d" != / ] || break
+  d=$(dirname "$d")
+done
+for inside in "$weave_dir" "$ground"; do
+  [ -z "$inside" ] || [[ $real != "$inside" && $real != "$inside"/* ]] ||
+    fail "$dest is inside $inside; back up the Weave Ground somewhere else"
+done
+[[ $ground != "$real"/* ]] || fail "$dest holds the Weave Ground; back it up somewhere else"
+# Nobody else may swap a directory on the way to it: each one above it is writable only by its owner, or
+# sticky (finding 9c4a64c905c3).
+d=$parent
+while :; do
+  m=$((8#$(mode_of "$d")))
+  if (((m & 8#022) != 0 && (m & 8#1000) == 0)); then
+    fail "$d, above $dest, is writable by group or others and not sticky"
+  fi
+  [ "$d" != / ] || break
+  d=$(dirname "$d")
+done
+
+# The owner's go for this destination, checked as weave-shadow --init checks it, before anything is made.
+[ -n "$owner" ] ||
+  fail "a backup needs --owner-decision <id>: the owner's approval of $real as the destination (scripts/owner-approve)"
+[[ $owner =~ ^[0-9a-f]{12,64}$ ]] || fail "--owner-decision $owner: give the approval's id, 12 to 64 lowercase hex digits"
+shown=$(env -u BRACKEN_AGENT "$main/scripts/bk" show "$owner" --json 2>/dev/null) ||
+  fail "--owner-decision $owner: the coordination Ground has no such contribution"
+jq -e '.kind == "claim" and (.retracted | not) and .author_name == "owner"
+       and ((.body.tags // []) | index("approval") != null)' <<<"$shown" >/dev/null 2>&1 ||
+  fail "--owner-decision $owner: it isn't a claim tagged approval, signed by owner and not retracted (scripts/owner-approve)"
+# The path as one word of the approval's text, give or take quotes, brackets, closing punctuation and a
+# final slash: so an approval of /a/bk-old doesn't approve /a/bk.
+jq -e --arg p "$real" '.body.statement | [splits("\\s+")]
+       | map(gsub("^[`\"(]+|[`\".,;:)]+$"; "") | if length > 1 then rtrimstr("/") else . end)
+       | index([$p]) != null' \
+  <<<"$shown" >/dev/null 2>&1 ||
+  fail "--owner-decision $owner: the approval doesn't name $real, so it isn't the owner's go for this destination"
+
+if [ ! -e "$real" ] && [ ! -L "$real" ]; then
+  mkdir -m 700 "$real"
+fi
+[ -d "$real" ] && [ ! -L "$real" ] || fail "$dest isn't a directory"
+[ -O "$real" ] || fail "$dest isn't yours"
+mode=$(mode_of "$real")
+[ "$mode" = 700 ] || fail "$dest is mode $mode; a copy holds private keys, so it must be 0700 (chmod 700 it)"
+# An ACL can let others in whatever the mode says: ls marks one with +, and macOS lists it under -e.
+acl=$(ls -lde "$real" 2>/dev/null | tail -n +2) || acl=''
+[[ -z $acl && $(ls -ld "$real" | cut -c 11) != + ]] || fail "$dest has an ACL; a copy holds private keys, so remove it"
+
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+named=()
+while IFS= read -r name; do named+=("$name"); done < <(
+  find "$real" -mindepth 1 -maxdepth 1 -name '[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z' \
+    -exec basename {} \; | sort
+)
+for name in ${named[@]+"${named[@]}"}; do
+  [ "$name" != "$stamp" ] || fail "$real/$stamp already exists; run again in a second"
+  [[ $name < $stamp ]] || fail "$real/$name is named for a time after now ($stamp): a clock ran fast; move it away first"
+done
+final="$real/$stamp"
+work="$real/.partial-$stamp"
+mkdir -m 700 "$work"
+trap 'rm -rf -- "$work"' EXIT
+
+# Contributions are immutable files written by atomic rename, so a copy holds whole files only, and only
+# a write in flight (.tmp-*) is left out. A contribution written while the copy runs may be in it without
+# an ancestor written just before, in a directory already copied, so each pass copies again what is new.
+before=$(held) || fail "scripts/weave can't open the Weave Ground $ground"
+read -r first _ <<<"$before"
+same='' got=''
+for _ in 1 2 3 4 5; do
+  tar -C "$ground" --exclude='.tmp-*' -cf - . | tar -C "$work" -xpf -
+  chmod 700 "$work"
+  got=$(held "$work") || { got=''; continue; }
+  read -r count _ <<<"$got"
+  [ "$count" -ge "$first" ] || fail "the copy holds $count contributions, fewer than the $first the Ground held when it began"
+  now=$(held) || fail "scripts/weave can't open the Weave Ground $ground"
+  [ "$got" != "$now" ] || { same=1; break; }
+done
+[ -n "$got" ] || fail "after 5 passes the pinned binary still can't open the copy: the Ground is being written to too fast"
+# A copy that opens is a whole Ground; written to meanwhile, it holds more than the Ground did at the start.
+[ -n "$same" ] || echo "weave-backup: the Ground was written to during the copy, so the copy holds what it held then, and some of what came after" >&2
+mv "$work" "$final"
+trap - EXIT
+echo "backup $final: $(say "$(head -n 1 <<<"$got")")"
+
+# The newest --keep copies stay, the new one among them. Only older copies of the Weave Ground are deleted:
+# directories, not symlinks, named for a time before the new one, holding its Ground id (finding
+# 85c08b7f8aea).
+id=$(ground_id "$ground")
+older=()
+for name in ${named[@]+"${named[@]}"}; do
+  [ -d "$real/$name" ] && [ ! -L "$real/$name" ] && [ "$(ground_id "$real/$name")" = "$id" ] || continue
+  older+=("$name")
+done
+old=$((${#older[@]} + 1 - keep))
+for ((i = 0; i < old; i++)); do
+  rm -rf -- "${real:?}/${older[i]}"
+  echo "deleted ${older[i]}"
+done

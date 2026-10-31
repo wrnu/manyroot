@@ -70,6 +70,12 @@ Nothing here is built yet. This is design only: one docs PR, no code.
   validator) records who claimed to act. Under shared keys these rules are
   conventions that honest but fallible agents follow, not guarantees
   against a dishonest one. They become guarantees with per-agent keys.
+- **The owner never signs.** The owner holds no key in the Weave Ground,
+  and no Weave rule asks for the owner's signature, so no signature there
+  stands for the owner. Agent identities sign every record. The owner's
+  go reaches Weave only as text: a policy version's `owner_decision`
+  names a claim in the coordination Ground, which `scripts/weave` checks
+  before a line write (section 1).
 
 ## Where this sits
 
@@ -1272,7 +1278,22 @@ user as the coordination Ground. Every worktree reaches it through
   team server later is new infrastructure, which needs the owner's go.
 - **It is backed up only by the owner's choice.** Stage 1 can be rebuilt
   from git; stage 2's proposals and evidence can't, so a backup comes
-  before stage 2 (section 8).
+  before stage 2 (section 8). `scripts/weave-backup --owner-decision <id>
+  <dest>` copies it, identities included, to `<dest>/<UTC time>/`, and
+  only to the destination the owner approved: `<id>` is an approval the
+  owner signed whose text names `<dest>`'s real path. It writes the copy
+  beside that, and moves it into place only once the pinned binary opens
+  it and it holds at least what the Ground held when the copy began. It
+  copies again while the counts differ, up to 5 passes, and once they
+  agree the heads and identities must too. A Ground written to throughout
+  gives a copy that opens and holds at least what it held at the start,
+  and the script says so. It keeps the newest 20 copies, the new one
+  among them, and deletes only older copies of this Ground. `<dest>` must
+  be a directory of yours at mode 0700 with no ACL, outside every git
+  checkout and `~/bracken-weave`, and not a symlink. No directory above it
+  may be writable by others unless it is sticky, since a copy holds the
+  private keys. The script prints counts only. The manager runs it by
+  hand. A schedule is the owner's go too (task `5b81f744a0ea`).
 
 ### Keeping the two scripts apart
 
@@ -1400,9 +1421,9 @@ each need their own decision.
 Not needed before the build; each gets its own decision when it comes up
 (retrospective `16cbeff051ea`, and section 4):
 - **A backup of the Weave Ground, before stage 2.** Stage 1 can be rebuilt
-  from git, stage 2's proposals and evidence can't.
-- **The owner never signs.** Say so in the trust model. (Citing the owner's
-  decision in each policy version comes before stage 2, in section 1.)
+  from git, stage 2's proposals and evidence can't. `scripts/weave-backup`
+  is ready to run by hand (section 5). Its destination and a schedule wait
+  for the owner's go.
 - **Retract means "wrong", never "done".** Objections close only through
   answers, and questions through a lifecycle state rather than retraction.
 - **Lazy payload loading and a persistent hash index**, if step 5's
