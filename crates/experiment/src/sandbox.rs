@@ -12,6 +12,9 @@
 //!   starts only the worker binary, `bracken` and git (with its exec path),
 //!   never a shell; connects only to its own sync socket.
 //! - **hub**: the hub worker. The same, for the hub, never a copy.
+//! - **python**: agent code in the pinned interpreter ([`crate::python`]). Reads only the interpreter's
+//!   installation, the libraries it loads and the system's time zone data; reads and writes only its scratch
+//!   directory; starts only the interpreter, and never forks; no network.
 //!
 //! Every path a rule names is resolved first: the kernel checks resolved
 //! paths, so a rule on `/tmp/x` never matches `/private/tmp/x`.
@@ -46,6 +49,20 @@ const AGENT: &str = r#"(allow file-read*
   (remote unix-socket (path-literal (param "SOCKET"))))
 "#;
 
+/// What agent code in Python may touch.
+pub struct PythonPaths<'a> {
+    /// The pinned interpreter, resolved.
+    pub python: &'a Path,
+    /// Its installation.
+    pub prefix: &'a Path,
+    /// The libraries outside it that it loads.
+    pub libraries: &'a [PathBuf],
+    /// The names it loads some of them by, through symlinks.
+    pub links: &'a [PathBuf],
+    /// The run's own directory: the tree, the runner and anything the code writes.
+    pub scratch: &'a Path,
+}
+
 /// The tools and hub profiles differ only in their store and sockets.
 const WORKER: &str = r#"(allow file-read* (literal (param "WORKER")) (literal (param "BRACKEN")))
 (allow file-read* file-write* (subpath (param "STORE")))
@@ -55,6 +72,15 @@ const WORKER: &str = r#"(allow file-read* (literal (param "WORKER")) (literal (p
 /// git, when the mode uses it: the real binary and the helpers in its exec path.
 const GIT: &str = r#"(allow file-read* (literal (param "GIT")) (subpath (param "GIT_EXEC_PATH")))
 (allow process-exec (literal (param "GIT")) (subpath (param "GIT_EXEC_PATH")))
+"#;
+
+/// Agent code in Python: the system's libraries as every profile has, but no fork, so no process but the
+/// interpreter; its installation, the time zone data and the scratch directory, which holds the tree.
+const PYTHON: &str = r#"(allow file-read*
+  (subpath "/usr/share/zoneinfo") (subpath "/private/var/db/timezone") (literal "/private/etc/localtime")
+  (subpath (param "PREFIX")) (literal (param "PYTHON")))
+(allow file-read* file-write* (subpath (param "SCRATCH")))
+(allow process-exec (literal (param "PYTHON")))
 "#;
 
 /// The agent profiles a harness may run under. The backend owns their text: a harness names one, so no
@@ -161,9 +187,41 @@ pub fn resolved(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Adds to `out` every path the kernel looks up to resolve the absolute `path`: each directory on the way,
+/// each symlink, and each path a symlink's target leads through.
+fn lookups(path: &Path, out: &mut std::collections::BTreeSet<PathBuf>, depth: u32) -> Result<(), String> {
+    use std::path::Component;
+    if depth > 32 {
+        return Err(format!("resolving {}: too many symlinks", path.display()));
+    }
+    let mut at = PathBuf::from("/");
+    for part in path.components() {
+        match part {
+            Component::RootDir | Component::CurDir => continue,
+            Component::ParentDir => {
+                at.pop();
+                continue;
+            }
+            Component::Normal(name) => at.push(name),
+            Component::Prefix(_) => return Err(format!("{} isn't a Unix path", path.display())),
+        }
+        out.insert(at.clone());
+        if let Ok(target) = std::fs::read_link(&at) {
+            let next = at.parent().unwrap_or(Path::new("/")).join(target);
+            lookups(&next, out, depth + 1)?;
+            at = resolved(&at)?;
+        }
+    }
+    Ok(())
+}
+
 fn param(name: &str, path: &Path) -> Result<(String, String), String> {
-    let p = resolved(path)?;
-    let s = p.to_str().ok_or_else(|| format!("{} is not UTF-8", p.display()))?;
+    unresolved(name, &resolved(path)?)
+}
+
+/// A parameter for `path` as it is: a symlink's own path, which the kernel checks when it looks the link up.
+fn unresolved(name: &str, path: &Path) -> Result<(String, String), String> {
+    let s = path.to_str().ok_or_else(|| format!("{} is not UTF-8", path.display()))?;
     Ok((name.to_string(), s.to_string()))
 }
 
@@ -209,6 +267,43 @@ impl Sandbox {
             }
             text.push_str(")\n");
         }
+        Ok(Sandbox { text, params })
+    }
+
+    /// The python profile: one run of agent code. BASE without fork, and without its unscoped
+    /// `file-read-metadata`: only the paths looked up on the way to what it may read can be stat'd (finding
+    /// 8b414a06f294). Whether a path exists still shows, and `sandbox-exec` can't hide it: a refused lookup fails
+    /// with `EPERM`, a missing one with `ENOENT`, and `access` answers either way (finding c932586417301). So
+    /// nothing else of a path shows, but no agent may ever be given the private store's path. And no other process's
+    /// information at all (finding c44e0191291a, note 116ae2144d9d): each of the two denies alone still lets
+    /// `KERN_PROCARGS2` read another process's arguments and environment, and both together refuse it, while
+    /// `os.uname`, which needs `sysctl-read`, still works.
+    pub fn python(p: &PythonPaths) -> Result<Sandbox, String> {
+        let base = BASE.replace("(allow process-fork)\n", "").replace("(allow file-read-metadata)\n", "");
+        assert_eq!(base.len(), BASE.len() - "(allow process-fork)\n(allow file-read-metadata)\n".len());
+        let mut text = format!("{base}{PYTHON}");
+        let mut params = vec![param("PYTHON", p.python)?, param("PREFIX", p.prefix)?, param("SCRATCH", p.scratch)?];
+        for (n, lib) in p.libraries.iter().enumerate() {
+            let name = format!("LIB{n}");
+            text.push_str(&format!("(allow file-read* (literal (param \"{name}\")))\n"));
+            params.push(param(&name, lib)?);
+        }
+        let mut above = std::collections::BTreeSet::new();
+        let fixed = ["/usr/share/zoneinfo", "/private/var/db/timezone", "/private/etc/localtime"].map(Path::new);
+        let read = [p.python, p.prefix, p.scratch]
+            .into_iter()
+            .chain(p.libraries.iter().chain(p.links).map(PathBuf::as_path))
+            .chain(fixed);
+        for path in read {
+            lookups(path, &mut above, 0)?;
+        }
+        text.push_str("(allow file-read-metadata");
+        for (n, dir) in above.iter().enumerate() {
+            let name = format!("ABOVE{n}");
+            text.push_str(&format!("\n  (literal (param \"{name}\"))"));
+            params.push(unresolved(&name, dir)?);
+        }
+        text.push_str(")\n(deny sysctl-read (sysctl-name-prefix \"kern.proc\"))\n(deny process-info*)\n");
         Ok(Sandbox { text, params })
     }
 

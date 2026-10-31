@@ -132,6 +132,7 @@ fn every_mistake_in_a_manifest_is_refused() {
         ("limits must", "limits", json!({"memory_mb": 100_000})),
         ("limits must", "limits", json!({"output_bytes": 0})),
         ("limits must", "limits", json!({"wall_seconds": 3601})),
+        ("limits must", "limits", json!({"scratch_mb": 0})),
         ("unknown field", "limits", json!({"cpu": 1})),
         ("isn't a name", "hidden/id", json!("..")),
         ("isn't a name", "hidden/id", json!("a/b")),
@@ -255,11 +256,18 @@ fn every_mistake_in_a_hidden_set_is_refused_naming_nothing_in_it() {
 /// A symlink, a special file or a repository inside the set is refused, naming nothing in it.
 #[test]
 fn a_symlink_or_repository_inside_a_hidden_set_is_refused_naming_nothing_in_it() {
-    let edits: [Edit; 3] = [
+    let edits: [Edit; 5] = [
         ("a symlink", |s| {
             std::os::unix::fs::symlink("test_a.py", s.join("tests/test_secret_link.py")).expect("a link")
         }),
         ("a .git", |s| write(&s.join("golden/.git/HEAD"), "ref: refs/heads/secret\n")),
+        // Finding 043504ed3df3: git on macOS finds a repository in .GIT too.
+        ("a .git", |s| write(&s.join("golden/secret/.GIT/HEAD"), "ref: refs/heads/secret\n")),
+        // Finding 81b5698a985c: a hard link puts a hidden file wherever its other link is, the project included.
+        ("a hard link", |s| {
+            let elsewhere = s.parent().and_then(Path::parent).expect("the store's parent").join("secret_linked.py");
+            std::fs::hard_link(s.join("tests/test_a.py"), elsewhere).expect("a hard link");
+        }),
         ("a symlink", |s| {
             let fifo = std::process::Command::new("mkfifo").arg(s.join("tests/secret_fifo")).status();
             assert!(fifo.expect("mkfifo").success());
@@ -334,4 +342,21 @@ fn a_set_without_its_golden_package_is_refused() {
     let d = digest(&store.join("tiny@1")).expect("a digest");
     let project = Project::load(&project_in(tmp.path(), &manifest_for(&d))).expect("loads");
     assert!(HiddenSet::open(&project, &store).expect_err("no golden").contains("golden"));
+}
+
+/// Finding 6951053f24c1: a hidden set's Debug says counts and the digest, never a file's name or bytes, so a
+/// failed expect_err or assertion can't print the set.
+#[test]
+fn a_hidden_sets_debug_holds_no_file_name_or_content() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let (store, _) = store_in(tmp.path(), &hidden(groups()));
+    write(&store.join("tiny@1/tests/test_secret_name.py"), "SECRET-CONTENT = 1\n");
+    let d = digest(&store.join("tiny@1")).expect("a digest");
+    let p = Project::load(&project_in(tmp.path(), &manifest_for(&d))).expect("loads");
+    let set = HiddenSet::open(&p, &store).expect("opens");
+    let shown = format!("{set:?} {set:#?}");
+    assert!(shown.contains("groups: 3") && shown.contains(&d), "{shown}");
+    for planted in ["secret", "SECRET", "test_a", "import unittest", "golden", "tiny@1/"] {
+        assert!(!shown.contains(planted), "{planted:?} in {shown}");
+    }
 }

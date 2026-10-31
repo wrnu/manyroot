@@ -102,7 +102,8 @@ under `crates/experiment/projects/<name>/`, all of which agents may read;
   lists in `revises` the items whose requirement it changes. Each item is
   revised by one change at most.
 - `limits` on each run of agent code: `cpu_seconds`, `memory_mb`,
-  `output_bytes` and `wall_seconds`, by default 10, 512, 1 MiB and 60.
+  `output_bytes`, `wall_seconds` and `scratch_mb`, by default 10, 512,
+  1 MiB, 60 and 256.
 - `hidden`: `{"id", "digest"}`, a reference only. The digest is blake3 over
   every entry of the hidden set in path order: each directory, empty ones
   included, by its path, and each file by its path and the blake3 of its
@@ -112,8 +113,9 @@ under `crates/experiment/projects/<name>/`, all of which agents may read;
 **The private store** holds a project's hidden set at `<store>/<hidden.id>/`
 and is given to the grader by path when it grades. The set must be a
 directory, not a symlink, and is refused if it, or the store, overlaps the
-project, is inside a git checkout, or holds a `.git` anywhere. So it never
-enters this repository, a Ground or a run directory:
+project, is inside a git checkout, or holds a `.git` anywhere, in any case
+(as macOS's file systems ignore it), or a file with a second, hard link.
+So it never enters this repository, a Ground or a run directory:
 
 ```
 <hidden.id>/
@@ -217,6 +219,66 @@ Requirements for building the runner (from security's review, evidence
 
 That execution profile is a new risky surface, and gets its own tests and
 security review, as Candidate B planned.
+
+**The execution profile as built** (`crates/experiment/src/python.rs`, task
+`9345098e82aa`), on macOS only; elsewhere agent code is refused:
+- **The interpreter** is pinned with `--python <path>`: resolved, asked
+  its version, which must be the project's minor version, and given a
+  digest: blake3 over every file of its installation but `site-packages`
+  (the standard library and its `__pycache__`, the framework's libpython)
+  and over the libraries outside it that it loads. With `--python-digest`,
+  a pin refuses an interpreter whose digest is another; a run's plan is to
+  record it, which isn't wired yet. Before each run the same files' paths,
+  inodes, sizes, modes and modification and change times are checked
+  against the pin's, so a file changed since is refused. A macOS framework
+  build's `bin/python3.x` only starts the interpreter in its `Python.app`,
+  an exec the profile refuses, so that interpreter is the one pinned. It
+  runs as `python -I -S -B -X utf8` with only `HOME` and `TMPDIR` set, both
+  the scratch directory.
+- **Reads:** the interpreter's installation, the libraries it and its
+  standard library's extension modules load (found from their Mach-O load
+  commands when it is pinned, such as Homebrew's mpdecimal and OpenSSL), the
+  system's libraries and time zone data, and the scratch directory.
+- **Metadata** only of the paths looked up on the way to those: each
+  directory above them, and each symlink and what it leads through (such as
+  `/opt/homebrew/opt/sqlite`). So it can't read a path's metadata or list
+  anything of the owner's. Whether a path exists still shows, and
+  `sandbox-exec` can't hide it: a refused path fails with `EPERM`, a
+  missing one with `ENOENT`, and `os.access` answers for either (finding
+  `c932586417301`). Nothing else of the path shows, but it means no agent
+  may ever be given the private store's path: not in a prompt, an issue,
+  a turn's configuration, a Ground, or the arguments or environment of
+  anything the grader runs.
+- **No other process:** no process information, and no `kern.proc` sysctl.
+  Either deny alone still lets `KERN_PROCARGS2` read another process's
+  arguments and environment, its parent's included (note `116ae2144d9d`);
+  together they refuse it, by number and by name, and listing and naming
+  processes, while `os.uname` still works.
+- **No mach service, no shared memory or semaphores, no Unix sockets.**
+- **Writes:** the scratch directory only, made fresh (`0700`) for each run,
+  holding a copy of the tree, and removed after, whatever the code did to
+  its permissions.
+- **No fork, no exec** but the interpreter's, **no network.**
+- **Limits:** CPU time (`SIGXCPU`), file size (16 MiB or the output limit if
+  larger) and open files (256) as rlimits. macOS doesn't enforce
+  `RLIMIT_AS`, so memory is the child's footprint, which the parent reads
+  every 20 ms and kills the run past its limit. Output is read up to its
+  limit, then the run is killed; so is a run past its wall time, or one
+  whose scratch directory holds more than `scratch_mb` or 10,000 files and
+  directories, checked every 100 ms. The check never follows a symlink
+  or changes anything while the code runs, so the code can't point it
+  elsewhere by swapping a directory for a symlink; it opens each directory
+  by name in its open parent, and counts one it can't read, such as one
+  the code took the owner's access to, as past the limit. The owner's
+  access is given back only after the run, for removing the directory. Killing ends the child's process
+  group.
+
+`run_tests` runs a tree's public tests there with `unittest`, and reports
+each test's outcome (pass, fail, error or skip) and the last 16 KiB of their
+output. It is feedback for the agent, not a grade: the tests share the
+child with the code under test. `bracken-experiment run-tests --project
+<dir> [--tree <dir>] --python <path> [--python-digest <digest>]` runs
+it, on the seed by default.
 
 ## Cost estimate
 

@@ -7,6 +7,7 @@
 //! - `report` measures finished runs and prints the comparison table.
 //! - `run` runs a whole mode with one agent harness, Claude Code or Pi, playing every agent.
 //! - `project check` checks an evaluation project, and its hidden set in a private store if given.
+//! - `run-tests` runs a project's public tests on a tree, under the Python profile.
 
 use std::path::PathBuf;
 
@@ -155,6 +156,22 @@ enum Cmd {
     /// Evaluation projects (docs/design/eval-suite.md, Project format).
     #[command(subcommand)]
     Project(ProjectCmd),
+    /// Run a project's public tests on a tree (the seed by default) with the pinned interpreter, under the
+    /// Python profile (docs/design/eval-suite.md, Isolation).
+    RunTests {
+        #[arg(long)]
+        project: PathBuf,
+        #[arg(long)]
+        tree: Option<PathBuf>,
+        /// The Python interpreter to pin: its version must be the project's.
+        #[arg(long)]
+        python: PathBuf,
+        /// The digest the interpreter must have, as a run's plan records it.
+        #[arg(long)]
+        python_digest: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Measure finished runs, one column each.
     Report {
         #[arg(required = true)]
@@ -236,6 +253,9 @@ fn main() {
             mock_run(dir, &mode, agents, turns, bracken, sandbox, plan)
         }
         Cmd::Project(ProjectCmd::Check { dir, hidden, json }) => project_check(&dir, hidden.as_deref(), json),
+        Cmd::RunTests { project, tree, python, python_digest, json } => {
+            run_tests(&project, tree.as_deref(), &python, python_digest.as_deref(), json)
+        }
         Cmd::Report { dirs, usage, json } => report(&dirs, usage.as_deref(), json),
     };
     if let Err(e) = result {
@@ -587,6 +607,40 @@ fn project_check(dir: &std::path::Path, hidden: Option<&std::path::Path>, json: 
             }
         }
         None => println!("hidden {}: not checked (no --hidden)", project.hidden.id),
+    }
+    Ok(())
+}
+
+fn run_tests(
+    project: &std::path::Path,
+    tree: Option<&std::path::Path>,
+    python: &std::path::Path,
+    python_digest: Option<&str>,
+    json: bool,
+) -> Result<(), String> {
+    use bracken_experiment::python::{Python, run_tests};
+    let project = bracken_experiment::project::Project::load(project)?;
+    let python = Python::pin(python, &project.python, python_digest)?;
+    let run = run_tests(&python, &project, tree.unwrap_or(&project.seed))?;
+    if json {
+        println!("{}", serde_json::json!({"python": python, "run": run}));
+        return Ok(());
+    }
+    eprint!("{}", run.output);
+    if !run.reported {
+        return Err(format!("the test runner reported nothing ({:?}): see its output above", run.exit));
+    }
+    let counts = ["pass", "fail", "error", "skip"].map(|o| format!("{} {o}", run.count(o)));
+    println!(
+        "{} tests: {} ({:?}); python {} {}",
+        run.tests.len(),
+        counts.join(", "),
+        run.exit,
+        python.version,
+        python.digest
+    );
+    for (id, outcome) in run.tests.iter().filter(|(_, o)| o == "fail" || o == "error") {
+        println!("{outcome}: {id}");
     }
     Ok(())
 }

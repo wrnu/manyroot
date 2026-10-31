@@ -38,6 +38,7 @@ pub mod plan;
 pub mod project;
 pub mod prompts;
 pub mod proxy;
+pub mod python;
 pub mod sandbox;
 pub mod shim;
 pub mod task;
