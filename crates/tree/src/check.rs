@@ -31,9 +31,13 @@
 //!   can, so on every exit path the group is stopped, the check's descendants
 //!   are found by parent pid (again until no new ones appear) and stopped
 //!   too, and then all are killed. If any had left the group, the run fails
-//!   with [`Exit::LeftGroup`]. An orphan reparented to launchd before the walk
-//!   can't be found (weave.md section 3). If one still holds the output open two
-//!   seconds after the check ended, the run fails with [`Exit::HeldOutput`];
+//!   with [`Exit::LeftGroup`]. That holds for a child in a new group or one
+//!   that joined another, the runner's included, but only while its parent
+//!   chain to the check is alive: an orphan reparented to launchd before the
+//!   walk can't be found (weave.md section 3). If one still holds the output
+//!   open two seconds after the check ended, the run fails with
+//!   [`Exit::HeldOutput`]; one that closed its output fails nothing. Killing
+//!   the runner's own group instead would kill its callers' processes too;
 //! - **no sandbox, no run**: off macOS, or if the profile isn't applied (a
 //!   probe must run under it and be refused a read outside the fresh
 //!   directory), [`Runner::run`] refuses and runs nothing.
