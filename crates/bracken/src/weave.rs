@@ -326,7 +326,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         }
         WeaveCommand::Diff { a, b, out } => {
             let ix = Index::build(s.graph());
-            let lines = Lines::build(s.graph(), &ix);
+            let lines = lines_for(s, &ix, &[Some(&a), Some(&b)]);
             let (ha, hb) =
                 (tree_at(s, &ix, &lines, &a, "the first tree")?, tree_at(s, &ix, &lines, &b, "the second tree")?);
             let (ma, mb) = (held_manifest(&ix, &ha)?, held_manifest(&ix, &hb)?);
@@ -391,7 +391,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         }
         WeaveCommand::Verify { git, at, manifest, line, repo, out } => {
             let ix = Index::build(s.graph());
-            let lines = Lines::build(s.graph(), &ix);
+            let lines = lines_for(s, &ix, &[at.as_deref(), line.as_deref()]);
             let hash = match (at, manifest) {
                 (Some(at), _) => decision_manifest(s, &lines, &at, "--at")?,
                 (None, Some(manifest)) => manifest_hash(s, &ix, &manifest, "--manifest")?,
@@ -421,7 +421,8 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         WeaveCommand::Check { out } => {
             let ix = Index::build(s.graph());
             let mut rows: Vec<Value> = ix.problems().iter().map(problem_json).collect();
-            for id in Lines::build(s.graph(), &ix).ignored_versions() {
+            // Which versions count needs no line judged: only the default line is.
+            for id in lines_for(s, &ix, &[]).ignored_versions() {
                 rows.push(json!({
                     "problem": "no_owner_decision", "id": id,
                     "text": format!("policy version {id} cites no owner decision, so it counts for nothing; only the main line weave init writes may"),
@@ -440,7 +441,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         }
         WeaveCommand::Head { line, out } => {
             let ix = Index::build(s.graph());
-            let lines = Lines::build(s.graph(), &ix);
+            let lines = lines_for(s, &ix, &[line.as_deref()]);
             let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
             let name = &lines.line(&line).expect("resolved").policy.name;
             let heads: Vec<(ContributionId, ContentHash)> = lines
@@ -467,7 +468,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         }
         WeaveCommand::Log { line, limit, since, out } => {
             let ix = Index::build(s.graph());
-            let lines = Lines::build(s.graph(), &ix);
+            let lines = lines_for(s, &ix, &[line.as_deref(), since.as_deref()]);
             let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
             let since = since.map(|d| decision_id(s, &lines, &d, "--since")).transpose()?;
             let all = lines.log(s.graph(), &line, since.as_ref());
@@ -504,7 +505,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         }
         WeaveCommand::Status { index, line, at, repo, out } => {
             let ix = Index::build(s.graph());
-            let lines = Lines::build(s.graph(), &ix);
+            let lines = lines_for(s, &ix, &[line.as_deref(), at.as_deref()]);
             let at = match at {
                 Some(at) => Some(decision_id(s, &lines, &at, "--at")?),
                 None => {
@@ -595,7 +596,7 @@ fn integrate(
             "this Ground holds no Weave marker, so weave writes nothing here; create a Weave Ground with `bracken weave init`"
         );
     }
-    let lines = Lines::build(s.graph(), &ix);
+    let lines = lines_for(s, &ix, &[line]);
     let line = resolve_line(s, &lines, line, "--line")?;
     let who = super::signer(s, agent)?;
     let parents = lines.heads(&line);
@@ -677,7 +678,7 @@ fn integrate(
     }
 
     let ix = Index::build(s.graph());
-    let lines = Lines::build(s.graph(), &ix);
+    let lines = judged_for(s, &ix, |_| vec![line]);
     let decision = draft(hash, commit);
     if let Err(why) = lines.judge_new(s.graph(), &ix, who.agent_id(), &decision) {
         decide(false);
@@ -761,6 +762,39 @@ fn decision_json(d: &DecisionRecord, names: &super::Names) -> Value {
 
 /// A line named on the command line, by its id (or a prefix) or its name; the
 /// default line if none is given.
+/// The lines and decisions of the replica, judging only the lines `given` names and the default line
+/// ([`Lines::build_for`], task a4d1a06a1072), so a line the command doesn't name costs it nothing. Each
+/// text names the line it is the id of, every line of that name (so an ambiguous name is refused as
+/// before), or the line of the decision or proposal it is the id of. Anything else names no line; what
+/// the command resolves afterwards, on the Lines returned, is resolved as on a full build.
+pub(crate) fn lines_for(s: &Store, ix: &Index, given: &[Option<&str>]) -> Lines {
+    judged_for(s, ix, |lines| {
+        let mut named = Vec::new();
+        for given in given.iter().flatten() {
+            match s.graph().resolve_prefix(given) {
+                Ok(id) => {
+                    named.extend(lines.version(&id).map(|v| v.id));
+                    named.extend(lines.decision(&id).map(|d| d.decision.line));
+                    named.extend(lines.proposal_named(&id).map(|p| p.line));
+                }
+                Err(_) => named.extend(lines.lines().filter(|v| v.policy.name == *given).map(|v| v.id)),
+            }
+        }
+        named
+    })
+}
+
+/// [`Lines::build_for`]. With `BRACKEN_WEAVE_STATS` set, it says on stderr how many decisions it judged and
+/// how many rule-5 questions it asked, so a test can check what a command pays for a line it doesn't name.
+pub(crate) fn judged_for<'a>(s: &Store, ix: &Index, pick: impl FnOnce(&Lines) -> Vec<ContributionId> + 'a) -> Lines {
+    let lines = Lines::build_for(s.graph(), ix, pick);
+    if std::env::var_os("BRACKEN_WEAVE_STATS").is_some() {
+        let questions = lines.obligation_stats().questions;
+        eprintln!("weave stats: {} decisions judged, {questions} questions", lines.judged_count());
+    }
+    lines
+}
+
 fn resolve_line(s: &Store, lines: &Lines, given: Option<&str>, what: &str) -> Result<ContributionId> {
     let Some(given) = given else {
         return lines

@@ -167,7 +167,7 @@ pub(crate) fn green(s: &Store, args: GreenArgs) -> Result<ExitCode> {
     let g = s.graph();
     let ix = Index::build(g);
     require_marker(&ix)?;
-    let lines = Lines::build(g, &ix);
+    let lines = super::lines_for(s, &ix, &[args.line.as_deref()]);
     let line = resolve_line(s, &lines, args.line.as_deref(), "--line")?;
     let checks = Checks::build(g, &ix, &lines);
     let names = Names::load(s)?;
@@ -291,7 +291,7 @@ pub(crate) fn review(s: &Store, args: ReviewArgs) -> Result<ExitCode> {
     let g = s.graph();
     let ix = Index::build(g);
     require_marker(&ix)?;
-    let lines = Lines::build(g, &ix);
+    let lines = super::lines_for(s, &ix, &[args.line.as_deref(), args.proposal.as_deref()]);
     let reviews = Reviews::build(&ix, &lines);
     let names = Names::load(s)?;
     let proposal_view = |p: &ContributionId| -> (Vec<(&Review, Target)>, Vec<Open>) {

@@ -126,7 +126,37 @@ fn checked(g: &Graph) -> Lines {
     assert_eq!(ix.ancestry_stats().fallbacks, 0, "{:?}", ix.ancestry_stats());
     assert_eq!(lines.stats().fallbacks, 0, "{:?}", lines.stats());
     assert!(lines.stats().peak_words <= g.len().max(1), "{:?}", lines.stats());
+    alone_agrees(g, &ix, &lines);
     lines
+}
+
+/// Task a4d1a06a1072: each line judged alone, with the default line, judges every decision and proposal
+/// on them, and judges whatever it judges as the full build does, with no question missed.
+fn alone_agrees(g: &Graph, ix: &Index, lines: &Lines) {
+    let mut asked: Vec<ContributionId> = lines.versions().map(|v| v.id).collect();
+    asked.push(ContributionId([0; 32]));
+    for line in asked {
+        let alone = Lines::build_for(g, ix, |_| vec![line]);
+        assert_eq!(alone.default_line(), lines.default_line(), "with {line}");
+        assert_eq!(alone.stats().fallbacks + alone.obligation_stats().fallbacks, 0, "with {line}");
+        assert!(alone.objections().differ_from_walking(ix, &alone).is_empty(), "with {line}");
+        for c in g.iter() {
+            let id = c.id();
+            if let Some(d) = alone.decision(&id) {
+                match alone.verdict(&id) {
+                    Some(verdict) => assert_eq!(Some(verdict), lines.verdict(&id), "decision {id} with {line}"),
+                    None => assert!(!alone.judges(&d.decision.line), "decision {id} on a judged line, with {line}"),
+                }
+            }
+            if let Some(p) = lines.proposal(&id) {
+                match alone.proposal(&id) {
+                    Some(q) => assert_eq!(q.verdict, p.verdict, "proposal {id} with {line}"),
+                    None => assert!(!alone.judges(&p.proposal.line), "proposal {id} on a judged line, with {line}"),
+                }
+                assert!(alone.proposal_named(&id).is_some(), "proposal {id}'s payload, with {line}");
+            }
+        }
+    }
 }
 
 fn artifact<R: Record>(record: &R) -> Body {
