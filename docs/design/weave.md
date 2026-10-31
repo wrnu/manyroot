@@ -1087,7 +1087,12 @@ from its results.
       qualifying decisions there and below. These are persistent sets of
       words, a bit per objection or manifest, that share what they have in
       common, so a decision adding nothing shares its parent's, and adding
-      one copies a path of seven nodes.
+      one copies a path of seven nodes. What was settled is a persistent map
+      of such sets, from a number per line that anything was settled on,
+      with eight levels of 16 ways. A settle copies the path to its line, and
+      a merge copies only the paths where its parents' maps differ (finding
+      `0a2094d4cf7b`). So a decision costs the lines it settles on or brings
+      in, not every line settled on below it.
     - Settles reach only decisions on the settling decision's line, so a
       parent on another line gives no window to share. A merge's parents may
       also each have settled what the other's window holds. Either way, the
@@ -1113,8 +1118,16 @@ from its results.
       questions, one per objection per later move, in 1.1 s. What grows
       faster than the line is the ancestor index's passes, one per 64
       askers: at 8,000 moves, answered `fixed`, it builds in 0.16 s (2.2 s
-      before). `measure_long_lines` in `crates/tree/tests/objections.rs`
-      gives these figures.
+      before). 8,000 lines, each settling the one objection at its root,
+      merged into main one by one, build in 0.9 s, allocating 152 MB in all,
+      twice what 4,000 lines allocate (5.1 s and 2.98 GB peak before: each
+      merge copied a map of every line below it). `measure_long_lines` in
+      `crates/tree/tests/objections.rs` gives these figures.
+    - Rules 1 to 3 stop junk only from someone who can't qualify. A line's
+      own integrators can make it cost the stated bound. On a line someone
+      makes for themselves, `n` moves each objected to and left unanswered
+      cost `n^2/2` rule-5 questions, as on any line: each move must answer
+      every objection to the moves below it.
   - A question nothing asked at build would be a bug. It is answered by
     walking and counted, and fails debug builds; the tests assert the count
     is zero.

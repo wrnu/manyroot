@@ -723,6 +723,7 @@ fn every_derived_status_is_as_pinned() {
 
     // The line, its policy versions, and every decision's verdict and the policy in force for it.
     let lines = Lines::build(g, &ix);
+    assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     assert_eq!(lines.default_line(), Some(n.line));
     let mut both = vec![n.line, n.side];
     both.sort();
@@ -863,7 +864,12 @@ fn every_derived_status_is_as_pinned() {
         before.insert(c.clone()).expect("each one's parents come first");
     }
     let before_ix = Index::build(&before);
-    assert_eq!(Lines::build(&before, &before_ix).heads(&n.side), forked);
+    let before_lines = Lines::build(&before, &before_ix);
+    assert!(
+        before_lines.objections().differ_from_walking(&before_ix, &before_lines).is_empty(),
+        "windows and a walk disagree"
+    );
+    assert_eq!(before_lines.heads(&n.side), forked);
     // Both objections on the side line were answered and settled: none is open.
     assert_eq!(lines.open_objections(g, &ix, &n.side), Some(vec![]));
     // bob's fail on S1's tree is the latest result there, so no decision on the side line is green.

@@ -3,6 +3,8 @@
 //! also made by walking the graph, and must agree; and no ancestor question falls
 //! back to a walk (decision on split note dc467163233c).
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
@@ -19,6 +21,52 @@ use bracken_tree::{ContentHash, Entry, Mode};
 use manyroot::{Body, Contribution, ContributionId, Graph, GroundId, Identity, RelationKind, Verdict};
 
 const GROUND: GroundId = GroundId([7; 32]);
+
+/// The system allocator, counting the bytes each thread asks for: what a test reads to pin what a build
+/// copies (finding 0a2094d4cf7b).
+struct Counting;
+
+thread_local! {
+    static ALLOCATED: Cell<u64> = const { Cell::new(0) };
+}
+
+fn count(bytes: usize) {
+    let _ = ALLOCATED.try_with(|a| a.set(a.get() + bytes as u64));
+}
+
+/// The bytes this thread has allocated so far.
+fn allocated() -> u64 {
+    ALLOCATED.with(Cell::get)
+}
+
+// SAFETY: each call passes its arguments to the system allocator unchanged.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        count(layout.size());
+        // SAFETY: as for System.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        count(layout.size());
+        // SAFETY: as for System.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: as for System.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        count(new_size);
+        // SAFETY: as for System.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
 const ARGV: &[&str] = &["cargo", "test"];
 
 type Files<'a> = &'a [(&'a str, &'a [u8])];
@@ -891,6 +939,7 @@ fn a_flood_over_many_ancestors_is_answered_by_one_line_wide_answer() {
     let line = w.line;
     let ix = Index::build(&w.g);
     let lines = Lines::build(&w.g, &ix);
+    assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     let none = w.draft(m2.0, &[head], |_| {});
     assert!(matches!(lines.judge_new(&w.g, &ix, w.alice.agent_id(), &none), Err(Unqualified::Unanswered { .. })));
     let one = w.draft(m2.0, &[head], |d| d.answers.push(answer(line, Disposition::Fixed)));
@@ -901,6 +950,7 @@ fn a_flood_over_many_ancestors_is_answered_by_one_line_wide_answer() {
     let after = w.decide(m3.0, &[e], |_| {});
     let ix = Index::build(&w.g);
     let lines = Lines::build(&w.g, &ix);
+    assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     assert_eq!(lines.verdict(&e).expect("judged").as_ref().map(|_| ()), Ok(()), "one reference");
     assert_eq!(lines.verdict(&after).expect("judged").as_ref().map(|_| ()), Ok(()), "and settled for the next");
     assert_eq!(lines.obligation_stats().fallbacks, 0, "{:?}", lines.obligation_stats());
@@ -1016,6 +1066,43 @@ fn an_answered_line_asks_two_questions_a_move() {
     assert!(matches!(lines.verdict(&merge).expect("judged"), Err(Unqualified::Unanswered { .. })), "the head's");
 }
 
+/// Finding 0a2094d4cf7b's shape: `n` lines, each of whose roots answers the one objection, to manifest
+/// `m0`, which it uses, and so settles it on that line; main merges them in one by one. Returns the
+/// merges.
+fn lines_merged_one_by_one(w: &mut World, n: usize) -> Vec<ContributionId> {
+    let bob = w.bob.clone();
+    let (m0, m0_artifact) = w.tree(&[("a", b"0")]);
+    let m1 = w.tree(&[("a", b"1")]).0;
+    let why = w.claim(&bob, "no", &[]);
+    let o = w.object(&bob, why, m0_artifact);
+    let mut merges = vec![w.decide(m1, &[], |_| {})];
+    for i in 0..n {
+        let line = w.side_line(&format!("side-{i}"), vec![]);
+        let root = w.decide_on(line, m0, &[], |d| d.answers.push(answer(o, Disposition::Overridden)));
+        let merge = w.decide(m1, &[*merges.last().expect("a root"), root], |_| {});
+        merges.push(merge);
+    }
+    merges
+}
+
+/// Finding 0a2094d4cf7b: what was settled is kept by line in a persistent map, so a merge copies only
+/// the path to the line it brings in, and twice the lines allocate about twice the bytes, not four times.
+#[test]
+fn lines_merged_one_by_one_cost_each_its_own_path() {
+    let mut made = Vec::new();
+    for n in [300, 600] {
+        let mut w = World::new();
+        let merges = lines_merged_one_by_one(&mut w, n);
+        let (_, lines) = w.lines();
+        assert!(merges.iter().all(|m| lines.verdict(m).expect("judged").is_ok()), "every merge qualifies");
+        let ix = Index::build(&w.g);
+        let before = allocated();
+        Lines::build(&w.g, &ix);
+        made.push(allocated() - before);
+    }
+    assert!(made[1] * 10 < made[0] * 25, "{made:?}");
+}
+
 /// The figures in weave.md section 4, *Objections*: run by hand in a release build, with
 /// `cargo test --release -p bracken-tree --test objections measure_long_lines -- --ignored --nocapture`.
 #[test]
@@ -1031,6 +1118,17 @@ fn measure_long_lines() {
         (4_000, Some(Disposition::FellBack), 0, false),
         (4_000, Some(Disposition::Fixed), 4_000, true),
     ] {
+        if n == 1_000 {
+            for lines_n in [4_000, 8_000] {
+                let mut w = World::new();
+                lines_merged_one_by_one(&mut w, lines_n);
+                let ix = Index::build(&w.g);
+                let (t, before) = (std::time::Instant::now(), allocated());
+                Lines::build(&w.g, &ix);
+                let made = allocated() - before;
+                eprintln!("{lines_n} lines merged one by one: {:?}, {made} bytes allocated", t.elapsed());
+            }
+        }
         let mut w = World::new();
         let bob = w.bob.clone();
         let m = [w.tree(&[("a", b"0")]).0, w.tree(&[("a", b"1")]).0];

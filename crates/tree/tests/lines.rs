@@ -116,6 +116,7 @@ fn checked(g: &Graph) -> Lines {
     let ix = Index::build(g);
     let lines = Lines::build(g, &ix);
     let walked = Lines::build_by_walking(g, &ix);
+    assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     for c in g.iter() {
         let id = c.id();
         assert_eq!(lines.verdict(&id), walked.verdict(&id), "decision {id}");
@@ -679,6 +680,7 @@ fn unchecked(g: &Graph) -> Lines {
     let ix = Index::build(g);
     let lines = Lines::build(g, &ix);
     assert_eq!((lines.stats().fallbacks, ix.ancestry_stats().fallbacks), (0, 0));
+    assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     lines
 }
 

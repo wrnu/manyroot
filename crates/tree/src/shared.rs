@@ -1,6 +1,7 @@
 //! A persistent set of `u32`s: a fixed-shape trie of 64-bit words, 16 ways at each of seven levels,
 //! whose versions share every subtree they have in common. Adding a value copies one path; a union or
 //! difference of two versions skips the subtrees they share, and otherwise reads a word per 64 values.
+//! [`SetMap`] maps `u32`s to such sets the same way, with a set at each leaf.
 
 use std::sync::Arc;
 
@@ -136,6 +137,108 @@ impl Set {
     }
 }
 
+/// Key levels: 4 bits per level cover a `u32`.
+const KEY_LEVELS: u32 = 8;
+
+/// A persistent map from `u32` to [`Set`], shaped as [`Set`] is, so that adding to one key copies one
+/// path, and a union of two versions skips the subtrees they share or that one of them lacks.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SetMap(Option<Arc<MapNode>>);
+
+#[derive(Debug)]
+enum MapNode {
+    Leaf(Set),
+    Branch([SetMap; 16]),
+}
+
+fn key_slot(k: u32, level: u32) -> usize {
+    ((k >> (4 * (KEY_LEVELS - 1 - level))) & 15) as usize
+}
+
+impl SetMap {
+    fn node(node: MapNode) -> SetMap {
+        SetMap(Some(Arc::new(node)))
+    }
+
+    fn same(&self, other: &SetMap) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    /// The set at `k`, empty if there is none.
+    pub(crate) fn get(&self, k: u32) -> Set {
+        let (mut map, mut level) = (self, 0);
+        loop {
+            match map.0.as_deref() {
+                None => return Set::default(),
+                Some(MapNode::Leaf(set)) => return set.clone(),
+                Some(MapNode::Branch(children)) => {
+                    map = &children[key_slot(k, level)];
+                    level += 1;
+                }
+            }
+        }
+    }
+
+    /// This map with `set` at `k`.
+    pub(crate) fn with(&self, k: u32, set: Set) -> SetMap {
+        self.with_at(k, set, 0)
+    }
+
+    fn with_at(&self, k: u32, set: Set, level: u32) -> SetMap {
+        if level == KEY_LEVELS {
+            return match self.0.as_deref() {
+                Some(MapNode::Leaf(old)) if old.same(&set) => self.clone(),
+                _ => SetMap::node(MapNode::Leaf(set)),
+            };
+        }
+        let mut children: [SetMap; 16] = match self.0.as_deref() {
+            Some(MapNode::Branch(children)) => children.clone(),
+            _ => Default::default(),
+        };
+        let at = key_slot(k, level);
+        let child = children[at].with_at(k, set, level + 1);
+        if child.same(&children[at]) {
+            return self.clone();
+        }
+        children[at] = child;
+        SetMap::node(MapNode::Branch(children))
+    }
+
+    /// At each key, the union of the two maps' sets.
+    pub(crate) fn union(&self, other: &SetMap) -> SetMap {
+        match (self.0.as_deref(), other.0.as_deref()) {
+            _ if self.same(other) => self.clone(),
+            (None, _) => other.clone(),
+            (_, None) => self.clone(),
+            (Some(MapNode::Leaf(a)), Some(MapNode::Leaf(b))) => {
+                let both = a.union(b);
+                if both.same(a) {
+                    self.clone()
+                } else if both.same(b) {
+                    other.clone()
+                } else {
+                    SetMap::node(MapNode::Leaf(both))
+                }
+            }
+            (Some(MapNode::Branch(a)), Some(MapNode::Branch(b))) => {
+                let children: [SetMap; 16] = std::array::from_fn(|i| a[i].union(&b[i]));
+                if children.iter().zip(a).all(|(c, a)| c.same(a)) {
+                    self.clone()
+                } else if children.iter().zip(b).all(|(c, b)| c.same(b)) {
+                    other.clone()
+                } else {
+                    SetMap::node(MapNode::Branch(children))
+                }
+            }
+            _ => unreachable!("a trie of fixed shape"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
@@ -185,6 +288,58 @@ mod tests {
             assert_eq!(less, reference.difference(&other.1).copied().collect::<Vec<_>>(), "version {i}");
             assert!(reference.iter().all(|x| set.contains(*x)));
             assert!(!set.contains(u32::MAX) || reference.contains(&u32::MAX));
+        }
+    }
+
+    /// Maps built by setting keys and joining, each against a `BTreeMap` of `BTreeSet`s.
+    #[test]
+    fn maps_agree_with_a_btreemap() {
+        use std::collections::BTreeMap;
+
+        use super::SetMap;
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let as_set = |r: &BTreeSet<u32>| r.iter().fold(Set::default(), |all, x| all.with(*x));
+        let mut versions: Vec<(SetMap, BTreeMap<u32, BTreeSet<u32>>)> = vec![(SetMap::default(), BTreeMap::new())];
+        for _ in 0..1_000 {
+            let r = next();
+            let (a, b) = (r as usize % versions.len(), (r >> 20) as usize % versions.len());
+            let made = match r >> 40 & 1 {
+                0 => {
+                    let k = match r >> 41 & 1 {
+                        0 => (r >> 42) as u32 % 40,
+                        _ => (r >> 9) as u32,
+                    };
+                    let (map, reference) = &versions[a];
+                    let mut more = reference.clone();
+                    more.entry(k).or_default().insert((r >> 50) as u32 % 200);
+                    (map.with(k, as_set(&more[&k])), more)
+                }
+                _ => {
+                    let mut both = versions[a].1.clone();
+                    for (k, v) in &versions[b].1 {
+                        both.entry(*k).or_default().extend(v);
+                    }
+                    (versions[a].0.union(&versions[b].0), both)
+                }
+            };
+            versions.push(made);
+        }
+        for (i, (map, reference)) in versions.iter().enumerate() {
+            for (k, v) in reference {
+                let mut all = Vec::new();
+                map.get(*k).difference(&Set::default(), &mut all);
+                assert_eq!(all, v.iter().copied().collect::<Vec<_>>(), "version {i}, key {k}");
+            }
+            let missing = (0..u32::MAX).step_by(1 << 28).find(|k| !reference.contains_key(k)).expect("a free key");
+            let mut none = Vec::new();
+            map.get(missing).difference(&Set::default(), &mut none);
+            assert!(none.is_empty(), "version {i}");
         }
     }
 }

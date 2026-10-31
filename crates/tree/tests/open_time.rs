@@ -137,6 +137,7 @@ fn a_fifty_megabyte_ground_opens_and_its_views_hold() {
     let t = Instant::now();
     let lines = Lines::build(s.graph(), &ix);
     let derive = t.elapsed();
+    assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     let t = Instant::now();
     let heads = lines.heads(&line);
     let log = lines.log(s.graph(), &line, None);
