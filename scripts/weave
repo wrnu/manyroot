@@ -15,7 +15,8 @@
 #   - evidence: check results come only from the check runner (weave.md section 3);
 #   - sync and serve: the Weave Ground never syncs in v0, and this never reads .bracken-team;
 #   - --as weave-runner, for anything but weave validate;
-#   - weave validate, which isn't built yet (Weave build step 7);
+#   - weave validate for an identity that isn't one of the line's validators, read from the pinned binary's
+#     own plan (weave validate --dry-run --json) before anything runs, and weave validate with a '--';
 #   - a line write (weave line create or weave line policy) whose --owner-decision isn't a claim tagged
 #     decision, not retracted, in the coordination Ground (read with the main checkout's scripts/bk): a
 #     policy is code this machine runs, so each version cites the owner's decision (weave.md section 1,
@@ -77,7 +78,6 @@ if [ "$cmd" = relate ]; then
   done
 fi
 [ "$who" != weave-runner ] || [ "$sub" = validate ] || fail "--as weave-runner is only for weave validate"
-[ "$sub" != validate ] || fail "weave validate isn't built yet (Weave build step 7)"
 if [ "$sub" = line ] && [[ $subsub == create || $subsub == policy ]]; then
   [ -n "$owner_decision" ] ||
     fail "weave line $subsub needs --owner-decision <id>: the id of the owner's decision, in the coordination Ground, that allows this policy"
@@ -121,4 +121,19 @@ if [ -f "$ground/ground.json" ] && [ -f "$main/.bracken/ground.json" ]; then
 fi
 
 export BRACKEN_DIR="$ground"
+if [ "$sub" = validate ]; then
+  # The binary refuses a signer that isn't a validator too; this reads the line's validators first, so
+  # that nothing runs for anyone else even under a binary that didn't (weave.md section 3).
+  plan=()
+  for arg in "$@"; do
+    case "$arg" in
+      --) fail "weave validate takes no '--'" ;;
+      --json | --dry-run) ;;
+      *) plan+=("$arg") ;;
+    esac
+  done
+  shown=$("$bin" "${plan[@]}" --dry-run --json) || fail "weave validate refused, so no check ran"
+  jq -e '.signer as $s | (.validators | index($s)) != null' <<<"$shown" >/dev/null 2>&1 ||
+    fail "the signer isn't one of the line's validators, so weave validate runs nothing for it"
+fi
 exec "$bin" "$@"

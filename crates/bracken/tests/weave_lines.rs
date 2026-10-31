@@ -840,3 +840,34 @@ fn line_policy_on_a_diverged_chain_needs_from() {
     w.ok(&["weave", "integrate", "--as", AS]);
     w.ok(&["weave", "line", "merge", "main", "--into", "dev", "--as", "bob"]);
 }
+
+// Rule 5 at integrate: until --answer (Weave step 7, PR 4), an objection in the window stops both
+// forms of integrate before anything is written, and the refusal names the objection, its basis and
+// the rule.
+#[test]
+fn integrate_refuses_while_an_objection_is_in_the_window() {
+    let w = Weave::new();
+    let first = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    let decision = first["decision"].as_str().expect("a decision");
+    let claim = w.ok(&["claim", "this decision breaks the build", "--as", AS]);
+    let claim = claim.split_whitespace().nth(1).expect("an id");
+    let objection: Value =
+        serde_json::from_str(&w.ok(&["relate", claim, "contradicts", decision, "--as", AS, "--json"])).expect("JSON");
+    let objection = objection["id"].as_str().expect("an id").to_owned();
+    w.commit("b.txt", b"two\n");
+    let proposal = w.ok(&["weave", "propose", "--as", AS]);
+    let proposal = proposal.lines().find_map(|l| l.strip_prefix("proposal ")).expect("a proposal").to_owned();
+    let before = w.contributions();
+    for args in [&["weave", "integrate", "--as", AS][..], &["weave", "integrate", "--proposals", &proposal, "--as", AS]]
+    {
+        let err = w.fails(args);
+        assert!(
+            err.contains(&format!(
+                "it doesn't answer the discussion objection {objection}, nor does a decision in its window"
+            )),
+            "{args:?}: {err}"
+        );
+        assert!(err.contains("(rule 5:") && err.contains("--answer"), "{args:?}: {err}");
+        assert_eq!(w.contributions(), before, "{args:?} wrote something");
+    }
+}
