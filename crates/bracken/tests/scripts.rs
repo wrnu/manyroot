@@ -4846,6 +4846,8 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
         weave_repo_with(&[("scripts/weave-shadow", &shadow), ("scripts/weave-propose", &propose)]);
     let approval = owner_approval(&dir);
     bk(&dir, &["id", "new", "alice"]);
+    bk(&dir, &["id", "new", "bob"]);
+    bk(&dir, &["id", "new", "manager"]);
     std::fs::create_dir(home.join("bracken-weave")).unwrap();
     let script = |name: &str, args: &[&str]| -> Output {
         let mut c = command(&dir, name, args);
@@ -4880,9 +4882,16 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
         push(name);
     };
     // The builder's pr claim for the pushed head, and with `proposed`, its proposal first.
+    let claimed = std::cell::RefCell::new(std::collections::HashMap::<String, (String, String)>::new());
     let claim = |pr: &str| {
         let (name, sha) = (git(&["symbolic-ref", "--short", "HEAD"]), git(&["rev-parse", "HEAD"]));
-        bk(&dir, &["claim", &format!("PR #{pr} {name} @ {sha}: {name}"), "--tag", "pr", "--as", "alice"]);
+        let id = bk(&dir, &["claim", &format!("PR #{pr} {name} @ {sha}: {name}"), "--tag", "pr", "--as", "alice"]);
+        claimed.borrow_mut().insert(pr.to_owned(), (id, sha));
+    };
+    // scripts/merge's pass on the PR's last pr claim: what the shadow checks a proposal against.
+    let gate = |pr: &str| {
+        let (id, sha) = claimed.borrow()[pr].clone();
+        bk(&dir, &["evidence", &id, "pass", "--method", &format!("merge gate @ {sha}"), "--as", "manager"]);
     };
     let proposal = |pr: &str| {
         let out = ok("scripts/weave-propose", &["--pr", pr, "--as", "alice"]);
@@ -4961,10 +4970,11 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     branch("f1", &|| write("f1.txt", "f1\n"));
     let p1 = proposal("1");
     let m1 = squash("f1", "1");
+    gate("1");
     let out = shadowed(&["--proposal", &p1, &m1], "merged");
     assert!(
         out.contains(
-            "stage 2a so far: 1 merges, 1 by Weave's own merge; fallbacks: 0 no proposal, 0 conflict, 0 mismatch"
+            "stage 2a so far: 1 merges, 1 by Weave's own merge; fallbacks: 0 no proposal, 0 conflict, 0 mismatch, 0 ancestor base"
         ),
         "{out}"
     );
@@ -4977,6 +4987,8 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     let p3 = proposal("3");
     let m3 = squash("f3", "3");
     // A proposal must be of the PR merged: #2's isn't #3's.
+    gate("3");
+    gate("2");
     refused("scripts/weave-shadow", &["--proposal", &p2, &m3], "which");
     shadowed(&["--proposal", &p3, &m3], "merged");
     let m2 = squash("f2", "2");
@@ -4995,6 +5007,7 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
         sha
     };
     let before = count();
+    gate("4");
     refused("scripts/weave-shadow", &["--proposal", &p4, &m4], "Stop and report it");
     assert_eq!(count(), before, "a mismatch wrote something");
     shadowed(&["--proposal", &p4, "--mismatched", &m4], "mismatch");
@@ -5006,7 +5019,7 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     let out = shadowed(&[&m5], "none");
     assert!(
         out.contains(
-            "stage 2a so far: 5 merges, 2 by Weave's own merge; fallbacks: 1 no proposal, 1 conflict, 1 mismatch"
+            "stage 2a so far: 5 merges, 2 by Weave's own merge; fallbacks: 1 no proposal, 1 conflict, 1 mismatch, 0 ancestor base"
         ),
         "{out}"
     );
@@ -5019,6 +5032,7 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     branch("f7", &|| write("f7.txt", "7\n"));
     let p7 = proposal("7");
     let m7 = squash("f7", "7");
+    gate("7");
     refused("scripts/weave-shadow", &["--proposal", &p7, &m7], "shadow the merges in order");
     shadowed(&[&m6], "none");
     shadowed(&["--proposal", &p7, &m7], "merged");
@@ -5030,6 +5044,8 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     branch("f9", &|| write("f9.txt", "9\n"));
     let p9 = proposal("9");
     let b1 = batch(&[("f8", "8"), ("f9", "9")]);
+    gate("8");
+    gate("9");
     shadowed(&["--proposal", &p9, "--proposal", &p8, &b1], "merged");
 
     // Another batch, where #10 has no proposal and #11's is of an earlier push than its pr claim names. That
@@ -5043,6 +5059,7 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     push("f11");
     claim("11");
     let b2 = batch(&[("f10", "10"), ("f11", "11")]);
+    gate("11");
     refused("scripts/weave-shadow", &["--proposal", &stale, &b2], "propose the merged head");
     refused("scripts/weave-shadow", &["--proposal", &p8, &b2], "which");
     git(&["switch", "-q", "f11"]);
@@ -5050,7 +5067,69 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     let out = shadowed(&["--proposal", &p11, &b2], "none");
     assert!(
         out.contains(
-            "stage 2a so far: 9 merges, 4 by Weave's own merge; fallbacks: 3 no proposal, 1 conflict, 1 mismatch"
+            "stage 2a so far: 9 merges, 4 by Weave's own merge; fallbacks: 3 no proposal, 1 conflict, 1 mismatch, 0 ancestor base"
+        ),
+        "{out}"
+    );
+
+    // PR #13 forks from #12's squash before the shadow records it, so its base is an ancestor's and it
+    // carries #12's g.txt. #14 deletes g.txt before #13 merges: Weave's merge brings it back, git's doesn't.
+    // That isn't Weave's merge going wrong: it's imported, noted as from an ancestor base, with no stop.
+    branch("f12", &|| write("g.txt", "g\n"));
+    claim("12");
+    let s12 = squash("f12", "12");
+    branch("f13", &|| write("h.txt", "h\n"));
+    let out = ok("scripts/weave-propose", &["--pr", "13", "--as", "alice"]);
+    assert!(out.contains(&format!(", an ancestor of the merge-base {s12},")), "{out}");
+    let p13 = out.lines().find_map(|l| l.strip_prefix("proposal ")).expect("a proposal").to_owned();
+    claim("13");
+    gate("13");
+    // Only the pr claim that merged counts: bob's newer claim for #13, of another head, doesn't.
+    bk(&dir, &["claim", &format!("PR #13 f13 @ {s12}: not bob's"), "--tag", "pr", "--as", "bob"]);
+    // Nor does a proposal of the merged head by anyone but that claim's author.
+    let by_bob = ok("scripts/weave-propose", &["--pr", "13", "--as", "bob"]);
+    let by_bob = by_bob.lines().find_map(|l| l.strip_prefix("proposal ")).expect("a proposal").to_owned();
+    git(&["switch", "-q", "main"]);
+    std::fs::remove_file(dir.join("g.txt")).unwrap();
+    let s14 = commit("undo g (#14)");
+    origin_main(&s14);
+    let s13 = squash("f13", "13");
+    shadowed(&[&s12], "none");
+    shadowed(&[&s14], "none");
+    refused("scripts/weave-shadow", &["--proposal", &by_bob, &s13], "is by bob");
+    let out = shadowed(&["--proposal", &p13, &s13], "ancestor");
+    assert!(
+        out.contains(
+            "stage 2a so far: 12 merges, 4 by Weave's own merge; fallbacks: 5 no proposal, 1 conflict, 1 mismatch, 1 ancestor base"
+        ),
+        "{out}"
+    );
+
+    // An ancestor base excuses only exactly that: #15's squash adds k.txt, #17 forks from it unrecorded, and
+    // git's merge of #17 changes k.txt again where Weave's doesn't. k.txt is a path the unrecorded commit
+    // changed, but Weave's merge isn't bringing anything back there, so it stops like any wrong merge.
+    branch("f15", &|| write("k.txt", "k\n"));
+    claim("15");
+    let s15 = squash("f15", "15");
+    branch("f17", &|| write("l.txt", "l\n"));
+    let p17 = proposal("17");
+    let s17 = {
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "-q", "--squash", "f17"]);
+        write("k.txt", "k, again\n");
+        let sha = commit("f17 (#17)");
+        origin_main(&sha);
+        sha
+    };
+    shadowed(&[&s15], "none");
+    gate("17");
+    let before = count();
+    refused("scripts/weave-shadow", &["--proposal", &p17, &s17], "Stop and report it");
+    assert_eq!(count(), before, "a mismatch wrote something");
+    let out = shadowed(&["--proposal", &p17, "--mismatched", &s17], "mismatch");
+    assert!(
+        out.contains(
+            "stage 2a so far: 14 merges, 4 by Weave's own merge; fallbacks: 6 no proposal, 1 conflict, 2 mismatch, 1 ancestor base"
         ),
         "{out}"
     );
@@ -5062,6 +5141,11 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     assert_eq!(
         notes,
         [
+            format!("shadow of {s17}: proposal {p17} mismatched at k.txt"),
+            format!("shadow of {s15}: no proposal for PR #15"),
+            format!("shadow of {s13}: proposal {p13} differed at g.txt, from an ancestor base"),
+            format!("shadow of {s14}: no proposal for PR #14"),
+            format!("shadow of {s12}: no proposal for PR #12"),
             format!("shadow of {b2}: no proposal for PR #10"),
             format!("shadow of {b1}: merged proposals {p8} {p9}"),
             format!("shadow of {m7}: merged proposal {p7}"),
