@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# weave-shadow: Weave dogfood stage 1, the shadow (docs/design/weave.md, section 6 row 9; docs/development.md,
+# Weave shadow). Everything goes through scripts/weave, so it opens only the Weave Ground,
+# ~/bracken-weave/manyroot, with every check scripts/weave makes.
+#
+#   scripts/weave-shadow --init --owner-decision <id>
+#       Once, after the owner's go to create the Weave Ground: weave init (the marker and line main, by
+#       weave-integrator), the validator identity weave-runner, and line main's policy: integrator
+#       weave-integrator, validator weave-runner, checks fmt and clippy. <id> is the owner's go: a claim
+#       tagged approval and signed by owner (scripts/owner-approve), in the coordination Ground. Run again
+#       after it stopped part way, it finishes the steps not yet done; once the Ground is set up, it
+#       refuses. As scripts/weave does, it refuses if ~/bracken-weave doesn't exist: creating it is the
+#       owner's go.
+#
+#   scripts/weave-shadow [--repo <dir>] <merged commit>
+#       After each merge to main: imports the commit's tree (weave import --from-git), records it as a
+#       decision on line main by weave-integrator (weave integrate of the given tree, whose parent is the
+#       line's head, the previous decision), and checks it with weave verify against the commit. Prints
+#       labelled lines (manifest, file, decision, verified) and exits non-zero on any difference. Before
+#       writing anything it refuses a commit that isn't on origin/main, or that doesn't come after the
+#       commit line main's head records (older, or unrelated). Run again for that recorded commit, it
+#       records nothing and verifies it again. <dir> is the git repository (the default is the main
+#       checkout).
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+  echo "weave-shadow: $here is not inside a git repository" >&2
+  exit 1
+}
+main=$(dirname "$common")
+weave="$here/weave"
+fail() { echo "weave-shadow: $*" >&2; exit 1; }
+usage() { sed -n '2,/^set -euo/{/^#/s/^# \{0,1\}//p;}' "${BASH_SOURCE[0]}"; }
+
+init='' owner='' repo=$main rev=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --init) init=1 ;;
+    --owner-decision) [ $# -ge 2 ] || fail "--owner-decision needs an id"; owner=$2; shift ;;
+    --owner-decision=*) owner=${1#*=} ;;
+    --repo) [ $# -ge 2 ] || fail "--repo needs a directory"; repo=$2; shift ;;
+    --repo=*) repo=${1#*=} ;;
+    -h | --help) usage; exit 0 ;;
+    -*) fail "unknown option $1; see --help" ;;
+    *) [ -z "$rev" ] || fail "one commit at a time"; rev=$1 ;;
+  esac
+  shift
+done
+
+if [ -n "$init" ]; then
+  [ -z "$rev" ] || fail "--init takes no commit"
+  [ -n "$owner" ] ||
+    fail "--init needs --owner-decision <id>: the owner's go to create the Weave Ground, an approval scripts/owner-approve wrote"
+  # The owner's go is checked before anything is created: a claim tagged approval, signed by owner and not
+  # retracted, as scripts/owner-approve writes it. A plain decision claim isn't the owner's go.
+  [[ $owner =~ ^[0-9a-f]{12,64}$ ]] || fail "--owner-decision $owner: give the approval's id, 12 to 64 lowercase hex digits"
+  shown=$(env -u BRACKEN_AGENT "$main/scripts/bk" show "$owner" --json 2>/dev/null) ||
+    fail "--owner-decision $owner: the coordination Ground has no such contribution"
+  jq -e '.kind == "claim" and (.retracted | not) and .author_name == "owner"
+         and ((.body.tags // []) | index("approval") != null)' <<<"$shown" >/dev/null 2>&1 ||
+    fail "--owner-decision $owner: it isn't a claim tagged approval, signed by owner and not retracted (scripts/owner-approve)"
+  path="${HOME:?HOME is not set}/bracken-weave/manyroot"
+  policy=(--integrator weave-integrator --validator weave-runner
+    --check 'fmt=cargo fmt --check' --check 'clippy=cargo clippy --all-targets -- -D warnings'
+    --owner-decision "$owner" --as weave-integrator)
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    "$weave" weave init --as weave-integrator --purpose dogfood
+  else
+    # A Ground already there is finished, not created again: --init may have stopped part way, and nothing
+    # under ~/bracken-weave is ever edited by hand. It must be one this script started: weave-integrator signs
+    # here.
+    ids=$("$weave" id list --json) || fail "$path isn't a Ground this script can open"
+    jq -e 'any(.[]; .name == "weave-integrator" and .can_sign)' <<<"$ids" >/dev/null ||
+      fail "$path holds no weave-integrator key, so --init didn't start it; it won't touch it"
+    echo "resuming --init in $path"
+  fi
+  # Each step only if it isn't done yet. weave-runner first, so a line written below can name it.
+  ids=$("$weave" id list --json)
+  jq -e 'any(.[]; .name == "weave-runner")' <<<"$ids" >/dev/null || "$weave" id new weave-runner
+  # line main's current policy, as a dry run that changes nothing shows it; none if weave init stopped
+  # after its marker, before writing the line.
+  if ! shown=$("$weave" weave line policy main --dry-run --json --owner-decision "$owner" --as weave-integrator 2>/dev/null)
+  then
+    "$weave" weave line create main "${policy[@]}"
+  else
+    runner=$(jq -r '.[] | select(.name == "weave-runner") | .agent' <<<"$("$weave" id list --json)")
+    jq -e --arg r "$runner" '(.validators | index($r) != null) and .checks.fmt != null and .checks.clippy != null' \
+      <<<"$shown" >/dev/null && fail "the Weave Ground $path is already set up; --init has nothing to do"
+    "$weave" weave line policy main "${policy[@]}"
+  fi
+  exit 0
+fi
+
+[ -n "$rev" ] || fail "which merged commit? see --help"
+[ -z "$owner" ] || fail "--owner-decision goes with --init"
+sha=$(git -C "$repo" rev-parse -q --verify "$rev^{commit}") || fail "$rev isn't a commit in $repo"
+
+# Only merged commits, in order, before anything is written (finding 93dea3dd7ec2): the commit must be on
+# origin/main, and it must be the commit line main's head records, or descend from it. The ref's full name:
+# git takes a local branch or tag called origin/main before the remote-tracking ref (finding 7315c1ccfaf4).
+git -C "$repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null ||
+  fail "$repo has no refs/remotes/origin/main to check $sha against"
+git -C "$repo" merge-base --is-ancestor "$sha" refs/remotes/origin/main ||
+  fail "$sha isn't on refs/remotes/origin/main: only merged commits are shadowed"
+head=$("$weave" weave head --line main --json)
+[ "$(jq -r '.forked' <<<"$head")" = false ] || fail "line main is forked; settle it before shadowing more commits"
+decision=$(jq -r '.heads[0].decision // empty' <<<"$head")
+recorded=''
+if [ -n "$decision" ]; then
+  log=$("$weave" weave log --line main --limit 1 --json)
+  [ "$(jq -r '.decisions[0].decision' <<<"$log")" = "$decision" ] || fail "line main's newest decision isn't its head"
+  recorded=$(jq -r '.decisions[0].source.git // empty' <<<"$log")
+  [ -n "$recorded" ] || fail "line main's head $decision names no git commit, so the next commit can't be checked against it"
+fi
+if [ -n "$recorded" ] && [ "$sha" = "$recorded" ]; then
+  echo "decision $decision (already recorded for $sha)"
+else
+  if [ -n "$recorded" ]; then
+    git -C "$repo" merge-base --is-ancestor "$recorded" "$sha" ||
+      fail "$sha doesn't come after $recorded, the commit line main's head records: an older or unrelated commit"
+  fi
+  "$weave" weave import --from-git "$sha" --repo "$repo" --as weave-integrator
+  out=$("$weave" weave integrate --line main --from-git "$sha" --repo "$repo" --note "shadow of $sha" \
+    --as weave-integrator --json)
+  decision=$(jq -r '.decision // empty' <<<"$out")
+  [ -n "$decision" ] || fail "weave integrate recorded no decision for $sha: $out"
+  echo "decision $decision"
+fi
+
+# weave verify's exit code isn't enough: its JSON says whether the trees are equal.
+verified=$("$weave" weave verify --git "$sha" --at "$decision" --repo "$repo" --json) || true
+equal=$(jq -r '.equal // empty' <<<"$verified" 2>/dev/null) || equal=''
+if [ "$equal" != true ]; then
+  jq -r '.differences[]? | "\(.difference): \(.path)"' <<<"$verified" >&2 2>/dev/null || true
+  fail "decision $decision doesn't verify equal to git's $sha"
+fi
+echo "verified $decision equal to $sha"
