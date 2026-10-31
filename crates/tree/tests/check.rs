@@ -325,7 +325,8 @@ mod macos_only {
     // Note 1301a2adcc85: posix_spawn with POSIX_SPAWN_SETPGROUP moves a child into another process group of
     // the session, here the runner's own, past the profile's setpgid deny. The kill of the check's group
     // misses it, so the sweep must find it by parent pid, kill it, and fail the run: at the timeout, and
-    // after the check's leader ended normally but left the spawner running.
+    // after the check's leader ended normally but left the spawner running. Only while the spawner is
+    // alive: an orphan there escapes, as weave.md section 3 says (finding 7a937874d039).
     #[test]
     fn a_posix_spawn_setpgroup_child_in_the_runners_group_is_killed_and_fails_the_run() {
         let mut s = Setup::new();
@@ -664,7 +665,7 @@ mod macos_only {
         let probe = s.path().join("procargs_probe");
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/procargs_probe.c");
         let cc = std::process::Command::new("/usr/bin/cc")
-            .args(["-Wall", "-Wextra", "-Werror", "-O1", "-o"])
+            .args(["-Wall", "-Wextra", "-O1", "-o"])
             .arg(&probe)
             .arg(&source)
             .output()

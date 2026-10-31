@@ -903,7 +903,14 @@ nothing else runs a check on a Weave manifest (security note
     can't be found. It closes with the dedicated check user of deferred task
     `fd68bfe3c07c`, whose every process can be killed. A child that joins
     another group of the session, the runner's included, through
-    `POSIX_SPAWN_SETPGROUP`, is found and killed the same way;
+    `POSIX_SPAWN_SETPGROUP`, is found and killed the same way, but only while
+    its parent chain to the check is alive. Orphaned there, it escapes as any
+    orphan does, and if it closed its output nothing fails the run (finding
+    `7a937874d039`). The runner doesn't kill the rest of its own group, the
+    processes in it that it didn't start: that group is its caller's, which
+    holds the shell or script that started it, its pipelines (`tee`, `cat`),
+    their other jobs, and helpers git or cargo left behind, and nothing tells
+    those from a check's orphan;
   - each check has a timeout, and its whole process group is killed when it
     ends or times out.
 - **No sandbox, no run.** If the profile can't be applied, on another OS or
