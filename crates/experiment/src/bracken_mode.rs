@@ -599,92 +599,21 @@ impl Store for BrackenStore {
     }
 
     fn sync_client(&mut self, socket: &Path, relay: &Path) -> Result<Value, String> {
-        let mut argv = vec!["sync".into(), opt("deadline", SYNC_DEADLINE), opt("budget", SYNC_BUDGET), "--exec".into()];
-        argv.extend([relay.to_string_lossy().into_owned(), "shim".into(), "--socket".into()]);
-        argv.push(socket.to_string_lossy().into_owned());
-        let out = self.run(&argv, None)?;
-        Ok(json!({ "synced": crate::args::short(String::from_utf8_lossy(&out).trim()) }))
+        self.runs += 1;
+        sync_client(&self.config.bracken, &self.replica(), &self.config.dir, socket, relay, SYNC_DEADLINE, SYNC_BUDGET)
     }
 
     fn sync_server(&mut self, socket: &Path, session: &Session) -> Result<Value, String> {
-        let allow = self.config.dir.join("allow.txt");
-        std::fs::write(&allow, session.peers.join("\n") + "\n").map_err(|e| format!("writing the allow list: {e}"))?;
-        // Over stdio every session has the same credential, and serve counts quotas from the log it is
-        // given: one log per agent gives each agent its own quota (finding 57acf0d9ce57).
-        let first_seen = self.config.dir.join(format!("first-seen-{}.jsonl", session.agent));
-        let stream = std::os::unix::net::UnixStream::connect(socket)
-            .map_err(|e| crate::driver::socket_error("connecting to", socket, &e))?;
-        let seconds = if session.sync_seconds > 0 { session.sync_seconds } else { SYNC_DEADLINE };
         self.runs += 1;
-        let mut child = Command::new(&self.config.bracken)
-            .arg("--dir")
-            .arg(self.replica())
-            .args(["serve", "--stdio"])
-            .arg(format!("--allow={}", allow.display()))
-            .arg(format!("--first-seen={}", first_seen.display()))
-            .args([opt("deadline", seconds), opt("budget", SYNC_BUDGET)])
-            .args([opt("quota-contributions", session.quota_contributions), opt("quota-bytes", session.quota_bytes)])
-            .env_clear()
-            .current_dir(&self.config.dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("starting bracken: {e}"))?;
-        let (mut to_bracken, mut from_bracken) =
-            (child.stdin.take().ok_or("no bracken stdin")?, child.stdout.take().ok_or("no bracken stdout")?);
-        let up = stream.try_clone().map_err(|e| e.to_string())?;
-        let control = stream.try_clone().map_err(|e| e.to_string())?;
-        let mut down = stream;
-        let limit = std::time::Duration::from_secs(u64::from(seconds) + 5);
-        let deadline = std::time::Instant::now() + limit;
-        // A peer that stops reading can hold a write for at most the session's time.
-        let _ = down.set_write_timeout(Some(limit));
-        let done = std::sync::atomic::AtomicBool::new(false);
-        let mut killed = false;
-        let relayed = std::thread::scope(|scope| {
-            // Both halves on threads, so this one can stop bracken at the deadline whatever they wait
-            // on (finding `a8cd5b213d6f`). The incoming half polls, and stops once bracken has
-            // finished: on macOS a shutdown of the socket doesn't wake a read blocked on its clone
-            // (finding `05bee0cd4fc4`).
-            let incoming = scope.spawn(|| crate::shim::relay_until(&up, &mut to_bracken, &done, deadline));
-            let outgoing = scope.spawn(|| crate::shim::relay(&mut from_bracken, &mut down));
-            while !outgoing.is_finished() {
-                if !killed && std::time::Instant::now() > deadline {
-                    let _ = child.kill();
-                    killed = true;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = control.shutdown(std::net::Shutdown::Both);
-            let outgoing = outgoing.join().unwrap_or_else(|_| Err("the relay panicked".into()));
-            let incoming = incoming.join().unwrap_or_else(|_| Err("the relay panicked".into()));
-            outgoing.and(incoming)
-        });
-        // The relay can end (a write timing out, say) with bracken still running: it gets until
-        // the deadline to finish, and is stopped then.
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => break,
-                Ok(None) if std::time::Instant::now() > deadline || (relayed.is_err() && !killed) => {
-                    let _ = child.kill();
-                    killed = true;
-                }
-                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
-                Err(e) => return Err(format!("waiting for bracken: {e}")),
-            }
-        }
-        if killed {
-            return Err("the sync session passed its deadline or failed; bracken was stopped".to_string());
-        }
-        let out = child.wait_with_output().map_err(|e| format!("running bracken: {e}"))?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            return Err(format!("bracken serve: {}", crate::args::short(err.trim())));
-        }
-        relayed?;
-        Ok(json!({ "served": true }))
+        sync_server(
+            &self.config.bracken,
+            &self.replica(),
+            &self.config.dir,
+            socket,
+            session,
+            SYNC_DEADLINE,
+            SYNC_BUDGET,
+        )
     }
 
     fn release_changes(&mut self, wave: usize) -> Result<Value, String> {
@@ -798,6 +727,128 @@ impl Store for BrackenStore {
         }
         Ok(json!({ "members": self.members()? }))
     }
+}
+
+/// A copy's half of one sync session: `bracken sync` on `replica`, its bytes relayed through the driver by
+/// `relay shim --socket` (the `bracken-experiment` binary). Weave mode syncs its replicas the same way.
+pub(crate) fn sync_client(
+    bracken: &Path,
+    replica: &Path,
+    dir: &Path,
+    socket: &Path,
+    relay: &Path,
+    deadline: u32,
+    budget: u64,
+) -> Result<Value, String> {
+    let mut argv = vec!["sync".into(), opt("deadline", deadline), opt("budget", budget), "--exec".into()];
+    argv.extend([relay.to_string_lossy().into_owned(), "shim".into(), "--socket".into()]);
+    argv.push(socket.to_string_lossy().into_owned());
+    let child = Command::new(bracken)
+        .arg("--dir")
+        .arg(replica)
+        .args(&argv)
+        .env_clear()
+        .current_dir(dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("starting bracken: {e}"))?;
+    let out = crate::mode::communicate(child, None).map_err(|e| format!("running bracken: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("bracken sync: {}", crate::args::short(err.trim())));
+    }
+    Ok(json!({ "synced": crate::args::short(String::from_utf8_lossy(&out.stdout).trim()) }))
+}
+
+/// The hub's half: `bracken serve --stdio` on `replica` for `session.agent`, within its quotas, on `socket`.
+pub(crate) fn sync_server(
+    bracken: &Path,
+    replica: &Path,
+    dir: &Path,
+    socket: &Path,
+    session: &Session,
+    deadline_seconds: u32,
+    budget: u64,
+) -> Result<Value, String> {
+    let allow = dir.join("allow.txt");
+    std::fs::write(&allow, session.peers.join("\n") + "\n").map_err(|e| format!("writing the allow list: {e}"))?;
+    // Over stdio every session has the same credential, and serve counts quotas from the log it is
+    // given: one log per agent gives each agent its own quota (finding 57acf0d9ce57).
+    let first_seen = dir.join(format!("first-seen-{}.jsonl", session.agent));
+    let stream = std::os::unix::net::UnixStream::connect(socket)
+        .map_err(|e| crate::driver::socket_error("connecting to", socket, &e))?;
+    let seconds = if session.sync_seconds > 0 { session.sync_seconds } else { deadline_seconds };
+    let mut child = Command::new(bracken)
+        .arg("--dir")
+        .arg(replica)
+        .args(["serve", "--stdio"])
+        .arg(format!("--allow={}", allow.display()))
+        .arg(format!("--first-seen={}", first_seen.display()))
+        .args([opt("deadline", seconds), opt("budget", budget)])
+        .args([opt("quota-contributions", session.quota_contributions), opt("quota-bytes", session.quota_bytes)])
+        .env_clear()
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("starting bracken: {e}"))?;
+    let (mut to_bracken, mut from_bracken) =
+        (child.stdin.take().ok_or("no bracken stdin")?, child.stdout.take().ok_or("no bracken stdout")?);
+    let up = stream.try_clone().map_err(|e| e.to_string())?;
+    let control = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut down = stream;
+    let limit = std::time::Duration::from_secs(u64::from(seconds) + 5);
+    let deadline = std::time::Instant::now() + limit;
+    // A peer that stops reading can hold a write for at most the session's time.
+    let _ = down.set_write_timeout(Some(limit));
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let mut killed = false;
+    let relayed = std::thread::scope(|scope| {
+        // Both halves on threads, so this one can stop bracken at the deadline whatever they wait
+        // on (finding `a8cd5b213d6f`). The incoming half polls, and stops once bracken has
+        // finished: on macOS a shutdown of the socket doesn't wake a read blocked on its clone
+        // (finding `05bee0cd4fc4`).
+        let incoming = scope.spawn(|| crate::shim::relay_until(&up, &mut to_bracken, &done, deadline));
+        let outgoing = scope.spawn(|| crate::shim::relay(&mut from_bracken, &mut down));
+        while !outgoing.is_finished() {
+            if !killed && std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                killed = true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _ = control.shutdown(std::net::Shutdown::Both);
+        let outgoing = outgoing.join().unwrap_or_else(|_| Err("the relay panicked".into()));
+        let incoming = incoming.join().unwrap_or_else(|_| Err("the relay panicked".into()));
+        outgoing.and(incoming)
+    });
+    // The relay can end (a write timing out, say) with bracken still running: it gets until
+    // the deadline to finish, and is stopped then.
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() > deadline || (relayed.is_err() && !killed) => {
+                let _ = child.kill();
+                killed = true;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => return Err(format!("waiting for bracken: {e}")),
+        }
+    }
+    if killed {
+        return Err("the sync session passed its deadline or failed; bracken was stopped".to_string());
+    }
+    let out = child.wait_with_output().map_err(|e| format!("running bracken: {e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("bracken serve: {}", crate::args::short(err.trim())));
+    }
+    relayed?;
+    Ok(json!({ "served": true }))
 }
 
 impl BrackenStore {

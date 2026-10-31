@@ -23,7 +23,7 @@ use bracken_experiment::driver::{
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_under};
 use bracken_experiment::pi::{PiBackend, PiConfig, PiCredential, PiExpect};
-use bracken_experiment::plan::PlanInputs;
+use bracken_experiment::plan::{PlanInputs, ProjectPlan};
 use bracken_experiment::task::Task;
 
 #[derive(Parser)]
@@ -69,10 +69,20 @@ enum Cmd {
     Run {
         #[arg(long)]
         dir: PathBuf,
-        #[arg(long, value_parser = ["bracken", "git", "crdt"])]
+        #[arg(long, value_parser = ["bracken", "git", "crdt", "weave"])]
         mode: String,
         #[arg(long, default_value_t = 10)]
         agents: usize,
+        /// Weave mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// A project run: the Python interpreter to pin, whose version must be the project's. The plan records
+        /// it, and every run of agent code pins it from there.
+        #[arg(long, requires = "project")]
+        python: Option<PathBuf>,
+        /// A project run: the digest the interpreter must have.
+        #[arg(long, requires = "python")]
+        python_digest: Option<String>,
         #[arg(long, default_value_t = 8)]
         turns: u32,
         // No clap default: with one, an unset `--claude` would pass `required_if_eq`.
@@ -132,10 +142,20 @@ enum Cmd {
     MockRun {
         #[arg(long)]
         dir: PathBuf,
-        #[arg(long, default_value = "bracken", value_parser = ["bracken", "git", "crdt"])]
+        #[arg(long, default_value = "bracken", value_parser = ["bracken", "git", "crdt", "weave"])]
         mode: String,
         #[arg(long, default_value_t = 3)]
         agents: usize,
+        /// Weave mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// A project run: the Python interpreter to pin, whose version must be the project's. The plan records
+        /// it, and every run of agent code pins it from there.
+        #[arg(long, requires = "project")]
+        python: Option<PathBuf>,
+        /// A project run: the digest the interpreter must have.
+        #[arg(long, requires = "python")]
+        python_digest: Option<String>,
         #[arg(long, default_value_t = 5)]
         turns: u32,
         #[arg(long, default_value_t = 1)]
@@ -200,6 +220,9 @@ fn main() {
             dir,
             mode,
             agents,
+            project,
+            python,
+            python_digest,
             turns,
             harness,
             claude,
@@ -217,6 +240,8 @@ fn main() {
             accept_rule,
             mode_token_cap,
         } => agent_run(AgentRun {
+            project: project_inputs(project.as_deref(), python.as_deref(), python_digest.as_deref())
+                .unwrap_or_else(|e| refuse_run(&e)),
             mode_token_cap,
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
             task: task_named(&task),
@@ -241,13 +266,37 @@ fn main() {
             model,
             bracken,
         }),
-        Cmd::MockRun { dir, mode, agents, turns, seed, task, bracken, sandbox, accept_rule } => {
+        Cmd::MockRun {
+            dir,
+            mode,
+            agents,
+            project,
+            python,
+            python_digest,
+            turns,
+            seed,
+            task,
+            bracken,
+            sandbox,
+            accept_rule,
+        } => {
             let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
+            let (project, python, integrator) =
+                match project_inputs(project.as_deref(), python.as_deref(), python_digest.as_deref()) {
+                    Ok(inputs) => inputs,
+                    Err(e) => {
+                        eprintln!("bracken-experiment: {e}");
+                        std::process::exit(1);
+                    }
+                };
             let plan = PlanInputs {
                 task: task_named(&task),
                 backend_seed: seed,
                 harness_commit: harness_commit(),
                 accept_rule,
+                project,
+                python,
+                integrator,
                 ..PlanInputs::default()
             };
             mock_run(dir, &mode, agents, turns, bracken, sandbox, plan)
@@ -263,6 +312,22 @@ fn main() {
         eprintln!("bracken-experiment: {e}");
         std::process::exit(1);
     }
+}
+
+/// A project run's plan inputs, from `--project`, `--python` and `--python-digest`: the project as the plan
+/// records it, the interpreter pinned, and the configuration's integrator setting. None of them without a
+/// project; a project without `--python` is refused (answer `5e40cacdbfb4`).
+fn project_inputs(
+    project: Option<&std::path::Path>,
+    python: Option<&std::path::Path>,
+    digest: Option<&str>,
+) -> Result<ProjectInputs, String> {
+    let Some(dir) = project else { return Ok((None, None, None)) };
+    let project = bracken_experiment::project::Project::load(dir)?;
+    let python = python.ok_or("a project run needs --python, the interpreter to pin")?;
+    let pin = bracken_experiment::python::Python::pin(python, &project.python, digest)?.plan_pin();
+    let integrator = bracken_experiment::weave_mode::ANY_AGENT.to_string();
+    Ok((Some(ProjectPlan::of(&project)?), Some(pin), Some(integrator)))
 }
 
 /// The tasks `--task` takes.
@@ -365,7 +430,11 @@ impl HarnessOptions {
     }
 }
 
+/// A project run's plan inputs: see [`project_inputs`].
+type ProjectInputs = (Option<ProjectPlan>, Option<bracken_experiment::python::PythonPin>, Option<String>);
+
 struct AgentRun {
+    project: ProjectInputs,
     task: Task,
     dir: PathBuf,
     mode: String,
@@ -419,6 +488,9 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
         expected_stops: vec![RUN_TOKEN_CAP.into(), RUN_TIME_CAP.into()],
         accept_rule: a.accept_rule,
         usage: std::path::absolute(backend_dir.join("usage.jsonl")).map_err(|e| e.to_string())?.display().to_string(),
+        project: a.project.0.clone(),
+        python: a.project.1.clone(),
+        integrator: a.project.2.clone(),
         ..PlanInputs::default()
     };
     let cfg = |plan: PlanInputs| -> Result<RunConfig, String> {

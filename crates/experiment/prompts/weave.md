@@ -1,0 +1,3 @@
+## Where things are
+
+The project is the tree at the head of the line main, whose first decision was the seed, and the spec and items the task tool shows, which only the task setter's key signs. A new item arrives as a claim tagged item, which task then shows. Work counts once it is in the line's head: you propose your working tree against the decision it started from, and any agent may integrate proposals onto the head; a merge that conflicts stops, listing its conflicts, until resolve settles each. When two integrations fork the line, merge its heads into your tree, settle any conflict marked in it, and integrate it: that settles the fork. Others' work reaches you, and yours reaches them, only when you sync.

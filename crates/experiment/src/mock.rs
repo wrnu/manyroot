@@ -18,6 +18,13 @@
 //! the turn after. In Bracken mode a rewrite retracts the agent's earlier
 //! artifact; in Git mode it goes on a branch from `main` with a PR, or onto the
 //! function's own branch while that PR is open. Phase 1's moves are as they ran.
+//!
+//! In Weave mode, a project run, the mock reads the task, brings its tree up to the line's head, writes a
+//! module of its own into the package, runs the public tests, proposes its tree, and integrates its own
+//! proposal. In lockstep no two integrations meet, so the line never forks. Otherwise two agents' turns can
+//! each integrate onto the same head and fork it: the next turn settles the fork by integrating one head's
+//! tree with every head as a parent (losing the other's changes, as a mock may), and an integration the
+//! line refuses leaves its proposal open.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -306,6 +313,9 @@ impl MockBackend {
         let tools = c.request("tools/list", json!({}))?;
         let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
+        if has("propose") {
+            return weave_turn(c, agent, turn);
+        }
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
         if has("replace") && !has("pr_open") {
             self.crdt_turn(c, agent, name, turn, &mut rng, &mut memory)?;
@@ -429,6 +439,54 @@ impl MockBackend {
         c.tool("sync", json!({}))?;
         Ok(())
     }
+}
+
+/// One Weave-mode turn of a project run (see the module's doc).
+fn weave_turn(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
+    let task = c.tool("task", json!({}))?;
+    if task["spec"].as_str().is_none_or(str::is_empty) {
+        return Err("the task tool showed no spec".into());
+    }
+    let head = c.tool("head", json!({}))?;
+    let heads: Vec<String> = head["heads"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|h| h["decision"].as_str().map(str::to_string))
+        .collect();
+    if heads.len() > 1 {
+        // Each agent writes its own files, so the heads' merge never conflicts.
+        let merged = c.tool("merge", json!({}))?;
+        if merged["conflicts"].as_array().is_some_and(|c| !c.is_empty()) {
+            return Err(format!("the heads' merge conflicts: {merged}"));
+        }
+        c.tool("integrate", json!({"note": format!("agent {agent} settles the fork")}))?;
+    } else if heads.first().map(String::as_str) != head["base"].as_str() {
+        c.tool("update", json!({}))?;
+    }
+    let files = c.tool("list_files", json!({}))?;
+    let init = files["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["path"].as_str())
+        .find(|p| p.ends_with("/__init__.py") && p.matches('/').count() == 1)
+        .ok_or("no package in the tree")?
+        .to_string();
+    c.tool("read_file", json!({"path": init, "limit": 20}))?;
+    let package = init.trim_end_matches("/__init__.py");
+    let module = format!("{package}/by_agent_{agent}_turn_{turn}.py");
+    c.tool("write_file", json!({"path": module, "text": format!("VALUE = {}\n", turn * 10 + agent as u32)}))?;
+    c.tool("run_tests", json!({}))?;
+    let proposed = c.tool("propose", json!({"summary": format!("agent {agent}'s module of turn {turn}")}))?;
+    let proposal = proposed["proposal"].as_str().ok_or("propose gave no proposal")?.to_string();
+    // Refused if the line forked or moved on under it: the proposal stays open, for later.
+    if c.tool("integrate", json!({"proposals": [proposal], "note": format!("agent {agent}'s turn {turn}")})).is_ok() {
+        c.tool("update", json!({}))?;
+    }
+    c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}")}))?;
+    c.tool("sync", json!({}))?;
+    Ok(())
 }
 
 /// Git mode, Phase 2: writes `program` as `spec`'s definition on the current branch, in place of the one

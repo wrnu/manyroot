@@ -76,6 +76,66 @@ pub struct PlanInputs {
     /// public-test run and grade pins it from here ([`crate::python::Python::from_plan`]). None otherwise.
     #[serde(default)]
     pub python: Option<crate::python::PythonPin>,
+    /// The evaluation project a Weave-mode run gives its agents in place of the task. None otherwise, and
+    /// then not written, so earlier plans read and hash as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<ProjectPlan>,
+    /// The configuration's integrator setting (answer `07959d6d9bc0`): who may integrate onto the line, as
+    /// [`crate::weave_mode::ANY_AGENT`]. None outside Weave mode, and then not written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub integrator: Option<String>,
+}
+
+/// A project as a plan records it: where it is, a digest of all of it, and what agents are given of it. No
+/// path, test name or count of its hidden set: only the reference project.json already holds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectPlan {
+    /// The project's directory, absolute.
+    pub dir: String,
+    pub name: String,
+    /// blake3 over every entry of the directory, as a hidden set's digest is made: the run refuses a project
+    /// changed since its plan.
+    pub digest: String,
+    /// The Python minor version it is written for.
+    pub python: String,
+    /// Each item, with the share of the run's agent-turns used before it is released (0 at the start).
+    pub items: Vec<(String, f64)>,
+    pub hidden: crate::project::HiddenRef,
+    /// blake3 of each text agents are given: the spec and each item's issue.
+    pub texts: BTreeMap<String, String>,
+}
+
+impl ProjectPlan {
+    pub fn of(project: &crate::project::Project) -> Result<ProjectPlan, String> {
+        let dir = std::fs::canonicalize(&project.dir).map_err(|e| format!("resolving the project: {e}"))?;
+        let read = |p: &Path| std::fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()));
+        let mut texts = BTreeMap::from([("spec".to_string(), hash(&read(&project.spec)?))]);
+        for item in &project.items {
+            texts.insert(format!("item-{}", item.id), hash(&read(&item.text)?));
+        }
+        let share = |r: crate::project::Release| match r {
+            crate::project::Release::Start => 0.0,
+            crate::project::Release::AfterShare(at) => at,
+        };
+        Ok(ProjectPlan {
+            dir: dir.display().to_string(),
+            name: project.name.clone(),
+            digest: crate::project::digest(&dir)?,
+            python: project.python.clone(),
+            items: project.items.iter().map(|i| (i.id.clone(), share(i.release))).collect(),
+            hidden: project.hidden.clone(),
+            texts,
+        })
+    }
+
+    /// The project, loaded again, refused if it changed since the plan.
+    pub fn load(&self) -> Result<crate::project::Project, String> {
+        let project = crate::project::Project::load(Path::new(&self.dir))?;
+        if crate::project::digest(Path::new(&self.dir))? != self.digest {
+            return Err(format!("the project at {} changed since the plan", self.dir));
+        }
+        Ok(project)
+    }
 }
 
 impl Default for PlanInputs {
@@ -94,6 +154,8 @@ impl Default for PlanInputs {
             accept_rule: AcceptRule::default(),
             harness: Value::Null,
             python: None,
+            project: None,
+            integrator: None,
         }
     }
 }
@@ -111,6 +173,9 @@ pub struct Plan {
     /// Phase 2's: the turn after which each wave of change requests goes out. Phase 1's plans have none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waves: Vec<u32>,
+    /// A project run with a change: the agent-turns used before it goes out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_after: Option<u32>,
     /// `git --version` of the binary the workers run.
     pub git: String,
     /// blake3 of the code that computes the measures and grades.
@@ -154,14 +219,26 @@ impl Plan {
         tools.extend(core_tools());
         let tools = serde_json::to_vec(&tools).expect("tool specs are plain JSON");
         let mut prompts = BTreeMap::from([
-            ("task-original".to_string(), hash(task.task_text(Version::ORIGINAL).as_bytes())),
-            ("task-changed".to_string(), hash(task.task_text(task.all()).as_bytes())),
             ("tools".to_string(), hash(&tools)),
             ("turn-message".to_string(), hash(TURN_MESSAGE.as_bytes())),
         ]);
-        // Between the first wave and the last, the task reads as each wave left it.
-        for wave in 1..task.waves().len() {
-            prompts.insert(format!("task-after-wave-{wave}"), hash(task.task_text(task.after_wave(wave)).as_bytes()));
+        let mut change_after = None;
+        if let Some(project) = &cfg.plan.project {
+            // A project's texts take the task's place.
+            prompts.extend(project.texts.clone());
+            let shares: Vec<f64> = project.items.iter().map(|(_, s)| *s).collect();
+            change_after = crate::weave_mode::change_share(&shares)
+                .ok()
+                .flatten()
+                .map(|s| crate::weave_mode::release_after(s, cfg.turns, cfg.agents));
+        } else {
+            prompts.insert("task-original".into(), hash(task.task_text(Version::ORIGINAL).as_bytes()));
+            prompts.insert("task-changed".into(), hash(task.task_text(task.all()).as_bytes()));
+            // Between the first wave and the last, the task reads as each wave left it.
+            for wave in 1..task.waves().len() {
+                prompts
+                    .insert(format!("task-after-wave-{wave}"), hash(task.task_text(task.after_wave(wave)).as_bytes()));
+            }
         }
         let pairs = |p: &[(&str, &str)]| p.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
         Plan {
@@ -172,12 +249,25 @@ impl Plan {
             calls_per_turn: cfg.calls_per_turn,
             turn_limit_seconds: cfg.turn_limit.as_secs(),
             release_at: RELEASE_AT,
-            waves: task.wave_turns(cfg.turns),
+            waves: if cfg.plan.project.is_some() { Vec::new() } else { task.wave_turns(cfg.turns) },
+            change_after,
             git,
             metrics_code: metrics_code(),
             prompts,
-            rules: rules(cfg.plan.accept_rule),
-            definitions: pairs(DEFINITIONS),
+            // A project run integrates by its integrator setting alone, and has no measures yet: the task's
+            // rules and definitions aren't its own.
+            rules: match (&cfg.plan.project, &cfg.plan.integrator) {
+                (Some(_), integrator) => vec![(
+                    "weave-integrator".to_string(),
+                    format!(
+                        "Answer 07959d6d9bc0: {}: every agent of the run is an integrator of main, and merges proposals \
+                         onto its head, or records a tree with every head as a parent.",
+                        integrator.as_deref().unwrap_or(crate::weave_mode::ANY_AGENT)
+                    ),
+                )],
+                (None, _) => rules(cfg.plan.accept_rule),
+            },
+            definitions: if cfg.plan.project.is_some() { Vec::new() } else { pairs(DEFINITIONS) },
         }
     }
 
@@ -200,6 +290,12 @@ pub fn report(dir: &Path, usage: Option<&Path>) -> Result<Report, String> {
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()));
     let plan_bytes = read(&dir.join("plan.json"))?;
     let plan: Plan = serde_json::from_slice(&plan_bytes).map_err(|e| format!("the plan: {e}"))?;
+    if plan.inputs.project.is_some() {
+        return Err(format!(
+            "{}: a project run has no measures yet; its metrics come after the first traces",
+            dir.display()
+        ));
+    }
     let plan_hash = hash(&plan_bytes);
     if plan.metrics_code != metrics_code() {
         return Err(format!(

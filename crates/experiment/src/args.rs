@@ -77,6 +77,20 @@ impl<'a> Args<'a> {
         self.ruled(key, v, check_text(v, MAX_TEXT))
     }
 
+    /// Free text of at most `max` bytes, no NUL: a file's contents, larger than [`MAX_TEXT`].
+    pub fn text_up_to(&self, key: &str, max: usize) -> Result<&'a str, String> {
+        let v = self.str(key)?;
+        self.ruled(key, v, check_text(v, max))
+    }
+
+    /// An id, if given.
+    pub fn id_opt(&self, key: &str) -> Result<Option<&'a str>, String> {
+        match self.str_opt(key)? {
+            None => Ok(None),
+            Some(_) => self.id(key).map(Some),
+        }
+    }
+
     pub fn text_opt(&self, key: &str) -> Result<&'a str, String> {
         match self.str_opt(key)? {
             None => Ok(""),
