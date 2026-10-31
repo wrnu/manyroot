@@ -212,16 +212,28 @@ fn affected(paths: &[&str]) -> Vec<String> {
 fn this_workspaces_changes_select_their_real_reverse_dependencies_and_the_rules_paths() {
     const BRACKEN: &[&str] = &["bracken", "bracken-demo", "bracken-experiment"];
     let all = packages::all(here());
-    assert_eq!(all, ["bracken", "bracken-demo", "bracken-experiment", "bracken-scope", "bracken-tree", "manyroot"]);
+    assert_eq!(
+        all,
+        [
+            "bracken",
+            "bracken-demo",
+            "bracken-experiment",
+            "bracken-query-lab",
+            "bracken-scope",
+            "bracken-tree",
+            "manyroot"
+        ]
+    );
     let cases: &[(&[&str], &[&str])] = &[
         (&["crates/tree/tests/merge.rs"], &[BRACKEN, &["bracken-tree"]].concat()),
         (&["crates/tree/src/lines.rs"], &[BRACKEN, &["bracken-tree"]].concat()),
-        (&["crates/manyroot/src/graph.rs"], &[BRACKEN, &["bracken-tree", "manyroot"]].concat()),
+        (&["crates/manyroot/src/graph.rs"], &[BRACKEN, &["bracken-query-lab", "bracken-tree", "manyroot"]].concat()),
         (&["crates/tree/Cargo.toml"], &[BRACKEN, &["bracken-tree"]].concat()),
         (&["crates/demo/src/main.rs"], &["bracken", "bracken-demo", "bracken-experiment"]),
         (&["crates/experiment/src/lib.rs"], &["bracken", "bracken-experiment"]),
         (&["crates/bracken/src/main.rs"], &["bracken", "bracken-demo", "bracken-experiment"]),
         (&["crates/scope/src/lib.rs"], &["bracken-scope"]),
+        (&["crates/query-lab/src/pipeline.rs"], &["bracken-query-lab"]),
         (&["scripts/merge", ".claude/skills/agent-team-kickoff/templates/merge"], &["bracken"]),
         (&["scripts/code-scope"], &["bracken", "bracken-scope"]),
         (&[".claude/skills/agent-team-kickoff/templates/code-scope"], &["bracken", "bracken-scope"]),

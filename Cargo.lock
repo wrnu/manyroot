@@ -210,6 +210,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bracken-query-lab"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "humantime",
+ "manyroot",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "bracken-scope"
 version = "0.1.0"
 dependencies = [

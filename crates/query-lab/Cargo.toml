@@ -1,0 +1,22 @@
+[package]
+name = "bracken-query-lab"
+description = "Research prototype: a declarative query language over a Manyroot Ground (task b6e2e0ca24fa). Nothing depends on it."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "query-lab"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+humantime.workspace = true
+manyroot.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

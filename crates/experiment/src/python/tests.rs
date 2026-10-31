@@ -303,16 +303,21 @@ for run in json.load(open(sys.argv[1])):
         let o = sandboxed("b = bytearray(1 << 30)\nfor i in range(0, len(b), 4096): b[i] = 1", &quick);
         assert_eq!(o.exit, Exit::Memory);
 
+        // Exit::Output is reported whenever the output filled its buffer, whichever limit then ended the
+        // run (finding 2e8cdbfcea20), so the wall time is 60 s here: ending within 30 s shows the output
+        // limit ended it, with room for a loaded machine, which took 13.6 s (task f0e98c5097f8).
         let start = Instant::now();
-        let o = sandboxed("import sys\nwhile True: sys.stdout.write('x' * 4096)", &quick);
+        let o =
+            sandboxed("import sys\nwhile True: sys.stdout.write('x' * 4096)", &Limits { wall_seconds: 60, ..quick });
         assert_eq!(o.exit, Exit::Output);
         assert_eq!(o.stdout.len(), 64 << 10, "kept up to the limit");
-        assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(30), "{:?}", start.elapsed());
 
+        // It would sleep 60 s: ending well before that, with Exit::WallTime, is the 3 s wall time's kill.
         let start = Instant::now();
         let o = sandboxed("import time; time.sleep(60)", &quick);
         assert_eq!(o.exit, Exit::WallTime);
-        assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
+        assert!(start.elapsed() < Duration::from_secs(30), "{:?}", start.elapsed());
 
         // The scratch cases below end only at the scratch limit, which a short wall time on a loaded machine
         // could beat (note 20a5e4ed3f3c).

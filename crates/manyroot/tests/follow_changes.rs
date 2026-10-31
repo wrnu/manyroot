@@ -270,40 +270,66 @@ fn a_replacement_needing_a_recheck_still_supersedes_the_old_version() {
     assert!(!layer.iter().any(|a| a.id == s.work || a.id == redone), "neither is established");
 }
 
-/// Finding `73252cef945e`: a stranger's subject with many passes and many changes once cost passes ×
-/// changes × graph size (11.7 s at 1,200 contributions). One sweep over the graph per 64 changes keeps it
-/// well inside the bound; the pairwise walk took minutes here.
-#[test]
-fn many_passes_and_changes_cost_one_sweep_not_a_walk_per_pair() {
-    let n = 400;
+/// A stranger's subject `w` resting on `d`, with `passes` passes by puppets and `changes` versions
+/// superseding `d` after them.
+fn passes_and_changes(passes: usize, changes: usize) -> (Graph, ContributionId) {
     let mallory = agent("mallory");
     let puppets: Vec<Identity> = (0..8).map(|i| agent(&format!("puppet{i}"))).collect();
     let mut g = Graph::new(ground());
     let d = add(&mut g, &mallory, claim("d"));
     let w = add(&mut g, &mallory, claim("w"));
     add(&mut g, &mallory, relate(w, RelationKind::DependsOn, d));
-    for i in 0..n {
+    for i in 0..passes {
         add(&mut g, &puppets[i % puppets.len()], pass(w));
     }
-    for i in 0..n {
+    for i in 0..changes {
         let r = add(&mut g, &mallory, claim(&format!("d, version {i}")));
         add(&mut g, &mallory, relate(r, RelationKind::Supersedes, d));
     }
-    assert!(g.len() > 3 * n);
-    let started = std::time::Instant::now();
-    let a = follow().assess(&g, &w).unwrap();
-    let evaluated = follow().evaluate(&g);
-    let took = started.elapsed();
-    assert_eq!((a.status, a.changes.len()), (Status::NeedsRecheck, n));
-    assert!(!evaluated.accepted.iter().any(|a| a.id == w));
-    assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    (g, w)
 }
 
-/// The same finding, across subjects: many subjects resting on one long chain whose far end changed once
-/// cost each subject a walk of the chain. One assessor works out what each node reaches once.
+/// Assesses `w` and evaluates `g`, checking `w` needs a recheck for its `changes` changes: the fastest
+/// of `runs`, so a pause of the process under load counts only if it hits them all.
+fn assess_and_evaluate(g: &Graph, w: &ContributionId, changes: usize, runs: usize) -> std::time::Duration {
+    (0..runs)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            let a = follow().assess(g, w).unwrap();
+            let evaluated = follow().evaluate(g);
+            let took = started.elapsed();
+            assert_eq!((a.status, a.changes.len()), (Status::NeedsRecheck, changes));
+            assert!(!evaluated.accepted.iter().any(|a| a.id == *w));
+            took
+        })
+        .min()
+        .expect("at least one run")
+}
+
+/// Finding `73252cef945e`: a stranger's subject with many passes and many changes once cost passes ×
+/// changes × graph size (11.7 s at 1,200 contributions). One sweep over the graph per 64 changes keeps
+/// 400 changes to 7 sweeps of a graph about 3 times the size of one with a single change, so about 21
+/// times its cost, where a walk per pair would be over a thousand times. The two are timed in the same
+/// process, one after the other, so the machine's load slows both, where an absolute bound failed under
+/// load (findings d723cb659e69, 2c8c53a94c58). Under load averages of 70 to 180 the ratio measured 7 to
+/// 26; the pairwise walk's 11.7 s was about 900 times this baseline. The baseline, the shorter run, is
+/// the fastest of five.
 #[test]
-fn many_subjects_on_a_long_chain_cost_one_walk_not_one_each() {
-    let (k, m) = (1000, 1000);
+fn many_passes_and_changes_cost_one_sweep_not_a_walk_per_pair() {
+    let n = 400;
+    let (one, w_one) = passes_and_changes(n, 1);
+    let (many, w_many) = passes_and_changes(n, n);
+    assert!(many.len() > 3 * n);
+    let took_one = assess_and_evaluate(&one, &w_one, 1, 5);
+    let took_many = assess_and_evaluate(&many, &w_many, n, 3);
+    let ratio = took_many.as_secs_f64() / took_one.as_secs_f64();
+    eprintln!("one change {took_one:?}, {n} changes {took_many:?}: {ratio:.1} times");
+    assert!(ratio < 200.0, "{n} changes took {ratio:.1} times one's: {took_many:?} against {took_one:?}");
+}
+
+/// `k` subjects, each with a pass, resting on one chain of `m` claims whose far end changed after the
+/// passes.
+fn subjects_on_a_chain(k: usize, m: usize) -> (Graph, Vec<ContributionId>) {
     let (mallory, puppet) = (agent("mallory"), agent("puppet"));
     let mut g = Graph::new(ground());
     let head = add(&mut g, &mallory, claim("c0"));
@@ -322,15 +348,47 @@ fn many_subjects_on_a_long_chain_cost_one_walk_not_one_each() {
     }
     let r = add(&mut g, &mallory, claim("the far end, changed"));
     add(&mut g, &mallory, relate(r, RelationKind::Supersedes, tail));
-    let started = std::time::Instant::now();
-    let p = follow();
-    let evaluated = p.evaluate(&g);
-    let assessor = p.assessor(&g);
-    let rechecks = subjects.iter().filter(|w| assessor.assess(w).unwrap().status == Status::NeedsRecheck).count();
-    let took = started.elapsed();
-    assert_eq!(rechecks, k);
-    assert!(!evaluated.accepted.iter().any(|a| subjects.contains(&a.id)));
-    assert!(took < std::time::Duration::from_secs(1), "took {took:?}");
+    (g, subjects)
+}
+
+/// Evaluates `g` and assesses every subject with one assessor, checking each needs a recheck: the
+/// fastest of `runs`, so a pause of the process under load counts only if it hits them all.
+fn evaluate_and_assess(g: &Graph, subjects: &[ContributionId], runs: usize) -> std::time::Duration {
+    (0..runs)
+        .map(|_| {
+            let started = std::time::Instant::now();
+            let p = follow();
+            let evaluated = p.evaluate(g);
+            let assessor = p.assessor(g);
+            let rechecks =
+                subjects.iter().filter(|w| assessor.assess(w).unwrap().status == Status::NeedsRecheck).count();
+            let took = started.elapsed();
+            assert_eq!(rechecks, subjects.len());
+            assert!(!evaluated.accepted.iter().any(|a| subjects.contains(&a.id)));
+            took
+        })
+        .min()
+        .expect("at least one run")
+}
+
+/// The same finding, across subjects: many subjects resting on one long chain whose far end changed once
+/// cost each subject a walk of the chain. One assessor works out what each node reaches once, so a
+/// thousand subjects cost little more than one: the graph is about 2.5 times the size, and a walk per
+/// subject would make it hundreds of times one's cost. The two are timed in the same process, one after
+/// the other, so the machine's load slows both, where an absolute bound failed under load (task
+/// f0e98c5097f8, gotcha 28a7d2a70c93). Under load averages of 300 to 450 the ratio measured 1.5 to 13.4;
+/// the one-subject baseline, the shorter and so the more easily skewed, is the fastest of five runs
+/// (finding 2c8c53a94c58).
+#[test]
+fn many_subjects_on_a_long_chain_cost_one_walk_not_one_each() {
+    let (k, m) = (1000, 1000);
+    let (one, one_subject) = subjects_on_a_chain(1, m);
+    let (many, subjects) = subjects_on_a_chain(k, m);
+    let took_one = evaluate_and_assess(&one, &one_subject, 5);
+    let took_many = evaluate_and_assess(&many, &subjects, 3);
+    let ratio = took_many.as_secs_f64() / took_one.as_secs_f64();
+    eprintln!("one subject {took_one:?}, {k} subjects {took_many:?}: {ratio:.1} times");
+    assert!(ratio < (k / 20) as f64, "{k} subjects took {ratio:.1} times one's: {took_many:?} against {took_one:?}");
 }
 
 /// On a dependency cycle, a subject's own changes aren't in its closure, as `dependencies` leaves it out;
