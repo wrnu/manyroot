@@ -16,6 +16,9 @@
 //!   installation, the libraries it loads and the system's time zone data; reads and writes only its scratch
 //!   directory; starts only the interpreter, and never forks; no network.
 //!
+//! No profile can read another process's arguments, environment, path or
+//! information, or list processes ([`BASE`]).
+//!
 //! Every path a rule names is resolved first: the kernel checks resolved
 //! paths, so a rule on `/tmp/x` never matches `/private/tmp/x`.
 
@@ -25,11 +28,18 @@ use std::process::Command;
 /// macOS's `sandbox-exec`.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
-/// What every profile allows: loading the system's libraries and nothing of the owner's.
+/// What every profile allows: loading the system's libraries and nothing of the owner's, and no other
+/// process's information (task e23f87035615). Reading another process takes both denies (note 116ae2144d9d):
+/// without the `kern.proc` prefix, `KERN_PROCARGS2` still reads its arguments and environment, a parent's
+/// secrets included, and `process-info*` must be unqualified, since `(target others)` leaves out the process
+/// group. A process may still read its own, as the check runner's profile found cargo needs (#160).
 const BASE: &str = r#"(version 1)
 (deny default)
 (allow process-fork)
 (allow sysctl-read)
+(deny sysctl-read (sysctl-name-prefix "kern.proc"))
+(deny process-info*)
+(allow process-info* (target self))
 (allow file-read-metadata)
 (allow file-read*
   (literal "/") (literal "/dev/null") (literal "/dev/urandom") (literal "/dev/random")
@@ -277,7 +287,8 @@ impl Sandbox {
     /// nothing else of a path shows, but no agent may ever be given the private store's path. And no other process's
     /// information at all (finding c44e0191291a, note 116ae2144d9d): each of the two denies alone still lets
     /// `KERN_PROCARGS2` read another process's arguments and environment, and both together refuse it, while
-    /// `os.uname`, which needs `sysctl-read`, still works.
+    /// `os.uname`, which needs `sysctl-read`, still works. BASE has them too; repeated last, they take back its
+    /// allowing a process its own information, which the interpreter doesn't need.
     pub fn python(p: &PythonPaths) -> Result<Sandbox, String> {
         let base = BASE.replace("(allow process-fork)\n", "").replace("(allow file-read-metadata)\n", "");
         assert_eq!(base.len(), BASE.len() - "(allow process-fork)\n(allow file-read-metadata)\n".len());

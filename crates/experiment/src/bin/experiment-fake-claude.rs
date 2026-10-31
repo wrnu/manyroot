@@ -12,13 +12,15 @@
 //! - `line <text>`: a raw line
 //! - `env <NAME>`: an event quoting environment variable `<NAME>`
 //! - `stderr-env <NAME>`: the same, on standard error
-//! - `probe <json>`: tries each access in `<json>` and reports which were allowed
+//! - `probe <json>`: tries each access in `<json>` and reports which were allowed, never what it read
 //! - `connect-loop <host:port> <file>`: forever, a `CONNECT` through `HTTPS_PROXY` every 100 ms,
 //!   appending `ok` or `no` to `<file>` (after writing its pid to `<file>.pid`)
 //! - `sleep <ms>`, `exit <code>`
 //!
 //! Run as `experiment-fake-claude probe <json>`, it only probes, printing the report: tests run it
-//! under the tools and hub profiles in place of the worker binary.
+//! under the tools and hub profiles in place of the worker binary. Run as `experiment-fake-claude
+//! spawn <program> <args>…`, it runs that and exits as it did: a parent for a probe to read whose
+//! environment shows, which a system program's doesn't.
 //!
 //! The `init` event by default shows what Claude Code 2.1.311 shows when started as the driver starts it.
 
@@ -34,6 +36,10 @@ use serde_json::{Map, Value, json};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("spawn") {
+        let status = Command::new(&args[2]).args(&args[3..]).status().expect("the program");
+        std::process::exit(status.code().unwrap_or(1));
+    }
     if args.get(1).map(String::as_str) == Some("probe") {
         let spec: Value = serde_json::from_str(args.get(2).map_or("{}", String::as_str)).expect("a probe spec");
         println!("{}", json!({"type": "probe", "results": probe(&spec)}));
@@ -228,7 +234,11 @@ impl Fake {
 }
 
 /// Tries each access in `spec` (lists under `read`, `write`, `exec`, `tcp`, `proxy`, `unix`,
-/// `mach`) and reports `allowed` or `denied` for each, as `<kind>:<target>`.
+/// `mach`, `process`) and reports `allowed` or `denied` for each, as `<kind>:<target>`.
+///
+/// For `process`, `parent` or a pid, each way of reading another process is `<way>:<target>`
+/// ([`PROCESS_WAYS`]). A read of its arguments and environment is `allowed` only if the variable
+/// `spec["plant"]` names is among them, and `read` if it isn't, so a test can tell the read is real.
 fn probe(spec: &Value) -> BTreeMap<String, &'static str> {
     let mut results = BTreeMap::new();
     let list = |k: &str| -> Vec<String> {
@@ -276,7 +286,113 @@ fn probe(spec: &Value) -> BTreeMap<String, &'static str> {
     for target in list("mach") {
         results.insert(format!("mach:{target}"), verdict(mach_lookup(&target)));
     }
+    let plant = format!("{}=", spec["plant"].as_str().unwrap_or("BRACKEN_PROBE_PLANTED_NAME"));
+    for target in list("process") {
+        let pid = if target == "parent" { std::os::unix::process::parent_id() } else { target.parse().unwrap_or(0) };
+        for (way, v) in process_reads(pid as i32, plant.as_bytes()) {
+            results.insert(format!("{way}:{target}"), v);
+        }
+    }
     results
+}
+
+/// The ways [`process_reads`] tries: the arguments and environment by number and by name, the
+/// process table, one process's entry, the list of pids, a process's path and its BSD info.
+pub const PROCESS_WAYS: [&str; 9] = [
+    "procargs2-mib",
+    "procargs-mib",
+    "procargs2-name",
+    "procargs-name",
+    "kern.proc.all",
+    "kern.proc.pid",
+    "listallpids",
+    "pidpath",
+    "pidinfo",
+];
+
+/// Elsewhere this probe has nothing to try.
+#[cfg(not(target_os = "macos"))]
+fn process_reads(_pid: i32, _plant: &[u8]) -> Vec<(&'static str, &'static str)> {
+    PROCESS_WAYS.iter().map(|w| (*w, "denied")).collect()
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn sysctl(
+        name: *mut i32,
+        namelen: u32,
+        oldp: *mut std::ffi::c_void,
+        oldlenp: *mut usize,
+        newp: *mut std::ffi::c_void,
+        newlen: usize,
+    ) -> i32;
+    fn sysctlnametomib(name: *const std::ffi::c_char, mibp: *mut i32, sizep: *mut usize) -> i32;
+    fn proc_listallpids(buffer: *mut std::ffi::c_void, buffersize: i32) -> i32;
+    fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, buffersize: u32) -> i32;
+    fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut std::ffi::c_void, buffersize: i32) -> i32;
+}
+
+/// `pid`'s arguments and environment, its entries in the process table, its path and its info, each
+/// tried as macOS offers it (note 116ae2144d9d).
+#[cfg(target_os = "macos")]
+fn process_reads(pid: i32, plant: &[u8]) -> Vec<(&'static str, &'static str)> {
+    const CTL_KERN: i32 = 1;
+    const KERN_ARGMAX: i32 = 8;
+    const KERN_PROC: i32 = 14;
+    const KERN_PROC_ALL: i32 = 0;
+    const KERN_PROC_PID: i32 = 1;
+    const KERN_PROCARGS: i32 = 38;
+    const KERN_PROCARGS2: i32 = 49;
+    const KINFO_PROC_SIZE: usize = 648;
+    const PROC_PIDTBSDINFO: i32 = 3;
+    const PROC_BSDINFO_SIZE: usize = 136;
+    // SAFETY, for each call below: every pointer is to a live buffer of the length passed with it.
+    let read = |mib: &mut [i32], buf: &mut [u8]| -> Option<usize> {
+        let mut len = buf.len();
+        let ptr = if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr().cast() };
+        let rc = unsafe { sysctl(mib.as_mut_ptr(), mib.len() as u32, ptr, &mut len, std::ptr::null_mut(), 0) };
+        (rc == 0).then_some(len)
+    };
+    let mut argmax = [0u8; 4];
+    let argmax = match read(&mut [CTL_KERN, KERN_ARGMAX], &mut argmax) {
+        Some(4) => (i32::from_ne_bytes(argmax) as usize).clamp(4096, 4 << 20),
+        _ => 1 << 20,
+    };
+    // A larger buffer than KERN_ARGMAX is refused (EINVAL), so it is exactly that.
+    let mut buf = vec![0u8; argmax];
+    let mut args = |mib: &mut [i32]| -> &'static str {
+        match read(mib, &mut buf) {
+            None => "denied",
+            Some(n) if buf[..n].windows(plant.len()).any(|w| w == plant) => "allowed",
+            Some(_) => "read",
+        }
+    };
+    let by_name = |name: &str| -> Option<Vec<i32>> {
+        let name = std::ffi::CString::new(name).expect("a name without NUL");
+        let mut mib = [0i32; 12];
+        let mut n = mib.len() - 1;
+        (unsafe { sysctlnametomib(name.as_ptr(), mib.as_mut_ptr(), &mut n) } == 0).then(|| {
+            let mut v = mib[..n].to_vec();
+            v.push(pid);
+            v
+        })
+    };
+    let procargs2 = args(&mut [CTL_KERN, KERN_PROCARGS2, pid]);
+    let procargs = args(&mut [CTL_KERN, KERN_PROCARGS, pid]);
+    let procargs2_name = by_name("kern.procargs2").map_or("denied", |mut m| args(&mut m));
+    let procargs_name = by_name("kern.procargs").map_or("denied", |mut m| args(&mut m));
+    // A table's size alone: open if it holds more than one entry, or for one process any.
+    let size = |mib: &mut [i32]| read(mib, &mut []);
+    let all = verdict(size(&mut [CTL_KERN, KERN_PROC, KERN_PROC_ALL]).is_some_and(|n| n > KINFO_PROC_SIZE));
+    let one = verdict(size(&mut [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]).is_some_and(|n| n > 0));
+    let pids = verdict(unsafe { proc_listallpids(std::ptr::null_mut(), 0) } > 1);
+    let mut path = [0u8; 4096];
+    let path = verdict(unsafe { proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) } > 0);
+    let mut info = [0u8; PROC_BSDINFO_SIZE];
+    let info =
+        verdict(unsafe { proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, info.as_mut_ptr().cast(), info.len() as i32) } > 0);
+    let got = [procargs2, procargs, procargs2_name, procargs_name, all, one, pids, path, info];
+    PROCESS_WAYS.iter().copied().zip(got).collect()
 }
 
 fn verdict(ok: bool) -> &'static str {
