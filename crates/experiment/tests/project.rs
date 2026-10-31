@@ -98,3 +98,25 @@ fn a_hidden_set_is_checked_by_digest_and_reported_in_counts() {
     let v: Value = serde_json::from_slice(&json.stdout).expect("JSON");
     assert_eq!(v["hidden"]["checked"]["groups"], 3);
 }
+
+#[cfg(target_os = "macos")]
+mod macos_only {
+    use super::*;
+
+    /// `run-tests` runs the example's public test under the Python profile, with the interpreter it pins.
+    #[test]
+    fn run_tests_runs_the_example_projects_public_tests() {
+        let python = std::env::var_os("BRACKEN_TEST_PYTHON").unwrap_or_else(|| "/opt/homebrew/bin/python3.12".into());
+        assert!(Path::new(&python).exists(), "this test needs Python 3.12 at {python:?} (or set BRACKEN_TEST_PYTHON)");
+        let out = Command::new(bin())
+            .args(["run-tests", "--project"])
+            .arg(fixture())
+            .arg("--python")
+            .arg(&python)
+            .output()
+            .expect("run-tests runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.starts_with("1 tests: 1 pass, 0 fail, 0 error, 0 skip (Code(0)); python 3.12."), "{stdout}");
+    }
+}

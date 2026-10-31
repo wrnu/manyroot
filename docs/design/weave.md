@@ -889,20 +889,21 @@ nothing else runs a check on a Weave manifest (security note
   - all network is denied, loopback and unix sockets included, and so are
     mach-lookup and other IPC, so `open` or `osascript` can't hand work to
     a process outside the sandbox;
-  - listing the process table (`sysctl kern.proc`) is denied, and so are
-    `setsid` and `setpgid`. `posix_spawn` with a new session or group can
+  - listing the process table (`sysctl kern.proc`, `proc_listallpids`) is
+    denied, and so is reading any process's arguments and environment
+    (`KERN_PROCARGS2`, `KERN_PROCARGS`), path or `proc_pidinfo`, by
+    `(deny process-info*)` with no `(target others)`, which leaves out the
+    check's own process group (note `1301a2adcc85`). So are `setsid` and
+    `setpgid`. `posix_spawn` with a new session or group can
     still leave the process group, so on every exit path the runner stops
     the group, finds the check's descendants by parent pid (again until no
     new ones appear), stops and kills each, and fails the run if any had
     left the group. The gap that remains: a process that left the group and
     was orphaned (its parent exited, so launchd adopted it) before the walk
     can't be found. It closes with the dedicated check user of deferred task
-    `fd68bfe3c07c`, whose every process can be killed. What
-    the profile can't deny on macOS: given another process's pid, a check
-    can still read its path, its `proc_pidinfo`, and its argv
-    (`KERN_PROCARGS2`), though not its environment. So nothing secret goes
-    in an argv on this machine. The full fix, a dedicated user for checks,
-    is deferred task `fd68bfe3c07c` and needs the owner's go;
+    `fd68bfe3c07c`, whose every process can be killed. A child that joins
+    another group of the session, the runner's included, through
+    `POSIX_SPAWN_SETPGROUP`, is found and killed the same way;
   - each check has a timeout, and its whole process group is killed when it
     ends or times out.
 - **No sandbox, no run.** If the profile can't be applied, on another OS or

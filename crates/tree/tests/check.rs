@@ -322,6 +322,38 @@ mod macos_only {
         s.assert_cleaned_up();
     }
 
+    // Note 1301a2adcc85: posix_spawn with POSIX_SPAWN_SETPGROUP moves a child into another process group of
+    // the session, here the runner's own, past the profile's setpgid deny. The kill of the check's group
+    // misses it, so the sweep must find it by parent pid, kill it, and fail the run: at the timeout, and
+    // after the check's leader ended normally but left the spawner running.
+    #[test]
+    fn a_posix_spawn_setpgroup_child_in_the_runners_group_is_killed_and_fails_the_run() {
+        let mut s = Setup::new();
+        s.runner.timeout = Duration::from_secs(3);
+        let python = PYTHON;
+        assert!(Path::new(python).exists(), "this test needs the Command Line Tools' python3 at {python}");
+        let group = rustix::process::getpgrp().as_raw_nonzero().get();
+        let spawn = format!(
+            "{python} -c 'import os, sys, time; p = os.posix_spawn(\"/bin/sleep\", [\"sleep\", \"600\"], {{}}, setpgroup={group}); \
+             print(p, os.getpgid(p) == {group}, flush=True); time.sleep(600)'"
+        );
+        for (what, script) in
+            [("at the timeout", spawn.clone()), ("after a normal end", format!("{spawn} & sleep 1; exit 0"))]
+        {
+            let out = s.run(&["bash", "-c", &script], &[]).expect("runs");
+            let tail = String::from_utf8_lossy(&out.tail).into_owned();
+            let (pid, joined) = tail.trim().split_once(' ').unwrap_or_else(|| panic!("{what}: {tail:?}"));
+            let pid: i32 = pid.parse().unwrap_or_else(|_| panic!("{what}: no pid in {tail:?}"));
+            assert_eq!(joined, "True", "{what}: the child didn't join the runner's group");
+            // Should it survive, it's in this process's group: kill it by pid, never by group.
+            let _guard = KillOnDrop::of(&[pid]);
+            assert!(!alive(&pid.to_string()), "{what}: the child {pid} in the runner's group outlived the check");
+            assert_eq!(out.exit, Exit::LeftGroup(vec![pid]), "{what}: {tail}");
+            assert!(!out.exit.passed());
+        }
+        s.assert_cleaned_up();
+    }
+
     // Finding 04592044646f: clean-up never follows a symlink out of the fresh directory, and still
     // removes a directory the check made unreadable.
     #[test]
@@ -502,9 +534,8 @@ mod macos_only {
 
     // With a toolchain: RUSTUP_HOME and DEVELOPER_DIR are set, PATH starts with the toolchain's
     // bin, and its rustc runs under the profile.
-    #[test]
-    fn a_toolchain_is_on_path_and_runs_under_the_profile() {
-        let mut s = Setup::new();
+    /// This machine's rustup toolchain, rustc's sysroot, given to the runner: its sysroot and RUSTUP_HOME.
+    fn with_toolchain(s: &mut Setup) -> (PathBuf, PathBuf) {
         let sysroot = std::process::Command::new("rustc").args(["--print", "sysroot"]).output().expect("rustc runs");
         let sysroot = PathBuf::from(String::from_utf8(sysroot.stdout).expect("UTF-8").trim());
         let toolchains = sysroot.parent().expect("toolchains");
@@ -517,6 +548,13 @@ mod macos_only {
         let rustup_home = toolchains.parent().expect("rustup home").to_path_buf();
         s.runner.toolchain =
             Some(bracken_tree::check::Toolchain { bin: sysroot.join("bin"), rustup_home: rustup_home.clone() });
+        (sysroot, rustup_home)
+    }
+
+    #[test]
+    fn a_toolchain_is_on_path_and_runs_under_the_profile() {
+        let mut s = Setup::new();
+        let (sysroot, rustup_home) = with_toolchain(&mut s);
         let out = s.sh("echo \"$RUSTUP_HOME|$DEVELOPER_DIR|${PATH%%:*}\"; rustc --version");
         let mut lines = out.lines();
         assert_eq!(
@@ -532,6 +570,149 @@ mod macos_only {
             )
         );
         assert!(lines.next().is_some_and(|l| l.starts_with("rustc ")), "rustc didn't run: {out}");
+        s.assert_cleaned_up();
+    }
+
+    /// The environment variable that makes [`procargs_probe_parent`] run, naming the planted variable.
+    const PROBE_PARENT: &str = "BRACKEN_PROBE_PARENT";
+
+    /// Every way the probe tries, as it names them.
+    const PROBE_WAYS: [&str; 12] = [
+        "procargs2-mib",
+        "procargs-mib",
+        "procargs2-name",
+        "procargs-name",
+        "kern.proc.all",
+        "kern.proc.pid",
+        "proc_listallpids",
+        "proc_pidpath",
+        "proc_pidinfo",
+        "ps-E",
+        "ps-ax",
+        "pgrep",
+    ];
+
+    /// The probe's lines by way, from output the parent prefixed with `prefix`.
+    fn probe_lines<'a>(out: &'a str, prefix: &str) -> BTreeMap<&'a str, &'a str> {
+        out.lines().filter_map(|l| l.strip_prefix(prefix)).filter_map(|l| l.split_once(' ')).collect()
+    }
+
+    // Finding c44e0191291a, decision 53b58f146ce1: a check can't read another process's arguments or
+    // environment, nor list processes. The probe (procargs_probe.c) reads its parent, which holds a
+    // planted variable from its exec: the parent is this test binary run again with the plant in its
+    // environment, since a variable set after exec isn't in the kernel's copy (note 116ae2144d9d). It
+    // tries KERN_PROCARGS2 and KERN_PROCARGS by MIB and by name, kern.proc.all and kern.proc.pid, libproc's
+    // proc_listallpids, proc_pidpath and proc_pidinfo, and the ps and pgrep tools. Run directly by the
+    // parent, the control, every way reads, and the argument reads find the plant; as a check, every way
+    // is denied. Also from a check that first joined the parent's process group, with posix_spawn's
+    // POSIX_SPAWN_SETPGROUP (the profile denies setpgid): (deny process-info* (target others)) didn't
+    // cover a process in the check's own group, so the parent's environment was open there (note
+    // 1301a2adcc85). It never prints what it reads.
+    #[test]
+    fn a_check_cant_read_another_processs_arguments_or_environment() {
+        use std::os::unix::process::CommandExt;
+        let plant = format!("BRACKEN_PROBE_PLANTED_{}", std::process::id());
+        let out = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+            .args(["--exact", "macos_only::procargs_probe_parent", "--ignored", "--nocapture", "--test-threads=1"])
+            .env(&plant, "planted")
+            .env(PROBE_PARENT, &plant)
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("the probe's parent runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "the probe's parent failed: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+        let control = probe_lines(&stdout, "control: ");
+        let check = probe_lines(&stdout, "check: ");
+        let joined = probe_lines(&stdout, "joined: ");
+        // The process both read is the planted one, their parent. The joined probe is the child of the
+        // check that spawned it into the parent's group.
+        assert_eq!((control.get("target"), check.get("target")), (Some(&"parent"), Some(&"parent")), "{stdout}");
+        assert_eq!((joined.get("join"), joined.get("target")), (Some(&"open"), Some(&"not-parent")), "{stdout}");
+        for way in PROBE_WAYS {
+            let open = control.get(way).unwrap_or_else(|| panic!("the control tried no {way}: {stdout}"));
+            assert!(
+                open.starts_with("open"),
+                "the control couldn't {way}, so the check's denial proves nothing: {open}"
+            );
+            if way.starts_with("procargs") || way == "ps-E" {
+                assert!(open.ends_with("plant found"), "the control's {way} didn't find the plant: {open}");
+            }
+            if way == "ps-ax" || way == "pgrep" {
+                assert!(open.ends_with("parent listed"), "the control's {way} didn't list the parent: {open}");
+            }
+        }
+        for (what, lines) in [("check", &check), ("joined", &joined)] {
+            let open: Vec<String> = PROBE_WAYS
+                .iter()
+                .map(|way| (way, lines.get(way).unwrap_or_else(|| panic!("the {what} probe tried no {way}: {stdout}"))))
+                .filter(|(_, result)| !result.starts_with("denied"))
+                .map(|(way, result)| format!("{way} {result}"))
+                .collect();
+            assert!(open.is_empty(), "a check ({what}) can read other processes: {open:#?}");
+        }
+    }
+
+    // Not a test of its own: the probe's parent, which a_check_cant_read_another_processs_arguments_or_environment
+    // runs with the plant in its environment, leading a process group of its own. It runs the probe
+    // directly, then as a check, then as a check that joins this process's group.
+    #[test]
+    #[ignore = "run by a_check_cant_read_another_processs_arguments_or_environment"]
+    fn procargs_probe_parent() {
+        let Ok(plant) = std::env::var(PROBE_PARENT) else { return };
+        let s = Setup::new();
+        let probe = s.path().join("procargs_probe");
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/procargs_probe.c");
+        let cc = std::process::Command::new("/usr/bin/cc")
+            .args(["-Wall", "-Wextra", "-Werror", "-O1", "-o"])
+            .arg(&probe)
+            .arg(&source)
+            .output()
+            .expect("cc runs");
+        assert!(cc.status.success(), "cc: {}", String::from_utf8_lossy(&cc.stderr));
+        let pid = std::process::id().to_string();
+        let control =
+            std::process::Command::new(&probe).args([&plant, &pid]).env_clear().output().expect("the probe runs");
+        assert!(control.status.success(), "the control: {}", String::from_utf8_lossy(&control.stderr));
+        let binary = std::fs::read(&probe).expect("read the probe");
+        std::fs::remove_file(&probe).expect("remove the probe");
+        let check = s
+            .run(&["./procargs_probe", &plant, &pid], &[("procargs_probe", Mode::Executable, &binary)])
+            .expect("the check runs");
+        assert_eq!(check.exit, Exit::Code(0), "{}", String::from_utf8_lossy(&check.tail));
+        let joined = s
+            .run(&["./procargs_probe", &plant, &pid, &pid], &[("procargs_probe", Mode::Executable, &binary)])
+            .expect("the check runs");
+        assert_eq!(joined.exit, Exit::Code(0), "{}", String::from_utf8_lossy(&joined.tail));
+        // A line of its own: libtest's "test ... " has no newline before the first.
+        println!();
+        for (prefix, out) in [("control", &control.stdout), ("check", &check.tail), ("joined", &joined.tail)] {
+            for line in String::from_utf8_lossy(out).lines() {
+                println!("{prefix}: {line}");
+            }
+        }
+        s.assert_cleaned_up();
+    }
+
+    // Cargo and rustc still work under the profile, which denies every process-info* (note 1301a2adcc85):
+    // cargo build and cargo test of a crate with a unit test, offline.
+    #[test]
+    fn cargo_builds_and_tests_a_crate_under_the_profile() {
+        let mut s = Setup::new();
+        with_toolchain(&mut s);
+        s.runner.timeout = Duration::from_secs(300);
+        let files: &[(&str, Mode, &[u8])] = &[
+            ("Cargo.toml", Mode::File, b"[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2024\"\n"),
+            (
+                "src/lib.rs",
+                Mode::File,
+                b"pub fn two() -> u32 { 2 }\n#[test]\nfn two_is_two() { assert_eq!(two(), 2); }\n",
+            ),
+        ];
+        let out = s.run(&["sh", "-c", "cargo build --offline && cargo test --offline"], files).expect("runs");
+        let tail = String::from_utf8_lossy(&out.tail);
+        assert_eq!(out.exit, Exit::Code(0), "{tail}");
+        assert!(tail.contains("test two_is_two ... ok"), "{tail}");
         s.assert_cleaned_up();
     }
 

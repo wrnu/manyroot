@@ -101,16 +101,19 @@ pub struct Limits {
     pub memory_mb: u32,
     pub output_bytes: u64,
     pub wall_seconds: u32,
+    /// What the run's scratch directory may hold, the tree's copy included (finding 6519b45fa1ed).
+    pub scratch_mb: u32,
 }
 
 impl Default for Limits {
     fn default() -> Limits {
-        Limits { cpu_seconds: 10, memory_mb: 512, output_bytes: 1 << 20, wall_seconds: 60 }
+        Limits { cpu_seconds: 10, memory_mb: 512, output_bytes: 1 << 20, wall_seconds: 60, scratch_mb: 256 }
     }
 }
 
 /// The most each limit may be set to.
-const MAX_LIMITS: Limits = Limits { cpu_seconds: 600, memory_mb: 8192, output_bytes: 64 << 20, wall_seconds: 3600 };
+const MAX_LIMITS: Limits =
+    Limits { cpu_seconds: 600, memory_mb: 8192, output_bytes: 64 << 20, wall_seconds: 3600, scratch_mb: 8192 };
 
 /// The hidden tests and golden solution, by reference only: which set, and the digest of its whole
 /// contents, so the grader refuses any store but the approved one.
@@ -198,7 +201,8 @@ impl Project {
         if !(within(limits.cpu_seconds.into(), MAX_LIMITS.cpu_seconds.into())
             && within(limits.memory_mb.into(), MAX_LIMITS.memory_mb.into())
             && within(limits.output_bytes, MAX_LIMITS.output_bytes)
-            && within(limits.wall_seconds.into(), MAX_LIMITS.wall_seconds.into()))
+            && within(limits.wall_seconds.into(), MAX_LIMITS.wall_seconds.into())
+            && within(limits.scratch_mb.into(), MAX_LIMITS.scratch_mb.into()))
         {
             return Err(format!("limits must each be above 0 and at most {MAX_LIMITS:?}"));
         }
@@ -311,8 +315,9 @@ fn check_items(items: &[Item]) -> Result<(), String> {
 }
 
 /// The private store's hidden set for a project, checked against it, as read once: what was digested is
-/// what is parsed and what the grader is given.
-#[derive(Debug, Clone)]
+/// what is parsed and what the grader is given. Its `Debug` says only counts and the digest (finding
+/// `6951053f24c1`), so no `{:?}`, `expect_err` or assertion can print a hidden file's name or bytes.
+#[derive(Clone)]
 pub struct HiddenSet {
     /// `<store>/<hidden.id>`, resolved.
     pub dir: PathBuf,
@@ -454,11 +459,30 @@ pub fn digest(dir: &Path) -> Result<String, String> {
     Ok(Snapshot::read(dir)?.digest())
 }
 
+impl std::fmt::Debug for HiddenSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HiddenSet")
+            .field("groups", &self.groups.len())
+            .field("snapshot", &self.snapshot)
+            .finish_non_exhaustive()
+    }
+}
+
 /// A hidden set as read once: its directories, and each file's bytes, by path relative to it.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Snapshot {
     dirs: BTreeSet<String>,
     files: BTreeMap<String, Vec<u8>>,
+}
+
+impl std::fmt::Debug for Snapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Snapshot")
+            .field("dirs", &self.dirs.len())
+            .field("files", &self.files.len())
+            .field("digest", &self.digest())
+            .finish()
+    }
 }
 
 impl Snapshot {
@@ -536,13 +560,18 @@ fn walk(root: &Path, names: Names) -> Result<Tree, String> {
             let entry = entry.map_err(unread)?;
             let name = entry.file_name().into_string().map_err(|_| format!("a name that isn't UTF-8{}", at(&rel)))?;
             let rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
-            if name == ".git" {
+            // macOS's file systems ignore case, and so does git there (finding 043504ed3df3).
+            if name.eq_ignore_ascii_case(".git") {
                 return Err(format!("a .git, a repository inside{}", at(&rel)));
             }
             let meta = std::fs::symlink_metadata(entry.path()).map_err(unread)?;
             if meta.is_dir() {
                 dirs.insert(rel.clone());
                 stack.push((entry.path(), rel));
+            } else if meta.is_file() && names == Names::Hidden && meta.nlink() > 1 {
+                // A hard link would put the same file where agents read or in a repository, whatever its path
+                // (finding 81b5698a985c).
+                return Err("a file with another link to it (a hard link)".into());
             } else if meta.is_file() {
                 total += meta.len();
                 if meta.len() > MAX_FILE_BYTES || total > MAX_TOTAL_BYTES || files.len() >= MAX_FILES {
