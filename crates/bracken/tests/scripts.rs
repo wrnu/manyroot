@@ -635,6 +635,7 @@ fn merge_dry_run_command(
     let mut merge =
         command(&dir, "scripts/merge", &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"]);
     merge.env("PATH", format!("{}:{path}", tmp.path().join("stubs").display())).env("GIT_CONFIG_NOSYSTEM", "1");
+    merge.env("CODE_SCOPE_TOKENS", affected_stub(&tmp.path().join("stubs/bracken-scope")));
     (tmp, dir, merge)
 }
 
@@ -1040,6 +1041,39 @@ fn put(dir: &Path, path: &str, text: &str) {
     let file = dir.join(path);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::write(file, text).unwrap();
+}
+
+/// A stand-in for crates/scope's bracken-scope, which code-scope runs through CODE_SCOPE_TOKENS: these
+/// repositories have no Cargo workspace for it to read. comment-only says no to every file. packages logs
+/// its arguments, and the paths it was given, to $AFFECTED_LOG if set; prints every package for --all;
+/// fails with $AFFECTED_FAIL; and otherwise maps each path as the old hand-written rows did, enough for
+/// these tests. The real tool is tested in crates/scope.
+const AFFECTED_STUB: &str = r#"#!/usr/bin/env bash
+[ "$1" != comment-only ] || { echo 'no: the stub'; exit 1; }
+shift
+if [ "$1" = --all ]; then
+  echo "$*" >>"${AFFECTED_LOG:-/dev/null}"
+  printf '%s\n' bracken bracken-demo bracken-experiment bracken-scope bracken-tree manyroot
+  exit 0
+fi
+mapfile -d '' -t paths
+echo "$* <${paths[*]}>" >>"${AFFECTED_LOG:-/dev/null}"
+[ -z "${AFFECTED_FAIL:-}" ] || { echo 'cargo metadata failed' >&2; exit 3; }
+for p in "${paths[@]}"; do
+  case "$p" in
+    rustfmt.toml) ;;
+    crates/tree/*) printf '%s\n' bracken bracken-tree ;;
+    crates/bracken/* | crates/demo/* | crates/experiment/*) printf '%s\n' bracken bracken-demo bracken-experiment ;;
+    scripts/* | .claude/skills/*) echo bracken ;;
+    *) printf '%s\n' bracken bracken-tree ;;
+  esac
+done | LC_ALL=C sort -u
+"#;
+
+/// Writes [`AFFECTED_STUB`] at `path`, returning it.
+fn affected_stub(path: &Path) -> PathBuf {
+    write_executable(path, AFFECTED_STUB);
+    path.to_owned()
 }
 
 /// Commits everything in `dir` as `message`.
@@ -2148,22 +2182,31 @@ fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_the_kickoff_te
 }
 
 /// scripts/code-scope full names each path a head changed that needs the whole table, a rename or a
-/// deletion of one too (a rename counts as a deletion and an addition), and any build.rs; code-scope packages maps the
-/// changed files through AGENTS.md's Tests rows (findings 0095e19fcdb7, 4825c59b07e9); and code-scope
-/// light-passes says which of the five builder passes a light run needs are missing on the sha.
+/// deletion of one too (a rename counts as a deletion and an addition), and any build.rs. code-scope
+/// packages asks bracken-scope packages (here a stub, through CODE_SCOPE_TOKENS; task de42fa5c776d) for
+/// every package when full names a path, and otherwise for the packages the changed paths affect, given
+/// NUL-separated, from the merge base to the head; it asks nothing for no change, and its failure is exit 2,
+/// saying so. code-scope light-passes says which of the five builder passes a light run needs are missing
+/// on the sha.
 #[test]
 fn code_scope_names_what_needs_the_full_table_and_the_light_scope() {
     for scripts in SCRIPTS {
         let scope = repo_root().join(scripts).join("code-scope");
         let files = [("scripts/code-scope", scope.as_path())];
-        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
             put(dir, "crates/tree/src/old.rs", "tree\n");
             put(dir, "crates/manyroot/src/gone.rs", "protocol\n");
             put(dir, "notes.txt", "notes\n");
         });
         let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?}");
+        let stub = affected_stub(&tmp.path().join("bracken-scope"));
+        let log = tmp.path().join("affected.log");
         let scope = |args: &[&str]| {
-            let out = run(&dir, "scripts/code-scope", args);
+            let out = command(&dir, "scripts/code-scope", args)
+                .env("CODE_SCOPE_TOKENS", &stub)
+                .env("AFFECTED_LOG", &log)
+                .output()
+                .unwrap();
             (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
         };
         let branch = |name: &str, change: &dyn Fn()| {
@@ -2201,15 +2244,44 @@ fn code_scope_names_what_needs_the_full_table_and_the_light_scope() {
         }
         assert_eq!(scope(&["full", "main", "no-such-branch"]).0, Some(2), "{scripts}");
 
-        assert_eq!(scope(&["packages", "main", "rename"]).1, "bracken\nbracken-tree\n", "{scripts}");
+        // What code-scope packages asked the tool, and what it printed.
+        let asked = |branch: &str| {
+            let _ = std::fs::remove_file(&log);
+            let out = scope(&["packages", "main", branch]);
+            (out, std::fs::read_to_string(&log).unwrap_or_default())
+        };
+        let rev = |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
+        let main = rev("main");
+        let all = "bracken\nbracken-demo\nbracken-experiment\nbracken-scope\nbracken-tree\nmanyroot\n";
+        // A path full names: every package, the tool asked only for the head's.
+        for branch in ["rename", "delete", "build"] {
+            assert_eq!(asked(branch), ((Some(0), all.to_owned()), format!("--all {branch}\n")), "{scripts}");
+        }
         assert_eq!(
-            scope(&["packages", "main", "delete"]).1,
-            "bracken\nbracken-demo\nbracken-experiment\nbracken-scope\nbracken-tree\nmanyroot\n",
+            asked("docs"),
+            ((Some(0), "bracken\nbracken-tree\n".to_owned()), format!("{main} docs <notes.txt>\n")),
             "{scripts}"
         );
-        assert_eq!(scope(&["packages", "main", "docs"]).1, "bracken\nbracken-tree\n", "{scripts}");
-        assert_eq!(scope(&["packages", "main", "demo"]).1, "bracken\nbracken-demo\nbracken-experiment\n", "{scripts}");
-        assert_eq!(scope(&["packages", "main", "fmt"]), (Some(0), String::new()), "{scripts}");
+        assert_eq!(
+            asked("demo"),
+            (
+                (Some(0), "bracken\nbracken-demo\nbracken-experiment\n".to_owned()),
+                format!("{main} demo <crates/demo/src/main.rs scripts/x>\n")
+            ),
+            "{scripts}"
+        );
+        assert_eq!(asked("fmt"), ((Some(0), String::new()), format!("{main} fmt <rustfmt.toml>\n")), "{scripts}");
+        // No change: nothing asked.
+        assert_eq!(asked("main"), ((Some(0), String::new()), String::new()), "{scripts}");
+        let failed = command(&dir, "scripts/code-scope", &["packages", "main", "docs"])
+            .env("CODE_SCOPE_TOKENS", &stub)
+            .env("AFFECTED_FAIL", "1")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&failed.stderr);
+        assert_eq!(failed.status.code(), Some(2), "{scripts}: {stderr}");
+        assert!(stderr.contains("bracken-scope packages failed (exit 3)") && stderr.contains("cargo metadata failed"));
+        assert!(failed.stdout.is_empty(), "{scripts}");
 
         let h = "a".repeat(40);
         let passes = |methods: &[&str], packages: &[&str]| {
@@ -2250,7 +2322,7 @@ fn code_scope_names_what_needs_the_full_table_and_the_light_scope() {
 /// A light pass (`scripts/test-table --split -p … @ <sha> on <main> tree <key>`, decision `464d3ccca45e`,
 /// answer `10cf8a5053a3`) counts as the merged-tree form does when main is ahead in code, but fails the
 /// scope check for a head that scripts/code-scope full names, each kind of path in its list; for one
-/// whose packages, from AGENTS.md's rows, it leaves out, or that has none (findings 0095e19fcdb7,
+/// whose packages, from code-scope packages, it leaves out, or that has none (findings 0095e19fcdb7,
 /// 4825c59b07e9); and unless the pr claim's author has the five passes on the exact sha (finding
 /// 013ac6db02d9). A failing code-scope fails it too. Without the merged tree, with main since moved in
 /// code, without packages, in the old --light form, or written by anyone but the manager, it doesn't
@@ -2541,6 +2613,7 @@ fn verify_seq_light_counts_only_on_the_builders_passes_and_where_the_full_table_
                 .env("LOG", &log)
                 .env("TMPDIR", &scratch)
                 .env("BRACKEN_BIN", tmp.path().join("bracken"))
+                .env("CODE_SCOPE_TOKENS", affected_stub(&tmp.path().join("bracken-scope")))
                 .env_remove("ON")
                 .output()
                 .unwrap();

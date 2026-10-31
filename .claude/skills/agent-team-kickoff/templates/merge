@@ -27,7 +27,7 @@
 #      does in 5, but fails this check unless all of these hold: scripts/code-scope full names no path
 #      the head changed since main's tip (its list, the one list of the paths that need the whole
 #      table, is the only place they're named); its packages include every one scripts/code-scope packages computes
-#      for the head (AGENTS.md's Tests rows, findings 0095e19fcdb7, 4825c59b07e9); and the pr claim's
+#      for the head (bracken-scope packages, findings 0095e19fcdb7, 4825c59b07e9); and the pr claim's
 #      author has the five passes on the exact sha that verify-seq --light checks first (scripts/code-scope
 #      light-passes, finding 013ac6db02d9). It exists only for a merged tree, never for the bare head;
 #   5. main's tip is an ancestor of the sha, or every file main changed since the
@@ -451,8 +451,8 @@ else
     case "$x" in
       " docs-only") $docs_only || wrong+=("a docs-only pass${m:+ on main $m} on a head that isn't docs-only ($scope)") ;;
       " light -p "*)
-        # The one list of what needs the whole table (code-scope full), and the scope from AGENTS.md's
-        # rows (code-scope packages), read as verify-seq --light reads them.
+        # The one list of what needs the whole table (code-scope full), and the scope from bracken-scope
+        # packages (code-scope packages), read as verify-seq --light reads them.
         [ -n "$needs_full" ] || needs_full=$(cd "$main" && "$here/code-scope" full "$tip" "$sha" 2>&1; echo "exit $?")
         case "${needs_full##*exit }" in
           1) ;;

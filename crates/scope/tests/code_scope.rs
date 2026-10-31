@@ -1,7 +1,8 @@
 //! scripts/code-scope with bracken-scope (task 0837da3df7a4): a Rust file changed only in comments, from the
 //! merge base to the head and from main's tip to the merged tree, names a doc's row and never needs the full
 //! table, but its head is never docs-only, since clippy reads comments (finding c40ed7b8d3f8); anything else
-//! stays code. One test per copy of the script (decision 4bf44934cb67 (5)).
+//! stays code. The packages come from `bracken-scope packages` (task de42fa5c776d), on a workspace with this
+//! repository's package names and dependencies. One test per copy of the script (decision 4bf44934cb67 (5)).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -33,7 +34,9 @@ struct Repo {
 }
 
 impl Repo {
-    /// A repository holding `<scripts>/code-scope` as scripts/code-scope and a few crates, on main.
+    /// A repository holding `<scripts>/code-scope` as scripts/code-scope and a workspace of a few crates, as
+    /// this one's are named and depend on each other (bracken on bracken-tree, bracken-experiment on
+    /// bracken-demo), on main.
     fn new(scripts: &str) -> Repo {
         let tmp = tempfile::tempdir().expect("a temp dir");
         let dir = tmp.path().join("repo");
@@ -49,6 +52,25 @@ impl Repo {
         put(&dir, "crates/experiment/src/plan.rs", "const TASK: &str = include_str!(\"task.rs\");\n");
         put(&dir, "crates/experiment/src/task.rs", "// The task.\npub fn t() {}\n");
         put(&dir, "README.md", "# Readme\n");
+        let members = ["crates/tree", "crates/bracken", "crates/demo", "crates/experiment"];
+        put(&dir, "Cargo.toml", &format!("[workspace]\nresolver = \"3\"\nmembers = {members:?}\n"));
+        for (dir_name, name, lib, dep) in [
+            ("tree", "bracken-tree", "lib.rs", None),
+            ("bracken", "bracken", "lib.rs", Some(("bracken-tree", "tree"))),
+            ("demo", "bracken-demo", "broken.rs", None),
+            ("experiment", "bracken-experiment", "plan.rs", Some(("bracken-demo", "demo"))),
+        ] {
+            let mut manifest = format!(
+                "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\npath = \"src/{lib}\"\n"
+            );
+            if let Some((dep, path)) = dep {
+                manifest.push_str(&format!("\n[dependencies]\n{dep} = {{ path = \"../{path}\" }}\n"));
+            }
+            put(&dir, &format!("crates/{dir_name}/Cargo.toml"), &manifest);
+        }
+        let lock = Command::new("cargo").args(["generate-lockfile", "--offline"]).current_dir(&dir).output();
+        let lock = lock.expect("cargo ran");
+        assert!(lock.status.success(), "{}", String::from_utf8_lossy(&lock.stderr));
         let repo = Repo { _tmp: tmp, dir };
         for args in [
             &["init", "-q", "-b", "main"][..],
@@ -107,8 +129,10 @@ const HELPER: &str = env!("CARGO_BIN_EXE_bracken-scope");
 fn comment_only_changes_are_a_docs_row(scripts: &str) {
     let repo = Repo::new(scripts);
     let comment = |t: &str| t.replace("// one", "// one, the\n    // only one");
-    let tree = vec!["bracken".to_owned(), "bracken-tree".to_owned()];
-    let bracken = vec!["bracken".to_owned(), "bracken-demo".to_owned(), "bracken-experiment".to_owned()];
+    let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    let tree = names(&["bracken", "bracken-tree"]);
+    let bracken = names(&["bracken", "bracken-demo", "bracken-experiment"]);
+    let all = names(&["bracken", "bracken-demo", "bracken-experiment", "bracken-tree"]);
 
     // No full table, a doc's row, and never docs-only.
     repo.head(&[("crates/tree/src/lib.rs", &comment)]);
@@ -122,8 +146,7 @@ fn comment_only_changes_are_a_docs_row(scripts: &str) {
         ("crates/tree/src/lib.rs", &comment),
         ("crates/bracken/src/lib.rs", &|_: &str| "pub fn h() {}\n".into()),
     ]);
-    let all = ["bracken", "bracken-demo", "bracken-experiment", "bracken-tree"].map(str::to_owned).to_vec();
-    assert_eq!(repo.verdict(HELPER), (false, all, false), "{scripts}: a comment and code elsewhere");
+    assert_eq!(repo.verdict(HELPER), (false, all.clone(), false), "{scripts}: a comment and code elsewhere");
     // The reviewer's collapsible_if case: comment-only by its tokens, so a doc's row, but not docs-only, so
     // its light run lints it.
     repo.head(&[("crates/demo/src/clippy.rs", &|t: &str| t.replace("        // Why b matters.\n", ""))]);
@@ -131,7 +154,8 @@ fn comment_only_changes_are_a_docs_row(scripts: &str) {
     let (docs, out) = repo.scope(&["docs-only", "main", "topic"], HELPER);
     assert_eq!((docs, out.trim()), (1, "code-scope: not docs: crates/demo/src/clippy.rs"), "{scripts}");
 
-    // Code, each: a doc comment, inner or outer; a string literal; a cfg; a blank line after an attribute.
+    // Code, each: a doc comment, inner or outer; a string literal; a cfg; a blank line after an attribute. In
+    // crates/tree/src, each needs the full table, so every package.
     for (what, edit) in [
         ("an outer doc comment", &(|t: &str| t.replace("/// Its name.", "/// Its own name.")) as &Edit),
         ("an inner doc comment", &|t: &str| t.replace("//! The tree.", "//! The tree, here.")),
@@ -140,17 +164,22 @@ fn comment_only_changes_are_a_docs_row(scripts: &str) {
         ("a blank line after an attribute", &|t: &str| t.replace("(unix)]\n", "(unix)]\n\n")),
     ] {
         repo.head(&[("crates/tree/src/lib.rs", edit)]);
-        assert_eq!(repo.verdict(HELPER), (true, tree.clone(), false), "{scripts}: {what}");
+        assert_eq!(repo.verdict(HELPER), (true, all.clone(), false), "{scripts}: {what}");
     }
-    // A file that doesn't lex, and one included as text, are code whatever changed in them.
+    // A file that doesn't lex, and one included as text, are code whatever changed in them. crates/demo's
+    // change selects bracken-experiment, which depends on it, and bracken by its rule; crates/experiment's
+    // doesn't select bracken-demo, which it depends on.
     repo.head(&[("crates/demo/src/broken.rs", &|t: &str| t.replace("// broken", "// still broken"))]);
     assert_eq!(repo.verdict(HELPER), (false, bracken.clone(), false), "{scripts}: a file that doesn't lex");
     repo.head(&[("crates/experiment/src/task.rs", &|t: &str| t.replace("// The task.", "// The task, here."))]);
-    assert_eq!(repo.verdict(HELPER), (false, bracken.clone(), false), "{scripts}: a file included as text");
+    let experiment = names(&["bracken", "bracken-experiment"]);
+    assert_eq!(repo.verdict(HELPER), (false, experiment, false), "{scripts}: a file included as text");
 
-    // Without bracken-scope, every Rust file is code.
+    // Without bracken-scope, every Rust file is code, and packages can't say which packages: exit 2.
     repo.head(&[("crates/tree/src/lib.rs", &comment)]);
-    assert_eq!(repo.verdict(""), (true, tree.clone(), false), "{scripts}: no bracken-scope");
+    assert_eq!(repo.scope(&["full", "main", "topic"], "").0, 0, "{scripts}: no bracken-scope");
+    assert_eq!(repo.scope(&["docs-only", "main", "topic"], "").0, 1, "{scripts}: no bracken-scope");
+    assert_eq!(repo.scope(&["packages", "main", "topic"], ""), (2, String::new()), "{scripts}: no bracken-scope");
 
     // Comment-only from the merge base to the head, but not in the merged tree (finding 24e15486a4a4): the
     // head moves x across the comments, main makes one of them code, and git merges the two cleanly into
@@ -163,7 +192,7 @@ fn comment_only_changes_are_a_docs_row(scripts: &str) {
     let text = std::fs::read_to_string(&file).expect("read");
     std::fs::write(&file, text.replace("// c2", "y")).expect("written");
     repo.git(&["commit", "-qam", "main moves"]);
-    assert_eq!(repo.verdict(HELPER), (true, tree, false), "{scripts}: tokens neither side tested");
+    assert_eq!(repo.verdict(HELPER), (true, all, false), "{scripts}: tokens neither side tested");
 }
 
 #[test]

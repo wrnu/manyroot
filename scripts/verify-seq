@@ -56,8 +56,8 @@
 #
 # --light (decision 464d3ccca45e, answer 10cf8a5053a3) is the light counted run, for one head at a time,
 # here. The full table stays the default; the manager chooses light, by risk. Its scope is the packages
-# scripts/code-scope packages computes from the head's changed files through AGENTS.md's Tests rows
-# (findings 0095e19fcdb7, 4825c59b07e9), never the builder's own choice. For each head it first checks,
+# scripts/code-scope packages computes from the head's changed files, by bracken-scope packages (guppy's
+# determinator, task de42fa5c776d; findings 0095e19fcdb7, 4825c59b07e9), never the builder's own choice. For each head it first checks,
 # and refuses with the reason, recording nothing, unless:
 #   - the scope isn't empty (a change only to rustfmt.toml has none: run the full table);
 #   - the pr claim's author recorded passes on that exact head of cargo fmt --check, both clippies
