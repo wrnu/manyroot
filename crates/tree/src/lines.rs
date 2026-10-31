@@ -257,7 +257,35 @@ impl Lines {
         // Rules 5 and 6: each decision's window, answers and used objections from the decision graph, then
         // every question they ask of each decision's past, under the policy in force for it, at once
         // (decision on split note dc467163233c).
-        let mut obligations = Obligations::new(ix, &lines, &lines.order);
+        // Only a decision that may qualify is worked out: one that is retracted, on no line, by no
+        // integrator under the policy in force for it, or with a parent that may not, fails rule 1, 2 or
+        // 3 whatever it must answer, and so does every descendant (finding e4f57cd207b6). Those rules
+        // are judged as before; this only leaves out what they make moot.
+        let mut may_qualify: HashSet<ContributionId> = HashSet::new();
+        for id in &lines.order {
+            let record = &lines.decisions[id];
+            let d = &record.decision;
+            if g.is_retracted(id) || !lines.versions.contains_key(&d.line) {
+                continue;
+            }
+            let walked;
+            let chain = match walking {
+                true => {
+                    walked = lines.chain(&d.line, true, |a| g.is_ancestor(a, id));
+                    Some(&walked)
+                }
+                false => chains.get(id),
+            };
+            let integrates = match chain {
+                Some(Ok(policy)) => lines.versions[policy].policy.integrators.contains(&record.author),
+                Some(Err(_)) => false,
+                None => true,
+            };
+            if integrates && d.parents.iter().all(|p| may_qualify.contains(p)) {
+                may_qualify.insert(*id);
+            }
+        }
+        let mut obligations = Obligations::new(ix, &lines, &lines.order, may_qualify);
         // What answers settle is asked first, as the windows depend on it. Answers naming the line name
         // the window, so settling then takes two passes: the first leaves them out, and its windows, which
         // hold the second's, give what they ask (decision 4afee4855944).

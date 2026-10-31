@@ -227,6 +227,7 @@ impl World {
         }
         assert_eq!(lines.obligation_stats().fallbacks, 0, "{:?}", lines.obligation_stats());
         assert_eq!(lines.stats().fallbacks, 0, "{:?}", lines.stats());
+        assert_eq!(lines.objections().differ_from_walking(&ix, &lines), vec![], "windows and a walk disagree");
         (ix, lines)
     }
 
@@ -693,11 +694,10 @@ fn many_objections_from_anyone_are_answered_in_one_reference() {
     assert!(lines.open_objections(&w.g, &ix, &w.line).expect("a policy").is_empty(), "all settled");
 }
 
-/// Finding fa578bd1da48: a `fell_back` answer's bases are worked out once per decision fallen back from,
-/// not at every later move: a chain of moves, each objected to and answered fell_back by the next, takes
-/// one decision-graph walk per objected decision.
+/// Finding fa578bd1da48: a chain of moves, each objected to and answered fell_back by the next, back to
+/// its grandparent's manifest, qualifies. The bases are kept as each decision is judged, with no walk.
 #[test]
-fn fell_back_walks_once_per_decision_fallen_back_from() {
+fn a_chain_answered_fell_back_qualifies() {
     const N: usize = 40;
     let mut w = World::new();
     let bob = w.bob.clone();
@@ -716,13 +716,38 @@ fn fell_back_walks_once_per_decision_fallen_back_from() {
     }
     let (_, lines) = w.lines();
     assert_eq!(lines.verdict(&previous).expect("judged").as_ref().map(|_| ()), Ok(()));
-    assert_eq!(lines.objections().fell_back_walks(), N - 1, "one walk per decision fallen back from");
 }
 
-/// Finding 67aa4fdb882b: a blanket fell_back answer, naming the decision, walks once, however many
-/// objections it covers.
+/// A `fell_back` answer to an objection to `d1` returns to the manifest of a qualifying strict ancestor of
+/// `d1`'s: `d0`'s, not `d1`'s own or a new one, below a merge too.
 #[test]
-fn a_blanket_fell_back_walks_once() {
+fn fell_back_returns_only_to_an_ancestors_manifest() {
+    let mut w = World::new();
+    let bob = w.bob.clone();
+    let (m0, m1, d0, d1) = two_moves(&mut w);
+    let why = w.claim(&bob, "no", &[]);
+    let o = w.object(&bob, why, d1);
+    let m2 = w.tree(&[("a", b"2")]);
+    for (manifest, ok) in [(m0.0, true), (m1.0, false), (m2.0, false)] {
+        let e = w.draft(manifest, &[d1], |d| d.answers.push(answer(o, Disposition::FellBack)));
+        let verdict = w.judge_new(&e);
+        assert!(if ok { verdict.is_ok() } else { not_allowed(verdict, o) }, "{manifest:?}");
+    }
+    let m3 = w.tree(&[("a", b"3")]);
+    let other = w.decide(m3.0, &[d0], |_| {});
+    let merge = w.decide(m1.0, &[d1, other], |d| d.answers.push(answer(o, Disposition::Overridden)));
+    assert_eq!(w.verdict(&merge), Ok(()));
+    let o = w.object(&bob, why, merge);
+    for (manifest, ok) in [(m3.0, true), (m0.0, true), (m2.0, false)] {
+        let e = w.draft(manifest, &[merge], |d| d.answers.push(answer(o, Disposition::FellBack)));
+        let verdict = w.judge_new(&e);
+        assert!(if ok { verdict.is_ok() } else { not_allowed(verdict, o) }, "below the merge {manifest:?}");
+    }
+}
+
+/// Finding 67aa4fdb882b: a blanket fell_back answer, naming the decision, answers every objection to it.
+#[test]
+fn a_blanket_fell_back_answers_every_objection() {
     const K: usize = 200;
     let mut w = World::new();
     let bob = w.bob.clone();
@@ -734,7 +759,6 @@ fn a_blanket_fell_back_walks_once() {
     let e = w.decide(m0.0, &[d1], |d| d.answers.push(answer(d1, Disposition::FellBack)));
     let (_, lines) = w.lines();
     assert_eq!(lines.verdict(&e).expect("judged").as_ref().map(|_| ()), Ok(()));
-    assert_eq!(lines.objections().fell_back_walks(), 1, "one walk for d1, not one per objection");
 }
 
 /// Finding 0bf37b345567, the reviewer's case: an answer at a decision that doesn't use a manifest
@@ -841,8 +865,6 @@ fn a_settlement_on_another_line_doesnt_cross_to_this_one() {
         assert!(unanswered(w.verdict(&child), o), "{basis}: a child on main of the side decision");
         let merge = w.decide(m3.0, &[d1, a], |_| {});
         assert!(unanswered(w.verdict(&merge), o), "{basis}: a merge on main bringing the side decision in");
-        let (_, lines) = w.lines();
-        assert!(lines.objections().cross_line_walks() >= 2, "each parent on another line is walked");
     }
 }
 
@@ -905,4 +927,142 @@ fn a_line_wide_overridden_doesnt_override_a_goal() {
         d.answers.push(answer(bound, Disposition::Fixed));
     });
     assert_eq!(w.verdict(&e), Ok(()));
+}
+
+/// A line of `n` moves after a root, each objected to by bob and the objection to each answered `fixed`
+/// by the next: the chain and its head.
+fn answered_chain(w: &mut World, n: usize) -> (Vec<ContributionId>, ContentHash) {
+    let bob = w.bob.clone();
+    let m = [w.tree(&[("a", b"0")]).0, w.tree(&[("a", b"1")]).0];
+    let why = w.claim(&bob, "no", &[]);
+    let mut chain = vec![w.decide(m[0], &[], |_| {})];
+    let mut objection = None;
+    for i in 1..=n {
+        let next = w.decide(m[i % 2], &[*chain.last().expect("a root")], |d| {
+            d.answers.extend(objection.map(|o| answer(o, Disposition::Fixed)));
+        });
+        objection = Some(w.object(&bob, why, next));
+        chain.push(next);
+    }
+    (chain, m[0])
+}
+
+/// Finding e4f57cd207b6: decisions that can't qualify, on a made-up line, by someone who isn't an
+/// integrator, or below such a decision, each naming main's head as a parent and answering by the line,
+/// ask nothing of the index, and a merge on main that brings one in is refused for it before rule 5.
+#[test]
+fn decisions_that_cant_qualify_cost_only_their_own_count() {
+    const MOVES: usize = 200;
+    const JUNK: usize = 200;
+    let mut w = World::new();
+    let (alice, bob) = (w.alice.clone(), w.bob.clone());
+    let (chain, m) = answered_chain(&mut w, MOVES);
+    let head = *chain.last().expect("a head");
+    let before = w.lines().1.obligation_stats();
+    let made_up = w.claim(&bob, "a line", &[]);
+    let mut junk = Vec::new();
+    for i in 0..JUNK {
+        let (who, line) = match i % 3 {
+            0 => (&bob, made_up),
+            1 => (&alice, made_up),
+            _ => (&bob, w.line),
+        };
+        let mut d = w.draft(m, &[head], |d| d.answers.push(answer(line, Disposition::Overridden)));
+        d.line = line;
+        junk.push(w.add(&who.clone(), artifact(&d)));
+    }
+    let below = w.decide(m, &[junk[0]], |_| {});
+    let merge = w.decide(m, &[head, junk[2]], |_| {});
+    let (_, lines) = w.lines();
+    let after = lines.obligation_stats();
+    assert_eq!(after.questions, before.questions, "{before:?} {after:?}");
+    for (i, d) in junk.iter().enumerate() {
+        let verdict = lines.verdict(d).expect("judged").clone().map(|_| ());
+        let expected = match i % 3 {
+            2 => matches!(verdict, Err(Unqualified::NotAnIntegrator { .. })),
+            _ => matches!(verdict, Err(Unqualified::NotALine(_))),
+        };
+        assert!(expected, "{i}: {verdict:?}");
+    }
+    for d in [below, merge] {
+        let verdict = lines.verdict(&d).expect("judged").clone().map(|_| ());
+        assert!(matches!(verdict, Err(Unqualified::ParentUnqualified(_))), "{verdict:?}");
+    }
+}
+
+/// The cost the round-3 review of #152 measured: with an objection to every move, each answered by the
+/// next, a move asks only about the objection its parent left and the one it answers, so a line of
+/// `n` moves asks fewer than `2n` questions; and a decision on another line, and a merge back, each
+/// read its parents' histories less what its own line settled, as walking gives.
+#[test]
+fn an_answered_line_asks_two_questions_a_move() {
+    const MOVES: usize = 400;
+    let mut w = World::new();
+    let (chain, m) = answered_chain(&mut w, MOVES);
+    let head = *chain.last().expect("a head");
+    let (_, lines) = w.lines();
+    let stats = lines.obligation_stats();
+    assert!(stats.questions < 2 * MOVES, "{stats:?}");
+    assert!(chain.iter().all(|d| lines.verdict(d).expect("judged").is_ok()));
+    // On side, nothing main settled is settled: its first decision must answer every objection.
+    let side = w.side_line("side", vec![]);
+    let s1 = w.decide_on(side, m, &[head], |_| {});
+    let (_, lines) = w.lines();
+    assert!(matches!(lines.verdict(&s1).expect("judged"), Err(Unqualified::Unanswered { .. })));
+    let s1 = w.decide_on(side, m, &[head], |d| d.answers.push(answer(side, Disposition::Overridden)));
+    let merge = w.decide(m, &[head, s1], |_| {});
+    let (_, lines) = w.lines();
+    assert_eq!(lines.verdict(&s1).expect("judged").as_ref().map(|_| ()), Ok(()));
+    assert!(matches!(lines.verdict(&merge).expect("judged"), Err(Unqualified::Unanswered { .. })), "the head's");
+}
+
+/// The figures in weave.md section 4, *Objections*: run by hand in a release build, with
+/// `cargo test --release -p bracken-tree --test objections measure_long_lines -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn measure_long_lines() {
+    for (n, disposition, junk, made_up) in [
+        (1_000usize, Some(Disposition::Fixed), 0usize, false),
+        (2_000, Some(Disposition::Fixed), 0, false),
+        (4_000, Some(Disposition::Fixed), 0, false),
+        (8_000, Some(Disposition::Fixed), 0, false),
+        (4_000, None, 0, false),
+        (1_600, Some(Disposition::FellBack), 0, false),
+        (4_000, Some(Disposition::FellBack), 0, false),
+        (4_000, Some(Disposition::Fixed), 4_000, true),
+    ] {
+        let mut w = World::new();
+        let bob = w.bob.clone();
+        let m = [w.tree(&[("a", b"0")]).0, w.tree(&[("a", b"1")]).0];
+        let mut previous = w.decide(m[0], &[], |_| {});
+        let mut objection: Option<ContributionId> = None;
+        let why = w.claim(&bob, "no", &[]);
+        for i in 1..=n {
+            let next = w.decide(m[i % 2], &[previous], |d| {
+                if let (Some(o), Some(disposition)) = (objection, disposition) {
+                    d.answers.push(answer(o, disposition));
+                }
+            });
+            objection = Some(w.object(&bob, why, next));
+            previous = next;
+        }
+        let side = w.claim(&bob, "a line", &[]);
+        for _ in 0..junk {
+            let mut d = w.draft(m[0], &[previous], |_| {});
+            d.line = side;
+            let who = if made_up { bob.clone() } else { w.alice.clone() };
+            w.add(&who, artifact(&d));
+        }
+        let ix = Index::build(&w.g);
+        let t = std::time::Instant::now();
+        let lines = Lines::build(&w.g, &ix);
+        let ok = lines.verdict(&previous).expect("judged").is_ok();
+        let stats = lines.obligation_stats();
+        eprintln!(
+            "n={n} {disposition:?} junk={junk}: {:?} ok={ok} questions={} ors={}",
+            t.elapsed(),
+            stats.questions,
+            stats.ors
+        );
+    }
 }

@@ -1063,36 +1063,58 @@ from its results.
     one validator's 8,000 failed results on one manifest take about 0.25 s
     for one decision and 0.3 s for ten (4.3 s for one before). A later
     re-run or retraction never changes what the decision saw.
-  - **Objections** (build step 7, rules 5 and 6). Each decision's window
-    (the objections to its ancestors in the decision graph), the answers
-    below it and the objections to what it uses come from the decision
-    graph, shared along single-parent runs, with no Ground walk. Every
-    question they ask of a decision's past is asked at once: whether each
-    objection, the retractions below it, its basis's result and goal links
-    and their retractions are in the past, and whether the policy in force
-    is in the result's, all references through one ancestor answer. A
-    decision asks one question per
-    objection in its window that no answer below it settled, so an
-    objection is asked about at each move only until it is answered: 2,000
-    objections settled by one answer cost later moves nothing. Settled
-    objections are carried along the decision graph, shared along runs of
-    decisions that settle nothing. A `fell_back` answer's bases, the
-    manifests of the objected decision's qualifying ancestors, take one
-    decision-graph walk per decision fallen back from, whether the answer
-    names an objection or, blanket, the decision itself (findings
-    `fa578bd1da48` and `67aa4fdb882b`); a line-wide `fell_back` answer
-    counts every objected decision. Settling asks, once per answer, whether
-    each objection it names, and each retraction below it, is in the
-    answering decision's past. An answer naming the line names the window,
-    which settling itself decides, so with such answers settling takes two
-    passes: the first leaves them out, and asks about the window it finds,
-    which holds the window the second finds. Settles reach only decisions on
-    the settling decision's line, so a parent on another line than its
-    child's gives no window to share: its decision ancestry is walked once
-    for the objections to it. Measured in a release build, a line of 1,600
-    moves, each objected to and answered by the next, builds in 0.08 s
-    answered `fixed` and 0.4 s answered `fell_back` (6.2 s and minutes
-    before).
+  - **Objections** (build step 7, rules 5 and 6). Only a decision that may
+    qualify is worked out. One that is retracted, on no line, by no
+    integrator under the policy in force for it, or with a parent that may
+    not, fails rule 1, 2 or 3 whatever it must answer, and so does every
+    descendant, so it costs no more than its own count (finding
+    `e4f57cd207b6`). For the rest, each decision's window (the objections to
+    its ancestors in the decision graph), the answers below it and the
+    objections to what it uses come from the decision graph, with no Ground
+    walk. Every question they ask of a decision's past is asked at once:
+    whether each objection, the retractions below it, its basis's result and
+    goal links and their retractions are in the past, and whether the policy
+    in force is in the result's, all references through one ancestor answer.
+    A decision asks one question per objection in its window that no answer
+    below it settled, so an objection is asked about at each move only until
+    it is answered: 2,000 objections settled by one answer cost later moves
+    nothing.
+    - A decision with one parent on its line takes the parent's window,
+      less what the parent settled, plus the objections to the parent, and
+      shares it if there are none of either. Each decision also keeps its
+      history (the objections to it and its ancestors, settled or not), what
+      answers there and below settled, by line, and the manifests of the
+      qualifying decisions there and below. These are persistent sets of
+      words, a bit per objection or manifest, that share what they have in
+      common, so a decision adding nothing shares its parent's, and adding
+      one copies a path of seven nodes.
+    - Settles reach only decisions on the settling decision's line, so a
+      parent on another line gives no window to share. A merge's parents may
+      also each have settled what the other's window holds. Either way, the
+      window is the parents' histories less what was settled on the
+      decision's line, read a word per 64 objections, and only where the two
+      differ.
+    - A `fell_back` answer's bases, the manifests of the objected decision's
+      qualifying strict ancestors, are its parents' sets, whether the answer
+      names an objection, the decision itself (blanket) or the line (findings
+      `fa578bd1da48` and `67aa4fdb882b`).
+    - Settling asks, once per answer, whether each objection it names, and
+      each retraction below it, is in the answering decision's past. An
+      answer naming the line names the window, which settling itself
+      decides, so with such answers settling takes two passes: the first
+      leaves them out, and asks about the window it finds, which holds the
+      window the second finds.
+    - Measured in a release build on an M-series Mac, a line of 4,000 moves,
+      each objected to and answered by the next, asks 7,998 questions. It
+      builds in 0.06 s answered `fixed` and 0.08 s answered `fell_back`
+      (0.54 s and 3.0 s before). 4,000 decisions by someone else on a
+      made-up line, with its head as their parent, add no questions and
+      about 0.01 s (62 s before). Left unanswered, the line asks 8 million
+      questions, one per objection per later move, in 1.1 s. What grows
+      faster than the line is the ancestor index's passes, one per 64
+      askers: at 8,000 moves, answered `fixed`, it builds in 0.16 s (2.2 s
+      before). `measure_long_lines` in `crates/tree/tests/objections.rs`
+      gives these figures.
   - A question nothing asked at build would be a bug. It is answered by
     walking and counted, and fails debug builds; the tests assert the count
     is zero.
