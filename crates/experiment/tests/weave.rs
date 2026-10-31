@@ -59,7 +59,7 @@ impl Stores {
         std::fs::create_dir(&sockets).expect("sockets");
         let project = Project::load(&tiny()).expect("the fixture");
         let mut hub = Worker::spawn(&bin(), "weave", &config("hub", "setter")).expect("hub");
-        hub.ok(&request("project", hub_data(&project, ANY_AGENT).expect("the data"))).expect("the project");
+        hub.ok(&request("project", hub_data(&project, ANY_AGENT, false).expect("the data"))).expect("the project");
         let setup = hub.ok(&request("setup", Value::Null)).expect("hub setup");
         assert_eq!(setup.result["released"], json!(["sum", "mean-empty"]), "the items released at the start");
         let seed = Worker::bytes(&hub.ok(&request("export", Value::Null)).expect("export")).expect("bytes");

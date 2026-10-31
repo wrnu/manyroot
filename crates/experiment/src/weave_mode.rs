@@ -182,17 +182,17 @@ fn item_shares(project: &Project) -> Vec<f64> {
 
 /// What the hub is given of `project`, so its worker never reads the project directory: the spec, the seed's
 /// files (hex), each item with its text and whether it goes out later than the start, and the integrator
-/// setting.
-pub fn hub_data(project: &Project, integrator: &str) -> Result<Value, String> {
+/// setting. A run that holds the change back (`hold`) gives the hub no later item at all.
+pub fn hub_data(project: &Project, integrator: &str, hold: bool) -> Result<Value, String> {
     let read = |p: &Path| std::fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()));
     let text = |p: &Path| String::from_utf8(read(p)?).map_err(|_| format!("{} isn't UTF-8", p.display()));
-    let change = change_share(&item_shares(project))?;
+    let change = change_share(&item_shares(project))?.filter(|_| !hold);
     let mut seed = Vec::new();
     for rel in project.seed_files()? {
         seed.push(json!([rel, hex::encode(read(&project.seed.join(&rel))?)]));
     }
     let mut items = Vec::new();
-    for item in &project.items {
+    for item in project.items.iter().filter(|i| !hold || i.release == Release::Start) {
         items.push(json!({
             "id": item.id,
             "kind": item.kind.name(),

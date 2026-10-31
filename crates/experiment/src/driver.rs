@@ -274,7 +274,8 @@ struct Run<'a> {
 struct ProjectRun {
     project: crate::project::Project,
     python: crate::python::Python,
-    /// The change's share of the run's agent-turns, and the agent-turns used before it goes out.
+    /// The change's share of the run's agent-turns, and the agent-turns used before it goes out; None for a
+    /// project without one, or a run holding it back.
     change: Option<(f64, u32)>,
 }
 
@@ -295,6 +296,7 @@ fn project_run(cfg: &RunConfig, mode: &dyn Mode) -> Result<Option<ProjectRun>, S
     let python = crate::python::Python::from_plan(pin, &project.python)?;
     let shares: Vec<f64> = plan.items.iter().map(|(_, s)| *s).collect();
     let change = crate::weave_mode::change_share(&shares)?
+        .filter(|_| !cfg.plan.hold_change)
         .map(|s| (s, crate::weave_mode::release_after(s, cfg.turns, cfg.agents)));
     Ok(Some(ProjectRun { change, project, python }))
 }
@@ -347,7 +349,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     let mut hub = Worker::spawn_in(&cfg.worker_bin, mode.name(), &hub_store, hub_profile.as_ref())?;
     if let Some(p) = &project {
         let integrator = cfg.plan.integrator.as_deref().unwrap_or(crate::weave_mode::ANY_AGENT);
-        let data = crate::weave_mode::hub_data(&p.project, integrator)?;
+        let data = crate::weave_mode::hub_data(&p.project, integrator, cfg.plan.hold_change)?;
         hub.ok(&Request { op: "project".into(), args: data, ..Request::default() })?;
     }
     hub.ok(&Request { op: "setup".into(), ..Request::default() })?;

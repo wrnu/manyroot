@@ -159,9 +159,24 @@ fn a_project_with_no_public_test_or_two_changes_on_one_item_is_refused() {
     let tmp = tempfile::tempdir().expect("a temp dir");
     let mut m = manifest();
     m["items"][1] = json!({"id": "again", "kind": "change", "title": "Again", "text": "items/fix-sign.md",
-                           "release": {"after_share": 0.7}, "revises": ["add"]});
+                           "release": {"after_share": 0.5}, "revises": ["add"]});
     let err = Project::load(&project_in(tmp.path(), &m)).expect_err("two changes");
     assert!(err.contains("revised by both"), "{err}");
+}
+
+#[test]
+fn a_project_with_two_release_points_after_the_start_is_refused() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let mut m = manifest();
+    m["items"][1]["release"] = json!({"after_share": 0.25});
+    let err = Project::load(&project_in(tmp.path(), &m)).expect_err("two release points");
+    assert!(err.contains("\"fix-sign\" and \"wider\" are released at different shares"), "{err}");
+
+    // A later item at the change's own share is the same release point.
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let mut m = manifest();
+    m["items"][1]["release"] = json!({"after_share": 0.5});
+    Project::load(&project_in(tmp.path(), &m)).expect("one release point after the start");
 }
 
 #[test]

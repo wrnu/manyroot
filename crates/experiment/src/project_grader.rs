@@ -76,8 +76,33 @@ pub struct GroupGrade {
     pub index: usize,
     pub item: String,
     pub counts: Counts,
+    /// One outcome per test, in the order the tests ran: the worst of its own (and its subtests'). A test that
+    /// hadn't ended when the host did is a `fail`, as in `counts`. No test names: an index is all a grade needs.
+    pub outcomes: Vec<Outcome>,
     /// Why its tests didn't all run, if they didn't: how the host ended.
     pub unfinished: Option<String>,
+}
+
+/// A test's outcome, worst last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Outcome {
+    Pass,
+    Skip,
+    Fail,
+    Error,
+}
+
+impl Outcome {
+    /// An outcome as the host names it.
+    fn named(kind: &str) -> Outcome {
+        match kind {
+            "\"pass\"" => Outcome::Pass,
+            "\"fail\"" => Outcome::Fail,
+            "\"skip\"" => Outcome::Skip,
+            _ => Outcome::Error,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -111,8 +136,8 @@ pub fn grade(python: &Python, project: &Project, set: &HiddenSet, tree: Tree, sh
             continue;
         }
         let file = group.file.strip_prefix("tests/").expect("checked to be under tests/");
-        let (counts, unfinished) = run_group(python, project, set, &tree, file)?;
-        groups.push(GroupGrade { index, item: group.item.clone(), counts, unfinished });
+        let (counts, outcomes, unfinished) = run_group(python, project, set, &tree, file)?;
+        groups.push(GroupGrade { index, item: group.item.clone(), counts, outcomes, unfinished });
     }
     let items = project
         .items
@@ -189,7 +214,7 @@ fn run_group(
     set: &HiddenSet,
     tree: &Tree,
     file: &str,
-) -> Result<(Counts, Option<String>), String> {
+) -> Result<(Counts, Vec<Outcome>, Option<String>), String> {
     let scratch = Scratch::new()?;
     let tests = scratch.dir.join("tests");
     let (dirs, files) = set.under("tests");
@@ -213,6 +238,8 @@ fn run_group(
     let mut server = Server { python, project, set, tree, running: None, generation: 0 };
     // What the host has said as it went (finding e7d128464936): the number of tests, each outcome, each test's end.
     let (mut total, mut done, mut so_far, mut counts) = (0u32, 0u32, Counts::default(), None);
+    // Each ended test's outcome, and the worst so far of the one running.
+    let (mut outcomes, mut running_test) = (Vec::new(), None::<Outcome>);
     while let Some(line) = running.next(deadline) {
         let reply = match line.split_once(' ') {
             Some(("S", request)) => server.ask(request, deadline)?,
@@ -223,10 +250,13 @@ fn run_group(
             }
             Some(("O", kind)) => {
                 so_far.add_one(kind);
+                running_test = running_test.max(Some(Outcome::named(kind)));
                 continue;
             }
             Some(("D", _)) => {
                 done += 1;
+                // A test that said nothing, which unittest doesn't do, counts as an error.
+                outcomes.push(running_test.take().unwrap_or(Outcome::Error));
                 continue;
             }
             Some(("R", result)) => {
@@ -241,10 +271,18 @@ fn run_group(
     }
     server.end();
     let exit = running.finish();
+    let unended = usize::try_from(total.saturating_sub(done)).expect("a u32 fits a usize");
+    if counts.is_none() && unended > 0 {
+        // The tests that hadn't ended when the host did are failures, the one that was running among them.
+        outcomes.push(running_test.take().map_or(Outcome::Fail, |o| o.max(Outcome::Fail)));
+        outcomes.extend(std::iter::repeat_n(Outcome::Fail, unended - 1));
+    }
+    // An outcome outside any test: the file failed to load.
+    outcomes.extend(running_test);
     Ok(match counts {
-        Some(counts) => (counts, None),
+        Some(counts) => (counts, outcomes, None),
         // The tests that hadn't ended when the host did count as failures.
-        None => (Counts { fail: so_far.fail + total.saturating_sub(done), ..so_far }, Some(describe(&exit))),
+        None => (Counts { fail: so_far.fail + total.saturating_sub(done), ..so_far }, outcomes, Some(describe(&exit))),
     })
 }
 

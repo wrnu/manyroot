@@ -29,6 +29,7 @@ pub mod claude;
 pub mod crdt_mode;
 pub mod driver;
 pub mod git_mode;
+pub mod grade_run;
 pub mod grader;
 pub mod lang;
 pub mod metrics;

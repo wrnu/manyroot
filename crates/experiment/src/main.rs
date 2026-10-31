@@ -8,6 +8,7 @@
 //! - `run` runs a whole mode with one agent harness, Claude Code or Pi, playing every agent.
 //! - `project check` checks an evaluation project, and its hidden set in a private store if given.
 //! - `run-tests` runs a project's public tests on a tree, under the Python profile.
+//! - `grade-run` grades a finished project run's trees with the project's hidden set, into a grades file.
 
 use std::path::PathBuf;
 
@@ -83,6 +84,9 @@ enum Cmd {
         /// A project run: the digest the interpreter must have.
         #[arg(long, requires = "python")]
         python_digest: Option<String>,
+        /// A project run: hold the project's change back, so only the items released at the start go out.
+        #[arg(long, requires = "project")]
+        hold_change: bool,
         #[arg(long, default_value_t = 8)]
         turns: u32,
         // No clap default: with one, an unset `--claude` would pass `required_if_eq`.
@@ -156,6 +160,9 @@ enum Cmd {
         /// A project run: the digest the interpreter must have.
         #[arg(long, requires = "python")]
         python_digest: Option<String>,
+        /// A project run: hold the project's change back, so only the items released at the start go out.
+        #[arg(long, requires = "project")]
+        hold_change: bool,
         #[arg(long, default_value_t = 5)]
         turns: u32,
         #[arg(long, default_value_t = 1)]
@@ -192,6 +199,25 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Grade a finished project run: each checkpoint's tree and the end's, with the project's hidden set
+    /// (docs/design/eval-suite.md, Running a project). One line a tree goes to --grades, a new file outside the
+    /// run, the project, the store, any Ground and any git checkout.
+    GradeRun {
+        /// The run directory, holding plan.json and events.jsonl.
+        #[arg(long)]
+        dir: PathBuf,
+        /// The private store holding the project's hidden set. Named nowhere but here.
+        #[arg(long)]
+        hidden: PathBuf,
+        /// The grades file to write.
+        #[arg(long)]
+        grades: PathBuf,
+        /// The bracken binary that checks trees out of the run's hub; defaults to the one next to this executable.
+        #[arg(long)]
+        bracken: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     /// Measure finished runs, one column each.
     Report {
         #[arg(required = true)]
@@ -223,6 +249,7 @@ fn main() {
             project,
             python,
             python_digest,
+            hold_change,
             turns,
             harness,
             claude,
@@ -240,7 +267,7 @@ fn main() {
             accept_rule,
             mode_token_cap,
         } => agent_run(AgentRun {
-            project: project_inputs(project.as_deref(), python.as_deref(), python_digest.as_deref())
+            project: project_inputs(project.as_deref(), python.as_deref(), python_digest.as_deref(), hold_change)
                 .unwrap_or_else(|e| refuse_run(&e)),
             mode_token_cap,
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
@@ -273,6 +300,7 @@ fn main() {
             project,
             python,
             python_digest,
+            hold_change,
             turns,
             seed,
             task,
@@ -281,8 +309,8 @@ fn main() {
             accept_rule,
         } => {
             let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
-            let (project, python, integrator) =
-                match project_inputs(project.as_deref(), python.as_deref(), python_digest.as_deref()) {
+            let inputs =
+                match project_inputs(project.as_deref(), python.as_deref(), python_digest.as_deref(), hold_change) {
                     Ok(inputs) => inputs,
                     Err(e) => {
                         eprintln!("bracken-experiment: {e}");
@@ -294,10 +322,7 @@ fn main() {
                 backend_seed: seed,
                 harness_commit: harness_commit(),
                 accept_rule,
-                project,
-                python,
-                integrator,
-                ..PlanInputs::default()
+                ..inputs.into_plan(PlanInputs::default())
             };
             mock_run(dir, &mode, agents, turns, bracken, sandbox, plan)
         }
@@ -306,6 +331,20 @@ fn main() {
         Cmd::RunTests { project, tree, python, python_digest, json } => {
             run_tests(&project, tree.as_deref(), &python, python_digest.as_deref(), json)
         }
+        Cmd::GradeRun { dir, hidden, grades, bracken, json } => std::env::current_exe()
+            .map_err(|e| e.to_string())
+            .map(|me| bracken.unwrap_or_else(|| me.with_file_name("bracken")))
+            .and_then(|bracken| bracken_experiment::grade_run::grade_run(&dir, &hidden, &grades, &bracken))
+            .map(|s| {
+                if json {
+                    println!("{}", serde_json::to_string(&s).expect("a summary is plain JSON"));
+                } else {
+                    println!(
+                        "{} ({}): {} trees graded, {} passing all that applies",
+                        s.project, s.hidden, s.points, s.all_pass
+                    );
+                }
+            }),
         Cmd::Report { dirs, usage, json } => report(&dirs, usage.as_deref(), json),
     };
     if let Err(e) = result {
@@ -314,20 +353,29 @@ fn main() {
     }
 }
 
-/// A project run's plan inputs, from `--project`, `--python` and `--python-digest`: the project as the plan
-/// records it, the interpreter pinned, and the configuration's integrator setting. None of them without a
-/// project; a project without `--python` is refused (answer `5e40cacdbfb4`).
+/// A project run's plan inputs, from `--project`, `--python`, `--python-digest` and `--hold-change`: the project
+/// as the plan records it, the interpreter pinned, the configuration's integrator setting and whether the change
+/// is held back. None of them without a project; a project without `--python` is refused (answer
+/// `5e40cacdbfb4`), and so is holding back a change a project hasn't.
 fn project_inputs(
     project: Option<&std::path::Path>,
     python: Option<&std::path::Path>,
     digest: Option<&str>,
+    hold_change: bool,
 ) -> Result<ProjectInputs, String> {
-    let Some(dir) = project else { return Ok((None, None, None)) };
+    let Some(dir) = project else { return Ok(ProjectInputs::default()) };
     let project = bracken_experiment::project::Project::load(dir)?;
     let python = python.ok_or("a project run needs --python, the interpreter to pin")?;
+    if hold_change && project.first_change().is_none() {
+        return Err(format!("--hold-change: project {} has no change to hold back", project.name));
+    }
     let pin = bracken_experiment::python::Python::pin(python, &project.python, digest)?.plan_pin();
-    let integrator = bracken_experiment::weave_mode::ANY_AGENT.to_string();
-    Ok((Some(ProjectPlan::of(&project)?), Some(pin), Some(integrator)))
+    Ok(ProjectInputs {
+        project: Some(ProjectPlan::of(&project)?),
+        python: Some(pin),
+        integrator: Some(bracken_experiment::weave_mode::ANY_AGENT.to_string()),
+        hold_change,
+    })
 }
 
 /// The tasks `--task` takes.
@@ -431,7 +479,21 @@ impl HarnessOptions {
 }
 
 /// A project run's plan inputs: see [`project_inputs`].
-type ProjectInputs = (Option<ProjectPlan>, Option<bracken_experiment::python::PythonPin>, Option<String>);
+#[derive(Default)]
+struct ProjectInputs {
+    project: Option<ProjectPlan>,
+    python: Option<bracken_experiment::python::PythonPin>,
+    integrator: Option<String>,
+    hold_change: bool,
+}
+
+impl ProjectInputs {
+    /// `plan` with these inputs.
+    fn into_plan(self, plan: PlanInputs) -> PlanInputs {
+        let ProjectInputs { project, python, integrator, hold_change } = self;
+        PlanInputs { project, python, integrator, hold_change, ..plan }
+    }
+}
 
 struct AgentRun {
     project: ProjectInputs,
@@ -488,10 +550,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
         expected_stops: vec![RUN_TOKEN_CAP.into(), RUN_TIME_CAP.into()],
         accept_rule: a.accept_rule,
         usage: std::path::absolute(backend_dir.join("usage.jsonl")).map_err(|e| e.to_string())?.display().to_string(),
-        project: a.project.0.clone(),
-        python: a.project.1.clone(),
-        integrator: a.project.2.clone(),
-        ..PlanInputs::default()
+        ..a.project.into_plan(PlanInputs::default())
     };
     let cfg = |plan: PlanInputs| -> Result<RunConfig, String> {
         Ok(RunConfig {
