@@ -4,6 +4,7 @@
 #   test-table
 #   test-table --remote [-p <package>]...
 #   test-table --split
+#   test-table --lists       (in --split's box)
 #
 # Runs, from the top of the checkout it lives in, stopping at the first that fails:
 #   cargo fmt --check
@@ -59,7 +60,11 @@
 # ignores, this Mac lists its own, and any test that runs here but is missing or ignored on Linux
 # must be in a macos_only module, or the run fails naming it, so no test is skipped on both sides.
 # Each side lists its tests twice over: cargo nextest list for the tests in test binaries, and cargo
-# test --doc -- --list for the doctests (answer 92eacabfd720).
+# test --doc -- --list for the doctests (answer 92eacabfd720). The box runs test-table --lists for its
+# side: each list is written whole to a file first, cargo's own output to files too, and printed only
+# then, with nothing else writing, each list ending with its cksum, which this side checks. So a line on
+# standard error, which the box's output carries in the same stream, can't land inside a list line and
+# drop a test from it (task 06d7b4ef2c75), and a list damaged on the way fails as damaged.
 # It ends with the last lines of both parts. A docs-only head (below) runs locally, with no box. A
 # Ctrl-C or a failure here stops the box, and the box is deleted as --remote deletes it.
 set -euo pipefail
@@ -195,6 +200,36 @@ nextest_listed() {
   awk 'NF == 2 { print $1 "|" $2 }' | LC_ALL=C sort -u
 }
 
+# --lists, in --split's box: the tests this machine has (all) and those it ignores (ignored), as
+# 'LIST <which> nextest|doc <line>' lines, each list ending with 'LIST end <which> <cksum of its lines>'.
+# Every list goes to a file first, and cargo's own output too (the doctests' list needs cargo's, which
+# names each crate), so nothing writes while they're printed: printed as they're made, a buffered
+# list's lines could be split by cargo's lines on standard error, which the box's output carries in the
+# same stream.
+box_lists() {
+  local d which run doc rc
+  d=$(mktemp -d)
+  echo "test-table: the tests Linux has, and those it ignores"
+  for which in all ignored; do
+    run=all doc=''
+    [ "$which" = all ] || { run=only; doc=--ignored; }
+    cargo nextest list --locked --workspace --run-ignored "$run" --message-format oneline \
+      >"$d/$which.nextest" 2>"$d/err" || { rc=$?; cat "$d/err" >&2; exit "$rc"; }
+    # shellcheck disable=SC2086 # $doc is one option or none
+    cargo test --locked --doc --workspace -- --list $doc >"$d/$which.doc" 2>&1 ||
+      { rc=$?; cat "$d/$which.doc" >&2; exit "$rc"; }
+    # awk 1: each line ends in a newline, the last one too, as the prefixed lines will.
+    awk 1 "$d/$which.nextest" >"$d/$which.n"
+    awk 1 "$d/$which.doc" >"$d/$which.d"
+  done
+  for which in all ignored; do
+    sed "s/^/LIST $which nextest /" "$d/$which.n"
+    sed "s/^/LIST $which doc /" "$d/$which.d"
+    echo "LIST end $which $(cat "$d/$which.n" "$d/$which.d" | cksum)"
+  done
+  rm -rf -- "$d"
+}
+
 # Stops the process group of job $1, if it still runs: SIGINT, which boat takes as a Ctrl-C and
 # deletes its box, and the tests' part passes on to timeout; 15 s on, SIGTERM; then SIGKILL, so nothing that
 # ignores or outlives a signal holds the run open.
@@ -281,19 +316,9 @@ split() {
   [[ $here_limit =~ ^[1-9][0-9]*$ ]] && [ "$here_limit" -le 1800 ] ||
     fail "TEST_TABLE_HERE_LIMIT must be 1 to 1800 seconds, not '$here_limit'"
   box_job='' here_job=''
-  # Each list ends with a line saying it was whole; under pipefail a failed cargo fails the box, and a
-  # list without its end line fails the run, so a list cut short can't hide a test. nextest's lines and
-  # the doctests' are marked apart, each read by its own parser; nextest's build output goes to
-  # standard error, unmarked, so it's never read as a test.
-  # shellcheck disable=SC2016 # expanded in the box
-  local lists='set -o pipefail
-echo "test-table: the tests Linux has, and those it ignores"
-cargo nextest list --locked --workspace --run-ignored all --message-format oneline | sed "s/^/LIST all nextest /"
-cargo test --locked --doc --workspace -- --list 2>&1 | sed "s/^/LIST all doc /"
-echo "LIST end all"
-cargo nextest list --locked --workspace --run-ignored only --message-format oneline | sed "s/^/LIST ignored nextest /"
-cargo test --locked --doc --workspace -- --list --ignored 2>&1 | sed "s/^/LIST ignored doc /"
-echo "LIST end ignored"'
+  # The box's lists, from this script's --lists there (box_lists): each ends with a line holding its
+  # cksum, so a list cut short, or with a line damaged on the way, fails the run and can't hide a test.
+  local lists='scripts/test-table --lists'
   # Stops both parts on every way out, then deletes the box by id if boat left it: a killed box part
   # can't. Both run as jobs with job control (set -m): each in its own process group, with SIGINT
   # not ignored, as a plain background job's would be (finding 87cfdf4680c7), and this shell waits
@@ -346,8 +371,17 @@ echo "LIST end ignored"'
   echo "== here, last lines"
   grep -E '^ *Summary \[|^test-table: ' "$split_tmp/here" | tail -n 8 || true
   [ "$rc" -eq 0 ] || { echo "test-table: the box's table exited $rc" >&2; exit "$rc"; }
-  { grep -qx 'LIST end all' "$split_tmp/box" && grep -qx 'LIST end ignored' "$split_tmp/box"; } ||
-    fail "the box's test lists didn't finish, so which tests need macOS is unknown"
+  local sum got
+  for which in all ignored; do
+    sum=$(sed -n "s/^LIST end $which //p" "$split_tmp/box" | tail -n 1)
+    [ -n "$sum" ] || fail "the box's test lists didn't finish, so which tests need macOS is unknown"
+    got=$({
+      sed -n "s/^LIST $which nextest //p" "$split_tmp/box"
+      sed -n "s/^LIST $which doc //p" "$split_tmp/box"
+    } | cksum)
+    [ "$got" = "$sum" ] ||
+      fail "the box's list of $which tests came back damaged (its cksum doesn't match), so which tests need macOS is unknown"
+  done
   [ -s "$split_tmp/linux-all" ] || fail "the box listed no tests, so which tests need macOS is unknown"
   # Runs here but is missing on Linux, or ignored there and not here: it must be one of the tests run here.
   escaped=$({
@@ -374,11 +408,16 @@ case "${1:-}" in
     remote
     exit 0
     ;;
+  --lists)
+    [ $# -eq 1 ] || fail "usage: test-table --lists"
+    box_lists
+    exit 0
+    ;;
   --split)
     # A docs-only head runs the local docs-only table below: nothing for a box to do.
     "$here/code-scope" docs-only origin/main HEAD >/dev/null 2>&1 || { split; exit 0; }
     ;;
-  *) fail "usage: test-table [--remote [-p <package>]... | --split]" ;;
+  *) fail "usage: test-table [--remote [-p <package>]... | --split | --lists]" ;;
 esac
 
 step() {

@@ -2103,7 +2103,10 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
 /// one box, as --remote runs it, and here only the macos_only tests, under nextest; it passes only if both
 /// do, and ends with both parts' last lines. Which tests need macOS comes from the code: a test that runs
 /// here but is missing or ignored on Linux, by the two sides' lists (nextest's, and cargo test --doc's for
-/// doctests), must be in a macos_only module.
+/// doctests), must be in a macos_only module. The box's lists come from the real test-table --lists, with a
+/// cargo that writes its own lines on standard error in the middle of its list's lines, as cargo nextest
+/// list's build output can land (task 06d7b4ef2c75): they arrive whole, and a list damaged on the way
+/// fails as damaged.
 /// A failure here stops the box and deletes it; a docs-only head uses no box.
 #[test]
 fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
@@ -2157,7 +2160,30 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
                echo '     Summary [   1.000s] 1 test run: 1 passed, 0 skipped'; [ -z \"$FAIL_HERE\" ] || exit \"$FAIL_HERE\" ;;\n\
              esac\n",
         );
+        // The box's cargo, for test-table --lists: prints the box's lists ($T/linux-{all,ignored}.{nextest,doc}).
+        // nextest's comes in pieces with a line of cargo's on standard error between them, mid-line; the
+        // doctests' with cargo's whole lines between its own, as cargo and the doctests' harness, each
+        // writing its own lines, interleave in the one stream that list is read from.
+        let box_stubs = tmp.path().join("box-stubs");
+        std::fs::create_dir_all(&box_stubs).unwrap();
+        write_executable(
+            &box_stubs.join("cargo"),
+            "#!/bin/bash
+             case \"$*\" in
+             *'nextest list'*'--run-ignored only'*) f=ignored.nextest ;;
+             *'nextest list'*) f=all.nextest ;;
+             *'--list --ignored'*) f=ignored.doc ;;
+             *--list*) f=all.doc ;;
+             *) exit 1 ;;
+             esac
+             while IFS= read -r line; do
+               if [[ $f == *nextest ]]; then printf '%s' \"${line:0:3}\"; echo '    Finished `test` profile' >&2; printf '%s\\n' \"${line:3}\"
+               else echo '     Running unittests' >&2; printf '%s\\n' \"$line\"; fi
+             done <\"$T/linux-$f\"
+",
+        );
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let box_path = format!("{}:{}", box_stubs.display(), std::env::var("PATH").unwrap());
         let log = tmp.path().join("log");
         let t = |name: &str| tmp.path().join(name);
         let read = |name: &str| std::fs::read_to_string(t(name)).unwrap_or_default();
@@ -2184,13 +2210,16 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
             std::fs::write(t("mac-ignored.nextest"), nextest("", mac_ign)).unwrap();
             std::fs::write(t("mac-all.doc"), doc("", mac_all)).unwrap();
             std::fs::write(t("mac-ignored.doc"), doc("", mac_ign)).unwrap();
-            let linux = nextest("LIST all nextest ", linux_all)
-                + &doc("LIST all doc ", linux_all)
-                + "LIST end all\n"
-                + &nextest("LIST ignored nextest ", linux_ign)
-                + &doc("LIST ignored doc ", linux_ign)
-                + "LIST end ignored\n";
-            std::fs::write(t("linux"), linux).unwrap();
+            std::fs::write(t("linux-all.nextest"), nextest("", linux_all)).unwrap();
+            std::fs::write(t("linux-ignored.nextest"), nextest("", linux_ign)).unwrap();
+            std::fs::write(t("linux-all.doc"), doc("", linux_all)).unwrap();
+            std::fs::write(t("linux-ignored.doc"), doc("", linux_ign)).unwrap();
+            let mut c = command(&dir, "scripts/test-table", &["--lists"]);
+            let lists = c.env("PATH", &box_path).env("T", tmp.path()).output().unwrap();
+            let linux = String::from_utf8(lists.stdout).unwrap();
+            assert!(lists.status.success(), "{scripts}: --lists: {}", String::from_utf8_lossy(&lists.stderr));
+            assert!(!linux.contains("Finished"), "{scripts}: nextest's standard error in the lists: {linux}");
+            std::fs::write(t("linux"), &linux).unwrap();
         };
         // Fails, rather than hangs, if the run outlasts 120 s: it then stops its process group. With
         // `stop_on`, a Ctrl-C goes to the run's group once that file exists.
@@ -2314,14 +2343,25 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
         assert!(text(&out).contains("lists didn't finish"), "{scripts}: {}", text(&out));
         setup(&both, &[], &both, &[]);
-        let cut = nextest("LIST all nextest ", &both)
-            + &doc("LIST all doc ", &both)
-            + "LIST end all\n"
-            + &nextest("LIST ignored nextest ", &[]);
+        let whole = read("linux");
+        let cut = &whole[..whole.find("LIST end ignored").expect("the end of the ignored list")];
         std::fs::write(t("linux"), cut).unwrap();
         let out = split("0", "0", "");
         assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
         assert!(text(&out).contains("lists didn't finish"), "{scripts}: {}", text(&out));
+
+        // A line damaged on the way, here by a line of standard error inside it, fails as damaged: it can't
+        // drop a test from the list and pass it off as one that needs macOS.
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        let whole = read("linux");
+        let line = "LIST all nextest agent plain\n";
+        assert!(whole.contains(line), "{scripts}: {whole}");
+        std::fs::write(t("linux"), whole.replace(line, "LIST all nextest ag    Finished `test` profile\nent plain\n"))
+            .unwrap();
+        let out = split("0", "0", "");
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("list of all tests came back damaged"), "{scripts}: {}", text(&out));
+        assert!(!text(&out).contains("neither part runs them"), "{scripts}: {}", text(&out));
 
         // The tests here fail while the box runs (its 10 minutes): the box is stopped and deleted at once.
         setup(&both, &[], &both, &["macos_only::sandboxed"]);
