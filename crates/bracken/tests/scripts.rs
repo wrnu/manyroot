@@ -3433,16 +3433,25 @@ fn set_mtimes(path: &Path, when: std::time::SystemTime) {
 
 /// cleanup (owner process 11f1ac552f26) on stubbed worktrees, with HOME and TMPDIR throwaway directories
 /// and a stub cargo that logs any call. Of this repo's worktrees, it removes only the clean, unused ones
-/// idle 2 hours under T3's root (t3-<id>) or TMPDIR, and removes target/ only in a builder's worktree
-/// whose branch is squash-merged into origin/main; it clears only idle scratch entries. A dirty, in-use,
-/// young, unmerged, key-holding or outside worktree stays, each with its reason. The dry run changes
-/// nothing, and both runs end with a summary and exit 0.
+/// idle 2 hours under T3's root (t3-<id>) or TMPDIR. A builder's worktree whose branch is squash-merged
+/// into origin/main loses only its target/ while origin still has the branch; once origin hasn't, the
+/// worktree and its branch go (task 268f5a72c4f2), also when main has since changed the lines it changed,
+/// so that merging it conflicts but its patch reverse-applies where it landed; but only if its tip is the
+/// head a current pr claim names. The reviewer's repro (finding e2741e2be8cc) stays: a local commit after
+/// the squash merge that reverts part of the branch, which its net patch can't show. So does a branch no
+/// pr claim names. One holding ignored files besides target/ stays, as does anything named pg-*
+/// (PineGrove's). It clears only idle scratch entries. A dirty, in-use, young, unmerged,
+/// key-holding or outside worktree stays, each with its reason. The dry run changes nothing, and both runs
+/// end with a summary and exit 0.
 #[test]
 fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_run_changes_nothing() {
     for scripts in SCRIPTS {
         let cleanup = repo_root().join(scripts).join("cleanup");
-        let (tmp, dir) = repo(&[("scripts/cleanup", &cleanup)], ".bracken/\n/target\n", |dir| {
+        let (tmp, dir) = repo(&[("scripts/cleanup", &cleanup)], ".bracken/\n/target\n*.log\n", |dir| {
             std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+            std::fs::write(dir.join("shared.txt"), "a\nb\nc\n").unwrap();
+            std::fs::write(dir.join("f.rs"), "one();\ntwo();\n").unwrap();
+            std::fs::write(dir.join("g.txt"), "x\n").unwrap();
         });
         let t = tmp.path();
         let git = |dir: &Path, args: &[&str]| {
@@ -3477,11 +3486,23 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         std::fs::write(t3.join("t3-dirty/wip"), "work").unwrap();
         std::fs::create_dir_all(t3.join("t3-key/.bracken/identities")).unwrap();
         std::fs::write(t3.join("t3-key/.bracken/identities/k"), "key").unwrap();
-        for branch in ["merged", "unmerged", "linked"] {
+        for branch in ["merged", "unmerged", "linked", "pushed", "junk", "unclaimed"] {
             add(&t3.join(branch), Some(branch));
             commit(&t3.join(branch), branch);
         }
-        for branch in ["merged", "unmerged"] {
+        // The reviewer's repro: "reverted" changes two lines of f.rs and appends to g.txt.
+        add(&t3.join("reverted"), Some("reverted"));
+        std::fs::write(t3.join("reverted/f.rs"), "one();\ndbg();\ntwo();\nkeep();\n").unwrap();
+        std::fs::write(t3.join("reverted/g.txt"), "x\ny\n").unwrap();
+        git(&t3.join("reverted"), &["commit", "-qam", "c1"]);
+        // "later" changes a line of a file main had, which main changes again after the squash merge.
+        add(&t3.join("later"), Some("later"));
+        std::fs::write(t3.join("later/shared.txt"), "a\nB\nc\n").unwrap();
+        git(&t3.join("later"), &["commit", "-qam", "later"]);
+        // origin keeps "pushed" after the merge.
+        git(&t3.join("pushed"), &["push", "-q", "origin", "pushed"]);
+        std::fs::write(t3.join("junk/notes.log"), "ignored, not target/").unwrap();
+        for branch in ["merged", "unmerged", "later", "pushed"] {
             std::fs::create_dir_all(t3.join(branch).join("target/debug")).unwrap();
             std::fs::write(t3.join(branch).join("target/debug/big"), "build").unwrap();
         }
@@ -3491,10 +3512,28 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         std::fs::write(shared.join("other-build"), "build").unwrap();
         std::os::unix::fs::symlink(&shared, t3.join("linked/target")).unwrap();
         // The forge squash-merges "merged" and "linked": main gets their changes, not their commits.
-        for branch in ["merged", "linked"] {
+        for branch in ["merged", "linked", "later", "pushed", "junk", "unclaimed", "reverted"] {
             git(&dir, &["merge", "-q", "--squash", branch]);
             git(&dir, &["commit", "-qm", &format!("{branch} (#1)")]);
         }
+        // Each pushed and claimed head, as a builder's pr claim names it; "unclaimed" has none.
+        bk(&dir, &["init", "--name", "cleanup"]);
+        bk(&dir, &["id", "new", "builder"]);
+        for (n, branch) in ["merged", "linked", "later", "pushed", "junk", "reverted"].iter().enumerate() {
+            let head = String::from_utf8(run(&dir, "git", &["rev-parse", branch]).stdout).unwrap();
+            let claim = format!("PR #{} {branch} @ {}: {branch}", n + 1, head.trim());
+            bk(&dir, &["claim", &claim, "--tag", "pr", "--as", "builder"]);
+        }
+        // Then, unpushed, "reverted" drops dbg() and reverts g.txt: its net patch now shows only keep(),
+        // which main has, so its content alone would call it merged.
+        std::fs::write(t3.join("reverted/f.rs"), "one();\ntwo();\nkeep();\n").unwrap();
+        std::fs::write(t3.join("reverted/g.txt"), "x\n").unwrap();
+        git(&t3.join("reverted"), &["commit", "-qam", "c2"]);
+        let c2 = String::from_utf8(run(&dir, "git", &["rev-parse", "reverted"]).stdout).unwrap();
+        std::fs::write(dir.join("shared.txt"), "a\nB2\nc\n").unwrap();
+        git(&dir, &["commit", "-qam", "main changes the line again"]);
+        let conflict = run(&dir, "git", &["merge-tree", "--write-tree", "main", "later"]);
+        assert!(!conflict.status.success(), "{scripts}: merging later should conflict");
         git(&dir, &["push", "-q", "origin", "main"]);
         add(&scratch.join("task1/tree"), None);
         add(&t.join("elsewhere/tree"), None);
@@ -3504,6 +3543,10 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         git(&origin, &["branch", "extra", "main"]);
         std::fs::create_dir_all(scratch.join("old/deep")).unwrap();
         std::fs::write(scratch.join("old/deep/file"), "x").unwrap();
+        // Another project's, though idle in the scratch root, and a worktree named like one.
+        std::fs::create_dir_all(scratch.join("pg-old")).unwrap();
+        std::fs::write(scratch.join("pg-old/file"), "x").unwrap();
+        add(&t3.join("pg-tree"), None);
 
         // Everything so far was last used 3 hours ago; what follows is new.
         set_mtimes(t, std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 3600));
@@ -3546,7 +3589,14 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         let expect = [
             ("/t3-clean", "remove"),
             ("/task1/tree", "remove"),
-            ("/merged", "clean"),
+            ("/merged", "remove"),
+            ("/later", "remove"),
+            ("/pushed", "clean"),
+            ("/junk", "won't touch"),
+            ("/reverted", "keep"),
+            ("/unclaimed", "keep"),
+            ("bracken-scratch/pg-old", "won't touch"),
+            ("/pg-tree", "won't touch"),
             ("/linked", "won't touch"),
             ("bracken-scratch/old", "clear"),
             ("/t3-dirty", "won't touch"),
@@ -3565,7 +3615,19 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         assert!(line(&dry, "/t3-busy").contains("in use by pid"), "{scripts}: {dry}");
         assert!(line(&dry, "/unmerged").contains("isn't merged"), "{scripts}: {dry}");
         assert!(line(&dry, "elsewhere/tree").contains("outside"), "{scripts}: {dry}");
-        assert!(dry.lines().last().unwrap().contains("4 to do with --apply"), "{scripts}: {dry}");
+        assert!(
+            line(&dry, "/merged").contains("worktree and branch merged") && line(&dry, "/merged").contains("(merged)")
+        );
+        let squash = ["log", "--format=%h", "--fixed-strings", "--grep=later (#1)", "main"];
+        let landed = String::from_utf8(run(&dir, "git", &squash).stdout).unwrap();
+        assert!(line(&dry, "/later").contains(&format!("(in {})", landed.trim())), "{scripts}: {dry}");
+        assert!(line(&dry, "/junk").contains("ignored files besides target/: notes.log"), "{scripts}: {dry}");
+        assert!(
+            line(&dry, "/reverted").contains("not its pr claim's head")
+                && line(&dry, "/reverted").contains("moved since")
+        );
+        assert!(line(&dry, "/unclaimed").contains("no current pr claim names it"), "{scripts}: {dry}");
+        assert!(dry.lines().last().unwrap().contains("6 to do with --apply"), "{scripts}: {dry}");
         assert_eq!(worktrees(), before, "{scripts}: the dry run changed the worktrees");
         assert!(!log.exists(), "{scripts}: the dry run ran cargo");
         assert_eq!(refs(), refs_before, "{scripts}: the dry run changed the refs");
@@ -3578,13 +3640,38 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
             s.wait().unwrap();
         }
         assert!(refs().contains("refs/remotes/origin/extra"), "{scripts}: --apply didn't fetch");
-        assert!(applied.lines().last().unwrap().contains("4 done"), "{scripts}: {applied}");
+        assert!(applied.lines().last().unwrap().contains("6 done"), "{scripts}: {applied}");
         let after = worktrees();
-        for gone in ["t3-clean", "task1/tree"] {
+        for gone in ["t3-clean", "task1/tree", "/merged", "/later"] {
             assert!(!after.contains(gone), "{scripts}: {gone} is still a worktree: {after}");
         }
+        let branches = String::from_utf8(run(&dir, "git", &["branch", "--format=%(refname:short)"]).stdout).unwrap();
+        let branch_states = [
+            ("merged", false),
+            ("later", false),
+            ("pushed", true),
+            ("junk", true),
+            ("unmerged", true),
+            ("reverted", true),
+            ("unclaimed", true),
+        ];
+        for (branch, stays) in branch_states {
+            assert_eq!(branches.lines().any(|b| b == branch), stays, "{scripts}: branch {branch}: {branches}");
+        }
+        assert!(line(&applied, "/later").contains("worktree and branch later"), "{scripts}: {applied}");
+        assert!(applied.lines().any(|l| l.starts_with("removed") && l.contains("/merged: and branch merged")));
+        assert!(!t3.join("merged").exists() && !t3.join("later").exists(), "{scripts}");
+        assert!(!t3.join("pushed/target").exists() && t3.join("pushed/pushed").exists(), "{scripts}: {applied}");
+        assert!(t3.join("junk/notes.log").exists(), "{scripts}: {applied}");
+        let still = String::from_utf8(run(&dir, "git", &["rev-parse", "reverted"]).stdout).unwrap();
+        assert_eq!(still, c2, "{scripts}: the unpushed commit was lost: {applied}");
+        assert!(t3.join("reverted/f.rs").exists() && t3.join("unclaimed").exists(), "{scripts}: {applied}");
+        assert!(scratch.join("pg-old/file").exists() && t3.join("pg-tree").exists(), "{scripts}: {applied}");
+        assert!(line(&applied, "/pg-tree").contains("named pg-*"), "{scripts}: {applied}");
         assert!(!t3.join("t3-clean").exists() && !scratch.join("old").exists(), "{scripts}: {applied}");
-        for stays in ["t3-dirty", "t3-busy", "t3-key", "t3-young", "/merged", "unmerged", "/linked", "elsewhere/tree"] {
+        for stays in
+            ["t3-dirty", "t3-busy", "t3-key", "t3-young", "/pushed", "/junk", "unmerged", "/linked", "elsewhere/tree"]
+        {
             assert!(after.contains(stays), "{scripts}: {stays} was removed: {applied}");
         }
         // git worktree list quotes a backslash, so look for the directory itself.
@@ -3593,7 +3680,7 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         assert!(scratch.join("new/file").exists() && home.join("bracken-runs/run1").exists(), "{scripts}");
         // target/ is removed directly, never through cargo, and a symlinked one isn't followed.
         assert!(!log.exists(), "{scripts}: cargo ran: {applied}");
-        assert!(!t3.join("merged/target").exists() && t3.join("unmerged/target/debug/big").exists(), "{scripts}");
+        assert!(t3.join("unmerged/target/debug/big").exists(), "{scripts}");
         assert!(line(&applied, "/linked").contains("symlink") && shared.join("other-build").exists(), "{scripts}");
     }
 }

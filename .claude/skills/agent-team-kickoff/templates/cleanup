@@ -11,18 +11,30 @@
 #   - this repo's git worktrees under T3's ~/.t3/worktrees/<main checkout's name> or under $TMPDIR:
 #       t3-<id> (delegated children's and the owner's threads') and those under $TMPDIR (review and verify
 #       checkouts) are removed with git worktree remove;
-#       the others under T3's root (builders') have their target/ removed once their branch is merged into
-#       origin/main (not with cargo clean, which also clears a build dir that may be shared);
+#       the others under T3's root (builders') once their branch's changes are all in origin/main (below):
+#       if origin still has the branch, only their target/ is removed (not with cargo clean, which also
+#       clears a build dir that may be shared); once it's gone, the forge having deleted it on merging,
+#       the worktree is removed with git worktree remove and its local branch with git branch -D (task
+#       268f5a72c4f2), if nothing but target/ is ignored in it and its tip is the head a current pr
+#       claim in the Ground names for it ('PR #<n> <branch> @ <sha>: ...', process section 4.3), and it
+#       prints both. A tip that moved since, or a branch no pr claim names, stays, saying so (finding
+#       e2741e2be8cc: a local commit after the squash merge that undoes part of the branch drops out of
+#       its patch, so only the tip it pushed and claimed can be judged by it). The remote-tracking ref's
+#       reflog can't say: git fetch --prune deletes it with the ref;
 #   - the entries of $TMPDIR/bracken-scratch (the team's scratch root, one entry per task), removed.
 # Each action needs what it acts on to be clean (no uncommitted files and no commits only it holds),
-# unused (no process has a file open in it: lsof) and idle for 2 hours. With --apply, a worktree action
-# also needs git fetch --prune origin to work first, so origin/main and the remote branches are current;
-# the dry run fetches nothing and judges by the refs as they stand.
+# unused (no process has a file open in it: lsof) and idle for 2 hours. A branch's changes are all in
+# origin/main when it has commits of its own, and merging it into origin/main changes nothing, or, as
+# after the forge's squash merge with later commits on main, its own patch since its merge base with
+# origin/main reverse-applies to the tree of a commit on origin/main's first-parent line since then:
+# every file it changed held there what the branch made of it, whatever main has done since. With --apply,
+# a worktree action also needs git fetch --prune origin to work first, so origin/main and the remote
+# branches are current; the dry run fetches nothing and judges by the refs as they stand.
 #
 # It never touches the main checkout, .bracken/, ~/bracken-runs, a worktree holding ignored files under
-# .bracken/ (an identity's key), other repos, or anything outside those places. Each line it prints says
-# what it does or why not; "won't touch" lines (dirty, outside its places) are for the manager's weekly
-# look.
+# .bracken/ (an identity's key), anything named pg-* (PineGrove's), other repos, or anything outside those
+# places. Each line it prints says what it does or why not; "won't touch" lines (dirty, outside its
+# places) are for the manager's weekly look.
 set -uo pipefail
 
 usage() { echo "usage: cleanup [--apply]" >&2; exit 2; }
@@ -60,6 +72,8 @@ inside() { [ -n "$2" ] && { [ "$1" = "$2" ] || [[ $1 == "$2"/* ]]; }; }
 forbidden() {
   inside "$1" "$main/.bracken" || inside "$1" "$runs" || inside "$runs" "$1" || inside "$main" "$1"
 }
+# Named pg-*: another project's (PineGrove), wherever it is.
+other_project() { [[ ${1##*/} == pg-* ]]; }
 show() { [[ $1 == "$HOME"/* ]] && echo "~${1#"$HOME"}" || echo "$1"; }
 gb() { awk -v k="$1" 'BEGIN { printf "%.1f GB", k / 1048576 }'; }
 kb() { du -sk "$1" 2>/dev/null | awk '{ k += $1 } END { print k + 0 }'; }
@@ -109,14 +123,56 @@ idle() {
   echo $(((now - newest) / 60))
 }
 
-# The branch's changes are all in origin/main: it has commits of its own, and merging it into origin/main
-# changes nothing (a squash merge leaves it no ancestor of main). A new branch with nothing of its own isn't.
+# The branch's changes are all in origin/main (see the header). Sets landed to how: "merged", or "in <main
+# commit>" for the newest commit on origin/main's first-parent line since the merge base whose tree its own
+# patch reverse-applies to, checked in a throwaway index, so no worktree's index or files change. Only the
+# commits that touch the files it changed are tried, at most 200. git apply wants each hunk's context
+# exactly. A new branch with nothing of its own isn't merged.
 merged() {
-  local tip tree
+  local tip tree base idx patch c rc=1 paths=()
+  landed=''
   tip=$(git rev-parse -q --verify "refs/heads/$1^{commit}") || return 1
   [ -n "$(git rev-list -n 1 "origin/main..$tip")" ] || return 1
-  tree=$(git merge-tree --write-tree origin/main "$tip" 2>/dev/null | head -1) || return 1
-  [ "$tree" = "$(git rev-parse 'origin/main^{tree}')" ]
+  # A conflict makes merge-tree fail: then only the patch can say.
+  if tree=$(git merge-tree --write-tree origin/main "$tip" 2>/dev/null | head -1) &&
+    [ "$tree" = "$(git rev-parse 'origin/main^{tree}')" ]; then
+    landed=merged
+    return 0
+  fi
+  base=$(git merge-base origin/main "$tip") || return 1
+  mapfile -d '' -t paths < <(git diff --no-renames --name-only -z "$base" "$tip")
+  [ ${#paths[@]} -gt 0 ] || return 1
+  idx=$(mktemp -d) || return 1
+  patch="$idx/patch"
+  if git diff --no-renames --binary --full-index "$base" "$tip" >"$patch"; then
+    for c in $(git --literal-pathspecs rev-list --first-parent --max-count=200 "$base..origin/main" \
+      -- "${paths[@]}"); do
+      if GIT_INDEX_FILE="$idx/index" git read-tree "$c" 2>/dev/null &&
+        GIT_INDEX_FILE="$idx/index" git apply --cached --check -R "$patch" 2>/dev/null; then
+        landed="in $(git rev-parse --short "$c")"
+        rc=0
+        break
+      fi
+    done
+  fi
+  rm -rf -- "$idx"
+  return "$rc"
+}
+# Whether origin has branch $1 (as last fetched).
+on_origin() { git rev-parse -q --verify "refs/remotes/origin/$1" >/dev/null; }
+# The heads the Ground's current pr claims give branch $1, one a line; returns 2 if the Ground can't be
+# read. The claims are read once, through the scripts/bk beside this script.
+pr_read=false pr_ok=false pr_claims=''
+claimed_heads() {
+  if ! $pr_read; then
+    pr_read=true
+    command -v jq >/dev/null &&
+      pr_claims=$("$here/bk" log --tag pr --current --json </dev/null 2>/dev/null |
+        jq -r '.[] | select(.retracted | not) | (.body.statement // "") | split("\n")[0]') && pr_ok=true
+  fi
+  $pr_ok || return 2
+  B=$1 awk '$1 == "PR" && $2 ~ /^#[0-9]+$/ && $3 == ENVIRON["B"] && $4 == "@" && $5 ~ /^[0-9a-f]{40}:$/ {
+    print substr($5, 1, 40) }' <<<"$pr_claims"
 }
 
 if $apply; then echo "cleanup: applying"; else echo "cleanup: dry run; nothing changes without --apply"; fi
@@ -142,6 +198,7 @@ worktree() {
   fi
   if [ -z "$kind" ]; then untouched "$p" "outside the places it cleans"; return; fi
   if forbidden "$p"; then untouched "$p" "holds or is inside the main checkout, .bracken/ or ~/bracken-runs"; return; fi
+  if other_project "$p"; then untouched "$p" "named pg-*, another project's"; return; fi
   if [ "$locked" = true ]; then untouched "$p" "locked"; return; fi
   $fetched || { keep "$p" "not checked: git fetch failed"; return; }
   # A deleted branch leaves HEAD naming no commit, and every file looks staged.
@@ -181,6 +238,48 @@ worktree() {
   # The worktree's own target/, removed directly: cargo clean follows CARGO_TARGET_DIR, build.target-dir
   # and build.build-dir, any of which may be shared (findings 1fac2c0f426c, a3cb4a1ac00d).
   if [ -L "$p/target" ]; then untouched "$p" "target/ is a symlink; not followed"; return; fi
+  if ! on_origin "$branch"; then
+    # Merged and gone from origin: the whole worktree and its branch go, if its tip is the head it last
+    # pushed and claimed, and only target/ is ignored in it, since git worktree remove would take any other
+    # ignored file with it.
+    local ignored heads tip
+    tip=$(git rev-parse "refs/heads/$branch")
+    if ! heads=$(claimed_heads "$branch"); then
+      keep "$p" "branch $branch is merged by content, but the Ground's pr claims couldn't be read (jq, scripts/bk)"
+      return
+    fi
+    if [ -z "$heads" ]; then
+      keep "$p" "branch $branch is merged by content, but no current pr claim names it: never pushed and claimed"
+      return
+    fi
+    if ! grep -qxF "$tip" <<<"$heads"; then
+      keep "$p" "branch $branch is at ${tip:0:8}, not its pr claim's head $(head -c 8 <<<"$heads"): it moved since"
+      return
+    fi
+    ignored=$(git -C "$p" status --porcelain --ignored 2>/dev/null | grep -vx '!! target/' | head -1)
+    if [ -n "$ignored" ]; then
+      untouched "$p" "merged, but holds ignored files besides target/: ${ignored#!! } (for the manager)"
+      return
+    fi
+    size=$(kb "$p")
+    why="its changes are all in origin/main ($landed), origin has no $branch, nothing running"
+    say remove "$p" "worktree and branch $branch: $why, idle $((n / 60)) h ($(gb "$size"))"
+    acted=$((acted + 1))
+    $apply || { freed=$((freed + size)); return; }
+    if ! git worktree remove "$p" </dev/null 2>&1 | sed 's/^/  /' || [ -e "$p" ]; then
+      failed=$((failed + 1))
+      say failed "$p" "git worktree remove refused it; branch $branch kept"
+      return
+    fi
+    freed=$((freed + size))
+    if git branch -D "$branch" </dev/null 2>&1 | sed 's/^/  /'; then
+      say removed "$p" "and branch $branch"
+    else
+      failed=$((failed + 1))
+      say failed "$p" "removed, but git branch -D $branch failed"
+    fi
+    return
+  fi
   if [ ! -d "$p/target" ]; then keep "$p" "branch $branch is merged; no target/ to clean"; return; fi
   if [ "$(real "$p/target")" != "$p/target" ]; then untouched "$p" "target/ resolves outside it"; return; fi
   if [ ! -f "$p/Cargo.toml" ]; then untouched "$p" "has target/ but no Cargo.toml"; return; fi
@@ -221,6 +320,7 @@ elif [ -d "$scratch" ]; then
   for e in "$root"/* "$root"/.[!.]* "$root"/..?*; do
     [ -e "$e" ] || [ -L "$e" ] || continue
     if forbidden "$e"; then untouched "$e" "holds .bracken/ or ~/bracken-runs"; continue; fi
+    if other_project "$e"; then untouched "$e" "named pg-*, another project's"; continue; fi
     if [ -n "$(find "$e" -name .git -print 2>/dev/null | head -1)" ]; then
       untouched "$e" "holds a git checkout; remove it with git worktree remove (for the manager)"
       continue
