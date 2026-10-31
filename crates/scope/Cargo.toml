@@ -14,3 +14,6 @@ determinator = "0.13"
 guppy = "0.19"
 proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
 tempfile.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

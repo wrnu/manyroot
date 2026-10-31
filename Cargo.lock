@@ -218,6 +218,7 @@ dependencies = [
  "determinator",
  "guppy",
  "proc-macro2",
+ "serde_json",
  "tempfile",
 ]
 

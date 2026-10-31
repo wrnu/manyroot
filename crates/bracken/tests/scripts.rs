@@ -3515,7 +3515,8 @@ fn set_mtimes(path: &Path, when: std::time::SystemTime) {
 /// pr claim names. One holding ignored files besides target/ stays, as does anything named pg-*
 /// (PineGrove's). It clears only idle scratch entries. A dirty, in-use, young, unmerged,
 /// key-holding or outside worktree stays, each with its reason. The dry run changes nothing, and both runs
-/// end with a summary and exit 0.
+/// end with a summary and exit 0. Each run reads the pr claims once, however many branches it judges by
+/// them (finding 36e8f80a34ab): a stub jq counts the reads.
 #[test]
 fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_run_changes_nothing() {
     for scripts in SCRIPTS {
@@ -3631,6 +3632,11 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         std::fs::create_dir_all(&stubs).unwrap();
         write_executable(&stubs.join("cargo"), "#!/bin/sh\necho \"$PWD|$*\" >>\"$LOG\"\n");
         let log = t.join("cargo.log");
+        let jq = String::from_utf8(run(&dir, "sh", &["-c", "command -v jq"]).stdout).unwrap();
+        let jq_log = t.join("jq.log");
+        let stub = format!("#!/bin/sh\necho read >>'{}'\nexec '{}' \"$@\"\n", jq_log.display(), jq.trim());
+        write_executable(&stubs.join("jq"), &stub);
+        let reads = || std::fs::read_to_string(&jq_log).unwrap_or_default().lines().count();
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
         let busy = t3.join("t3-busy");
         let mut sleeper = Command::new("sleep").arg("120").current_dir(&busy).spawn().unwrap();
@@ -3659,6 +3665,7 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         let before = worktrees();
 
         let dry = cleanup(&[]);
+        assert_eq!(reads(), 1, "{scripts}: the dry run read the pr claims more than once: {dry}");
         let expect = [
             ("/t3-clean", "remove"),
             ("/task1/tree", "remove"),
@@ -3708,6 +3715,7 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         assert!(scratch.join("old/deep/file").exists() && t3.join("t3-clean").exists(), "{scripts}");
 
         let applied = cleanup(&["--apply"]);
+        assert_eq!(reads(), 2, "{scripts}: --apply read the pr claims more than once: {applied}");
         for s in [&mut sleeper, &mut slashed] {
             s.kill().unwrap();
             s.wait().unwrap();

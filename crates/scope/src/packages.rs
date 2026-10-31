@@ -37,7 +37,8 @@ pub fn rules() -> Result<DeterminatorRules> {
 /// there, so nothing is fetched and the lock file is taken as it is. It's filtered to this host's
 /// platform: a build fetches only its own platform's crates, and without the filter cargo metadata needs
 /// every platform's (a Linux box lacks Windows' anstyle-wincon). The workspace's packages and the edges
-/// between them hold on every platform here, so the filter loses nothing the determinator reads.
+/// between them hold on every platform here, so the filter loses nothing the determinator reads; the test
+/// `no_edge_between_workspace_packages_is_platform_specific` keeps that so (task 7000db5f8726).
 pub fn graph_at(repo: &Path, commit: &str) -> Result<PackageGraph> {
     let dir = tempfile::tempdir().context("making a directory to unpack it in")?;
     let mut archive = Command::new("git")
@@ -75,12 +76,19 @@ pub fn graph_at(repo: &Path, commit: &str) -> Result<PackageGraph> {
     metadata.build_graph().with_context(|| format!("building the package graph of {commit}"))
 }
 
-/// This host's target triple, as rustc names it.
+/// This host's target triple, as rustc names it: `$RUSTC` if it names one, as cargo takes it, else `rustc`.
 fn host() -> Result<String> {
-    let out = Command::new("rustc").arg("-vV").stdin(Stdio::null()).output().context("running rustc -vV")?;
-    ensure!(out.status.success(), "rustc -vV failed: {}", String::from_utf8_lossy(&out.stderr));
+    let rustc = std::env::var_os("RUSTC").filter(|r| !r.is_empty()).unwrap_or_else(|| "rustc".into());
+    let shown = rustc.to_string_lossy().into_owned();
+    let out = Command::new(&rustc)
+        .arg("-vV")
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("running {shown} -vV"))?;
+    ensure!(out.status.success(), "{shown} -vV failed: {}", String::from_utf8_lossy(&out.stderr));
     let text = String::from_utf8_lossy(&out.stdout);
-    let host = text.lines().find_map(|l| l.strip_prefix("host: ")).context("rustc -vV named no host")?;
+    let host =
+        text.lines().find_map(|l| l.strip_prefix("host: ")).with_context(|| format!("{shown} -vV named no host"))?;
     Ok(host.trim().to_owned())
 }
 

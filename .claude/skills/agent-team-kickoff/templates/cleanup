@@ -160,9 +160,10 @@ merged() {
 }
 # Whether origin has branch $1 (as last fetched).
 on_origin() { git rev-parse -q --verify "refs/remotes/origin/$1" >/dev/null; }
-# The heads the Ground's current pr claims give branch $1, one a line; returns 2 if the Ground can't be
-# read. The claims are read once, through the scripts/bk beside this script.
-pr_read=false pr_ok=false pr_claims=''
+# Puts in $claimed the heads the Ground's current pr claims give branch $1, one a line; returns 2 if the
+# Ground can't be read. The claims are read once a run, through the scripts/bk beside this script, so it
+# must run in this shell, never in $(...), or the next call reads them again (finding 36e8f80a34ab).
+pr_read=false pr_ok=false pr_claims='' claimed=''
 claimed_heads() {
   if ! $pr_read; then
     pr_read=true
@@ -171,8 +172,8 @@ claimed_heads() {
         jq -r '.[] | select(.retracted | not) | (.body.statement // "") | split("\n")[0]') && pr_ok=true
   fi
   $pr_ok || return 2
-  B=$1 awk '$1 == "PR" && $2 ~ /^#[0-9]+$/ && $3 == ENVIRON["B"] && $4 == "@" && $5 ~ /^[0-9a-f]{40}:$/ {
-    print substr($5, 1, 40) }' <<<"$pr_claims"
+  claimed=$(B=$1 awk '$1 == "PR" && $2 ~ /^#[0-9]+$/ && $3 == ENVIRON["B"] && $4 == "@" && $5 ~ /^[0-9a-f]{40}:$/ {
+    print substr($5, 1, 40) }' <<<"$pr_claims")
 }
 
 if $apply; then echo "cleanup: applying"; else echo "cleanup: dry run; nothing changes without --apply"; fi
@@ -244,10 +245,11 @@ worktree() {
     # ignored file with it.
     local ignored heads tip
     tip=$(git rev-parse "refs/heads/$branch")
-    if ! heads=$(claimed_heads "$branch"); then
+    if ! claimed_heads "$branch"; then
       keep "$p" "branch $branch is merged by content, but the Ground's pr claims couldn't be read (jq, scripts/bk)"
       return
     fi
+    heads=$claimed
     if [ -z "$heads" ]; then
       keep "$p" "branch $branch is merged by content, but no current pr claim names it: never pushed and claimed"
       return
