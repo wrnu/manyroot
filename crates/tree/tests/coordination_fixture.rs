@@ -35,6 +35,7 @@ fn the_coordination_fixture_reads_unchanged_with_weave_linked_in() {
     assert!(ix.check_results().is_empty() && ix.goal_links().is_empty());
     assert!(ix.file_hashes().is_empty());
     let lines = Lines::build(g, &ix);
+    assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     assert_eq!(lines.lines().count(), 0);
     assert_eq!(lines.default_line(), None);
     let checks = Checks::build(g, &ix, &lines);

@@ -165,6 +165,7 @@ impl World {
     fn checks(&self) -> (Index, Lines, Checks) {
         let ix = Index::build(&self.g);
         let lines = Lines::build(&self.g, &ix);
+        assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
         let checks = Checks::build(&self.g, &ix, &lines);
         (ix, lines, checks)
     }

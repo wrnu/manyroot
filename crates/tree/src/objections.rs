@@ -27,7 +27,7 @@ use crate::hash::ContentHash;
 use crate::lines::{Lines, Unqualified};
 use crate::results::CheckResult;
 use crate::reviews::Target;
-use crate::shared::Set;
+use crate::shared::{Set, SetMap};
 
 /// What backs an objection, under one policy over one causal past.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,9 +100,9 @@ enum Key {
 }
 
 /// The objections settled by answers at a decision and its ancestors in the decision graph (decision
-/// 8cf20fe7669a, D), by the line of the decision whose answer settled each: a settle reaches only that
-/// line (decision 4afee4855944, 1).
-type Settled = Arc<BTreeMap<ContributionId, Set>>;
+/// 8cf20fe7669a, D), by the number of the line of the decision whose answer settled each: a settle
+/// reaches only that line (decision 4afee4855944, 1). Persistent at both levels (finding 0a2094d4cf7b).
+type Settled = SetMap;
 
 /// What rules 5 and 6 read of one decision: its window and the objections to what it uses, both less
 /// those settled below it, its own answers, and its breakage entries' ages.
@@ -143,6 +143,8 @@ pub struct Obligations {
     history: HashMap<ContributionId, Set>,
     /// What answers at each decision and its ancestors settled, shared along runs that settle nothing.
     settled: HashMap<ContributionId, Settled>,
+    /// Each line some answer settled an objection on, numbered, for `settled`.
+    line_numbers: HashMap<ContributionId, u32>,
     /// The objections each decision's own answers settle, ascending.
     settles: HashMap<ContributionId, Vec<At>>,
     /// Each decision's answers, resolved.
@@ -334,7 +336,7 @@ impl Obligations {
         for id in order.iter().filter(|id| self.may_qualify.contains(*id)) {
             let d = &lines.decision(id).expect("in order").decision;
             let settled = self.settled_for(&d.parents);
-            let on_line = settled.get(&d.line).cloned().unwrap_or_default();
+            let on_line = self.settled_on(&settled, &d.line);
             let window = self.window_for(lines, &d.line, &d.parents, &on_line);
             let uses = self.uses_for(ix, lines, d, &on_line);
             let ages = self.ages_for(lines, d);
@@ -371,10 +373,9 @@ impl Obligations {
             let settled = match settles.is_empty() {
                 true => settled,
                 false => {
-                    let mut by_line = (*settled).clone();
-                    let mine = by_line.entry(d.line).or_default();
-                    *mine = settles.iter().fold(mine.clone(), |all, at| all.with(*at));
-                    Arc::new(by_line)
+                    let next = self.line_numbers.len() as u32;
+                    let line = *self.line_numbers.entry(d.line).or_insert(next);
+                    settled.with(line, settles.iter().fold(on_line, |all, at| all.with(*at)))
                 }
             };
             self.window.insert(*id, window);
@@ -393,23 +394,14 @@ impl Obligations {
     }
 
     /// The objections settled at strict ancestors of a decision with `parents`, by line. A decision with
-    /// one parent shares its parent's.
+    /// one parent shares its parent's, and a merge copies only the paths where its parents differ.
     fn settled_for(&self, parents: &[ContributionId]) -> Settled {
-        let below = |p: &ContributionId| self.settled.get(p).cloned().unwrap_or_default();
-        match parents {
-            [] => Settled::default(),
-            [p] => below(p),
-            _ => {
-                let mut all: BTreeMap<ContributionId, Set> = BTreeMap::new();
-                for p in parents {
-                    for (line, theirs) in below(p).iter() {
-                        let mine = all.entry(*line).or_default();
-                        *mine = mine.union(theirs);
-                    }
-                }
-                Arc::new(all)
-            }
-        }
+        parents.iter().filter_map(|p| self.settled.get(p)).fold(Settled::default(), |all, theirs| all.union(theirs))
+    }
+
+    /// What answers on `line` settled, in `settled`.
+    fn settled_on(&self, settled: &Settled, line: &ContributionId) -> Set {
+        self.line_numbers.get(line).map_or_else(Set::default, |n| settled.get(*n))
     }
 
     /// The objections to the strict ancestors of a decision with `parents`, settled or not. A decision
@@ -775,7 +767,7 @@ impl Obligations {
 
     /// The same for a decision not yet written, whose past is the whole replica.
     pub(crate) fn of_new(&self, ix: &Index, lines: &Lines, d: &Decision) -> Reads {
-        let settled = self.settled_for(&d.parents).get(&d.line).cloned().unwrap_or_default();
+        let settled = self.settled_on(&self.settled_for(&d.parents), &d.line);
         Reads {
             window: self.window_for(lines, &d.line, &d.parents, &settled),
             uses: self.uses_for(ix, lines, d, &settled),
@@ -834,7 +826,7 @@ impl Obligations {
 
     /// The window of the next move on a line whose heads are `heads`.
     pub(crate) fn next_move(&self, lines: &Lines, line: &ContributionId, heads: &[ContributionId]) -> Vec<(bool, At)> {
-        let settled = self.settled_for(heads).get(line).cloned().unwrap_or_default();
+        let settled = self.settled_on(&self.settled_for(heads), line);
         self.window_for(lines, line, heads, &settled).iter().map(|at| (false, *at)).collect()
     }
 
@@ -848,7 +840,7 @@ impl Obligations {
         heads: &[ContributionId],
     ) -> Vec<(bool, At)> {
         let Some(p) = lines.proposal_named(proposal) else { return vec![] };
-        let settled = self.settled_for(heads).get(&p.line).cloned().unwrap_or_default();
+        let settled = self.settled_on(&self.settled_for(heads), &p.line);
         let mut ats: Vec<At> = self.to_manifest.get(&p.manifest).cloned().unwrap_or_default();
         ats.extend(self.to_proposal.iter().filter(|at| {
             matches!(self.list[**at as usize].target, Target::Proposal { line, change, .. } if line == p.line && change == p.change)
