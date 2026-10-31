@@ -20,28 +20,33 @@
 ## Tests
 
 This table is the CI: the forge's workflow runs only by hand, and the manager's counted run on the merged tree, main merged with the exact head, is what a merge waits for ([docs/development.md](docs/development.md)). The manager chooses how much of the table it covers, by risk (owner decision `464d3ccca45e`, superseding `20a06f9b815e` for counted runs):
-- **Light:** the tests and doctests of the packages your changed files need by the rows below (`scripts/code-scope packages` computes them, with `crates/bracken`'s extra packages always), fmt, both clippies and the Ground guards, on the merged tree, in a box plus their macOS-only tests on the Mac (`scripts/test-table --split -p`). It needs your recorded passes on the exact head of `cargo fmt --check`, both clippies, `cargo nextest run -P fast -p <packages>` and `scripts/test-table --remote -p <packages>`, each naming at least those packages. They're its precondition only: nothing counted rests on them.
+- **Light:** the tests and doctests of the packages your changed files affect (`scripts/code-scope packages` decides them; the table below documents it), fmt, both clippies and the Ground guards, on the merged tree, in a box plus their macOS-only tests on the Mac (`scripts/test-table --split -p`). It needs your recorded passes on the exact head of `cargo fmt --check`, both clippies, `cargo nextest run -P fast -p <packages>` and `scripts/test-table --remote -p <packages>`, each naming at least those packages. They're its precondition only: nothing counted rests on them.
 - **Full:** the whole table, which is also the default. It's always required for a head that touches `crates/manyroot`, the root `Cargo.toml` or `Cargo.lock`, `docs/protocol.md`, anything in `crates/tree/src/`, `crates/tree/Cargo.toml`, the weave-v1 fixtures, `.cargo/`, `rust-toolchain*` or any `build.rs`. `scripts/code-scope full` holds that list, and `scripts/verify-seq --light` and `scripts/merge` both refuse a light run for such a head.
 
 | Package | Test | Lint | Format |
 |---|---|---|---|
 | workspace | `cargo test --workspace` | `cargo clippy --all-targets -- -D warnings` | `cargo fmt --check` |
 
-Builders don't run the whole `cargo test --workspace` (decision `ef5b807d3196`): the manager's counted run does. Before every `pr` claim, run the lint and format checks (`cargo clippy` for this machine and with `--target x86_64-unknown-linux-gnu`), then `cargo nextest run -P fast` with the packages for every row your branch touches (a package's dependents include the crates whose tests run the `bracken` binary), and `cargo test --doc` with those of them that have a library. That's every package but `bracken`, which is a binary only: `cargo test --doc -p bracken` fails with "no library targets", so when `-p bracken` is your whole scope there's no doctest step. You need cargo-nextest: `cargo install --locked cargo-nextest` (reference `4f8a96525a1e`). The `fast` profile in `.config/nextest.toml` leaves out the slowest tests, which the counted run still runs (decision `4bf44934cb67`). Then run `scripts/test-table --remote -p <the same packages>` once. Record each of these on the exact head with `bk-evidence`: a light counted run needs all five, with `-p` packages, not `--workspace`. The packages for each row:
+Builders don't run the whole `cargo test --workspace` (decision `ef5b807d3196`): the manager's counted run does. Before every `pr` claim, run the lint and format checks (`cargo clippy` for this machine and with `--target x86_64-unknown-linux-gnu`), then `cargo nextest run -P fast` with the packages `scripts/code-scope packages origin/main HEAD` prints, one `-p` each, and `cargo test --doc` with those of them that have a library. That's every package but `bracken`, which is a binary only: `cargo test --doc -p bracken` fails with "no library targets", so when `-p bracken` is your whole scope there's no doctest step. You need cargo-nextest: `cargo install --locked cargo-nextest` (reference `4f8a96525a1e`). The `fast` profile in `.config/nextest.toml` leaves out the slowest tests, which the counted run still runs (decision `4bf44934cb67`). Then run `scripts/test-table --remote -p <the same packages>` once. Record each of these on the exact head with `bk-evidence`: a light counted run needs all five, with `-p` packages, not `--workspace`.
 
-| You changed | Test |
+`scripts/code-scope packages` decides the packages, not this table (owner decision `73f2ba4c08e5`, task `de42fa5c776d`). It prints every package when `scripts/code-scope full` names a path. Otherwise it runs `crates/scope` (`bracken-scope`), guppy's determinator: a path in a crate selects that crate and every package that depends on it in the real cargo graph, and `.config/determinator.toml` maps the paths outside the crates. Any change to `bracken`'s build, a path in it or in a crate it depends on, also selects `bracken-demo` and `bracken-experiment`, whose tests run its binary though cargo's graph doesn't show it (`RUN_BINARY` in `crates/scope/src/packages.rs`). This table documents what it prints on this repository; when the rules or the graph change, the table follows:
+
+| You changed | Packages |
 |---|---|
-| root `Cargo.toml` or `Cargo.lock` | `--workspace` |
-| `crates/manyroot` | `--workspace` |
-| `crates/tree` | `-p bracken-tree -p bracken` |
+| a path in `scripts/code-scope full`'s list: root `Cargo.toml` or `Cargo.lock`, `crates/manyroot`, `crates/tree/src/`, `crates/tree/Cargo.toml`, the weave-v1 fixtures, `docs/protocol.md`, `.cargo/`, `rust-toolchain*`, any `build.rs` | every package (the full table) |
+| the rest of `crates/tree` | `-p bracken -p bracken-demo -p bracken-experiment -p bracken-tree` |
+| `crates/bracken` | `-p bracken -p bracken-demo -p bracken-experiment`: demo's and experiment's tests run the `bracken` binary |
+| `crates/demo` | `-p bracken -p bracken-demo -p bracken-experiment`: `-p bracken` builds the binary their tests run |
+| `crates/experiment` | `-p bracken -p bracken-experiment` |
 | `crates/scope` | `-p bracken-scope` |
-| `code-scope`, in `scripts/` or `.claude/skills/` | `-p bracken -p bracken-scope` |
-| `crates/bracken`, `scripts/`, `.claude/skills/` | `-p bracken`, plus `-p bracken-demo -p bracken-experiment` if you change a command's arguments, output, or what it records, accepts, syncs or refuses |
-| `crates/demo` or `crates/experiment` | `-p bracken -p bracken-demo -p bracken-experiment` |
-| anything else except `rustfmt.toml` (docs, root files, `.forgejo/`) | `-p bracken-tree -p bracken`: their tests import every tracked file |
-| `rustfmt.toml` | the format check alone |
+| `code-scope`, in `scripts/` or `.claude/skills/` | `-p bracken -p bracken-scope`: bracken-scope's tests run it too |
+| `scripts/`, `.claude/skills/` | `-p bracken` |
+| `.config/determinator.toml` | `-p bracken -p bracken-scope -p bracken-tree` |
+| docs, `.bracken/`, the rest of `.claude/` and `.config/`, `.forgejo/`, and the root files the rules name | `-p bracken -p bracken-tree`: their tests import every tracked file |
+| `rustfmt.toml` | none: the format check alone |
+| anything else, such as a new root file or directory | every package, until a rule in `.config/determinator.toml` names it |
 
-A Rust file changed only in comments takes a doc's row, `-p bracken-tree -p bracken`, and never needs the full table (task `0837da3df7a4`): the same tokens on both sides, by `crates/scope`, where a doc comment is code, since rustdoc and doctests read it. It isn't docs-only, since clippy reads plain comments too (finding `c40ed7b8d3f8`), so its head gets a light run.
+A Rust file changed only in comments takes a doc's row, `-p bracken -p bracken-tree`, and never needs the full table (task `0837da3df7a4`): `code-scope` asks for README.md's packages in its place. That's the same tokens on both sides, by `bracken-scope comment-only`, where a doc comment is code, since rustdoc and doctests read it. It isn't docs-only, since clippy reads plain comments too (finding `c40ed7b8d3f8`), so its head gets a light run.
 
 ## Releases
 

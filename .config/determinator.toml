@@ -1,0 +1,67 @@
+# The rules guppy's determinator follows for the paths outside the workspace's crates (task de42fa5c776d,
+# owner decision 73f2ba4c08e5), compiled into crates/scope's bracken-scope, whose 'packages' subcommand
+# scripts/code-scope packages runs for scripts/verify-seq --light and scripts/merge. A path inside a crate
+# needs no rule: it marks its crate changed, and the determinator adds every package that depends on it,
+# from the real cargo graph. A path no rule names and no crate holds marks every package changed.
+# bracken-demo and bracken-experiment, whose tests run the bracken binary, come with any change to
+# bracken's build, by RUN_BINARY in crates/scope/src/packages.rs: a rule here can't tell a change to its
+# build from one its tests only read.
+#
+# The paths that always need the whole table aren't here: scripts/code-scope full holds that one list,
+# and code-scope packages prints every package for them before this file is read. AGENTS.md's Tests
+# table documents these rules; when one changes, the table follows.
+#
+# Globs are globset's, relative to the workspace's root, and * matches / too: name root files exactly.
+# Rules apply in order, and the first that matches decides (post-rule "skip"), unless it says otherwise.
+
+# Only the rules here: the default rules would ignore README, LICENSE and .gitignore files, which the
+# tests below read.
+use-default-rules = false
+
+# The format check alone, which every run does: no package.
+[[path-rule]]
+globs = ["rustfmt.toml"]
+mark-changed = []
+
+# code-scope, both copies: crates/scope's tests run it as well as crates/bracken's.
+[[path-rule]]
+globs = ["scripts/code-scope", ".claude/skills/**/code-scope"]
+mark-changed = ["bracken", "bracken-scope"]
+
+# The scripts and skills: their tests are in crates/bracken/tests/scripts.rs.
+[[path-rule]]
+globs = ["scripts/**", ".claude/skills/**"]
+mark-changed = ["bracken"]
+
+# This file: bracken-scope compiles it in and tests it, and the tests below read it as a tracked file.
+[[path-rule]]
+globs = [".config/determinator.toml"]
+mark-changed = ["bracken-scope", "bracken-tree", "bracken"]
+
+# crates/demo and crates/experiment: their own packages, by cargo's graph, and bracken too, though
+# neither depends on it: their tests run the bracken binary and fail without it ("build bracken first:
+# cargo build -p bracken"), and -p bracken is what builds it beside them.
+[[path-rule]]
+globs = ["crates/demo/**", "crates/experiment/**"]
+mark-changed = ["bracken"]
+post-rule = "skip-rules"
+
+# Docs, the Ground and the other tracked files outside the crates: bracken-tree's and bracken's tests read
+# every tracked file.
+[[path-rule]]
+globs = [
+    "docs/**",
+    ".bracken/**",
+    ".claude/**",
+    ".config/**",
+    ".forgejo/**",
+    "AGENTS.md",
+    "CLAUDE.md",
+    "PRODUCT.md",
+    "README.md",
+    "LICENSE-APACHE",
+    "LICENSE-MIT",
+    ".gitignore",
+    ".gitattributes",
+]
+mark-changed = ["bracken-tree", "bracken"]

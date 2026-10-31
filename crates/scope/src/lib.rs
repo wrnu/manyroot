@@ -12,6 +12,10 @@
 //!   caller asks [`included`] for that.
 //!
 //! A file read as text at run time, by path, isn't seen here.
+//!
+//! [`packages`] is the other half of `bracken-scope`: which workspace packages a change affects.
+
+pub mod packages;
 
 use std::str::FromStr;
 
