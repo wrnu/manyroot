@@ -3944,7 +3944,21 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
 
     // Refused before anything is written: a commit not on origin/main, an older commit after a newer one,
     // and a commit unrelated to the recorded one (the test's own repository, whose origin/main is its HEAD).
-    let tree = format!("{}^{{tree}}", commits[1]);
+    // Its tree is commits[2]'s with one file more, outside .bracken/, which Weave's recorded tree leaves
+    // out: made through a scratch index, so that it differs from commits[2]'s whatever the repository's
+    // last commits changed (task bb59a076515a: two of them may differ only in .bracken/).
+    let extra = tmp.path().join("extra.txt");
+    std::fs::write(&extra, "in no merged commit\n").unwrap();
+    let blob = git_out(&clone, &["hash-object", "-w", extra.to_str().unwrap()]);
+    let index = tmp.path().join("scratch-index");
+    let scratch = |args: &[&str]| {
+        let out = command(&clone, "git", args).env("GIT_INDEX_FILE", &index).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    scratch(&["read-tree", &commits[2]]);
+    scratch(&["update-index", "--add", "--cacheinfo", &format!("100644,{blob},unmerged-only.txt")]);
+    let tree = scratch(&["write-tree"]);
     let unmerged = git_out(&clone, &["commit-tree", &tree, "-p", &commits[2], "-m", "unmerged"]);
     let refused_in = |out: Output, expected: &str| {
         let stderr = String::from_utf8_lossy(&out.stderr);
