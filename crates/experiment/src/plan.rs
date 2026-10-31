@@ -72,6 +72,10 @@ pub struct PlanInputs {
     /// plans from before it was recorded.
     #[serde(default)]
     pub harness: Value,
+    /// The pinned Python interpreter, for a run of an evaluation project (`docs/design/eval-suite.md`): every
+    /// public-test run and grade pins it from here ([`crate::python::Python::from_plan`]). None otherwise.
+    #[serde(default)]
+    pub python: Option<crate::python::PythonPin>,
 }
 
 impl Default for PlanInputs {
@@ -89,6 +93,7 @@ impl Default for PlanInputs {
             expected_stops: Vec::new(),
             accept_rule: AcceptRule::default(),
             harness: Value::Null,
+            python: None,
         }
     }
 }

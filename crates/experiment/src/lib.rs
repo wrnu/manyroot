@@ -36,6 +36,7 @@ pub mod mode;
 pub mod pi;
 pub mod plan;
 pub mod project;
+pub mod project_grader;
 pub mod prompts;
 pub mod proxy;
 pub mod python;

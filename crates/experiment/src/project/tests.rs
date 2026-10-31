@@ -57,6 +57,7 @@ fn store_in(dir: &Path, hidden: &Value) -> (PathBuf, String) {
     }
     write(&set.join("tests/data.txt"), "data\n");
     write(&set.join("golden/tiny/__init__.py"), "");
+    write(&set.join("golden-before/tiny/__init__.py"), "");
     let d = digest(&set).expect("a digest");
     (store, d)
 }
@@ -186,7 +187,13 @@ fn a_hidden_set_opens_only_with_the_projects_digest_and_says_only_counts() {
     let set = HiddenSet::open(&p, &store).expect("opens");
     assert_eq!(
         set.summary(&p),
-        StoreSummary { groups: 3, test_files: 2, golden_files: 1, items_without_tests: vec!["wider".into()] }
+        StoreSummary {
+            groups: 3,
+            test_files: 2,
+            golden_files: 1,
+            golden_before_files: 1,
+            items_without_tests: vec!["wider".into()]
+        }
     );
     assert_eq!(set.file("tests/test_a.py"), Some(&b"import unittest\n"[..]), "the bytes it read and digested");
     let applying = |share| set.groups.iter().filter(|g| set.applies(&p, g, share)).map(|g| &g.file).collect::<Vec<_>>();

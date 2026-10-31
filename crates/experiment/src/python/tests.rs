@@ -68,6 +68,13 @@ mod macos_only {
         let err = Python::pin(&p.executable, "3.12", Some(&"0".repeat(64))).expect_err("another digest");
         assert!(err.contains("not the expected"), "{err}");
         p.check().expect("nothing has changed");
+        // What a plan records pins the same interpreter again, and nothing else.
+        let pin = p.plan_pin();
+        assert_eq!(Python::from_plan(&pin, "3.12").expect("the plan's").digest, p.digest);
+        let other = PythonPin { digest: "0".repeat(64), ..pin.clone() };
+        assert!(Python::from_plan(&other, "3.12").expect_err("another digest").contains("not the expected"));
+        let other = PythonPin { version: "3.12.0".into(), ..pin };
+        assert!(Python::from_plan(&other, "3.12").expect_err("another version").contains("not the plan's"));
         // The standard library, with the modules that load those libraries, works under the profile.
         let o = sandboxed("import decimal, sqlite3, ssl, json, datetime; print('OK')", &limits());
         assert_eq!(
@@ -324,10 +331,47 @@ for run in json.load(open(sys.argv[1])):
             &quick,
         );
         assert_eq!(o.exit, Exit::Scratch);
+        // A run that fills its scratch directory and ends before the next poll is still past the limit.
+        let o = sandboxed("open('big', 'wb').write(b'x' * (10 << 20))", &quick);
+        assert_eq!(o.exit, Exit::Scratch);
         // Each directory made costs the sandbox's checks, so the CPU limit is generous here.
         let many = Limits { cpu_seconds: 20, wall_seconds: 60, ..quick };
         let o = sandboxed("import os, time\nfor i in range(12000): os.mkdir(f'd{i}')\ntime.sleep(60)", &many);
         assert_eq!(o.exit, Exit::Scratch);
+    }
+
+    /// The walk holds only the directories on its path open (finding 0dfdb731d17a): hundreds of siblings are
+    /// counted, not judged past the limit, with the open-file limit at 64. In a child of its own, since the
+    /// limit is the whole process's.
+    #[test]
+    fn the_scratch_walk_counts_many_siblings_with_few_files_open() {
+        let exe = std::env::current_exe().expect("the test binary");
+        let inner = "python::tests::macos_only::siblings_under_a_low_open_file_limit";
+        let out = Command::new("/bin/sh")
+            .args(["-c", "ulimit -n 64 && exec \"$0\" --exact --ignored --test-threads 1 \"$1\""])
+            .arg(exe)
+            .arg(inner)
+            .output()
+            .expect("ran");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && text.contains("1 passed"), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    #[ignore = "run by the_scratch_walk_counts_many_siblings_with_few_files_open, under a low open-file limit"]
+    fn siblings_under_a_low_open_file_limit() {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        for i in 0..300 {
+            std::fs::create_dir(tmp.path().join(format!("d{i}"))).expect("a directory");
+        }
+        let mut deep = tmp.path().join("d0");
+        for i in 0..10 {
+            deep = deep.join(format!("e{i}"));
+            std::fs::create_dir(&deep).expect("a directory");
+        }
+        let (bytes, entries) = usage(tmp.path(), 1 << 30);
+        assert_eq!(entries, 310, "every directory counted");
+        assert!(bytes < 1 << 30, "{bytes}");
     }
 
     /// The code can't make the parent act on a file outside by swapping a directory it took the owner's access
@@ -361,7 +405,8 @@ for run in json.load(open(sys.argv[1])):
         let dir = scratch.dir.clone();
         let code = "import os; os.makedirs('a/b'); open('a/b/f', 'w').write('x'); os.chmod('a/b', 0); os.chmod('a', 0)";
         let o = python().run(&scratch, &["-c".into(), code.into()], &limits()).expect("ran");
-        assert_eq!(o.exit, Exit::Code(0), "{}", String::from_utf8_lossy(&o.stderr));
+        // A directory the last check can't read counts as past the limit.
+        assert_eq!(o.exit, Exit::Scratch, "{}", String::from_utf8_lossy(&o.stderr));
         drop(scratch);
         assert!(!dir.exists(), "{}", dir.display());
     }

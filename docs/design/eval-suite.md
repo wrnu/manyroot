@@ -122,6 +122,8 @@ So it never enters this repository, a Ground or a run directory:
   hidden.json      format 1; project; groups: [{item, file, applies}]
   tests/*.py       the hidden tests, standard library unittest
   golden/          the golden solution, laid out like seed/
+  golden-before/   for a project with a change: the golden solution just
+                   before the first change, laid out like seed/
 ```
 
 A group judges one item with one test file. `applies` is `always`, or, for
@@ -138,8 +140,9 @@ issue present, ids unique, changes released after the start and revising
 existing items, limits in range, and a seed holding the package and the
 public tests. With `--hidden <store>` it checks the hidden set too: the
 digest, the manifest's project and items, each group's file under `tests/`,
-and the golden solution's package. It prints counts only: groups, test
-files, golden files, and items no hidden test judges. `--json` prints the
+and the golden solution's package, before the change too if the project has
+one. It prints counts only: groups, test files, golden files (and how many
+before the change), and items no hidden test judges. `--json` prints the
 same as JSON.
 
 The set is read once. Each file is opened and checked to be the regular file
@@ -207,6 +210,7 @@ Requirements for building the runner (from security's review, evidence
 - **pytest runs in the grader**, calling agent code through a proxy to the
   sandboxed child. Hidden tests never import agent code into the grader's
   process, where it could read expected values, patch asserts or exit early.
+  As built, the runner is `unittest`, in a sandboxed host of its own (Grading).
 - **The limits are enforced by the operating system**, not in Python:
   `ctypes`, `os` and `subprocess` are all in the standard library.
 - **Hidden-test results stay away from agents for the whole run:** out of
@@ -270,8 +274,11 @@ security review, as Candidate B planned.
   elsewhere by swapping a directory for a symlink; it opens each directory
   by name in its open parent, and counts one it can't read, such as one
   the code took the owner's access to, as past the limit. The owner's
-  access is given back only after the run, for removing the directory. Killing ends the child's process
-  group.
+  access is given back only after the run, for removing the directory.
+  The walk keeps open only the directories on the path it is walking, so
+  hundreds of siblings don't exhaust the parent's open files, and a run
+  that ends of itself is checked once more. Killing ends the child's
+  process group.
 
 `run_tests` runs a tree's public tests there with `unittest`, and reports
 each test's outcome (pass, fail, error or skip) and the last 16 KiB of their
@@ -279,6 +286,84 @@ output. It is feedback for the agent, not a grade: the tests share the
 child with the code under test. `bracken-experiment run-tests --project
 <dir> [--tree <dir>] --python <path> [--python-digest <digest>]` runs
 it, on the seed by default.
+
+A run's plan records the interpreter's path, version and digest
+(`python`), and every run of agent code pins it from there again, refused
+if either has changed (`Python::from_plan`).
+
+## Grading
+
+The grader (`crates/experiment/src/project_grader.rs`, task
+`9345098e82aa`) runs a project's hidden tests on a tree, and reports counts
+per item and per group, by index: no test's name, source, expected value or
+message. The tests and the code under test never share a process:
+- **The host** runs one group's test file with `unittest`, in the Python
+  profile, in a scratch directory holding the hidden set's `tests/` as read
+  and digested, and nothing of the tree. It works in an empty directory of
+  its own there, never the tests'. Importing the package gives a proxy:
+  each attribute, call, iteration, comparison and so on is a line to the
+  grader. Only the package and its submodules become proxy modules, only
+  when the host imports them, and the host refuses a package whose name
+  something else there already answers to (finding `734e5389e188`).
+- **The server** answers them: the code under test, in the same profile, in
+  another scratch directory with the tree. Plain values (numbers, strings,
+  bytes, decimals, dates and times, and lists, tuples, sets and dicts of them)
+  come back as data, decoded and compared by the host; so do subclasses of
+  them but tuple's, as the plain type. Anything else comes back as a handle
+  that equals only itself, and whose `in` the host answers from its items,
+  so the code's own `__eq__` or `__contains__` never answers for a test. A
+  server that dies is started again for the next call. Each start is a new
+  generation, whose number tags its handles. A handle got as an attribute of
+  a module of the package, such as a test file's `from pkg.mod import f`, is
+  found again by name on the new server; any other of one that has ended is
+  that test's error, never another object (findings `fe2549db89ee`,
+  `5f5c3b4b25a9`). The server may run as long as the host, and each call as
+  long, and use as much CPU, as one run of the project's code: a budget per
+  call, not for the group.
+- **An exception** comes back as its class, with its module, name and
+  bases. The host raises one class per class of the code's, of that name,
+  whose bases are the mirrors of its bases, so `issubclass` holds along the
+  code's own hierarchy. A class of Python's own, builtin or of the standard
+  library, is raised as itself, but strictly: only from a module the host
+  has already loaded, the name walked through classes only, and only a
+  class whose own module and name are the ones claimed (finding
+  `d1f7d7880644`). One whose constructor takes other arguments, such as
+  `json.JSONDecodeError`, is made with the message as its arguments
+  (finding `ed723694b473`). So `assertRaises` with the package's class
+  or one of its bases, a builtin or a standard library class works, and so
+  do checks of the class's name (answer `c473d137f5b7`, finding
+  `621c185d3e6f`). Never as themselves: `StopIteration`,
+  `StopAsyncIteration` and anything of `unittest`, which would stop the
+  host's iterator or skip a test (finding `d077f100ac33`).
+- **A command:** a test's `subprocess` runs only `python -m <package> ...`
+  (`sys.executable` or a `python`), and not in the host. The grader runs it in
+  a fresh child under the profile, with the tree, the working directory's
+  files (at most 32 MiB) and the input, and gives back its exit code, its
+  output and the working directory's files after it. A command's working
+  directory is the host's empty one unless the test gives another, never
+  the tests' directory or one holding it, and the files it gives back are
+  written only inside it, through no symlink (findings `7f3dc66a8589`,
+  `f13d1ff05b5f`). So agent code never runs in the host's process and never
+  sees a hidden file (note `9891289fb39c`).
+- **Limits:** the server and each command have the project's. The host has
+  four times its CPU and wall time, 1 GiB and 16 MiB of output: it runs a
+  whole file, waiting on each call. The host reports the number of tests,
+  each outcome and each test's end as they happen, so a group whose host
+  ends early keeps them: it is unfinished, with how it ended, and the tests
+  that hadn't ended count as failures (finding `e7d128464936`).
+
+A group applies at a share of the run only once its item is released, and a
+before- or after-change group only on its side of its change. **The approval
+check** grades `golden/` at the end of the run, where every group that
+applies must pass, and, for a project with a change, `golden-before/` just
+before the first change is released, where every group that applies then
+must pass (answer `c473d137f5b7`). Both must, before a project's hidden set is
+approved.
+
+`bracken-experiment project grade <dir> --hidden <store> --python <path>
+[--python-digest <digest>] (--tree <dir> [--share <s>] | --golden)
+[--json]` grades a tree, or runs the approval check. It prints counts per
+item only.
 
 ## Cost estimate
 
