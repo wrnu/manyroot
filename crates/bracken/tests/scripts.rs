@@ -3944,9 +3944,10 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
 
     // Refused before anything is written: a commit not on origin/main, an older commit after a newer one,
     // and a commit unrelated to the recorded one (the test's own repository, whose origin/main is its HEAD).
-    // Its tree is commits[2]'s with one file more, outside .bracken/, which Weave's recorded tree leaves
-    // out: made through a scratch index, so that it differs from commits[2]'s whatever the repository's
-    // last commits changed (task bb59a076515a: two of them may differ only in .bracken/).
+    // The commit not on origin/main, `unmerged`, is a child of commits[2] whose tree is commits[2]'s with
+    // one file more, outside .bracken/, which Weave's recorded tree leaves out: made through a scratch
+    // index, so that it differs from commits[2]'s whatever the repository's last commits changed (task
+    // bb59a076515a: two of them may differ only in .bracken/).
     let extra = tmp.path().join("extra.txt");
     std::fs::write(&extra, "in no merged commit\n").unwrap();
     let blob = git_out(&clone, &["hash-object", "-w", extra.to_str().unwrap()]);
@@ -3974,8 +3975,9 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     refused_in(run_with(&["HEAD"]), &format!("doesn't come after {}", commits[2]));
     assert_eq!(count(), before, "a refused commit wrote something");
 
-    // A mismatch fails: a merged commit (here one whose tree is an earlier commit's), recorded, then shown by
-    // git with another tree (git replace), no longer verifies.
+    // A mismatch fails: a merged commit (here `unmerged`, once origin/main points at it), recorded, then
+    // shown by git with another tree (git replace, by commits[2], whose tree lacks the extra file), no longer
+    // verifies.
     git_out(&clone, &["update-ref", "refs/remotes/origin/main", &unmerged]);
     let out = in_clone(&unmerged);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));

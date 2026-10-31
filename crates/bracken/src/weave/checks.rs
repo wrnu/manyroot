@@ -190,7 +190,7 @@ pub(crate) fn validate(s: &mut Store, agent: Option<&str>, args: ValidateArgs) -
     if !dry_run {
         super::merge::require_marker(&ix)?;
     }
-    let lines = Lines::build(s.graph(), &ix);
+    let lines = super::lines_for(s, &ix, &[line.as_deref()]);
     let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
     let (version, policy) = current_policy(&lines, &line)?;
     let who = crate::signer(s, agent)?;
@@ -288,7 +288,7 @@ pub(super) fn run_for_integrate(
     json: bool,
 ) -> Result<Recorded> {
     let ix = Index::build(s.graph());
-    let lines = Lines::build(s.graph(), &ix);
+    let lines = super::judged_for(s, &ix, |_| vec![*line]);
     let (version, policy) = current_policy(&lines, line)?;
     let manifest = complete_manifest(&ix, hash)?;
     let (target, _) = ix.manifest(hash).expect("a held manifest");

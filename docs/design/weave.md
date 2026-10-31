@@ -450,6 +450,20 @@ use causal order and break ties by the smallest id; none use `timestamp_ms`
 replica. The one exception is completeness, which converges once replicas
 sync.
 
+**Who pays for a line.** Whether a decision qualifies reads only its
+causal ancestors that are decisions, on any line, and its own line's
+policy chain (rules 1 to 6 below). So a reader judges only the lines it
+asks about, plus the default line: their decisions, and the decisions
+those have as ancestors, on whatever line. It also judges the proposals on
+those lines. Every other decision is left unjudged, and every other
+proposal is kept by its payload alone, so that naming it still finds its
+line. Each command asks about the lines it names, by id or name, or by the
+id of one of their decisions or proposals. A line nobody names, and no
+named line's decision descends from, costs a reader nothing beyond holding
+its records (task `a4d1a06a1072`). Asking about a line still judges it
+whole, with the same verdict a judgement of every line gives. This changes
+what is computed, never what qualifies.
+
 **Counted check results.** Counting is always done under one policy
 version `P`, over one set of contributions `S` (the whole replica, or one
 decision's causal ancestors). A check result on manifest hash `H` is
@@ -1135,7 +1149,18 @@ from its results.
       own integrators can make it cost the stated bound. On a line someone
       makes for themselves, `n` moves each objected to and left unanswered
       cost `n^2/2` rule-5 questions, as on any line: each move must answer
-      every objection to the moves below it.
+      every objection to the moves below it. Only a reader that asks about
+      that line, or about a line whose decisions descend from its moves,
+      pays this cost (section 2, *Who pays for a line*). With 300 such
+      moves beside main, judging main asks exactly the questions it asks
+      without them, and no stray move is judged, while a full build asks
+      44,850 questions. In the CLI, `weave head`, `weave check` and
+      `weave line merge main --into dev` judge the same decisions with 40
+      such moves as with none, and `weave log --line stray` judges all 40
+      and asks 780 questions (`a_line_nobody_asks_about_costs_a_reader_of_main_nothing`
+      in `crates/tree/tests/objections.rs`, and
+      `a_line_nobody_names_costs_main_nothing_and_naming_it_judges_it` in
+      `crates/bracken/tests/weave_lines.rs`).
   - A question nothing asked at build would be a bug. It is answered by
     walking and counted, and fails debug builds; the tests assert the count
     is zero.

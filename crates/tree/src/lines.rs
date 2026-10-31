@@ -126,6 +126,17 @@ pub struct Qualified {
     pub policy: ContributionId,
 }
 
+/// The lines a build judges: the ones asked about and the default line, by first artifact, and every
+/// version of their chains.
+#[derive(Debug, Default)]
+struct Scope {
+    lines: BTreeSet<ContributionId>,
+    versions: BTreeSet<ContributionId>,
+}
+
+/// Picks the lines a build judges, given what is known before any is judged.
+type Pick<'a> = Box<dyn FnOnce(&Lines) -> Vec<ContributionId> + 'a>;
+
 /// One replica's lines and decisions.
 #[derive(Debug, Default)]
 pub struct Lines {
@@ -142,6 +153,11 @@ pub struct Lines {
     proposals: BTreeMap<ContributionId, ProposalRecord>,
     /// Retracted proposals' payloads: a review of one still names its line and change.
     retracted_proposals: BTreeMap<ContributionId, Proposal>,
+    /// The payloads of proposals on lines this build doesn't judge: still what a review or a use names.
+    unjudged_proposals: BTreeMap<ContributionId, Proposal>,
+    /// The lines this build judges, with the versions of their chains, if not every line
+    /// ([`Lines::build_for`]).
+    scope: Option<Scope>,
     judged: BTreeMap<ContributionId, Result<Qualified, Unqualified>>,
     /// The policy version in force for each decision whose line's chain gives one, qualifying or not.
     in_force: HashMap<ContributionId, ContributionId>,
@@ -159,18 +175,62 @@ pub struct Lines {
 }
 
 impl Lines {
+    /// Every line and decision in the replica, each judged.
     pub fn build(g: &Graph, ix: &Index) -> Lines {
-        Lines::build_with(g, ix, false)
+        Lines::build_with(g, ix, false, None)
     }
 
     /// [`Lines::build`], walking the graph for every question instead of answering from
     /// the index: the reference the index is tested against.
     #[doc(hidden)]
     pub fn build_by_walking(g: &Graph, ix: &Index) -> Lines {
-        Lines::build_with(g, ix, true)
+        Lines::build_with(g, ix, true, None)
     }
 
-    fn build_with(g: &Graph, ix: &Index, walking: bool) -> Lines {
+    /// The lines `pick` names, and the default line, judged (task a4d1a06a1072): their decisions, the
+    /// decisions those descend from on any line, and their proposals. `pick` sees every version, line
+    /// and decoded record, and the default line, before anything is judged. A decision's verdict reads
+    /// only its decision-ancestors and its own line's policy, so each judged here is judged as
+    /// [`Lines::build`] judges it. Any other decision has no verdict, any other proposal is known only
+    /// by its payload, and the validators and current policies [`crate::results::Checks`] reads are
+    /// only these lines'. So a line nobody asks about costs its records' decoding and no more.
+    pub fn build_for<'a>(g: &Graph, ix: &Index, pick: impl FnOnce(&Lines) -> Vec<ContributionId> + 'a) -> Lines {
+        Lines::build_with(g, ix, false, Some(Box::new(pick)))
+    }
+
+    /// [`Lines::build_for`], walking the graph for every question.
+    #[doc(hidden)]
+    pub fn build_for_by_walking<'a>(
+        g: &Graph,
+        ix: &Index,
+        pick: impl FnOnce(&Lines) -> Vec<ContributionId> + 'a,
+    ) -> Lines {
+        Lines::build_with(g, ix, true, Some(Box::new(pick)))
+    }
+
+    /// How many decisions this build judged.
+    #[doc(hidden)]
+    pub fn judged_count(&self) -> usize {
+        self.judged.len()
+    }
+
+    /// Whether this build judges `line`: every line, for [`Lines::build`].
+    pub fn judges(&self, line: &ContributionId) -> bool {
+        self.scope.as_ref().is_none_or(|s| s.lines.contains(line))
+    }
+
+    /// The policy versions of the lines this build judges, in id order.
+    pub fn judged_versions(&self) -> impl Iterator<Item = &Version> {
+        self.versions.values().filter(|v| self.scope.as_ref().is_none_or(|s| s.versions.contains(&v.id)))
+    }
+
+    /// The default line: the line named main by the counted marker's author, among [`Lines::lines`].
+    fn find_default_line(&self, g: &Graph, ix: &Index) -> Option<ContributionId> {
+        let author = g.get(&ix.counted_marker()?).expect("indexed from the graph").author();
+        self.lines().find(|v| v.author == author && v.policy.name == "main").map(|v| v.id)
+    }
+
+    fn build_with(g: &Graph, ix: &Index, walking: bool, pick: Option<Pick<'_>>) -> Lines {
         let mut lines = Lines::default();
         let order = g.topo_order();
         for id in &order {
@@ -238,6 +298,9 @@ impl Lines {
             links.retain(|_, list| !list.is_empty());
         }
         lines.ignored = ignored.into_iter().collect();
+        if let Some(pick) = pick {
+            lines.restrict(g, ix, pick);
+        }
         let mut chains = if walking { HashMap::new() } else { lines.ask_chains(g) };
         let missed = Cell::new(0);
         // A chain verdict nothing asked for: a bug, so walk, and count it (answer b2dbc4f5e810).
@@ -416,11 +479,7 @@ impl Lines {
             lines.proposals.get_mut(&id).expect("listed").verdict = verdict;
         }
 
-        if let Some(marker) = ix.counted_marker() {
-            let author = g.get(&marker).expect("indexed from the graph").author();
-            let main = lines.lines().find(|v| v.author == author && v.policy.name == "main").map(|v| v.id);
-            lines.default_line = main;
-        }
+        lines.default_line = lines.find_default_line(g, ix);
         lines.stats.fallbacks += missed.get();
         let (first, second, then) = (blanket.stats(), line_wide.stats(), pasts.stats());
         lines.obligation_stats = Stats {
@@ -433,6 +492,39 @@ impl Lines {
         };
         lines.obligations = obligations;
         lines
+    }
+
+    /// Leaves only what [`Lines::build_for`] judges: the lines `pick` names and the default line, each
+    /// with the versions of its chain; the decisions on them and every decision those descend from; and
+    /// the proposals on them. As nothing is judged yet, the first artifacts are those that supersede no
+    /// version, as [`Lines::lines`] and the default line take them.
+    fn restrict(&mut self, g: &Graph, ix: &Index, pick: Pick<'_>) {
+        self.firsts = self.versions.keys().filter(|id| !self.predecessors.contains_key(id)).copied().collect();
+        self.default_line = self.find_default_line(g, ix);
+        let mut scope = Scope { lines: pick(self).into_iter().collect(), versions: BTreeSet::new() };
+        scope.lines.extend(self.default_line);
+        let mut stack: Vec<ContributionId> = scope.lines.iter().copied().collect();
+        while let Some(v) = stack.pop() {
+            if self.versions.contains_key(&v) && scope.versions.insert(v) {
+                stack.extend(self.successors.get(&v).into_iter().flatten().map(|(_, next)| *next));
+            }
+        }
+        let mut judging: HashSet<ContributionId> = HashSet::new();
+        let mut stack: Vec<ContributionId> =
+            self.decisions.values().filter(|d| scope.lines.contains(&d.decision.line)).map(|d| d.id).collect();
+        while let Some(id) = stack.pop() {
+            if let Some(d) = self.decisions.get(&id)
+                && judging.insert(id)
+            {
+                stack.extend(d.decision.parents.iter().copied());
+            }
+        }
+        self.order.retain(|id| judging.contains(id));
+        let (judged, rest): (BTreeMap<_, _>, BTreeMap<_, _>) =
+            std::mem::take(&mut self.proposals).into_iter().partition(|(_, r)| scope.lines.contains(&r.proposal.line));
+        self.proposals = judged;
+        self.unjudged_proposals = rest.into_iter().map(|(id, r)| (id, r.proposal)).collect();
+        self.scope = Some(scope);
     }
 
     /// Judges a decision by rules 2 to 4, given which of the contributions it names are
@@ -543,7 +635,7 @@ impl Lines {
                 true => list_of[&find(&mut root, *line)],
                 false => 0,
             };
-        for d in self.decisions.values() {
+        for d in self.order.iter().map(|id| &self.decisions[id]) {
             if self.versions.contains_key(&d.decision.line) && !g.is_retracted(&d.id) {
                 askers.push((d.id, list_for(&d.decision.line)));
                 asks.push((d.decision.line, true));
@@ -777,7 +869,11 @@ impl Lines {
     /// The payload of a proposal artifact that decodes, retracted or not, valid or not: what a review of
     /// it names, by its line and change (finding 06bbc6a34636).
     pub fn proposal_named(&self, id: &ContributionId) -> Option<&Proposal> {
-        self.proposals.get(id).map(|r| &r.proposal).or_else(|| self.retracted_proposals.get(id))
+        self.proposals
+            .get(id)
+            .map(|r| &r.proposal)
+            .or_else(|| self.retracted_proposals.get(id))
+            .or_else(|| self.unjudged_proposals.get(id))
     }
 
     /// The valid proposals on a line, ascending.

@@ -276,6 +276,25 @@ impl World {
         assert_eq!(lines.obligation_stats().fallbacks, 0, "{:?}", lines.obligation_stats());
         assert_eq!(lines.stats().fallbacks, 0, "{:?}", lines.stats());
         assert_eq!(lines.objections().differ_from_walking(&ix, &lines), vec![], "windows and a walk disagree");
+        // The default line judged alone, and three other lines each with it, judge as the full build does
+        // (task a4d1a06a1072): a fixed number of builds, however many lines a test makes. tests/lines.rs
+        // judges every line alone, on its random Grounds.
+        let others: Vec<ContributionId> =
+            lines.versions().map(|v| v.id).filter(|v| Some(*v) != lines.default_line()).collect();
+        let mut asked = vec![None];
+        if let (Some(first), Some(last)) = (others.first(), others.last()) {
+            asked.extend([Some(*first), Some(others[others.len() / 2]), Some(*last)]);
+            asked.dedup();
+        }
+        for line in asked {
+            let alone = Lines::build_for(&self.g, &ix, |_| line.into_iter().collect());
+            assert_eq!(alone.obligation_stats().fallbacks, 0, "with {line:?}");
+            for id in self.g.iter().map(|c| c.id()) {
+                if let Some(verdict) = alone.verdict(&id) {
+                    assert_eq!(Some(verdict), lines.verdict(&id), "{id} judged with {line:?}");
+                }
+            }
+        }
         (ix, lines)
     }
 
@@ -1064,6 +1083,72 @@ fn an_answered_line_asks_two_questions_a_move() {
     let (_, lines) = w.lines();
     assert_eq!(lines.verdict(&s1).expect("judged").as_ref().map(|_| ()), Ok(()));
     assert!(matches!(lines.verdict(&merge).expect("judged"), Err(Unqualified::Unanswered { .. })), "the head's");
+}
+
+/// A line `stray` of `n` moves by alice off the root of main, each objected to by bob and left
+/// unanswered, so judging it asks `n^2/2` questions; main has a few moves of its own. Returns main's moves
+/// and stray's.
+fn main_and_a_stray_line(w: &mut World, n: usize) -> (Vec<ContributionId>, Vec<ContributionId>) {
+    let bob = w.bob.clone();
+    let m = w.tree(&[("a", b"0")]).0;
+    let why = w.claim(&bob, "no", &[]);
+    let mut main = vec![w.decide(m, &[], |_| {})];
+    for _ in 0..3 {
+        let next = w.decide(m, &[*main.last().expect("a root")], |_| {});
+        main.push(next);
+    }
+    let stray_line = w.side_line("stray", vec![]);
+    let mut stray = vec![w.decide_on(stray_line, m, &[main[0]], |_| {})];
+    for _ in 1..n {
+        w.object(&bob, why, *stray.last().expect("one"));
+        let next = w.decide_on(stray_line, m, &[*stray.last().expect("one")], |_| {});
+        stray.push(next);
+    }
+    (main, stray)
+}
+
+/// Task a4d1a06a1072: a reader of main pays nothing for a line it doesn't ask about. With a stray line
+/// of 300 unanswered objected moves beside it, judging main asks exactly the questions it asks with no
+/// stray line at all, and no stray decision is judged.
+#[test]
+fn a_line_nobody_asks_about_costs_a_reader_of_main_nothing() {
+    const N: usize = 300;
+    let mut w = World::new();
+    let (main, stray) = main_and_a_stray_line(&mut w, N);
+    let ix = Index::build(&w.g);
+    let read = Lines::build_for(&w.g, &ix, |_| vec![]);
+    let full = Lines::build(&w.g, &ix);
+    assert!(main.iter().all(|d| read.verdict(d) == full.verdict(d) && read.verdict(d).is_some_and(|v| v.is_ok())));
+    assert!(stray.iter().all(|d| read.verdict(d).is_none()), "no stray decision is judged");
+    let mut alone = World::new();
+    let (main_alone, _) = main_and_a_stray_line(&mut alone, 1);
+    let ix_alone = Index::build(&alone.g);
+    let read_alone = Lines::build_for(&alone.g, &ix_alone, |_| vec![]);
+    assert_eq!(main_alone.len(), main.len());
+    let (with, without) = (read.obligation_stats(), read_alone.obligation_stats());
+    assert_eq!((with.questions, with.passes), (without.questions, without.passes), "{with:?} {without:?}");
+    assert!(full.obligation_stats().questions >= N * (N - 1) / 2, "{:?}", full.obligation_stats());
+}
+
+/// Task a4d1a06a1072: asking about the stray line still judges it fully, as the full build does and at its
+/// cost: its root qualifies, the next move is refused for the objection to the root, and every later one
+/// for its parent (rule 3).
+#[test]
+fn asking_about_a_line_judges_it_fully() {
+    const N: usize = 60;
+    let mut w = World::new();
+    let (_, stray) = main_and_a_stray_line(&mut w, N);
+    let ix = Index::build(&w.g);
+    let full = Lines::build(&w.g, &ix);
+    let line = full.decision(&stray[0]).expect("a decision").decision.line;
+    let asked = Lines::build_for(&w.g, &ix, |_| vec![line]);
+    assert_eq!(asked.verdict(&stray[0]).expect("judged").as_ref().map(|_| ()), Ok(()));
+    for d in &stray[1..] {
+        assert_eq!(asked.verdict(d), full.verdict(d), "{d}");
+    }
+    assert!(matches!(asked.verdict(&stray[1]), Some(Err(Unqualified::Unanswered { .. }))));
+    assert!(matches!(asked.verdict(&stray[2]), Some(Err(Unqualified::ParentUnqualified(_)))));
+    assert_eq!(asked.obligation_stats().questions, full.obligation_stats().questions);
 }
 
 /// Finding 0a2094d4cf7b's shape: `n` lines, each of whose roots answers the one objection, to manifest

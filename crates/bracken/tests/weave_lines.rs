@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use bracken_tree::ContentHash;
-use bracken_tree::format::{Guardrails, LINE_MEDIA_TYPE, Line, Record, VERSION};
+use bracken_tree::format::{DECISION_MEDIA_TYPE, Decision, Guardrails, LINE_MEDIA_TYPE, Line, Record, VERSION};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -870,4 +870,109 @@ fn integrate_refuses_while_an_objection_is_in_the_window() {
         assert!(err.contains("(rule 5:") && err.contains("--answer"), "{args:?}: {err}");
         assert_eq!(w.contributions(), before, "{args:?} wrote something");
     }
+}
+
+impl Weave {
+    /// Runs a command that must succeed with `BRACKEN_WEAVE_STATS` set, and returns each build's
+    /// (decisions judged, questions asked), in order.
+    fn stats(&self, args: &[&str]) -> Vec<(usize, u64)> {
+        let out = Command::new(env!("CARGO_BIN_EXE_bracken"))
+            .args(args)
+            .current_dir(&self.repo)
+            .env("BRACKEN_DIR", &self.ground)
+            .env("BRACKEN_WEAVE_STATS", "1")
+            .env_remove("BRACKEN_AGENT")
+            .output()
+            .expect("bracken runs");
+        let stderr = String::from_utf8(out.stderr).expect("UTF-8");
+        assert!(out.status.success(), "bracken {args:?} failed: {stderr}");
+        let builds: Vec<(usize, u64)> = stderr
+            .lines()
+            .filter_map(|l| l.strip_prefix("weave stats: "))
+            .map(|l| {
+                let (judged, rest) = l.split_once(" decisions judged, ").expect("judged");
+                let questions = rest.strip_suffix(" questions").expect("questions");
+                (judged.parse().expect("a count"), questions.parse().expect("a count"))
+            })
+            .collect();
+        assert!(!builds.is_empty(), "bracken {args:?} printed no stats: {stderr}");
+        builds
+    }
+}
+
+/// Task a4d1a06a1072: a line anyone starts, here `stray`, whose moves are written by hand and each
+/// objected to and left unanswered, costs a command that doesn't name it nothing: reading main, checking
+/// the Ground, merging main into another line and moving main judge what they judged before it existed.
+/// Naming the line still judges all of it.
+#[test]
+fn a_line_nobody_names_costs_main_nothing_and_naming_it_judges_it() {
+    const N: usize = 40;
+    let w = Weave::new();
+    let first = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    let (first, manifest) = (first["decision"].as_str().expect("an id"), first["manifest"].as_str().expect("a hash"));
+    w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
+    let out = w.ok(&["weave", "line", "create", "stray", "--owner-decision", OD, "--as", AS]);
+    let stray_line = out.trim().strip_prefix("line ").and_then(|l| l.strip_suffix(" (stray)")).expect("labelled");
+    let reads: [&[&str]; 3] = [
+        &["weave", "head"],
+        &["weave", "check"],
+        &["weave", "line", "merge", "main", "--into", "dev", "--dry-run", "--as", AS],
+    ];
+    let before: Vec<_> = reads.iter().map(|args| w.stats(args)).collect();
+
+    let file = w.tmp.path().join("decision.cbor");
+    let mut stray: Vec<String> = Vec::new();
+    for i in 0..N {
+        let parent = stray.last().map_or(first, String::as_str);
+        let decision = Decision {
+            v: VERSION,
+            line: stray_line.parse().expect("an id"),
+            manifest: manifest.parse().expect("a hash"),
+            parents: vec![parent.parse().expect("an id")],
+            proposals: vec![],
+            breakage: vec![],
+            answers: vec![],
+            resolutions: vec![],
+            goals: vec![],
+            source: None,
+            note: format!("stray {i}"),
+        };
+        fs::write(&file, decision.encode()).expect("write the decision");
+        let out = w.ok(&[
+            "artifact",
+            file.to_str().expect("UTF-8"),
+            "--name",
+            "decision",
+            "--media-type",
+            DECISION_MEDIA_TYPE,
+            "--as",
+            AS,
+        ]);
+        let id = out.trim().strip_prefix("artifact ").expect("labelled").to_owned();
+        if i + 1 < N {
+            let claim = w.ok(&["claim", "this move is wrong", "--as", AS]);
+            let claim = claim.split_whitespace().nth(1).expect("an id");
+            w.ok(&["relate", claim, "contradicts", &id, "--as", AS]);
+        }
+        stray.push(id);
+    }
+
+    for (args, before) in reads.iter().zip(&before) {
+        assert_eq!(&w.stats(args), before, "bracken {args:?} pays for the stray line");
+    }
+    w.commit("a.txt", b"two\n");
+    for (judged, questions) in w.stats(&["weave", "integrate", "--as", AS]) {
+        assert!(judged <= 2 && questions == 0, "integrate judged {judged} decisions, asking {questions} questions");
+    }
+
+    // Named, by its name or by one of its moves, the stray line is judged whole, every unanswered
+    // objection asked about in each later move's window.
+    for args in [&["weave", "log", "--line", "stray"][..], &["weave", "status", "--at", &stray[N - 1]]] {
+        for (judged, questions) in w.stats(args) {
+            assert!(judged > N, "bracken {args:?} judged {judged} decisions");
+            assert!(questions >= (N * (N - 1) / 2) as u64, "bracken {args:?} asked {questions} questions");
+        }
+    }
+    let head = w.json(&["weave", "head", "--line", "stray", "--json"]);
+    assert_eq!(head["heads"][0]["decision"], stray[0].as_str(), "only the first move qualifies");
 }

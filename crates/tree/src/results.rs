@@ -165,9 +165,10 @@ pub(crate) fn answer(
 impl Checks {
     pub fn build(g: &Graph, ix: &Index, lines: &Lines) -> Checks {
         let mut checks = Checks::default();
-        // Only results by a validator under some policy version can count, so only theirs are asked
-        // about: anyone else's writes cost nothing.
-        let validators: HashSet<&AgentId> = lines.versions().flat_map(|v| &v.policy.validators).collect();
+        // Only results by a validator under some policy version of a line judged can count, so only
+        // theirs are asked about: anyone else's writes cost nothing, as do the validators of a line
+        // nobody asked about (task a4d1a06a1072).
+        let validators: HashSet<&AgentId> = lines.judged_versions().flat_map(|v| &v.policy.validators).collect();
         for r in ix.check_results().iter().filter(|r| validators.contains(&r.author)) {
             checks.results.insert(r.id, r.clone());
             checks.by_key.entry((r.author, r.manifest, r.method.clone())).or_default().push(r.id);
@@ -192,7 +193,7 @@ impl Checks {
         // version is its ancestor. The current versions by method, then one pass over the results
         // (finding bf859c9a069d).
         let mut by_method: HashMap<String, Vec<ContributionId>> = HashMap::new();
-        for line in lines.lines() {
+        for line in lines.lines().filter(|l| lines.judges(&l.id)) {
             if let [current] = lines.current_versions(&line.id).as_slice() {
                 let policy = &lines.version(current).expect("a current version").policy;
                 for name in policy.checks.keys() {

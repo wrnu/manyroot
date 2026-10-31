@@ -277,7 +277,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             if !dry_run {
                 require_marker(&ix)?;
             }
-            let lines = Lines::build(s.graph(), &ix);
+            let lines = super::lines_for(s, &ix, &[Some(&line)]);
             let first = resolve_line(s, &lines, Some(&line), "the line")?;
             let who = signer(s, agent)?;
             let author = lines.line(&first).expect("resolved").author;
@@ -366,7 +366,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             if !dry_run {
                 require_marker(&ix)?;
             }
-            let lines = Lines::build(s.graph(), &ix);
+            let lines = super::lines_for(s, &ix, &[Some(&into), Some(&from), base.as_deref()]);
             let target = lines_target(s, &lines, &ix, &into, &from, base.as_deref())?;
             write_merge(s, agent, &ix, &lines, target, note, dry_run, None, &Default::default(), out)
         }
@@ -469,7 +469,7 @@ pub(crate) fn propose(s: &mut Store, agent: Option<&str>, args: ProposeArgs) -> 
     if !dry_run {
         require_marker(&ix)?;
     }
-    let lines = Lines::build(s.graph(), &ix);
+    let lines = super::lines_for(s, &ix, &[line.as_deref(), base.as_deref()]);
     let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
     let base = match base {
         Some(b) => {
@@ -578,7 +578,8 @@ pub(crate) fn integrate_proposals(
 ) -> Result<ExitCode> {
     let ix = Index::build(s.graph());
     require_marker(&ix)?;
-    let lines = Lines::build(s.graph(), &ix);
+    let named: Vec<Option<&str>> = proposals.iter().map(|p| Some(p.as_str())).chain([line]).collect();
+    let lines = super::lines_for(s, &ix, &named);
     let target = proposals_target(s, &lines, &ix, line, proposals)?;
     write_merge(s, agent, &ix, &lines, target, note, false, run, decide_args, out)
 }
@@ -925,7 +926,11 @@ fn write_merge(
         }
     }
     let ix = Index::build(s.graph());
-    let lines = Lines::build(s.graph(), &ix);
+    // Its own line and its parents' lines, as rule 3 judges its parents.
+    let lines = super::judged_for(s, &ix, |l| {
+        let parents = decision.parents.iter().filter_map(|p| l.decision(p)).map(|p| p.decision.line);
+        std::iter::once(decision.line).chain(parents).collect()
+    });
     if let Err(why) = lines.judge_new(s.graph(), &ix, who.agent_id(), &decision) {
         decide(false);
         print_tree_written(Some(hash), &[], &results, out);
@@ -1019,7 +1024,11 @@ pub(crate) fn resolve(s: &mut Store, agent: Option<&str>, args: ResolveArgs) -> 
     if !dry_run {
         require_marker(&ix)?;
     }
-    let lines = Lines::build(s.graph(), &ix);
+    let named: Vec<Option<&str>> = [into.as_deref(), from.as_deref(), base.as_deref(), line.as_deref()]
+        .into_iter()
+        .chain(proposals.iter().map(|p| Some(p.as_str())))
+        .collect();
+    let lines = super::lines_for(s, &ix, &named);
     let target = match (&into, &from) {
         (Some(into), Some(from)) => lines_target(s, &lines, &ix, into, from, base.as_deref())?,
         _ => proposals_target(s, &lines, &ix, line.as_deref(), &proposals)?,
