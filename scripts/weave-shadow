@@ -21,6 +21,11 @@
 #       commit line main's head records (older, or unrelated). Run again for that recorded commit, it
 #       records nothing and verifies it again. <dir> is the git repository (the default is the main
 #       checkout).
+#
+# "Line main" is always the default line: the line named main whose first version the marker's author,
+# weave-integrator, wrote. Anyone can write another line named main, which never becomes the default, so
+# this script never names line main by name, where such a line would make it ambiguous (finding
+# b5b5871cc017). It gives no --line, or the default line's id.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -79,15 +84,17 @@ if [ -n "$init" ]; then
   ids=$("$weave" id list --json)
   jq -e 'any(.[]; .name == "weave-runner")' <<<"$ids" >/dev/null || "$weave" id new weave-runner
   # line main's current policy, as a dry run that changes nothing shows it; none if weave init stopped
-  # after its marker, before writing the line.
-  if ! shown=$("$weave" weave line policy main --dry-run --json --owner-decision "$owner" --as weave-integrator 2>/dev/null)
+  # after its marker, before writing the line. The line by its id, never by its name.
+  line=$("$weave" weave head --json 2>/dev/null | jq -r '.line // empty') || line=''
+  if [ -z "$line" ] ||
+    ! shown=$("$weave" weave line policy "$line" --dry-run --json --owner-decision "$owner" --as weave-integrator 2>/dev/null)
   then
     "$weave" weave line create main "${policy[@]}"
   else
     runner=$(jq -r '.[] | select(.name == "weave-runner") | .agent' <<<"$("$weave" id list --json)")
     jq -e --arg r "$runner" '(.validators | index($r) != null) and .checks.fmt != null and .checks.clippy != null' \
       <<<"$shown" >/dev/null && fail "the Weave Ground $path is already set up; --init has nothing to do"
-    "$weave" weave line policy main "${policy[@]}"
+    "$weave" weave line policy "$line" "${policy[@]}"
   fi
   exit 0
 fi
@@ -103,12 +110,12 @@ git -C "$repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null ||
   fail "$repo has no refs/remotes/origin/main to check $sha against"
 git -C "$repo" merge-base --is-ancestor "$sha" refs/remotes/origin/main ||
   fail "$sha isn't on refs/remotes/origin/main: only merged commits are shadowed"
-head=$("$weave" weave head --line main --json)
+head=$("$weave" weave head --json)
 [ "$(jq -r '.forked' <<<"$head")" = false ] || fail "line main is forked; settle it before shadowing more commits"
 decision=$(jq -r '.heads[0].decision // empty' <<<"$head")
 recorded=''
 if [ -n "$decision" ]; then
-  log=$("$weave" weave log --line main --limit 1 --json)
+  log=$("$weave" weave log --limit 1 --json)
   [ "$(jq -r '.decisions[0].decision' <<<"$log")" = "$decision" ] || fail "line main's newest decision isn't its head"
   recorded=$(jq -r '.decisions[0].source.git // empty' <<<"$log")
   [ -n "$recorded" ] || fail "line main's head $decision names no git commit, so the next commit can't be checked against it"
@@ -121,7 +128,7 @@ else
       fail "$sha doesn't come after $recorded, the commit line main's head records: an older or unrelated commit"
   fi
   "$weave" weave import --from-git "$sha" --repo "$repo" --as weave-integrator
-  out=$("$weave" weave integrate --line main --from-git "$sha" --repo "$repo" --note "shadow of $sha" \
+  out=$("$weave" weave integrate --from-git "$sha" --repo "$repo" --note "shadow of $sha" \
     --as weave-integrator --json)
   decision=$(jq -r '.decision // empty' <<<"$out")
   [ -n "$decision" ] || fail "weave integrate recorded no decision for $sha: $out"

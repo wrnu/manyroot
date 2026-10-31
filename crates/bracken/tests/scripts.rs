@@ -3804,8 +3804,9 @@ fn git_out(dir: &Path, args: &[&str]) -> String {
 /// recorded commit, it records nothing. Before writing anything it refuses a commit that isn't on
 /// origin/main (even with a local branch of that name on it, finding 7315c1ccfaf4), one older than the
 /// recorded commit, and an unrelated one (finding 93dea3dd7ec2). A
-/// recorded decision that no longer matches git's tree (through git replace) fails. Never the real
-/// ~/bracken-weave: HOME is under $TMPDIR.
+/// recorded decision that no longer matches git's tree (through git replace) fails. A second line named
+/// main, by someone else, changes none of it: the script uses the default line, never the name (finding
+/// b5b5871cc017). Never the real ~/bracken-weave: HOME is under $TMPDIR.
 #[test]
 fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     let shadow = repo_root().join("scripts/weave-shadow");
@@ -3891,6 +3892,18 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     let runner = ids.as_array().unwrap().iter().find(|i| i["name"] == "weave-runner").expect("weave-runner");
     assert_eq!(policy["validators"], serde_json::json!([runner["agent"]]), "{policy}");
     assert_eq!(policy["integrators"].as_array().unwrap().len(), 1, "{policy}");
+
+    // Someone else's line named main: it never becomes the default line, and from here on naming main is
+    // ambiguous, so the script mustn't name it.
+    let weave_ok = |args: &[&str]| {
+        let out = command(&dir, "scripts/weave", args).env("HOME", &home).output().unwrap();
+        assert!(out.status.success(), "weave {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    weave_ok(&["id", "new", "mallory"]);
+    weave_ok(&["weave", "line", "create", "main", "--owner-decision", &decision, "--as", "mallory"]);
+    let out = command(&dir, "scripts/weave", &["weave", "head", "--line", "main"]).env("HOME", &home).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("2 lines are named"), "{out:?}");
+    refused(&["--init", "--owner-decision", &approval], "already set up");
 
     // Three successive first-parent commits of this repository, oldest first, in a clone sharing its
     // objects, whose origin/main is this repository's HEAD: a branch under test isn't on the real origin/main.

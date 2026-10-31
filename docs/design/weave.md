@@ -450,15 +450,22 @@ use causal order and break ties by the smallest id; none use `timestamp_ms`
 replica. The one exception is completeness, which converges once replicas
 sync.
 
-**Who pays for a line.** Whether a decision qualifies reads only its
-causal ancestors that are decisions, on any line, and its own line's
-policy chain (rules 1 to 6 below). So a reader judges only the lines it
+**Who pays for a line.** Whether a decision qualifies reads only what is
+in its past: its causal ancestors that are decisions, on any line, with
+their verdicts; the objections, answers, check results and goal links
+there; and its own line's policy chain (rules 1 to 6 below). So a reader
+judges only the lines it
 asks about, plus the default line: their decisions, and the decisions
 those have as ancestors, on whatever line. It also judges the proposals on
 those lines. Every other decision is left unjudged, and every other
 proposal is kept by its payload alone, so that naming it still finds its
 line. Each command asks about the lines it names, by id or name, or by the
-id of one of their decisions or proposals. A line nobody names, and no
+id of one of their decisions or proposals. A name names every line of that
+name, and anyone can write a line called `main`, which never becomes the
+default line. So `--line main` judges such a line too, and is then refused
+as ambiguous; only giving no `--line` (the default line), or the line's id,
+can't be made to. `scripts/weave-shadow` does that (finding
+`b5b5871cc017`). A line nobody names, and no
 named line's decision descends from, costs a reader nothing beyond holding
 its records (task `a4d1a06a1072`). Asking about a line still judges it
 whole, with the same verdict a judgement of every line gives. This changes
