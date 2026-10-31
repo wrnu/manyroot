@@ -5796,3 +5796,208 @@ fn pi_prefix_refuses_a_node_tarball_that_doesnt_match_its_pin() {
         assert!(String::from_utf8_lossy(&out.stderr).contains("builds for macOS on arm64 only"));
     }
 }
+
+/// Task 5b81f744a0ea: scripts/weave-backup copies the Weave Ground, identities included, to
+/// <dest>/<UTC time>/, at mode 0700. It does so only with the owner's approval naming <dest>'s real path,
+/// and only once the pinned binary opens the copy with the Ground's contributions, heads and identities.
+/// Writes in flight (.tmp-*) are left out, and a pass that misses an ancestor while the Ground is written
+/// to meanwhile is copied again. It keeps the newest --keep copies, the new one among them. It deletes only
+/// older directories holding a copy of this Ground, and stops at a name dated after now. It refuses a
+/// destination inside a git checkout (through a symlinked parent too) or ~/bracken-weave, one holding the
+/// Ground, a symlink, a file, one not at 0700 or with an ACL, and one under a directory others can write
+/// to. It prints counts only. --verify opens a copy and refuses an incomplete one and one of another
+/// Ground. Never the real ~/bracken-weave: HOME is under $TMPDIR. Findings a9ad923091bf, 85c08b7f8aea,
+/// 9c4a64c905c3 and 661f68c123b7.
+#[test]
+fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
+    use std::os::unix::fs::PermissionsExt;
+    let backup = repo_root().join("scripts/weave-backup");
+    let (tmp, dir, home, _) = weave_repo_with(&[("scripts/weave-backup", &backup)]);
+    let real_path = std::env::var("PATH").unwrap();
+    let shim = tmp.path().join("shim");
+    let run_with = |path: &str, args: &[&str]| -> Output {
+        let mut c = command(&dir, "scripts/weave-backup", args);
+        c.env("HOME", &home).env("PATH", path).env("REAL_PATH", &real_path).env("T", tmp.path());
+        c.output().unwrap()
+    };
+    let run_backup = |args: &[&str]| run_with(&real_path, args);
+    let refused = |args: &[&str], expected: &str| {
+        let out = run_backup(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+    };
+    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o7777;
+    let private_dir = |p: &Path| {
+        std::fs::create_dir(p).unwrap();
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    // A path as the script names it: its parent's real path, then its name ($TMPDIR may be a symlink).
+    let real = |p: &Path| std::fs::canonicalize(p.parent().unwrap()).unwrap().join(p.file_name().unwrap());
+    let s = |p: &Path| p.to_str().unwrap().to_owned();
+
+    let [a, b, open, file, acl, fut] = ["a", "b", "open", "file", "acl", "fut"].map(|n| tmp.path().join(n));
+    let approval = |text: &str| bk(&dir, &["claim", text, "--tag", "approval", "--as", "owner"]);
+    bk(&dir, &["id", "new", "owner"]);
+    let go = approval(&format!(
+        "Approval (owner): back up the Weave Ground to `{}`, {}, {}/ {} {} and {}.",
+        s(&real(&a)),
+        s(&real(&b)),
+        s(&real(&open)),
+        s(&real(&file)),
+        s(&real(&acl)),
+        s(&real(&fut))
+    ));
+    let a_old = approval(&format!("Approval (owner): back up to {}-old", s(&real(&a))));
+    bk(&dir, &["id", "new", "manager"]);
+    let not_owner =
+        bk(&dir, &["claim", &format!("Approval: {}", s(&real(&a))), "--tag", "approval", "--as", "manager"]);
+    let with = |dest: &Path| [s(dest)];
+    let backup_to = |dest: &Path, more: &[&str]| -> Vec<String> {
+        let mut args: Vec<String> = vec!["--owner-decision".into(), go.clone()];
+        args.extend(more.iter().map(|m| m.to_string()));
+        args.extend(with(dest));
+        args
+    };
+    let refused_to = |dest: &Path, expected: &str| {
+        let args = backup_to(dest, &[]);
+        refused(&args.iter().map(String::as_str).collect::<Vec<_>>(), expected);
+    };
+    refused_to(&a, "no Weave Ground at");
+    assert!(!a.exists());
+
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let ok = |args: &[&str]| -> String {
+        let out = weave(&dir, "scripts/weave", &home, None, args);
+        assert!(out.status.success(), "weave {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let init = ok(&["weave", "init", "--as", "weave-integrator"]);
+    let marker = init.lines().find_map(|l| l.strip_prefix("marker ")).expect("a marker").to_owned();
+    ok(&["claim", "hello", "--as", "weave-integrator"]);
+    let ground = home.join("bracken-weave/manyroot");
+    // A write in flight, which the copy leaves out.
+    let shard = ground.join("objects").join(&marker[..2]);
+    std::fs::write(shard.join(".tmp-1-inflight"), b"half").unwrap();
+
+    // Refused before anything is created.
+    let symlink = tmp.path().join("link");
+    std::os::unix::fs::symlink(tmp.path(), &symlink).unwrap();
+    let into_checkout = tmp.path().join("into-checkout");
+    std::os::unix::fs::symlink(&dir, &into_checkout).unwrap();
+    let shared = tmp.path().join("shared");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+    std::fs::create_dir(&open).unwrap();
+    std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&file, b"").unwrap();
+    refused_to(&dir.join("backups"), "inside the git checkout");
+    refused_to(&into_checkout.join("backups"), "inside the git checkout");
+    refused_to(&home.join("bracken-weave/backups"), "back up the Weave Ground somewhere else");
+    refused_to(&ground.join("objects"), "back up the Weave Ground somewhere else");
+    refused_to(&home, "holds the Weave Ground");
+    refused_to(&symlink, "is a symlink");
+    refused_to(&shared.join("bk"), "is writable by group or others and not sticky");
+    refused(&[&s(&a)], "a backup needs --owner-decision");
+    refused(&["--owner-decision", "TODO", &s(&a)], "12 to 64 lowercase hex");
+    refused(&["--owner-decision", "0123456789ab", &s(&a)], "has no such contribution");
+    refused(&["--owner-decision", &not_owner, &s(&a)], "isn't a claim tagged approval, signed by owner");
+    refused(&["--owner-decision", &a_old, &s(&a)], "the approval doesn't name");
+    refused(&["--owner-decision", &go, &s(&tmp.path().join("elsewhere"))], "the approval doesn't name");
+    refused_to(&file, "isn't a directory");
+    refused_to(&open, "must be 0700");
+    refused(&["--owner-decision", &go, "--keep", "0", &s(&a)], "give a whole number");
+    if cfg!(target_os = "macos") {
+        private_dir(&acl);
+        let chmod = Command::new("chmod").args(["+a", "everyone allow list"]).arg(&acl).status().unwrap();
+        assert!(chmod.success());
+        refused_to(&acl, "has an ACL");
+        assert_eq!(std::fs::read_dir(&acl).unwrap().count(), 0);
+    }
+    private_dir(&fut);
+    std::fs::write(fut.join("99990101T000000Z"), b"").unwrap();
+    refused_to(&fut, "is named for a time after now");
+    assert_eq!(std::fs::read_dir(&fut).unwrap().count(), 1, "a refusal wrote into {fut:?}");
+    assert!(!a.exists() && !dir.join("backups").exists() && !shared.join("bk").exists(), "a refusal created something");
+    assert_eq!(std::fs::read_dir(&open).unwrap().count(), 0, "a refusal wrote into {open:?}");
+
+    // A first copy, into a directory it creates at 0700: identities included, byte for byte, the write in
+    // flight left out, and counts only printed.
+    let args = backup_to(&a, &[]);
+    let out = run_backup(&args.iter().map(String::as_str).collect::<Vec<_>>());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(mode(&a), 0o700);
+    let copies: Vec<PathBuf> = std::fs::read_dir(&a).unwrap().map(|e| e.unwrap().path()).collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let copy = &copies[0];
+    assert_eq!(stdout, format!("backup {}: 3 contributions, 1 heads, 1 identities\n", s(&real(copy))));
+    assert_eq!(mode(copy), 0o700);
+    let key = |g: &Path| std::fs::read(g.join("identities/weave-integrator.json")).unwrap();
+    assert_eq!(key(copy), key(&ground));
+    assert_eq!(mode(&copy.join("identities/weave-integrator.json")), 0o600);
+    assert!(copy.join("objects").join(&marker[..2]).join(&marker[2..]).exists());
+    assert!(!copy.join("objects").join(&marker[..2]).join(".tmp-1-inflight").exists(), "a write in flight was copied");
+    let out = run_backup(&["--verify", &s(copy)]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("verified {}: 3 contributions, 1 heads, 1 identities\n", s(copy))
+    );
+
+    // --verify refuses a copy missing a contribution others build on, and a copy of another Ground.
+    let broken = tmp.path().join("broken");
+    assert!(Command::new("cp").arg("-Rp").arg(copy).arg(&broken).status().unwrap().success());
+    std::fs::remove_file(broken.join("objects").join(&marker[..2]).join(&marker[2..])).unwrap();
+    refused(&["--verify", &s(&broken)], "isn't a complete copy");
+    let other = tmp.path().join("other");
+    let out = Command::new(env!("CARGO_BIN_EXE_bracken")).arg("init").env("BRACKEN_DIR", &other).output().unwrap();
+    assert!(out.status.success());
+    refused(&["--verify", &s(&other)], "a copy of another Ground");
+
+    // The first pass misses the marker, as if its directory was copied just before it was written, while
+    // someone writes to the Ground: the copy is made again, and holds the new contribution too. Then only the
+    // two oldest copies of this Ground go: never a directory that isn't one, a file or a symlink.
+    std::fs::create_dir(&shim).unwrap();
+    write_executable(
+        &shim.join("tar"),
+        &format!(
+            "#!/bin/sh\nPATH=$REAL_PATH tar \"$@\" || exit\ncase \" $* \" in *\" -xpf \"*) ;; *) exit 0 ;; esac\n\
+             [ ! -e \"$T/tar.once\" ] || exit 0\ntouch \"$T/tar.once\"\n\
+             rm \"$2/objects/{}/{}\"\nHOME={home:?} PATH=$REAL_PATH {weave:?} claim racing --as weave-integrator >/dev/null\n",
+            &marker[..2],
+            &marker[2..],
+            home = home,
+            weave = dir.join("scripts/weave"),
+        ),
+    );
+    private_dir(&b);
+    for name in ["20200101T000000Z", "20200102T000000Z", "20200103T000000Z"] {
+        assert!(Command::new("cp").arg("-Rp").arg(copy).arg(b.join(name)).status().unwrap().success());
+    }
+    std::fs::create_dir(b.join("20200101T120000Z")).unwrap();
+    std::fs::create_dir(b.join("notes")).unwrap();
+    std::fs::write(b.join("20200104T000000Z"), b"").unwrap();
+    std::os::unix::fs::symlink(copy, b.join("20200105T000000Z")).unwrap();
+    let args = backup_to(&b, &["--keep", "2"]);
+    let out =
+        run_with(&format!("{}:{real_path}", shim.display()), &args.iter().map(String::as_str).collect::<Vec<_>>());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(tmp.path().join("tar.once").exists(), "the shim ran");
+    assert!(out.stderr.is_empty(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains(": 4 contributions, 1 heads, 1 identities\n"), "{stdout}");
+    assert!(stdout.ends_with("deleted 20200101T000000Z\ndeleted 20200102T000000Z\n"), "{stdout}");
+    let mut left: Vec<String> =
+        std::fs::read_dir(&b).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+    left.sort();
+    let kept = ["20200101T120000Z", "20200103T000000Z", "20200104T000000Z", "20200105T000000Z", "notes"];
+    let new: Vec<&String> = left.iter().filter(|n| !kept.contains(&n.as_str())).collect();
+    assert_eq!((left.len(), new.len()), (6, 1), "{left:?}");
+    let new = new[0].clone();
+    assert!(copy.exists(), "the symlink's target is kept");
+    let out = run_backup(&["--verify", &s(&b.join(&new))]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(": 4 contributions, 1 heads, 1 identities"));
+}
