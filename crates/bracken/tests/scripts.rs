@@ -4747,6 +4747,254 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     assert!(stderr.contains(&format!("doesn't verify equal to git's {unmerged}")), "{stderr}");
 }
 
+/// Weave dogfood stage 2a (task 87a1bcba025d, design c4fe14c88fe1): a builder proposes each pushed head with
+/// scripts/weave-propose, against the decision that mirrors its merge-base or its nearest recorded
+/// first-parent ancestor; after git's merge, weave-shadow --proposal has Weave merge it itself, written only
+/// if it equals git's tree. A merge commit whose first parent is a checkpoint can bring in a batch of
+/// squashes, one --proposal each, merged in squash order into one decision; one PR without a proposal makes
+/// the whole merge an import, noted with the PR. Each proposal must be of a PR the merge brings in, and of
+/// the head its current pr claim names. A per-file conflict falls back to the import, noted with its paths;
+/// a merge that differs from git's stops with nothing written, and --mismatched then imports, noted. Merges
+/// are shadowed in order, and each run counts the outcomes. Only weave-integrator moves a line. Findings
+/// 155debbbee94, 1f66448c728d and da532127b55f. Never the real ~/bracken-weave: HOME is under $TMPDIR.
+#[test]
+fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
+    let shadow = repo_root().join("scripts/weave-shadow");
+    let propose = repo_root().join("scripts/weave-propose");
+    let (tmp, dir, home, _) =
+        weave_repo_with(&[("scripts/weave-shadow", &shadow), ("scripts/weave-propose", &propose)]);
+    let approval = owner_approval(&dir);
+    bk(&dir, &["id", "new", "alice"]);
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let script = |name: &str, args: &[&str]| -> Output {
+        let mut c = command(&dir, name, args);
+        c.env("HOME", &home).output().unwrap()
+    };
+    let ok = |name: &str, args: &[&str]| -> String {
+        let out = script(name, args);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(out.status.success(), "{name} {args:?}: {}{stdout}", String::from_utf8_lossy(&out.stderr));
+        stdout
+    };
+    let refused = |name: &str, args: &[&str], expected: &str| {
+        let out = script(name, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{name} {args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{name} {args:?}: expected {expected:?} in {stderr}");
+    };
+    ok("scripts/weave-shadow", &["--init", "--owner-decision", &approval]);
+    let git = |args: &[&str]| git_out(&dir, args);
+    let write = |path: &str, text: &str| std::fs::write(dir.join(path), text).unwrap();
+    let commit = |msg: &str| {
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", msg]);
+        git(&["rev-parse", "HEAD"])
+    };
+    let push = |name: &str| git(&["update-ref", &format!("refs/remotes/origin/{name}"), "HEAD"]);
+    // A builder's branch from main, committed and pushed (its remote-tracking ref set).
+    let branch = |name: &str, change: &dyn Fn()| {
+        git(&["switch", "-q", "-c", name, "main"]);
+        change();
+        commit(name);
+        push(name);
+    };
+    // The builder's pr claim for the pushed head, and with `proposed`, its proposal first.
+    let claim = |pr: &str| {
+        let (name, sha) = (git(&["symbolic-ref", "--short", "HEAD"]), git(&["rev-parse", "HEAD"]));
+        bk(&dir, &["claim", &format!("PR #{pr} {name} @ {sha}: {name}"), "--tag", "pr", "--as", "alice"]);
+    };
+    let proposal = |pr: &str| {
+        let out = ok("scripts/weave-propose", &["--pr", pr, "--as", "alice"]);
+        claim(pr);
+        out.lines().find_map(|l| l.strip_prefix("proposal ")).expect("a proposal").to_owned()
+    };
+    let origin_main = |sha: &str| git(&["update-ref", "refs/remotes/origin/main", sha]);
+    // git's squash merge of a branch straight onto main, now origin/main.
+    let squash = |name: &str, pr: &str| {
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "-q", "--squash", name]);
+        let sha = commit(&format!("{name} (#{pr})"));
+        origin_main(&sha);
+        sha
+    };
+    // As main has it: the forge squashes each branch in turn onto main's tip, a checkpoint commit lands on
+    // main meanwhile (only .bracken/ changes), and the local merge of the two is the new main.
+    let index = tmp.path().join("scratch-index");
+    let batch = |prs: &[(&str, &str)]| {
+        git(&["switch", "-q", "main"]);
+        let tip = git(&["rev-parse", "HEAD"]);
+        let mut forge = tip.clone();
+        for (name, pr) in prs {
+            let tree = git(&["merge-tree", "--write-tree", &forge, name]);
+            forge = git(&["commit-tree", &tree, "-p", &forge, "-m", &format!("{name} (#{pr})")]);
+        }
+        let scratch = |args: &[&str]| {
+            let out = command(&dir, "git", args).env("GIT_INDEX_FILE", &index).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        scratch(&["read-tree", &tip]);
+        let blob = git(&["hash-object", "-w", "--stdin", "--path", "x"]);
+        scratch(&["update-index", "--add", "--cacheinfo", &format!("100644,{blob},.bracken/checkpoint")]);
+        let checkpoint = git(&["commit-tree", &scratch(&["write-tree"]), "-p", &tip, "-m", "ground: checkpoint"]);
+        let tree = git(&["merge-tree", "--write-tree", &checkpoint, &forge]);
+        let merge = git(&[
+            "commit-tree",
+            &tree,
+            "-p",
+            &checkpoint,
+            "-p",
+            &forge,
+            "-m",
+            "Merge remote-tracking branch 'origin/main'",
+        ]);
+        git(&["reset", "-q", "--hard", &merge]);
+        origin_main(&merge);
+        merge
+    };
+    let shadowed = |args: &[&str], outcome: &str| -> String {
+        let out = ok("scripts/weave-shadow", args);
+        assert!(out.contains(&format!("\noutcome {outcome}\n")), "{args:?}: {out}");
+        assert!(out.contains("verified "), "{out}");
+        out
+    };
+    let count = || {
+        let out = script("scripts/weave", &["log", "--json", "--limit", "0"]);
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["omitted"].as_u64().unwrap()
+    };
+
+    // The first commit, as stage 1 records it.
+    write("x.txt", "one\ntwo\nthree\nfour\nfive\n");
+    let c0 = commit("x");
+    origin_main(&c0);
+    shadowed(&[&c0], "first");
+
+    // Only what was pushed is proposed, and only weave-integrator moves a line.
+    git(&["switch", "-q", "-c", "unpushed"]);
+    write("u.txt", "u\n");
+    commit("u");
+    refused("scripts/weave-propose", &["--pr", "9", "--as", "alice"], "push first");
+    refused("scripts/weave", &["weave", "integrate", "--as", "alice"], "only --as weave-integrator");
+
+    // PR #1: proposed, merged by git, then merged by Weave equal to it.
+    branch("f1", &|| write("f1.txt", "f1\n"));
+    let p1 = proposal("1");
+    let m1 = squash("f1", "1");
+    let out = shadowed(&["--proposal", &p1, &m1], "merged");
+    assert!(
+        out.contains(
+            "stage 2a so far: 1 merges, 1 by Weave's own merge; fallbacks: 0 no proposal, 0 conflict, 0 mismatch"
+        ),
+        "{out}"
+    );
+
+    // PRs #2 and #3 both change x.txt, in different lines: git merges both, Weave merges #3 and conflicts on
+    // #2, which falls back to the import, noted with the path.
+    branch("f2", &|| write("x.txt", "ONE\ntwo\nthree\nfour\nfive\n"));
+    let p2 = proposal("2");
+    branch("f3", &|| write("x.txt", "one\ntwo\nthree\nfour\nFIVE\n"));
+    let p3 = proposal("3");
+    let m3 = squash("f3", "3");
+    // A proposal must be of the PR merged: #2's isn't #3's.
+    refused("scripts/weave-shadow", &["--proposal", &p2, &m3], "which");
+    shadowed(&["--proposal", &p3, &m3], "merged");
+    let m2 = squash("f2", "2");
+    shadowed(&["--proposal", &p2, &m2], "conflict");
+
+    // PR #4's merge in git carries more than its proposal: it stops with nothing written, then --mismatched
+    // imports it, noted.
+    branch("f4", &|| write("f4.txt", "f4\n"));
+    let p4 = proposal("4");
+    let m4 = {
+        git(&["switch", "-q", "main"]);
+        git(&["merge", "-q", "--squash", "f4"]);
+        write("extra.txt", "the manager's\n");
+        let sha = commit("f4 (#4)");
+        origin_main(&sha);
+        sha
+    };
+    let before = count();
+    refused("scripts/weave-shadow", &["--proposal", &p4, &m4], "Stop and report it");
+    assert_eq!(count(), before, "a mismatch wrote something");
+    shadowed(&["--proposal", &p4, "--mismatched", &m4], "mismatch");
+
+    // A merge without a proposal is imported, noted.
+    write("direct.txt", "d\n");
+    let m5 = commit("direct");
+    origin_main(&m5);
+    let out = shadowed(&[&m5], "none");
+    assert!(
+        out.contains(
+            "stage 2a so far: 5 merges, 2 by Weave's own merge; fallbacks: 1 no proposal, 1 conflict, 1 mismatch"
+        ),
+        "{out}"
+    );
+
+    // A branch from a commit the shadow hasn't recorded is proposed against its nearest recorded first-parent
+    // ancestor. Its merge waits for the commit before it: one merge at a time, in order.
+    write("m6.txt", "6\n");
+    let m6 = commit("m6");
+    origin_main(&m6);
+    branch("f7", &|| write("f7.txt", "7\n"));
+    let p7 = proposal("7");
+    let m7 = squash("f7", "7");
+    refused("scripts/weave-shadow", &["--proposal", &p7, &m7], "shadow the merges in order");
+    shadowed(&[&m6], "none");
+    shadowed(&["--proposal", &p7, &m7], "merged");
+
+    // A batch: the local merge, after a checkpoint, of two squashes. Their proposals, given in any order, are
+    // merged in squash order into one decision.
+    branch("f8", &|| write("f8.txt", "8\n"));
+    let p8 = proposal("8");
+    branch("f9", &|| write("f9.txt", "9\n"));
+    let p9 = proposal("9");
+    let b1 = batch(&[("f8", "8"), ("f9", "9")]);
+    shadowed(&["--proposal", &p9, "--proposal", &p8, &b1], "merged");
+
+    // Another batch, where #10 has no proposal and #11's is of an earlier push than its pr claim names. That
+    // proposal is refused; with none for #10, the whole merge is imported, noted with which PR.
+    branch("f10", &|| write("f10.txt", "10\n"));
+    claim("10");
+    branch("f11", &|| write("f11.txt", "11\n"));
+    let stale = proposal("11");
+    write("f11.txt", "11, again\n");
+    commit("f11 again");
+    push("f11");
+    claim("11");
+    let b2 = batch(&[("f10", "10"), ("f11", "11")]);
+    refused("scripts/weave-shadow", &["--proposal", &stale, &b2], "propose the merged head");
+    refused("scripts/weave-shadow", &["--proposal", &p8, &b2], "which");
+    git(&["switch", "-q", "f11"]);
+    let p11 = proposal("11");
+    let out = shadowed(&["--proposal", &p11, &b2], "none");
+    assert!(
+        out.contains(
+            "stage 2a so far: 9 merges, 4 by Weave's own merge; fallbacks: 3 no proposal, 1 conflict, 1 mismatch"
+        ),
+        "{out}"
+    );
+
+    let log =
+        serde_json::from_str::<serde_json::Value>(&ok("scripts/weave", &["weave", "log", "--limit", "100", "--json"]))
+            .unwrap();
+    let notes: Vec<&str> = log["decisions"].as_array().unwrap().iter().map(|d| d["note"].as_str().unwrap()).collect();
+    assert_eq!(
+        notes,
+        [
+            format!("shadow of {b2}: no proposal for PR #10"),
+            format!("shadow of {b1}: merged proposals {p8} {p9}"),
+            format!("shadow of {m7}: merged proposal {p7}"),
+            format!("shadow of {m6}: no proposal"),
+            format!("shadow of {m5}: no proposal"),
+            format!("shadow of {m4}: proposal {p4} mismatched at extra.txt"),
+            format!("shadow of {m2}: proposal {p2} conflicted at x.txt"),
+            format!("shadow of {m3}: merged proposal {p3}"),
+            format!("shadow of {m1}: merged proposal {p1}"),
+            format!("shadow of {c0}"),
+        ]
+    );
+}
+
 /// scripts/weave refuses a line write unless --owner-decision names a claim tagged decision, or an
 /// approval signed by owner (what scripts/weave-shadow --init passes), not retracted, in the coordination
 /// Ground (answer 2a620fd0b0dc, finding 3cd6cd19f9a0).

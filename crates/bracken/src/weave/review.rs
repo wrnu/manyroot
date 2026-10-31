@@ -338,7 +338,8 @@ pub(crate) fn review(s: &Store, args: ReviewArgs) -> Result<ExitCode> {
         let proposals: Vec<Value> = per_proposal
             .iter()
             .map(|(p, rs, os)| {
-                json!({"proposal": p,
+                let named = lines.proposal_named(p);
+                json!({"proposal": p, "summary": named.map(|n| n.summary.as_str()), "base": named.map(|n| n.base),
                        "reviews": rs.iter().map(|(r, t)| review_json(r, t, &names)).collect::<Vec<_>>(),
                        "must_answer": os.iter().map(|o| open_json(o, &names)).collect::<Vec<_>>()})
             })

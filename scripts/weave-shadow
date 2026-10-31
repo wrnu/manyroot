@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# weave-shadow: Weave dogfood stage 1, the shadow (docs/design/weave.md, section 6 row 9; docs/development.md,
-# Weave shadow). Everything goes through scripts/weave, so it opens only the Weave Ground,
+# weave-shadow: Weave dogfood, the shadow: stage 1, and stage 2a's merges of builders' proposals
+# (docs/design/weave.md, section 6 rows 9 and 10a; docs/development.md, Weave shadow; task 87a1bcba025d). Everything goes through scripts/weave, so it opens only the Weave Ground,
 # ~/bracken-weave/manyroot, with every check scripts/weave makes.
 #
 #   scripts/weave-shadow --init --owner-decision <id>
@@ -12,15 +12,29 @@
 #       refuses. As scripts/weave does, it refuses if ~/bracken-weave doesn't exist: creating it is the
 #       owner's go.
 #
-#   scripts/weave-shadow [--repo <dir>] <merged commit>
-#       After each merge to main: imports the commit's tree (weave import --from-git), records it as a
-#       decision on line main by weave-integrator (weave integrate of the given tree, whose parent is the
-#       line's head, the previous decision), and checks it with weave verify against the commit. Prints
-#       labelled lines (manifest, file, decision, verified) and exits non-zero on any difference. Before
-#       writing anything it refuses a commit that isn't on origin/main, or that doesn't come after the
-#       commit line main's head records (older, or unrelated). Run again for that recorded commit, it
-#       records nothing and verifies it again. <dir> is the git repository (the default is the main
-#       checkout).
+#   scripts/weave-shadow [--repo <dir>] [--proposal <id>]... [--mismatched] <merged commit>
+#       After each merge to main, one merge at a time, in order: records the commit as a decision on line
+#       main by weave-integrator, whose parent is the line's head, the previous decision, and checks it
+#       with weave verify against the commit. Exits non-zero on any difference. Before writing anything it
+#       refuses a commit that isn't on origin/main, or that doesn't come after the commit line main's head
+#       records (older, or unrelated). Run again for that recorded commit, it records nothing and verifies
+#       it again. <dir> is the git repository (the default is the main checkout).
+#       The commit brings in one PR's squash, or with a merge commit, the squashes on its second parent's
+#       line down to its first parent: a batch, oldest first, each subject ending (#N). With a --proposal
+#       for each (scripts/weave-propose; each pr claim names it), Weave merges them itself, in that order,
+#       into one decision: weave integrate --proposals <ids> --mirrors <commit>, which writes the merge only
+#       if it comes out as the commit's tree. Each proposal must be of a PR the commit brings in, and of the
+#       head its current pr claim names. That needs the head to mirror the commit's first parent (outside
+#       .bracken/, which Weave leaves out), so merges are shadowed one at a time. Then:
+#         - a per-file conflict falls back to importing the commit's tree, with the conflicting paths in
+#           the decision's note;
+#         - a merge that differs from git's stops it, writing nothing: report it. To go on, run it again
+#           with --mismatched, which checks the merge still differs and imports the commit's tree, with the
+#           differing paths in the note;
+#         - with no --proposal, or none for one of the PRs, the commit's tree is imported, noted as having
+#           no proposal (and for which PRs).
+#       Every decision's note says which, and each run ends by counting them on line main since stage 2a
+#       began.
 #
 # "Line main" is always the default line: the line named main whose first version the marker's author,
 # weave-integrator, wrote. Anyone can write another line named main, which never becomes the default, so
@@ -38,10 +52,13 @@ weave="$here/weave"
 fail() { echo "weave-shadow: $*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/{/^#/s/^# \{0,1\}//p;}' "${BASH_SOURCE[0]}"; }
 
-init='' owner='' repo=$main rev=''
+init='' owner='' repo=$main rev='' proposals=() mismatched=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --init) init=1 ;;
+    --proposal) [ $# -ge 2 ] || fail "--proposal needs an id"; proposals+=("$2"); shift ;;
+    --proposal=*) proposals+=("${1#*=}") ;;
+    --mismatched) mismatched=1 ;;
     --owner-decision) [ $# -ge 2 ] || fail "--owner-decision needs an id"; owner=$2; shift ;;
     --owner-decision=*) owner=${1#*=} ;;
     --repo) [ $# -ge 2 ] || fail "--repo needs a directory"; repo=$2; shift ;;
@@ -118,6 +135,7 @@ fi
 
 [ -n "$rev" ] || fail "which merged commit? see --help"
 [ -z "$owner" ] || fail "--owner-decision goes with --init"
+[ -z "$mismatched" ] || [ ${#proposals[@]} -gt 0 ] || fail "--mismatched goes with the proposals that mismatched"
 sha=$(git -C "$repo" rev-parse -q --verify "$rev^{commit}") || fail "$rev isn't a commit in $repo"
 
 # Only merged commits, in order, before anything is written (finding 93dea3dd7ec2): the commit must be on
@@ -144,12 +162,99 @@ else
     git -C "$repo" merge-base --is-ancestor "$recorded" "$sha" ||
       fail "$sha doesn't come after $recorded, the commit line main's head records: an older or unrelated commit"
   fi
-  "$weave" weave import --from-git "$sha" --repo "$repo" --as weave-integrator
-  out=$("$weave" weave integrate --from-git "$sha" --repo "$repo" --note "shadow of $sha" \
-    --as weave-integrator --json)
+  # The PRs the merge brings in, oldest first: a merge commit's second-parent line down to its first
+  # parent (a batch of squashes, or one), or a squash straight onto main. Each squash's subject ends (#N).
+  if git -C "$repo" rev-parse -q --verify "$sha^2" >/dev/null; then
+    squashes=$(git -C "$repo" rev-list --reverse --first-parent "$sha^2" "^$sha^1")
+  else
+    squashes=$sha
+  fi
+  # Each PR's proposal, as "<n>=<id>" (no associative arrays: macOS's bash is 3.2).
+  prs=() got=()
+  of_pr() { local e; for e in ${got[@]+"${got[@]}"}; do [ "${e%%=*}" != "$1" ] || { echo "${e#*=}"; return; }; done; }
+  for c in $squashes; do
+    subject=$(git -C "$repo" log -1 --format=%s "$c")
+    if [[ $subject =~ \(#([0-9]+)\)$ ]]; then
+      prs+=("${BASH_REMATCH[1]}")
+    elif [ ${#proposals[@]} -gt 0 ]; then
+      fail "$c ('$subject') brings in no PR: its subject doesn't end with (#N)"
+    fi
+  done
+  if [ ${#proposals[@]} -gt 0 ]; then
+    # Weave's merge of the proposals stands for git's merge only onto the same tree: the head must mirror
+    # the commit's first parent, outside .bracken/.
+    [ -n "$recorded" ] || fail "line main has no decision yet, so there's nothing to merge the proposals onto"
+    git -C "$repo" diff --quiet "$recorded" "$sha^1" -- . ':(exclude).bracken' ||
+      fail "line main's head mirrors $recorded, not $sha's first parent: shadow the merges in order, one at a time"
+    # Each proposal is of a PR this merge brings in, and of that PR's head as its current pr claim names it
+    # (finding 1f66448c728d).
+    claims=$(env -u BRACKEN_AGENT "$main/scripts/bk" log --tag pr --current --json 2>/dev/null) ||
+      fail "can't read the pr claims in the coordination Ground"
+    for p in "${proposals[@]}"; do
+      summary=$("$weave" weave review --proposal "$p" --json 2>/dev/null | jq -r '.proposals[0].summary // empty') ||
+        summary=''
+      [[ $summary =~ ^PR\ \#([0-9]+)\ [^\ ]+\ @\ ([0-9a-f]{40})$ ]] ||
+        fail "proposal $p isn't one scripts/weave-propose wrote: its summary is '$summary'"
+      n=${BASH_REMATCH[1]} head_sha=${BASH_REMATCH[2]}
+      [[ " ${prs[*]-} " == *" $n "* ]] || fail "proposal $p is of PR #$n, which $sha doesn't bring in"
+      [ -z "$(of_pr "$n")" ] || fail "proposals $(of_pr "$n") and $p are both of PR #$n"
+      claimed=$(jq -r --arg n "PR #$n " '[.[] | select(.body.statement // "" | startswith($n))] | last
+        | .body.statement // "" | capture("@ (?<sha>[0-9a-f]{40})").sha // empty' <<<"$claims" 2>/dev/null) || claimed=''
+      [ -n "$claimed" ] || fail "no current pr claim names PR #$n's head, so proposal $p can't be checked against it"
+      [ "$claimed" = "$head_sha" ] ||
+        fail "proposal $p is of $head_sha, but PR #$n's current pr claim names $claimed: propose the merged head"
+      got+=("$n=$p")
+    done
+  fi
+  # How the decision comes about, which its note records: merged (Weave's own merge), or a fallback that
+  # imports the commit's tree.
+  how='' paths='' ordered=() missing=()
+  for n in ${prs[@]+"${prs[@]}"}; do
+    if [ -n "$(of_pr "$n")" ]; then ordered+=("$(of_pr "$n")"); else missing+=("#$n"); fi
+  done
+  list=${ordered[@]+"${ordered[*]}"}
+  word=proposal
+  [ ${#ordered[@]} -le 1 ] || word=proposals
+  if [ ${#proposals[@]} -gt 0 ] && [ ${#missing[@]} -eq 0 ]; then
+    err=$(mktemp)
+    if out=$("$weave" weave integrate --proposals "${ordered[@]}" --mirrors "$sha" --repo "$repo" \
+      --note "shadow of $sha: merged $word $list" --as weave-integrator --json 2>"$err"); then
+      [ -z "$mismatched" ] || { rm -f -- "$err"; fail "the $word merged equal to $sha after all, so --mismatched recorded it as merged"; }
+      how=merged
+    elif paths=$(jq -er '[.conflicts[]?.path] | select(length > 0) | join(", ")' <<<"$out" 2>/dev/null); then
+      how=conflict
+    elif paths=$(jq -er '[.differs[]?.path] | select(length > 0) | join(", ")' <<<"$out" 2>/dev/null); then
+      if [ -z "$mismatched" ]; then
+        jq -r '.differs[] | "differs: \(.change) \(.path)"' <<<"$out" >&2
+        rm -f -- "$err"
+        fail "Weave's merge of $word $list differs from git's $sha; nothing was written. Stop and report it; to go on, run again with --mismatched"
+      fi
+      how=mismatch
+    else
+      cat -- "$err" >&2
+      rm -f -- "$err"
+      fail "weave integrate --proposals $list failed for $sha, so nothing was recorded"
+    fi
+    rm -f -- "$err"
+  elif [ -n "$recorded" ]; then
+    [ -z "$mismatched" ] || fail "--mismatched goes with the proposals that mismatched"
+    how=none
+  fi
+  case $how in
+    merged) note='' ;;
+    conflict) note="shadow of $sha: $word $list conflicted at $paths" ;;
+    mismatch) note="shadow of $sha: $word $list mismatched at $paths" ;;
+    none) note="shadow of $sha: no proposal${missing[@]+ for PR ${missing[*]}}" ;;
+    *) note="shadow of $sha" ;;
+  esac
+  if [ "$how" != merged ]; then
+    "$weave" weave import --from-git "$sha" --repo "$repo" --as weave-integrator
+    out=$("$weave" weave integrate --from-git "$sha" --repo "$repo" --note "$note" --as weave-integrator --json)
+  fi
   decision=$(jq -r '.decision // empty' <<<"$out")
   [ -n "$decision" ] || fail "weave integrate recorded no decision for $sha: $out"
   echo "decision $decision"
+  echo "outcome ${how:-first}"
 fi
 
 # weave verify's exit code isn't enough: its JSON says whether the trees are equal.
@@ -160,3 +265,11 @@ if [ "$equal" != true ]; then
   fail "decision $decision doesn't verify equal to git's $sha"
 fi
 echo "verified $decision equal to $sha"
+
+# How often Weave's own merge was used: line main's decisions by what their notes say.
+notes=$("$weave" weave log --limit 100000 --json | jq -r '.decisions[].note')
+count() { grep -cE "^shadow of [0-9a-f]+: $1" <<<"$notes" || true; }
+merged=$(count 'merged proposals? ') none=$(count 'no proposal( for PR .*)?$')
+conflict=$(count 'proposals? [0-9a-f ]+ conflicted at ') mismatch=$(count 'proposals? [0-9a-f ]+ mismatched at ')
+echo "stage 2a so far: $((merged + none + conflict + mismatch)) merges, $merged by Weave's own merge;" \
+  "fallbacks: $none no proposal, $conflict conflict, $mismatch mismatch"

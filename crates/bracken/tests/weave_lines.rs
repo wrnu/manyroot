@@ -976,3 +976,47 @@ fn a_line_nobody_names_costs_main_nothing_and_naming_it_judges_it() {
     let head = w.json(&["weave", "head", "--line", "stray", "--json"]);
     assert_eq!(head["heads"][0]["decision"], stray[0].as_str(), "only the first move qualifies");
 }
+
+/// Stage 2a (task 87a1bcba025d): `integrate --proposals P --mirrors <commit>` writes the merge only when it
+/// comes out as the commit's tree, naming the commit as the decision's source. Otherwise it lists the paths
+/// that differ and writes nothing: never forced.
+#[test]
+fn integrate_mirrors_a_commit_only_when_the_merge_equals_its_tree() {
+    let w = Weave::new();
+    let base = w.integrate_on(&w.ground, AS);
+    let first = w.git(&["rev-parse", "HEAD"]).trim().to_owned();
+
+    // A branch adding b.txt, proposed from its commit; then git's merge of it onto main.
+    w.git(&["switch", "-q", "-c", "feature"]);
+    w.commit("b.txt", b"b\n");
+    let feature = w.git(&["rev-parse", "HEAD"]).trim().to_owned();
+    let p = w.id_of(&["weave", "propose", "--from-git", &feature, "--base", &base, "--as", AS, "--json"], "proposal");
+    w.git(&["switch", "-q", "main"]);
+    w.git(&["merge", "-q", "--squash", "feature"]);
+    w.git(&["commit", "-q", "-m", "b (#1)"]);
+    let merged = w.git(&["rev-parse", "HEAD"]).trim().to_owned();
+
+    // Mirroring the commit before the merge: the trees differ, so nothing is written.
+    let before = w.contributions();
+    let out =
+        w.run_on(&w.ground, &["weave", "integrate", "--proposals", &p, "--mirrors", &first, "--as", AS, "--json"]);
+    assert!(!out.status.success());
+    let listed: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(listed["differs"], json!([{"path": "b.txt", "change": "added"}]), "{listed}");
+    assert_eq!(listed["mirrors"], first);
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&format!("differs from {first}'s at 1 paths")));
+    assert_eq!(w.contributions(), before, "a mismatch wrote something");
+
+    // Mirroring git's merge: written, with the commit as its source.
+    let d = w.json(&["weave", "integrate", "--proposals", &p, "--mirrors", "HEAD", "--as", AS, "--json"]);
+    assert_eq!(d["proposals"], json!([p]));
+    let log = w.json(&["weave", "log", "--limit", "1", "--json"]);
+    assert_eq!(log["decisions"][0]["decision"], d["decision"]);
+    assert_eq!(log["decisions"][0]["source"]["git"], merged);
+    let verified = w.json(&["weave", "verify", "--git", "HEAD", "--json"]);
+    assert_eq!(verified["equal"], true, "{verified}");
+
+    // --mirrors goes with --proposals only.
+    let err = w.fails(&["weave", "integrate", "--mirrors", "HEAD", "--as", AS]);
+    assert!(err.contains("--proposals"), "{err}");
+}
