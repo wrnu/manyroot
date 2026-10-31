@@ -30,6 +30,7 @@ use super::{Output, contribute, decide, print_json, write_stdout};
 
 mod checks;
 mod merge;
+mod review;
 
 #[derive(Subcommand)]
 pub(crate) enum WeaveCommand {
@@ -177,7 +178,7 @@ pub(crate) enum WeaveCommand {
         #[arg(long, default_value = "")]
         note: String,
         /// Run the line's checks on the candidate before writing the decision, and record each result,
-        /// for your own information: an integrator's results never count toward green.
+        /// for your own information: they never count for your own decision.
         #[arg(long)]
         run: bool,
         /// With --run: how long each check may run, in seconds, before its process group is killed: 1 to
@@ -189,8 +190,16 @@ pub(crate) enum WeaveCommand {
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         #[command(flatten)]
+        decide: review::DecideArgs,
+        #[command(flatten)]
         out: Output,
     },
+    /// The line's green under its current policy, and per head each check's counted results, with the
+    /// fails a later attempt replaced.
+    Green(review::GreenArgs),
+    /// Reviews of the line's heads and open proposals, and the objections the next move must answer,
+    /// with the dispositions each allows.
+    Review(review::ReviewArgs),
     /// Validator: run the line's named checks (default: all of them) on a manifest through the check
     /// runner, sandboxed, and record each result on the manifest. Only for one of the line's validators;
     /// refuses a check you already have a latest result for on the manifest unless --again.
@@ -540,22 +549,24 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             }
             Ok(ExitCode::SUCCESS)
         }
-        WeaveCommand::Integrate { line, proposals, note, run, timeout, out, .. } if !proposals.is_empty() => {
+        WeaveCommand::Integrate { line, proposals, note, run, timeout, decide, out, .. } if !proposals.is_empty() => {
             let run = if run { Some(checks::Run::new(s, timeout)?) } else { None };
-            merge::integrate_proposals(s, agent, line.as_deref(), &proposals, note, run.as_ref(), out)
+            merge::integrate_proposals(s, agent, line.as_deref(), &proposals, note, run.as_ref(), &decide, out)
         }
+        WeaveCommand::Green(args) => review::green(s, args),
+        WeaveCommand::Review(args) => review::review(s, args),
         WeaveCommand::Validate(args) => checks::validate(s, agent, args),
         WeaveCommand::Line { command } => merge::line(s, agent, command),
         WeaveCommand::Propose(args) => merge::propose(s, agent, args),
         WeaveCommand::Resolve(args) => merge::resolve(s, agent, args),
-        WeaveCommand::Integrate { line, from_git, index, manifest, note, run, timeout, repo, out, .. } => {
+        WeaveCommand::Integrate { line, from_git, index, manifest, note, run, timeout, repo, decide, out, .. } => {
             let source = match (manifest, index) {
                 (Some(m), _) => Given::Manifest(m),
                 (None, true) => Given::Git(Source::Index),
                 (None, false) => Given::Git(Source::Rev(from_git.unwrap_or_else(|| "HEAD".to_owned()))),
             };
             let run = if run { Some(checks::Run::new(s, timeout)?) } else { None };
-            integrate(s, agent, line.as_deref(), source, note, run.as_ref(), &repo, out)
+            integrate(s, agent, line.as_deref(), source, note, run.as_ref(), &decide, &repo, out)
         }
     }
 }
@@ -574,6 +585,7 @@ fn integrate(
     given: Given,
     note: String,
     run: Option<&checks::Run>,
+    decide_args: &review::DecideArgs,
     repo: &Path,
     out: Output,
 ) -> Result<ExitCode> {
@@ -587,18 +599,24 @@ fn integrate(
     let line = resolve_line(s, &lines, line, "--line")?;
     let who = super::signer(s, agent)?;
     let parents = lines.heads(&line);
-    let draft = |manifest: ContentHash, source: Option<String>| Decision {
+    let mut template = Decision {
         v: VERSION,
         line,
-        manifest,
+        manifest: ContentHash::of(b""),
         parents: parents.clone(),
         proposals: vec![],
         breakage: vec![],
         answers: vec![],
         resolutions: vec![],
         goals: vec![],
-        source: source.map(|git| bracken_tree::Source { git }),
+        source: None,
         note: note.clone(),
+    };
+    decide_args.apply(s, &ix, &lines, &mut template)?;
+    let draft = |manifest: ContentHash, source: Option<String>| Decision {
+        manifest,
+        source: source.map(|git| bracken_tree::Source { git }),
+        ..template.clone()
     };
     // Rules 2 and 3 don't depend on the tree, so they are checked before anything is written. The
     // manifest's own rule is checked again once the candidate is written.
@@ -701,8 +719,9 @@ fn refusal(why: &Unqualified) -> String {
         Unqualified::ParentNotAnAncestor(_) | Unqualified::ParentUnqualified(_) => "rule 3",
         Unqualified::ManifestNotHeld(_) | Unqualified::ManifestIncomplete { .. } => "rule 4",
         Unqualified::Unanswered { .. } | Unqualified::AnswerNotAllowed { .. } => {
-            "rule 5: every objection in the window needs an answer its basis allows, and integrate can't write \
-             one until --answer (Weave step 7, PR 4), so it refuses while an objection is open"
+            "rule 5: every objection in the window needs an answer its basis allows; `bracken weave review` lists \
+             them, and --answer <objection>=<disposition>:<reason> answers one, or names its target to answer \
+             every objection to it"
         }
         Unqualified::ProtectedPath { .. }
         | Unqualified::TooMuchBreakage { .. }
@@ -734,7 +753,9 @@ fn decision_json(d: &DecisionRecord, names: &super::Names) -> Value {
         r.breakage.iter().map(|b| json!({"check": b.check, "detail": b.detail, "paths": b.paths})).collect();
     json!({"decision": d.id, "author": d.author.to_string(), "author_name": names.display(&d.author),
            "manifest": r.manifest.to_string(), "parents": r.parents, "breakage": breakage,
-           "proposals": r.proposals, "resolutions": r.resolutions,
+           "proposals": r.proposals, "resolutions": r.resolutions, "goals": r.goals,
+           "answers": r.answers.iter().map(|a| json!({"objection": a.objection, "disposition": a.disposition.as_str(),
+                                                      "reason": a.reason})).collect::<Vec<_>>(),
            "source": r.source.as_ref().map(|s| json!({"git": s.git})), "note": r.note})
 }
 

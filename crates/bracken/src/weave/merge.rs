@@ -368,7 +368,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             }
             let lines = Lines::build(s.graph(), &ix);
             let target = lines_target(s, &lines, &ix, &into, &from, base.as_deref())?;
-            write_merge(s, agent, &ix, &lines, target, note, dry_run, None, out)
+            write_merge(s, agent, &ix, &lines, target, note, dry_run, None, &Default::default(), out)
         }
     }
 }
@@ -565,6 +565,7 @@ pub(crate) fn propose(s: &mut Store, agent: Option<&str>, args: ProposeArgs) -> 
 }
 
 /// `weave integrate --proposals`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn integrate_proposals(
     s: &mut Store,
     agent: Option<&str>,
@@ -572,13 +573,14 @@ pub(crate) fn integrate_proposals(
     proposals: &[String],
     note: String,
     run: Option<&checks::Run>,
+    decide_args: &super::review::DecideArgs,
     out: Output,
 ) -> Result<ExitCode> {
     let ix = Index::build(s.graph());
     require_marker(&ix)?;
     let lines = Lines::build(s.graph(), &ix);
     let target = proposals_target(s, &lines, &ix, line, proposals)?;
-    write_merge(s, agent, &ix, &lines, target, note, false, run, out)
+    write_merge(s, agent, &ix, &lines, target, note, false, run, decide_args, out)
 }
 
 /// One step of a merge: `from` merged into the tree so far, against `base`.
@@ -799,6 +801,7 @@ fn write_merge(
     note: String,
     dry_run: bool,
     run: Option<&checks::Run>,
+    decide_args: &super::review::DecideArgs,
     out: Output,
 ) -> Result<ExitCode> {
     let resolved = match build(ix, &target) {
@@ -872,7 +875,7 @@ fn write_merge(
             missing[0]
         );
     }
-    let decision = Decision {
+    let mut decision = Decision {
         v: VERSION,
         line: target.line,
         manifest: hash,
@@ -885,6 +888,7 @@ fn write_merge(
         source: None,
         note,
     };
+    decide_args.apply(s, ix, lines, &mut decision)?;
     let names = Names::load(s)?;
     let used = used_resolutions(s, &resolved.used, &names);
     if dry_run {
