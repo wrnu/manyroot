@@ -10,9 +10,10 @@
 #       origin/main, or the nearest first-parent ancestor of it the shadow recorded, so the proposal's change
 #       is the branch's own (against Weave's head, a branch behind main would propose undoing what was
 #       merged since). Run the main checkout's copy, "$main/scripts/weave-propose", from the branch's
-#       worktree. The summary is 'PR #<n> <branch> @ <sha>'. Prints
-#       'proposal <id>': name it in the pr claim as 'Weave proposal <id>'. The identity (default
-#       BRACKEN_AGENT) is created in the Weave Ground the first time.
+#       worktree. The summary is 'PR #<n> <branch> @ <sha>'. Prints 'proposal <id>': name it in the pr claim
+#       as 'Weave proposal <id>'. Before it, if the base is an ancestor's, it prints 'base <id> mirrors
+#       <commit>, an ancestor of the merge-base ...'. The identity (default BRACKEN_AGENT) is created in the
+#       Weave Ground the first time.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -50,10 +51,10 @@ fork=$(git -C "$repo" merge-base HEAD refs/remotes/origin/main) || fail "$branch
 # records itself, since it records the local merge that brings it in.
 mirrored=$("$weave" weave log --limit 100000 --json |
   jq -r '.decisions[] | select(.source.git != null) | "\(.source.git) \(.decision)"')
-base=''
+base='' from=''
 for c in $(git -C "$repo" rev-list --first-parent --max-count 1000 "$fork"); do
   base=$(awk -v c="$c" '$1 == c { print $2; exit }' <<<"$mirrored")
-  [ -z "$base" ] || break
+  [ -z "$base" ] || { from=$c; break; }
 done
 [ -n "$base" ] ||
   fail "no decision on main mirrors $fork, $branch's merge-base with origin/main, or a first-parent ancestor of it; propose again once the shadow has recorded it"
@@ -64,4 +65,8 @@ out=$("$weave" weave propose --from-git "$sha" --base "$base" --summary "PR #$pr
   --as "$who" --json)
 id=$(jq -r '.proposal // empty' <<<"$out")
 [ -n "$id" ] || fail "weave propose wrote no proposal: $out"
+# From an ancestor, the proposal carries the unrecorded commits' edits too. If a later merge undid one, Weave's
+# merge brings it back where git's doesn't: scripts/weave-shadow tells that apart (finding b2dd0470fb61).
+[ "$from" = "$fork" ] ||
+  echo "base $base mirrors $from, an ancestor of the merge-base $fork, which the shadow hasn't recorded"
 echo "proposal $id"
