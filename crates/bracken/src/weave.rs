@@ -28,6 +28,7 @@ use serde_json::{Value, json};
 
 use super::{Output, contribute, decide, print_json, write_stdout};
 
+mod checks;
 mod merge;
 
 #[derive(Subcommand)]
@@ -175,12 +176,25 @@ pub(crate) enum WeaveCommand {
         /// What the decision does, in words.
         #[arg(long, default_value = "")]
         note: String,
+        /// Run the line's checks on the candidate before writing the decision, and record each result,
+        /// for your own information: an integrator's results never count toward green.
+        #[arg(long)]
+        run: bool,
+        /// With --run: how long each check may run, in seconds, before its process group is killed: 1 to
+        /// 604800 (7 days), default 1800.
+        #[arg(long, value_name = "SECONDS", requires = "run",
+              value_parser = clap::value_parser!(u64).range(1..=checks::MAX_TIMEOUT))]
+        timeout: Option<u64>,
         /// The git repository to import from.
         #[arg(long, default_value = ".")]
         repo: PathBuf,
         #[command(flatten)]
         out: Output,
     },
+    /// Validator: run the line's named checks (default: all of them) on a manifest through the check
+    /// runner, sandboxed, and record each result on the manifest. Only for one of the line's validators;
+    /// refuses a check you already have a latest result for on the manifest unless --again.
+    Validate(checks::ValidateArgs),
     /// Line policies, and merges between lines.
     Line {
         #[command(subcommand)]
@@ -526,19 +540,22 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             }
             Ok(ExitCode::SUCCESS)
         }
-        WeaveCommand::Integrate { line, proposals, note, out, .. } if !proposals.is_empty() => {
-            merge::integrate_proposals(s, agent, line.as_deref(), &proposals, note, out)
+        WeaveCommand::Integrate { line, proposals, note, run, timeout, out, .. } if !proposals.is_empty() => {
+            let run = if run { Some(checks::Run::new(s, timeout)?) } else { None };
+            merge::integrate_proposals(s, agent, line.as_deref(), &proposals, note, run.as_ref(), out)
         }
+        WeaveCommand::Validate(args) => checks::validate(s, agent, args),
         WeaveCommand::Line { command } => merge::line(s, agent, command),
         WeaveCommand::Propose(args) => merge::propose(s, agent, args),
         WeaveCommand::Resolve(args) => merge::resolve(s, agent, args),
-        WeaveCommand::Integrate { line, from_git, index, manifest, note, repo, out, .. } => {
+        WeaveCommand::Integrate { line, from_git, index, manifest, note, run, timeout, repo, out, .. } => {
             let source = match (manifest, index) {
                 (Some(m), _) => Given::Manifest(m),
                 (None, true) => Given::Git(Source::Index),
                 (None, false) => Given::Git(Source::Rev(from_git.unwrap_or_else(|| "HEAD".to_owned()))),
             };
-            integrate(s, agent, line.as_deref(), source, note, &repo, out)
+            let run = if run { Some(checks::Run::new(s, timeout)?) } else { None };
+            integrate(s, agent, line.as_deref(), source, note, run.as_ref(), &repo, out)
         }
     }
 }
@@ -549,12 +566,14 @@ enum Given {
     Manifest(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn integrate(
     s: &mut Store,
     agent: Option<&str>,
     line: Option<&str>,
     given: Given,
     note: String,
+    run: Option<&checks::Run>,
     repo: &Path,
     out: Output,
 ) -> Result<ExitCode> {
@@ -585,7 +604,7 @@ fn integrate(
     // manifest's own rule is checked again once the candidate is written.
     match lines.judge_new(s.graph(), &ix, who.agent_id(), &draft(ContentHash::of(b""), None)) {
         Ok(_) | Err(Unqualified::ManifestNotHeld(_) | Unqualified::ManifestIncomplete { .. }) => {}
-        Err(why) => bail!("the decision wouldn't qualify, so nothing was written: {why}"),
+        Err(why) => bail!("the decision wouldn't qualify, so nothing was written: {}", refusal(&why)),
     }
 
     let (hash, commit, files, manifest_id) = match given {
@@ -618,7 +637,7 @@ fn integrate(
                 .collect();
             if let Some(e) = failure {
                 decide(false);
-                print_tree_written(None, &files, out);
+                print_tree_written(None, &files, &[], out);
                 return Err(
                     e.context(format!("{} file versions were written, and no manifest or decision", files.len()))
                 );
@@ -628,26 +647,37 @@ fn integrate(
         }
     };
 
+    let mut results = Vec::new();
+    if let Some(run) = run {
+        let recorded = checks::run_for_integrate(s, &who, run, &line, &hash, out.json)?;
+        results = recorded.results;
+        if let Some(e) = recorded.failure {
+            decide(false);
+            print_tree_written(Some(hash), &files, &results, out);
+            return Err(e.context("the candidate was written, and no decision"));
+        }
+    }
+
     let ix = Index::build(s.graph());
     let lines = Lines::build(s.graph(), &ix);
     let decision = draft(hash, commit);
     if let Err(why) = lines.judge_new(s.graph(), &ix, who.agent_id(), &decision) {
         decide(false);
-        print_tree_written(Some(hash), &files, out);
-        bail!("the decision wouldn't qualify, so none was written (the candidate stays): {why}");
+        print_tree_written(Some(hash), &files, &results, out);
+        bail!("the decision wouldn't qualify, so none was written (the candidate stays): {}", refusal(&why));
     }
     let id = match write_record(s, &who, &decision) {
         Ok(id) => id,
         Err(e) => {
             decide(false);
-            print_tree_written(Some(hash), &files, out);
+            print_tree_written(Some(hash), &files, &results, out);
             return Err(e.context("the candidate was written, but not the decision"));
         }
     };
     if out.json {
         let rows: Vec<Value> = files.iter().map(|(h, p)| json!({"hash": h.to_string(), "path": p})).collect();
         print_json(&json!({"manifest": hash.to_string(), "manifest_id": manifest_id, "files": rows, "decision": id,
-                           "line": line, "parents": parents}));
+                           "line": line, "parents": parents, "results": results}));
     } else {
         println!("manifest {hash}");
         for (h, p) in &files {
@@ -658,11 +688,36 @@ fn integrate(
     Ok(ExitCode::SUCCESS)
 }
 
-/// What `integrate` wrote before it stopped: the manifest, if it is held, and the file versions.
-fn print_tree_written(manifest: Option<ContentHash>, files: &[(ContentHash, String)], out: Output) {
+/// Why a decision `integrate` or `line merge` would write doesn't qualify, with the rule it breaks
+/// (weave.md section 2). Every reason is named here, with no catch-all, so a new one can't pass
+/// unexplained; for rule 5, what settles it.
+fn refusal(why: &Unqualified) -> String {
+    let rule = match why {
+        Unqualified::Retracted => "rule 1",
+        Unqualified::NotALine(_) | Unqualified::LineNotAnAncestor(_) | Unqualified::PolicyDiverged { .. } => {
+            "its line and policy"
+        }
+        Unqualified::NotAnIntegrator { .. } => "rule 2",
+        Unqualified::ParentNotAnAncestor(_) | Unqualified::ParentUnqualified(_) => "rule 3",
+        Unqualified::ManifestNotHeld(_) | Unqualified::ManifestIncomplete { .. } => "rule 4",
+        Unqualified::Unanswered { .. } | Unqualified::AnswerNotAllowed { .. } => {
+            "rule 5: every objection in the window needs an answer its basis allows, and integrate can't write \
+             one until --answer (Weave step 7, PR 4), so it refuses while an objection is open"
+        }
+        Unqualified::ProtectedPath { .. }
+        | Unqualified::TooMuchBreakage { .. }
+        | Unqualified::BreakageTooOld { .. } => "rule 6, the policy's guardrails",
+    };
+    format!("{why} ({rule})")
+}
+
+/// What `integrate` wrote before it stopped: the manifest, if it is held, the file versions, and with
+/// --run the check results, which in text it printed as they were recorded.
+fn print_tree_written(manifest: Option<ContentHash>, files: &[(ContentHash, String)], results: &[Value], out: Output) {
     if out.json {
         let rows: Vec<Value> = files.iter().map(|(h, p)| json!({"hash": h.to_string(), "path": p})).collect();
-        print_json(&json!({"manifest": manifest.map(|m| m.to_string()), "files": rows, "decision": Value::Null}));
+        print_json(&json!({"manifest": manifest.map(|m| m.to_string()), "files": rows, "results": results,
+                           "decision": Value::Null}));
         return;
     }
     if let Some(m) = manifest {

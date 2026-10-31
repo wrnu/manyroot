@@ -3580,7 +3580,8 @@ fn weave(dir: &Path, script: &str, home: &Path, bin: Option<&Path>, args: &[&str
 
 /// Weave build step 4: scripts/weave creates and opens only ~/bracken-weave/manyroot, by its real path,
 /// which it exports. It refuses --dir in both forms; evidence, sync and serve, found past --as;
-/// --as weave-runner for anything but weave validate, which isn't built yet; and a Ground that resolves
+/// --as weave-runner for anything but weave validate, and validate for a signer the binary's plan doesn't
+/// list among the validators (this stub prints none); and a Ground that resolves
 /// into a git checkout or has the coordination Ground's id.
 #[test]
 fn weave_opens_only_the_weave_ground_and_refuses_what_it_must() {
@@ -3616,7 +3617,7 @@ fn weave_opens_only_the_weave_ground_and_refuses_what_it_must() {
         (&["serve", "--stdio"], "serve is refused"),
         (&["--as", "weave-runner", "weave", "check"], "only for weave validate"),
         (&["--as=weave-runner", "claim", "x"], "only for weave validate"),
-        (&["--as", "weave-runner", "weave", "validate"], "isn't built yet"),
+        (&["--as", "weave-runner", "weave", "validate"], "isn't one of the line's validators"),
         // Findings 26650dedc33e and 3e1a0454a03b: -h and --help get no early exit.
         (&["sync", "--exec", prog.to_str().unwrap(), "--help"], "sync is refused"),
         (&["-h", "sync", "--exec", prog.to_str().unwrap()], "sync is refused"),
@@ -3667,6 +3668,73 @@ fn weave_opens_only_the_weave_ground_and_refuses_what_it_must() {
     std::fs::create_dir_all(copy.join("bracken-weave/manyroot")).unwrap();
     std::fs::copy(dir.join(".bracken/ground.json"), copy.join("bracken-weave/manyroot/ground.json")).unwrap();
     refused(&copy, &["weave", "check"], "has the coordination Ground's id");
+}
+
+/// scripts/weave runs weave validate only for one of the line's validators, as the pinned binary's own plan
+/// (validate --dry-run --json) lists them, before anything runs; and never with a '--'.
+#[test]
+fn weave_runs_validate_only_for_a_validator() {
+    let (tmp, dir, home, _) = weave_repo();
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let real = |args: &[&str]| weave(&dir, "scripts/weave", &home, None, args);
+    let out = real(&["weave", "init", "--as", "weave-integrator"]);
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+
+    // A stub whose plan is $PLAN, and which otherwise says it ran.
+    let stub = tmp.path().join("plan-stub");
+    write_executable(
+        &stub,
+        "#!/bin/sh\ncase \" $* \" in *\" --dry-run \"*) printf '%s\\n' \"$PLAN\"; exit 0 ;; esac\necho \"RAN $*\"\n",
+    );
+    let planned = |plan: &str, args: &[&str]| {
+        let mut c = command(&dir, "scripts/weave", args);
+        c.env("HOME", &home).env("BRACKEN_BIN", &stub).env("PLAN", plan);
+        c.output().unwrap()
+    };
+    let validate = ["--as", "weave-runner", "weave", "validate", "--manifest", "blake3:00", "--json"];
+    for plan in [r#"{"signer": "aa", "validators": ["bb"]}"#, r#"{"signer": "aa", "validators": []}"#, "not JSON", ""] {
+        let out = planned(plan, &validate);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{plan}: {stderr}");
+        assert!(stderr.contains("isn't one of the line's validators"), "{plan}: {stderr}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("RAN"), "{plan}: it ran");
+    }
+    let out = planned(r#"{"signer": "aa", "validators": ["bb", "aa"]}"#, &validate);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    // The plan was asked for without the caller's --json, and the run itself gets the arguments as given.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "RAN --as weave-runner weave validate --manifest blake3:00 --json"
+    );
+    let out = planned(r#"{"signer": "aa", "validators": ["aa"]}"#, &["weave", "validate", "--", "x"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("takes no '--'"), "{out:?}");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("RAN"));
+
+    // With the real binary: a line whose only validator is val, and a manifest.
+    let decision = owner_decision(&dir);
+    for args in [
+        &["id", "new", "val"][..],
+        &["weave", "line", "policy", "main", "--validator", "val", "--check", "ok=true", "--owner-decision", &decision],
+    ] {
+        let mut args = args.to_vec();
+        args.extend(["--as", "weave-integrator"]);
+        let out = real(&args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+    let out = real(&["weave", "integrate", "--as", "weave-integrator", "--json"]);
+    assert!(out.status.success(), "integrate: {}", String::from_utf8_lossy(&out.stderr));
+    let integrated: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let hash = integrated["manifest"].as_str().unwrap();
+    // The integrator isn't a validator: refused before anything runs.
+    let out = real(&["--as", "weave-integrator", "weave", "validate", "--manifest", hash]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("isn't one of line") && stderr.contains("weave validate refused"), "{stderr}");
+    // val is: its plan lists the check.
+    let out = real(&["--as", "val", "weave", "validate", "--manifest", hash, "--dry-run"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("would run ok attempt 1"), "{stdout}");
 }
 
 /// scripts/weave refuses a line write unless --owner-decision names a claim tagged decision, not

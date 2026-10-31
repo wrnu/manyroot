@@ -34,7 +34,8 @@ use manyroot::{AgentId, Body, ContributionId, RelationKind, Store};
 use serde_json::{Value, json};
 
 use super::{
-    decision_id, file_value_json, held_manifest, known_keys, print_tree_written, resolve_line, write_record, write_tree,
+    checks, decision_id, file_value_json, held_manifest, known_keys, print_tree_written, refusal, resolve_line,
+    write_record, write_tree,
 };
 use crate::{Names, Output, contribute, decide, print_json, signer, write_stdout};
 
@@ -224,7 +225,7 @@ pub(crate) struct ResolveArgs {
     out: Output,
 }
 
-fn require_marker(ix: &Index) -> Result<()> {
+pub(super) fn require_marker(ix: &Index) -> Result<()> {
     if ix.counted_marker().is_none() {
         bail!(
             "this Ground holds no Weave marker, so weave writes nothing here; create a Weave Ground with `bracken weave init`"
@@ -367,7 +368,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             }
             let lines = Lines::build(s.graph(), &ix);
             let target = lines_target(s, &lines, &ix, &into, &from, base.as_deref())?;
-            write_merge(s, agent, &ix, &lines, target, note, dry_run, out)
+            write_merge(s, agent, &ix, &lines, target, note, dry_run, None, out)
         }
     }
 }
@@ -537,7 +538,7 @@ pub(crate) fn propose(s: &mut Store, agent: Option<&str>, args: ProposeArgs) -> 
         .collect();
     if let Some(e) = failure {
         decide(false);
-        print_tree_written(None, &files, out);
+        print_tree_written(None, &files, &[], out);
         return Err(e.context(format!("{} file versions were written, and no manifest or proposal", files.len())));
     }
     let proposal = Proposal { v: VERSION, line, base, manifest: hash, change: change.hash(), summary };
@@ -545,7 +546,7 @@ pub(crate) fn propose(s: &mut Store, agent: Option<&str>, args: ProposeArgs) -> 
         Ok(id) => id,
         Err(e) => {
             decide(false);
-            print_tree_written(Some(hash), &files, out);
+            print_tree_written(Some(hash), &files, &[], out);
             return Err(e.context("the tree was written, but not the proposal"));
         }
     };
@@ -570,13 +571,14 @@ pub(crate) fn integrate_proposals(
     line: Option<&str>,
     proposals: &[String],
     note: String,
+    run: Option<&checks::Run>,
     out: Output,
 ) -> Result<ExitCode> {
     let ix = Index::build(s.graph());
     require_marker(&ix)?;
     let lines = Lines::build(s.graph(), &ix);
     let target = proposals_target(s, &lines, &ix, line, proposals)?;
-    write_merge(s, agent, &ix, &lines, target, note, false, out)
+    write_merge(s, agent, &ix, &lines, target, note, false, run, out)
 }
 
 /// One step of a merge: `from` merged into the tree so far, against `base`.
@@ -796,6 +798,7 @@ fn write_merge(
     target: Target,
     note: String,
     dry_run: bool,
+    run: Option<&checks::Run>,
     out: Output,
 ) -> Result<ExitCode> {
     let resolved = match build(ix, &target) {
@@ -900,32 +903,42 @@ fn write_merge(
     match lines.judge_new(s.graph(), ix, who.agent_id(), &decision) {
         Ok(_) => {}
         Err(Unqualified::ManifestNotHeld(_)) if !held => {}
-        Err(why) => bail!("the decision wouldn't qualify, so nothing was written: {why}"),
+        Err(why) => bail!("the decision wouldn't qualify, so nothing was written: {}", refusal(&why)),
     }
     let (_, failure) = write_tree(s, &who, &[], &resolved.manifest, held)?;
     if let Some(e) = failure {
         decide(false);
         return Err(e.context("nothing was written"));
     }
+    let mut results = Vec::new();
+    if let Some(run) = run {
+        let recorded = checks::run_for_integrate(s, &who, run, &target.line, &hash, out.json)?;
+        results = recorded.results;
+        if let Some(e) = recorded.failure {
+            decide(false);
+            print_tree_written(Some(hash), &[], &results, out);
+            return Err(e.context("the candidate was written, and no decision"));
+        }
+    }
     let ix = Index::build(s.graph());
     let lines = Lines::build(s.graph(), &ix);
     if let Err(why) = lines.judge_new(s.graph(), &ix, who.agent_id(), &decision) {
         decide(false);
-        print_tree_written(Some(hash), &[], out);
-        bail!("the decision wouldn't qualify, so none was written (the candidate stays): {why}");
+        print_tree_written(Some(hash), &[], &results, out);
+        bail!("the decision wouldn't qualify, so none was written (the candidate stays): {}", refusal(&why));
     }
     let id = match write_record(s, &who, &decision) {
         Ok(id) => id,
         Err(e) => {
             decide(false);
-            print_tree_written(Some(hash), &[], out);
+            print_tree_written(Some(hash), &[], &results, out);
             return Err(e.context("the candidate was written, but not the decision"));
         }
     };
     if out.json {
         print_json(&json!({"manifest": hash.to_string(), "manifest_new": !held, "decision": id, "line": target.line,
                            "parents": decision.parents, "proposals": decision.proposals,
-                           "resolutions": decision.resolutions, "used": used}));
+                           "resolutions": decision.resolutions, "used": used, "results": results}));
     } else {
         println!("manifest {hash}");
         print_used(&used);
@@ -1075,7 +1088,7 @@ pub(crate) fn resolve(s: &mut Store, agent: Option<&str>, args: ResolveArgs) -> 
         Err(e) => {
             decide(false);
             if let Some((_, hash)) = file_id {
-                print_tree_written(None, &[(hash, path.clone())], out);
+                print_tree_written(None, &[(hash, path.clone())], &[], out);
             }
             return Err(e.context("the resolution wasn't written"));
         }
