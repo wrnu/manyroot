@@ -507,10 +507,7 @@ never changes whether `E` qualified (finding `b2098df8e4be`). A decision
    is `E` itself, or is a descendant of `D` and an ancestor of `E`. So an
    objection made before the line moved counts against that move, and one
    made later binds the next move. This is the causal window, counted in
-   line moves (findings `6b3daf366e21` and `ec772d4abda9`). An objection to
-   `D` stays in the window of every later decision, and its answers are
-   judged again under each one's `P_E`: so, as in the example below, a
-   policy that makes a goal binding binds the moves under it.
+   line moves (findings `6b3daf366e21` and `ec772d4abda9`).
    "Non-retracted" is judged within `E`'s past, by the protocol's rule (a
    retracted retraction restores it), and a target resolves whether or not
    it is retracted (gotcha `b4d45c7352d4`).
@@ -545,10 +542,54 @@ never changes whether `E` qualified (finding `b2098df8e4be`). A decision
    simply be overridden. Whether a `fixed` really fixed anything shows in
    green, once the checks have run on `A`'s manifest.
 
+   **One answer can cover many objections** (decisions `8cf20fe7669a` and
+   `4afee4855944`, findings `4d9669a353b3` and `05e9995ccde0`). An
+   answer's `objection` names one of:
+   - an objection, which it answers;
+   - a target: a decision, a manifest artifact or a proposal. It answers
+     every objection to that target (to a manifest hash, or to a
+     proposal's line and change) that rule 5 judges at the answering
+     decision;
+   - the answering decision's own line (its `line`). It answers every
+     objection in the decision's window, whatever its target. It doesn't
+     answer objections to what the decision uses, which need their own
+     answer or one naming their target.
+
+   An answer answers each objection it covers under its disposition only
+   where that disposition is allowed for that objection's basis, judged
+   under `P_E` as for any answer; the others stay unanswered. So one
+   reference answers any number of objections, spread over any number of
+   targets, and no flood of objections, from anyone, can stop a line, while
+   a goal-backed or evidence-backed objection can't be overridden in bulk.
+
+   **An answered objection is settled.** `O` is settled at `A` only if
+   rule 5 judged `O` at `A` and found an allowed answer there:
+   - `O` is in `A`'s window, or targets a manifest or proposal `A` uses;
+   - `O` is in `A`'s past and not retracted there;
+   - an answer of `A` names `O`, its target, or `A`'s line (for an
+     objection in the window);
+   - and `A` qualifies, so that answer is allowed for `O`'s basis under
+     `A`'s policy.
+
+   Then `O` is settled for every descendant of `A` on `A`'s own line `L`,
+   both in the window and in what a decision uses, and no later decision on
+   `L` judges it again, even if `O` is later retracted and restored. A
+   decision on another line, including a merge on another line that brings
+   `A` in, judges `O` again under its own `P_E`, since a basis is
+   classified per line: a goal binds only the lines it refines, and a
+   result counts only under a line's validators and checks (finding
+   `620ab4bd76ba`, decision `4afee4855944`). An answer at a decision that
+   doesn't use the objected manifest or proposal, or to an objection
+   retracted in its past, settles nothing, so a restored objection binds
+   the next move again (finding `0bf37b345567`). So each objection costs a
+   judgement per move on a line only until it is answered there.
+
    For example: under `P0`, `G` isn't a goal setter, so an objection from
    `G`'s goal is discussion, and `E` may answer it `overridden`. If `P1`
-   later adds `G`, `E` still qualifies, because `P1` isn't `P_E`. Only
-   decisions whose policy in force is `P1` treat `G`'s goals as binding.
+   later adds `G`, `E` still qualifies, because `P1` isn't `P_E`, and the
+   objection stays settled for `E`'s descendants. Only decisions whose
+   policy in force is `P1` treat `G`'s goals as binding, so a new objection
+   from `G`'s goal binds the moves under `P1`.
 6. **Guardrails** (finding `ca41b1e0a0fa`):
    - **Protected paths: always.** No breakage entry names a path under
      `protected`. No exception.
@@ -777,10 +818,11 @@ never write outside the target directory, and never follow a symlink
 | `weave status [--index] [--at D]` | The index or `HEAD` against main's manifest (or `D`'s, which a forked line needs): added, changed, deleted, mode changed. |
 | `weave diff <a> <b>` | Per-file difference between two manifests or decisions. Text files show a unified diff. |
 | `weave propose [--line L] [--base D] [--from-git <rev> \| --index] [--summary text] [--dry-run]` | Imports the tree and writes a proposal against `base` (default: the line's head), which must be a qualifying decision on the line. Refuses a tree equal to the base's. |
-| `weave integrate [--line L] [--proposals ...] [--run]` | Integrator: builds the candidate and writes the decision, in the order below. Runs no checks unless `--run` is given. Refuses if the result wouldn't qualify. Without proposals it records a given tree, `--from-git <rev>` (the default is `HEAD`, named in the decision's `source`), `--index` or `--manifest H`, with every head of the line as a parent, so on a forked line it settles the fork. With `--proposals P...` it merges each valid proposal in turn onto the line's single head, against the proposal's own base, applies the resolutions the Ground holds, and writes the decision listing the proposals and the resolutions it used. The line defaults to the proposals'. A conflict without a resolution stops it: it lists the conflicts and writes nothing. Until rule 5 lands (step 7), it checks no objections (answer `12000ab70ae5`). |
-| `weave validate --manifest H [--check <name>]... [--again]` | Validator: runs the line's named checks (default: all of them) on manifest `H` through the check runner, and records each result. Refuses a check it already has a latest result for on `H` unless `--again`. |
-| `weave review [--line L] [<proposal or decision>]` | Reviews and open objections, with what each would need as an answer. |
-| `weave head [--line L]`, `weave green [--line L]` | The head, or the fork's heads, and green, with the manifest hash. |
+| `weave integrate [--line L] [--proposals ...] [--run] [--answer O=DISPOSITION:REASON]... [--breakage CHECK[:PATHS]]... [--goal G]...` | Integrator: builds the candidate and writes the decision, in the order below. Runs no checks unless `--run` is given. Refuses if the result wouldn't qualify. Without proposals it records a given tree, `--from-git <rev>` (the default is `HEAD`, named in the decision's `source`), `--index` or `--manifest H`, with every head of the line as a parent, so on a forked line it settles the fork. With `--proposals P...` it merges each valid proposal in turn onto the line's single head, against the proposal's own base, applies the resolutions the Ground holds, and writes the decision listing the proposals and the resolutions it used. The line defaults to the proposals'. A conflict without a resolution stops it: it lists the conflicts and writes nothing. `--answer` answers an objection with a disposition and a reason, or, naming its target (a decision, a manifest artifact or a proposal), every objection to it the disposition is allowed for, or, naming the line, every objection in the decision's window the disposition is allowed for; `--breakage` records known breakage of a check, with the paths it affects, under the line's guardrails; `--goal` names a goal the decision serves. It refuses, naming rule 5, while an objection the decision must answer has no allowed answer (`weave review` lists them), and rule 6 when the breakage breaks a guardrail. |
+| `weave validate --manifest H [--line L] [--check <name>]... [--again] [--timeout SECONDS] [--dry-run]` | Validator: runs the named checks of line `L`'s policy (default: the default line, and all of its checks) on manifest `H` through the check runner, and records each result. Refuses a check it already has a latest result for on `H` unless `--again`. `--timeout` bounds each check (default 1,800 seconds), after which its process group is killed. `--dry-run` shows the line, its validators and what would run, and runs and writes nothing. |
+| `weave review [--line L] [--proposal P]` | The reviews of the line's heads, the open objections the next move must answer, each with its basis and the dispositions it allows, and the reviews of each open proposal on the line (one whose change no decision on it lists), carried over by change, with what a decision using it unchanged would have to answer. With `--proposal`, that proposal alone. |
+| `weave head [--line L]` | The head, or the fork's heads, with the manifest hash. |
+| `weave green [--line L]` | Green under the line's current policy: the green decision, none, the ambiguous set, or a diverged chain's versions; and per head, each check's counted passes and fails, with the fails a later attempt replaced, each with its validator and attempt. |
 | `weave log [--line L] [--limit N] [--since D]` | Decisions on a line, newest first in causal order, with their checks and breakage. At most 20 unless `--limit` says otherwise; never prints payloads. |
 | `weave slice [--at D] <path or prefix>...` | Those paths' contents at a decision or manifest, for an agent that needs a part, not the whole. |
 | `weave checkout [--at D] <dir>` | Materializes a manifest into an empty directory, or updates a directory that is clean against it. If writing fails part way, it removes what it wrote, or names what it couldn't remove. |
@@ -881,7 +923,10 @@ exist, on the validators' path as well as the integrator's.
 hash, so each check runs once per manifest for green: a validator runs
 `weave validate`, and every decision with that manifest uses the result.
 `integrate` runs nothing by default. `--run` is opt-in, for the
-integrator's own information, and its results never count. In stage 2 the
+integrator's own information, and its results never count for the
+integrator's own decision. They count for another integrator's decision
+on that manifest if the integrator is one of the policy's validators, as
+section 2's eligibility rule says (decision `195c6410262f`). In stage 2 the
 line's only validator is a named runner identity, `weave-runner`, which
 runs the test table's checks once per candidate (retrospective
 `16cbeff051ea`: 57% of the results on pr claims never counted, and the
@@ -902,8 +947,9 @@ rules 4 and 5), so the order is fixed:
    refusals above, and its manifest artifact.
 3. **Only with `--run`: run the checks** through the check runner, and
    record each result on the manifest artifact.
-4. **Write the decision**, which names the manifest's content hash, if it
-   would qualify. Otherwise write nothing more: the candidate, and any
+4. **Write the decision**, which names the manifest's content hash, with
+   its answers, breakage and goals, if it would qualify, by every rule
+   including 5 and 6. Otherwise write nothing more: the candidate, and any
    failing results, stay on record, and `integrate` reports which rule
    stopped it.
 
@@ -1025,9 +1071,28 @@ from its results.
     objection, the retractions below it, its basis's result and goal links
     and their retractions are in the past, and whether the policy in force
     is in the result's, all references through one ancestor answer. A
-    decision asks one question per objection in its window, so `D`
-    decisions below `K` objections ask about `D x K`, a bit each; objections
-    are judged again by every later move, as rule 5 requires.
+    decision asks one question per
+    objection in its window that no answer below it settled, so an
+    objection is asked about at each move only until it is answered: 2,000
+    objections settled by one answer cost later moves nothing. Settled
+    objections are carried along the decision graph, shared along runs of
+    decisions that settle nothing. A `fell_back` answer's bases, the
+    manifests of the objected decision's qualifying ancestors, take one
+    decision-graph walk per decision fallen back from, whether the answer
+    names an objection or, blanket, the decision itself (findings
+    `fa578bd1da48` and `67aa4fdb882b`); a line-wide `fell_back` answer
+    counts every objected decision. Settling asks, once per answer, whether
+    each objection it names, and each retraction below it, is in the
+    answering decision's past. An answer naming the line names the window,
+    which settling itself decides, so with such answers settling takes two
+    passes: the first leaves them out, and asks about the window it finds,
+    which holds the window the second finds. Settles reach only decisions on
+    the settling decision's line, so a parent on another line than its
+    child's gives no window to share: its decision ancestry is walked once
+    for the objections to it. Measured in a release build, a line of 1,600
+    moves, each objected to and answered by the next, builds in 0.08 s
+    answered `fixed` and 0.4 s answered `fell_back` (6.2 s and minutes
+    before).
   - A question nothing asked at build would be a bug. It is answered by
     walking and counted, and fails debug builds; the tests assert the count
     is zero.

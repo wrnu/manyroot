@@ -87,25 +87,39 @@ pub struct Open {
 /// One objection's index in [`Obligations::list`].
 type At = u32;
 
-/// Answers at or below a decision: (objection, answering decision), ascending.
-type Answered = Arc<[(ContributionId, ContributionId)]>;
+/// What an answer names: one objection, or every objection to a target (decision 8cf20fe7669a, B).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Objection(ContributionId),
+    Decision(ContributionId),
+    Manifest(ContentHash),
+    Change(ContributionId, ContentHash),
+    /// The answering decision's own line: every objection in its window (decision 4afee4855944, 2).
+    Line,
+}
 
-/// What rules 5 and 6 read of one decision: its window, the objections to what it uses, the answers at
-/// or below it, and its breakage entries' ages.
+/// An objection settled by an answer at a decision `A` (decision 8cf20fe7669a, D): its index, `A`'s line,
+/// and whether it was in `A`'s window. Ascending.
+type Settled = Arc<[(At, ContributionId, bool)]>;
+
+/// What rules 5 and 6 read of one decision: its window and the objections to what it uses, both less
+/// those settled below it, its own answers, and its breakage entries' ages.
 #[derive(Debug, Clone)]
 pub(crate) struct Reads {
     pub(crate) window: Arc<[At]>,
     pub(crate) uses: Vec<At>,
-    pub(crate) answered: Answered,
+    answers: Vec<(Key, Disposition)>,
     pub(crate) ages: BTreeMap<String, u64>,
 }
 
 /// Every objection in a replica, what rule 5 asks of each decision, and what rule 6 counts: each
-/// decision's window (objections to its strict decision-ancestors), the answers at or below it, the
-/// objections to what it uses, and its breakage entries' ages.
+/// decision's window (objections to its strict decision-ancestors) and the objections to what it uses,
+/// both less those settled below it, its answers, and its breakage entries' ages.
 #[derive(Debug, Default)]
 pub struct Obligations {
     list: Vec<Objection>,
+    /// Each objection's index in `list`, by id.
+    by_id: HashMap<ContributionId, At>,
     to_decision: HashMap<ContributionId, Vec<At>>,
     to_manifest: HashMap<ContentHash, Vec<At>>,
     to_proposal: Vec<At>,
@@ -115,15 +129,41 @@ pub struct Obligations {
     results: HashMap<ContributionId, CheckResult>,
     /// The goal links of each goal claim an objection comes from.
     links: HashMap<ContributionId, Vec<GoalLink>>,
-    /// Each decision's window, ascending: objections to its strict ancestors in the decision graph.
+    /// Each decision's window, ascending: objections to its strict ancestors in the decision graph that
+    /// no answer below it settled.
     window: HashMap<ContributionId, Arc<[At]>>,
-    /// Each decision's answers at or below it in the decision graph: (objection, answering decision),
-    /// ascending.
-    answered: HashMap<ContributionId, Answered>,
-    /// The objections to what each decision uses: its manifest, and the proposals it uses.
+    /// The objections settled at each decision's strict ancestors.
+    settled_below: HashMap<ContributionId, Settled>,
+    /// The objections each decision's own answers settle.
+    settles: HashMap<ContributionId, Vec<(At, ContributionId, bool)>>,
+    /// Each decision's answers, resolved.
+    answers: HashMap<ContributionId, Vec<(Key, Disposition)>>,
+    /// The objections to what each decision uses, its manifest and the proposals it uses, that no answer
+    /// on its line below it settled.
     uses: HashMap<ContributionId, Vec<At>>,
     /// Each decision's breakage entries' ages, by check, where it has any.
     ages: HashMap<ContributionId, BTreeMap<String, u64>>,
+    /// The decisions an answer falls back from: the targets of objections some decision answers
+    /// `fell_back`.
+    falls_back_from: HashSet<ContributionId>,
+    /// For each of those, once judged, the manifests of its qualifying strict ancestors: what a
+    /// `fell_back` answer to an objection to it may return to (finding fa578bd1da48).
+    fell_back: HashMap<ContributionId, HashSet<ContentHash>>,
+    /// How many decision-graph walks those took: one per decision fallen back from.
+    fell_back_walks: usize,
+    /// How many decision-graph walks windows took: one per parent on another line than its child's.
+    cross_line_walks: std::cell::Cell<usize>,
+}
+
+/// The manifests of `d`'s qualifying strict ancestors in the decision graph, in one walk.
+fn fell_back_bases(lines: &Lines, d: &ContributionId) -> HashSet<ContentHash> {
+    let mut below = lines.decision_ancestry(d);
+    below.remove(d);
+    below
+        .iter()
+        .filter(|b| matches!(lines.verdict(b), Some(Ok(_))))
+        .filter_map(|b| lines.decision(b).map(|b| b.decision.manifest))
+        .collect()
 }
 
 /// Whether `path` is `prefix` or below it.
@@ -133,10 +173,10 @@ fn under(path: &str, prefix: &str) -> bool {
 }
 
 impl Obligations {
-    /// Every objection whose target resolves, with the results and goal links its basis may need, then
-    /// each decision's window, answers, used objections and breakage ages, in `lines`' causal order.
-    /// Reads only payloads and the decision graph: no ancestor question.
-    pub(crate) fn build(ix: &Index, lines: &Lines, order: &[ContributionId]) -> Obligations {
+    /// Every objection whose target resolves, with the results and goal links its basis may need, and
+    /// each decision's answers resolved. [`Obligations::propagate`] then works out what each decision
+    /// reads.
+    pub(crate) fn new(ix: &Index, lines: &Lines, order: &[ContributionId]) -> Obligations {
         let mut ob = Obligations::default();
         let results: HashMap<ContributionId, &CheckResult> = ix.check_results().iter().map(|r| (r.id, r)).collect();
         let mut links: HashMap<ContributionId, Vec<GoalLink>> = HashMap::new();
@@ -174,22 +214,226 @@ impl Obligations {
             }
             ob.list.push(Objection { id: review.id, author: review.author, from: review.from, target, objected });
         }
+        ob.by_id = ob.list.iter().enumerate().map(|(at, o)| (o.id, at as At)).collect();
         for id in order {
             let d = &lines.decision(id).expect("in order").decision;
-            let window = ob.window_for(&d.parents);
-            let answered = ob.answered_for(&d.parents, Some((id, d)));
-            let uses = ob.uses_for(ix, lines, d);
-            let ages = ob.ages_for(lines, d);
-            ob.window.insert(*id, window);
-            ob.answered.insert(*id, answered);
-            if !uses.is_empty() {
-                ob.uses.insert(*id, uses);
-            }
-            if !ages.is_empty() {
-                ob.ages.insert(*id, ages);
+            let answers = ob.resolve(ix, lines, d);
+            if !answers.is_empty() {
+                ob.answers.insert(*id, answers);
             }
         }
+        // The decisions a fell_back answer falls back from: the target of the objection it names, or the
+        // decision it names, blanket (finding 67aa4fdb882b).
+        let falls_back_from: HashSet<ContributionId> = ob
+            .answers
+            .values()
+            .flatten()
+            .filter(|(_, disposition)| *disposition == Disposition::FellBack)
+            .flat_map(|(key, _)| match key {
+                // A line-wide fell_back may answer an objection to any objected decision.
+                Key::Line => ob.to_decision.keys().copied().collect::<Vec<_>>(),
+                Key::Decision(d) => vec![*d],
+                Key::Objection(o) => match ob.list[ob.by_id[o] as usize].target {
+                    Target::Decision(d) => vec![d],
+                    _ => vec![],
+                },
+                _ => vec![],
+            })
+            .collect();
+        ob.falls_back_from = falls_back_from;
         ob
+    }
+
+    /// What an answer names, if anything: an objection, or a target whose objections it covers.
+    fn resolve(&self, ix: &Index, lines: &Lines, d: &Decision) -> Vec<(Key, Disposition)> {
+        d.answers
+            .iter()
+            .filter_map(|a| {
+                let key = if self.by_id.contains_key(&a.objection) {
+                    Key::Objection(a.objection)
+                } else if a.objection == d.line {
+                    Key::Line
+                } else {
+                    match Target::of(ix, lines, &a.objection)? {
+                        Target::Decision(d) => Key::Decision(d),
+                        Target::Manifest(_, hash) => Key::Manifest(hash),
+                        Target::Proposal { line, change, .. } => Key::Change(line, change),
+                    }
+                };
+                Some((key, a.disposition))
+            })
+            .collect()
+    }
+
+    /// Whether an answer naming `key` covers objection `o`, judged in the answering decision's window
+    /// (`in_window`) or as an objection to what it uses.
+    fn covers(key: &Key, o: &Objection, in_window: bool) -> bool {
+        match (key, o.target) {
+            (Key::Objection(id), _) => *id == o.id,
+            (Key::Line, _) => in_window,
+            (Key::Decision(d), Target::Decision(t)) => *d == t,
+            (Key::Manifest(h), Target::Manifest(_, t)) => *h == t,
+            (Key::Change(l, c), Target::Proposal { line, change, .. }) => *l == line && *c == change,
+            _ => false,
+        }
+    }
+
+    /// The objections an answer naming a target covers, for [`Obligations::settle_asks`].
+    fn covered(&self, key: &Key) -> Vec<At> {
+        match key {
+            Key::Objection(_) | Key::Line => vec![],
+            Key::Decision(d) => self.to_decision.get(d).cloned().unwrap_or_default(),
+            Key::Manifest(h) => self.to_manifest.get(h).cloned().unwrap_or_default(),
+            Key::Change(..) => self
+                .to_proposal
+                .iter()
+                .filter(|at| Self::covers(key, &self.list[**at as usize], false))
+                .copied()
+                .collect(),
+        }
+    }
+
+    /// The objections an answer names: the one it names, those to the target it names, or for its line,
+    /// those in its window.
+    fn named(&self, key: &Key, window: &[At]) -> Vec<At> {
+        match key {
+            Key::Objection(o) => self.by_id.get(o).copied().into_iter().collect(),
+            Key::Line => window.to_vec(),
+            _ => self.covered(key),
+        }
+    }
+
+    /// Whether some decision answers its line, blanket: then settling takes two passes.
+    pub(crate) fn has_line_answers(&self) -> bool {
+        self.answers.values().flatten().any(|(key, _)| *key == Key::Line)
+    }
+
+    /// The questions settling asks: for each decision with answers, whether each objection they name is
+    /// in its past, and each retraction below it. With `line_answers` false, the first pass: answers
+    /// naming the line are left out, as what they name is the window, which settling decides. With it
+    /// true, the second: only those, each naming the window the first pass found, which holds the one
+    /// the second will (decision 4afee4855944).
+    pub(crate) fn settle_asks(
+        &self,
+        retractions: &Retractions,
+        line_answers: bool,
+    ) -> HashMap<ContributionId, Vec<ContributionId>> {
+        let mut refs: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
+        for (id, answers) in &self.answers {
+            let window = self.window.get(id).map(|w| &w[..]).unwrap_or(&[]);
+            for (key, _) in answers.iter().filter(|(key, _)| (*key == Key::Line) == line_answers) {
+                for at in self.named(key, window) {
+                    let o = self.list[at as usize].id;
+                    let asked = refs.entry(*id).or_default();
+                    asked.push(o);
+                    asked.extend(retractions.below(&o));
+                }
+            }
+        }
+        refs
+    }
+
+    /// Each decision's window, settled objections, used objections and breakage ages, in `lines`' causal
+    /// order, from payloads and the decision graph; `in_past(x, a)` answers [`Obligations::settle_asks`].
+    /// With `line_answers` false, answers naming the line settle nothing.
+    pub(crate) fn propagate(
+        &mut self,
+        ix: &Index,
+        lines: &Lines,
+        order: &[ContributionId],
+        retractions: &Retractions,
+        line_answers: bool,
+        in_past: &mut dyn FnMut(&ContributionId, &ContributionId) -> bool,
+    ) {
+        self.window.clear();
+        self.settled_below.clear();
+        self.settles.clear();
+        self.uses.clear();
+        self.ages.clear();
+        self.cross_line_walks.set(0);
+        for id in order {
+            let d = &lines.decision(id).expect("in order").decision;
+            let settled_below = self.settled_for(&d.parents);
+            let window = self.window_for(lines, &d.line, &d.parents, &settled_below);
+            let uses = self.uses_for(ix, lines, d, &settled_below);
+            let ages = self.ages_for(lines, d);
+            // What its answers settle for its descendants (finding 0bf37b345567): exactly the objections rule
+            // 5 judges here and that an answer here names, so an allowed one, as this decision qualifies
+            // only if each judged objection has one. Rule 5 judges an objection in its window, or to what
+            // it uses, that is in its past and not retracted there. One it doesn't judge (to a manifest or
+            // proposal it doesn't use, outside its past, or retracted there, even if later restored) isn't
+            // settled. Whether it qualifies needn't be asked: if not, no descendant does (rule 3).
+            let mut settles: Vec<(At, ContributionId, bool)> = Vec::new();
+            for (key, _) in self.answers.get(id).into_iter().flatten() {
+                if *key == Key::Line && !line_answers {
+                    continue;
+                }
+                for at in self.named(key, &window) {
+                    let in_window = window.binary_search(&at).is_ok();
+                    if !in_window && uses.binary_search(&at).is_err() {
+                        continue;
+                    }
+                    let o = self.list[at as usize].id;
+                    if !in_past(&o, id) || retractions.within(&o, |x| in_past(x, id)) {
+                        continue;
+                    }
+                    settles.push((at, d.line, in_window));
+                }
+            }
+            settles.sort_unstable();
+            settles.dedup();
+            self.window.insert(*id, window);
+            self.settled_below.insert(*id, settled_below);
+            if !settles.is_empty() {
+                self.settles.insert(*id, settles);
+            }
+            if !uses.is_empty() {
+                self.uses.insert(*id, uses);
+            }
+            if !ages.is_empty() {
+                self.ages.insert(*id, ages);
+            }
+        }
+    }
+
+    /// The objections settled at strict ancestors of a decision with `parents`. A decision with one
+    /// parent that settles nothing shares its parent's.
+    fn settled_for(&self, parents: &[ContributionId]) -> Settled {
+        let empty = Settled::from([]);
+        let below = |p: &ContributionId| self.settled_below.get(p).cloned().unwrap_or_else(|| empty.clone());
+        match parents {
+            [] => empty,
+            [p] if !self.settles.contains_key(p) => below(p),
+            _ => {
+                let mut all: BTreeSet<(At, ContributionId, bool)> = BTreeSet::new();
+                for p in parents {
+                    all.extend(below(p).iter().copied());
+                    all.extend(self.settles.get(p).into_iter().flatten().copied());
+                }
+                all.into_iter().collect::<Vec<_>>().into()
+            }
+        }
+    }
+
+    /// Records that `id` has been judged: if an answer falls back from it, the manifests it may fall back
+    /// to, its qualifying strict ancestors' (all judged before it), are worked out once now.
+    pub(crate) fn judged(&mut self, lines: &Lines, id: &ContributionId) {
+        if self.falls_back_from.contains(id) {
+            self.fell_back.insert(*id, fell_back_bases(lines, id));
+            self.fell_back_walks += 1;
+        }
+    }
+
+    /// How many decision-graph walks windows took, in the last pass: one per parent on another line.
+    #[doc(hidden)]
+    pub fn cross_line_walks(&self) -> usize {
+        self.cross_line_walks.get()
+    }
+
+    /// How many decision-graph walks `fell_back` answers took.
+    #[doc(hidden)]
+    pub fn fell_back_walks(&self) -> usize {
+        self.fell_back_walks
     }
 
     /// Every objection whose target resolves, in id order.
@@ -197,41 +441,38 @@ impl Obligations {
         &self.list
     }
 
-    /// A decision's window with `parents`: the objections to its strict decision-ancestors, ascending.
-    /// A decision with one parent and no objection to it shares its parent's.
-    fn window_for(&self, parents: &[ContributionId]) -> Arc<[At]> {
+    /// The window of a decision on `line` with `parents`: the objections to its strict decision-ancestors
+    /// that no answer settled for it, ascending. An objection is settled for it only by an answer at an
+    /// ancestor on its own line (decision 4afee4855944, 1), so the window of a parent on another line is
+    /// no help: that parent's strict ancestors are walked once for their objections instead. A decision
+    /// with one parent on its line, no objection to that parent and no answer there shares its parent's.
+    fn window_for(
+        &self,
+        lines: &Lines,
+        line: &ContributionId,
+        parents: &[ContributionId],
+        settled: &[(At, ContributionId, bool)],
+    ) -> Arc<[At]> {
         let empty = Arc::<[At]>::from([]);
-        let parts = |p: &ContributionId| {
-            (self.window.get(p).cloned().unwrap_or_else(|| empty.clone()), self.to_decision.get(p))
-        };
+        let on_line = |p: &ContributionId| lines.decision(p).is_some_and(|r| r.decision.line == *line);
+        let below = |p: &ContributionId| self.window.get(p).cloned().unwrap_or_else(|| empty.clone());
         match parents {
             [] => empty,
-            [p] if !self.to_decision.contains_key(p) => parts(p).0,
+            [p] if on_line(p) && !self.to_decision.contains_key(p) && !self.settles.contains_key(p) => below(p),
             _ => {
                 let mut all: BTreeSet<At> = BTreeSet::new();
                 for p in parents {
-                    let (below, to) = parts(p);
-                    all.extend(below.iter().copied());
-                    all.extend(to.into_iter().flatten().copied());
+                    if on_line(p) {
+                        all.extend(below(p).iter().copied());
+                    } else {
+                        self.cross_line_walks.set(self.cross_line_walks.get() + 1);
+                        for a in lines.decision_ancestry(p).iter().filter(|a| *a != p) {
+                            all.extend(self.to_decision.get(a).into_iter().flatten().copied());
+                        }
+                    }
+                    all.extend(self.to_decision.get(p).into_iter().flatten().copied());
                 }
-                all.into_iter().collect::<Vec<_>>().into()
-            }
-        }
-    }
-
-    /// A decision's answers at or below it, given its parents, and itself if it is in the graph.
-    fn answered_for(&self, parents: &[ContributionId], own: Option<(&ContributionId, &Decision)>) -> Answered {
-        let empty = Answered::from([]);
-        let mine: Vec<(ContributionId, ContributionId)> =
-            own.map(|(id, d)| d.answers.iter().map(|a| (a.objection, *id)).collect()).unwrap_or_default();
-        match parents {
-            [] if mine.is_empty() => empty,
-            [p] if mine.is_empty() => self.answered.get(p).cloned().unwrap_or(empty),
-            _ => {
-                let mut all: BTreeSet<(ContributionId, ContributionId)> = mine.into_iter().collect();
-                for p in parents {
-                    all.extend(self.answered.get(p).into_iter().flat_map(|a| a.iter().copied()));
-                }
+                all.retain(|at| !settled.iter().any(|(s, l, in_window)| s == at && *in_window && l == line));
                 all.into_iter().collect::<Vec<_>>().into()
             }
         }
@@ -241,7 +482,7 @@ impl Obligations {
     /// manifest hash, or to a proposal `X` it uses, by listing `X` or a proposal with `X`'s line and
     /// change, or because every entry of `X`'s change is in its own change against one of its parents on
     /// its line (security note 17906a29698f). Ascending.
-    fn uses_for(&self, ix: &Index, lines: &Lines, d: &Decision) -> Vec<At> {
+    fn uses_for(&self, ix: &Index, lines: &Lines, d: &Decision, settled: &[(At, ContributionId, bool)]) -> Vec<At> {
         let mut uses: Vec<At> = self.to_manifest.get(&d.manifest).cloned().unwrap_or_default();
         if !self.to_proposal.is_empty() {
             let listed: HashSet<(ContributionId, ContentHash)> =
@@ -277,6 +518,8 @@ impl Obligations {
             uses.sort_unstable();
             uses.dedup();
         }
+        // Settled by an answer at an ancestor on its line.
+        uses.retain(|at| !settled.iter().any(|(s, line, _)| s == at && *line == d.line));
         uses
     }
 
@@ -408,54 +651,35 @@ impl Obligations {
             }
             (Disposition::FellBack, _) => {
                 let Target::Decision(d) = o.target else { return false };
-                let mut below = lines.decision_ancestry(&d);
-                below.remove(&d);
-                below.iter().any(|b| {
-                    matches!(lines.verdict(b), Some(Ok(_)))
-                        && lines.decision(b).is_some_and(|b| b.decision.manifest == a.manifest)
-                })
+                match self.fell_back.get(&d) {
+                    Some(bases) => bases.contains(&a.manifest),
+                    // A target no answer in the replica falls back from: a decision not yet written does.
+                    None => fell_back_bases(lines, &d).contains(&a.manifest),
+                }
             }
             _ => false,
         }
     }
 
-    /// Rule 5 for decision `e` (with id `id`, `None` if not yet written) by `author` on its line, under
-    /// `policy`, over the past `in_past` holds: every objection in its window to a qualifying decision,
-    /// and every objection to what it uses, in that past and not retracted there, has an allowed answer.
+    /// Rule 5 for decision `e` by `author` on its line, under `policy`, over the past `in_past` holds:
+    /// every objection in its window to a qualifying decision, and every objection to what it uses, in
+    /// that past, not retracted there and not settled below it, has an allowed answer in `e` itself,
+    /// naming it or its target (decision 8cf20fe7669a).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rule_5(
         &self,
         lines: &Lines,
         retractions: &Retractions,
-        id: Option<&ContributionId>,
         author: &AgentId,
         e: &Decision,
         policy: &Line,
-        window: &[At],
-        uses: &[At],
-        answered: &[(ContributionId, ContributionId)],
+        reads: &Reads,
         in_past: &mut dyn FnMut(&ContributionId) -> bool,
         in_epoch: &mut dyn FnMut(&ContributionId) -> bool,
     ) -> Result<(), Unqualified> {
-        let answers_to = |o: &ContributionId| -> Vec<(Option<ContributionId>, &Decision)> {
-            let mine = e.answers.iter().filter(|a| a.objection == *o).map(|_| (id.copied(), e));
-            let start = answered.partition_point(|(x, _)| x < o);
-            let below = answered[start..]
-                .iter()
-                .take_while(|(x, _)| x == o)
-                .filter(|(_, a)| Some(a) != id)
-                .filter_map(|(_, a)| lines.decision(a).map(|r| (Some(*a), &r.decision)));
-            mine.chain(below).collect()
-        };
-        let disposition_of = |a: &Decision, o: &ContributionId| -> Vec<Disposition> {
-            a.answers.iter().filter(|x| x.objection == *o).map(|x| x.disposition).collect()
-        };
-        let mut seen: HashSet<At> = HashSet::new();
-        for (uses_it, at) in window.iter().map(|at| (false, at)).chain(uses.iter().map(|at| (true, at))) {
-            if !seen.insert(*at) && uses_it {
-                // An objection both in the window and to what `e` uses was judged in the window.
-                continue;
-            }
+        let window = reads.window.iter().map(|at| (false, at));
+        let uses = reads.uses.iter().filter(|at| reads.window.binary_search(at).is_err()).map(|at| (true, at));
+        for (uses_it, at) in window.chain(uses) {
             let o = &self.list[*at as usize];
             if !in_past(&o.id) || retractions.within(&o.id, &mut *in_past) {
                 continue;
@@ -468,27 +692,13 @@ impl Obligations {
                 _ => *author,
             };
             let basis = self.basis(o, policy, &e.line, Some(&eligible_for), retractions, in_past, in_epoch);
-            // Who may answer: in the window, `e` or a decision that the objection's target is a strict
-            // ancestor of; for what `e` uses, `e` or an ancestor of it on its line.
-            let may_answer = |a: &Option<ContributionId>, d: &Decision| match a {
-                None => true,
-                Some(a) if Some(a) == id => true,
-                Some(a) => match uses_it {
-                    false => self.window.get(a).is_some_and(|w| w.binary_search(at).is_ok()),
-                    true => d.line == e.line,
-                },
-            };
-            let answers: Vec<(Option<ContributionId>, &Decision)> =
-                answers_to(&o.id).into_iter().filter(|(a, d)| may_answer(a, d)).collect();
-            let Some((_, first)) = answers.first() else {
+            let mut answers =
+                reads.answers.iter().filter(|(key, _)| Self::covers(key, o, !uses_it)).map(|(_, d)| *d).peekable();
+            let Some(first) = answers.peek().copied() else {
                 return Err(Unqualified::Unanswered { objection: o.id, basis: basis.kind() });
             };
-            let ok = answers.iter().any(|(_, a)| {
-                disposition_of(a, &o.id).into_iter().any(|disp| self.allowed(lines, o, &basis, uses_it, a, disp))
-            });
-            if !ok {
-                let disposition = disposition_of(first, &o.id)[0];
-                return Err(Unqualified::AnswerNotAllowed { objection: o.id, disposition, basis: basis.kind() });
+            if !answers.any(|disposition| self.allowed(lines, o, &basis, uses_it, e, disposition)) {
+                return Err(Unqualified::AnswerNotAllowed { objection: o.id, disposition: first, basis: basis.kind() });
             }
         }
         Ok(())
@@ -541,21 +751,25 @@ impl Obligations {
         Reads {
             window: self.window.get(id).cloned().unwrap_or_else(|| Arc::from([])),
             uses: self.uses.get(id).cloned().unwrap_or_default(),
-            answered: self.answered.get(id).cloned().unwrap_or_else(|| Answered::from([])),
+            answers: self.answers.get(id).cloned().unwrap_or_default(),
             ages: self.ages.get(id).cloned().unwrap_or_default(),
         }
     }
 
-    /// The same for a decision not yet written.
+    /// The same for a decision not yet written, whose past is the whole replica.
     pub(crate) fn of_new(&self, ix: &Index, lines: &Lines, d: &Decision) -> Reads {
-        let window = self.window_for(&d.parents);
-        let answered = self.answered_for(&d.parents, None);
-        Reads { window, uses: self.uses_for(ix, lines, d), answered, ages: self.ages_for(lines, d) }
+        let settled = self.settled_for(&d.parents);
+        Reads {
+            window: self.window_for(lines, &d.line, &d.parents, &settled),
+            uses: self.uses_for(ix, lines, d, &settled),
+            answers: self.resolve(ix, lines, d),
+            ages: self.ages_for(lines, d),
+        }
     }
 
-    /// The objections in a window, or to what a decision uses, that no answer allows, judged now: under
-    /// `policy`, over the whole replica, with retraction read now. For [`Lines::open_objections`] and
-    /// [`Lines::proposal_objections`].
+    /// The objections among `candidates` that bind now, unanswered: under `policy`, over the whole
+    /// replica, with retraction read now, each with the dispositions its basis allows. For
+    /// [`Lines::open_objections`] and [`Lines::proposal_objections`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn open(
         &self,
@@ -564,7 +778,6 @@ impl Obligations {
         line: &ContributionId,
         policy: &Line,
         candidates: &[(bool, At)],
-        answered: &[(ContributionId, ContributionId)],
         eligible_for: Option<&AgentId>,
         in_epoch: &mut dyn FnMut(&ContributionId) -> bool,
     ) -> Vec<Open> {
@@ -583,24 +796,8 @@ impl Obligations {
                 _ => eligible_for.copied(),
             };
             let basis = self.basis(o, policy, line, eligible.as_ref(), retractions, &mut now, in_epoch);
-            let start = answered.partition_point(|(x, _)| *x < o.id);
-            let answered_ok = answered[start..].iter().take_while(|(x, _)| *x == o.id).any(|(_, a)| {
-                let may = match uses_it {
-                    false => self.window.get(a).is_some_and(|w| w.binary_search(at).is_ok()),
-                    true => lines.decision(a).is_some_and(|d| d.decision.line == *line),
-                };
-                let Some(d) = lines.decision(a) else { return false };
-                may && d
-                    .decision
-                    .answers
-                    .iter()
-                    .filter(|x| x.objection == o.id)
-                    .any(|x| self.allowed(lines, o, &basis, *uses_it, &d.decision, x.disposition))
-            });
-            if !answered_ok {
-                let allowed = basis.allows(*uses_it);
-                open.push(Open { objection: o.clone(), basis, allowed });
-            }
+            let allowed = basis.allows(*uses_it);
+            open.push(Open { objection: o.clone(), basis, allowed });
         }
         open.sort_by_key(|o| o.objection.id);
         open
@@ -618,23 +815,30 @@ impl Obligations {
         rs
     }
 
-    /// The window and answers of the next move on a line whose heads are `heads`.
-    pub(crate) fn next_move(&self, heads: &[ContributionId]) -> (Vec<(bool, At)>, Answered) {
-        let window = self.window_for(heads);
-        let answered = self.answered_for(heads, None);
-        (window.iter().map(|at| (false, *at)).collect(), answered)
+    /// The window of the next move on a line whose heads are `heads`.
+    pub(crate) fn next_move(&self, lines: &Lines, line: &ContributionId, heads: &[ContributionId]) -> Vec<(bool, At)> {
+        let settled = self.settled_for(heads);
+        self.window_for(lines, line, heads, &settled).iter().map(|at| (false, *at)).collect()
     }
 
-    /// The objections to a manifest or proposal that a decision using `proposal` unchanged would have
-    /// to answer: to any proposal with its line and change, and to its manifest.
-    pub(crate) fn of_proposal(&self, lines: &Lines, proposal: &ContributionId) -> Vec<(bool, At)> {
+    /// The objections to a manifest or proposal that a next move on its line, from `heads`, using
+    /// `proposal` unchanged would have to answer: to any proposal with its line and change, and to its
+    /// manifest, less those an answer on the line settled.
+    pub(crate) fn of_proposal(
+        &self,
+        lines: &Lines,
+        proposal: &ContributionId,
+        heads: &[ContributionId],
+    ) -> Vec<(bool, At)> {
         let Some(p) = lines.proposal_named(proposal) else { return vec![] };
+        let settled = self.settled_for(heads);
         let mut ats: Vec<At> = self.to_manifest.get(&p.manifest).cloned().unwrap_or_default();
         ats.extend(self.to_proposal.iter().filter(|at| {
             matches!(self.list[**at as usize].target, Target::Proposal { line, change, .. } if line == p.line && change == p.change)
         }));
         ats.sort_unstable();
         ats.dedup();
+        ats.retain(|at| !settled.iter().any(|(s, line, _)| s == at && *line == p.line));
         ats.into_iter().map(|at| (true, at)).collect()
     }
 }

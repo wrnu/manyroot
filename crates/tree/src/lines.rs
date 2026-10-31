@@ -257,7 +257,34 @@ impl Lines {
         // Rules 5 and 6: each decision's window, answers and used objections from the decision graph, then
         // every question they ask of each decision's past, under the policy in force for it, at once
         // (decision on split note dc467163233c).
-        let obligations = Obligations::build(ix, &lines, &lines.order);
+        let mut obligations = Obligations::new(ix, &lines, &lines.order);
+        // What answers settle is asked first, as the windows depend on it. Answers naming the line name
+        // the window, so settling then takes two passes: the first leaves them out, and its windows, which
+        // hold the second's, give what they ask (decision 4afee4855944).
+        let first_asks = if walking { HashMap::new() } else { obligations.settle_asks(ix.retractions(), false) };
+        let blanket = Ancestry::build(g, &first_asks, &[]);
+        drop(first_asks);
+        let blanket_missed = Cell::new(0);
+        let two_passes = obligations.has_line_answers();
+        let mut covered = |o: &ContributionId, a: &ContributionId| match walking {
+            true => g.is_ancestor(o, a),
+            false => answer(&blanket, &blanket_missed, g, o, a),
+        };
+        obligations.propagate(ix, &lines, &lines.order, ix.retractions(), false, &mut covered);
+        let line_wide = match (two_passes, walking) {
+            (true, false) => Ancestry::build(g, &obligations.settle_asks(ix.retractions(), true), &[]),
+            _ => Ancestry::default(),
+        };
+        if two_passes {
+            let mut covered = |o: &ContributionId, a: &ContributionId| match walking {
+                true => g.is_ancestor(o, a),
+                false => match line_wide.is_ancestor(o, a) {
+                    Some(answer) => answer,
+                    None => answer(&blanket, &blanket_missed, g, o, a),
+                },
+            };
+            obligations.propagate(ix, &lines, &lines.order, ix.retractions(), true, &mut covered);
+        }
         let mut refs: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
         if !walking {
             for (id, chain) in &chains {
@@ -304,13 +331,10 @@ impl Lines {
                     obligations.rule_5(
                         &lines,
                         ix.retractions(),
-                        Some(&id),
                         &record.author,
                         &record.decision,
                         policy,
-                        &reads.window,
-                        &reads.uses,
-                        &reads.answered,
+                        &reads,
                         &mut in_past,
                         &mut in_epoch,
                     )?;
@@ -319,6 +343,7 @@ impl Lines {
                 })
             };
             lines.judged.insert(id, verdict);
+            obligations.judged(&lines, &id);
         }
         // A line stays a line for its decisions' sake, even if its author later has it supersede
         // another version.
@@ -369,7 +394,15 @@ impl Lines {
             lines.default_line = main;
         }
         lines.stats.fallbacks += missed.get();
-        lines.obligation_stats = Stats { fallbacks: rule_5_missed.get(), ..pasts.stats() };
+        let (first, second, then) = (blanket.stats(), line_wide.stats(), pasts.stats());
+        lines.obligation_stats = Stats {
+            passes: first.passes + second.passes + then.passes,
+            ors: first.ors + second.ors + then.ors,
+            questions: first.questions + second.questions + then.questions,
+            bytes: first.bytes.max(then.bytes),
+            fallbacks: rule_5_missed.get() + blanket_missed.get(),
+            ..then
+        };
         lines.obligations = obligations;
         lines
     }
@@ -604,19 +637,7 @@ impl Lines {
         let mut in_epoch = |r: &ContributionId| answer(&epochs, &missed, g, &q.policy, r);
         let mut in_past = |x: &ContributionId| g.contains(x);
         let (retractions, obligations) = (ix.retractions(), &self.obligations);
-        obligations.rule_5(
-            self,
-            retractions,
-            None,
-            &author,
-            d,
-            policy,
-            &reads.window,
-            &reads.uses,
-            &reads.answered,
-            &mut in_past,
-            &mut in_epoch,
-        )?;
+        obligations.rule_5(self, retractions, &author, d, policy, &reads, &mut in_past, &mut in_epoch)?;
         obligations.rule_6(self, d, policy, &reads.ages)?;
         Ok(q)
     }
@@ -636,12 +657,12 @@ impl Lines {
     pub fn open_objections(&self, g: &Graph, ix: &Index, line: &ContributionId) -> Option<Vec<Open>> {
         let [version] = self.current_versions(line)[..] else { return None };
         let policy = &self.versions[&version].policy;
-        let (candidates, answered) = self.obligations.next_move(&self.heads(line));
+        let candidates = self.obligations.next_move(self, line, &self.heads(line));
         let epochs = self.epochs(g, &candidates, &version);
         let missed = Cell::new(0);
         let mut in_epoch = |r: &ContributionId| answer(&epochs, &missed, g, &version, r);
         let retractions = ix.retractions();
-        Some(self.obligations.open(self, retractions, line, policy, &candidates, &answered, None, &mut in_epoch))
+        Some(self.obligations.open(self, retractions, line, policy, &candidates, None, &mut in_epoch))
     }
 
     /// The objections a decision using `proposal` unchanged on its line would have to answer, to any
@@ -653,13 +674,12 @@ impl Lines {
         let line = self.proposal_named(proposal)?.line;
         let [version] = self.current_versions(&line)[..] else { return None };
         let policy = &self.versions[&version].policy;
-        let candidates = self.obligations.of_proposal(self, proposal);
-        let (_, answered) = self.obligations.next_move(&self.heads(&line));
+        let candidates = self.obligations.of_proposal(self, proposal, &self.heads(&line));
         let epochs = self.epochs(g, &candidates, &version);
         let missed = Cell::new(0);
         let mut in_epoch = |r: &ContributionId| answer(&epochs, &missed, g, &version, r);
         let retractions = ix.retractions();
-        Some(self.obligations.open(self, retractions, &line, policy, &candidates, &answered, None, &mut in_epoch))
+        Some(self.obligations.open(self, retractions, &line, policy, &candidates, None, &mut in_epoch))
     }
 
     /// Every objection in the replica whose target resolves.

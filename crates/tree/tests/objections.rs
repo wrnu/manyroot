@@ -326,8 +326,9 @@ fn an_objection_binds_every_move_until_answered() {
 }
 
 /// Finding b2098df8e4be: the basis is classified under the policy in force for the decision judged.
-/// A later policy that makes the goal's author a goal setter doesn't change an earlier decision, but
-/// binds the decisions under it.
+/// A later policy that makes the goal's author a goal setter doesn't change an earlier decision, nor
+/// reopen the objection it settled (decision 8cf20fe7669a, D); a new objection from the goal binds the
+/// decisions under it.
 #[test]
 fn a_basis_is_judged_under_the_policy_in_force() {
     let mut w = World::new();
@@ -343,7 +344,11 @@ fn a_basis_is_judged_under_the_policy_in_force() {
     assert_eq!(w.verdict(&e), Ok(()), "a later policy doesn't change e");
     let m3 = w.tree(&[("a", b"3")]);
     let f = w.decide(m3.0, &[e], |_| {});
-    assert!(not_allowed(w.verdict(&f), o), "under p1 the goal binds, and overridden isn't allowed");
+    assert_eq!(w.verdict(&f), Ok(()), "e settled the objection; it isn't judged again under p1");
+    let again = w.object(&bob, goal, f);
+    let m4 = w.tree(&[("a", b"4")]);
+    let g = w.decide(m4.0, &[f], |d| d.answers.push(answer(again, Disposition::Overridden)));
+    assert!(not_allowed(w.verdict(&g), again), "under p1 the goal binds, and overridden isn't allowed");
 }
 
 /// Task 8ff95e0b756f, the reviewer's case: a goal binds only through a link a goal setter wrote. alice
@@ -613,4 +618,291 @@ fn many_objections_are_judged_without_a_walk() {
     let (_, lines) = w.lines();
     assert_eq!(lines.verdict(&parent).expect("judged").as_ref().map(|_| ()), Ok(()));
     assert!(lines.obligation_stats().questions > 0, "{:?}", lines.obligation_stats());
+}
+
+/// Decision 8cf20fe7669a: 2,000 objections to one head, by a validator, are settled by one blanket
+/// answer naming the head, and later moves don't judge them again: their index questions don't grow
+/// with the objections.
+#[test]
+fn a_blanket_answer_settles_many_objections_once() {
+    const K: usize = 2_000;
+    let build = |moves: usize| {
+        let mut w = World::new();
+        let bob = w.bob.clone();
+        let (_, _, _, d1) = two_moves(&mut w);
+        for i in 0..K {
+            let why = w.claim(&bob, &format!("no {i}"), &[]);
+            w.object(&bob, why, d1);
+        }
+        let m2 = w.tree(&[("a", b"2")]);
+        let e = w.decide(m2.0, &[d1], |d| d.answers.push(answer(d1, Disposition::Fixed)));
+        let mut last = e;
+        for i in 0..moves {
+            let m = w.tree(&[("a", &(100 + i as u32).to_le_bytes()[..])]);
+            last = w.decide(m.0, &[last], |_| {});
+        }
+        let (_, lines) = w.lines();
+        assert_eq!(lines.verdict(&last).expect("judged").as_ref().map(|_| ()), Ok(()), "{moves} moves");
+        lines.obligation_stats().questions
+    };
+    let (one, ten) = (build(1), build(10));
+    assert!(ten - one < 100, "later moves don't ask about the settled objections: {one} then {ten}");
+    assert!(one >= K, "the blanket answer asks about each once: {one}");
+}
+
+/// Decision 8cf20fe7669a, B: a blanket overridden answers only the objections its basis allows, so a
+/// goal-backed objection survives it and needs its own answer.
+#[test]
+fn a_goal_backed_objection_survives_a_blanket_overridden() {
+    let mut w = World::new();
+    let (alice, bob) = (w.alice.clone(), w.bob.clone());
+    let (_, _, _, d1) = two_moves(&mut w);
+    let why = w.claim(&bob, "meh", &[]);
+    w.object(&bob, why, d1);
+    let (goal, _) = w.goal(&alice, &alice);
+    let bound = w.object(&bob, goal, d1);
+    let m2 = w.tree(&[("a", b"2")]);
+    let blanket = w.decide(m2.0, &[d1], |d| d.answers.push(answer(d1, Disposition::Overridden)));
+    assert!(not_allowed(w.verdict(&blanket), bound));
+    let both = w.decide(m2.0, &[d1], |d| {
+        d.answers.push(answer(d1, Disposition::Overridden));
+        d.answers.push(answer(bound, Disposition::Fixed));
+    });
+    assert_eq!(w.verdict(&both), Ok(()));
+}
+
+/// Decision 8cf20fe7669a: 2,000 objections by an identity with no role in the policy can't stop the
+/// line: one reference answers them all.
+#[test]
+fn many_objections_from_anyone_are_answered_in_one_reference() {
+    let mut w = World::new();
+    let mallory = Rc::new(Identity::generate("mallory").expect("a valid name"));
+    let (_, _, _, d1) = two_moves(&mut w);
+    for i in 0..2_000 {
+        let why = w.claim(&mallory, &format!("no {i}"), &[]);
+        w.object(&mallory, why, d1);
+    }
+    let m2 = w.tree(&[("a", b"2")]);
+    assert!(matches!(w.judge_new(&w.draft(m2.0, &[d1], |_| {})), Err(Unqualified::Unanswered { .. })));
+    let e = w.draft(m2.0, &[d1], |d| d.answers.push(answer(d1, Disposition::Overridden)));
+    assert_eq!(w.judge_new(&e), Ok(()));
+    let alice = w.alice.clone();
+    let e = w.add(&alice, artifact(&e));
+    assert_eq!(w.verdict(&e), Ok(()));
+    let (ix, lines) = w.lines();
+    assert!(lines.open_objections(&w.g, &ix, &w.line).expect("a policy").is_empty(), "all settled");
+}
+
+/// Finding fa578bd1da48: a `fell_back` answer's bases are worked out once per decision fallen back from,
+/// not at every later move: a chain of moves, each objected to and answered fell_back by the next, takes
+/// one decision-graph walk per objected decision.
+#[test]
+fn fell_back_walks_once_per_decision_fallen_back_from() {
+    const N: usize = 40;
+    let mut w = World::new();
+    let bob = w.bob.clone();
+    let m = [w.tree(&[("a", b"0")]).0, w.tree(&[("a", b"1")]).0];
+    let mut previous = w.decide(m[0], &[], |_| {});
+    let mut objection: Option<ContributionId> = None;
+    for i in 1..=N {
+        let why = w.claim(&bob, "no", &[]);
+        let next = w.decide(m[i % 2], &[previous], |d| {
+            if let Some(o) = objection {
+                d.answers.push(answer(o, Disposition::FellBack));
+            }
+        });
+        objection = Some(w.object(&bob, why, next));
+        previous = next;
+    }
+    let (_, lines) = w.lines();
+    assert_eq!(lines.verdict(&previous).expect("judged").as_ref().map(|_| ()), Ok(()));
+    assert_eq!(lines.objections().fell_back_walks(), N - 1, "one walk per decision fallen back from");
+}
+
+/// Finding 67aa4fdb882b: a blanket fell_back answer, naming the decision, walks once, however many
+/// objections it covers.
+#[test]
+fn a_blanket_fell_back_walks_once() {
+    const K: usize = 200;
+    let mut w = World::new();
+    let bob = w.bob.clone();
+    let (m0, _, _, d1) = two_moves(&mut w);
+    for i in 0..K {
+        let why = w.claim(&bob, &format!("no {i}"), &[]);
+        w.object(&bob, why, d1);
+    }
+    let e = w.decide(m0.0, &[d1], |d| d.answers.push(answer(d1, Disposition::FellBack)));
+    let (_, lines) = w.lines();
+    assert_eq!(lines.verdict(&e).expect("judged").as_ref().map(|_| ()), Ok(()));
+    assert_eq!(lines.objections().fell_back_walks(), 1, "one walk for d1, not one per objection");
+}
+
+/// Finding 0bf37b345567, the reviewer's case: an answer at a decision that doesn't use a manifest
+/// settles nothing about an objection to it, directly or by a blanket answer naming the artifact; a
+/// later decision on that manifest must still answer it, and a goal-backed one can't be overridden.
+#[test]
+fn an_answer_settles_only_what_rule_5_judged_there() {
+    for blanket in [false, true] {
+        let mut w = World::new();
+        let (alice, bob) = (w.alice.clone(), w.bob.clone());
+        let m0 = w.tree(&[("a", b"0")]);
+        let d0 = w.decide(m0.0, &[], |_| {});
+        let m9 = w.tree(&[("z", b"9")]);
+        let (goal, _) = w.goal(&alice, &alice);
+        let o = w.object(&bob, goal, m9.1);
+        let refused = w.draft(m9.0, &[d0], |d| d.answers.push(answer(o, Disposition::Overridden)));
+        assert!(not_allowed(w.judge_new(&refused), o), "blanket {blanket}: goal-backed");
+        let m2 = w.tree(&[("a", b"2")]);
+        let named = if blanket { m9.1 } else { o };
+        let a = w.decide(m2.0, &[d0], |d| d.answers.push(answer(named, Disposition::Overridden)));
+        assert_eq!(w.verdict(&a), Ok(()), "blanket {blanket}: a doesn't use m9, so rule 5 doesn't judge o");
+        let e = w.decide(m9.0, &[a], |_| {});
+        assert!(unanswered(w.verdict(&e), o), "blanket {blanket}: a settled nothing");
+    }
+}
+
+/// Finding 0bf37b345567, the restore case: an objection retracted within the answering decision's past
+/// isn't judged there, so its answer settles nothing; restored by retracting the retraction, it binds
+/// the next move again.
+#[test]
+fn a_restored_objection_isnt_settled_by_an_answer_made_while_it_was_retracted() {
+    let mut w = World::new();
+    let bob = w.bob.clone();
+    let (_, _, _, d1) = two_moves(&mut w);
+    let why = w.claim(&bob, "no", &[]);
+    let o = w.object(&bob, why, d1);
+    let unobject = w.retract(&bob, o);
+    let m2 = w.tree(&[("a", b"2")]);
+    let a = w.decide(m2.0, &[d1], |d| d.answers.push(answer(o, Disposition::Overridden)));
+    assert_eq!(w.verdict(&a), Ok(()));
+    w.retract(&bob, unobject);
+    let m3 = w.tree(&[("a", b"3")]);
+    let e = w.decide(m3.0, &[a], |_| {});
+    assert!(unanswered(w.verdict(&e), o), "restored, and never answered while it stood");
+    // Answered while it stood, it stays settled through a later retraction and restoration.
+    let f = w.decide(m3.0, &[a], |d| d.answers.push(answer(o, Disposition::Overridden)));
+    let again = w.retract(&bob, o);
+    w.retract(&bob, again);
+    let m4 = w.tree(&[("a", b"4")]);
+    let g = w.decide(m4.0, &[f], |_| {});
+    assert_eq!(w.verdict(&g), Ok(()), "f's answer was judged while o stood");
+}
+
+impl World {
+    /// A second line by alice, `name`, with these validators: its own first artifact, so goals linked to
+    /// main don't bind it.
+    fn side_line(&mut self, name: &str, validators: Vec<manyroot::AgentId>) -> ContributionId {
+        let alice = self.alice.clone();
+        let mut line = policy(self, vec![alice.agent_id()], rails(2, 2, &["secrets"]));
+        line.name = name.into();
+        line.validators = validators;
+        self.add(&alice, artifact(&line))
+    }
+
+    /// A decision by alice on `line`, shaped by `with`.
+    fn decide_on(
+        &mut self,
+        line: ContributionId,
+        manifest: ContentHash,
+        parents: &[ContributionId],
+        with: impl FnOnce(&mut Decision),
+    ) -> ContributionId {
+        let alice = self.alice.clone();
+        let mut d = self.draft(manifest, parents, with);
+        d.line = line;
+        self.add(&alice, artifact(&d))
+    }
+}
+
+/// Finding 620ab4bd76ba, decision 4afee4855944 (1): an answer settles an objection only for decisions on
+/// its own line. bob's goal-backed objection to main's d1 is only discussion on `side`, so `side` may
+/// override it; but a child on main of that side decision, or a merge on main bringing it in, judges it
+/// again under main's policy, and refuses. The same holds through a line with no validators, where an
+/// evidence-backed objection is only discussion.
+#[test]
+fn a_settlement_on_another_line_doesnt_cross_to_this_one() {
+    for basis in ["goal", "evidence"] {
+        let mut w = World::new();
+        let (alice, bob) = (w.alice.clone(), w.bob.clone());
+        let (_, m1, _, d1) = two_moves(&mut w);
+        let from = match basis {
+            "goal" => w.goal(&alice, &alice).0,
+            _ => w.result(&bob, m1, false),
+        };
+        let o = w.object(&bob, from, d1);
+        let m2 = w.tree(&[("a", b"2")]);
+        let refused = w.draft(m2.0, &[d1], |d| d.answers.push(answer(o, Disposition::Overridden)));
+        assert!(not_allowed(w.judge_new(&refused), o), "{basis}: binding on main");
+        let side = w.side_line("side", vec![]);
+        let a = w.decide_on(side, m2.0, &[d1], |d| d.answers.push(answer(o, Disposition::Overridden)));
+        assert_eq!(w.verdict(&a), Ok(()), "{basis}: on side, o is discussion");
+        let m3 = w.tree(&[("a", b"3")]);
+        let child = w.decide(m3.0, &[a], |_| {});
+        assert!(unanswered(w.verdict(&child), o), "{basis}: a child on main of the side decision");
+        let merge = w.decide(m3.0, &[d1, a], |_| {});
+        assert!(unanswered(w.verdict(&merge), o), "{basis}: a merge on main bringing the side decision in");
+        let (_, lines) = w.lines();
+        assert!(lines.objections().cross_line_walks() >= 2, "each parent on another line is walked");
+    }
+}
+
+/// Finding 05e9995ccde0, decision 4afee4855944 (2): 2,000 objections spread over 1,100 ancestor
+/// decisions, more targets than a decision may name, are answered by one answer naming the line.
+#[test]
+fn a_flood_over_many_ancestors_is_answered_by_one_line_wide_answer() {
+    const DECISIONS: usize = 1_100;
+    const OBJECTIONS: usize = 2_000;
+    let mut w = World::new();
+    let mallory = Rc::new(Identity::generate("mallory").expect("a valid name"));
+    let m = w.tree(&[("a", b"0")]);
+    let mut chain = vec![w.decide(m.0, &[], |_| {})];
+    for _ in 1..DECISIONS {
+        let next = w.decide(m.0, &[*chain.last().expect("one")], |_| {});
+        chain.push(next);
+    }
+    let why = w.claim(&mallory, "no", &[]);
+    for i in 0..OBJECTIONS {
+        w.object(&mallory, why, chain[i % DECISIONS]);
+    }
+    let head = *chain.last().expect("the head");
+    let m2 = w.tree(&[("a", b"2")]);
+    let line = w.line;
+    let ix = Index::build(&w.g);
+    let lines = Lines::build(&w.g, &ix);
+    let none = w.draft(m2.0, &[head], |_| {});
+    assert!(matches!(lines.judge_new(&w.g, &ix, w.alice.agent_id(), &none), Err(Unqualified::Unanswered { .. })));
+    let one = w.draft(m2.0, &[head], |d| d.answers.push(answer(line, Disposition::Fixed)));
+    assert_eq!(lines.judge_new(&w.g, &ix, w.alice.agent_id(), &one).map(|_| ()), Ok(()));
+    let alice = w.alice.clone();
+    let e = w.add(&alice, artifact(&one));
+    let m3 = w.tree(&[("a", b"3")]);
+    let after = w.decide(m3.0, &[e], |_| {});
+    let ix = Index::build(&w.g);
+    let lines = Lines::build(&w.g, &ix);
+    assert_eq!(lines.verdict(&e).expect("judged").as_ref().map(|_| ()), Ok(()), "one reference");
+    assert_eq!(lines.verdict(&after).expect("judged").as_ref().map(|_| ()), Ok(()), "and settled for the next");
+    assert_eq!(lines.obligation_stats().fallbacks, 0, "{:?}", lines.obligation_stats());
+    assert!(lines.open_objections(&w.g, &ix, &w.line).expect("a policy").is_empty());
+}
+
+/// Decision 4afee4855944 (2): a line-wide answer judges each objection against its own basis, so a
+/// goal-backed one survives a line-wide overridden.
+#[test]
+fn a_line_wide_overridden_doesnt_override_a_goal() {
+    let mut w = World::new();
+    let (alice, bob) = (w.alice.clone(), w.bob.clone());
+    let (_, _, d0, d1) = two_moves(&mut w);
+    let why = w.claim(&bob, "meh", &[]);
+    w.object(&bob, why, d0);
+    let (goal, _) = w.goal(&alice, &alice);
+    let bound = w.object(&bob, goal, d1);
+    let m2 = w.tree(&[("a", b"2")]);
+    let line = w.line;
+    let e = w.decide(m2.0, &[d1], |d| d.answers.push(answer(line, Disposition::Overridden)));
+    assert!(not_allowed(w.verdict(&e), bound));
+    let e = w.decide(m2.0, &[d1], |d| {
+        d.answers.push(answer(line, Disposition::Overridden));
+        d.answers.push(answer(bound, Disposition::Fixed));
+    });
+    assert_eq!(w.verdict(&e), Ok(()));
 }

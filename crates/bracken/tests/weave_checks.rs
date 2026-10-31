@@ -325,7 +325,6 @@ mod macos_only {
         script
     }
 
-    /// The check's PATH: the toolchain's bin, as `rustc --print sysroot` names it, then the system's.
     /// The rustup home, `~/.rustup`, resolved.
     fn rustup_home() -> PathBuf {
         PathBuf::from(std::env::var("HOME").expect("HOME")).join(".rustup").canonicalize().expect("a rustup home")
@@ -513,5 +512,79 @@ mod macos_only {
                 "{what}: {details}"
             );
         }
+    }
+
+    /// Finding afb0e1a0267f: each of toolchain()'s three refusals, through a crafted HOME, stops validate
+    /// before anything is written: a rustup home that is HOME or holds it, a default toolchain that isn't
+    /// a plain name, and a toolchain resolving outside the home's toolchains. Deleting any refusal fails
+    /// its case.
+    #[test]
+    fn a_crafted_rustup_home_is_refused_before_anything_is_written() {
+        use std::os::unix::fs::symlink;
+        let w = Weave::new(&[("ok.sh", "true\n")]);
+        w.checks(&["ok=bash ok.sh"]);
+        let hash = w.integrate();
+        // A fresh HOME per case, beside the Ground, crafted by `craft`.
+        let case = |label: &str, craft: &dyn Fn(&Path), refusal: &str| {
+            let home = w.base().join(format!("home-{label}"));
+            fs::create_dir_all(&home).expect("mkdir home");
+            craft(&home);
+            let before = w.contributions();
+            let out = w
+                .command(&["weave", "validate", "--manifest", &hash, "--as", VAL, "--json"])
+                .env("HOME", &home)
+                .output()
+                .expect("bracken runs");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{label}: validate ran: {stderr}");
+            assert!(stderr.contains(refusal), "{label}: {stderr}");
+            assert!(stderr.contains("nothing was written"), "{label}: {stderr}");
+            assert_eq!(w.contributions(), before, "{label}: something was written");
+        };
+        let settings = |rustup: &Path, name: &str| {
+            fs::write(rustup.join("settings.toml"), format!("default_toolchain = \"{name}\"\n")).expect("write");
+        };
+        // The rustup home is HOME, or holds it.
+        case("is-home", &|home| symlink(home, home.join(".rustup")).expect("symlink"), "or holds it");
+        case(
+            "holds-home",
+            &|home| symlink(home.parent().expect("a parent"), home.join(".rustup")).expect("symlink"),
+            "or holds it",
+        );
+        // The default toolchain isn't a plain name.
+        for (label, name) in [("dotdot", ".."), ("dotdot-x", "../x"), ("slash", "a/b")] {
+            case(
+                label,
+                &|home| {
+                    let rustup = home.join(".rustup");
+                    fs::create_dir_all(rustup.join("toolchains")).expect("mkdir");
+                    settings(&rustup, name);
+                },
+                "isn't a toolchain name",
+            );
+        }
+        // The toolchain resolves outside the home's toolchains: a toolchain linked to HOME, and the
+        // toolchains directory itself linked elsewhere in HOME.
+        case(
+            "toolchain-is-home",
+            &|home| {
+                let rustup = home.join(".rustup");
+                fs::create_dir_all(rustup.join("toolchains")).expect("mkdir");
+                settings(&rustup, "x");
+                symlink(home, rustup.join("toolchains").join("x")).expect("symlink");
+            },
+            "outside the rustup home's toolchains",
+        );
+        case(
+            "toolchains-elsewhere",
+            &|home| {
+                let rustup = home.join(".rustup");
+                fs::create_dir_all(home.join("other").join("x").join("bin")).expect("mkdir");
+                fs::create_dir_all(&rustup).expect("mkdir");
+                settings(&rustup, "x");
+                symlink(home.join("other"), rustup.join("toolchains")).expect("symlink");
+            },
+            "outside the rustup home's toolchains",
+        );
     }
 }
