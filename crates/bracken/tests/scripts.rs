@@ -4480,6 +4480,28 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     assert!(out.status.success(), "resumed --init: {}", String::from_utf8_lossy(&out.stderr));
     assert!(stdout.contains("resuming --init in"), "{stdout}");
     refused(&["--init", "--owner-decision", &approval], "already set up");
+    // With the default line there, a policy dry run that fails stops --init with its error, and nothing is
+    // written: never a second line main (finding b33d60c94e6d).
+    let count = || {
+        let out =
+            command(&dir, "scripts/weave", &["log", "--json", "--limit", "0"]).env("HOME", &home).output().unwrap();
+        serde_json::from_slice::<serde_json::Value>(&out.stdout).unwrap()["omitted"].as_u64().unwrap()
+    };
+    let before = count();
+    let no_dry_run = tmp.path().join("no-dry-run");
+    write_executable(
+        &no_dry_run,
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" line policy \"*\" --dry-run \"*) echo no-dry-run: refused >&2; exit 1 ;; esac\n\
+             exec {:?} \"$@\"\n",
+            tmp.path().join("bracken")
+        ),
+    );
+    let out = run_in(Some(&no_dry_run), &["--init", "--owner-decision", &approval]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no-dry-run: refused") && stderr.contains("can't read line main's policy"), "{stderr}");
+    assert_eq!(count(), before, "a failed dry run wrote something");
     let weave = |args: &[&str]| -> serde_json::Value {
         let mut c = command(&dir, "scripts/weave", args);
         let out = c.env("HOME", &home).output().unwrap();
