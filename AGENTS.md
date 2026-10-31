@@ -34,10 +34,14 @@ Builders don't run the whole `cargo test --workspace` (decision `ef5b807d3196`):
 | root `Cargo.toml` or `Cargo.lock` | `--workspace` |
 | `crates/manyroot` | `--workspace` |
 | `crates/tree` | `-p bracken-tree -p bracken` |
+| `crates/scope` | `-p bracken-scope` |
+| `code-scope`, in `scripts/` or `.claude/skills/` | `-p bracken -p bracken-scope` |
 | `crates/bracken`, `scripts/`, `.claude/skills/` | `-p bracken`, plus `-p bracken-demo -p bracken-experiment` if you change a command's arguments, output, or what it records, accepts, syncs or refuses |
 | `crates/demo` or `crates/experiment` | `-p bracken -p bracken-demo -p bracken-experiment` |
 | anything else except `rustfmt.toml` (docs, root files, `.forgejo/`) | `-p bracken-tree -p bracken`: their tests import every tracked file |
 | `rustfmt.toml` | the format check alone |
+
+A Rust file changed only in comments takes a doc's row, `-p bracken-tree -p bracken`, and never needs the full table (task `0837da3df7a4`): the same tokens on both sides, by `crates/scope`, where a doc comment is code, since rustdoc and doctests read it. It isn't docs-only, since clippy reads plain comments too (finding `c40ed7b8d3f8`), so its head gets a light run.
 
 ## Releases
 
