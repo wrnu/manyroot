@@ -3550,8 +3550,15 @@ fn ground_checkpoint_refuses_a_ground_holding_a_weave_record() {
 /// the BRACKEN_DIR it was given and its arguments. The stub hands `show` to the real bracken, so
 /// scripts/weave can still look an owner decision up in the coordination Ground through scripts/bk.
 fn weave_repo() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+    weave_repo_with(&[])
+}
+
+/// [`weave_repo`], with more scripts beside scripts/weave.
+fn weave_repo_with(more: &[(&str, &Path)]) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let weave = repo_root().join("scripts/weave");
-    let (tmp, dir) = repo(&[("scripts/weave", &weave)], ".bracken/\n", |_| {});
+    let mut files: Vec<(&str, &Path)> = vec![("scripts/weave", &weave)];
+    files.extend_from_slice(more);
+    let (tmp, dir) = repo(&files, ".bracken/\n", |_| {});
     bk(&dir, &["init", "--name", "coordination"]);
     let home = tmp.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
@@ -3737,8 +3744,197 @@ fn weave_runs_validate_only_for_a_validator() {
     assert!(stdout.contains("would run ok attempt 1"), "{stdout}");
 }
 
-/// scripts/weave refuses a line write unless --owner-decision names a claim tagged decision, not
-/// retracted, in the coordination Ground (answer 2a620fd0b0dc, finding 3cd6cd19f9a0).
+/// An approval of the Weave Ground's creation, as scripts/owner-approve writes it: a claim tagged
+/// approval, signed by owner, in the coordination Ground of a [`weave_repo`], for weave-shadow --init.
+fn owner_approval(dir: &Path) -> String {
+    bk(dir, &["id", "new", "owner"]);
+    bk(dir, &["claim", "Approval (owner): create the Weave Ground", "--tag", "approval", "--as", "owner"])
+}
+
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let out = run(dir, "git", args);
+    assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// Weave dogfood stage 1 (task 60fcf3d31dda): scripts/weave-shadow --init sets up a Weave Ground under a
+/// throwaway HOME, given an owner-signed approval and nothing else, and finishes the job when run again
+/// after stopping part way. Then three successive merged commits of this repository each become a decision
+/// on line main, whose parent is the one before, and each verifies equal to its commit. Run again for the
+/// recorded commit, it records nothing. Before writing anything it refuses a commit that isn't on
+/// origin/main (even with a local branch of that name on it, finding 7315c1ccfaf4), one older than the
+/// recorded commit, and an unrelated one (finding 93dea3dd7ec2). A
+/// recorded decision that no longer matches git's tree (through git replace) fails. Never the real
+/// ~/bracken-weave: HOME is under $TMPDIR.
+#[test]
+fn weave_shadow_records_each_merged_commit_and_verifies_it() {
+    let shadow = repo_root().join("scripts/weave-shadow");
+    let (tmp, dir, home, _) = weave_repo_with(&[("scripts/weave-shadow", &shadow)]);
+    let approval = owner_approval(&dir);
+    let decision = owner_decision(&dir);
+    let manager_approval = bk(&dir, &["claim", "Approval: not the owner's", "--tag", "approval", "--as", "manager"]);
+    let run_in = |bin: Option<&Path>, args: &[&str]| {
+        let mut c = command(&dir, "scripts/weave-shadow", args);
+        c.env("HOME", &home).env("BRACKEN_DIR", "/inherited/and/ignored");
+        if let Some(bin) = bin {
+            c.env("BRACKEN_BIN", bin);
+        }
+        c.output().unwrap()
+    };
+    let run_with = |args: &[&str]| run_in(None, args);
+    let refused = |args: &[&str], expected: &str| {
+        let out = run_with(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr}");
+    };
+    refused(&["--init"], "--init needs --owner-decision");
+    refused(&["--init", "--owner-decision", &approval], "bracken-weave doesn't exist");
+    refused(&["HEAD"], "has no refs/remotes/origin/main");
+    git_out(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    refused(&["HEAD"], "no Weave Ground at");
+
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    // A wrong owner's go is refused before anything is created: only an approval signed by owner will do.
+    refused(&["--init", "--owner-decision", "0123456789ab"], "has no such contribution");
+    refused(&["--init", "--owner-decision", "TODO"], "12 to 64 lowercase hex");
+    refused(&["--init", "--owner-decision", &decision], "isn't a claim tagged approval, signed by owner");
+    refused(&["--init", "--owner-decision", &manager_approval], "isn't a claim tagged approval, signed by owner");
+    let ground = home.join("bracken-weave/manyroot");
+    assert!(!ground.exists(), "a refused --init left a Ground");
+
+    // --init stopped part way (here its identity weave-runner fails once, after weave init) leaves a Ground
+    // without line main's policy; run again, it finishes it; once more, it has nothing to do.
+    let flaky = tmp.path().join("flaky");
+    write_executable(
+        &flaky,
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" id new weave-runner \"*) [ -e \"$0.failed\" ] || {{ touch \"$0.failed\"; \
+             echo flaky: failed once >&2; exit 1; }} ;; esac\nexec {:?} \"$@\"\n",
+            tmp.path().join("bracken")
+        ),
+    );
+    let out = run_in(Some(&flaky), &["--init", "--owner-decision", &approval]);
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(ground.exists(), "the failure came after weave init");
+    let out = run_in(Some(&flaky), &["--init", "--owner-decision", &approval]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "resumed --init: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("resuming --init in"), "{stdout}");
+    refused(&["--init", "--owner-decision", &approval], "already set up");
+    let weave = |args: &[&str]| -> serde_json::Value {
+        let mut c = command(&dir, "scripts/weave", args);
+        let out = c.env("HOME", &home).output().unwrap();
+        assert!(out.status.success(), "weave {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let policy = weave(&[
+        "weave",
+        "line",
+        "policy",
+        "main",
+        "--dry-run",
+        "--owner-decision",
+        &approval,
+        "--as",
+        "weave-integrator",
+        "--json",
+    ]);
+    assert_eq!(policy["checks"].as_object().unwrap().len(), 2, "{policy}");
+    assert_eq!(policy["checks"]["fmt"], serde_json::json!(["cargo", "fmt", "--check"]));
+    assert_eq!(
+        policy["checks"]["clippy"],
+        serde_json::json!(["cargo", "clippy", "--all-targets", "--", "-D", "warnings"])
+    );
+    assert_eq!(policy["owner_decision"], approval);
+    let ids = weave(&["id", "list", "--json"]);
+    let runner = ids.as_array().unwrap().iter().find(|i| i["name"] == "weave-runner").expect("weave-runner");
+    assert_eq!(policy["validators"], serde_json::json!([runner["agent"]]), "{policy}");
+    assert_eq!(policy["integrators"].as_array().unwrap().len(), 1, "{policy}");
+
+    // Three successive first-parent commits of this repository, oldest first, in a clone sharing its
+    // objects, whose origin/main is this repository's HEAD: a branch under test isn't on the real origin/main.
+    let clone = tmp.path().join("clone");
+    git_out(
+        tmp.path(),
+        &["clone", "-q", "--shared", "--no-checkout", repo_root().to_str().unwrap(), clone.to_str().unwrap()],
+    );
+    let root_head = git_out(&repo_root(), &["rev-parse", "HEAD"]);
+    git_out(&clone, &["update-ref", "refs/remotes/origin/main", &root_head]);
+    // A box has no git identity, and commit-tree below needs one.
+    git_out(&clone, &["config", "user.name", "t"]);
+    git_out(&clone, &["config", "user.email", "t@example.invalid"]);
+    let mut commits: Vec<String> =
+        git_out(&clone, &["rev-list", "--first-parent", "-n", "3", "origin/main"]).lines().map(str::to_owned).collect();
+    commits.reverse();
+    assert_eq!(commits.len(), 3, "this repository has three first-parent commits");
+    let in_clone = |sha: &str| run_with(&["--repo", clone.to_str().unwrap(), sha]);
+    let mut decisions = Vec::new();
+    for sha in &commits {
+        let out = in_clone(sha);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{sha}: {}{stdout}", String::from_utf8_lossy(&out.stderr));
+        let decision = stdout.lines().find_map(|l| l.strip_prefix("decision ")).expect("a decision").to_owned();
+        assert!(stdout.contains(&format!("verified {decision} equal to {sha}")), "{stdout}");
+        decisions.push(decision);
+    }
+    let log = weave(&["weave", "log", "--json"]);
+    let rows = log["decisions"].as_array().unwrap();
+    assert_eq!(rows.len(), 3);
+    // Newest first: each decision names its commit, and its parent is the one before.
+    for (i, row) in rows.iter().rev().enumerate() {
+        assert_eq!(row["decision"], decisions[i]);
+        assert_eq!(row["source"]["git"], commits[i]);
+        let parents: Vec<&str> = row["parents"].as_array().unwrap().iter().map(|p| p.as_str().unwrap()).collect();
+        let want: Vec<&str> = if i == 0 { vec![] } else { vec![decisions[i - 1].as_str()] };
+        assert_eq!(parents, want);
+    }
+    let size = run(&ground, "du", &["-sk", "."]);
+    let kib = String::from_utf8_lossy(&size.stdout).split_whitespace().next().unwrap_or("?").to_owned();
+    eprintln!("the throwaway Weave Ground after three commits: {kib} KiB");
+
+    // Again for the commit recorded: nothing new, and it verifies.
+    let count = || weave(&["log", "--json", "--limit", "100000"])["contributions"].as_array().unwrap().len();
+    let before = count();
+    let out = in_clone(&commits[2]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains(&format!("decision {} (already recorded for {})", decisions[2], commits[2])), "{stdout}");
+    assert_eq!(count(), before);
+
+    // Refused before anything is written: a commit not on origin/main, an older commit after a newer one,
+    // and a commit unrelated to the recorded one (the test's own repository, whose origin/main is its HEAD).
+    let tree = format!("{}^{{tree}}", commits[1]);
+    let unmerged = git_out(&clone, &["commit-tree", &tree, "-p", &commits[2], "-m", "unmerged"]);
+    let refused_in = |out: Output, expected: &str| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains(expected), "expected {expected:?} in {stderr}");
+    };
+    refused_in(in_clone(&unmerged), &format!("{unmerged} isn't on refs/remotes/origin/main"));
+    // Nor does a local branch called origin/main make it merged: git would take it before the remote-tracking
+    // ref (finding 7315c1ccfaf4).
+    git_out(&clone, &["branch", "origin/main", &unmerged]);
+    refused_in(in_clone(&unmerged), &format!("{unmerged} isn't on refs/remotes/origin/main"));
+    refused_in(in_clone(&commits[0]), &format!("{} doesn't come after {}", commits[0], commits[2]));
+    refused_in(run_with(&["HEAD"]), &format!("doesn't come after {}", commits[2]));
+    assert_eq!(count(), before, "a refused commit wrote something");
+
+    // A mismatch fails: a merged commit (here one whose tree is an earlier commit's), recorded, then shown by
+    // git with another tree (git replace), no longer verifies.
+    git_out(&clone, &["update-ref", "refs/remotes/origin/main", &unmerged]);
+    let out = in_clone(&unmerged);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    git_out(&clone, &["replace", &unmerged, &commits[2]]);
+    let out = in_clone(&unmerged);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains(&format!("doesn't verify equal to git's {unmerged}")), "{stderr}");
+}
+
+/// scripts/weave refuses a line write unless --owner-decision names a claim tagged decision, or an
+/// approval signed by owner (what scripts/weave-shadow --init passes), not retracted, in the coordination
+/// Ground (answer 2a620fd0b0dc, finding 3cd6cd19f9a0).
 #[test]
 fn weave_needs_an_owner_decision_for_line_writes() {
     let (_tmp, dir, home, stub) = weave_repo();
@@ -3747,6 +3943,8 @@ fn weave_needs_an_owner_decision_for_line_writes() {
     let note = bk(&dir, &["claim", "a note", "--tag", "note", "--as", "manager"]);
     let retracted = bk(&dir, &["claim", "withdrawn", "--tag", "decision", "--as", "manager"]);
     bk(&dir, &["retract", &retracted, "--reason", "withdrawn", "--as", "manager"]);
+    let approval = owner_approval(&dir);
+    let not_owners = bk(&dir, &["claim", "Approval: not the owner's", "--tag", "approval", "--as", "manager"]);
     let run_with = |args: &[&str]| weave(&dir, "scripts/weave", &home, Some(&stub), args);
     for (args, expected) in [
         (&["weave", "line", "create", "main", "--as", "a"][..], "needs --owner-decision"),
@@ -3757,6 +3955,7 @@ fn weave_needs_an_owner_decision_for_line_writes() {
         (&["weave", "line", "create", "x", "--owner-decision", "0123456789ab"], "has no such contribution"),
         (&["weave", "line", "create", "x", "--owner-decision", &note], "isn't a claim tagged decision"),
         (&["weave", "line", "create", "x", "--owner-decision", &retracted], "isn't a claim tagged decision"),
+        (&["weave", "line", "create", "x", "--owner-decision", &not_owners], "isn't a claim tagged decision"),
     ] {
         let out = run_with(args);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -3767,6 +3966,7 @@ fn weave_needs_an_owner_decision_for_line_writes() {
     for args in [
         &["weave", "line", "create", "main", "--owner-decision", &decision, "--as", "a"][..],
         &["weave", "line", "policy", "x", &equals],
+        &["weave", "line", "policy", "x", "--owner-decision", &approval],
         &["weave", "check"],
     ] {
         let out = run_with(args);

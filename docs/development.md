@@ -93,6 +93,19 @@ Network-sync step 3 (task `c03e893d04eb`, owner approval `f0f7caf53376`): the te
 
 `~/.bracken-team/manyroot/` (mode 0700) holds the server's replica (`ground/`), the tokens (`tokens/<identity>`, 0600), their blake3 hashes (`tokens.b3`), the allowlist (every identity the main checkout knows, rebuilt at each start), the first-seen log, `server.log`, `server.pid` and `url`. The server uses the limits recommended in `docs/design/network-sync.md` (17 MiB batches, an 8 MiB id budget, 16 sessions). It runs the pinned binary, which must include `bracken sync --confirm`: upgrade it before setting up. Nothing else writes the server's replica.
 
+## Weave shadow (dogfood stage 1)
+
+Weave build step 9 (docs/design/weave.md, section 6, and section 5, *Where the Weave Ground lives*; task `60fcf3d31dda`). In stage 1 the Weave Ground only shadows git: each merged commit of `main` becomes a decision on Weave's line `main`, checked equal to the commit. Git stays the repository of record.
+
+**It waits for the owner's go.** Creating the Weave Ground at `~/bracken-weave/manyroot` is new data on this machine and needs the owner's go, recorded as an approval the owner signs with `scripts/owner-approve` (or the manager with `--delegated`, after asking for this one approval). Until then, nothing creates, writes or reads anything under `~/bracken-weave`. `scripts/weave-shadow`'s test runs on a throwaway Ground under `$TMPDIR` only.
+
+| When | Command (manager, from the main checkout) |
+|---|---|
+| Once, after the owner's go | `mkdir -m 700 ~/bracken-weave`, then `scripts/weave-shadow --init --owner-decision <the approval's id>`. In order, it runs `weave init` (by `weave-integrator`), creates the validator identity `weave-runner`, and writes line `main`'s policy: integrator `weave-integrator`, validator `weave-runner`, and the checks `fmt` (`cargo fmt --check`) and `clippy` (`cargo clippy --all-targets -- -D warnings`), citing the go. It checks the approval before it creates anything, and refuses anything but a claim tagged `approval` and signed by `owner`: a plain decision claim isn't the go. If it stops part way, run it again: it finishes the steps not yet done, in a Ground that holds `weave-integrator`'s key, and refuses once the Ground is set up. |
+| After each merge, once the merge is in the main checkout (process 9.3) and the pinned binary is upgraded | `scripts/weave-shadow <merged sha>`. Before writing anything, it refuses a commit that isn't on `origin/main`, and one that doesn't descend from the commit line `main`'s head records (an older or unrelated commit), so shadow the merges in order. It imports the commit's tree, records a decision on `main` whose parent is the previous decision, and runs `weave verify` against the commit. It prints `decision <id>` and `verified <id> equal to <sha>`, and exits non-zero on any difference. Run again for the same commit, it records nothing and verifies again. |
+
+A non-zero exit means Weave doesn't hold what git does for that commit: stop the shadow and tell the owner. The Ground can be rebuilt from git in stage 1, so it needs no backup yet. Stage 2, where builders propose and `weave-runner` validates, needs its own decision. A throwaway Ground was about 8.3 MiB after three successive commits of this repository: the first holds the whole tree, and each later commit adds only its changed files.
+
 ## Remote test runs (boat.dev)
 
 Owner decision `25c1e3543e76` (task `489bfeb6b5af`, reference `ea41264b3c38`): the test table can run in a boat.dev box, a fresh Linux x86_64 machine, instead of on the owner's machine. It began as a trial; since decision `2a9e444218d6` the team is on boat's $20/month plan (`box_20`).

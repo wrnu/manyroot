@@ -18,7 +18,8 @@
 #   - weave validate for an identity that isn't one of the line's validators, read from the pinned binary's
 #     own plan (weave validate --dry-run --json) before anything runs, and weave validate with a '--';
 #   - a line write (weave line create or weave line policy) whose --owner-decision isn't a claim tagged
-#     decision, not retracted, in the coordination Ground (read with the main checkout's scripts/bk): a
+#     decision, or tagged approval and signed by owner (scripts/owner-approve, as scripts/weave-shadow
+#     --init requires), not retracted, in the coordination Ground (read with the main checkout's scripts/bk): a
 #     policy is code this machine runs, so each version cites the owner's decision (weave.md section 1,
 #     finding 3cd6cd19f9a0);
 #   - artifact with a Weave media type, in any case, and relate with supersedes anywhere in its arguments,
@@ -85,9 +86,10 @@ if [ "$sub" = line ] && [[ $subsub == create || $subsub == policy ]]; then
     fail "--owner-decision $owner_decision: give the decision claim's id, 12 to 64 lowercase hex digits"
   shown=$(env -u BRACKEN_AGENT "$main/scripts/bk" show "$owner_decision" --json 2>/dev/null) ||
     fail "--owner-decision $owner_decision: the coordination Ground has no such contribution"
-  jq -e '.kind == "claim" and (.retracted | not) and ((.body.tags // []) | index("decision") != null)' \
+  jq -e '.kind == "claim" and (.retracted | not) and (((.body.tags // []) | index("decision") != null)
+         or (.author_name == "owner" and ((.body.tags // []) | index("approval") != null)))' \
     <<<"$shown" >/dev/null 2>&1 ||
-    fail "--owner-decision $owner_decision: it isn't a claim tagged decision, not retracted, in the coordination Ground"
+    fail "--owner-decision $owner_decision: it isn't a claim tagged decision, or an approval signed by owner, not retracted, in the coordination Ground"
 fi
 
 # The Weave Ground's real path. weave init creates it, so for init its parent must exist instead.
