@@ -28,7 +28,7 @@ use manyroot::{
 };
 use serde_json::{Map, Value, json};
 
-use crate::serve::{linger, read_head_bytes, reason_phrase};
+use crate::serve::{LINGER, linger_for, read_head_bytes, reason_phrase};
 use crate::wire::{Refused, Timed};
 use crate::{
     CurrentView, Names, contribution_json, intent_json, intent_until, listing, live_intents, now_ms, show_json,
@@ -342,11 +342,19 @@ struct Listener {
     hosts: Vec<String>,
     connections: AtomicUsize,
     streams: AtomicUsize,
+    /// How long a connection lingers after its response, and how long its request's head may take:
+    /// [`LINGER`] and [`HEAD_TIMEOUT`], except in a test that must not depend on timing.
+    linger: Duration,
+    head_timeout: Duration,
 }
 
 impl Listener {
     fn new(hosts: Vec<String>) -> Listener {
-        Listener { hosts, connections: AtomicUsize::new(0), streams: AtomicUsize::new(0) }
+        Listener::with_timeouts(hosts, LINGER, HEAD_TIMEOUT)
+    }
+
+    fn with_timeouts(hosts: Vec<String>, linger: Duration, head_timeout: Duration) -> Listener {
+        Listener { hosts, connections: AtomicUsize::new(0), streams: AtomicUsize::new(0), linger, head_timeout }
     }
 }
 
@@ -469,8 +477,8 @@ struct Request {
     host: Option<String>,
 }
 
-fn read_request(stream: &TcpStream) -> Result<Request, Refused> {
-    let (bytes, _) = read_head_bytes(&mut Timed::new(stream, Instant::now() + HEAD_TIMEOUT, None))?;
+fn read_request(stream: &TcpStream, head_timeout: Duration) -> Result<Request, Refused> {
+    let (bytes, _) = read_head_bytes(&mut Timed::new(stream, Instant::now() + head_timeout, None))?;
     let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
     let mut req = httparse::Request::new(&mut headers);
     match req.parse(&bytes) {
@@ -581,10 +589,11 @@ impl Viewer {
         // without blocking: about 700 bytes into a just-accepted socket's empty send buffer (finding
         // 18fe9ad99875).
         let (shed, to_shed) = std::sync::mpsc::sync_channel::<TcpStream>(SHED_QUEUE);
+        let wait = on.linger;
         std::thread::spawn(move || {
             for stream in to_shed {
                 let _ = respond(&stream, &error(503, "too many connections"));
-                linger(&stream);
+                linger_for(&stream, wait);
             }
         });
         for stream in socket.incoming() {
@@ -602,7 +611,7 @@ impl Viewer {
                 // Given back even if the handler panics.
                 let _slot = Release(&on.connections);
                 viewer.connection(&stream, &on);
-                linger(&stream);
+                linger_for(&stream, on.linger);
             });
         }
     }
@@ -610,7 +619,7 @@ impl Viewer {
     /// One request, answered only if its Host is one of the listener's own.
     fn connection(&self, stream: &TcpStream, on: &Listener) {
         let hosts_on = &on.hosts;
-        let request = match read_request(stream) {
+        let request = match read_request(stream, on.head_timeout) {
             Ok(r) => r,
             Err(refused) => {
                 let _ = respond(stream, &error(refused.status, refused.reason));
@@ -1489,20 +1498,39 @@ mod tests {
         line.split(' ').nth(1).and_then(|c| c.parse().ok()).unwrap_or_else(|| panic!("{line:?}"))
     }
 
+    /// A listener lingers [`LINGER`], a second, and waits [`HEAD_TIMEOUT`], ten, for a head: only a test
+    /// sets other values.
+    #[test]
+    fn a_listener_keeps_todays_timeouts() {
+        let on = Listener::new(vec!["127.0.0.1:1".into()]);
+        assert_eq!((on.linger, on.head_timeout), (Duration::from_secs(1), Duration::from_secs(10)));
+    }
+
     /// Finding 6e1807aa762f: each listener has its own budget. Two listeners on 127.0.0.1 (which only a
     /// test can set up; `Bind::check` allows one loopback address) serve one replica. Listener A's event
     /// streams and then its connections are used up, and A refuses more with 503, while B still serves.
+    /// A lingers until its peer closes and waits as long for a head (task 463af1e31299, note
+    /// b1b37679b62f), so nothing below depends on how fast a loaded box schedules A's threads: its idle
+    /// connections hold their slots, and a connection in its shedder holds the shedder, until the test
+    /// drops them.
     #[test]
     fn a_full_listener_doesnt_lock_out_the_other() {
         let tmp = tempfile::tempdir().expect("a temp dir");
         let dir = tmp.path().join("g");
         Store::init(&dir, "budget").expect("a Ground");
         let viewer = Arc::new(Viewer::new(&dir, Policy::default(), None).expect("a viewer"));
-        let mut ports = Vec::new();
+        // Longer than any test runs.
+        const FOREVER: Duration = Duration::from_secs(3_600);
+        let (mut ports, mut listeners) = (Vec::new(), Vec::new());
         for _ in 0..2 {
             let socket = TcpListener::bind(("127.0.0.1", 0)).expect("a listener");
             let port = socket.local_addr().expect("its address").port();
-            let on = Arc::new(Listener::new(hosts(ip("127.0.0.1"), port, &[])));
+            let on = match ports.is_empty() {
+                true => Listener::with_timeouts(hosts(ip("127.0.0.1"), port, &[]), FOREVER, FOREVER),
+                false => Listener::new(hosts(ip("127.0.0.1"), port, &[])),
+            };
+            let on = Arc::new(on);
+            listeners.push(Arc::clone(&on));
             let viewer = Arc::clone(&viewer);
             std::thread::spawn(move || viewer.accept(&socket, &on));
             ports.push(port);
@@ -1520,6 +1548,14 @@ mod tests {
         }
         assert_eq!(status_of(a, "/api/events"), 503, "A's streams are used up");
         assert_eq!(status_of(b, "/api/events"), 200, "B's aren't");
+        // That refusal's connection is given back once its handler sees the close, which must happen
+        // before A's other slots are filled: otherwise one idle connection would be shed, and hold the
+        // shedder.
+        let started = std::time::Instant::now();
+        while listeners[0].connections.load(Ordering::SeqCst) != MAX_STREAMS {
+            assert!(started.elapsed() < Duration::from_secs(60), "A's refused stream is given back");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         // The rest of A's connections, idle: each holds its slot until its head times out.
         for _ in MAX_STREAMS..MAX_CONNECTIONS {
             held.push(TcpStream::connect(("127.0.0.1", a)).expect("connect"));
@@ -1538,16 +1574,16 @@ mod tests {
             assert_eq!(&head, b"HTTP/1.1 503");
         }
         // A burst past the shedding queue still gets 503s (finding 18fe9ad99875). Silent connections fill
-        // the queue, each holding the shedder for its second of linger; those that come next are answered
-        // at once. They send nothing, so the close without a linger can't reset them. The burst connects
-        // right behind the silent ones, as the shedder frees a slot after its first linger, and a burst
-        // connection accepted then would wait in the queue (note d416610e525c). Waiting, it would get
-        // its 503 only after the 16 silent ones' lingers, and the read timeout is well short of that.
+        // the queue: the first holds the shedder in its linger until the test drops it, and the next
+        // SHED_QUEUE wait behind it, so those after them, accepted in the order they connected, are
+        // answered at once. They send nothing, so the close without a linger can't reset them. A burst
+        // connection that waited in the queue instead would get no 503 until the silent ones are dropped,
+        // after the reads: the read timeout only keeps that from hanging the test.
         let connect = |_| TcpStream::connect(("127.0.0.1", a)).expect("connect");
         let silent: Vec<TcpStream> = (0..SHED_QUEUE + 4).map(connect).collect();
         let burst: Vec<TcpStream> = (0..8).map(connect).collect();
         for mut burst in burst {
-            burst.set_read_timeout(Some(Duration::from_secs(8))).expect("a read timeout");
+            burst.set_read_timeout(Some(Duration::from_secs(60))).expect("a read timeout");
             let mut head = [0u8; 12];
             std::io::Read::read_exact(&mut burst, &mut head).expect("a 503 before the queue drains");
             assert_eq!(&head, b"HTTP/1.1 503");
