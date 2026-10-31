@@ -314,6 +314,23 @@ mod macos_only {
         assert_eq!(g.counts, Counts { pass: 8, error: 1, ..Counts::default() }, "{g:#?}");
     }
 
+    /// A class fixture's error is charged to that class's tests, which never ran, never to the next test that
+    /// did (finding bcecc7c3f6e3): one outcome per test, by index, in the suite's order.
+    #[test]
+    fn a_class_fixture_error_is_its_own_tests_outcome() {
+        let test = "import unittest\nimport tiny.stats as stats\n\n\
+                    class A(unittest.TestCase):\n\
+                    \x20   @classmethod\n    def setUpClass(cls):\n        raise RuntimeError('no fixture')\n\
+                    \x20   def test_a(self):\n        pass\n\n\
+                    class B(unittest.TestCase):\n\
+                    \x20   def test_b1(self):\n        self.assertEqual(stats.f(), 1)\n\
+                    \x20   def test_b2(self):\n        self.assertEqual(stats.f(), 1)\n";
+        let g = graded("def f():\n    return 1\n", test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        assert_eq!(g.counts, Counts { pass: 2, error: 1, ..Counts::default() }, "{g:#?}");
+        use Outcome::*;
+        assert_eq!(g.outcomes, [Error, Pass, Pass], "{g:#?}");
+    }
+
     /// A host killed at its wall time keeps the outcomes it reported, and the tests it didn't finish count as
     /// failures (finding e7d128464936). Each hanging call ends at one run's wall time, a second here, as an error.
     #[test]

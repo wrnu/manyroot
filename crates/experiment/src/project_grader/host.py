@@ -470,7 +470,24 @@ def outcome(kind):
     tell("O", kind)
 
 
+# Each test's index in the suite's order: an outcome is told after its test's B, so one outside any test (a
+# class or module fixture's error) is never charged to a test that ran (finding bcecc7c3f6e3).
+index = {}
+
+
+def flat(suite):
+    for t in suite:
+        if isinstance(t, unittest.TestSuite):
+            yield from flat(t)
+        else:
+            yield t
+
+
 class Result(unittest.TestResult):
+    def startTest(self, test):
+        super().startTest(test)
+        tell("B", index.get(id(test), -1))
+
     def stopTest(self, test):
         super().stopTest(test)
         tell("D", 1)
@@ -505,7 +522,9 @@ try:
     sys.modules[name] = loaded
     spec.loader.exec_module(loaded)
     suite = unittest.defaultTestLoader.loadTestsFromModule(loaded)
-    tell("N", suite.countTestCases())
+    tests_in_order = list(flat(suite))
+    index.update((id(t), i) for i, t in enumerate(tests_in_order))
+    tell("N", len(tests_in_order))
     suite.run(Result())
 except Exception:
     outcome("error")

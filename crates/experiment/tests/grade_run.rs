@@ -100,16 +100,26 @@ mod macos_only {
         Python::pin(Path::new(&path), "3.12", None).expect("pinned").plan_pin()
     }
 
-    /// The tiny fixture copied into `root/tiny`, its hidden set a throwaway store in `root/store`: one group for
-    /// `sum` and one for `decimals`, two tests each: one needing a `sum_of` the seed hasn't, one passing.
+    /// The tiny fixture copied into `root/tiny`, its hidden set a throwaway store in `root/store`, four groups:
+    /// `sum`'s before and after its change, `decimals`'s, each two tests (one needing a `sum_of` the seed hasn't,
+    /// one passing), and `mean-empty`'s one test, which passes only once agent 0's turn-2 module is on the line,
+    /// so the grades differ by tree and by side of the change (finding 1c68a820ee05).
     fn project_and_store(root: &Path) -> (PathBuf, PathBuf) {
         let set = root.join("store/tiny@1");
         let groups = json!([
-            {"item": "sum", "file": format!("tests/test_sum_{MARKER}.py"), "applies": "always"},
+            {"item": "sum", "file": format!("tests/test_sum_before_{MARKER}.py"), "applies": "before-change"},
+            {"item": "sum", "file": format!("tests/test_sum_after_{MARKER}.py"), "applies": "after-change"},
             {"item": "decimals", "file": format!("tests/test_decimals_{MARKER}.py"), "applies": "always"},
+            {"item": "mean-empty", "file": format!("tests/test_turn_{MARKER}.py"), "applies": "always"},
         ]);
         write(&set.join("hidden.json"), &json!({"format": 1, "project": "tiny", "groups": groups}).to_string());
-        for item in ["sum", "decimals"] {
+        let turn = format!(
+            "# {MARKER}\nimport unittest\n\nclass T(unittest.TestCase):\n\
+             \x20   def test_{MARKER}_turn(self):\n        import tiny.by_agent_0_turn_2 as m\n\
+             \x20       self.assertEqual(m.VALUE, 20)\n"
+        );
+        write(&set.join(format!("tests/test_turn_{MARKER}.py")), &turn);
+        for item in ["sum_before", "sum_after", "decimals"] {
             let test = format!(
                 "# {MARKER}\nimport unittest\nimport tiny.stats\n\nclass T(unittest.TestCase):\n\
                  \x20   def test_{MARKER}_{item}_a(self):\n        self.assertTrue(hasattr(tiny.stats, 'sum_of'))\n\
@@ -218,18 +228,21 @@ mod macos_only {
         assert_eq!(released, [false, true, true, true]);
         assert_eq!(points[0]["turn_share"], json!(1.0 / 3.0));
         assert_eq!(points[3]["turn_share"], json!(1.0));
-        for p in &points {
-            let indexes: Vec<u64> = p["grade"]["groups"]
-                .as_array()
-                .expect("groups")
-                .iter()
-                .map(|g| g["index"].as_u64().expect("an index"))
-                .collect();
-            let expect: &[u64] = if p["change_released"] == true { &[0, 1] } else { &[0] };
+        for (k, p) in points.iter().enumerate() {
+            let groups = p["grade"]["groups"].as_array().expect("groups");
+            let indexes: Vec<u64> = groups.iter().map(|g| g["index"].as_u64().expect("an index")).collect();
+            // Before the change: sum's old tests and the turn test; after: sum's new tests, decimals' and it.
+            let expect: &[u64] = if p["change_released"] == true { &[1, 2, 3] } else { &[0, 3] };
             assert_eq!(indexes, expect, "{p}");
-            for g in p["grade"]["groups"].as_array().expect("groups") {
-                // The seed has no `sum_of`, and no agent of the mock writes one: by index, the first fails.
-                assert_eq!(g["outcomes"], json!(["fail", "pass"]), "{g}");
+            for g in groups {
+                let outcomes = if g["index"] == 3 {
+                    // Agent 0's turn-2 module is on the line from the second checkpoint.
+                    if k == 0 { json!(["error"]) } else { json!(["pass"]) }
+                } else {
+                    // The seed has no `sum_of`, and no agent of the mock writes one: by index, the first fails.
+                    json!(["fail", "pass"])
+                };
+                assert_eq!(g["outcomes"], outcomes, "point {k}: {g}");
             }
         }
         // Each tree is checked out of the hub by the manifest its event names; in lockstep the line never forks.
@@ -238,6 +251,10 @@ mod macos_only {
             assert!(p["decision"].is_string() && p["forked"] == false, "{p}");
         }
         assert_eq!(points[2]["manifest"], points[3]["manifest"], "the end is the last checkpoint's tree");
+        assert!(
+            points[0]["manifest"] != points[1]["manifest"] && points[1]["manifest"] != points[2]["manifest"],
+            "each checkpoint's own tree, as the agents integrated"
+        );
 
         // Nothing of the store: no marker, test name or path, in the grades or anywhere in the run.
         let store_path = store.to_string_lossy().into_owned();
@@ -259,6 +276,39 @@ mod macos_only {
             .expect("grade-run");
         assert!(!again.status.success());
         assert!(String::from_utf8_lossy(&again.stderr).contains("already exists"));
+
+        // A tree that can't be checked out is that point's error, and every other tree is still graded
+        // (finding aad6a4f0057b); nothing but the grades file is left beside it.
+        let events = cfg.root.join("events.jsonl");
+        let text = std::fs::read_to_string(&events).expect("the events");
+        let mut edited = false;
+        let lines: Vec<String> = text
+            .lines()
+            .map(|l| {
+                let mut e: Value = serde_json::from_str(l).expect("an event");
+                if !edited && e["event"] == "checkpoint" {
+                    e["data"]["line"]["heads"][0]["manifest"] = json!(format!("blake3:{}", "0".repeat(64)));
+                    edited = true;
+                }
+                e.to_string()
+            })
+            .collect();
+        std::fs::write(&events, lines.join("\n") + "\n").expect("the events");
+        let bad = root.join("grades/bad.jsonl");
+        let summary = bracken_experiment::grade_run::grade_run(&cfg.root, &store, &bad, &bracken()).expect("graded");
+        assert_eq!((summary.points, summary.errors), (4, 1), "{summary:?}");
+        let lines: Vec<Value> = std::fs::read_to_string(&bad)
+            .expect("the grades")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("JSON"))
+            .collect();
+        assert!(lines[0]["error"].is_string() && lines[0].get("grade").is_none(), "{}", lines[0]);
+        assert!(lines[1..].iter().all(|l| l["grade"]["groups"].is_array() && l.get("error").is_none()));
+        let names: Vec<String> = std::fs::read_dir(root.join("grades"))
+            .expect("the directory")
+            .map(|e| e.expect("an entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names.len(), 2, "no partial file left: {names:?}");
     }
 
     /// A run holding its change back never releases it, and its plan says so: no change point, no held item's
@@ -284,6 +334,12 @@ mod macos_only {
         let summary = bracken_experiment::grade_run::grade_run(&cfg.root, &store, &grades, &bracken()).expect("graded");
         assert_eq!(summary.points, 3);
         let text = std::fs::read_to_string(&grades).expect("the grades");
-        assert!(text.lines().all(|l| l.contains("\"change_released\":false")), "{text}");
+        for l in text.lines() {
+            let p: Value = serde_json::from_str(l).expect("JSON");
+            assert_eq!(p["change_released"], false, "{p}");
+            let indexes: Vec<&Value> =
+                p["grade"]["groups"].as_array().expect("groups").iter().map(|g| &g["index"]).collect();
+            assert_eq!(indexes, [&json!(0), &json!(3)], "the before-change side, always: {p}");
+        }
     }
 }

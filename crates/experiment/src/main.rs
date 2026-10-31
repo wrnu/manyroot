@@ -340,8 +340,8 @@ fn main() {
                     println!("{}", serde_json::to_string(&s).expect("a summary is plain JSON"));
                 } else {
                     println!(
-                        "{} ({}): {} trees graded, {} passing all that applies",
-                        s.project, s.hidden, s.points, s.all_pass
+                        "{} ({}): {} trees graded, {} passing all that applies, {} not graded",
+                        s.project, s.hidden, s.points, s.all_pass, s.errors
                     );
                 }
             }),

@@ -353,8 +353,11 @@ message. The tests and the code under test never share a process:
   each outcome and each test's end as they happen, so a group whose host
   ends early keeps them: it is unfinished, with how it ended, and the tests
   that hadn't ended count as failures (finding `e7d128464936`). A group's
-  grade also lists one outcome per test, in the order they ran, the worst of
-  the test's own and its subtests': by index, never by name.
+  grade also lists one outcome per test, in the suite's order, the worst of
+  the test's own and its subtests': by index, never by name. The host names
+  each test's index as it starts, so an error outside any test, such as a
+  class fixture's, is the outcome of the tests it kept from running, never
+  of the next test that ran (finding `bcecc7c3f6e3`).
 
 A group applies at a share of the run only once its item is released, and a
 before- or after-change group only on its side of its change. **The approval
@@ -404,16 +407,20 @@ the same way, runs a project's agents through **Weave mode**
   proposed; `propose`; `proposals`; `diff`; `integrate`, which merges
   proposals onto the head; `resolve`, which settles a conflict that stopped
   such a merge, with the line's side, the proposal's, the agent's own file
-  or a deletion; and `merge`, on a forked line.
+  or a deletion, or, given no proposals, a conflict of the agent's own
+  `merge`, with its file as it stands (refused while it holds a conflict
+  marker) or a deletion; and `merge`, on a forked line.
 - **Recording a tree:** `integrate` given no proposals records the agent's
   tree, with every head as a parent, only if nothing would be lost (finding
   `9f4e48c4c547`): the tree started from the line's one head, or, on a
   forked line, it is the agent's `merge` of exactly the heads there now,
-  with no conflict markers left in the files that conflicted. `merge` makes
-  the tree every head merged by git's three-way merge, against where the
-  heads parted, through any earlier merge: the store mirrors the line's
-  decisions as git commits, once each. A tree from a head that is no longer
-  the line's reaches it as a proposal, which merges.
+  with every conflict it reported settled by `resolve`, so one with no
+  markers to find, such as a binary file's, never passes unsettled (finding
+  `e26a1c74e007`). `merge` makes the tree every head merged by git's
+  three-way merge, against where the heads parted, through any earlier
+  merge: the store mirrors the line's decisions as git commits, once each,
+  and puts the tree back as it was on any failure. A tree from a head that
+  is no longer the line's reaches it as a proposal, which merges.
 - **`run_tests`** runs the public tests on the agent's working tree, in the
   Python profile with the interpreter pinned from the plan. The driver runs
   it, not the agent's worker, since a sandboxed process can't start another
@@ -437,16 +444,20 @@ the same way, runs a project's agents through **Weave mode**
   tree, and the line at the end as `end`, with the hidden set
   (`src/grade_run.rs`), checking each out of the run's hub by the manifest
   id its event names (on a forked line, the first head's, and the grade says
-  it was forked). It takes
-  the project and the interpreter from the plan, refusing a project changed
-  since, and the store only from `--hidden`, which it checks against the
-  project's digest. A tree is graded at share 1 if the change had gone out
-  before it, else at share 0, so the change's groups apply only once agents
-  had it. Each tree is one line of the grades file: the checkpoint's turn or
-  `end`, the share of turns done, whether the change was out, the decision
-  and manifest graded and its grade, groups and tests by index alone. The grades file
-  must be new, and outside the run, the project, the store, any Ground and
-  any git checkout; no run reads it, and nothing records the store's path.
+  it was forked). It takes the project and the interpreter from the plan,
+  refusing a project changed since, and the store only from `--hidden`,
+  which it checks against the project's digest. A tree is graded at share 1
+  if the change had gone out before it, else at share 0, so the change's
+  groups apply only once agents had it. Each tree is one line of the grades
+  file: the checkpoint's turn or `end`, the share of turns done, whether the
+  change was out, the decision and manifest graded, and its grade, groups
+  and tests by index alone; or, for a tree that couldn't be graded, such as
+  one whose checkout was refused, why, and every other tree is still graded
+  (finding `aad6a4f0057b`). The grades file must be new, and outside the
+  run, the project, the store, any Ground and any git checkout; it is
+  written beside its name, by its resolved parent, and given its name only
+  once every tree is graded, never replacing a file. No run reads it, and
+  nothing records the store's path.
 
 ## Cost estimate
 
