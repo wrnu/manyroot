@@ -314,28 +314,32 @@ for run in json.load(open(sys.argv[1])):
         assert_eq!(o.exit, Exit::WallTime);
         assert!(start.elapsed() < Duration::from_secs(5), "{:?}", start.elapsed());
 
-        // Python ignores SIGXFSZ, so a write past the file size limit fails instead of ending it.
-        let o = sandboxed("open('big', 'wb').write(b'x' * (32 << 20))", &quick);
+        // The scratch cases below end only at the scratch limit, which a short wall time on a loaded machine
+        // could beat (note 20a5e4ed3f3c).
+        let roomy = Limits { wall_seconds: 60, ..quick };
+        // Python ignores SIGXFSZ, so a write past the file size limit fails instead of ending it. The scratch
+        // directory may hold more than the file size limit here, so no scratch poll can end it first.
+        let o = sandboxed("open('big', 'wb').write(b'x' * (32 << 20))", &Limits { scratch_mb: 64, ..roomy });
         assert!(String::from_utf8_lossy(&o.stderr).contains("File too large"), "{o:?}");
 
         // The scratch directory's size and its count of files are each limited, however many files hold it.
         let o = sandboxed(
             "for i in range(16): open(f'f{i}', 'wb').write(b'x' * (1 << 20))\nimport time; time.sleep(60)",
-            &quick,
+            &roomy,
         );
         assert_eq!(o.exit, Exit::Scratch);
         // Nor can the code hide what it writes by first taking away the owner's read access to where it writes.
         let o = sandboxed(
             "import os, time\nos.mkdir('d')\nos.chmod('d', 0o300)\nos.chmod('.', 0o300)\n\
              for i in range(16): open(f'd/f{i}', 'wb').write(b'x' * (1 << 20))\ntime.sleep(60)",
-            &quick,
+            &roomy,
         );
         assert_eq!(o.exit, Exit::Scratch);
         // A run that fills its scratch directory and ends before the next poll is still past the limit.
-        let o = sandboxed("open('big', 'wb').write(b'x' * (10 << 20))", &quick);
+        let o = sandboxed("open('big', 'wb').write(b'x' * (10 << 20))", &roomy);
         assert_eq!(o.exit, Exit::Scratch);
         // Each directory made costs the sandbox's checks, so the CPU limit is generous here.
-        let many = Limits { cpu_seconds: 20, wall_seconds: 60, ..quick };
+        let many = Limits { cpu_seconds: 20, ..roomy };
         let o = sandboxed("import os, time\nfor i in range(12000): os.mkdir(f'd{i}')\ntime.sleep(60)", &many);
         assert_eq!(o.exit, Exit::Scratch);
     }
@@ -405,7 +409,8 @@ for run in json.load(open(sys.argv[1])):
         let dir = scratch.dir.clone();
         let code = "import os; os.makedirs('a/b'); open('a/b/f', 'w').write('x'); os.chmod('a/b', 0); os.chmod('a', 0)";
         let o = python().run(&scratch, &["-c".into(), code.into()], &limits()).expect("ran");
-        // A directory the last check can't read counts as past the limit.
+        // Scratch whichever check sees it (note 20a5e4ed3f3c): a directory the code took away counts as past the
+        // limit, both to a poll while the code runs and to the last check once it has exited.
         assert_eq!(o.exit, Exit::Scratch, "{}", String::from_utf8_lossy(&o.stderr));
         drop(scratch);
         assert!(!dir.exists(), "{}", dir.display());
