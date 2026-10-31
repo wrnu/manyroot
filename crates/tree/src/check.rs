@@ -24,7 +24,8 @@
 //!   Metadata (`stat`) stays readable everywhere, as in the experiment, since
 //!   tools resolve their paths through directories they can't read. Listing
 //!   the process table is denied, and so is reading any process's arguments,
-//!   environment, path or `proc_pidinfo`, whatever group it's in;
+//!   environment, path, `proc_pidinfo`, process group or session, whatever group
+//!   it's in;
 //! - it has a timeout, and its whole process group is killed when it ends or
 //!   times out. The profile denies `setsid` and `setpgid`, so a check can't
 //!   leave the group that way. `posix_spawn` with a new session or group still
@@ -71,7 +72,9 @@ pub const LANG: &str = "en_US.UTF-8";
 /// Reading another process takes both of the last two rules (note 1301a2adcc85): without the `kern.proc`
 /// prefix, `KERN_PROCARGS2` stays open, and `process-info*` must be unqualified, since `(target others)`
 /// leaves out the check's own process group, which `posix_spawn`'s `POSIX_SPAWN_SETPGROUP` can make the
-/// runner's. A process may still read its own: cargo dies of SIGTRAP without it.
+/// runner's. A process may still read its own: cargo dies of SIGTRAP without it. `getpgid` and `getsid`,
+/// which tell which pids are live and their groups and sessions, are denied for every pid, its own included,
+/// since the rule can't tell them apart (task 72fd057d4b33); `getpgrp` stays.
 const PROFILE: &str = r#"(version 1)
 (deny default)
 (allow process-fork)
@@ -89,7 +92,7 @@ const PROFILE: &str = r#"(version 1)
   (subpath (param "TEMP")) (subpath "/bin") (subpath "/sbin") (subpath "/usr/bin") (subpath "/usr/sbin")
   (subpath "/usr/libexec") (subpath "/Library/Developer/CommandLineTools"))
 (allow signal (target same-sandbox))
-(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid))
+(deny syscall-unix (syscall-number SYS_setsid SYS_setpgid SYS_getpgid SYS_getsid))
 (deny sysctl-read (sysctl-name-prefix "kern.proc"))
 (deny process-info*)
 (allow process-info* (target self))

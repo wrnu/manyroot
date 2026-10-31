@@ -253,6 +253,15 @@ impl Project {
         self.items.iter().filter(move |i| i.release.by(share))
     }
 
+    /// The share at which the first change is released, if the project has one.
+    pub fn first_change(&self) -> Option<f64> {
+        let shares = self.items.iter().filter(|i| i.kind == Kind::Change).filter_map(|i| match i.release {
+            Release::AfterShare(at) => Some(at),
+            Release::Start => None,
+        });
+        shares.reduce(f64::min)
+    }
+
     /// The change that revises `item`, if one does.
     pub fn revised_by(&self, item: &str) -> Option<&Item> {
         self.items.iter().find(|i| i.revises.iter().any(|r| r == item))
@@ -359,6 +368,7 @@ pub struct StoreSummary {
     pub groups: usize,
     pub test_files: usize,
     pub golden_files: usize,
+    pub golden_before_files: usize,
     /// Items no group judges.
     pub items_without_tests: Vec<String>,
 }
@@ -419,11 +429,22 @@ impl HiddenSet {
         if !snapshot.dirs.contains(&format!("golden/{}", project.package)) {
             return Err(format!("the golden solution has no package directory {}", project.package));
         }
+        // The golden solution before the change, for the approval check (answer c473d137f5b7).
+        if project.first_change().is_some() && !snapshot.dirs.contains(&format!("golden-before/{}", project.package)) {
+            return Err(format!(
+                "the project has a change, and golden-before/ has no package directory {}",
+                project.package
+            ));
+        }
         Ok(HiddenSet { dir, groups: m.groups, snapshot })
     }
 
-    /// Whether `group` judges its item once `share` of the run's agent-turns is used.
+    /// Whether `group` judges its item once `share` of the run's agent-turns is used: never before its item is
+    /// released (note 9891289fb39c), and a before- or after-change group only on its side of the change.
     pub fn applies(&self, project: &Project, group: &Group, share: f64) -> bool {
+        if !project.item(&group.item).is_some_and(|i| i.release.by(share)) {
+            return false;
+        }
         let changed = || project.revised_by(&group.item).is_some_and(|c| c.release.by(share));
         match group.applies {
             Applies::Always => true,
@@ -437,6 +458,20 @@ impl HiddenSet {
         self.snapshot.file(rel)
     }
 
+    /// The directories and files under `dir` in the set (such as `golden` or `tests`), relative to it, as read and
+    /// digested.
+    pub fn under(&self, dir: &str) -> (Vec<&str>, Vec<(&str, &[u8])>) {
+        let prefix = format!("{dir}/");
+        let dirs = self.snapshot.dirs.iter().filter_map(|d| d.strip_prefix(&prefix)).collect();
+        let files = self
+            .snapshot
+            .files
+            .iter()
+            .filter_map(|(rel, bytes)| rel.strip_prefix(&prefix).map(|r| (r, bytes.as_slice())))
+            .collect();
+        (dirs, files)
+    }
+
     pub fn summary(&self, project: &Project) -> StoreSummary {
         let judged: BTreeSet<&str> = self.groups.iter().map(|g| g.item.as_str()).collect();
         let test_files: BTreeSet<&str> = self.groups.iter().map(|g| g.file.as_str()).collect();
@@ -444,6 +479,7 @@ impl HiddenSet {
             groups: self.groups.len(),
             test_files: test_files.len(),
             golden_files: self.snapshot.files.keys().filter(|f| f.starts_with("golden/")).count(),
+            golden_before_files: self.snapshot.files.keys().filter(|f| f.starts_with("golden-before/")).count(),
             items_without_tests: project
                 .items
                 .iter()

@@ -27,6 +27,7 @@ not (
         test(=metrics::tests::checkpoints_rank_every_mode_alike_from_its_shared_library)
         | test(=bracken_mode::tests::concurrent_work_across_pages_is_listed_once)
         | test(=metrics::tests::every_contract_case_is_judged_by_the_agents_working_copy_in_every_mode)
+        | test(=python::tests::macos_only::the_parent_never_acts_on_a_path_the_code_can_swap)
     ))
     | (binary_id(=bracken-experiment::report) & (
         test(=scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode)

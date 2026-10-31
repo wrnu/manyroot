@@ -42,6 +42,16 @@ const PROBE: &str = "import json, sys, sysconfig; print(json.dumps({'version': '
                      'prefix': sys.base_prefix, 'stdlib': sysconfig.get_path('stdlib'), \
                      'platstdlib': sysconfig.get_path('platstdlib')}))";
 
+/// The interpreter as a run's plan records it, and pins it from again (decision c008b959c572): a run refuses
+/// an interpreter whose digest or version isn't the plan's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PythonPin {
+    pub path: PathBuf,
+    pub version: String,
+    pub digest: String,
+}
+
 /// The pinned interpreter.
 #[derive(Debug, Clone, Serialize)]
 pub struct Python {
@@ -92,14 +102,32 @@ impl Python {
             objects.extend(extension_modules(Path::new(&dir)));
         }
         let (libraries, links) = libraries(&objects, &prefix)?;
+        // The stamp before and after the digest: a file changed while it was hashed is caught.
+        let stamp = fingerprint(&prefix, &executable, &libraries, Fingerprint::Metadata)?;
         let digest = fingerprint(&prefix, &executable, &libraries, Fingerprint::Contents)?;
+        if fingerprint(&prefix, &executable, &libraries, Fingerprint::Metadata)? != stamp {
+            return Err(format!("python {}'s files changed while it was pinned", executable.display()));
+        }
         if let Some(expected) = expected
             && expected != digest
         {
             return Err(format!("python {}'s digest is {digest}, not the expected {expected}", executable.display()));
         }
-        let stamp = fingerprint(&prefix, &executable, &libraries, Fingerprint::Metadata)?;
         Ok(Python { digest, stamp, executable, version, prefix, libraries, links })
+    }
+
+    /// What a plan records of it.
+    pub fn plan_pin(&self) -> PythonPin {
+        PythonPin { path: self.executable.clone(), version: self.version.clone(), digest: self.digest.clone() }
+    }
+
+    /// The interpreter `pin` names, pinned again: refused unless its digest and version are the pin's.
+    pub fn from_plan(pin: &PythonPin, minor: &str) -> Result<Python, String> {
+        let python = Python::pin(&pin.path, minor, Some(&pin.digest))?;
+        if python.version != pin.version {
+            return Err(format!("python {} is {}, not the plan's {}", pin.path.display(), python.version, pin.version));
+        }
+        Ok(python)
     }
 
     /// Refuses if any of the interpreter's files has changed since it was pinned.
@@ -112,16 +140,38 @@ impl Python {
 
     /// Runs `args` after the interpreter's own flags in `scratch`, under the profile and `limits`.
     pub fn run(&self, scratch: &Scratch, args: &[OsString], limits: &Limits) -> Result<Outcome, String> {
+        self.run_with_input(scratch, args, limits, None)
+    }
+
+    /// [`Python::run`], with `input` written to its standard input.
+    pub fn run_with_input(
+        &self,
+        scratch: &Scratch,
+        args: &[OsString],
+        limits: &Limits,
+        input: Option<Vec<u8>>,
+    ) -> Result<Outcome, String> {
+        let mut cmd = self.command(scratch, args)?;
+        if input.is_some() {
+            cmd.stdin(Stdio::piped());
+        }
+        run_limited(cmd, limits, &scratch.dir, input)
+    }
+
+    /// Starts `args` in `scratch` under the profile and `limits`, to talk to a line at a time ([`Running`]).
+    pub fn start(&self, scratch: &Scratch, args: &[OsString], limits: &Limits) -> Result<Running, String> {
+        let mut cmd = self.command(scratch, args)?;
+        cmd.stdin(Stdio::piped());
+        Running::start(cmd, limits, &scratch.dir)
+    }
+
+    /// The command [`Python::run`] runs: `args` in `scratch` under the profile, with nothing of this process's
+    /// environment. Refused elsewhere than macOS, and if the interpreter's files have changed since the pin.
+    fn command(&self, scratch: &Scratch, args: &[OsString]) -> Result<Command, String> {
         if !cfg!(target_os = "macos") {
             return Err("agent code runs only under macOS's sandbox-exec; this system has none".into());
         }
         self.check()?;
-        run_limited(self.command(scratch, args)?, limits, &scratch.dir)
-    }
-
-    /// The command [`Python::run`] runs: `args` in `scratch` under the profile, with nothing of this process's
-    /// environment.
-    fn command(&self, scratch: &Scratch, args: &[OsString]) -> Result<Command, String> {
         let sandbox = Sandbox::python(&PythonPaths {
             python: &self.executable,
             prefix: &self.prefix,
@@ -211,42 +261,51 @@ const NOFOLLOW_DIR: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
 /// so it never acts on a path the code could swap for a symlink (finding b9a13da2a14c): each directory is opened
 /// by name in its already open parent without following a symlink, each entry looked at the same way, and
 /// nothing is changed. A directory it can't read, such as one the code has taken the owner's access to, counts
-/// as past the limit (finding b4014e7dbbd8).
+/// as past the limit (finding b4014e7dbbd8). It walks depth first, so only the directories on the path it is
+/// walking are open, two descriptors each, however many siblings they have (finding 0dfdb731d17a); a tree too
+/// deep for the parent's open-file limit counts as past the limit too.
 fn usage(dir: &Path, max_bytes: u64) -> (u64, u64) {
     use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, openat, statat};
     use rustix::io::Errno;
     let past = (max_bytes.saturating_add(1), 0);
-    let Ok(top) = openat(CWD, dir, NOFOLLOW_DIR, Mode::empty()) else { return past };
+    let open = |fd: std::os::fd::OwnedFd| Dir::read_from(&fd).map(|list| (fd, list));
+    let Ok(top) = openat(CWD, dir, NOFOLLOW_DIR, Mode::empty()).and_then(open) else { return past };
     let (mut bytes, mut entries) = (0u64, 0u64);
-    let mut stack = vec![top];
-    while let Some(fd) = stack.pop() {
-        let Ok(list) = Dir::read_from(&fd) else { return past };
-        for entry in list {
-            let Ok(entry) = entry else { return past };
-            let name = entry.file_name();
-            if name == c"." || name == c".." {
+    let mut path = vec![top];
+    while let Some((fd, list)) = path.last_mut() {
+        let entry = match list.next() {
+            None => {
+                path.pop();
                 continue;
             }
-            entries += 1;
-            match statat(&fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-                Ok(stat) => {
-                    bytes = bytes.saturating_add(u64::try_from(stat.st_size).unwrap_or(0));
-                    if FileType::from_raw_mode(stat.st_mode as _) == FileType::Directory {
-                        match openat(&fd, name, NOFOLLOW_DIR, Mode::empty()) {
-                            Ok(child) => stack.push(child),
-                            // Gone, or swapped for something else since: what it held is still found where it is.
-                            Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => {}
-                            Err(_) => return past,
-                        }
+            Some(Err(_)) => return past,
+            Some(Ok(entry)) => entry,
+        };
+        let name = entry.file_name();
+        if name == c"." || name == c".." {
+            continue;
+        }
+        entries += 1;
+        let mut child = None;
+        match statat(&*fd, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(stat) => {
+                bytes = bytes.saturating_add(u64::try_from(stat.st_size).unwrap_or(0));
+                if FileType::from_raw_mode(stat.st_mode as _) == FileType::Directory {
+                    match openat(&*fd, name, NOFOLLOW_DIR, Mode::empty()).and_then(open) {
+                        Ok(opened) => child = Some(opened),
+                        // Gone, or swapped for something else since: what it held is still found where it is.
+                        Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => {}
+                        Err(_) => return past,
                     }
                 }
-                Err(Errno::NOENT) => {}
-                Err(_) => return past,
             }
-            if bytes > max_bytes || entries > MAX_SCRATCH_FILES {
-                return (bytes, entries);
-            }
+            Err(Errno::NOENT) => {}
+            Err(_) => return past,
         }
+        if bytes > max_bytes || entries > MAX_SCRATCH_FILES {
+            return (bytes, entries);
+        }
+        path.extend(child);
     }
     (bytes, entries)
 }
@@ -403,7 +462,7 @@ fn unlock_in(fd: &std::os::fd::OwnedFd) {
     }
 }
 
-fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
     for entry in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))? {
         let entry = entry.map_err(|e| format!("{}: {e}", from.display()))?;
@@ -420,8 +479,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Starts `cmd` in a process group of its own with the rlimits, and waits for it within the rest.
-fn run_limited(mut cmd: Command, limits: &Limits, scratch: &Path) -> Result<Outcome, String> {
+/// Puts `cmd` in a process group of its own, with the rlimits.
+fn limit(cmd: &mut Command, limits: &Limits) {
     use std::os::unix::process::CommandExt;
     let cpu = u64::from(limits.cpu_seconds);
     // What the code may write to one file: as much as it may print, and at least 16 MiB.
@@ -440,40 +499,90 @@ fn run_limited(mut cmd: Command, limits: &Limits, scratch: &Path) -> Result<Outc
             Ok(())
         });
     }
-    let mut child = cmd.spawn().map_err(|e| format!("starting python: {e}"))?;
-    let cap = usize::try_from(limits.output_bytes).unwrap_or(usize::MAX);
-    let full = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stdout = reader(child.stdout.take().expect("piped"), cap, full.clone());
-    let stderr = reader(child.stderr.take().expect("piped"), cap, full.clone());
-    let deadline = Instant::now() + Duration::from_secs(limits.wall_seconds.into());
-    let memory = u64::from(limits.memory_mb) << 20;
-    let scratch_bytes = u64::from(limits.scratch_mb) << 20;
-    let mut next_scratch = Instant::now();
-    let ended = loop {
-        if let Some(status) = child.try_wait().map_err(|e| format!("waiting for python: {e}"))? {
-            break exit_of(status);
+}
+
+/// The limits the parent checks a running child against, every [`POLL`]: its output, wall time, memory
+/// footprint and scratch directory (every [`SCRATCH_POLL`]).
+struct Watch {
+    full: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    deadline: Instant,
+    memory: u64,
+    scratch: PathBuf,
+    scratch_bytes: u64,
+    next_scratch: Instant,
+}
+
+impl Watch {
+    fn new(limits: &Limits, scratch: &Path, full: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Watch {
+        Watch {
+            full,
+            deadline: Instant::now() + Duration::from_secs(limits.wall_seconds.into()),
+            memory: u64::from(limits.memory_mb) << 20,
+            scratch: scratch.to_path_buf(),
+            scratch_bytes: u64::from(limits.scratch_mb) << 20,
+            next_scratch: Instant::now(),
         }
-        let over = if full.load(std::sync::atomic::Ordering::SeqCst) {
+    }
+
+    /// The limit the child `pid` has passed, if it has passed one.
+    fn over(&mut self, pid: u32) -> Option<Exit> {
+        if self.full.load(std::sync::atomic::Ordering::SeqCst) {
             Some(Exit::Output)
-        } else if Instant::now() > deadline {
+        } else if Instant::now() > self.deadline {
             Some(Exit::WallTime)
-        } else if footprint(child.id()).is_some_and(|bytes| bytes > memory) {
+        } else if footprint(pid).is_some_and(|bytes| bytes > self.memory) {
             Some(Exit::Memory)
-        } else if Instant::now() >= next_scratch && {
-            next_scratch = Instant::now() + SCRATCH_POLL;
-            let (bytes, entries) = usage(scratch, scratch_bytes);
-            bytes > scratch_bytes || entries > MAX_SCRATCH_FILES
+        } else if Instant::now() >= self.next_scratch && {
+            self.next_scratch = Instant::now() + SCRATCH_POLL;
+            self.scratch_over()
         } {
             Some(Exit::Scratch)
         } else {
             None
-        };
-        if let Some(why) = over {
+        }
+    }
+
+    /// Whether the scratch directory holds more than its limits allow.
+    fn scratch_over(&self) -> bool {
+        let (bytes, entries) = usage(&self.scratch, self.scratch_bytes);
+        bytes > self.scratch_bytes || entries > MAX_SCRATCH_FILES
+    }
+
+    /// How a run that ended `ended` counts: past the scratch limit if it ended of itself with the directory over
+    /// it, which the last poll may have missed (task 950f77ad7e4a).
+    fn last(&self, ended: Exit) -> Exit {
+        match ended {
+            Exit::Code(_) | Exit::Signal(_) if self.scratch_over() => Exit::Scratch,
+            ended => ended,
+        }
+    }
+}
+
+/// Starts `cmd` with the rlimits, writes `input` to it, and waits for it within the rest of `limits`.
+fn run_limited(mut cmd: Command, limits: &Limits, scratch: &Path, input: Option<Vec<u8>>) -> Result<Outcome, String> {
+    limit(&mut cmd, limits);
+    let mut child = cmd.spawn().map_err(|e| format!("starting python: {e}"))?;
+    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = std::io::Write::write_all(&mut stdin, &input);
+        });
+    }
+    let cap = usize::try_from(limits.output_bytes).unwrap_or(usize::MAX);
+    let full = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stdout = reader(child.stdout.take().expect("piped"), cap, full.clone());
+    let stderr = reader(child.stderr.take().expect("piped"), cap, full.clone());
+    let mut watch = Watch::new(limits, scratch, full.clone());
+    let ended = loop {
+        if let Some(status) = child.try_wait().map_err(|e| format!("waiting for python: {e}"))? {
+            break exit_of(status);
+        }
+        if let Some(why) = watch.over(child.id()) {
             kill(&mut child);
             break why;
         }
         std::thread::sleep(POLL);
     };
+    let ended = watch.last(ended);
     // Not the group again: once reaped, its id may be another process group's, and with no fork it held only the child.
     let (out, err) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
     let exit = if full.load(std::sync::atomic::Ordering::SeqCst) { Exit::Output } else { ended };
@@ -504,6 +613,121 @@ fn reader(
     })
 }
 
+/// A child started with [`Python::start`]: lines go to its standard input, and come from its standard output, at
+/// most [`MAX_LINE`] bytes each. A watchdog ends it past a limit ([`Watch`]), when its standard error passes the
+/// output limit, or when a line is longer than [`MAX_LINE`]: the run is killed, and [`Running::finish`] says why.
+/// The child is reaped only once the watchdog has stopped, so it never signals a group whose id is free.
+pub struct Running {
+    child: Child,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    why: std::sync::Arc<std::sync::Mutex<Option<Exit>>>,
+    watch: Option<std::thread::JoinHandle<()>>,
+    /// For the scratch check once it has ended.
+    last: Watch,
+}
+
+/// The longest line a [`Running`] child may send.
+pub const MAX_LINE: usize = 64 << 20;
+
+impl Running {
+    fn start(mut cmd: Command, limits: &Limits, scratch: &Path) -> Result<Running, String> {
+        use std::io::BufRead;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        limit(&mut cmd, limits);
+        let mut child = cmd.spawn().map_err(|e| format!("starting python: {e}"))?;
+        let full = Arc::new(AtomicBool::new(false));
+        let cap = usize::try_from(limits.output_bytes).unwrap_or(usize::MAX);
+        drop(reader(child.stderr.take().expect("piped"), cap, full.clone()));
+        let (send, lines) = std::sync::mpsc::channel();
+        let (out, too_long) = (child.stdout.take().expect("piped"), full.clone());
+        std::thread::spawn(move || {
+            let mut out = std::io::BufReader::new(out);
+            loop {
+                let mut line = Vec::new();
+                match std::io::Read::take(&mut out, MAX_LINE as u64 + 1).read_until(b'\n', &mut line) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if line.last() != Some(&b'\n') => {
+                        too_long.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(_) => {
+                        line.pop();
+                        if send.send(String::from_utf8_lossy(&line).into_owned()).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let (stop, why) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+        let mut limits_watch = Watch::new(limits, scratch, full);
+        let last = Watch::new(limits, scratch, Arc::new(AtomicBool::new(false)));
+        let (pid, watching, reason) = (child.id(), stop.clone(), why.clone());
+        let watch = std::thread::spawn(move || {
+            while !watching.load(Ordering::SeqCst) {
+                if let Some(over) = limits_watch.over(pid) {
+                    // Not reaped until the watchdog has stopped, so the group is still the child's.
+                    kill_pid_group(pid);
+                    *reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(over);
+                    return;
+                }
+                std::thread::sleep(POLL);
+            }
+        });
+        let stdin = child.stdin.take();
+        Ok(Running { child, stdin, lines, stop, why, watch: Some(watch), last })
+    }
+
+    /// Sends one line.
+    pub fn send(&mut self, line: &str) -> Result<(), String> {
+        let stdin = self.stdin.as_mut().ok_or("the child's input is closed")?;
+        let mut bytes = line.as_bytes().to_vec();
+        bytes.push(b'\n');
+        std::io::Write::write_all(stdin, &bytes).map_err(|e| format!("writing to the child: {e}"))
+    }
+
+    /// The next line, waiting until `deadline` at most; `None` if the child ended, was killed, or sent nothing in
+    /// time.
+    pub fn next(&self, deadline: Instant) -> Option<String> {
+        match self.next_line(deadline) {
+            Line::Got(line) => Some(line),
+            Line::Late | Line::Closed => None,
+        }
+    }
+
+    /// The next line, waiting until `deadline` at most, or why there is none.
+    pub fn next_line(&self, deadline: Instant) -> Line {
+        use std::sync::mpsc::RecvTimeoutError;
+        match self.lines.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(line) => Line::Got(line),
+            Err(RecvTimeoutError::Timeout) => Line::Late,
+            Err(RecvTimeoutError::Disconnected) => Line::Closed,
+        }
+    }
+
+    /// The CPU time the child has used so far; `None` once that can't be read.
+    pub fn cpu(&self) -> Option<Duration> {
+        cpu_time(self.child.id())
+    }
+
+    /// Ends the child, and says how it ended: the limit it passed, if one did.
+    pub fn finish(mut self) -> Exit {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(watch) = self.watch.take() {
+            let _ = watch.join();
+        }
+        drop(self.stdin.take());
+        // Not reaped yet, so its group's id is still its own.
+        kill_group(&self.child);
+        let status = self.child.wait();
+        let why = self.why.lock().unwrap_or_else(|e| e.into_inner()).take();
+        why.unwrap_or_else(|| self.last.last(status.map(exit_of).unwrap_or(Exit::Code(-1))))
+    }
+}
+
 fn exit_of(status: std::process::ExitStatus) -> Exit {
     use std::os::unix::process::ExitStatusExt;
     match (status.code(), status.signal()) {
@@ -518,39 +742,88 @@ fn kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-/// Kills the child's process group: the child and anything that shares it.
+/// Kills the child's process group: the child and anything that shares it. Only while it is unreaped.
 fn kill_group(child: &Child) {
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+    kill_pid_group(child.id());
+}
+
+fn kill_pid_group(pid: u32) {
+    if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
     }
+}
+
+/// What [`Running::next_line`] found.
+pub enum Line {
+    Got(String),
+    /// Nothing by the deadline.
+    Late,
+    /// The child's output has ended.
+    Closed,
 }
 
 /// The child's memory footprint in bytes, as macOS counts it for memory pressure; `None` once it has gone.
 #[cfg(target_os = "macos")]
 fn footprint(pid: u32) -> Option<u64> {
-    /// `rusage_info_v0` from `<sys/resource.h>`.
+    rusage(pid).map(|info| info.phys_footprint)
+}
+
+/// The child's CPU time, user and system; `None` once it has gone.
+#[cfg(target_os = "macos")]
+fn cpu_time(pid: u32) -> Option<Duration> {
     #[repr(C)]
-    #[derive(Default)]
-    struct RusageInfoV0 {
-        uuid: [u8; 16],
-        user_time: u64,
-        system_time: u64,
-        pkg_idle_wkups: u64,
-        interrupt_wkups: u64,
-        pageins: u64,
-        wired_size: u64,
-        resident_size: u64,
-        phys_footprint: u64,
-        proc_start_abstime: u64,
-        proc_exit_abstime: u64,
+    struct Timebase {
+        numer: u32,
+        denom: u32,
     }
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut Timebase) -> i32;
+    }
+    let info = rusage(pid)?;
+    let mut timebase = Timebase { numer: 0, denom: 0 };
+    // SAFETY: `timebase` is a `mach_timebase_info_data_t` and lives through the call.
+    if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
+        return None;
+    }
+    // The times are in mach absolute time units: nanoseconds only on Intel.
+    let ticks = u128::from(info.user_time) + u128::from(info.system_time);
+    let nanos = ticks * u128::from(timebase.numer) / u128::from(timebase.denom);
+    Some(Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cpu_time(_pid: u32) -> Option<Duration> {
+    None
+}
+
+/// `rusage_info_v0` from `<sys/resource.h>`.
+#[cfg(target_os = "macos")]
+#[repr(C)]
+#[derive(Default)]
+struct RusageInfoV0 {
+    uuid: [u8; 16],
+    user_time: u64,
+    system_time: u64,
+    pkg_idle_wkups: u64,
+    interrupt_wkups: u64,
+    pageins: u64,
+    wired_size: u64,
+    resident_size: u64,
+    phys_footprint: u64,
+    proc_start_abstime: u64,
+    proc_exit_abstime: u64,
+}
+
+/// The child's resource use; `None` once it has gone.
+#[cfg(target_os = "macos")]
+fn rusage(pid: u32) -> Option<RusageInfoV0> {
     unsafe extern "C" {
         fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV0) -> i32;
     }
     let mut info = RusageInfoV0::default();
     // SAFETY: `info` is a `rusage_info_v0`, the flavor 0 (`RUSAGE_INFO_V0`) asks for, and lives through the call.
     let ok = unsafe { proc_pid_rusage(pid as i32, 0, &mut info) } == 0;
-    ok.then_some(info.phys_footprint)
+    ok.then_some(info)
 }
 
 #[cfg(not(target_os = "macos"))]

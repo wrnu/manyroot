@@ -304,16 +304,16 @@ mod macos_only {
         assert!(Path::new(python).exists(), "this test needs the Command Line Tools' python3 at {python}");
         let spawn = format!(
             "{python} -c 'import os, sys, time; p = os.posix_spawn(\"/bin/sleep\", [\"sleep\", \"60\"], {{}}, setsid=True); \
-             print(p, os.getpgid(p) != os.getpgrp(), flush=True); time.sleep(60)'"
+             print(p, flush=True); time.sleep(60)'"
         );
         for (what, script) in
             [("at the timeout", spawn.clone()), ("after a normal end", format!("{spawn} & sleep 1; exit 0"))]
         {
             let out = s.run(&["bash", "-c", &script], &[]).expect("runs");
             let tail = String::from_utf8_lossy(&out.tail).into_owned();
-            let (pid, outside) = tail.trim().split_once(' ').unwrap_or_else(|| panic!("{what}: {tail:?}"));
-            let pid: i32 = pid.parse().expect("a pid");
-            assert_eq!(outside, "True", "{what}: the child didn't leave the group");
+            let pid: i32 = tail.trim().parse().unwrap_or_else(|_| panic!("{what}: no pid in {tail:?}"));
+            // The check can't ask the child's group itself, since the profile denies getpgid (task
+            // 72fd057d4b33): the runner finding it outside the check's group says it left.
             assert_eq!(out.exit, Exit::LeftGroup(vec![pid]), "{what}: {tail}");
             assert!(!out.exit.passed());
             assert!(out.exit.to_string().contains("left the process group"), "{}", out.exit);
@@ -336,16 +336,16 @@ mod macos_only {
         let group = rustix::process::getpgrp().as_raw_nonzero().get();
         let spawn = format!(
             "{python} -c 'import os, sys, time; p = os.posix_spawn(\"/bin/sleep\", [\"sleep\", \"600\"], {{}}, setpgroup={group}); \
-             print(p, os.getpgid(p) == {group}, flush=True); time.sleep(600)'"
+             print(p, flush=True); time.sleep(600)'"
         );
         for (what, script) in
             [("at the timeout", spawn.clone()), ("after a normal end", format!("{spawn} & sleep 1; exit 0"))]
         {
             let out = s.run(&["bash", "-c", &script], &[]).expect("runs");
             let tail = String::from_utf8_lossy(&out.tail).into_owned();
-            let (pid, joined) = tail.trim().split_once(' ').unwrap_or_else(|| panic!("{what}: {tail:?}"));
-            let pid: i32 = pid.parse().unwrap_or_else(|_| panic!("{what}: no pid in {tail:?}"));
-            assert_eq!(joined, "True", "{what}: the child didn't join the runner's group");
+            let pid: i32 = tail.trim().parse().unwrap_or_else(|_| panic!("{what}: no pid in {tail:?}"));
+            // The check can't ask the child's group itself, since the profile denies getpgid (task
+            // 72fd057d4b33): the runner finding it outside the check's group says it left.
             // Should it survive, it's in this process's group: kill it by pid, never by group.
             let _guard = KillOnDrop::of(&[pid]);
             assert!(!alive(&pid.to_string()), "{what}: the child {pid} in the runner's group outlived the check");
@@ -578,7 +578,7 @@ mod macos_only {
     const PROBE_PARENT: &str = "BRACKEN_PROBE_PARENT";
 
     /// Every way the probe tries, as it names them.
-    const PROBE_WAYS: [&str; 12] = [
+    const PROBE_WAYS: [&str; 14] = [
         "procargs2-mib",
         "procargs-mib",
         "procargs2-name",
@@ -588,6 +588,8 @@ mod macos_only {
         "proc_listallpids",
         "proc_pidpath",
         "proc_pidinfo",
+        "getpgid",
+        "getsid",
         "ps-E",
         "ps-ax",
         "pgrep",
@@ -603,7 +605,8 @@ mod macos_only {
     // planted variable from its exec: the parent is this test binary run again with the plant in its
     // environment, since a variable set after exec isn't in the kernel's copy (note 116ae2144d9d). It
     // tries KERN_PROCARGS2 and KERN_PROCARGS by MIB and by name, kern.proc.all and kern.proc.pid, libproc's
-    // proc_listallpids, proc_pidpath and proc_pidinfo, and the ps and pgrep tools. Run directly by the
+    // proc_listallpids, proc_pidpath and proc_pidinfo, getpgid and getsid (task 72fd057d4b33), and the ps
+    // and pgrep tools. Run directly by the
     // parent, the control, every way reads, and the argument reads find the plant; as a check, every way
     // is denied. Also from a check that first joined the parent's process group, with posix_spawn's
     // POSIX_SPAWN_SETPGROUP (the profile denies setpgid): (deny process-info* (target others)) didn't

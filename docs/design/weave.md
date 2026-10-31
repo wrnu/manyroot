@@ -914,8 +914,10 @@ nothing else runs a check on a Weave manifest (security note
     denied, and so is reading any process's arguments and environment
     (`KERN_PROCARGS2`, `KERN_PROCARGS`), path or `proc_pidinfo`, by
     `(deny process-info*)` with no `(target others)`, which leaves out the
-    check's own process group (note `1301a2adcc85`). So are `setsid` and
-    `setpgid`. `posix_spawn` with a new session or group can
+    check's own process group (note `1301a2adcc85`). So are `getpgid` and
+    `getsid`, which would tell which pids are live and their groups and
+    sessions, for every pid since the rule can't tell a process's own apart
+    (task `72fd057d4b33`), and `setsid` and `setpgid`. `posix_spawn` with a new session or group can
     still leave the process group, so on every exit path the runner stops
     the group, finds the check's descendants by parent pid (again until no
     new ones appear), stops and kills each, and fails the run if any had

@@ -207,7 +207,7 @@ fn assert_verdicts(report: &Value, want: &[(&str, &str)]) {
 const PLANTED: &str = "BRACKEN_PROBE_PLANTED_NAME";
 
 /// The ways `experiment-fake-claude` tries to read another process (its `PROCESS_WAYS`).
-const PROCESS_WAYS: [&str; 9] = [
+const PROCESS_WAYS: [&str; 11] = [
     "procargs2-mib",
     "procargs-mib",
     "procargs2-name",
@@ -217,6 +217,8 @@ const PROCESS_WAYS: [&str; 9] = [
     "listallpids",
     "pidpath",
     "pidinfo",
+    "getpgid",
+    "getsid",
 ];
 
 /// `cmd` probing every way of reading its parent, the fake's `spawn`, whose environment as it was
@@ -224,11 +226,23 @@ const PROCESS_WAYS: [&str; 9] = [
 /// parent such as this shows a leak. The probe says only whether each way read anything, and whether
 /// the plant was in what it read.
 fn probe_planted_parent(cmd: &Command) -> Value {
+    let mut parent = Command::new(fake());
+    parent.arg("spawn").arg(cmd.get_program()).args(cmd.get_args());
+    probe_from(parent)
+}
+
+/// The same, with the parent inside `sandbox` too, as the harness holding the auth value is: the probe,
+/// its child, shares its sandbox (finding a9e5f73a3d3a).
+fn probe_planted_parent_inside(sandbox: &Sandbox) -> Value {
+    let mut parent = sandbox.command(&fake());
+    parent.arg("spawn").arg(fake());
+    probe_from(parent)
+}
+
+/// `parent` started with [`PLANTED`] in its environment, running the probe of its parent.
+fn probe_from(mut parent: Command) -> Value {
     let spec = json!({"process": ["parent"], "plant": PLANTED});
-    let out = Command::new(fake())
-        .arg("spawn")
-        .arg(cmd.get_program())
-        .args(cmd.get_args())
+    let out = parent
         .arg("probe")
         .arg(spec.to_string())
         .env_clear()
@@ -777,8 +791,9 @@ mod macos_only {
 
     /// Under the agent, tools and hub profiles, a process reads nothing of another (task e23f87035615,
     /// note 116ae2144d9d): not its parent's arguments or environment, by number or by name, nor the
-    /// process table, the list of pids, a path or info. Unsandboxed, the same probe reads them all, the
-    /// parent's planted variable among them.
+    /// process table, the list of pids, a path, info, process group or session; whether the parent is
+    /// outside the sandbox or inside it with the probe (task 72fd057d4b33). Unsandboxed, the same probe
+    /// reads them all, the parent's planted variable among them.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
     fn no_profile_reads_another_process() {
@@ -814,8 +829,14 @@ mod macos_only {
         let hub = Sandbox::hub(&hub).expect("the hub profile");
         for (name, sandbox) in [("agent", agent), ("tools", tools), ("hub", hub)] {
             let r = probe_planted_parent(&sandbox.command(&fake));
+            let inside = probe_planted_parent_inside(&sandbox);
             for way in PROCESS_WAYS {
                 assert_eq!(r[format!("{way}:parent")], "denied", "{way} under the {name} profile: {r:#}");
+                assert_eq!(
+                    inside[format!("{way}:parent")],
+                    "denied",
+                    "{way} of a parent in the {name} profile: {inside:#}"
+                );
             }
         }
     }

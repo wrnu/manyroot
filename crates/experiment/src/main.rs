@@ -253,6 +253,7 @@ fn main() {
             mock_run(dir, &mode, agents, turns, bracken, sandbox, plan)
         }
         Cmd::Project(ProjectCmd::Check { dir, hidden, json }) => project_check(&dir, hidden.as_deref(), json),
+        Cmd::Project(cmd @ ProjectCmd::Grade { .. }) => project_grade(cmd),
         Cmd::RunTests { project, tree, python, python_digest, json } => {
             run_tests(&project, tree.as_deref(), &python, python_digest.as_deref(), json)
         }
@@ -562,6 +563,75 @@ enum ProjectCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Grade a tree with a project's hidden tests, in counts per item (docs/design/eval-suite.md, Grading);
+    /// with --golden, the approval check of the hidden set's golden trees. Says nothing of the tests.
+    Grade {
+        dir: PathBuf,
+        /// The private store holding the project's hidden set.
+        #[arg(long)]
+        hidden: PathBuf,
+        /// The Python interpreter to pin: its version must be the project's.
+        #[arg(long)]
+        python: PathBuf,
+        /// The digest the interpreter must have, as a run's plan records it.
+        #[arg(long)]
+        python_digest: Option<String>,
+        /// The tree to grade, laid out as the seed is.
+        #[arg(long, required_unless_present = "golden", conflicts_with = "golden")]
+        tree: Option<PathBuf>,
+        #[arg(long)]
+        golden: bool,
+        /// The share of the run's agent-turns used: the groups that apply then. The end by default.
+        #[arg(long, default_value_t = 1.0)]
+        share: f64,
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+fn project_grade(cmd: ProjectCmd) -> Result<(), String> {
+    use bracken_experiment::project::{HiddenSet, Project};
+    use bracken_experiment::project_grader::{Grade, Tree, golden_check, grade};
+    use bracken_experiment::python::Python;
+    let ProjectCmd::Grade { dir, hidden, python, python_digest, tree, golden, share, json } = cmd else {
+        unreachable!("only Grade is passed here")
+    };
+    if !(0.0..=1.0).contains(&share) {
+        return Err(format!("--share {share} isn't from 0 to 1"));
+    }
+    let project = Project::load(&dir)?;
+    let set = HiddenSet::open(&project, &hidden)?;
+    let python = Python::pin(&python, &project.python, python_digest.as_deref())?;
+    let lines = |name: &str, g: &Grade| {
+        println!("{name} at share {}: {}", g.share, if g.all_pass() { "all pass" } else { "not all pass" });
+        for i in &g.items {
+            let c = i.counts;
+            let unfinished =
+                if i.unfinished > 0 { format!(", {} groups unfinished", i.unfinished) } else { String::new() };
+            println!("  {}: {} pass, {} fail, {} error, {} skip{unfinished}", i.id, c.pass, c.fail, c.error, c.skip);
+        }
+    };
+    if golden {
+        let check = golden_check(&python, &project, &set)?;
+        if json {
+            println!("{}", serde_json::json!({"passed": check.passed(), "check": check, "python": python.plan_pin()}));
+        } else {
+            lines("golden", &check.after);
+            if let Some(before) = &check.before {
+                lines("golden-before", before);
+            }
+            println!("approval check: {}", if check.passed() { "passed" } else { "failed" });
+        }
+        return if check.passed() { Ok(()) } else { Err("the golden trees don't pass the approval check".into()) };
+    }
+    let tree = tree.expect("the parser requires --tree without --golden");
+    let g = grade(&python, &project, &set, Tree::Dir(&tree), share)?;
+    if json {
+        println!("{}", serde_json::json!({"grade": g, "python": python.plan_pin()}));
+    } else {
+        lines("tree", &g);
+    }
+    Ok(())
 }
 
 fn project_check(dir: &std::path::Path, hidden: Option<&std::path::Path>, json: bool) -> Result<(), String> {
@@ -599,8 +669,8 @@ fn project_check(dir: &std::path::Path, hidden: Option<&std::path::Path>, json: 
     match store {
         Some(s) => {
             println!(
-                "hidden {}: digest matches; {} groups in {} test files; golden solution {} files",
-                project.hidden.id, s.groups, s.test_files, s.golden_files
+                "hidden {}: digest matches; {} groups in {} test files; golden solution {} files, {} before the change",
+                project.hidden.id, s.groups, s.test_files, s.golden_files, s.golden_before_files
             );
             if !s.items_without_tests.is_empty() {
                 println!("items no hidden test judges: {}", s.items_without_tests.join(", "));
