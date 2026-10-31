@@ -62,9 +62,11 @@ if [ -n "$init" ]; then
   [[ $owner =~ ^[0-9a-f]{12,64}$ ]] || fail "--owner-decision $owner: give the approval's id, 12 to 64 lowercase hex digits"
   shown=$(env -u BRACKEN_AGENT "$main/scripts/bk" show "$owner" --json 2>/dev/null) ||
     fail "--owner-decision $owner: the coordination Ground has no such contribution"
-  jq -e '.kind == "claim" and (.retracted | not) and .author_name == "owner"
-         and ((.body.tags // []) | index("approval") != null)' <<<"$shown" >/dev/null 2>&1 ||
-    fail "--owner-decision $owner: it isn't a claim tagged approval, signed by owner and not retracted (scripts/owner-approve)"
+  jq -e '. as $c | .kind == "claim" and (.retracted | not) and .author_name == "owner"
+         and ((.body.tags // []) | index("approval") != null)
+         and ([.referrers[]? | select(.kind == "relation" and .body.kind == "supersedes" and .body.to == $c.id
+                                and .author == $c.author and (.retracted | not))] | length) == 0' <<<"$shown" >/dev/null 2>&1 ||
+    fail "--owner-decision $owner: it isn't a claim tagged approval, signed by owner, not retracted and not superseded (scripts/owner-approve)"
   path="${HOME:?HOME is not set}/bracken-weave/manyroot"
   policy=(--integrator weave-integrator --validator weave-runner
     --check 'fmt=cargo fmt --check' --check 'clippy=cargo clippy --all-targets -- -D warnings'
@@ -87,7 +89,20 @@ if [ -n "$init" ]; then
   # after its marker, before writing the line. The line by its id, never by its name. Only with no default
   # line is line main created: a dry run that fails stops here with its error, rather than write a second
   # line main (finding b33d60c94e6d).
-  line=$("$weave" weave head --json 2>/dev/null | jq -r '.line // empty') || line=''
+  # Only weave head's own "no default line" error means there is none (finding b9e95bfb20fc); any other
+  # failure stops --init with its error.
+  err=$(mktemp)
+  if head=$("$weave" weave head --json 2>"$err"); then
+    line=$(jq -r '.line // empty' <<<"$head")
+    [ -n "$line" ] || { rm -f -- "$err"; fail "weave head printed no line"; }
+  elif grep -q 'has no default line' "$err"; then
+    line=''
+  else
+    cat -- "$err" >&2
+    rm -f -- "$err"
+    fail "weave head failed, so --init stops and writes nothing"
+  fi
+  rm -f -- "$err"
   if [ -z "$line" ]; then
     "$weave" weave line create main "${policy[@]}"
   else
