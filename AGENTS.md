@@ -39,6 +39,7 @@ Builders don't run the whole `cargo test --workspace` (decision `ef5b807d3196`):
 | `crates/demo` | `-p bracken -p bracken-demo -p bracken-experiment`: `-p bracken` builds the binary their tests run |
 | `crates/experiment` | `-p bracken -p bracken-experiment` |
 | `crates/scope` | `-p bracken-scope` |
+| `crates/query-lab` | `-p bracken-query-lab`: a research prototype nothing depends on |
 | `code-scope`, in `scripts/` or `.claude/skills/` | `-p bracken -p bracken-scope`: bracken-scope's tests run it too |
 | `scripts/`, `.claude/skills/` | `-p bracken` |
 | `.config/determinator.toml` | `-p bracken -p bracken-scope -p bracken-tree` |

@@ -1,0 +1,91 @@
+% The prelude: the CLI's derived notions, each defined once. The comments name the code each mirrors;
+% the tests and `query-lab bench` check the answers against it.
+
+% ---- References and liveness ----
+
+refers(X, Y) :- relation(X, Y, _, _).
+refers(X, Y) :- relation(X, _, _, Y).
+refers(X, Y) :- evidence(X, Y, _, _).
+refers(X, Y) :- retract(X, Y).
+
+live(X) :- contribution(X, _), !retracted(X).
+open(X) :- subject(X), !retracted(X).
+
+% ---- What `log --current` shows (CurrentView in crates/bracken/src/main.rs) ----
+
+% S supersedes T in a way that counts: a live relation by T's own author, from a live subject.
+supersedes(S, T) :- relation(R, S, supersedes, T), !retracted(R), author(R, A), author(T, A), subject(T), open(S).
+
+hidden(X) :- retracted(X).
+hidden(T) :- supersedes(_, T).
+hidden(X) :- refers(X, Y), hidden(Y).
+current(X) :- contribution(X, _), !hidden(X).
+
+% Shown but marked: a live supersedes relation by someone other than the subject's author.
+superseded_by_others(T, S, A) :- relation(R, S, supersedes, T), !retracted(R), author(R, A), author(T, B), A != B,
+    subject(S), !retracted(S).
+
+% ---- Supersession chains ----
+
+% Every later version of T, through supersessions that count.
+later(T, S) :- supersedes(S, T).
+later(T, S) :- later(T, M), supersedes(S, M).
+latest(T, S) :- later(T, S), current(S).
+
+% ---- Causal ancestry ----
+
+% Written right-recursively, so a query with D bound demands only D (see magic.rs).
+ancestor(A, D) :- parent(D, A).
+ancestor(A, D) :- ancestor(M, D), parent(M, A).
+
+% ---- Open findings (`log --open`, open_finding in crates/bracken/src/main.rs; and scripts/merge, section 3) ----
+
+% A pr claim the triager merged: a live pass of theirs whose method starts `merge gate`.
+merged(H) :- evidence(E, H, pass, M), author(E, $triager), !retracted(E), starts_with(M, "merge gate").
+
+% A contradicts link from F still counts if live, or retracted by someone other than F's author and the
+% triager (a retract is always its relation's author's).
+link(R, F, H) :- relation(R, F, contradicts, H), !retracted(R).
+link(R, F, H) :- relation(R, F, contradicts, H), retracted(R), author(R, A), author(F, B), A != B, A != $triager.
+
+triaged(F) :- evidence(E, F, _, _), !retracted(E), author(E, $triager).
+confirmed(F) :- evidence(E, F, pass, _), !retracted(E), author(E, $triager).
+deferred(F) :- relation(D, T, depends_on, F), !retracted(D), author(D, $triager), author(T, $triager),
+    !hidden(T), tag(T, "task"), tag(T, "deferred").
+blocks(F) :- !retracted(F), triaged_or_not(F).
+triaged_or_not(F) :- link(_, F, _), !triaged(F).
+triaged_or_not(F) :- link(_, F, _), confirmed(F), !deferred(F).
+
+open_finding(F) :- link(_, F, H), !hidden(H), !merged(H), blocks(F).
+
+% ---- Acceptance under a policy (Policy and Assessor in crates/manyroot/src/validation.rs) ----
+
+% Evidence counts when live, not by the subject's author, and by a validator.
+counted(E, X, V) :- evidence(E, X, V, _), subject(X), !retracted(E), author(E, A), author(X, B), A != B,
+    validator(A).
+rejected(X) :- open(X), counted(_, X, fail).
+pass_by(X, A) :- counted(E, X, pass), author(E, A).
+passes_enough(X) :- open(X), !rejected(X), #count { A : pass_by(X, A) } >= $min_passes.
+% A subject's status before supersession: accepted, rejected, pending or retracted.
+base_accepted(X) :- passes_enough(X).
+superseded_accepted(X) :- base_accepted(X), relation(R, S, supersedes, X), !retracted(R), author(R, A),
+    author(X, A), base_accepted(S).
+accepted(X) :- base_accepted(X), !superseded_accepted(X).
+pending(X) :- open(X), !rejected(X), !base_accepted(X).
+
+status(X, retracted) :- subject(X), retracted(X).
+status(X, rejected) :- rejected(X).
+status(X, pending) :- pending(X).
+status(X, superseded) :- superseded_accepted(X).
+status(X, accepted) :- accepted(X).
+
+% ---- The merge gate's Ground checks for one pr claim, $claim (scripts/merge, sections 1 to 3) ----
+
+% 1. The claim is current, and nobody else claims to supersede it.
+gate_current(C) :- C = $claim, current(C), !others_supersede(C).
+others_supersede(T) :- superseded_by_others(T, _, _).
+% 2. It's accepted under the policy.
+gate_accepted(C) :- C = $claim, accepted(C).
+% 3. Every finding linked to it is triaged, and each confirmed one deferred. scripts/merge reads the
+% findings of the claim itself, merged or not.
+gate_blocking(F) :- link(_, F, $claim), blocks(F).

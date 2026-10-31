@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/manyroot", "crates/bracken", "crates/demo", "crates/experiment", "crates/scope", "crates/tree"]
+members = ["crates/manyroot", "crates/bracken", "crates/demo", "crates/experiment", "crates/scope", "crates/tree", "crates/query-lab"]
 
 [workspace.package]
 version = "0.1.0"
