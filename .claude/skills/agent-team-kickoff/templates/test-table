@@ -3,8 +3,9 @@
 #
 #   test-table
 #   test-table --remote [-p <package>]...
-#   test-table --split
-#   test-table --lists       (in --split's box)
+#   test-table --split [-p <package>]...
+#   test-table --light -p <package>...       (in --split -p's box)
+#   test-table --lists [-p <package>]...     (in --split's box)
 #
 # Runs, from the top of the checkout it lives in, stopping at the first that fails:
 #   cargo fmt --check
@@ -67,11 +68,26 @@
 # drop a test from it (task 06d7b4ef2c75), and a list damaged on the way fails as damaged.
 # It ends with the last lines of both parts. A docs-only head (below) runs locally, with no box. A
 # Ctrl-C or a failure here stops the box, and the box is deleted as --remote deletes it.
+#
+# --split -p <package>... is the light counted run (decision 464d3ccca45e, finding 94e07ed7dd6b), run by
+# scripts/verify-seq --light in the merged tree (bk-evidence --on), the packages scripts/code-scope
+# packages computes. It's --split for those packages only: the box runs --light -p <package>... (cargo
+# fmt --check, both clippies, cargo nextest run -p <package>..., every test of those packages, the slow
+# ones too, cargo test --doc for those of them with a library, and the Ground guards), and this Mac
+# runs their macOS-only tests, the lists of both sides restricted to them too. It isn't the whole
+# table, and it counts only where scripts/merge takes a light pass: never for a head scripts/code-scope
+# full names. A docs-only head runs it too, with no shortcut. --light alone runs the box's part here.
+#
+# With TEST_TABLE_MODE set (verify-seq sets it: the mode, light or full, and why), a run that passes, or
+# fails through a check here, ends with 'test-table: counted run mode: <it>', so the evidence's details
+# hold it.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$(git -C "$here" rev-parse --show-toplevel)"
-fail() { echo "test-table: $*" >&2; exit 1; }
+# The counted run's mode and why, for the evidence's details: verify-seq sets TEST_TABLE_MODE.
+mode_line() { [ -z "${TEST_TABLE_MODE:-}" ] || echo "test-table: counted run mode: $TEST_TABLE_MODE"; }
+fail() { echo "test-table: $*" >&2; mode_line >&2; exit 1; }
 timeout=$(command -v timeout || command -v gtimeout) || fail "needs timeout (on macOS, gtimeout from coreutils)"
 
 # Whether box $1 may still exist: listed in any state, or boat can't say. --all, because plain list
@@ -104,8 +120,33 @@ need_nextest() {
   cargo nextest --version >/dev/null 2>&1 || fail "needs cargo-nextest (cargo install --locked cargo-nextest; reference 4f8a96525a1e)"
 }
 
-# The packages --remote -p names: the box runs only their tests, not the table.
+# The packages --remote -p names: the box runs only their tests, not the table. For --split -p
+# (light_split) and --light, the light table's packages; libs, after scope_libs, those of them with a
+# library, as -p options.
 packages=()
+light=false
+light_split=false
+libs=()
+
+# Checks every named package is this workspace's, and sets libs to those with a library, whose
+# doctests cargo test --doc can run (it fails on a binary-only package).
+scope_libs() {
+  local meta p
+  command -v jq >/dev/null || fail "-p with --light, --split or --lists needs jq"
+  meta=$(cargo metadata --locked --no-deps --format-version 1) || fail "failed: cargo metadata"
+  libs=()
+  for p in "${packages[@]}"; do
+    jq -e --arg p "$p" 'any(.packages[]; .name == $p)' <<<"$meta" >/dev/null || fail "no package $p in this workspace"
+    if jq -e --arg p "$p" 'any(.packages[] | select(.name == $p) | .targets[]; .kind | index("lib"))' <<<"$meta" >/dev/null; then
+      libs+=(-p "$p")
+    fi
+  done
+}
+
+# The cargo options for the scope: -p <package>... if packages are named, else --workspace.
+scope_args() {
+  if [ ${#packages[@]} -gt 0 ]; then printf -- '-p\n%s\n' "${packages[@]}"; else echo --workspace; fi
+}
 
 # The table in one boat box, for HEAD, or only the tests of $packages; $1, if given, runs in the box
 # after it.
@@ -141,7 +182,7 @@ setup() {
   "$@" >"$log" 2>&1 || { rc=$?; echo "test-table: box setup failed (exit $rc): $*" >&2; cat "$log" >&2; exit "$rc"; }
 }
 setup $sudo add-apt-repository -y ppa:git-core/ppa
-setup $sudo apt-get install -y -qq git b3sum curl
+setup $sudo apt-get install -y -qq git b3sum curl jq
 nextest_tar=cargo-nextest-$nextest_version-x86_64-unknown-linux-gnu.tar.gz
 nextest_dir=$(mktemp -d)
 setup curl -fsSL -o "$nextest_dir/$nextest_tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/$nextest_tar"
@@ -154,7 +195,14 @@ cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
 git checkout -q tested'
   local what="the table"
-  if [ ${#packages[@]} -gt 0 ]; then
+  if $light_split; then
+    what="the light table:$(printf ' -p %s' "${packages[@]}")"
+    # The Ground guards need the bracken binary, which the scope's tests may not build.
+    # shellcheck disable=SC2016 # expanded in the box
+    inner="$inner"'
+cargo build --locked -q -p bracken --bin bracken
+BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table --light'"$(printf ' -p %s' "${packages[@]}")"
+  elif [ ${#packages[@]} -gt 0 ]; then
     what="cargo test --locked$(printf ' -p %s' "${packages[@]}")"
     inner="$inner
 $what"
@@ -177,7 +225,9 @@ $1}"
     echo "test-table: the box's table exited $rc" >&2
     exit "$rc"
   fi
-  if [ ${#packages[@]} -gt 0 ]; then
+  if $light_split; then
+    echo "test-table: $what passed at $(git rev-parse HEAD), in a box; not the whole table"
+  elif [ ${#packages[@]} -gt 0 ]; then
     echo "test-table: $what passed at $(git rev-parse HEAD), in a box; not the whole table"
   else
     echo "test-table: all passed at $(git rev-parse HEAD), in a box"
@@ -207,17 +257,27 @@ nextest_listed() {
 # list's lines could be split by cargo's lines on standard error, which the box's output carries in the
 # same stream.
 box_lists() {
-  local d which run doc rc
+  local d which run doc rc cargo_scope
   d=$(mktemp -d)
+  mapfile -t cargo_scope < <(scope_args)
+  if [ ${#packages[@]} -gt 0 ]; then
+    scope_libs
+  else
+    libs=(--workspace)
+  fi
   echo "test-table: the tests Linux has, and those it ignores"
   for which in all ignored; do
     run=all doc=''
     [ "$which" = all ] || { run=only; doc=--ignored; }
-    cargo nextest list --locked --workspace --run-ignored "$run" --message-format oneline \
+    cargo nextest list --locked "${cargo_scope[@]}" --run-ignored "$run" --message-format oneline \
       >"$d/$which.nextest" 2>"$d/err" || { rc=$?; cat "$d/err" >&2; exit "$rc"; }
-    # shellcheck disable=SC2086 # $doc is one option or none
-    cargo test --locked --doc --workspace -- --list $doc >"$d/$which.doc" 2>&1 ||
-      { rc=$?; cat "$d/$which.doc" >&2; exit "$rc"; }
+    if [ ${#libs[@]} -eq 0 ]; then
+      : >"$d/$which.doc"
+    else
+      # shellcheck disable=SC2086 # $doc is one option or none
+      cargo test --locked --doc "${libs[@]}" -- --list $doc >"$d/$which.doc" 2>&1 ||
+        { rc=$?; cat "$d/$which.doc" >&2; exit "$rc"; }
+    fi
     # awk 1: each line ends in a newline, the last one too, as the prefixed lines will.
     awk 1 "$d/$which.nextest" >"$d/$which.n"
     awk 1 "$d/$which.doc" >"$d/$which.d"
@@ -284,19 +344,27 @@ bounded() {
   return "$rc"
 }
 
-# The macOS-only tests here, then this Mac's lists of the tests it has and ignores, each bounded.
+# The macOS-only tests here, then this Mac's lists of the tests it has and ignores, each bounded: of
+# the workspace, or for --split -p of the named packages only, where none of them may have such a test.
 here_part() {
   trap pass_on INT TERM
-  bounded "$here_limit" cargo nextest run --locked --workspace --no-fail-fast -E 'test(~macos_only::)' \
+  local which rc cargo_scope none=()
+  mapfile -t cargo_scope < <(scope_args)
+  ! $light_split || none=(--no-tests=pass)
+  bounded "$here_limit" cargo nextest run --locked "${cargo_scope[@]}" --no-fail-fast "${none[@]}" -E 'test(~macos_only::)' \
     > >(tee -i "$split_tmp/here") 2>&1 || exit
-  local which rc
   for which in all only; do
-    bounded 300 cargo nextest list --locked --workspace --run-ignored "$which" --message-format oneline \
+    bounded 300 cargo nextest list --locked "${cargo_scope[@]}" --run-ignored "$which" --message-format oneline \
       >"$split_tmp/mac-$which.nextest" 2>"$split_tmp/mac-$which.err" ||
       { rc=$?; cat "$split_tmp/mac-$which.err" >&2; exit "$rc"; }
   done
-  bounded 300 cargo test --locked --doc --workspace -- --list >"$split_tmp/mac-all.doc" 2>&1 || exit
-  bounded 300 cargo test --locked --doc --workspace -- --list --ignored >"$split_tmp/mac-only.doc" 2>&1 || exit
+  if [ ${#libs[@]} -eq 0 ]; then
+    : >"$split_tmp/mac-all.doc"
+    : >"$split_tmp/mac-only.doc"
+  else
+    bounded 300 cargo test --locked --doc "${libs[@]}" -- --list >"$split_tmp/mac-all.doc" 2>&1 || exit
+    bounded 300 cargo test --locked --doc "${libs[@]}" -- --list --ignored >"$split_tmp/mac-only.doc" 2>&1 || exit
+  fi
   { nextest_listed <"$split_tmp/mac-all.nextest"; tests_listed <"$split_tmp/mac-all.doc"; } | LC_ALL=C sort -u >"$split_tmp/mac-all"
   { nextest_listed <"$split_tmp/mac-only.nextest"; tests_listed <"$split_tmp/mac-only.doc"; } | LC_ALL=C sort -u >"$split_tmp/mac-ignored"
 }
@@ -308,6 +376,11 @@ split() {
   need_nextest
   [ -z "$(git status --porcelain)" ] || fail "--split tests HEAD: commit or set aside the changes first"
   git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
+  if $light_split; then
+    scope_libs
+  else
+    libs=(--workspace)
+  fi
   # split_tmp, box_job and here_job are globals: the EXIT trap runs after this function has returned.
   split_tmp=$(mktemp -d)
   # The tests here end by 1800 s, as the local table's do. TEST_TABLE_HERE_LIMIT can only shorten it
@@ -318,7 +391,10 @@ split() {
   box_job='' here_job=''
   # The box's lists, from this script's --lists there (box_lists): each ends with a line holding its
   # cksum, so a list cut short, or with a line damaged on the way, fails the run and can't hide a test.
+  # The whole workspace's lists for the full run: printf with no names would still print ' -p ' once,
+  # which --lists refuses (fail 40550d3c989e).
   local lists='scripts/test-table --lists'
+  [ ${#packages[@]} -eq 0 ] || lists+=$(printf ' -p %s' "${packages[@]}")
   # Stops both parts on every way out, then deletes the box by id if boat left it: a killed box part
   # can't. Both run as jobs with job control (set -m): each in its own process group, with SIGINT
   # not ignored, as a plain background job's would be (finding 87cfdf4680c7), and this shell waits
@@ -344,7 +420,11 @@ split() {
   }
   trap stop_parts EXIT
   trap 'exit 130' INT TERM
-  echo "test-table: the whole table in a box (output at the end), and here the macOS-only tests"
+  if $light_split; then
+    echo "test-table: the light table in a box:$(printf ' -p %s' "${packages[@]}") (output at the end), and here their macOS-only tests"
+  else
+    echo "test-table: the whole table in a box (output at the end), and here the macOS-only tests"
+  fi
   set -m
   (remote "$lists") >"$split_tmp/box" 2>&1 &
   box_job=$!
@@ -390,34 +470,60 @@ split() {
   } | grep -v '^[^|]*|.*macos_only::' || true)
   [ -z "$escaped" ] ||
     fail "these run on this Mac but not on Linux, and aren't in a macos_only module, so neither part runs them: $(tr '\n' ' ' <<<"$escaped")"
-  echo "test-table: all passed at $(git rev-parse HEAD): the whole table in a box, and the macOS-only tests here"
+  if $light_split; then
+    echo "test-table: light run passed at $(git rev-parse HEAD):$(printf ' -p %s' "${packages[@]}"), in a box, and their macOS-only tests here; not the whole table"
+  else
+    echo "test-table: all passed at $(git rev-parse HEAD): the whole table in a box, and the macOS-only tests here"
+  fi
+  mode_line
+}
+
+# Parses -p <package>... from $@ into packages, failing with usage $1 on anything else.
+take_packages() {
+  local use=$1
+  shift
+  while [ $# -gt 0 ]; do
+    [ "$1" = -p ] && [ $# -ge 2 ] || fail "usage: $use"
+    # A name goes into the box's script: a letter or digit, then letters, digits, - and _ only, as
+    # cargo's package names, so never an option or anything the box's shell would read.
+    [[ $2 =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "-p takes a package name, not '$2'"
+    packages+=("$2")
+    shift 2
+  done
 }
 
 case "${1:-}" in
   '') ;;
   --remote)
     shift
-    while [ $# -gt 0 ]; do
-      [ "$1" = -p ] && [ $# -ge 2 ] || fail "usage: test-table --remote [-p <package>]..."
-      # A name goes into the box's script: a letter or digit, then letters, digits, - and _ only, as
-      # cargo's package names, so never an option or anything the box's shell would read.
-      [[ $2 =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "-p takes a package name, not '$2'"
-      packages+=("$2")
-      shift 2
-    done
+    take_packages "test-table --remote [-p <package>]..." "$@"
     remote
     exit 0
     ;;
+  --light)
+    shift
+    [ $# -ge 2 ] || fail "usage: test-table --light -p <package>..."
+    take_packages "test-table --light -p <package>..." "$@"
+    light=true
+    ;;
   --lists)
-    [ $# -eq 1 ] || fail "usage: test-table --lists"
+    shift
+    take_packages "test-table --lists [-p <package>]..." "$@"
     box_lists
     exit 0
     ;;
   --split)
+    shift
+    take_packages "test-table --split [-p <package>]..." "$@"
+    if [ ${#packages[@]} -gt 0 ]; then
+      light_split=true
+      split
+      exit 0
+    fi
     # A docs-only head runs the local docs-only table below: nothing for a box to do.
     "$here/code-scope" docs-only origin/main HEAD >/dev/null 2>&1 || { split; exit 0; }
     ;;
-  *) fail "usage: test-table [--remote [-p <package>]... | --split | --lists]" ;;
+  *) fail "usage: test-table [--remote [-p <package>]... | --split [-p <package>]... | --light -p <package>... | --lists [-p <package>]...]" ;;
 esac
 
 step() {
@@ -425,18 +531,40 @@ step() {
   "$@" || fail "failed: $*"
 }
 guards() {
-  if [ "$(git rev-parse HEAD)" = "$(git rev-parse --verify -q origin/main^{commit} || true)" ]; then
+  if [ "$(git rev-parse HEAD)" = "$(git rev-parse --verify -q 'origin/main^{commit}' || true)" ]; then
     echo "test-table: HEAD is origin/main: skipped the Ground guards (nothing to compare it with)"
   else
     step scripts/ground-guards origin/main HEAD
   fi
 }
+if $light; then
+  need_nextest
+  # Every named package must be this workspace's, and the doctests run for those with a library.
+  scope_libs
+  scope=$(printf ' -p %s' "${packages[@]}")
+  echo "test-table: light:$scope"
+  step cargo fmt --check
+  step cargo clippy --locked --all-targets -- -D warnings
+  step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+  # shellcheck disable=SC2086 # $scope is the -p options, one word each
+  step "$timeout" 1800 cargo nextest run --locked --no-fail-fast $scope
+  if [ ${#libs[@]} -gt 0 ]; then
+    step "$timeout" 1800 cargo test --locked --doc "${libs[@]}"
+  else
+    echo "test-table: no doctests:$scope has no library"
+  fi
+  guards
+  echo "test-table: light run passed at $(git rev-parse HEAD):$scope; not the whole table"
+  mode_line
+  exit 0
+fi
 if scope=$("$here/code-scope" docs-only origin/main HEAD 2>&1); then
   echo "test-table: $scope"
   step cargo fmt --check
   echo "test-table: docs-only: skipped clippy and cargo test"
   guards
   echo "test-table: all passed at $(git rev-parse HEAD), docs-only"
+  mode_line
   exit 0
 fi
 need_nextest
@@ -447,3 +575,4 @@ step "$timeout" 1800 cargo nextest run --locked --workspace --no-fail-fast
 step "$timeout" 1800 cargo test --locked --doc --workspace
 guards
 echo "test-table: all passed at $(git rev-parse HEAD)"
+mode_line

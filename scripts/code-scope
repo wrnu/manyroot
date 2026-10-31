@@ -5,6 +5,9 @@
 #   code-scope docs-only <base> <head>
 #   code-scope key <commit>
 #   code-scope chain <main> <head>...
+#   code-scope full <base> <head>
+#   code-scope packages <base> <head>
+#   code-scope light-passes <sha> <package>... <the author's pass methods, on standard input>
 #
 # Docs are the *.md files outside crates/: crates/ holds .md files the code compiles in (the
 # experiment's prompts), so those count as code. .bracken/ is the Ground.
@@ -23,10 +26,30 @@
 # of that head onto P_(i-1) produces. One line each, '<i> <commit> <key>', for i = 0..n. The merge
 # commits are made with git commit-tree, nothing else refers to them, and no ref or worktree changes.
 # A head that doesn't merge cleanly onto its prefix stops it: exit 1, naming that head.
+#
+# full exits 0 when what <head> changed since its merge base with <base> touches a path a light counted
+# run can't cover (decision 464d3ccca45e, answer 10cf8a5053a3), printing one 'code-scope: full: <path>
+# (<why>)' line for each, and exits 1, saying so, when it touches none; 2 on an error. Renames count as
+# a deletion and an addition, as for docs-only. scripts/verify-seq --light refuses such a head, and
+# scripts/merge refuses a light pass for it: this list is the one both read. Another project replaces
+# the list with its own.
+#
+# packages prints, one a line and sorted, the packages AGENTS.md's Tests rows ask for, for what <head>
+# changed since its merge base with <base> (findings 0095e19fcdb7, 4825c59b07e9): the scope a light run
+# must test, whatever the builder ran. Where a row's extra packages depend on what a change means
+# (crates/bracken: demo and experiment if a command's arguments or output change), it takes them always.
+# It prints nothing for a change only to rustfmt.toml, whose row is the format check alone.
+#
+# light-passes reads pass methods (one a line: the pr claim's author's passes on the claim) and exits 0
+# when they hold, on exactly <sha>, the five a light run needs first (decision 464d3ccca45e): cargo fmt
+# --check, both clippies, cargo nextest run -P fast -p ..., and scripts/test-table --remote -p ..., the
+# last two each naming every <package>. Otherwise it prints, on one line, what's missing, and exits 1.
+# verify-seq --light and merge both check with it. They're a precondition only: the light run itself
+# tests the merged tree (finding 94e07ed7dd6b).
 set -euo pipefail
 
 usage() {
-  echo "usage: code-scope docs-only <base> <head> | code-scope key <commit> | code-scope chain <main> <head>..." >&2
+  echo "usage: code-scope docs-only <base> <head> | code-scope key <commit> | code-scope chain <main> <head>... | code-scope full <base> <head> | code-scope packages <base> <head> | code-scope light-passes <sha> <package>..." >&2
   exit 2
 }
 
@@ -38,7 +61,95 @@ docs() {
   esac
 }
 
+# Why a change to $1 needs the full table, printed; or nothing, returning 1. The protocol class (AGENTS.md:
+# encoding, ids, the signing context and validity rules) is crates/manyroot and docs/protocol.md. The
+# Weave validity code the weave-v1 fixture pins is all of crates/tree's source and manifest, whatever
+# module a fixture test reads through, and the fixtures and their test (findings 4320dbb473bb,
+# be317d39449b): a list of modules would miss lib.rs, which decides what each module compiles from, and
+# rot as modules are added. .cargo/, rust-toolchain* and any build.rs change every build.
+full_mode() {
+  case "$1" in
+    crates/manyroot/*) echo "crates/manyroot, the protocol crate" ;;
+    Cargo.toml | Cargo.lock) echo "the workspace's $1" ;;
+    docs/protocol.md) echo "the protocol class" ;;
+    crates/tree/src/* | crates/tree/Cargo.toml | crates/tree/tests/weave_fixture.rs | crates/tree/tests/fixtures/*)
+      echo "crates/tree's source, or the Weave validity code the weave-v1 fixture pins" ;;
+    .cargo/* | rust-toolchain*) echo "the build's configuration" ;;
+    # A build script runs at every build and changes its package without a manifest change (finding
+    # 398c794c1707): any build.rs, at any depth.
+    build.rs | */build.rs) echo "a build script" ;;
+    *) return 1 ;;
+  esac
+}
+
+# The packages AGENTS.md's Tests rows ask for, for a change to $1, one a line.
+row_packages() {
+  case "$1" in
+    rustfmt.toml) ;;
+    Cargo.toml | Cargo.lock | crates/manyroot/*) printf '%s\n' manyroot bracken-tree bracken bracken-demo bracken-experiment ;;
+    crates/tree/*) printf '%s\n' bracken-tree bracken ;;
+    crates/bracken/* | crates/demo/* | crates/experiment/*) printf '%s\n' bracken bracken-demo bracken-experiment ;;
+    scripts/* | .claude/skills/*) echo bracken ;;
+    *) printf '%s\n' bracken-tree bracken ;;
+  esac
+}
+
 case "${1:-}" in
+  packages)
+    [ $# -eq 3 ] || usage
+    base=$(git merge-base "$2" "$3") || exit 2
+    changed=$(mktemp)
+    trap 'rm -f "$changed"' EXIT
+    git diff --no-renames --name-only -z "$base" "$3" >"$changed" || exit 2
+    while IFS= read -r -d '' path; do row_packages "$path"; done <"$changed" | LC_ALL=C sort -u
+    ;;
+  light-passes)
+    [ $# -ge 3 ] || usage
+    sha=$2
+    shift 2
+    methods=$(cat)
+    pkg='[A-Za-z0-9][A-Za-z0-9_-]*'
+    missing=()
+    grep -qxF "cargo fmt --check @ $sha" <<<"$methods" || missing+=("cargo fmt --check")
+    grep -qxE "cargo clippy( --locked)?( --workspace)? --all-targets -- -D warnings @ $sha" <<<"$methods" ||
+      missing+=("cargo clippy --all-targets -- -D warnings")
+    grep -qxE "cargo clippy( --locked)?( --workspace)? --all-targets --target x86_64-unknown-linux-gnu -- -D warnings @ $sha" <<<"$methods" ||
+      missing+=("cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings")
+    # covers <prefix>: whether some method '<prefix> -p <package>... @ <sha>' names every package.
+    covers() {
+      local line p ok
+      while IFS= read -r line; do
+        ok=true
+        for p in "$@"; do [[ " ${line% @ *} " == *" -p $p "* ]] || ok=false; done
+        ! $ok || return 0
+      done < <(grep -xE "$prefix( -p $pkg)+ @ $sha" <<<"$methods" || true)
+      return 1
+    }
+    scope=$(printf ' -p %s' "$@")
+    prefix='cargo nextest run -P fast'
+    covers "$@" || missing+=("cargo nextest run -P fast$scope")
+    prefix='scripts/test-table --remote'
+    covers "$@" || missing+=("scripts/test-table --remote$scope")
+    if [ ${#missing[@]} -gt 0 ]; then
+      echo "no pass on $sha of: $(printf '%s; ' "${missing[@]}" | sed 's/; $//')"
+      exit 1
+    fi
+    ;;
+  full)
+    [ $# -eq 3 ] || usage
+    base=$(git merge-base "$2" "$3") || exit 2
+    changed=$(mktemp)
+    trap 'rm -f "$changed"' EXIT
+    git diff --no-renames --name-only -z "$base" "$3" >"$changed" || exit 2
+    found=false
+    while IFS= read -r -d '' path; do
+      if why=$(full_mode "$path"); then
+        found=true
+        echo "code-scope: full: $path ($why)"
+      fi
+    done <"$changed"
+    $found || { echo "code-scope: no path since $base needs the full table"; exit 1; }
+    ;;
   docs-only)
     [ $# -eq 3 ] || usage
     base=$(git merge-base "$2" "$3") || exit 2

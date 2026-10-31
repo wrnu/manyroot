@@ -17,6 +17,8 @@ not (
         | test(=verify_seq_sigterm_with_sigint_ignored_still_stops_both_runs)
         | test(=merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_scripts)
         | test(=merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_the_kickoff_templates)
+        | test(=merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed_in_scripts)
+        | test(=merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed_in_the_kickoff_templates)
         | test(=merge_lets_main_be_ahead_only_in_skill_docs_the_branch_leaves_alone)
         | test(=ground_checkpoint_refuses_more_than_a_pipe_of_unexpected_staged_lines)
         | test(=ground_guards_refuse_each_way_a_head_can_hide_or_break_the_ground)

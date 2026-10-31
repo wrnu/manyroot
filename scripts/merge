@@ -21,7 +21,15 @@
 #      only if <id> is a current manager pass of the whole table on a pr claim of the same PR with the
 #      same key (owner decision 642a47c04a10). Any other such pass fails this check. Here and in 5,
 #      'scripts/test-table --split' (the whole table in a box plus the macOS-only tests on the Mac,
-#      owner decision 01a2d668b67e) counts as scripts/test-table; --remote alone doesn't;
+#      owner decision 01a2d668b67e) counts as scripts/test-table; --remote alone doesn't. A light pass
+#      ('scripts/test-table --split -p <package>... @ <sha> on <main sha> tree <key>', from
+#      scripts/verify-seq --light: decision 464d3ccca45e, answer 10cf8a5053a3) counts as the --on form
+#      does in 5, but fails this check unless all of these hold: scripts/code-scope full names no path
+#      the head changed since main's tip (its list, the one list of the paths that need the whole
+#      table, is the only place they're named); its packages include every one scripts/code-scope packages computes
+#      for the head (AGENTS.md's Tests rows, findings 0095e19fcdb7, 4825c59b07e9); and the pr claim's
+#      author has the five passes on the exact sha that verify-seq --light checks first (scripts/code-scope
+#      light-passes, finding 013ac6db02d9). It exists only for a merged tree, never for the bare head;
 #   5. main's tip is an ancestor of the sha, or every file main changed since the
 #      branch point is under .bracken/, or is untouched by the branch and either
 #      under docs/ (not docs/vision.md) or a .md file under .claude/skills/ outside
@@ -31,8 +39,8 @@
 #      the merge ('scripts/test-table @ <sha> on <main sha>', from bk-evidence --on, with
 #      ' tree <key>' and then ' docs-only' or ' reuses <id>' after it as bk-evidence now
 #      records them) with a main sha that main's tip has moved past only in those same
-#      paths. A pass of any other command with --on doesn't count: part of the table
-#      proves too little;
+#      paths. A light pass counts here too, where the scope check allows it. A pass of
+#      any other command with --on doesn't count: part of the table proves too little;
 #   6. scripts/ground-guards passes on the sha against main's tip: no keys or stray
 #      files under .bracken/, the Ground append-only, the Ground opens, and
 #      docs/vision.md matches it;
@@ -291,10 +299,14 @@ git -C "$main" fetch -q origin main "refs/pull/$pr/head" || fail "couldn't fetch
 tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no origin/main"
 
 # The manager's passes of scripts/test-table naming the sha, one '<main sha>\t<key>\t<suffix>' line
-# each; the main and key are empty for a pass without --on, the suffix ' docs-only', ' reuses <id>' or empty.
+# each; the main and key are empty for a pass without --on, the suffix ' docs-only', ' reuses <id>',
+# ' light -p <package>...' (a light pass, always with --on) or empty.
 tables=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
   and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
-  | .body.method | capture("^scripts/test-table( --split)? @ (?<h>[0-9a-f]{40})( on (?<m>[0-9a-f]{40})( tree (?<k>[0-9a-f]{40,64}))?)?(?<x> docs-only| reuses [0-9a-f]{64})?$")?
+  | .body.method
+  | ((capture("^scripts/test-table( --split)? @ (?<h>[0-9a-f]{40})( on (?<m>[0-9a-f]{40})( tree (?<k>[0-9a-f]{40,64}))?)?(?<x> docs-only| reuses [0-9a-f]{64})?$")?)
+     // (capture("^scripts/test-table --split(?<p>( -p [A-Za-z0-9][A-Za-z0-9_-]*)+) @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40}) tree (?<k>[0-9a-f]{40,64})$")?
+         | .x = " light" + .p))
   | select(.h == $sha) | [.m // "", .k // "", .x // ""] | @tsv] | unique | .[]' <<<"$shown")
 # The manager's batch passes naming the sha, one '<batch>\t<main>\t<key>\t<run>' line each.
 batch_passes=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
@@ -434,9 +446,44 @@ else
   if scope=$(cd "$main" && "$here/code-scope" docs-only "$tip" "$sha" 2>&1); then docs_only=true; fi
   scope=${scope#code-scope: }
   wrong=()
+  needs_full='' light_packages='' light_passes=''
   while IFS=$'\t' read -r m k x; do
     case "$x" in
       " docs-only") $docs_only || wrong+=("a docs-only pass${m:+ on main $m} on a head that isn't docs-only ($scope)") ;;
+      " light -p "*)
+        # The one list of what needs the whole table (code-scope full), and the scope from AGENTS.md's
+        # rows (code-scope packages), read as verify-seq --light reads them.
+        [ -n "$needs_full" ] || needs_full=$(cd "$main" && "$here/code-scope" full "$tip" "$sha" 2>&1; echo "exit $?")
+        case "${needs_full##*exit }" in
+          1) ;;
+          0) wrong+=("a light pass on main $m, but the head needs the whole table: $(sed '$d; s/^code-scope: full: //' <<<"$needs_full" | tr '\n' ' ' | sed 's/ $//')") ;;
+          *) wrong+=("a light pass on main $m, and code-scope full failed: $(sed '$d' <<<"$needs_full" | tr '\n' ' ')") ;;
+        esac
+        [ -n "$light_packages" ] || light_packages=$(cd "$main" && "$here/code-scope" packages "$tip" "$sha" 2>&1; echo "exit $?")
+        if [ "${light_packages##*exit }" != 0 ]; then
+          wrong+=("a light pass on main $m, and code-scope packages failed: $(sed '$d' <<<"$light_packages" | tr '\n' ' ')")
+        elif [ "$light_packages" = "exit 0" ]; then
+          wrong+=("a light pass on main $m, but the head has no package to test")
+        else
+          lacks=()
+          while IFS= read -r p; do
+            [[ "$x " == *" -p $p "* ]] || lacks+=("$p")
+          done < <(sed '$d' <<<"$light_packages")
+          [ ${#lacks[@]} -eq 0 ] || wrong+=("a light pass on main $m that leaves out ${lacks[*]}, which the head's changes need")
+          # The pr claim's author's five passes on the exact sha, verify-seq --light's precondition.
+          if [ -z "$light_passes" ]; then
+            # shellcheck disable=SC2046 # one package name a word
+            light_passes=$(jq -r --arg full "$full" '.author_name as $a | [.referrers[] | select(.kind == "evidence"
+              and .retracted == false and .author_name == $a and .body.target == $full and .body.verdict == "pass")
+              | .body.method] | .[]' <<<"$shown" | "$here/code-scope" light-passes "$sha" $(sed '$d' <<<"$light_packages") 2>&1; echo "exit $?")
+          fi
+          case "${light_passes##*exit }" in
+            0) ;;
+            1) wrong+=("a light pass on main $m, but the pr claim's author has $(sed '$d' <<<"$light_passes")") ;;
+            *) wrong+=("a light pass on main $m, and code-scope light-passes failed: $(sed '$d' <<<"$light_passes" | tr '\n' ' ')") ;;
+          esac
+        fi
+        ;;
       " reuses "*) reuses_a_pass "${x# reuses }" "$k" ||
         wrong+=("a pass reusing ${x# reuses }, which isn't a current manager pass of the whole table on PR #$pr with key ${k:-none}") ;;
     esac
