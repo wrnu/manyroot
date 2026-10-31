@@ -132,6 +132,66 @@ fn a_change_to_brackens_build_brings_the_packages_that_run_its_binary() {
     assert_eq!((code, lines), (Some(0), vec!["bracken".to_owned()]), "{err}");
 }
 
+/// The edges between `dir`'s workspace packages that only some platforms have, as `<from> -> <to> (<target>)`:
+/// each member's declared dependencies, from `cargo metadata --no-deps`, which needs no crate fetched, so it
+/// sees every platform's where a filtered graph can't.
+fn platform_specific_edges(dir: &Path) -> Vec<String> {
+    let out = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--offline", "--format-version", "1"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let metadata: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let members = metadata["packages"].as_array().unwrap();
+    let names: Vec<&str> = members.iter().map(|p| p["name"].as_str().unwrap()).collect();
+    let mut edges = Vec::new();
+    for member in members {
+        for dep in member["dependencies"].as_array().unwrap() {
+            let to = dep["name"].as_str().unwrap();
+            if names.contains(&to) && !dep["target"].is_null() {
+                edges.push(format!("{} -> {to} ({})", member["name"].as_str().unwrap(), dep["target"]));
+            }
+        }
+    }
+    edges
+}
+
+/// graph_at filters cargo metadata to the host's platform (gotcha 8e4eafdd00a7), which drops any dependency
+/// declared for other platforms only. That loses nothing the determinator reads only while no edge between
+/// this workspace's packages is platform-specific (task 7000db5f8726). The check finds one in a fixture that
+/// has it, so it can fail.
+#[test]
+fn no_edge_between_workspace_packages_is_platform_specific() {
+    assert_eq!(platform_specific_edges(&repo_root()), Vec::<String>::new());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    put(dir, "Cargo.toml", "[workspace]\nresolver = \"3\"\nmembers = [\"crates/a\", \"crates/b\"]\n");
+    krate(dir, "a", &[], "a");
+    krate(dir, "b", &[], "b");
+    let b = dir.join("crates/b/Cargo.toml");
+    let manifest = std::fs::read_to_string(&b).unwrap();
+    std::fs::write(&b, format!("{manifest}\n[target.'cfg(windows)'.dependencies]\na = {{ path = \"../a\" }}\n"))
+        .unwrap();
+    assert_eq!(platform_specific_edges(dir), ["b -> a (\"cfg(windows)\")"]);
+}
+
+/// The host's triple comes from $RUSTC when it names a compiler, as cargo takes it (task 7000db5f8726): one
+/// that doesn't exist is the error.
+#[test]
+fn the_host_comes_from_rustc_when_it_names_one() {
+    let out = Command::new(env!("CARGO_BIN_EXE_bracken-scope"))
+        .args(["packages", "--all", "HEAD"])
+        .env("RUSTC", "/no/such/rustc")
+        .current_dir(repo_root())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.code() == Some(2) && err.contains("running /no/such/rustc -vV"), "{err}");
+}
+
 /// This repository's package graph at HEAD, built once.
 fn here() -> &'static PackageGraph {
     static GRAPH: OnceLock<PackageGraph> = OnceLock::new();
