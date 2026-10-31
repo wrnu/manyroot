@@ -493,12 +493,20 @@ pub fn serve_http(intake: Intake, tokens: Tokens, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// How long [`linger`] waits for the peer to close.
+pub const LINGER: Duration = Duration::from_secs(1);
+
 /// Closes a connection after its response without losing the response: closing a socket with
 /// unread input (a pipelined request, an unread body) resets it, and the peer may then drop the
-/// response. So this half-closes, and discards a bounded amount of input first.
+/// response. So this half-closes, and discards a bounded amount of input first, for up to [`LINGER`].
 pub fn linger(stream: &TcpStream) {
+    linger_for(stream, LINGER);
+}
+
+/// [`linger`], waiting up to `wait`.
+pub fn linger_for(stream: &TcpStream, wait: Duration) {
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let mut input = Timed::new(stream, Instant::now() + Duration::from_secs(1), None);
+    let mut input = Timed::new(stream, Instant::now() + wait, None);
     let _ = io::copy(&mut (&mut input).take(1 << 20), &mut io::sink());
 }
 
