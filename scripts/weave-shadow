@@ -83,14 +83,16 @@ if [ -n "$init" ]; then
   # Each step only if it isn't done yet. weave-runner first, so a line written below can name it.
   ids=$("$weave" id list --json)
   jq -e 'any(.[]; .name == "weave-runner")' <<<"$ids" >/dev/null || "$weave" id new weave-runner
-  # line main's current policy, as a dry run that changes nothing shows it; none if weave init stopped
-  # after its marker, before writing the line. The line by its id, never by its name.
+  # line main's current policy, as a dry run that changes nothing shows it; no line if weave init stopped
+  # after its marker, before writing the line. The line by its id, never by its name. Only with no default
+  # line is line main created: a dry run that fails stops here with its error, rather than write a second
+  # line main (finding b33d60c94e6d).
   line=$("$weave" weave head --json 2>/dev/null | jq -r '.line // empty') || line=''
-  if [ -z "$line" ] ||
-    ! shown=$("$weave" weave line policy "$line" --dry-run --json --owner-decision "$owner" --as weave-integrator 2>/dev/null)
-  then
+  if [ -z "$line" ]; then
     "$weave" weave line create main "${policy[@]}"
   else
+    shown=$("$weave" weave line policy "$line" --dry-run --json --owner-decision "$owner" --as weave-integrator) ||
+      fail "can't read line main's policy ($line), so --init stops and writes nothing"
     runner=$(jq -r '.[] | select(.name == "weave-runner") | .agent' <<<"$("$weave" id list --json)")
     jq -e --arg r "$runner" '(.validators | index($r) != null) and .checks.fmt != null and .checks.clippy != null' \
       <<<"$shown" >/dev/null && fail "the Weave Ground $path is already set up; --init has nothing to do"
