@@ -17,7 +17,8 @@
 //!   directory; starts only the interpreter, and never forks; no network.
 //!
 //! No profile can read another process's arguments, environment, path or
-//! information, or list processes ([`BASE`]).
+//! information, or list processes through the process table ([`BASE`]).
+//! Which pids are live can still be learnt, one pid at a time.
 //!
 //! Every path a rule names is resolved first: the kernel checks resolved
 //! paths, so a rule on `/tmp/x` never matches `/private/tmp/x`.
@@ -33,9 +34,11 @@ pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 /// without the `kern.proc` prefix, `KERN_PROCARGS2` still reads its arguments and environment, a parent's
 /// secrets included, and `process-info*` must be unqualified, since `(target others)` leaves out the process
 /// group. A process may still read its own, as the check runner's profile found cargo needs (#160).
-/// `getpgid` and `getsid` are denied too, which would otherwise tell which pids are live and their groups
-/// and sessions (task 72fd057d4b33): for any pid, its own included, since the rule can't tell them apart.
-/// `getpgrp` stays.
+/// `getpgid` and `getsid` are denied too, which would otherwise tell any pid's group and session (task
+/// 72fd057d4b33): for any pid, its own included, since the rule can't tell them apart. `getpgrp` stays.
+/// Which pids are live stays open (finding f55c629069a9): `getpriority` answers for a live pid or group, and
+/// a denied call fails differently for a live pid and a dead one. That gives no arguments, environment, name
+/// or path.
 const BASE: &str = r#"(version 1)
 (deny default)
 (allow process-fork)

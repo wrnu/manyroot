@@ -345,7 +345,7 @@ mod macos_only {
             let tail = String::from_utf8_lossy(&out.tail).into_owned();
             let pid: i32 = tail.trim().parse().unwrap_or_else(|_| panic!("{what}: no pid in {tail:?}"));
             // The check can't ask the child's group itself, since the profile denies getpgid (task
-            // 72fd057d4b33): the runner finding it outside the check's group says it left.
+            // 72fd057d4b33): the runner finding it outside the check's group says it joined the runner's.
             // Should it survive, it's in this process's group: kill it by pid, never by group.
             let _guard = KillOnDrop::of(&[pid]);
             assert!(!alive(&pid.to_string()), "{what}: the child {pid} in the runner's group outlived the check");

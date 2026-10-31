@@ -246,7 +246,8 @@ mod macos_only {
     /// Agent code can't forge a pass (findings 734e5389e188, d077f100ac33, d1f7d7880644): by naming a module of
     /// the standard library, which the test then imports; by raising StopIteration to stop the test's iterator
     /// early; by returning a list whose `in` always says yes; or by raising a class that claims to be unittest's
-    /// own through another module.
+    /// own through another module. Nor can a class that claims a lazily imported name of unittest make the host
+    /// import it (finding 998cb1f3da18).
     #[test]
     fn agent_code_cant_forge_a_pass() {
         let stats = "import fractions\n\nclass Yes(list):\n    def __contains__(self, x):\n        return True\n\n\
@@ -254,8 +255,11 @@ mod macos_only {
                      def items():\n    return Yes([1])\n\n\
                      class Stop(Exception):\n    pass\n\n\
                      Stop.__module__ = 'doctest'\nStop.__qualname__ = 'unittest.case._ShouldStop'\n\n\
-                     def stop():\n    raise Stop()\n";
-        let test = "import types, unittest\nimport tiny.stats as stats\n\nclass T(unittest.TestCase):\n\
+                     def stop():\n    raise Stop()\n\n\
+                     class Lazy(Exception):\n    pass\n\n\
+                     Lazy.__module__ = 'unittest'\nLazy.__qualname__ = 'IsolatedAsyncioTestCase'\n\n\
+                     def lazy():\n    raise Lazy()\n";
+        let test = "import sys, types, unittest\nimport tiny.stats as stats\n\nclass T(unittest.TestCase):\n\
                     \x20   def test_no_module_but_the_package(self):\n        with self.assertRaises(Exception):\n\
                     \x20           stats.lib()\n        import fractions\n\
                     \x20       self.assertIs(type(fractions), types.ModuleType)\n\
@@ -267,9 +271,12 @@ mod macos_only {
                     \x20       self.assertEqual(stats.items(), [1])\n\
                     \x20   def test_no_class_of_unittest_through_another_module(self):\n\
                     \x20       with self.assertRaises(Exception) as cm:\n            stats.stop()\n\
-                    \x20       self.assertFalse(issubclass(type(cm.exception), unittest.case._ShouldStop))\n";
+                    \x20       self.assertFalse(issubclass(type(cm.exception), unittest.case._ShouldStop))\n\
+                    \x20   def test_no_lazy_import_for_a_claimed_class(self):\n\
+                    \x20       with self.assertRaises(Exception):\n            stats.lazy()\n\
+                    \x20       self.assertNotIn('unittest.async_case', sys.modules)\n";
         let g = graded(stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
-        assert_eq!(g.counts, Counts { pass: 4, ..Counts::default() }, "{g:#?}");
+        assert_eq!(g.counts, Counts { pass: 5, ..Counts::default() }, "{g:#?}");
     }
 
     /// A crash costs only its own test (findings fe2549db89ee, 5f5c3b4b25a9): `f`, imported from the package at

@@ -851,12 +851,14 @@ The layers, each of which holds if another fails:
 
    No profile can read another process: not its arguments or environment
    (`KERN_PROCARGS2`, where a parent's secrets would be), its path or its
-   information, nor list processes. That takes both `(deny sysctl-read
-   (sysctl-name-prefix "kern.proc"))` and an unqualified `(deny
-   process-info*)` (note `116ae2144d9d`); a process may still read its own
-   (task `e23f87035615`). `getpgid` and `getsid`, which would tell which
-   pids are live, are denied for every pid, its own included (task
-   `72fd057d4b33`).
+   information, nor list processes through the process table. That takes
+   both `(deny sysctl-read (sysctl-name-prefix "kern.proc"))` and an
+   unqualified `(deny process-info*)` (note `116ae2144d9d`); a process may
+   still read its own (task `e23f87035615`). `getpgid` and `getsid`, which would tell a pid's
+   group and session, are denied for every pid, its own included (task
+   `72fd057d4b33`). Which pids are live can still be learnt, one pid at a
+   time, from `getpriority` or the error of a denied call (finding
+   `f55c629069a9`), but not what they run.
 
    `sandbox-exec` is deprecated but still works on current macOS. Step 6
    proves each profile with tests that try each forbidden access from inside
