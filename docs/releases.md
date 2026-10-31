@@ -65,6 +65,39 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-10-31: Weave's payload formats are pinned
+
+Task `3be1b325a43e` (Weave build step 8, docs/design/weave.md section 5).
+No format changes: this pins the formats Weave already writes, so that a
+later change to them is caught.
+
+- **Existing Grounds open unchanged.** No encoding, id, signing context,
+  validity rule or body kind changed, in the coordination Ground or in
+  Weave's records.
+- **Pinned:** Weave's seven media types (file, manifest, marker, line,
+  decision, proposal, resolution) are pinned twice:
+  - by the golden vectors in `crates/tree/tests/format_guard.rs`, one record
+    of each type with its bytes and content hash;
+  - by the fixture Weave Ground `crates/tree/tests/fixtures/weave-v1`, which
+    `crates/tree/tests/weave_fixture.rs` opens. It checks every id, every
+    record's bytes, and every derived status: qualification, heads, green,
+    counted results, reviews, goals and open objections.
+- **The coordination Ground with Weave linked in:**
+  - `crates/tree/tests/coordination_fixture.rs` opens the coordination
+    fixture `ground-v1` from the library;
+  - `crates/bracken/tests/coordination_fixture.rs` opens it through the
+    binary.
+
+  Both compare every status, the accepted layer and its conflicts with
+  `ground-v1-acceptance.json`, under one pass and two. The binary's test also
+  checks that `weave check` finds nothing and that reading writes nothing.
+- **A later change to a Weave format, or to how the fixture reads, is
+  protocol class:** an independent review, the manager's go logged as
+  `owner-review`, and an entry here naming what changed. Rebuilding
+  `weave-v1` (its ignored `write_weave_v1_fixture` test) or editing a pinned
+  value is part of that change, never a way to make a test pass. Add new
+  cases to the scenario's end, so that the existing ids stay as they are.
+
 ### 2026-10-27: supersession counts only when the relation's author wrote the target
 
 Decision `4c55e65bc290` (point 4), answering `3d381dfdb8a9`. A
