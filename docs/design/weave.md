@@ -921,8 +921,8 @@ nothing else runs a check on a Weave manifest (security note
     new ones appear), stops and kills each, and fails the run if any had
     left the group. The gap that remains: a process that left the group and
     was orphaned (its parent exited, so launchd adopted it) before the walk
-    can't be found. It closes with the dedicated check user of deferred task
-    `fd68bfe3c07c`, whose every process can be killed. A child that joins
+    can't be found. It stays a documented limit: checks run as the owner's
+    own user (decision `6f15365a7281`). A child that joins
     another group of the session, the runner's included, through
     `POSIX_SPAWN_SETPGROUP`, is found and killed the same way, but only while
     its parent chain to the check is alive. Orphaned there, it escapes as any

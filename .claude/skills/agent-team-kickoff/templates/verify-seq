@@ -5,6 +5,8 @@
 #   [ON=origin/main] verify-seq [--split [-j N]] <pr claim>:<sha> ...
 #   [ON=origin/main] verify-seq [--split] --batch <pr claim>:<sha> ...
 #   [ON=origin/main] verify-seq --split [-j N] --speculative <pr claim>:<sha> ...
+#   [ON=origin/main] verify-seq --light [--reason <why>] <pr claim>:<sha> ...
+#   --reason <why> goes with any of them
 #
 # For each pair, in a scratch worktree at <sha> (removed afterwards if the run left it clean), this
 # checkout's bk-evidence records a run of scripts/test-table on <claim> as manager, and the last two
@@ -52,11 +54,33 @@
 # pass or pin that can't be written isn't reported as done: the queue stops there and exits 1, as it does
 # when a run's job ends without recording anything.
 #
+# --light (decision 464d3ccca45e, answer 10cf8a5053a3) is the light counted run, for one head at a time,
+# here. The full table stays the default; the manager chooses light, by risk. Its scope is the packages
+# scripts/code-scope packages computes from the head's changed files through AGENTS.md's Tests rows
+# (findings 0095e19fcdb7, 4825c59b07e9), never the builder's own choice. For each head it first checks,
+# and refuses with the reason, recording nothing, unless:
+#   - the scope isn't empty (a change only to rustfmt.toml has none: run the full table);
+#   - the pr claim's author recorded passes on that exact head of cargo fmt --check, both clippies
+#     (cargo clippy --all-targets -- -D warnings, and with --target x86_64-unknown-linux-gnu), and cargo
+#     nextest run -P fast -p <package>... and scripts/test-table --remote -p <package>..., each naming
+#     every package in the scope (scripts/code-scope light-passes);
+#   - scripts/code-scope full names no path the head changed since main (its list, the one list of
+#     the paths that need the whole table, is the only place they're named).
+# Those passes are a precondition only: nothing counted rests on them (finding 94e07ed7dd6b). It then
+# runs scripts/test-table --split -p <the scope> on the merged tree (bk-evidence --on ON, default
+# origin/main, without --reuse): the scope's light table in a box, and its macOS-only tests here. So
+# main merged with the head is always tested for the scope, whether or not main moved since the
+# builder's run. Batches stay full: --light refuses --batch, --speculative, --split and -j.
+#
+# Every run's evidence details end with 'test-table: counted run mode: <light|full>: <why>': for light,
+# the scope and the builder's passes it checked; for full, any path code-scope full names, then
+# --reason, if given, or 'the default'.
+#
 # A Ctrl-C or SIGTERM stops every running run, each box deleted, and records no evidence for them;
 # it exits 130.
 set -uo pipefail
 
-usage() { echo "usage: [ON=<main>] verify-seq [--split [-j N]] [--batch | --speculative] <pr claim>:<sha> ..." >&2; exit 2; }
+usage() { echo "usage: [ON=<main>] verify-seq [--split [-j N]] [--batch | --speculative] [--reason <why>] <pr claim>:<sha> ..." >&2; echo "       [ON=<main>] verify-seq --light [--reason <why>] <pr claim>:<sha> ..." >&2; exit 2; }
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 cd "$main" || exit 1
@@ -64,9 +88,15 @@ table=(scripts/test-table)
 jobs=''
 batch=false
 speculative=false
+light=false
+reason=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --split) table=(scripts/test-table --split); shift ;;
+    --light) light=true; shift ;;
+    --reason) [ $# -ge 2 ] && [[ $2 =~ [^[:space:]] ]] && [[ $2 != *$'\n'* ]] ||
+      { echo "verify-seq: --reason takes one line saying why" >&2; exit 2; }
+      reason=$2; shift 2 ;;
     --batch) batch=true; shift ;;
     --speculative) speculative=true; shift ;;
     -j) [ $# -ge 2 ] && [[ $2 =~ ^[1-8]$ ]] || { echo "verify-seq: -j takes 1 to 8 (boxes at once)" >&2; exit 2; }
@@ -104,6 +134,15 @@ split=false
 ! $batch || [ -z "$jobs" ] || { echo "verify-seq: --batch runs one tree at a time; -j doesn't apply" >&2; exit 2; }
 ! $batch || ! $speculative || { echo "verify-seq: --batch and --speculative don't go together" >&2; exit 2; }
 ! $speculative || $split || { echo "verify-seq: --speculative needs --split: its runs go in boxes at once" >&2; exit 2; }
+if $light; then
+  ! $split && ! $batch && ! $speculative && [ -z "$jobs" ] ||
+    { echo "verify-seq: --light runs one head at a time, here: batches and --split stay full" >&2; exit 2; }
+  command -v jq >/dev/null || { echo "verify-seq: --light needs jq" >&2; exit 2; }
+  # The light run always tests the merged tree.
+  ON=${ON:-origin/main}
+fi
+# Each run's mode, for its evidence's details (test-table prints it at the end).
+export TEST_TABLE_MODE="full: ${reason:-the default}"
 # Boxes at once (decision 2a9e444218d6, answer c3e60ba8b879): 4 by default with --split; one run at a
 # time without it, or with --batch.
 if [ -z "$jobs" ]; then
@@ -116,11 +155,60 @@ fi
 # verify-seq would exit with the run's boxes still up. bk-evidence runs in this shell, not a subshell,
 # which would take SIGTERM's default again. A signal before bk-evidence starts stops it starting
 # (note fa805ecf517e); one as it starts reaches it too, through the job's group.
+# light_check <pr claim> <sha>: whether a light run may count for this head, by the rules above. Sets
+# light_scope (the -p options) and light_why (what it checked), or prints why not and returns 1.
+light_check() {
+  local claim=$1 h=$2 shown id author methods scope missing full rc=0
+  scope=$(cd "$main" && "$here/code-scope" packages "$ON" "$h" 2>&1) ||
+    { echo "light refused: code-scope packages failed: $scope"; return 1; }
+  [ -n "$scope" ] || { echo "light refused: no package to test (a change only to rustfmt.toml): run the full table"; return 1; }
+  # shellcheck disable=SC2086 # one package name a word
+  light_scope=$(printf ' -p %s' $scope)
+  shown=$(bk show "$claim" --json 2>/dev/null) || { echo "light refused: no claim $claim"; return 1; }
+  id=$(jq -r .id <<<"$shown")
+  author=$(jq -r '.author_name // empty' <<<"$shown")
+  [ -n "$author" ] || { echo "light refused: $claim has no author name"; return 1; }
+  methods=$(bk log --kind evidence --author "$author" --json | jq -r --arg t "$id" '.[]
+    | select(.body.target == $t and .body.verdict == "pass" and (.retracted | not)) | .body.method') ||
+    { echo "light refused: couldn't read $author's evidence on $claim"; return 1; }
+  # shellcheck disable=SC2086 # one package name a word
+  missing=$("$here/code-scope" light-passes "$h" $scope <<<"$methods" 2>&1) || rc=$?
+  if [ "$rc" -eq 1 ]; then
+    echo "light refused: $author has $missing (on $claim)"
+    return 1
+  elif [ "$rc" -ne 0 ]; then
+    echo "light refused: code-scope light-passes failed: $missing"
+    return 1
+  fi
+  if full=$(cd "$main" && "$here/code-scope" full "$ON" "$h" 2>&1); then
+    echo "light refused: the full table is required: $(tr '\n' ' ' <<<"$full" | sed 's/ $//')"
+    return 1
+  elif [ $? -ne 1 ]; then
+    echo "light refused: code-scope full failed: $full"
+    return 1
+  fi
+  light_why="the scope$light_scope, from the changed files; $author's passes on $h of fmt, both clippies, the fast run and --remote, naming it; no path needs the full table"
+}
+
 verify() {
-  local claim=${1%%:*} h=${1#*:} stopped=false
+  local claim=${1%%:*} h=${1#*:} stopped=false light_scope='' light_why='' full
   local v="${TMPDIR:-/tmp}/verify-$h"
+  local cmd=("${table[@]}")
   trap 'stopped=true' INT TERM
   echo "== $claim @ ${h:0:7}"
+  if $light; then
+    if ! light_check "$claim" "$h"; then
+      cd "$main" && git worktree remove "$v"
+      echo "nothing run or recorded for $claim"
+      return
+    fi
+    # shellcheck disable=SC2206 # the -p options, one word each
+    cmd=(scripts/test-table --split $light_scope)
+    TEST_TABLE_MODE="light: ${reason:+$reason; }$light_why"
+  elif full=$(cd "$main" && "$here/code-scope" full "${ON:-origin/main}" "$h" 2>/dev/null); then
+    full=${full//code-scope: full: /}
+    TEST_TABLE_MODE="full: required: ${full//$'\n'/; }; ${reason:-the default}"
+  fi
   # The worktree is made before the fork, one at a time (see the loop below).
   cd "$v" || return
   if $stopped; then
@@ -128,7 +216,11 @@ verify() {
     echo "interrupted before the run; nothing recorded"
     return
   fi
-  "$here/bk-evidence" "$claim" --as manager ${ON:+--on "$ON" --reuse} -- "${table[@]}" >"$logs/$claim.out" 2>&1
+  if $light; then
+    "$here/bk-evidence" "$claim" --as manager --on "$ON" -- "${cmd[@]}" >"$logs/$claim.out" 2>&1
+  else
+    "$here/bk-evidence" "$claim" --as manager ${ON:+--on "$ON" --reuse} -- "${cmd[@]}" >"$logs/$claim.out" 2>&1
+  fi
   # Recorded only if bk-evidence says so; anything else (a changed checkout, an unconfirmed write) is a PR
   # not run, and verify-seq exits 1 (finding f764c35b1147).
   ! grep -qE '^bk-evidence: recorded (pass|fail) [0-9a-f]{64} ' "$logs/$claim.out" || touch "$logs/$claim.ok"

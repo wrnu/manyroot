@@ -673,7 +673,8 @@ mod run {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        // Whether it ended or timed out, nothing it started outlives it.
+        // Whether it ended or timed out, nothing it started that the sweep can find outlives it (an orphan
+        // can, weave.md section 3).
         let (status, left) = group.finish()?;
         // A process the sweep couldn't find may still hold the pipe: wait for it only briefly, then stop
         // the reader, which ends before its next read, and join it. A held pipe fails the run.

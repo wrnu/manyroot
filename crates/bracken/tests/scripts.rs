@@ -1347,6 +1347,94 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
     }
 }
 
+/// `test-table --light -p <package>...` (decision `464d3ccca45e`), with a `cargo` stub that logs each call and
+/// knows two packages, one with a library: fmt, both clippies, nextest of exactly those packages, the
+/// doctests of those with a library only, then the Ground guards. With TEST_TABLE_MODE set it ends with
+/// the counted run's mode, on a pass and on a failing step. A package the workspace lacks is refused
+/// before any check runs.
+#[test]
+fn test_table_light_runs_the_named_packages_and_the_guards() {
+    for scripts in SCRIPTS {
+        let (table, scope) =
+            (repo_root().join(scripts).join("test-table"), repo_root().join(scripts).join("code-scope"));
+        let files = [("scripts/test-table", table.as_path()), ("scripts/code-scope", scope.as_path())];
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\necho \"ground-guards $*\" >>\"$LOG\"\n");
+        });
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        let meta = r#"{"packages":[{"name":"lib-a","targets":[{"kind":["lib"]},{"kind":["test"]}]},{"name":"bin-b","targets":[{"kind":["bin"]}]}]}"#;
+        write_executable(
+            &stubs.join("cargo"),
+            &format!(
+                "#!/bin/sh\necho \"cargo $*\" >>\"$LOG\"\ncase \"$*\" in metadata*) echo '{meta}' ;; esac\n\
+                 case \"$*\" in *\"$FAIL_ON\"*) [ -n \"$FAIL_ON\" ] && exit 3 ;; esac\nexit 0\n"
+            ),
+        );
+        let log = tmp.path().join("log");
+        let light = |args: &[&str], fail_on: &str| {
+            let _ = std::fs::remove_file(&log);
+            let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+            let mut all = vec!["--light"];
+            all.extend_from_slice(args);
+            let out = command(&dir, "scripts/test-table", &all)
+                .env("PATH", path)
+                .env("LOG", &log)
+                .env("FAIL_ON", fail_on)
+                .env("TEST_TABLE_MODE", "light: the builder's passes")
+                .output()
+                .unwrap();
+            (out, std::fs::read_to_string(&log).unwrap_or_default())
+        };
+        let start = "cargo nextest --version\ncargo metadata --locked --no-deps --format-version 1\n";
+        let checks = "cargo fmt --check\n\
+                      cargo clippy --locked --all-targets -- -D warnings\n\
+                      cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings\n";
+
+        let (out, calls) = light(&["-p", "lib-a", "-p", "bin-b"], "");
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            calls,
+            format!(
+                "{start}{checks}cargo nextest run --locked --no-fail-fast -p lib-a -p bin-b\n\
+                 cargo test --locked --doc -p lib-a\nground-guards origin/main HEAD\n"
+            ),
+            "{scripts}"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("light run passed at") && stdout.contains("not the whole table"),
+            "{scripts}: {stdout}"
+        );
+        assert!(
+            stdout.trim_end().ends_with("test-table: counted run mode: light: the builder's passes"),
+            "{scripts}: {stdout}"
+        );
+
+        // A binary-only scope has no doctests to run, and says so.
+        let (out, calls) = light(&["-p", "bin-b"], "");
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(!calls.contains("--doc") && String::from_utf8_lossy(&out.stdout).contains("no doctests"), "{scripts}");
+
+        // A failing step stops the run, and the mode still ends the output.
+        let (out, calls) = light(&["-p", "lib-a"], "nextest run");
+        assert!(!out.status.success(), "{scripts}: a failing step passed");
+        assert!(!calls.contains("--doc") && !calls.contains("ground-guards"), "{scripts}: went on: {calls}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("failed: ") && stderr.contains("counted run mode: light"), "{scripts}: {stderr}");
+
+        // A package the workspace lacks, or no package, is refused before any check.
+        let (out, calls) = light(&["-p", "lib-a", "-p", "nope"], "");
+        assert!(!out.status.success(), "{scripts}: an unknown package ran");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no package nope"), "{scripts}");
+        assert_eq!(calls, start, "{scripts}: ran a check for an unknown package");
+        for args in [&[][..], &["lib-a"], &["-p", "--workspace"]] {
+            let (out, calls) = light(args, "");
+            assert!(!out.status.success() && calls.is_empty(), "{scripts}: {args:?} ran: {calls}");
+        }
+    }
+}
+
 /// `services` (owner decision `6fed6a4c8af0`), without touching this machine's launchd: `launchctl`
 /// is a stub that logs its calls and has nothing loaded, and HOME is a throwaway directory. The dry
 /// run prints two valid plists that keep alive what scripts/team-server run and scripts/bk view start,
@@ -2059,6 +2147,288 @@ fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_the_kickoff_te
     merge_counts_a_docs_only_or_reused_pass_only_where_it_holds(SCRIPTS[1]);
 }
 
+/// scripts/code-scope full names each path a head changed that needs the whole table, a rename or a
+/// deletion of one too (a rename counts as a deletion and an addition), and any build.rs; code-scope packages maps the
+/// changed files through AGENTS.md's Tests rows (findings 0095e19fcdb7, 4825c59b07e9); and code-scope
+/// light-passes says which of the five builder passes a light run needs are missing on the sha.
+#[test]
+fn code_scope_names_what_needs_the_full_table_and_the_light_scope() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("code-scope");
+        let files = [("scripts/code-scope", scope.as_path())];
+        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/old.rs", "tree\n");
+            put(dir, "crates/manyroot/src/gone.rs", "protocol\n");
+            put(dir, "notes.txt", "notes\n");
+        });
+        let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?}");
+        let scope = |args: &[&str]| {
+            let out = run(&dir, "scripts/code-scope", args);
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let branch = |name: &str, change: &dyn Fn()| {
+            git(&["switch", "-qc", name, "main"]);
+            change();
+            commit_all(&dir, name);
+            git(&["switch", "-q", "main"]);
+        };
+        branch("rename", &|| git(&["mv", "crates/tree/src/old.rs", "elsewhere.rs"]));
+        branch("delete", &|| git(&["rm", "-q", "crates/manyroot/src/gone.rs"]));
+        branch("docs", &|| put(&dir, "notes.txt", "more\n"));
+        branch("demo", &|| {
+            put(&dir, "crates/demo/src/main.rs", "demo\n");
+            put(&dir, "scripts/x", "x\n");
+        });
+        branch("fmt", &|| put(&dir, "rustfmt.toml", "max_width = 120\n"));
+        branch("build", &|| {
+            put(&dir, "crates/tree/build.rs", "fn main() {}\n");
+            put(&dir, "build.rs", "fn main() {}\n");
+            put(&dir, "crates/demo/sub/build.rs", "fn main() {}\n");
+        });
+
+        let (code, out) = scope(&["full", "main", "rename"]);
+        assert_eq!(code, Some(0), "{scripts}: {out}");
+        assert!(out.contains("code-scope: full: crates/tree/src/old.rs ("), "{scripts}: {out}");
+        let (code, out) = scope(&["full", "main", "delete"]);
+        assert_eq!(code, Some(0), "{scripts}: {out}");
+        assert!(out.contains("code-scope: full: crates/manyroot/src/gone.rs ("), "{scripts}: {out}");
+        assert_eq!(scope(&["full", "main", "docs"]).0, Some(1), "{scripts}");
+        // A build script anywhere, with no manifest change (finding 398c794c1707).
+        let (code, out) = scope(&["full", "main", "build"]);
+        assert_eq!(code, Some(0), "{scripts}: {out}");
+        for path in ["build.rs", "crates/tree/build.rs", "crates/demo/sub/build.rs"] {
+            assert!(out.contains(&format!("code-scope: full: {path} (a build script)")), "{scripts}: {path}: {out}");
+        }
+        assert_eq!(scope(&["full", "main", "no-such-branch"]).0, Some(2), "{scripts}");
+
+        assert_eq!(scope(&["packages", "main", "rename"]).1, "bracken\nbracken-tree\n", "{scripts}");
+        assert_eq!(
+            scope(&["packages", "main", "delete"]).1,
+            "bracken\nbracken-demo\nbracken-experiment\nbracken-tree\nmanyroot\n",
+            "{scripts}"
+        );
+        assert_eq!(scope(&["packages", "main", "docs"]).1, "bracken\nbracken-tree\n", "{scripts}");
+        assert_eq!(scope(&["packages", "main", "demo"]).1, "bracken\nbracken-demo\nbracken-experiment\n", "{scripts}");
+        assert_eq!(scope(&["packages", "main", "fmt"]), (Some(0), String::new()), "{scripts}");
+
+        let h = "a".repeat(40);
+        let passes = |methods: &[&str], packages: &[&str]| {
+            let mut args = vec!["light-passes", h.as_str()];
+            args.extend_from_slice(packages);
+            let mut c = command(&dir, "scripts/code-scope", &args);
+            let mut child = c.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).spawn().unwrap();
+            let text: String = methods.iter().map(|m| format!("{m} @ {h}\n")).collect();
+            std::io::Write::write_all(&mut child.stdin.take().unwrap(), text.as_bytes()).unwrap();
+            let out = child.wait_with_output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let all = [
+            "cargo fmt --check",
+            "cargo clippy --all-targets -- -D warnings",
+            "cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings",
+            "cargo nextest run -P fast -p bracken-tree -p bracken",
+            "scripts/test-table --remote -p bracken -p bracken-tree -p bracken-demo",
+        ];
+        assert_eq!(passes(&all, &["bracken", "bracken-tree"]), (Some(0), String::new()), "{scripts}");
+        // bracken-demo is in the --remote run but not the fast run; bracken-tre isn't bracken-tree.
+        let (code, out) = passes(&all, &["bracken", "bracken-demo"]);
+        assert_eq!(code, Some(1), "{scripts}: {out}");
+        assert_eq!(
+            out,
+            format!("no pass on {h} of: cargo nextest run -P fast -p bracken -p bracken-demo\n"),
+            "{scripts}"
+        );
+        let (code, out) = passes(&all[1..], &["bracken-tre"]);
+        assert_eq!(code, Some(1), "{scripts}: {out}");
+        assert!(
+            out.contains("cargo fmt --check; cargo nextest run -P fast -p bracken-tre; scripts/test-table --remote -p bracken-tre"),
+            "{scripts}: {out}"
+        );
+    }
+}
+
+/// A light pass (`scripts/test-table --split -p … @ <sha> on <main> tree <key>`, decision `464d3ccca45e`,
+/// answer `10cf8a5053a3`) counts as the merged-tree form does when main is ahead in code, but fails the
+/// scope check for a head that scripts/code-scope full names, each kind of path in its list; for one
+/// whose packages, from AGENTS.md's rows, it leaves out, or that has none (findings 0095e19fcdb7,
+/// 4825c59b07e9); and unless the pr claim's author has the five passes on the exact sha (finding
+/// 013ac6db02d9). A failing code-scope fails it too. Without the merged tree, with main since moved in
+/// code, without packages, in the old --light form, or written by anyone but the manager, it doesn't
+/// count.
+fn merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed(scripts: &str) {
+    let lib = |dir: &Path| put(dir, "lib.rs", "main's code\n");
+    let case = |what: &str| format!("{scripts}: {what}");
+    let key = "1".repeat(40);
+    let scope = "-p bracken -p bracken-tree";
+    let five = |scope: &str| {
+        [
+            "cargo fmt --check".to_owned(),
+            "cargo clippy --all-targets -- -D warnings".to_owned(),
+            "cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings".to_owned(),
+            format!("cargo nextest run -P fast {scope}"),
+            format!("scripts/test-table --remote {scope}"),
+        ]
+    };
+    // How a case differs from the light pass that counts: what the branch changes, the manager's method
+    // ({head} and {tip} filled in), and the builder's passes, with the sha they name.
+    struct Light<'a> {
+        path: &'a str,
+        method: &'a str,
+        who: &'a str,
+        passes: Vec<String>,
+        passes_by: &'a str,
+        passes_on_head: bool,
+        failing_full: bool,
+    }
+    let ok_method = "scripts/test-table --split -p bracken -p bracken-tree @ {head} on {tip} tree {key}";
+    let base = || Light {
+        path: "code.txt",
+        method: ok_method,
+        who: "manager",
+        passes: five(scope).to_vec(),
+        passes_by: "builder",
+        passes_on_head: true,
+        failing_full: false,
+    };
+    let merge = |l: Light| {
+        let (_tmp, dir, mut merge) =
+            merge_dry_run_command(scripts, |_| {}, |dir| put(dir, l.path, "a change\n"), lib, None);
+        let rev = |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
+        let (head, tip, before) = (rev("pr"), rev("main"), rev("main~1"));
+        let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+        let claim = prs[0]["id"].as_str().unwrap().to_owned();
+        let on = if l.passes_on_head { head.clone() } else { tip.clone() };
+        for p in &l.passes {
+            bk(&dir, &["evidence", &claim, "pass", "--method", &format!("{p} @ {on}"), "--as", l.passes_by]);
+        }
+        let method = l
+            .method
+            .replace("{head}", &head)
+            .replace("{tip}", &tip)
+            .replace("{before}", &before)
+            .replace("{key}", &key);
+        bk(&dir, &["evidence", &claim, "pass", "--method", &method, "--as", l.who]);
+        if l.failing_full {
+            let real = dir.join("scripts/code-scope");
+            std::fs::rename(&real, dir.join("scripts/code-scope.real")).unwrap();
+            write_executable(
+                &real,
+                "#!/bin/sh\nif [ \"$1\" = full ]; then echo 'code-scope: no such commit' >&2; exit 2; fi\n\
+                 exec \"$(dirname \"$0\")/code-scope.real\" \"$@\"\n",
+            );
+        }
+        merge.output().unwrap()
+    };
+    let refused = |what: &str, check: &str, l: Light, says: &[&str]| {
+        let out = merge(l);
+        let line = check_line(&out, check);
+        assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
+        assert!(line.starts_with("FAIL"), "{}: {line}", case(what));
+        for s in says {
+            assert!(line.contains(s), "{}: expected {s:?}: {line}", case(what));
+        }
+    };
+
+    let out = merge(base());
+    assert!(out.status.success(), "{}: {}", case("a light pass"), String::from_utf8_lossy(&out.stdout));
+    assert!(check_line(&out, "scope").starts_with("ok "), "{}", case("a light pass"));
+    assert!(check_line(&out, "main").contains("tested"), "{}", case("a light pass"));
+    // A wider scope than the head needs counts too.
+    let wider = "scripts/test-table --split -p bracken -p bracken-demo -p bracken-tree @ {head} on {tip} tree {key}";
+    let out = merge(Light { method: wider, ..base() });
+    assert!(out.status.success(), "{}: {}", case("a wider light pass"), String::from_utf8_lossy(&out.stdout));
+
+    for path in [
+        "crates/manyroot/src/graph.rs",
+        "Cargo.toml",
+        "Cargo.lock",
+        "docs/protocol.md",
+        "crates/tree/src/lib.rs",
+        "crates/tree/src/check.rs",
+        "crates/tree/Cargo.toml",
+        "crates/tree/tests/fixtures/weave-v1/ground.json",
+        ".cargo/config.toml",
+        "rust-toolchain.toml",
+    ] {
+        refused(path, "scope", Light { path, ..base() }, &["needs the whole table", path]);
+    }
+
+    // The scope comes from the changed files: crates/demo's row needs three packages.
+    refused(
+        "a scope narrower than the head's",
+        "scope",
+        Light { path: "crates/demo/src/main.rs", ..base() },
+        &["leaves out bracken-demo bracken-experiment"],
+    );
+    refused(
+        "a head with no package to test",
+        "scope",
+        Light { path: "rustfmt.toml", ..base() },
+        &["no package to test"],
+    );
+
+    // The builder's five passes, on the exact sha, by the pr claim's author.
+    refused("no builder passes", "scope", Light { passes: vec![], ..base() }, &["pr claim's author has no pass on"]);
+    refused(
+        "the builder's passes on another sha",
+        "scope",
+        Light { passes_on_head: false, ..base() },
+        &["cargo fmt --check", "cargo nextest run -P fast -p bracken -p bracken-tree"],
+    );
+    refused("val's passes, not the author's", "scope", Light { passes_by: "val", ..base() }, &["no pass on"]);
+    let mut no_clippy = five(scope).to_vec();
+    no_clippy.remove(1);
+    refused(
+        "the builder's passes without clippy",
+        "scope",
+        Light { passes: no_clippy, ..base() },
+        &["of: cargo clippy --all-targets -- -D warnings"],
+    );
+    let mut workspace = five(scope).to_vec();
+    workspace[3] = "cargo nextest run -P fast --workspace".to_owned();
+    refused(
+        "a --workspace fast run",
+        "scope",
+        Light { passes: workspace, ..base() },
+        &["cargo nextest run -P fast -p bracken -p bracken-tree"],
+    );
+    refused("code-scope full failing", "scope", Light { failing_full: true, ..base() }, &["code-scope full failed"]);
+
+    // Main moved in code since the light pass's main: it doesn't count in 5.
+    let before = "scripts/test-table --split -p bracken -p bracken-tree @ {head} on {before} tree {key}";
+    refused("main moved in code since the light pass", "main", Light { method: before, ..base() }, &[]);
+    for (what, l) in [
+        (
+            "a light pass of the bare head",
+            Light { method: "scripts/test-table --split -p bracken -p bracken-tree @ {head}", ..base() },
+        ),
+        ("val's light pass", Light { who: "val", ..base() }),
+        (
+            "a split pass without the merged tree's key",
+            Light { method: "scripts/test-table --split -p bracken @ {head} on {tip}", ..base() },
+        ),
+        (
+            "the old --light form",
+            Light {
+                method: "scripts/test-table --light -p bracken -p bracken-tree @ {head} on {tip} tree {key}",
+                ..base()
+            },
+        ),
+    ] {
+        refused(what, "main", l, &[]);
+    }
+}
+
+#[test]
+fn merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed_in_scripts() {
+    merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed(SCRIPTS[0]);
+}
+
+#[test]
+fn merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed_in_the_kickoff_templates() {
+    merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed(SCRIPTS[1]);
+}
+
 /// verify-seq runs each head in a scratch worktree of the main checkout, through the bk-evidence beside it,
 /// as manager; with ON set it tests the merge with ON and asks to reuse a pass of the same tree. The
 /// worktree is gone afterwards. A stub bk-evidence logs where it ran and its arguments.
@@ -2099,6 +2469,180 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
     }
 }
 
+/// verify-seq --light (decision `464d3ccca45e`, answer `10cf8a5053a3`), with a stub bk-evidence that logs its
+/// arguments and the run's mode. Its scope is what scripts/code-scope packages computes from the head's
+/// changed files (findings 0095e19fcdb7, 4825c59b07e9), whatever the builder ran. For each head it
+/// refuses, recording nothing, until the pr claim's author (not anyone else) has passes on that exact head
+/// (not another sha) of fmt, both clippies (neither alone is enough), a fast run and a --remote run each
+/// naming every package in the scope (a --workspace fast run doesn't), and it refuses a head
+/// scripts/code-scope full names, or with no package to test. Then it runs scripts/test-table --split -p
+/// <the scope> on the merge with origin/main, without --reuse (finding 94e07ed7dd6b), the mode in
+/// TEST_TABLE_MODE. Without --light, the full run's mode names what needs the whole table, and --reason.
+/// Batches, --split, --speculative and -j refuse --light.
+#[test]
+fn verify_seq_light_counts_only_on_the_builders_passes_and_where_the_full_table_isnt_needed() {
+    for scripts in SCRIPTS {
+        let file = |name: &str| repo_root().join(scripts).join(name);
+        let (seq, scope) = (file("verify-seq"), file("code-scope"));
+        let files = [("scripts/verify-seq", seq.as_path()), ("scripts/code-scope", scope.as_path())];
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            write_executable(
+                &dir.join("scripts/bk-evidence"),
+                "#!/bin/sh\necho \"$*|$TEST_TABLE_MODE\" >>\"$LOG\"\necho bk-evidence: recorded pass aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '(exit 0)' >&2\n",
+            );
+        });
+        let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?}");
+        let rev = |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
+        git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        bk(&dir, &["init", "--name", "seq"]);
+        for id in ["builder", "val", "manager"] {
+            bk(&dir, &["id", "new", id]);
+        }
+        // Heads off main, each changing one path; each claim's text is its own.
+        let claims = std::cell::Cell::new(0);
+        let claim_on = |branch: &str, sha: &str| {
+            claims.set(claims.get() + 1);
+            let text = format!("PR #{} {branch} @ {sha}: x", claims.get());
+            bk(&dir, &["claim", &text, "--tag", "pr", "--as", "builder"])
+        };
+        let head = |branch: &str, path: &str| {
+            git(&["switch", "-qc", branch, "main"]);
+            put(&dir, path, "a change\n");
+            commit_all(&dir, branch);
+            let sha = rev("HEAD");
+            git(&["switch", "-q", "main"]);
+            (claim_on(branch, &sha), sha)
+        };
+        let (claim, sha) = head("code", "code.txt");
+        let (lock_claim, lock_sha) = head("lock", "Cargo.lock");
+        let (fmt_claim, fmt_sha) = head("fmt", "rustfmt.toml");
+        let scope = "-p bracken -p bracken-tree";
+        let five = |scope: &str| {
+            vec![
+                "cargo fmt --check".to_owned(),
+                "cargo clippy --all-targets -- -D warnings".to_owned(),
+                "cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings".to_owned(),
+                format!("cargo nextest run -P fast {scope}"),
+                format!("scripts/test-table --remote {scope}"),
+            ]
+        };
+        let record = |claim: &str, sha: &str, who: &str, methods: &[String]| {
+            for method in methods {
+                bk(&dir, &["evidence", claim, "pass", "--method", &format!("{method} @ {sha}"), "--as", who]);
+            }
+        };
+        let log = tmp.path().join("log");
+        let scratch = tmp.path().join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let seq = |args: &[&str]| {
+            let _ = std::fs::remove_file(&log);
+            let mut c = command(&dir.join("scripts"), "./verify-seq", args);
+            let out = c
+                .env("LOG", &log)
+                .env("TMPDIR", &scratch)
+                .env("BRACKEN_BIN", tmp.path().join("bracken"))
+                .env_remove("ON")
+                .output()
+                .unwrap();
+            (out, std::fs::read_to_string(&log).unwrap_or_default())
+        };
+        let pair = format!("{claim}:{sha}");
+        let refused = |args: &[&str], expected: &str| {
+            let (out, logged) = seq(args);
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {args:?}: {stdout}");
+            assert!(
+                stdout.contains("light refused") && stdout.contains(expected),
+                "{scripts}: expected {expected:?}: {stdout}"
+            );
+            assert!(logged.is_empty(), "{scripts}: ran bk-evidence: {logged}");
+        };
+        // A fresh claim on the code head with these passes by the builder, refused for `expected`.
+        let refused_with = |methods: &[String], on: &str, expected: &str| {
+            let c = claim_on("code", &sha);
+            record(&c, on, "builder", methods);
+            refused(&["--light", &format!("{c}:{sha}")], expected);
+        };
+
+        // No builder pass, then val's passes only, then the builder's with a --remote run of too little.
+        refused(&["--light", &pair], "cargo fmt --check");
+        record(&claim, &sha, "val", &five(scope));
+        refused(&["--light", &pair], "builder has no pass");
+        let mut narrow = five(scope);
+        narrow[4] = "scripts/test-table --remote -p bracken".to_owned();
+        record(&claim, &sha, "builder", &narrow);
+        refused(&["--light", &pair], "scripts/test-table --remote -p bracken -p bracken-tree");
+
+        // Passes on another sha; one clippy missing; a --workspace fast run; a fast run narrower than the
+        // scope the changed files need, which the builder chose.
+        refused_with(&five(scope), &lock_sha, "cargo fmt --check; cargo clippy --all-targets -- -D warnings");
+        let mut no_clippy = five(scope);
+        no_clippy.remove(2);
+        refused_with(
+            &no_clippy,
+            &sha,
+            "of: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings (on",
+        );
+        let mut workspace = five(scope);
+        workspace[3] = "cargo nextest run -P fast --workspace".to_owned();
+        refused_with(&workspace, &sha, "of: cargo nextest run -P fast -p bracken -p bracken-tree (on");
+        refused_with(&five("-p bracken"), &sha, "cargo nextest run -P fast -p bracken -p bracken-tree");
+
+        // All five: the scope's split table on the merge, and the mode.
+        record(&claim, &sha, "builder", &five("-p bracken-tree -p bracken"));
+        let (out, logged) = seq(&["--light", "--reason", "a scripts-only change", &pair]);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stdout));
+        let (args, mode) = logged.trim_end().split_once('|').unwrap();
+        assert_eq!(
+            args,
+            format!("{claim} --as manager --on origin/main -- scripts/test-table --split -p bracken -p bracken-tree"),
+            "{scripts}"
+        );
+        assert!(
+            mode.starts_with("light: a scripts-only change; the scope -p bracken -p bracken-tree, from the changed files; builder's passes on ")
+                && mode.contains("--remote"),
+            "{scripts}: {mode}"
+        );
+
+        // A head touching Cargo.lock, with all five passes: refused, naming it. One with no package to test.
+        record(
+            &lock_claim,
+            &lock_sha,
+            "builder",
+            &five("-p bracken -p bracken-demo -p bracken-experiment -p bracken-tree -p manyroot"),
+        );
+        refused(&["--light", &format!("{lock_claim}:{lock_sha}")], "Cargo.lock");
+        record(&fmt_claim, &fmt_sha, "builder", &five(scope));
+        refused(&["--light", &format!("{fmt_claim}:{fmt_sha}")], "no package to test");
+
+        // The full run says why: what needs the whole table, and --reason, or the default.
+        let (out, logged) = seq(&["--reason", "the manager's call", &format!("{lock_claim}:{lock_sha}")]);
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            logged.trim_end().ends_with("|full: required: Cargo.lock (the workspace's Cargo.lock); the manager's call"),
+            "{scripts}: {logged}"
+        );
+        let (_, logged) = seq(&[&pair]);
+        assert!(logged.trim_end().ends_with("-- scripts/test-table|full: the default"), "{scripts}: {logged}");
+
+        for args in [
+            &["--light", "--split", &pair][..],
+            &["--light", "--batch", &pair],
+            &["--light", "--split", "--speculative", &pair],
+            &["--light", "--speculative", &pair],
+            &["--light", "-j", "2", &pair],
+            &["--light", "-j", "1", &pair],
+            &["--reason", "", &pair],
+        ] {
+            let (out, logged) = seq(args);
+            assert_eq!(out.status.code(), Some(2), "{scripts}: {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(logged.is_empty(), "{scripts}: {args:?} ran");
+        }
+        let worktrees = String::from_utf8(run(&dir, "git", &["worktree", "list"]).stdout).unwrap();
+        assert_eq!(worktrees.lines().count(), 1, "{scripts}: left a worktree: {worktrees}");
+    }
+}
+
 /// `test-table --split` (owner decision `01a2d668b67e`), with a stub `boat` and `cargo`: the whole table in
 /// one box, as --remote runs it, and here only the macos_only tests, under nextest; it passes only if both
 /// do, and ends with both parts' last lines. Which tests need macOS comes from the code: a test that runs
@@ -2107,7 +2651,9 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
 /// cargo that writes its own lines on standard error in the middle of its list's lines, as cargo nextest
 /// list's build output can land (task 06d7b4ef2c75): they arrive whole, and a list damaged on the way
 /// fails as damaged.
-/// A failure here stops the box and deletes it; a docs-only head uses no box.
+/// A failure here stops the box and deletes it; a docs-only head uses no box. With -p <package>... (the
+/// light counted run, finding 94e07ed7dd6b) the box runs test-table --light and --lists for those packages,
+/// and here only their macOS-only tests and lists, the doctests' for those with a library.
 #[test]
 fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
     for scripts in SCRIPTS {
@@ -2126,13 +2672,18 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         let stubs = tmp.path().join("stubs");
         std::fs::create_dir_all(&stubs).unwrap();
         // boat run: as in the --remote test, then the box's lists ($T/linux), then $SLEEP seconds and $EXIT.
+        // With $BOX_PATH, the lists come instead from the box script's last line, the --lists command the
+        // run asked for, run in $REPO with the box's cargo: the real test-table --lists (fail 40550d3c989e).
         write_executable(
             &stubs.join("boat"),
             "#!/bin/bash\n\
              case \"$1\" in\n\
              run) printf '%s\\n' \"$@\" >\"$T/args\"\n\
                echo 'bx_stub01 ready in 1.0s'; touch \"$T/ready\"; echo 'test-table: all passed at x, in a box'\n\
-               [ ! -e \"$T/linux\" ] || cat \"$T/linux\"\n\
+               if [ -n \"$BOX_PATH\" ]; then\n\
+                 last=$(printf '%s\\n' \"${!#}\" | tail -n 1); printf '%s\\n' \"$last\" >\"$T/ran-lists\"\n\
+                 (cd \"$REPO\" && PATH=\"$BOX_PATH\" bash -c \"$last\") || { echo \"exit 9 · 5m 00s · default · \\$0.0030 · bx_stub01 deleted\"; exit 9; }\n\
+               elif [ -e \"$T/linux\" ]; then cat \"$T/linux\"; fi\n\
                sleep \"${SLEEP:-0}\"\n\
                echo \"exit $EXIT · 5m 00s · default · \\$0.0030 · bx_stub01 deleted\"; exit \"$EXIT\" ;;\n\
              list) if [ -e \"$T/left\" ]; then echo '{\"sandboxes\":[{\"id\": \"bx_stub01\"}]}'; else echo '{\"sandboxes\":[]}'; fi ;;\n\
@@ -2149,6 +2700,7 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
             "#!/bin/bash\n[ \"$*\" != 'nextest --version' ] || exit \"${NO_NEXTEST:-0}\"\necho \"cargo $*\" >>\"$LOG\"\n\
              if [ -n \"$HANG_LIST\" ] && [[ $* == *list* ]]; then touch \"$T/listing\"; sleep 600 & echo $! >>\"$T/pids\"; wait; fi\n\
              case \"$*\" in\n\
+             metadata*) echo '{\"packages\":[{\"name\":\"demo\",\"targets\":[{\"kind\":[\"lib\"]}]},{\"name\":\"agent\",\"targets\":[{\"kind\":[\"bin\"]}]}]}' ;;\n\
              *'nextest list'*'--run-ignored only'*) cat \"$T/mac-ignored.nextest\" ;;\n\
              *'nextest list'*) cat \"$T/mac-all.nextest\" ;;\n\
              *'--list --ignored'*) cat \"$T/mac-ignored.doc\" ;;\n\
@@ -2170,6 +2722,7 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
             &box_stubs.join("cargo"),
             "#!/bin/bash
              case \"$*\" in
+             metadata*) echo '{\"packages\":[{\"name\":\"agent\",\"targets\":[{\"kind\":[\"bin\"]}]}]}'; exit ;;
              *'nextest list'*'--run-ignored only'*) f=ignored.nextest ;;
              *'nextest list'*) f=all.nextest ;;
              *'--list --ignored'*) f=ignored.doc ;;
@@ -2227,7 +2780,7 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
             let mut c = command(&dir, "scripts/test-table", &["--split"]);
             c.env("PATH", &path).env("T", tmp.path()).env("LOG", &log).env("EXIT", exit).env("SLEEP", sleep);
             c.env("FAIL_HERE", fail_here).env("TEST_TABLE_HERE_LIMIT", "3");
-            for name in ["HANG", "HANG_LIST", "SURVIVE", "IGNORE_TERM", "NO_NEXTEST"] {
+            for name in ["HANG", "HANG_LIST", "SURVIVE", "IGNORE_TERM", "NO_NEXTEST", "BOX_PATH", "REPO"] {
                 c.env(name, env.iter().find(|(n, _)| *n == name).map_or("", |(_, v)| *v));
             }
             // Files, not pipes: a process the run left behind would hold a pipe open, and reading it would hang.
@@ -2288,6 +2841,70 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         );
         let args = read("args");
         assert!(args.lines().any(|a| a == "--no-env") && !args.contains("--env"), "{scripts}: {args}");
+
+        // The full run's box script, through the real --lists: the whole workspace's lists, with no -p
+        // (fail 40550d3c989e: it asked for '--lists -p ', which --lists refuses).
+        setup(&both, &[], &both, &["macos_only::sandboxed"]);
+        let out = split_with("0", "0", "", &[("BOX_PATH", &box_path), ("REPO", dir.to_str().unwrap())], None);
+        assert!(out.status.success(), "{scripts}: the full split through the real --lists: {}", text(&out));
+        assert_eq!(read("ran-lists"), "scripts/test-table --lists\n", "{scripts}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("the whole table in a box, and the macOS-only tests here")
+        );
+
+        // --split -p: the box runs the light table and the lists for the packages; here, their macOS-only
+        // tests (none is no failure) and lists, and the doctests' list only for the one with a library.
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_file(t("args"));
+        let mut c = command(&dir, "scripts/test-table", &["--split", "-p", "demo", "-p", "agent"]);
+        c.env("PATH", &path).env("T", tmp.path()).env("LOG", &log).env("EXIT", "0").env("SLEEP", "0");
+        c.env("FAIL_HERE", "").env("TEST_TABLE_HERE_LIMIT", "3").env("TEST_TABLE_MODE", "light: the scope");
+        for name in ["HANG", "HANG_LIST", "SURVIVE", "IGNORE_TERM", "NO_NEXTEST", "BOX_PATH", "REPO"] {
+            c.env(name, "");
+        }
+        let out = c.output().unwrap();
+        assert!(out.status.success(), "{scripts}: --split -p: {}", text(&out));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("light run passed at")
+                && stdout.contains("-p demo -p agent, in a box, and their macOS-only tests here; not the whole table"),
+            "{scripts}: {stdout}"
+        );
+        assert!(stdout.trim_end().ends_with("test-table: counted run mode: light: the scope"), "{scripts}: {stdout}");
+        let inner = read("args");
+        for line in [
+            "setup $sudo apt-get install -y -qq git b3sum curl jq",
+            "cargo build --locked -q -p bracken --bin bracken",
+            "BRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table --light -p demo -p agent",
+            "scripts/test-table --lists -p demo -p agent",
+        ] {
+            assert!(inner.lines().any(|l| l == line), "{scripts}: the box's script lacks {line:?}: {inner}");
+        }
+        assert!(
+            !inner.lines().any(|l| l == "BRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table"),
+            "{scripts}"
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        for call in [
+            "cargo nextest run --locked -p demo -p agent --no-fail-fast --no-tests=pass -E test(~macos_only::)",
+            "cargo nextest list --locked -p demo -p agent --run-ignored all --message-format oneline",
+            "cargo test --locked --doc -p demo -- --list",
+            "cargo test --locked --doc -p demo -- --list --ignored",
+        ] {
+            assert!(calls.lines().any(|l| l == call), "{scripts}: no {call:?} in {calls}");
+        }
+        assert!(!calls.contains("--workspace"), "{scripts}: {calls}");
+
+        // --lists -p in the box: a binary-only package has no doctests' list.
+        let mut c = command(&dir, "scripts/test-table", &["--lists", "-p", "agent"]);
+        let lists = c.env("PATH", &box_path).env("T", tmp.path()).output().unwrap();
+        let linux = String::from_utf8(lists.stdout).unwrap();
+        assert!(lists.status.success(), "{scripts}: --lists -p: {}", String::from_utf8_lossy(&lists.stderr));
+        assert!(linux.contains("LIST all nextest ") && !linux.contains("LIST all doc "), "{scripts}: {linux}");
+        for args in [&["--split", "-p"][..], &["--split", "-p", "-x"], &["--lists", "agent"]] {
+            let out = command(&dir, "scripts/test-table", args).env("PATH", &path).output().unwrap();
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {args:?}");
+        }
 
         // Without cargo-nextest it refuses to start, saying what it needs: no box, and no tests here.
         setup(&both, &[], &both, &["macos_only::sandboxed"]);
