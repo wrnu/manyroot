@@ -92,12 +92,17 @@ def real_class(module, qualname):
     """Python's own exception class `module.qualname`, if it is one the code may raise as itself. Strictly
     (finding d1f7d7880644): only from a module of the standard library this process has already loaded, never
     importing one for the code; the qualname walked through classes only, never another module; and only a class
-    whose own module and qualname are the ones claimed, an exception, and of no module in NOT_REAL."""
+    whose own module and qualname are the ones claimed, an exception, and of no module in NOT_REAL. A module in
+    NOT_REAL is refused before the walk, and the walk reads each object's own `__dict__`, never `getattr`, so no
+    module's lazy `__getattr__` imports anything for the code (finding 998cb1f3da18)."""
+    top = module.split(".")[0]
+    if top in NOT_REAL or top not in sys.stdlib_module_names:
+        return None
     found = sys.modules.get(module)
-    if found is None or isinstance(found, Module) or module.split(".")[0] not in sys.stdlib_module_names:
+    if found is None or isinstance(found, Module):
         return None
     for part in qualname.split("."):
-        found = getattr(found, part, None)
+        found = object.__getattribute__(found, "__dict__").get(part)
         if not isinstance(found, type):
             return None
     try:

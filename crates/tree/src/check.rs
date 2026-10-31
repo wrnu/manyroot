@@ -73,8 +73,9 @@ pub const LANG: &str = "en_US.UTF-8";
 /// prefix, `KERN_PROCARGS2` stays open, and `process-info*` must be unqualified, since `(target others)`
 /// leaves out the check's own process group, which `posix_spawn`'s `POSIX_SPAWN_SETPGROUP` can make the
 /// runner's. A process may still read its own: cargo dies of SIGTRAP without it. `getpgid` and `getsid`,
-/// which tell which pids are live and their groups and sessions, are denied for every pid, its own included,
-/// since the rule can't tell them apart (task 72fd057d4b33); `getpgrp` stays.
+/// which tell a pid's group and session, are denied for every pid, its own included, since the rule can't
+/// tell them apart (task 72fd057d4b33); `getpgrp` stays. Which pids are live can still be learnt, from
+/// `getpriority` or a denied call's error (finding f55c629069a9), but nothing of what they run.
 const PROFILE: &str = r#"(version 1)
 (deny default)
 (allow process-fork)
