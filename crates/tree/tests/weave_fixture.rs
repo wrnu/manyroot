@@ -135,7 +135,7 @@ fn result(target: ContributionId, manifest: &ContentHash, attempt: u64, passed: 
 }
 
 /// Every contribution id in the fixture, sorted.
-const FIXTURE_IDS: [&str; 75] = [
+const FIXTURE_IDS: [&str; 80] = [
     "02ed4a94d1d2569473e30be1f270dc90752bd878902620efea4b06651fdc77de",
     "0525c67be79c22b6a859118457df7da8d63b0177083243e67619079e9f8a0db5",
     "0d322d12d64bc174d2033b111f0bfdd8fe70fdbb52eb09a2c3e57c13499b9b3b",
@@ -144,16 +144,20 @@ const FIXTURE_IDS: [&str; 75] = [
     "11e730e6f30bfa0750baee3f99d2fec394dc31814eb47e1d3fe3cd376de9fd02",
     "159a0a3f202ee2181349d30a240b97217412c65b07cea6ddcf771e4a1d2ca60a",
     "1abc36543dc53a474e19b186a0f26bdced0d2c2649dc80adafeb3a89935d59a2",
+    "1ec860df36e83ba5cdf51e6b3ad46f36b0489defa43e4feb5d1740286fd40529",
     "1f5709d2d713154ae93276855c966cd18eab476598b7a7e0dcc5c0f4a3ba0b94",
     "1ff5e8c02eebb6d352dd399ba035403e95fe266a24ef36e8960430817f13fba4",
     "26dc4c822c3752a155c01ff2a1ea77bcdc78788ba304075155b632141b2fa6fd",
     "281008a75e0bafc0542ce06fe495a63c0123495ca00f9417a7483123bd30f112",
     "28449118f0d77fdb533846be50487f9c66890ccc61bd471e7be24a31beebd797",
+    "2850793053b5d5fe001a7fea8e7410f063c9c74995f6651935ae3a1caf7c1fe3",
     "290ddc4df22a6ed46fc47cbaf855a661a85567a3e5dcd120e29df95090bd81c4",
     "29c0381f01cda24b7f1790483dbd547b78ab1475e05318583080f0e2c77420fa",
     "2cc41fd30a2ace9635bc497c6d3ba7275708809202e33509b15d6acc75993e6f",
     "3358588e9b1493d92e23afd606c2ac585c4e23f37f1d56aeff5e52ba6c35185c",
+    "38fd1c5d712bead9e9ae4ed56c7dbd8f0bb077230dd83979bdca54aedd721370",
     "3c8c45fbd76414e96d38a3a87dc852818120f747d35d96c159bcd990c919abc9",
+    "41def19d1751a0614bd9dc5d3f374a21af00e818ad72ea09d4e4b902b6b94ab0",
     "4419cbf93108b801e3533995426942bbd0ac07bf5a0a85410afcf29df5f7689e",
     "477db27ef3f9b2443765042d7ba502741a38d8a2d71cf4e80d5dad27a6a68bb1",
     "47a0bfbcdfdac6a2ef2a926c3eeb9e88ba5e7dc985d00032172dbdbbea8df767",
@@ -202,6 +206,7 @@ const FIXTURE_IDS: [&str; 75] = [
     "cca7b25fba2b093536117d421efc63f485823aedb7dd287fb7769515dfd3cee5",
     "cd6327ede12bf62e1be86845e6777a2e016ada8514900326ef35ab280dd861c6",
     "d2c5f7ffbe38b59a3995876051928908924f53143c6fd1f7fac63115a38391c4",
+    "d56cb32a984e90a502bae653d6b79f93f234c25dcc7a8b2fe9b61154d673a2a1",
     "d697934d055530ee6cdf646c4c388fd5fa5f0968b04e9dbf52136a6148047744",
     "db2f11731aed55d9525b6127451970d293f9ba20f281345ad2d06d65e0833b95",
     "ecdd5fce003e34ba8e47ccb8bac1b51e660174c56637abb81bd4e0eeb6f63135",
@@ -264,6 +269,11 @@ struct Named {
     s9a: ContributionId,
     s9b: ContributionId,
     s10: ContributionId,
+    r1: ContributionId,
+    r2: ContributionId,
+    r3: ContributionId,
+    r4: ContributionId,
+    t1: ContributionId,
 }
 
 /// The fixture's manifests, by content: M1 (a.txt one), M2 (two), M3 (deux), M4 (the resolved merge).
@@ -546,6 +556,20 @@ fn write(store: &mut Store) -> Named {
     forked.sort();
     let s10 = add(store, &alice, artifact(&on_side(h7, forked)));
 
+    // Rule 6's count and its reducing exception (finding 05acef0e6c81), appended so every id above stays.
+    // R1, R2 and R3 list breakage for test and lint, 1, 2 and 3 moves old. R4 lists test alone, 4 moves
+    // old, past max_age 3, but its breakage is a strict subset of its parent's: it qualifies, reducing.
+    let entry = |check: &str| Breakage { check: check.into(), detail: "known".into(), paths: vec!["a.txt".into()] };
+    let both = || vec![entry("lint"), entry("test")];
+    let r1 = add(store, &alice, artifact(&Decision { breakage: both(), ..on_side(h7, vec![s10]) }));
+    let r2 = add(store, &alice, artifact(&Decision { breakage: both(), ..on_side(h7, vec![r1]) }));
+    let r3 = add(store, &alice, artifact(&Decision { breakage: both(), ..on_side(h7, vec![r2]) }));
+    let r4 = add(store, &alice, artifact(&Decision { breakage: vec![entry("test")], ..on_side(h7, vec![r3]) }));
+    // T1 lists three entries, past max_known 2, and R4's breakage holds only test, so it doesn't reduce:
+    // refused.
+    let three = vec![entry("doc"), entry("lint"), entry("test")];
+    let t1 = add(store, &alice, artifact(&Decision { breakage: three, ..on_side(h7, vec![r4]) }));
+
     let _ = h3;
     Named {
         marker,
@@ -597,6 +621,11 @@ fn write(store: &mut Store) -> Named {
         s9a,
         s9b,
         s10,
+        r1,
+        r2,
+        r3,
+        r4,
+        t1,
     }
 }
 
@@ -811,15 +840,24 @@ fn every_derived_status_is_as_pinned() {
     assert_eq!(on_side(&n.s4), Some(Err(protected)));
     // S3, S5 and S6 list test in an unbroken chain: S7 would make it 4 moves old, past max_age 3.
     assert_eq!(on_side(&n.s7), Some(Err(Unqualified::BreakageTooOld { check: "test".into(), age: 4, max: 3 })));
-    // The merge settles the fork: one head, and the fork's heads without it are S9a and S9b, whose
-    // merge base is S8.
-    assert_eq!(lines.heads(&n.side), [n.s10]);
+    // R4 qualifies by reducing: test is 4 moves old, past max_age 3, but {test} is a strict subset of
+    // R3's {lint, test}. T1's three entries pass max_known 2, and don't reduce R4's one.
+    for d in [n.r1, n.r2, n.r3, n.r4] {
+        assert_eq!(on_side(&d), ok, "{d}");
+    }
+    assert_eq!(on_side(&n.t1), Some(Err(Unqualified::TooMuchBreakage { count: 3, max: 2 })));
+    assert_eq!(lines.heads(&n.side), [n.r4]);
+    // The merge settles the fork: the fork's heads, on the Ground as it was before the merge, are S9a
+    // and S9b, whose merge base is S8; and S10, the merge, is below the head.
+    assert!(lines.decision_ancestry(&n.r4).contains(&n.s10));
     let mut forked = vec![n.s9a, n.s9b];
     forked.sort();
     assert_eq!(lines.merge_bases(&n.s9a, &n.s9b), [n.s8]);
     let mut before = manyroot::Graph::new(GROUND);
-    let mut chain: Vec<&Contribution> = g.iter().filter(|c| c.id() != n.s10).collect();
-    // The scenario writes each on the one before it, one second apart, so time order is causal order.
+    // The scenario writes each on the one before it, one second apart, so time order is causal order:
+    // the Ground before the merge is everything written before it.
+    let merged_at = g.get(&n.s10).expect("the merge").content().timestamp_ms;
+    let mut chain: Vec<&Contribution> = g.iter().filter(|c| c.content().timestamp_ms < merged_at).collect();
     chain.sort_by_key(|c| c.content().timestamp_ms);
     for c in chain {
         before.insert(c.clone()).expect("each one's parents come first");
