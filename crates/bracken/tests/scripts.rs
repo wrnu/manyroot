@@ -4545,6 +4545,12 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     refused(&["--init", "--owner-decision", "TODO"], "12 to 64 lowercase hex");
     refused(&["--init", "--owner-decision", &decision], "isn't a claim tagged approval, signed by owner");
     refused(&["--init", "--owner-decision", &manager_approval], "isn't a claim tagged approval, signed by owner");
+    let replaced = bk(&dir, &["claim", "Approval (owner): an old go", "--tag", "approval", "--as", "owner"]);
+    bk(
+        &dir,
+        &["claim", "Approval (owner): a newer go", "--tag", "approval", "--supersedes", &replaced, "--as", "owner"],
+    );
+    refused(&["--init", "--owner-decision", &replaced], "not retracted and not superseded");
     let ground = home.join("bracken-weave/manyroot");
     assert!(!ground.exists(), "a refused --init left a Ground");
 
@@ -4589,6 +4595,20 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(stderr.contains("no-dry-run: refused") && stderr.contains("can't read line main's policy"), "{stderr}");
     assert_eq!(count(), before, "a failed dry run wrote something");
+    // Nor does a weave head that fails for another reason than having no default line (finding b9e95bfb20fc).
+    let no_head = tmp.path().join("no-head");
+    write_executable(
+        &no_head,
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" weave head \"*) echo no-head: broken >&2; exit 1 ;; esac\nexec {:?} \"$@\"\n",
+            tmp.path().join("bracken")
+        ),
+    );
+    let out = run_in(Some(&no_head), &["--init", "--owner-decision", &approval]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no-head: broken") && stderr.contains("weave head failed"), "{stderr}");
+    assert_eq!(count(), before, "a failed weave head wrote something");
     let weave = |args: &[&str]| -> serde_json::Value {
         let mut c = command(&dir, "scripts/weave", args);
         let out = c.env("HOME", &home).output().unwrap();
@@ -5924,12 +5944,21 @@ fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
     let real = |p: &Path| std::fs::canonicalize(p.parent().unwrap()).unwrap().join(p.file_name().unwrap());
     let s = |p: &Path| p.to_str().unwrap().to_owned();
 
-    let [a, b, open, file, acl, fut] = ["a", "b", "open", "file", "acl", "fut"].map(|n| tmp.path().join(n));
+    // `a` is under a sticky directory others can write to, which is allowed (finding 99b7ce082502), and on
+    // macOS one with an ACL that only denies.
+    let sticky = tmp.path().join("sticky");
+    std::fs::create_dir(&sticky).unwrap();
+    std::fs::set_permissions(&sticky, std::fs::Permissions::from_mode(0o1777)).unwrap();
+    let acl_parent = tmp.path().join("acl-parent");
+    std::fs::create_dir(&acl_parent).unwrap();
+    let a = sticky.join("a");
+    let [b, open, file, acl, fut] = ["b", "open", "file", "acl", "fut"].map(|n| tmp.path().join(n));
     let approval = |text: &str| bk(&dir, &["claim", text, "--tag", "approval", "--as", "owner"]);
     bk(&dir, &["id", "new", "owner"]);
     let go = approval(&format!(
-        "Approval (owner): back up the Weave Ground to `{}`, {}, {}/ {} {} and {}.",
+        "Approval (owner): back up the Weave Ground to `{}`, {}, {}, {}/ {} {} and {}.",
         s(&real(&a)),
+        s(&real(&acl_parent.join("bk"))),
         s(&real(&b)),
         s(&real(&open)),
         s(&real(&file)),
@@ -5937,6 +5966,20 @@ fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
         s(&real(&fut))
     ));
     let a_old = approval(&format!("Approval (owner): back up to {}-old", s(&real(&a))));
+    let replaced = approval(&format!("Approval (owner): back up to {}", s(&real(&a))));
+    bk(
+        &dir,
+        &[
+            "claim",
+            "Approval (owner): not there after all",
+            "--tag",
+            "approval",
+            "--supersedes",
+            &replaced,
+            "--as",
+            "owner",
+        ],
+    );
     bk(&dir, &["id", "new", "manager"]);
     let not_owner =
         bk(&dir, &["claim", &format!("Approval: {}", s(&real(&a))), "--tag", "approval", "--as", "manager"]);
@@ -5991,11 +6034,19 @@ fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
     refused(&["--owner-decision", "0123456789ab", &s(&a)], "has no such contribution");
     refused(&["--owner-decision", &not_owner, &s(&a)], "isn't a claim tagged approval, signed by owner");
     refused(&["--owner-decision", &a_old, &s(&a)], "the approval doesn't name");
+    refused(&["--owner-decision", &replaced, &s(&a)], "not retracted and not superseded");
     refused(&["--owner-decision", &go, &s(&tmp.path().join("elsewhere"))], "the approval doesn't name");
     refused_to(&file, "isn't a directory");
     refused_to(&open, "must be 0700");
     refused(&["--owner-decision", &go, "--keep", "0", &s(&a)], "give a whole number");
     if cfg!(target_os = "macos") {
+        let chmod_a = |entry: &str, p: &Path| {
+            assert!(Command::new("chmod").args(["+a", entry]).arg(p).status().unwrap().success());
+        };
+        chmod_a("everyone deny delete", &sticky);
+        chmod_a("everyone allow add_file", &acl_parent);
+        refused_to(&acl_parent.join("bk"), "has an ACL that allows something");
+        assert!(!acl_parent.join("bk").exists());
         private_dir(&acl);
         let chmod = Command::new("chmod").args(["+a", "everyone allow list"]).arg(&acl).status().unwrap();
         assert!(chmod.success());

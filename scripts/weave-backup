@@ -15,8 +15,9 @@
 #       newest <n> copies (default 20), the new one among them, and deletes older ones: only directories
 #       named by a time before the new copy's that hold a copy of the Weave Ground.
 #       <dest> must be a directory of yours at mode 0700, with no ACL, not a symlink, outside every git
-#       checkout and outside ~/bracken-weave, and no directory above it may be writable by group or others
-#       unless it is sticky. If it doesn't exist, it is created at 0700. A name in it with a time later than
+#       checkout and outside ~/bracken-weave. Every directory above it must be yours or root's, with no ACL
+#       that allows anything, and writable by group or others only if it is sticky. The approval must not
+#       be superseded by its author. If it doesn't exist, it is created at 0700. A name in it with a time later than
 #       now (a clock that ran fast) stops it.
 #
 #   scripts/weave-backup --verify <copy>
@@ -79,7 +80,20 @@ say() { # "<contributions> <heads> <identities>" as words
   read -r c h i <<<"$1"
   echo "$c contributions, $h heads, $i identities"
 }
-mode_of() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+# Permission bits, sticky included, in octal (700, 1777): GNU stat's %a, or the last four digits of BSD
+# stat's %p, since its %Lp drops the sticky bit (finding 99b7ce082502).
+mode_of() {
+  local m
+  m=$(stat -c %a "$1" 2>/dev/null) || { m=$(stat -f %p "$1") && m=${m: -4}; }
+  printf '%o\n' $((8#$m))
+}
+owner_of() { stat -c %u "$1" 2>/dev/null || stat -f %u "$1"; }
+# An ACL entry that allows something: macOS lists them under ls -le (a deny entry, like the home
+# directory's "everyone deny delete", takes nothing away from the mode); elsewhere ls marks any ACL with +.
+allows_acl() {
+  ls -lde "$1" 2>/dev/null | tail -n +2 | grep -q ' allow ' && return 0
+  [ "$(ls -ld "$1" | cut -c 11)" = + ] && ! ls -lde "$1" >/dev/null 2>&1
+}
 
 if [ -n "$verify" ]; then
   [ -z "$owner" ] || fail "--owner-decision goes with a backup, not --verify"
@@ -114,14 +128,18 @@ for inside in "$weave_dir" "$ground"; do
     fail "$dest is inside $inside; back up the Weave Ground somewhere else"
 done
 [[ $ground != "$real"/* ]] || fail "$dest holds the Weave Ground; back it up somewhere else"
-# Nobody else may swap a directory on the way to it: each one above it is writable only by its owner, or
-# sticky (finding 9c4a64c905c3).
+# Nobody else may swap a directory on the way to it: each one above it is yours or root's, writable by
+# group or others only if sticky, and allows nothing more through an ACL (finding 9c4a64c905c3).
+me=$(id -u)
 d=$parent
 while :; do
   m=$((8#$(mode_of "$d")))
   if (((m & 8#022) != 0 && (m & 8#1000) == 0)); then
     fail "$d, above $dest, is writable by group or others and not sticky"
   fi
+  u=$(owner_of "$d")
+  [ "$u" = 0 ] || [ "$u" = "$me" ] || fail "$d, above $dest, belongs to another user"
+  ! allows_acl "$d" || fail "$d, above $dest, has an ACL that allows something"
   [ "$d" != / ] || break
   d=$(dirname "$d")
 done
@@ -132,9 +150,11 @@ done
 [[ $owner =~ ^[0-9a-f]{12,64}$ ]] || fail "--owner-decision $owner: give the approval's id, 12 to 64 lowercase hex digits"
 shown=$(env -u BRACKEN_AGENT "$main/scripts/bk" show "$owner" --json 2>/dev/null) ||
   fail "--owner-decision $owner: the coordination Ground has no such contribution"
-jq -e '.kind == "claim" and (.retracted | not) and .author_name == "owner"
-       and ((.body.tags // []) | index("approval") != null)' <<<"$shown" >/dev/null 2>&1 ||
-  fail "--owner-decision $owner: it isn't a claim tagged approval, signed by owner and not retracted (scripts/owner-approve)"
+jq -e '. as $c | .kind == "claim" and (.retracted | not) and .author_name == "owner"
+       and ((.body.tags // []) | index("approval") != null)
+       and ([.referrers[]? | select(.kind == "relation" and .body.kind == "supersedes" and .body.to == $c.id
+                                and .author == $c.author and (.retracted | not))] | length) == 0' <<<"$shown" >/dev/null 2>&1 ||
+  fail "--owner-decision $owner: it isn't a claim tagged approval, signed by owner, not retracted and not superseded (scripts/owner-approve)"
 # The path as one word of the approval's text, give or take quotes, brackets, closing punctuation and a
 # final slash: so an approval of /a/bk-old doesn't approve /a/bk.
 jq -e --arg p "$real" '.body.statement | [splits("\\s+")]

@@ -1285,7 +1285,8 @@ user as the coordination Ground. Every worktree reaches it through
   before stage 2 (section 8). `scripts/weave-backup --owner-decision <id>
   <dest>` copies it, identities included, to `<dest>/<UTC time>/`, and
   only to the destination the owner approved: `<id>` is an approval the
-  owner signed whose text names `<dest>`'s real path. It writes the copy
+  owner signed, not superseded, whose text names `<dest>`'s real path.
+  It writes the copy
   beside that, and moves it into place only once the pinned binary opens
   it and it holds at least what the Ground held when the copy began. It
   copies again while the counts differ, up to 5 passes, and once they
@@ -1294,9 +1295,10 @@ user as the coordination Ground. Every worktree reaches it through
   and the script says so. It keeps the newest 20 copies, the new one
   among them, and deletes only older copies of this Ground. `<dest>` must
   be a directory of yours at mode 0700 with no ACL, outside every git
-  checkout and `~/bracken-weave`, and not a symlink. No directory above it
-  may be writable by others unless it is sticky, since a copy holds the
-  private keys. The script prints counts only. The manager runs it by
+  checkout and `~/bracken-weave`, and not a symlink. Each directory above
+  it must be yours or root's, with no ACL that allows anything, and
+  writable by others only if it is sticky, since a copy holds the private
+  keys. The script prints counts only. The manager runs it by
   hand. A schedule is the owner's go too (task `5b81f744a0ea`).
 
 ### Keeping the two scripts apart
