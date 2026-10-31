@@ -188,6 +188,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bracken-scope"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "proc-macro2",
+ "tempfile",
+]
+
+[[package]]
 name = "bracken-tree"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,15 @@
+[package]
+name = "bracken-scope"
+description = "Which Rust files a change touched only in comments, for scripts/code-scope"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+proc-macro2 = { version = "1", default-features = false, features = ["span-locations"] }
+
+[dev-dependencies]
+tempfile.workspace = true

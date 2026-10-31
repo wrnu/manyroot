@@ -2204,7 +2204,7 @@ fn code_scope_names_what_needs_the_full_table_and_the_light_scope() {
         assert_eq!(scope(&["packages", "main", "rename"]).1, "bracken\nbracken-tree\n", "{scripts}");
         assert_eq!(
             scope(&["packages", "main", "delete"]).1,
-            "bracken\nbracken-demo\nbracken-experiment\nbracken-tree\nmanyroot\n",
+            "bracken\nbracken-demo\nbracken-experiment\nbracken-scope\nbracken-tree\nmanyroot\n",
             "{scripts}"
         );
         assert_eq!(scope(&["packages", "main", "docs"]).1, "bracken\nbracken-tree\n", "{scripts}");
@@ -2609,7 +2609,7 @@ fn verify_seq_light_counts_only_on_the_builders_passes_and_where_the_full_table_
             &lock_claim,
             &lock_sha,
             "builder",
-            &five("-p bracken -p bracken-demo -p bracken-experiment -p bracken-tree -p manyroot"),
+            &five("-p bracken -p bracken-demo -p bracken-experiment -p bracken-scope -p bracken-tree -p manyroot"),
         );
         refused(&["--light", &format!("{lock_claim}:{lock_sha}")], "Cargo.lock");
         record(&fmt_claim, &fmt_sha, "builder", &five(scope));
