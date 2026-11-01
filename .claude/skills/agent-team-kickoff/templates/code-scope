@@ -59,7 +59,9 @@
 # light-passes reads pass methods (one a line: the pr claim's author's passes on the claim) and exits 0
 # when they hold, on exactly <sha>, the five a light run needs first (decision 464d3ccca45e): cargo fmt
 # --check, both clippies, cargo nextest run -P fast -p ..., and scripts/test-table --remote -p ..., the
-# last two each naming every <package>. Otherwise it prints, on one line, what's missing, and exits 1.
+# last two each naming every <package>. Among the fast pass's -p arguments, -j <n>, --no-fail-fast and
+# --test-threads <n> may come anywhere, as builders run it on a loaded machine (task b1156a629af9); nothing
+# else may. Otherwise it prints, on one line, what's missing, and exits 1.
 # verify-seq --light and merge both check with it. They're a precondition only: the light run itself
 # tests the merged tree (finding 94e07ed7dd6b).
 set -euo pipefail
@@ -186,20 +188,23 @@ case "${1:-}" in
       missing+=("cargo clippy --all-targets -- -D warnings")
     grep -qxE "cargo clippy( --locked)?( --workspace)? --all-targets --target x86_64-unknown-linux-gnu -- -D warnings @ $sha" <<<"$methods" ||
       missing+=("cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings")
-    # covers <prefix>: whether some method '<prefix> -p <package>... @ <sha>' names every package.
+    # covers <prefix>: whether some method '<prefix> -p <package>... @ <sha>', with the arguments in
+    # $also allowed among the -p ones, names every package.
     covers() {
       local line p ok
       while IFS= read -r line; do
         ok=true
         for p in "$@"; do [[ " ${line% @ *} " == *" -p $p "* ]] || ok=false; done
         ! $ok || return 0
-      done < <(grep -xE "$prefix( -p $pkg)+ @ $sha" <<<"$methods" || true)
+      done < <(grep -xE "$prefix( -p $pkg$also)+ @ $sha" <<<"$methods" || true)
       return 1
     }
     scope=$(printf ' -p %s' "$@")
     prefix='cargo nextest run -P fast'
+    # Each a choice beside ' -p <package>', so any of them may come anywhere among the -p ones.
+    also='| -j [1-9][0-9]*| --no-fail-fast| --test-threads [1-9][0-9]*'
     covers "$@" || missing+=("cargo nextest run -P fast$scope")
-    prefix='scripts/test-table --remote'
+    prefix='scripts/test-table --remote' also=''
     covers "$@" || missing+=("scripts/test-table --remote$scope")
     if [ ${#missing[@]} -gt 0 ]; then
       echo "no pass on $sha of: $(printf '%s; ' "${missing[@]}" | sed 's/; $//')"
