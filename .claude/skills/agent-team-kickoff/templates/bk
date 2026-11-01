@@ -107,7 +107,7 @@ fi
 
 case "$cmd" in
   claim | artifact | relate | evidence | retract | intend) write=true ;;
-  log | show | heads | conflicts | accepted | cat | export | watch) write=false ;;
+  log | show | heads | conflicts | accepted | findings | cat | export | watch) write=false ;;
   *) exec "$bin" "$@" ;;
 esac
 token="$team/tokens/$who"
