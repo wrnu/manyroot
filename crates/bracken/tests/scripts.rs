@@ -4865,9 +4865,8 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     };
     let refused = |name: &str, args: &[&str], expected: &str| {
         let out = script(name, args);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.code(), Some(1), "{name} {args:?}: {stderr}");
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let (stderr, stdout) = (String::from_utf8_lossy(&out.stderr), String::from_utf8_lossy(&out.stdout));
+        assert_eq!(out.status.code(), Some(1), "{name} {args:?}: {stderr}{stdout}");
         assert!(stderr.contains(expected), "{name} {args:?}: expected {expected:?} in {stderr}{stdout}");
     };
     ok("scripts/weave-shadow", &["--init", "--owner-decision", &approval]);
@@ -5208,45 +5207,123 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
         "carries the manager's merge gate pass",
     );
     gate("27");
-    let dropped = {
-        let index = tmp.path().join("dropped-index");
+    // A stand-in scripts/weave whose `integrate --proposals` says the merge differs from git's `sha` only at
+    // `path`, with the manifest of `sha`'s tree with `path` as commit `from` has it: a Weave that took
+    // `from`'s side there. The shadow runs with it once, where it must stop and write nothing.
+    let stand_in = |sha: &str, path: &str, from: &str, args: &[&str]| {
+        let index = tmp.path().join("stand-in-index");
         let scratch = |args: &[&str]| {
             let out = command(&dir, "git", args).env("GIT_INDEX_FILE", &index).output().unwrap();
             assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
             String::from_utf8(out.stdout).unwrap().trim().to_owned()
         };
-        scratch(&["read-tree", &b4]);
-        let v1 = git(&["rev-parse", &format!("{s24}:p.txt")]);
-        scratch(&["update-index", "--cacheinfo", &format!("100644,{v1},p.txt")]);
-        let c = git(&["commit-tree", &scratch(&["write-tree"]), "-p", &b4, "-m", "#27's edit dropped"]);
+        scratch(&["read-tree", sha]);
+        let blob = git(&["rev-parse", &format!("{from}:{path}")]);
+        scratch(&["update-index", "--cacheinfo", &format!("100644,{blob},{path}")]);
+        let c = git(&["commit-tree", &scratch(&["write-tree"]), "-p", sha, "-m", "a stand-in's merge"]);
         let import = ok(
             "scripts/weave",
             &["weave", "import", "--from-git", &c, "--repo", dir.to_str().unwrap(), "--dry-run", "--json"],
         );
-        serde_json::from_str::<serde_json::Value>(&import).unwrap()["manifest"].as_str().unwrap().to_owned()
+        let manifest = serde_json::from_str::<serde_json::Value>(&import).unwrap()["manifest"].clone();
+        let real = dir.join("scripts/weave.real");
+        std::fs::rename(dir.join("scripts/weave"), &real).unwrap();
+        std::fs::write(
+            dir.join("scripts/weave.out"),
+            serde_json::json!({"differs": [{"path": path, "change": "modified"}], "manifest": manifest}).to_string(),
+        )
+        .unwrap();
+        write_executable(
+            &dir.join("scripts/weave"),
+            "#!/usr/bin/env bash\nhere=$(dirname \"$0\")\n\
+             case \" $* \" in *' weave integrate --proposals '*) cat \"$here/weave.out\"; exit 1 ;; esac\n\
+             exec \"$here/weave.real\" \"$@\"\n",
+        );
+        let before = count();
+        refused("scripts/weave-shadow", args, "Stop and report it");
+        assert_eq!(count(), before, "a mismatch wrote something");
+        std::fs::rename(&real, dir.join("scripts/weave")).unwrap();
+        std::fs::remove_file(dir.join("scripts/weave.out")).unwrap();
     };
-    let real = dir.join("scripts/weave.real");
-    std::fs::rename(dir.join("scripts/weave"), &real).unwrap();
-    std::fs::write(
-        dir.join("scripts/weave.out"),
-        serde_json::json!({"differs": [{"path": "p.txt", "change": "modified"}], "manifest": dropped}).to_string(),
-    )
-    .unwrap();
-    write_executable(
-        &dir.join("scripts/weave"),
-        "#!/usr/bin/env bash\nhere=$(dirname \"$0\")\n\
-         case \" $* \" in *' weave integrate --proposals '*) cat \"$here/weave.out\"; exit 1 ;; esac\n\
-         exec \"$here/weave.real\" \"$@\"\n",
-    );
-    let before = count();
-    refused("scripts/weave-shadow", &["--proposal", &p25, "--proposal", &p27, &b4], "Stop and report it");
-    assert_eq!(count(), before, "a mismatch wrote something");
-    std::fs::rename(&real, dir.join("scripts/weave")).unwrap();
-    std::fs::remove_file(dir.join("scripts/weave.out")).unwrap();
+    stand_in(&b4, "p.txt", &s24, &["--proposal", &p25, "--proposal", &p27, &b4]);
     let out = shadowed(&["--proposal", &p25, "--proposal", &p27, &b4], "conflict");
     assert!(
         out.contains(
             "stage 2a so far: 21 merges, 4 by Weave's own merge; fallbacks: 11 no proposal, 2 conflict, 2 mismatch, 2 ancestor base"
+        ),
+        "{out}"
+    );
+
+    // Another member brings the path back only if it brings the same entry (task 35ba3809bede, finding
+    // d84291cfaacf). #50's squash changes r.txt's first line; #51 and #52 fork from it unrecorded, and #52
+    // also changes its last line; #53 undoes #50. A Weave that kept #51's r.txt, dropping #52's edit, gives
+    // the tree #51's bringing back gives, so it must stop.
+    write("r.txt", "1\n2\n3\n4\n5\n");
+    let s49 = commit("r");
+    origin_main(&s49);
+    shadowed(&[&s49], "none");
+    branch("f50", &|| write("r.txt", "one\n2\n3\n4\n5\n"));
+    claim("50");
+    let s50 = squash("f50", "50");
+    branch("f51", &|| write("a51.txt", "51\n"));
+    let p51 = proposal("51");
+    branch("f52", &|| write("r.txt", "one\n2\n3\n4\nfive\n"));
+    let p52 = proposal("52");
+    git(&["switch", "-q", "main"]);
+    write("r.txt", "1\n2\n3\n4\n5\n");
+    let s53 = commit("undo r (#53)");
+    origin_main(&s53);
+    shadowed(&[&s50], "none");
+    shadowed(&[&s53], "none");
+    let b6 = batch(&[("f51", "51"), ("f52", "52")]);
+    gate("51");
+    gate("52");
+    let args = ["--proposal", &p51, "--proposal", &p52, &b6];
+    stand_in(&b6, "r.txt", &s50, &args);
+    // The real merge keeps both edits, where git's keeps #52's only: a mismatch.
+    refused("scripts/weave-shadow", &args, "Stop and report it");
+    shadowed(&[&args[..], &["--mismatched"]].concat(), "mismatch");
+
+    // And only where line main's head still has the path as that member's base had it. #41 forks unrecorded
+    // from #40's squash, which changes q.txt, so its base has q0; main then sets q.txt to u (#42), #43 sets
+    // it to #40's q1 again, and #44 forks from that unrecorded, so its base has u; #45 undoes #43. Both
+    // bring q1 back, but main's head has u, not #41's base's q0, so #41 doesn't merely bring it back. A Weave
+    // that took q1 there must stop; the real one conflicts, main's u against #41's q1.
+    write("q.txt", "q0\n");
+    let s39 = commit("q");
+    origin_main(&s39);
+    shadowed(&[&s39], "none");
+    branch("f40", &|| write("q.txt", "q1\n"));
+    claim("40");
+    let s40 = squash("f40", "40");
+    branch("f41", &|| write("a41.txt", "41\n"));
+    let p41 = proposal("41");
+    git(&["switch", "-q", "main"]);
+    write("q.txt", "u\n");
+    let s42 = commit("q u (#42)");
+    origin_main(&s42);
+    shadowed(&[&s40], "none");
+    shadowed(&[&s42], "none");
+    branch("f43", &|| write("q.txt", "q1\n"));
+    claim("43");
+    let s43 = squash("f43", "43");
+    branch("f44", &|| write("a44.txt", "44\n"));
+    let p44 = proposal("44");
+    git(&["switch", "-q", "main"]);
+    write("q.txt", "u\n");
+    let s45 = commit("undo q (#45)");
+    origin_main(&s45);
+    shadowed(&[&s43], "none");
+    shadowed(&[&s45], "none");
+    let b5 = batch(&[("f41", "41"), ("f44", "44")]);
+    gate("41");
+    gate("44");
+    let args = ["--proposal", &p41, "--proposal", &p44, &b5];
+    stand_in(&b5, "q.txt", &s43, &args);
+    let out = shadowed(&args, "conflict");
+    assert!(
+        out.contains(
+            "stage 2a so far: 31 merges, 4 by Weave's own merge; fallbacks: 19 no proposal, 3 conflict, 3 mismatch, 2 ancestor base"
         ),
         "{out}"
     );
@@ -5258,6 +5335,16 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     assert_eq!(
         notes,
         [
+            format!("shadow of {b5}: proposals {p41} {p44} conflicted at q.txt"),
+            format!("shadow of {s45}: no proposal for PR #45"),
+            format!("shadow of {s43}: no proposal for PR #43"),
+            format!("shadow of {s42}: no proposal for PR #42"),
+            format!("shadow of {s40}: no proposal for PR #40"),
+            format!("shadow of {s39}: no proposal"),
+            format!("shadow of {b6}: proposals {p51} {p52} mismatched at r.txt"),
+            format!("shadow of {s53}: no proposal for PR #53"),
+            format!("shadow of {s50}: no proposal for PR #50"),
+            format!("shadow of {s49}: no proposal"),
             format!("shadow of {b4}: proposals {p25} {p27} conflicted at p.txt"),
             format!("shadow of {s26}: no proposal for PR #26"),
             format!("shadow of {s24}: no proposal for PR #24"),
