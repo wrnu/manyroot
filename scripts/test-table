@@ -176,7 +176,10 @@ remote() {
   # In the box: the tools it lacks, HEAD checked out with origin/main beside it, then this script.
   # It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
   # programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both.
-  # The git-core PPA has the current git. Their output shows only if they fail.
+  # The git-core PPA has the current git. Their output shows only if they fail. Then every crate the
+  # host's whole package graph needs, dev-dependencies of packages the -p list leaves out included:
+  # bracken-scope's cargo metadata --offline reads them all, and a build fetches only what it builds
+  # (task 53efd11c6e4a: unicode-properties, manyroot's dev-dependency, without -p manyroot).
   # shellcheck disable=SC2016 # expanded in the box
   local inner='set -eu
 sudo=; [ "$(id -u)" -eq 0 ] || sudo=sudo
@@ -196,7 +199,8 @@ export PATH="$nextest_dir:$PATH"
 git init -q tree
 cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
-git checkout -q tested'
+git checkout -q tested
+setup cargo fetch --locked --target "$(rustc -vV | sed -n "s/^host: //p")"'
   local what="the table"
   if $light_split; then
     what="the light table:$(printf ' -p %s' "${packages[@]}")"
