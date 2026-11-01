@@ -38,6 +38,9 @@ use crate::project::{Limits, Project};
 
 /// The image a project run pins by default: Python 3.12 (decision c008b959c572), by digest.
 pub const IMAGE: &str = "python:3.12@sha256:17b9724493d916f56565c131f389faff2597f46dec6ce09516f95125bc9f519f";
+/// The CPU limit's signal, which a run past it ends as, whether the kernel sent it or the runner saw the
+/// container's total pass the limit.
+const SIGXCPU: i32 = 24;
 /// How often a running container's output and wall time are checked.
 pub const POLL: Duration = Duration::from_millis(20);
 /// The most open files a process may have.
@@ -65,11 +68,37 @@ const PROBE: &str = "import sys; print('%d.%d.%d' % sys.version_info[:3])";
 /// The image as a run's plan records it, and pins it from again (decisions c008b959c572, ac22cedd8fee): a run
 /// refuses an image that isn't here by the plan's digest, or whose version isn't the plan's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, try_from = "serde_json::Value")]
 pub struct PythonPin {
     /// Pinned by digest, as `name@sha256:<hex>`.
     pub image: String,
     pub version: String,
+}
+
+/// [`PythonPin`] as a plan holds it, with no other field.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PinFields {
+    image: String,
+    version: String,
+}
+
+impl TryFrom<serde_json::Value> for PythonPin {
+    type Error = String;
+
+    /// Refuses, saying why, a plan's pin of a host interpreter (a `path`), from before agent code ran in containers
+    /// (finding 264a0f0c8160): that interpreter can't be pinned again, so such a run can't be graded again.
+    fn try_from(v: serde_json::Value) -> Result<PythonPin, String> {
+        if v.get("path").is_some() {
+            return Err(
+                "the plan pins a host Python interpreter, from before agent code ran in containers (PR #191): \
+                        such a run can't be graded again"
+                    .into(),
+            );
+        }
+        let PinFields { image, version } = serde_json::from_value(v).map_err(|e| e.to_string())?;
+        Ok(PythonPin { image, version })
+    }
 }
 
 /// The pinned image.
@@ -109,6 +138,8 @@ impl Python {
         }
         let probe = docker(&[
             "run",
+            "--pull",
+            "never",
             "--rm",
             "--network",
             "none",
@@ -197,6 +228,8 @@ impl Python {
         stderr.truncate(cap);
         let files = std::mem::take(&mut *shared.files.lock().unwrap_or_else(|e| e.into_inner()));
         let started = *shared.started.lock().unwrap_or_else(|e| e.into_inner());
+        // To the supervisor's last word, if it said one: the container's teardown after it isn't the code's.
+        let ended = shared.ended.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or(ended);
         let ran = started.map_or(Duration::ZERO, |at| ended.saturating_duration_since(at));
         Ok(Outcome { exit, stdout, stderr, files, ran })
     }
@@ -292,7 +325,8 @@ fn sweep_now() {
 #[serde(rename_all = "snake_case")]
 pub enum Exit {
     Code(i32),
-    /// Killed by a signal: `SIGXCPU` (24) is the CPU limit, `SIGXFSZ` (25) the file size limit.
+    /// Killed by a signal: `SIGXCPU` (24) is the CPU limit, a process's or the container's in all, `SIGXFSZ` (25)
+    /// the file size limit.
     Signal(i32),
     WallTime,
     /// Killed for passing the container's memory limit.
@@ -405,17 +439,24 @@ struct Shared {
     stderr: Mutex<Vec<u8>>,
     files: Mutex<Vec<(String, Vec<u8>)>>,
     end: Mutex<Option<End>>,
+    /// When the supervisor said how the code ended: its end, before the container's removal.
+    ended: Mutex<Option<Instant>>,
 }
 
-/// The limit a container has passed, if it has passed one: its output, or its wall time from when the code
-/// started (or, until it has, from when the container was asked for, with [`START_GRACE`] more).
+/// The limit a container has passed, if it has passed one: its output; its CPU time in all, as the supervisor
+/// says it, which bounds what forked children use together, as their rlimits bound each alone (finding
+/// ee32bfe90b5c), and counts as the CPU limit's `SIGXCPU`; or its wall time from when the code started (or, until
+/// it has, from when the container was asked for, with [`START_GRACE`] more).
 fn over(shared: &Shared, limits: &Limits, spawned: Instant) -> Option<Exit> {
     let started = *shared.started.lock().unwrap_or_else(|e| e.into_inner());
     let extra = Duration::from_millis(shared.extra.load(Ordering::SeqCst));
     let deadline = started.unwrap_or(spawned + START_GRACE) + Duration::from_secs(limits.wall_seconds.into()) + extra;
     let now = shared.paused.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(Instant::now);
+    let cpu = Duration::from_micros(shared.cpu.load(Ordering::SeqCst));
     if shared.full.load(Ordering::SeqCst) {
         Some(Exit::Output)
+    } else if cpu > Duration::from_secs(limits.cpu_seconds.into()) {
+        Some(Exit::Signal(SIGXCPU))
     } else if now > deadline {
         Some(Exit::WallTime)
     } else {
@@ -460,21 +501,31 @@ impl Container {
         // What the code may write to one file: as much as it may print, and at least 16 MiB.
         let fsize = limits.output_bytes.max(16 << 20);
         let mut cmd = Command::new("docker");
-        cmd.args(["run", "-i", "--name", &name, "--label", &format!("{LABEL}={}", std::process::id())])
-            .args(["--log-driver", "none", "--init", "--network", "none", "--read-only"])
-            .arg("--tmpfs")
-            .arg(format!("{SCRATCH}:rw,size={}m,nr_inodes={MAX_SCRATCH_FILES},mode=1777", limits.scratch_mb))
-            .args(["--memory", &format!("{memory}m"), "--memory-swap", &format!("{memory}m")])
-            .args(["--cpus", "1", "--pids-limit", &MAX_PROCESSES.to_string()])
-            .args(["--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "SETPCAP"])
-            .args(["--security-opt", "no-new-privileges", "--user", "0:0"])
-            .args(["--ulimit", &format!("cpu={cpu}:{}", cpu + 1), "--ulimit", &format!("fsize={fsize}:{fsize}")])
-            .args(["--ulimit", &format!("nofile={MAX_OPEN_FILES}:{MAX_OPEN_FILES}"), "--ulimit", "core=0:0"])
-            .args(["-w", SCRATCH, "--mount", &format!("type=bind,source={source},target=/in,readonly")])
-            .args([python.image.as_str(), "python", "-I", "-S", "-B", "-c", SUPERVISOR, &spec])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        // Never pulled at run time (finding 5e407a7db683): an image gone since the pin fails the run.
+        cmd.args([
+            "run",
+            "--pull",
+            "never",
+            "-i",
+            "--name",
+            &name,
+            "--label",
+            &format!("{LABEL}={}", std::process::id()),
+        ])
+        .args(["--log-driver", "none", "--init", "--network", "none", "--read-only"])
+        .arg("--tmpfs")
+        .arg(format!("{SCRATCH}:rw,size={}m,nr_inodes={MAX_SCRATCH_FILES},mode=1777", limits.scratch_mb))
+        .args(["--memory", &format!("{memory}m"), "--memory-swap", &format!("{memory}m")])
+        .args(["--cpus", "1", "--pids-limit", &MAX_PROCESSES.to_string()])
+        .args(["--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "SETPCAP"])
+        .args(["--security-opt", "no-new-privileges", "--user", "0:0"])
+        .args(["--ulimit", &format!("cpu={cpu}:{}", cpu + 1), "--ulimit", &format!("fsize={fsize}:{fsize}")])
+        .args(["--ulimit", &format!("nofile={MAX_OPEN_FILES}:{MAX_OPEN_FILES}"), "--ulimit", "core=0:0"])
+        .args(["-w", SCRATCH, "--mount", &format!("type=bind,source={source},target=/in,readonly")])
+        .args([python.image.as_str(), "python", "-I", "-S", "-B", "-c", SUPERVISOR, &spec])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
         let spawned = Instant::now();
         let mut client = cmd.spawn().map_err(|e| format!("running docker: {e}"))?;
         let shared = Arc::new(Shared::default());
@@ -603,7 +654,10 @@ fn read_frames(from: impl Read, shared: &Shared, cap: usize, lines: Option<std::
                     shared.files.lock().unwrap_or_else(|e| e.into_inner()).push((path, bytes));
                 }
             }
-            (b'x', _) => *shared.end.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::from_slice(&payload).ok(),
+            (b'x', _) => {
+                *shared.ended.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+                *shared.end.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::from_slice(&payload).ok();
+            }
             _ => break,
         }
     }

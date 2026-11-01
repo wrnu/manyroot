@@ -237,7 +237,8 @@ runner stay on `sandbox-exec` for now.
   refuses an image not named by its digest, one that isn't here by that
   digest (it isn't pulled: `docker pull` it first), and one whose Python
   isn't the project's minor version. Every container runs it by that name,
-  so by that digest.
+  so by that digest, with `--pull never`, so an image removed since the pin
+  fails the run rather than being pulled.
 - **In and out:** a run's inputs (the tree, the runner, a command's working
   files) are written to a fresh `0700` directory of the host's, mounted
   read-only at `/in`, and copied into the scratch directory, `/scratch`,
@@ -256,7 +257,10 @@ runner stay on `sandbox-exec` for now.
   directory), `PATH` and `LANG` set. It can fork and exec inside the
   container, within its process limit.
 - **Limits:** CPU time (`SIGXCPU`), file size (16 MiB or the output limit if
-  larger) and open files (256) as rlimits. Memory is the container's cgroup
+  larger) and open files (256) as rlimits. The rlimit is each process's, and
+  the code may fork, so the container's CPU time in all, as the supervisor
+  says it every 0.1 s, has the same limit: past it the runner kills the run,
+  which ends as `SIGXCPU` too. Memory is the container's cgroup
   limit, with no swap: the run's `memory_mb`, **plus its `scratch_mb`**,
   since the scratch directory is a `tmpfs` held in memory and its pages
   count against the container's limit, plus 16 MiB for the container's init
@@ -296,7 +300,9 @@ container with the code under test. `bracken-experiment run-tests --project
 A run's plan records the image, by digest, and its Python's version
 (`python`), and every run of agent code pins it from there again, refused
 if the image isn't here by that digest or its version has changed
-(`Python::from_plan`).
+(`Python::from_plan`). A project run recorded before agent code ran in
+containers pinned a host interpreter, which can't be pinned again, so it
+can't be graded again: `grade-run` refuses its plan, saying so.
 
 **Overhead** (measured for task `879a58e77bde` on this Mac's Docker
 Desktop, at load averages of 150 to 370 from other agents' builds): a run
@@ -306,7 +312,13 @@ and remove its container: a median of 2.3 s over ten runs at load 236
 group's host, one for its server (again after a crash) and one for each
 command a test runs: while the host waits on one, its wall time counts only
 the code's own time there, not the containers' starts and removals, and a
-call's doesn't count its server's start.
+call's doesn't count its server's start. A command's own time ends when
+the supervisor says it has ended, so its container's removal isn't counted
+either. The group's first server start moves the host's deadline by however
+long it takes, a cost of grading the group at all. What else is left out,
+the code's server restarts and commands, moves the deadline by one more of
+its wall time at most, so code that crashes its server on every call can't
+stretch a group without end.
 
 ## Grading
 

@@ -1,6 +1,19 @@
 //! These need Docker, with the pinned image pulled (`docker pull` [`IMAGE`]): where Docker isn't running, each
 //! says so and passes without checking anything. The counted run on the Mac runs them.
 
+/// A plan's pin of a host interpreter, from before agent code ran in containers, is refused saying so, not as an
+/// unknown field (finding 264a0f0c8160); a pin of an image is read.
+#[test]
+fn an_old_plans_interpreter_pin_is_refused_saying_why() {
+    let old = serde_json::json!({"path": "/opt/homebrew/bin/python3.12", "version": "3.12.16", "digest": "ab"});
+    let err = serde_json::from_value::<super::PythonPin>(old).expect_err("refused").to_string();
+    assert!(err.contains("before agent code ran in containers"), "{err}");
+    let new = serde_json::json!({"image": super::IMAGE, "version": "3.12.16"});
+    assert_eq!(serde_json::from_value::<super::PythonPin>(new).expect("read").image, super::IMAGE);
+    let extra = serde_json::json!({"image": super::IMAGE, "version": "3.12.16", "more": 1});
+    assert!(serde_json::from_value::<super::PythonPin>(extra).is_err(), "no other field");
+}
+
 /// In `macos_only` though they don't need macOS, so the counted run's Mac side runs them: Docker is on this Mac
 /// and not in the test boxes, where they skip (decision ac22cedd8fee, docs/development.md).
 pub(crate) mod macos_only {
@@ -128,9 +141,9 @@ pub(crate) mod macos_only {
         assert_eq!((o.exit.clone(), stdout(&o).trim()), (Exit::Code(0), "ok"), "{}", stderr(&o));
 
         // Exit::Output is reported whenever the output filled its buffer, whichever limit then ended the
-        // run (finding 2e8cdbfcea20), so the wall time is 60 s here: ending within 30 s shows the output
-        // limit ended it, with room for a loaded machine, which took 13.6 s (task f0e98c5097f8).
-        let start = Instant::now();
+        // run (finding 2e8cdbfcea20), so the wall time is 60 s here: the code's own time ending short of it shows
+        // the output limit ended it. Its own, not the test's: a loaded machine's slow container start made the
+        // test's clock read 38.8 s (task 1346b7694f40).
         let o = contained(
             &p,
             "import sys\nwhile True: sys.stdout.write('x' * 4096)",
@@ -138,13 +151,12 @@ pub(crate) mod macos_only {
         );
         assert_eq!(o.exit, Exit::Output);
         assert_eq!(o.stdout.len(), 64 << 10, "kept up to the limit");
-        assert!(start.elapsed() < Duration::from_secs(30), "{:?}", start.elapsed());
+        assert!(o.ran < Duration::from_secs(60), "{:?}", o.ran);
 
         // It would sleep 60 s: ending well before that, with Exit::WallTime, is the 3 s wall time's kill.
-        let start = Instant::now();
         let o = contained(&p, "import time; time.sleep(60)", &quick);
         assert_eq!(o.exit, Exit::WallTime);
-        assert!(start.elapsed() < Duration::from_secs(30), "{:?}", start.elapsed());
+        assert!(o.ran < Duration::from_secs(30), "{:?}", o.ran);
 
         // Python ignores SIGXFSZ, so a write past the file size limit fails instead of ending it.
         let roomy = Limits { wall_seconds: 60, ..quick };
@@ -172,6 +184,30 @@ pub(crate) mod macos_only {
                      \x20           os._exit(0)\n        n += 1\nexcept OSError as e:\n    print(n < 64, e.errno)";
         let o = contained(&p, forks, &Limits { wall_seconds: 20, ..quick });
         assert_eq!((stdout(&o).trim(), o.exit.clone()), ("True 11", Exit::Code(0)), "{}", stderr(&o));
+    }
+
+    /// Forked children share one CPU limit (finding ee32bfe90b5c): four of them each using 0.9 s, under the
+    /// 1 s each process's rlimit allows, end the run as the CPU limit once the container's total passes it.
+    #[test]
+    fn forked_children_share_one_cpu_limit() {
+        let Some(p) = python() else { return };
+        let limits = Limits { cpu_seconds: 1, memory_mb: 128, output_bytes: 64 << 10, wall_seconds: 60, scratch_mb: 8 };
+        let code = "import os, time\nfor _ in range(4):\n    if os.fork() == 0:\n        end = time.process_time() + 0.9\n\
+                    \x20       while time.process_time() < end: pass\n        os._exit(0)\n\
+                    for _ in range(4): os.wait()\nprint('done')";
+        let o = contained(&p, code, &limits);
+        assert_eq!((stdout(&o).as_str(), o.exit.clone()), ("", Exit::Signal(24)), "{}", stderr(&o));
+    }
+
+    /// An image isn't pulled at run time (finding 5e407a7db683): one that isn't here fails the run.
+    #[test]
+    fn an_image_that_isnt_here_isnt_pulled() {
+        let Some(p) = python() else { return };
+        let digest = format!("sha256:{}", "0".repeat(64));
+        let gone = Python { image: format!("python@{digest}"), digest, version: p.version };
+        let scratch = Scratch::new().expect("a scratch directory");
+        let err = gone.run(&scratch, &["-c".into(), "pass".into()], &limits()).expect_err("refused");
+        assert!(err.contains("No such image"), "{err}");
     }
 
     /// What no file's size shows is bounded too, as the scratch directory is a filesystem of its own of a fixed size
