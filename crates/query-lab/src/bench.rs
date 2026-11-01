@@ -86,8 +86,9 @@ fn busiest_pr(g: &Ground) -> Option<u32> {
     })
 }
 
-/// scripts/merge's findings check (section 3), its reads and its jq, for one claim: the findings that
-/// block it. Mirrors the script line for line, through the same CLI calls.
+/// scripts/merge's findings check (section 3) as it stood until #205 switched it to `bracken findings`
+/// (task dea48fd16754): its reads and its jq, for one claim, the findings that block it. Mirrors that
+/// script line for line, through the same CLI calls; crates/bracken/tests/findings.rs keeps its text.
 fn merge_findings(claim: String, triager: String) -> CliWay {
     Box::new(move |cli| {
         let shown = cli.json(&["show", &claim, "--json"])?;
