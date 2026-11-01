@@ -4955,6 +4955,11 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
 
     // The first commit, as stage 1 records it.
     write("x.txt", "one\ntwo\nthree\nfour\nfive\n");
+    // Not UTF-8 (a Latin-1 é), so Weave merges it per file, where git merges its lines.
+    let latin1 = |first: &[u8], last: &[u8]| {
+        std::fs::write(dir.join("y.txt"), [first, b"\ntwo\ncaf\xe9\nfour\n", last, b"\n"].concat()).unwrap()
+    };
+    latin1(b"one", b"five");
     let c0 = commit("x");
     origin_main(&c0);
     shadowed(&[&c0], "first");
@@ -4979,11 +4984,18 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
         "{out}"
     );
 
-    // PRs #2 and #3 both change x.txt, in different lines: git merges both, Weave merges #3 and conflicts on
-    // #2, which falls back to the import, noted with the path.
-    branch("f2", &|| write("x.txt", "ONE\ntwo\nthree\nfour\nfive\n"));
+    // PRs #2 and #3 both change x.txt and y.txt, in different lines: git merges both. Weave merges #3, and
+    // on #2 merges x.txt line by line (task 7cbd0a0ce7d0) but not y.txt, which isn't UTF-8 text, so it
+    // conflicts and falls back to the import, noted with the path.
+    branch("f2", &|| {
+        write("x.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+        latin1(b"ONE", b"five");
+    });
     let p2 = proposal("2");
-    branch("f3", &|| write("x.txt", "one\ntwo\nthree\nfour\nFIVE\n"));
+    branch("f3", &|| {
+        write("x.txt", "one\ntwo\nthree\nfour\nFIVE\n");
+        latin1(b"one", b"FIVE");
+    });
     let p3 = proposal("3");
     let m3 = squash("f3", "3");
     // A proposal must be of the PR merged: #2's isn't #3's.
@@ -5152,7 +5164,7 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
             format!("shadow of {m6}: no proposal"),
             format!("shadow of {m5}: no proposal"),
             format!("shadow of {m4}: proposal {p4} mismatched at extra.txt"),
-            format!("shadow of {m2}: proposal {p2} conflicted at x.txt"),
+            format!("shadow of {m2}: proposal {p2} conflicted at y.txt"),
             format!("shadow of {m3}: merged proposal {p3}"),
             format!("shadow of {m1}: merged proposal {p1}"),
             format!("shadow of {c0}"),
@@ -6551,4 +6563,119 @@ fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
     assert!(copy.exists(), "the symlink's target is kept");
     let out = run_backup(&["--verify", &s(&b.join(&new))]);
     assert!(String::from_utf8_lossy(&out.stdout).contains(": 4 contributions, 1 heads, 1 identities"));
+}
+
+/// Task 23e73664dc45 (owner decision 8ac9b0239d90): scripts/rustc-wrapper, cargo's rustc wrapper. Without
+/// sccache on PATH it runs the compiler itself, with the caller's environment as it is. With sccache, it
+/// runs sccache with only what a compile needs: cargo's variables and the names it lists, never one that
+/// looks like a secret or isn't listed, with SCCACHE_CACHE_SIZE at 15G unless the caller set it, and
+/// sccache's own log settings dropped. Cargo's names that aren't shell identifiers
+/// (`CARGO_BIN_EXE_<bin-with-hyphens>`) pass too: bash 5 leaves them out of its own list of variables. Clippy
+/// skips sccache. The wrapper prints nothing of its own. It's run under every bash on PATH and under
+/// /bin/bash (macOS's 3.2).
+#[test]
+fn rustc_wrapper_uses_sccache_when_installed_and_gives_it_no_secrets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (bin, stubs, seen) = (tmp.path().join("bin"), tmp.path().join("stubs"), tmp.path().join("seen"));
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::create_dir(&stubs).unwrap();
+    // A compiler, a clippy and an sccache that each record how they were run, and with what variables. In
+    // bash, not sh: Linux's dash drops a name that isn't a shell identifier (CARGO_BIN_EXE_a-b) before its
+    // child runs, so the record would miss what the wrapper passed.
+    let record =
+        |who: &str| format!("#!/bin/bash\n{{ echo {who} \"$@\"; /usr/bin/env | sort; }} >\"{}\"\n", seen.display());
+    write_executable(&bin.join("rustc"), &record("rustc"));
+    write_executable(&bin.join("clippy-driver"), &record("clippy-driver"));
+    write_executable(&stubs.join("sccache"), &record("sccache"));
+    let wrapper = repo_root().join("scripts/rustc-wrapper");
+    let mut bashes = vec![PathBuf::from("/bin/bash")];
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap()) {
+        if let Ok(bash) = dir.join("bash").canonicalize()
+            && !bashes.iter().any(|b| b.canonicalize().ok().as_ref() == Some(&bash))
+        {
+            bashes.push(bash);
+        }
+    }
+    for bash in bashes.iter().filter(|b| b.exists()) {
+        rustc_wrapper_under(bash, &wrapper, &bin, &stubs, &seen, tmp.path());
+    }
+}
+
+fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, seen: &Path, home: &Path) {
+    let compile = |path: &str, compiler: &str, extra: &[(&str, &str)]| -> String {
+        let mut command = Command::new(bash);
+        command
+            .arg(wrapper)
+            .arg(bin.join(compiler))
+            .args(["--crate-name", "x"])
+            .env_clear()
+            .env("PATH", path)
+            .env("HOME", home)
+            .env("CARGO_PKG_NAME", "x")
+            .env("CARGO_BIN_EXE_a-b", "/bin/a-b")
+            .env("CARGO_PKG_AUTHORS", "Ann")
+            .env("CARGO_BIN_EXE_tokenizer", "/bin/tokenizer")
+            .env("SCCACHE_SERVER_PORT", "4226")
+            .env("SCCACHE_RECACHE", "1")
+            .env("OUT_DIR", "/out")
+            .env("UNLISTED", "u")
+            .env("ANTHROPIC_AUTH_TOKEN", "s1")
+            .env("CARGO_REGISTRY_TOKEN", "s2")
+            .env("OPENROUTER_API_KEY", "s3")
+            .env("SCCACHE_LOG", "debug");
+        command.envs(extra.iter().copied());
+        let out = command.output().unwrap();
+        assert!(out.status.success(), "{bash:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.stdout.is_empty() && out.stderr.is_empty(), "{bash:?}: the wrapper prints nothing of its own");
+        std::fs::read_to_string(seen).unwrap()
+    };
+    let has = |seen: &str, line: &str| seen.lines().any(|l| l == line);
+
+    // No sccache: the compiler itself, with the environment untouched.
+    let base = "/usr/bin:/bin";
+    let s = compile(base, "rustc", &[]);
+    assert!(s.starts_with("rustc --crate-name x\n"), "{s}");
+    assert!(has(&s, "ANTHROPIC_AUTH_TOKEN=s1") && has(&s, "UNLISTED=u"), "{s}");
+    assert!(!s.contains("SCCACHE_CACHE_SIZE"), "{s}");
+
+    // With sccache: sccache runs the compiler, and gets only what a compile needs.
+    let with = format!("{}:{base}", stubs.display());
+    let s = compile(&with, "rustc", &[]);
+    assert!(s.starts_with(&format!("sccache {} --crate-name x\n", bin.join("rustc").display())), "{s}");
+    let path = format!("PATH={with}");
+    let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+    let socket = format!("SCCACHE_SERVER_UDS=/tmp/bracken-sccache-{}/server.sock", uid.trim());
+    for kept in [
+        "CARGO_PKG_NAME=x",
+        "CARGO_BIN_EXE_a-b=/bin/a-b",
+        // Cargo's own, though AUTH and TOKEN are in their names (finding 58223509a78e).
+        "CARGO_PKG_AUTHORS=Ann",
+        "CARGO_BIN_EXE_tokenizer=/bin/tokenizer",
+        // A counted run's, from test-table.
+        "SCCACHE_RECACHE=1",
+        // The server on a unix socket in a 0700 directory of this user's, never a port (finding 292898be0ce0).
+        &socket,
+        "OUT_DIR=/out",
+        &path,
+        "SCCACHE_CACHE_SIZE=15G",
+        "SCCACHE_IGNORE_SERVER_IO_ERROR=1",
+    ] {
+        assert!(has(&s, kept), "{bash:?}: {kept}: {s}");
+    }
+    for gone in [
+        "ANTHROPIC_AUTH_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+        "OPENROUTER_API_KEY",
+        "SCCACHE_LOG",
+        "SCCACHE_SERVER_PORT",
+        "UNLISTED",
+    ] {
+        assert!(!s.contains(gone), "{bash:?}: {gone}: {s}");
+    }
+    // A cache size the caller set stays.
+    assert!(has(&compile(&with, "rustc", &[("SCCACHE_CACHE_SIZE", "3G")]), "SCCACHE_CACHE_SIZE=3G"));
+    // Clippy skips the cache, so a lint is never answered from one made under other flags.
+    let s = compile(&with, "clippy-driver", &[]);
+    assert!(s.starts_with("clippy-driver --crate-name x\n"), "{s}");
+    assert!(has(&s, "ANTHROPIC_AUTH_TOKEN=s1"), "{s}");
 }

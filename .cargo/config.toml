@@ -1,0 +1,9 @@
+# Smaller, shared Rust builds (owner decision 8ac9b0239d90; docs/development.md, under Builds).
+[build]
+# Incremental state was about 5.5 of each worktree's 10 GB target, and sccache can't cache an
+# incremental compile.
+incremental = false
+# Every compile goes through sccache when it's installed, and straight to rustc otherwise. Cargo
+# resolves a path with a slash from the directory holding .cargo/, so this is the repo's own script
+# from any worktree and any directory inside it.
+rustc-wrapper = "scripts/rustc-wrapper"

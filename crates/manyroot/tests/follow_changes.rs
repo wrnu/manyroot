@@ -309,7 +309,7 @@ fn assess_and_evaluate(g: &Graph, w: &ContributionId, changes: usize, runs: usiz
 /// Finding `73252cef945e`: a stranger's subject with many passes and many changes once cost passes ×
 /// changes × graph size (11.7 s at 1,200 contributions). One sweep over the graph per 64 changes keeps
 /// 400 changes to 7 sweeps of a graph about 3 times the size of one with a single change, so about 21
-/// times its cost, where a walk per pair would be over a thousand times. The two are timed in the same
+/// times its cost, where a walk per pair would be about 900 times. The two are timed in the same
 /// process, one after the other, so the machine's load slows both, where an absolute bound failed under
 /// load (findings d723cb659e69, 2c8c53a94c58). Under load averages of 70 to 180 the ratio measured 7 to
 /// 26; the pairwise walk's 11.7 s was about 900 times this baseline. The baseline, the shorter run, is
@@ -373,12 +373,12 @@ fn evaluate_and_assess(g: &Graph, subjects: &[ContributionId], runs: usize) -> s
 
 /// The same finding, across subjects: many subjects resting on one long chain whose far end changed once
 /// cost each subject a walk of the chain. One assessor works out what each node reaches once, so a
-/// thousand subjects cost little more than one: the graph is about 2.5 times the size, and a walk per
-/// subject would make it hundreds of times one's cost. The two are timed in the same process, one after
-/// the other, so the machine's load slows both, where an absolute bound failed under load (task
-/// f0e98c5097f8, gotcha 28a7d2a70c93). Under load averages of 300 to 450 the ratio measured 1.5 to 13.4;
-/// the one-subject baseline, the shorter and so the more easily skewed, is the fastest of five runs
-/// (finding 2c8c53a94c58).
+/// thousand subjects cost about 10 to 13 times one on a quiet machine, on a graph about 2.5 times the
+/// size, where a walk per subject would make it hundreds of times one's cost. The two are timed in the
+/// same process, one after the other, so the machine's load slows both, where an absolute bound failed
+/// under load (task f0e98c5097f8, gotcha 28a7d2a70c93). At load averages of about 200 to 230 the ratio
+/// measured 1.5 to 13.4; the one-subject baseline, the shorter and so the more easily skewed, is the
+/// fastest of five runs (finding 2c8c53a94c58).
 #[test]
 fn many_subjects_on_a_long_chain_cost_one_walk_not_one_each() {
     let (k, m) = (1000, 1000);

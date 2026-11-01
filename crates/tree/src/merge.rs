@@ -6,14 +6,18 @@
 //! Comparing a base `B` with sides `X` and `Y`: equal sides are taken; a side
 //! equal to `B` gives way to the other; anything else is a conflict, keyed on
 //! `(path, B, {X, Y})` with full file values, mode included. A resolution with
-//! exactly that key settles it, the smallest id first. A rename is a delete
-//! plus an add.
+//! exactly that key settles it, the smallest id first. Without one, a conflict
+//! whose three versions are all text files merges line by line
+//! ([`crate::text_merge`]; task 7cbd0a0ce7d0), if that merge is clean. A rename
+//! is a delete plus an add.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use manyroot::ContributionId;
 
-use crate::format::{Entry, FileValue, Manifest, Resolution};
+use crate::ContentHash;
+use crate::format::{Entry, FileValue, Manifest, Mode, Resolution};
+use crate::import::FileVersion;
 use crate::path::{self, Collision};
 
 /// One file conflict: what a resolution is keyed on.
@@ -129,26 +133,114 @@ pub enum MergeError {
     Collision(Collision),
 }
 
-/// A merged tree, with the resolutions it used, ascending.
+/// A merged tree, with the resolutions it used, ascending, and the paths it merged
+/// line by line, with the file versions that merge made, in path order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
     pub manifest: Manifest,
     pub used: Vec<ContributionId>,
+    /// The file versions the line merge made: the tree holds them, the replica may not.
+    pub merged_lines: Vec<FileVersion>,
 }
 
 /// Settles every conflict of `merged` with the resolution of its key that has the
 /// smallest id. `size` gives a held file version's size, for a resolution's result.
+/// No conflict merges line by line: see [`resolve_lines`].
 pub fn resolve(
     merged: &Merged,
     resolutions: &Resolutions,
-    size: impl Fn(&crate::ContentHash) -> Option<u64>,
+    size: impl Fn(&ContentHash) -> Option<u64>,
+) -> Result<Resolved, MergeError> {
+    resolve_lines(merged, resolutions, size, |_| None)
+}
+
+/// The mode of a file whose modes are `base`, `ours` and `theirs`, merged as values are: equal sides
+/// are taken, and a side equal to the base gives way to the other. `None` if they changed both ways.
+pub fn merge_mode(base: Mode, ours: Mode, theirs: Mode) -> Option<Mode> {
+    if ours == theirs || theirs == base {
+        Some(ours)
+    } else if ours == base {
+        Some(theirs)
+    } else {
+        None
+    }
+}
+
+/// The line merge of one conflict, if it is clean: its entry and its bytes. Only a conflict whose three
+/// versions are all present, regular files (not symlinks), held, and text merges, and only if its modes
+/// merge too.
+fn merge_lines<'a>(conflict: &Conflict, content: &impl Fn(&ContentHash) -> Option<&'a [u8]>) -> Option<FileVersion> {
+    let (b, x, y) = (conflict.key.base?, conflict.ours?, conflict.theirs?);
+    merge_mode(b.mode, x.mode, y.mode)?;
+    let (bb, xb, yb) = text_sides(conflict, content)?;
+    let bytes = crate::text_merge::merge(bb, xb, yb)?;
+    // A merge too big to write as one file version stays a conflict (finding d189e282cdee).
+    if bytes.len() > crate::import::MAX_FILE_BYTES {
+        return None;
+    }
+    Some(FileVersion { hash: ContentHash::of(&bytes), name: conflict.key.path.clone(), bytes })
+}
+
+/// Where a conflict's text conflicts, as base line ranges counted from 1, inclusive at both ends:
+/// `None` unless its three versions are present, held, regular files and text, with each side's diff
+/// within [`crate::text_merge::MAX_DIFF_LINES`], so it could merge line by line. Empty if its lines
+/// merge, and only its mode, or the merge's size, stops it.
+pub fn text_conflicts<'a>(
+    conflict: &Conflict,
+    content: impl Fn(&ContentHash) -> Option<&'a [u8]>,
+) -> Option<Vec<(u32, u32)>> {
+    let (bb, xb, yb) = text_sides(conflict, content)?;
+    Some(crate::text_merge::conflicts(bb, xb, yb)?.into_iter().map(|r| (r.start + 1, r.end.max(r.start + 1))).collect())
+}
+
+/// For a conflict whose base and sides are all text, as [`text_conflicts`] asks, the merge with each
+/// conflicting region between markers ([`crate::text_merge::markers`]); `None` for any other conflict.
+pub fn conflict_markers<'a>(
+    conflict: &Conflict,
+    content: impl Fn(&ContentHash) -> Option<&'a [u8]>,
+    labels: &crate::text_merge::Labels,
+) -> Option<Vec<u8>> {
+    let (bb, xb, yb) = text_sides(conflict, content)?;
+    crate::text_merge::markers(bb, xb, yb, labels)
+}
+
+/// The bytes of a conflict's base and sides, when all three are present, none is a symlink, `content`
+/// gives each, and each is text.
+fn text_sides<'a>(
+    conflict: &Conflict,
+    content: impl Fn(&ContentHash) -> Option<&'a [u8]>,
+) -> Option<(&'a [u8], &'a [u8], &'a [u8])> {
+    let (b, x, y) = (conflict.key.base?, conflict.ours?, conflict.theirs?);
+    if [b, x, y].iter().any(|v| v.mode == Mode::Symlink) {
+        return None;
+    }
+    let (bb, xb, yb) = (content(&b.hash)?, content(&x.hash)?, content(&y.hash)?);
+    [bb, xb, yb].iter().all(|bytes| crate::text_merge::is_text(bytes)).then_some((bb, xb, yb))
+}
+
+/// As [`resolve`], and then a conflict no resolution settles merges line by line if it can, with
+/// `content` giving a held file version's bytes. A resolution comes first, so every merge recorded
+/// before line merging computes the same tree, and an integrator can overrule a clean textual merge
+/// (design 68b57f9aed6d, answer c8a511445626).
+pub fn resolve_lines<'a>(
+    merged: &Merged,
+    resolutions: &Resolutions,
+    size: impl Fn(&ContentHash) -> Option<u64>,
+    content: impl Fn(&ContentHash) -> Option<&'a [u8]>,
 ) -> Result<Resolved, MergeError> {
     let mut entries = merged.settled.clone();
     let mut used = Vec::new();
     let mut unresolved = Vec::new();
+    let mut merged_lines = Vec::new();
     for conflict in &merged.conflicts {
         let Some((id, resolution)) = resolutions.for_key(&conflict.key).first() else {
-            unresolved.push(conflict.clone());
+            match line_merged(conflict, &content) {
+                Some((entry, version)) => {
+                    entries.insert(conflict.key.path.clone(), entry);
+                    merged_lines.push(version);
+                }
+                None => unresolved.push(conflict.clone()),
+            }
             continue;
         };
         if let Some(value) = resolution.result {
@@ -172,5 +264,17 @@ pub fn resolve(
     }
     used.sort();
     used.dedup();
-    Ok(Resolved { manifest: Manifest::new(entries.into_values().collect()), used })
+    Ok(Resolved { manifest: Manifest::new(entries.into_values().collect()), used, merged_lines })
+}
+
+/// [`merge_lines`]'s entry, with its mode merged, and its file version.
+fn line_merged<'a>(
+    conflict: &Conflict,
+    content: &impl Fn(&ContentHash) -> Option<&'a [u8]>,
+) -> Option<(Entry, FileVersion)> {
+    let version = merge_lines(conflict, content)?;
+    let (b, x, y) = (conflict.key.base?, conflict.ours?, conflict.theirs?);
+    let mode = merge_mode(b.mode, x.mode, y.mode)?;
+    let entry = Entry { path: conflict.key.path.clone(), mode, hash: version.hash, size: version.bytes.len() as u64 };
+    Some((entry, version))
 }

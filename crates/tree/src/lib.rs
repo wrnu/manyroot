@@ -42,6 +42,7 @@ pub mod results;
 pub mod reviews;
 pub mod secrets;
 mod shared;
+pub mod text_merge;
 
 pub use format::{
     Answer, Breakage, Change, ChangeEntry, CheckDefinition, Decision, Disposition, Entry, FileValue, FormatError,

@@ -166,3 +166,150 @@ fn a_merge_whose_paths_collide_is_refused() {
     let merged = merge::three_way(&base, &ours, &theirs);
     assert!(matches!(merge::resolve(&merged, &Resolutions::default(), |_| None), Err(MergeError::Collision(_))));
 }
+
+/// Bytes by hash, for the line merge: every version these tests make.
+fn held<'a>(versions: &'a [&'a [u8]]) -> impl Fn(&ContentHash) -> Option<&'a [u8]> {
+    move |h| versions.iter().copied().find(|b| ContentHash::of(b) == *h)
+}
+
+/// The line merge (task 7cbd0a0ce7d0): each case of the table, with text a line merge could join.
+/// Present, regular, text versions on all three sides merge line by line where their lines merge;
+/// everything else is a per-file conflict, as before.
+#[test]
+fn a_conflict_merges_line_by_line_only_for_three_text_files() {
+    type Side<'a> = Option<(&'a [u8], Mode)>;
+    let base: &[u8] = b"1\n2\n3\n4\n5\n";
+    let top: &[u8] = b"one\n2\n3\n4\n5\n";
+    let bottom: &[u8] = b"1\n2\n3\n4\nfive\n";
+    let both: &[u8] = b"one\n2\n3\n4\nfive\n";
+    let near: &[u8] = b"1\ntwo\n3\n4\n5\n";
+    let latin1: &[u8] = b"1\n2\n3\n4\n5\xe9\n";
+    let latin1_top: &[u8] = b"one\n2\n3\n4\n5\xe9\n";
+    let latin1_bottom: &[u8] = b"1\n2\n3\n4\nfive\xe9\n";
+    let nul: &[u8] = b"1\n2\n3\n4\n5\0\n";
+    let nul_top: &[u8] = b"one\n2\n3\n4\n5\0\n";
+    let nul_bottom: &[u8] = b"1\n2\n3\n4\nfive\0\n";
+    let versions = [base, top, bottom, both, near, latin1, latin1_top, latin1_bottom, nul, nul_top, nul_bottom];
+    type Case<'a> = (&'a str, Side<'a>, Side<'a>, Side<'a>, Result<Side<'a>, ()>);
+    let cases: [Case; 11] = [
+        ("lines apart", Some((base, F)), Some((top, F)), Some((bottom, F)), Ok(Some((both, F)))),
+        ("adjacent lines", Some((base, F)), Some((top, F)), Some((near, F)), Err(())),
+        (
+            "a mode change against a content change",
+            Some((base, F)),
+            Some((base, X)),
+            Some((bottom, F)),
+            Ok(Some((bottom, X))),
+        ),
+        ("a mode change and lines apart", Some((base, F)), Some((top, X)), Some((bottom, F)), Ok(Some((both, X)))),
+        ("two mode changes", Some((base, F)), Some((top, X)), Some((bottom, L)), Err(())),
+        ("a symlink", Some((base, L)), Some((top, L)), Some((bottom, L)), Err(())),
+        ("added on both", None, Some((top, F)), Some((bottom, F)), Err(())),
+        ("deleted against changed", Some((base, F)), None, Some((bottom, F)), Err(())),
+        ("changed against deleted", Some((base, F)), Some((top, F)), None, Err(())),
+        ("not UTF-8", Some((latin1, F)), Some((latin1_top, F)), Some((latin1_bottom, F)), Err(())),
+        ("a NUL", Some((nul, F)), Some((nul_top, F)), Some((nul_bottom, F)), Err(())),
+    ];
+    let size = |h: &ContentHash| versions.iter().find(|b| ContentHash::of(b) == *h).map(|b| b.len() as u64);
+    for (case, b, x, y, want) in &cases {
+        let merged = merge::three_way(&one(*b), &one(*x), &one(*y));
+        assert_eq!(merged.conflicts.len(), 1, "{case}: a per-file conflict first");
+        let got = merge::resolve_lines(&merged, &Resolutions::default(), size, held(&versions));
+        match want {
+            Ok(Some((bytes, mode))) => {
+                let resolved = got.unwrap_or_else(|e| panic!("{case}: {e}"));
+                assert_eq!(resolved.manifest.entries, [entry("p", bytes, *mode)], "{case}");
+                assert_eq!(resolved.merged_lines.len(), 1, "{case}");
+                assert_eq!(resolved.merged_lines[0].bytes, *bytes, "{case}");
+                assert!(resolved.used.is_empty(), "{case}: no resolution");
+            }
+            Ok(None) => unreachable!(),
+            Err(()) => assert!(matches!(got, Err(MergeError::Unresolved(c)) if c.len() == 1), "{case}"),
+        }
+        // Without the bytes, nothing merges line by line: the plain resolve, as before.
+        assert!(matches!(merge::resolve(&merged, &Resolutions::default(), size), Err(MergeError::Unresolved(_))));
+    }
+}
+
+/// A resolution comes before the line merge: an integrator's resolution of the key settles the file even
+/// where the lines would merge, so a merge recorded before line merging computes the same tree.
+#[test]
+fn a_resolution_comes_before_the_line_merge() {
+    let (base, top, bottom): (&[u8], &[u8], &[u8]) = (b"1\n2\n3\n4\n5\n", b"one\n2\n3\n4\n5\n", b"1\n2\n3\n4\nfive\n");
+    let chosen: &[u8] = b"chosen\n";
+    let versions = [base, top, bottom, chosen];
+    let size = |h: &ContentHash| versions.iter().find(|b| ContentHash::of(b) == *h).map(|b| b.len() as u64);
+    let merged = merge::three_way(&one(Some((base, F))), &one(Some((top, F))), &one(Some((bottom, F))));
+    let mut resolutions = Resolutions::default();
+    resolutions.insert(
+        id(9),
+        Resolution {
+            v: 0,
+            path: "p".into(),
+            base: value(base, F),
+            sides: merged.conflicts[0].key.sides,
+            result: value(chosen, F),
+        },
+    );
+    let resolved = merge::resolve_lines(&merged, &resolutions, size, held(&versions)).expect("resolved");
+    assert_eq!(resolved.manifest.entries, [entry("p", chosen, F)]);
+    assert_eq!(resolved.used, [id(9)]);
+    assert!(resolved.merged_lines.is_empty());
+}
+
+/// Where a text conflict's lines conflict, counted from 1; none for a file that isn't text.
+#[test]
+fn text_conflicts_name_the_lines() {
+    let (base, top, near): (&[u8], &[u8], &[u8]) = (b"1\n2\n3\n", b"one\n2\n3\n", b"1\ntwo\n3\n");
+    let versions = [base, top, near];
+    let merged = merge::three_way(&one(Some((base, F))), &one(Some((top, F))), &one(Some((near, F))));
+    assert_eq!(merge::text_conflicts(&merged.conflicts[0], held(&versions)), Some(vec![(1, 2)]));
+    let labels = bracken_tree::text_merge::Labels { ours: "into", base: "base", theirs: "from" };
+    let marked = merge::conflict_markers(&merged.conflicts[0], held(&versions), &labels).expect("text");
+    assert_eq!(marked, b"<<<<<<< into\none\n2\n||||||| base\n1\n2\n=======\n1\ntwo\n>>>>>>> from\n3\n");
+    // Neither for symlinks, nor for versions this replica doesn't hold.
+    let merged = merge::three_way(&one(Some((base, L))), &one(Some((top, L))), &one(Some((near, L))));
+    assert_eq!(merge::text_conflicts(&merged.conflicts[0], held(&versions)), None);
+    assert_eq!(merge::conflict_markers(&merged.conflicts[0], held(&versions), &labels), None);
+    let merged = merge::three_way(&one(Some((base, F))), &one(Some((top, F))), &one(Some((near, F))));
+    assert_eq!(merge::conflict_markers(&merged.conflicts[0], held(&[base, top]), &labels), None);
+}
+
+/// Finding d189e282cdee: each side may be 8 MiB, so a clean merge can be bigger than one file version
+/// may be. It stays a per-file conflict, rather than failing when the tree is written.
+#[test]
+fn a_line_merge_too_big_to_write_stays_a_conflict() {
+    let base: &[u8] = b"a\nb\nc\n";
+    let line = [b'x'; 1023].iter().chain(b"\n").copied().collect::<Vec<u8>>();
+    let big: Vec<u8> = line.repeat(8 * 1024 - 1);
+    let ours = [&big[..], base].concat();
+    let theirs = [base, &big[..]].concat();
+    assert!(bracken_tree::text_merge::is_text(&ours) && bracken_tree::text_merge::is_text(&theirs));
+    assert!(ours.len() + theirs.len() - base.len() > bracken_tree::import::MAX_FILE_BYTES);
+    let versions = [base, &ours[..], &theirs[..]];
+    let size = |h: &ContentHash| versions.iter().find(|b| ContentHash::of(b) == *h).map(|b| b.len() as u64);
+    let merged = merge::three_way(&one(Some((base, F))), &one(Some((&ours, F))), &one(Some((&theirs, F))));
+    let got = merge::resolve_lines(&merged, &Resolutions::default(), size, held(&versions));
+    assert!(matches!(got, Err(MergeError::Unresolved(ref c)) if c.len() == 1), "{got:?}");
+    // Its lines merge, so the listing names no conflicting region.
+    assert_eq!(merge::text_conflicts(&merged.conflicts[0], held(&versions)), Some(vec![]));
+}
+
+/// Finding 933f535c9476: over the diff cap, the listing names no lines either, as for a file that isn't
+/// text.
+#[test]
+fn over_the_diff_cap_the_listing_names_no_lines() {
+    let n = bracken_tree::text_merge::MAX_DIFF_LINES + 1;
+    let middle = |tag: &str| -> String { (0..n).map(|i| format!("{tag}{i}\n")).collect() };
+    let base = format!("h\ngap\n{}", middle("b"));
+    let (ours, theirs) = (format!("h\ngap\n{}", middle("o")), format!("H\ngap\n{}", middle("b")));
+    let versions = [base.as_bytes(), ours.as_bytes(), theirs.as_bytes()];
+    let merged = merge::three_way(
+        &one(Some((base.as_bytes(), F))),
+        &one(Some((ours.as_bytes(), F))),
+        &one(Some((theirs.as_bytes(), F))),
+    );
+    assert_eq!(merge::text_conflicts(&merged.conflicts[0], held(&versions)), None);
+    let size = |h: &ContentHash| versions.iter().find(|b| ContentHash::of(b) == *h).map(|b| b.len() as u64);
+    assert!(merge::resolve_lines(&merged, &Resolutions::default(), size, held(&versions)).is_err());
+}

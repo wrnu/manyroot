@@ -510,3 +510,233 @@ fn unicode_tables_are_pinned() {
         "blake3:a2dfd498ba458a2f61f89b2bf8254ea1b9cf7d078a2bcac64aba0826cd4e258c"
     );
 }
+
+/// The line merge's results are part of what a merged tree means across replicas and versions
+/// (task 7cbd0a0ce7d0, answer c8a511445626): these triples pin it, imara-diff's histogram diff included.
+/// A failure here means a change to the algorithm or the crate, which is reviewed as protocol class.
+/// Each is (base, ours, theirs, the content hash of the merge or "conflict").
+#[test]
+fn line_merge_golden_vectors() {
+    let vectors: [(&str, &str, &str, &str); 8] = [
+        (
+            "a\nb\nc\nd\ne\n",
+            "A\nb\nc\nd\ne\n",
+            "a\nb\nc\nd\nE\n",
+            "blake3:a697e21e31b7ce97c673b77be5edba07564d74b47512078da31f3d016eca72c2",
+        ),
+        ("a\nb\nc\nd\ne\n", "A\nb\nc\nd\ne\n", "a\nB\nc\nd\ne\n", "conflict"),
+        (
+            "a\nb\nc\nd\ne\n",
+            "a\nb\nN\nc\nd\ne\n",
+            "a\nb\nN\nc\nd\ne\n",
+            "blake3:447360351726de625e35b0841a61a0612844ed88514abd77f7113b09a60caf9d",
+        ),
+        (
+            "a\nb\nc\nd",
+            "a\nb\nc\nd\n",
+            "A\nb\nc\nd",
+            "blake3:4554a460ebbdba85ac6879a08afc3507f9072b38589a143a00f05365719757a7",
+        ),
+        (
+            "a\r\nb\r\nc\r\nd\r\n",
+            "A\r\nb\r\nc\r\nd\r\n",
+            "a\r\nb\r\nc\r\nD\r\n",
+            "blake3:095a36f014816f2b99c86691cec0dd02acd3f3877c3a6e3de6cd8b0697e03120",
+        ),
+        (
+            "fn f() {\n    a();\n}\n\nfn g() {\n    b();\n}\n",
+            "fn f() {\n    a();\n    a2();\n}\n\nfn g() {\n    b();\n}\n",
+            "fn f() {\n    a();\n}\n\nfn g() {\n    b();\n    b2();\n}\n",
+            "blake3:f37bef4d6ea870740ee7c7127eeb61fd7eca70f960a5ad27d8a728cc712700e9",
+        ),
+        (
+            "}\n\n    y();\n}\n    y();\n}\n    y();\n",
+            "}\n\n    y();\n}\n}\n    y();\n",
+            "}\n\n    y();\n    y();\n}\n    y();\n}\nw\n    y();\n",
+            "blake3:645be9d60a08b1e5482e55fe7aad11d0d1e700d02d86838c22cc382961811ceb",
+        ),
+        ("", "x\n", "y\n", "conflict"),
+    ];
+    for (i, (base, ours, theirs, want)) in vectors.iter().enumerate() {
+        let got = merge(base.as_bytes(), ours.as_bytes(), theirs.as_bytes())
+            .map_or_else(|| "conflict".to_owned(), |b| ContentHash::of(&b).to_string());
+        assert_eq!(&got, want, "vector {i}");
+    }
+}
+
+/// The line merge's diff cap, 10,000 lines per side once common first and last lines are set aside
+/// (finding 933f535c9476, answer 47a1c1088fd6), decides clean or not, so it is pinned: a rewrite of
+/// exactly that many lines merges, to these bytes, and one line more is a conflict.
+#[test]
+fn line_merge_cap_vectors() {
+    let file = |first: &str, tag: &str, n: usize| -> String {
+        let middle: String = (0..n).map(|i| format!("{tag}{i}\n")).collect();
+        format!("{first}\ngap\n{middle}tail\n")
+    };
+    for (n, want) in
+        [(10_000, "blake3:8498c76b9a5b1c1900f92d292005694560b79b0823aa6802af457f1139d561b8"), (10_001, "conflict")]
+    {
+        let (base, ours, theirs) = (file("h", "b", n), file("h", "o", n), file("H", "b", n));
+        let merged = merge(base.as_bytes(), ours.as_bytes(), theirs.as_bytes());
+        if let Some(bytes) = &merged {
+            assert_eq!(bytes, file("H", "o", n).as_bytes(), "both edits");
+        }
+        let got = merged.map_or_else(|| "conflict".to_owned(), |b| ContentHash::of(&b).to_string());
+        assert_eq!(got, want, "{n} lines");
+    }
+    assert_eq!(bracken_tree::text_merge::MAX_DIFF_LINES, 10_000);
+}
+
+// The line merge against git merge-file (task 7cbd0a0ce7d0). Weave's line merge is its own rule, which
+// agrees with git's in nearly all cases but not byte for byte (docs/design/weave.md, *Per-file merge*).
+
+use std::process::Command;
+
+use bracken_tree::text_merge::merge;
+
+/// A small deterministic generator, so a failing triple can be found again from its seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+const WORDS: [&str; 9] = ["a", "b", "c", "}", "", "fn x() {", "    y();", "z", "w"];
+
+/// A side: `base` with a few random edits. A small alphabet repeats lines, which is where diffs differ.
+fn edit(rng: &mut Rng, base: &[String]) -> Vec<String> {
+    let mut lines = base.to_vec();
+    for _ in 0..rng.below(4) {
+        let at = rng.below(lines.len() as u64 + 1) as usize;
+        let word = WORDS[rng.below(WORDS.len() as u64) as usize].to_owned();
+        match rng.below(3) {
+            0 => lines.insert(at, word),
+            1 if at < lines.len() => {
+                lines.remove(at);
+            }
+            _ if at < lines.len() => lines[at] = word,
+            _ => {}
+        }
+    }
+    lines
+}
+
+fn text(lines: &[String], final_newline: bool) -> String {
+    let mut s = lines.join("\n");
+    if final_newline && !lines.is_empty() {
+        s.push('\n');
+    }
+    s
+}
+
+/// git merge-file's answer: the merged bytes, or None for a conflict. Its exit is the conflict count.
+fn git_merge(dir: &std::path::Path, base: &str, ours: &str, theirs: &str) -> Option<Vec<u8>> {
+    for (name, body) in [("base", base), ("ours", ours), ("theirs", theirs)] {
+        std::fs::write(dir.join(name), body).expect("scratch write");
+    }
+    let out = Command::new("git")
+        .args(["merge-file", "-p", "--diff-algorithm=histogram", "ours", "base", "theirs"])
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("git runs");
+    match out.status.code() {
+        Some(0) => Some(out.stdout),
+        Some(n) if (1..127).contains(&n) => None,
+        other => panic!("git merge-file failed ({other:?}): {}", String::from_utf8_lossy(&out.stderr)),
+    }
+}
+
+/// How often the line merge and git merge-file disagree, by kind, over `n` triples from `seed`: printed,
+/// for measuring. `cargo test -p bracken-tree --test text_merge -- --ignored --nocapture tally`.
+#[test]
+#[ignore = "a measurement, not a check"]
+fn tally() {
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut rng = Rng(7);
+    let (mut agree, mut weave_only, mut git_only, mut differ, mut first) = (0, 0, 0, 0, Vec::new());
+    for case in 0..20000 {
+        let base: Vec<String> =
+            (0..rng.below(12) + 1).map(|_| WORDS[rng.below(WORDS.len() as u64) as usize].to_owned()).collect();
+        let (ours, theirs) = (edit(&mut rng, &base), edit(&mut rng, &base));
+        let nl = [rng.below(4) != 0, rng.below(4) != 0, rng.below(4) != 0];
+        let (b, x, y) = (text(&base, nl[0]), text(&ours, nl[1]), text(&theirs, nl[2]));
+        let got = merge(b.as_bytes(), x.as_bytes(), y.as_bytes());
+        let git = git_merge(dir.path(), &b, &x, &y);
+        match (&got, &git) {
+            _ if got == git => agree += 1,
+            (Some(_), None) => weave_only += 1,
+            (None, Some(_)) => git_only += 1,
+            _ => differ += 1,
+        }
+        if got != git && first.len() < 3 {
+            first.push(case);
+        }
+    }
+    println!(
+        "agree {agree}, clean only here {weave_only}, clean only in git {git_only}, both clean but different {differ}; first {first:?}"
+    );
+}
+
+/// The cases of the oracle's seed where git and imara-diff's histogram diff align repeated lines
+/// differently, so the two merges differ (question 49bd8e66c5f9, answer 55e0a67c68a2). Pinned in the
+/// format guard: a change to imara-diff or to git that moves this list is a change to what Weave's line
+/// merge gives, reviewed as protocol class. Don't edit it to make the test pass.
+const KNOWN_DIFFERENT: [usize; 1] = [620];
+
+/// git merge-file as an oracle: on 2,000 generated triples, both agree on whether a merge is clean,
+/// and on its bytes when it is, but for [`KNOWN_DIFFERENT`].
+#[test]
+fn agrees_with_git_merge_file() {
+    if Command::new("git").arg("--version").output().is_err() {
+        eprintln!("skipped: no git");
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let mut rng = Rng(0x7cbd_0a0c_e7d0_0001);
+    let (mut clean, mut conflicted, mut different) = (0, 0, Vec::new());
+    for case in 0..2000 {
+        let base: Vec<String> =
+            (0..rng.below(12) + 1).map(|_| WORDS[rng.below(WORDS.len() as u64) as usize].to_owned()).collect();
+        let (ours, theirs) = (edit(&mut rng, &base), edit(&mut rng, &base));
+        let nl = [rng.below(4) != 0, rng.below(4) != 0, rng.below(4) != 0];
+        let (b, x, y) = (text(&base, nl[0]), text(&ours, nl[1]), text(&theirs, nl[2]));
+        let got = merge(b.as_bytes(), x.as_bytes(), y.as_bytes());
+        let git = git_merge(dir.path(), &b, &x, &y);
+        if got != git {
+            different.push(case);
+            eprintln!("case {case}: base {b:?}, ours {x:?}, theirs {y:?}: here {got:?}, git {git:?}");
+        }
+        if git.is_some() {
+            clean += 1;
+        } else {
+            conflicted += 1;
+        }
+    }
+    assert!(clean > 200 && conflicted > 200, "the cases cover both: {clean} clean, {conflicted} conflicts");
+    assert_eq!(different, KNOWN_DIFFERENT, "where the merges differ from git's");
+}
+
+/// The same inputs give the same bytes every time, and swapping the sides doesn't change whether a merge
+/// is clean.
+#[test]
+fn deterministic_and_symmetric() {
+    let mut rng = Rng(42);
+    for _ in 0..500 {
+        let base: Vec<String> = (0..rng.below(10) + 1).map(|_| format!("l{}", rng.below(5))).collect();
+        let (x, y) = (text(&edit(&mut rng, &base), true), text(&edit(&mut rng, &base), true));
+        let b = text(&base, true);
+        let once = merge(b.as_bytes(), x.as_bytes(), y.as_bytes());
+        assert_eq!(once, merge(b.as_bytes(), x.as_bytes(), y.as_bytes()));
+        assert_eq!(once.is_some(), merge(b.as_bytes(), y.as_bytes(), x.as_bytes()).is_some(), "{b:?} {x:?} {y:?}");
+    }
+}

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# rustc-wrapper: cargo's build.rustc-wrapper for this repository (.cargo/config.toml, owner decision
+# 8ac9b0239d90, docs/development.md under Builds). Cargo runs it as `rustc-wrapper <compiler> <args>...`.
+#
+# With sccache on PATH, the compile goes through sccache: one compile cache for every worktree on this
+# machine, capped at SCCACHE_CACHE_SIZE (15G unless the caller set it). Without sccache (the boat box, a
+# fresh machine) it runs the compiler itself, so nothing needs sccache to build.
+#
+# The sccache server listens on a unix socket in /tmp/bracken-sccache-<uid>, a directory of this user's at
+# mode 0700, never on a TCP port another local process could reach (finding 292898be0ce0). If that
+# directory is anything else (a symlink, someone else's, another mode), the compile skips sccache.
+#
+# sccache's client sends its environment to the server, which runs the compiler with it. So sccache gets
+# only what a compile needs: cargo's and rustc's variables (all of them, CARGO_PKG_AUTHORS and
+# CARGO_BIN_EXE_<name> included, but no registry credential), then the names in KEEP and the prefixes
+# below, never one that looks like a secret. Nothing else in the caller's environment (tokens, keys)
+# reaches the server. A build script's `cargo:rustc-env` variable passes only if it's listed here: if a
+# dependency needs one, the build fails with "environment variable not defined", and the fix is to add
+# its name to KEEP.
+#
+# Clippy (cargo runs `rustc-wrapper clippy-driver rustc <args>` for workspace members) skips sccache,
+# so a lint is never answered from a cache made under other lint flags.
+#
+# It prints nothing of its own, and never logs a command or the environment: it drops sccache's own
+# log settings too.
+set -euo pipefail
+
+sccache=$(command -v sccache || true)
+case "${1##*/}" in
+  clippy-driver*) sccache= ;;
+esac
+if [[ -n "$sccache" ]]; then
+  uid=$(id -u)
+  socket_dir=/tmp/bracken-sccache-$uid
+  [[ -e "$socket_dir" || -L "$socket_dir" ]] || mkdir -m 700 "$socket_dir" 2>/dev/null || true
+  if [[ -L "$socket_dir" ]] ||
+    [[ -z "$(find "$socket_dir" -maxdepth 0 -type d -user "$uid" -perm 700 2>/dev/null)" ]]; then
+    sccache=
+  fi
+fi
+if [[ -z "$sccache" ]]; then
+  exec "$@"
+fi
+
+KEEP=" PATH HOME TMPDIR USER LOGNAME LANG OUT_DIR TARGET HOST PROFILE OPT_LEVEL DEBUG NUM_JOBS SDKROOT \
+DEVELOPER_DIR MACOSX_DEPLOYMENT_TARGET CC CXX AR CFLAGS CXXFLAGS LDFLAGS "
+kept=()
+# The environment as the process has it, NUL-separated. Not bash's own list (compgen -e, ${!name}): bash 5
+# leaves out names that aren't shell identifiers, such as cargo's CARGO_BIN_EXE_<bin-with-hyphens>.
+while IFS= read -r -d '' entry; do
+  name=${entry%%=*}
+  case "$name" in
+    CARGO_REGISTRY* | CARGO_REGISTRIES* | SCCACHE_LOG | SCCACHE_ERROR_LOG | SCCACHE_SERVER_*) continue ;;
+    # Cargo's and rustc's own, before the secret patterns: CARGO_PKG_AUTHORS has AUTH in it (finding
+    # 58223509a78e).
+    CARGO* | RUST* | CLIPPY* | __CARGO* | DEP_*) ;;
+    *TOKEN* | *SECRET* | *PASSWORD* | *PASSWD* | *CREDENTIAL* | *_KEY | *_KEY_* | *AUTH*) continue ;;
+    SCCACHE_* | LC_*) ;;
+    *) [[ "$KEEP" == *" $name "* ]] || continue ;;
+  esac
+  kept+=("$entry")
+done < <(/usr/bin/env -0)
+
+exec /usr/bin/env -i "${kept[@]}" \
+  SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-15G}" \
+  SCCACHE_IGNORE_SERVER_IO_ERROR="${SCCACHE_IGNORE_SERVER_IO_ERROR:-1}" \
+  SCCACHE_SERVER_UDS="$socket_dir/server.sock" \
+  "$sccache" "$@"

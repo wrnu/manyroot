@@ -14,6 +14,11 @@
 //! target line, the smallest id first. Anyone else's are listed as offered, and
 //! an integrator adopts one by writing their own: `resolve --take <id>`
 //! (decision 91c12b4da2ad).
+//!
+//! `resolve --markers <file>` writes nothing to the Ground: for a text
+//! conflict, it writes the merge with each conflicting region between
+//! diff3-style markers to a new file, to edit and then record with `resolve
+//! --file` (task 7cbd0a0ce7d0, design 68b57f9aed6d section 3).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -181,7 +186,7 @@ pub(crate) enum ModeArg {
 /// `weave resolve`.
 #[derive(Args)]
 #[command(group(ArgGroup::new("merge").required(true).args(["into", "proposals"])))]
-#[command(group(ArgGroup::new("result").required(true).args(["take", "delete", "file"])))]
+#[command(group(ArgGroup::new("result").required(true).args(["take", "delete", "file", "markers"])))]
 pub(crate) struct ResolveArgs {
     /// The conflicted path.
     path: String,
@@ -211,6 +216,11 @@ pub(crate) struct ResolveArgs {
     /// the .bracken root entries, and pass import's secret refusals.
     #[arg(long, value_name = "FILE")]
     file: Option<PathBuf>,
+    /// Write nothing to the Ground: write this new file with the conflict's lines merged and each
+    /// conflicting region between markers (`<<<<<<< into`, `||||||| base`, `=======`, `>>>>>>> from`), to
+    /// edit and then give to --file. Only for a conflict whose base and sides are all text.
+    #[arg(long, value_name = "FILE", conflicts_with_all = ["mode", "dry_run"])]
+    markers: Option<PathBuf>,
     /// The result's mode. Defaults to the side's mode with --take, and to the file's executable bit with
     /// --file.
     #[arg(long, value_enum, conflicts_with = "delete")]
@@ -790,19 +800,57 @@ fn proposals_target(s: &Store, lines: &Lines, ix: &Index, line: Option<&str>, gi
     })
 }
 
-/// Builds the merge, step by step; where it stops, the step and why.
-fn build(ix: &Index, target: &Target) -> Result<Resolved, (usize, MergeError)> {
+/// Resolves one step's merge: resolutions first, then the line merge (task 7cbd0a0ce7d0), reading a
+/// file's bytes from the replica or from what an earlier step's line merge made.
+fn resolve_step(
+    g: &manyroot::Graph,
+    ix: &Index,
+    merged: &files::Merged,
+    applied: &Resolutions,
+    made: &Made,
+) -> Result<Resolved, MergeError> {
+    // A resolution may take a version an earlier step merged by lines, held nowhere yet (finding
+    // fa1c271c4db7): it is written with the tree.
+    let size = |h: &ContentHash| ix.file_size(h).or_else(|| made.get(h).map(|f| f.bytes.len() as u64));
+    files::resolve_lines(merged, applied, size, |h| file_bytes(g, ix, made, h))
+}
+
+/// The file versions a merge's line merges made, by hash: the tree so far may hold them before any is
+/// written.
+type Made = BTreeMap<ContentHash, import::FileVersion>;
+
+/// The bytes of the file version `h`, from the replica or from what the line merge made.
+fn file_bytes<'a>(g: &'a manyroot::Graph, ix: &'a Index, made: &'a Made, h: &ContentHash) -> Option<&'a [u8]> {
+    ix.file(g, h).or_else(|| made.get(h).map(|f| f.bytes.as_slice()))
+}
+
+/// Builds the merge, step by step; where it stops, the step, why, and what the line merge made before
+/// it. Its `merged_lines` are the paths a step merged by lines whose version the final tree still holds,
+/// in path order, named by path, never by content (finding f34ae4b848c0). A resolution may keep such a
+/// version, as `--take into` after a line merge does.
+fn build(g: &manyroot::Graph, ix: &Index, target: &Target) -> Result<Resolved, (usize, MergeError, Made)> {
     let mut tree = target.start.clone();
     let mut used = Vec::new();
+    let mut made = BTreeMap::new();
+    let mut by_path: BTreeMap<String, import::FileVersion> = BTreeMap::new();
     for (i, step) in target.steps.iter().enumerate() {
         let merged = files::three_way(&step.base, &tree, &step.from);
-        let resolved = files::resolve(&merged, &target.applied, |h| ix.file_size(h)).map_err(|e| (i, e))?;
+        let resolved = match resolve_step(g, ix, &merged, &target.applied, &made) {
+            Ok(r) => r,
+            Err(e) => return Err((i, e, made)),
+        };
         tree = resolved.manifest;
         used.extend(resolved.used);
+        for f in resolved.merged_lines {
+            made.insert(f.hash, f.clone());
+            by_path.insert(f.name.clone(), f);
+        }
     }
     used.sort();
     used.dedup();
-    Ok(Resolved { manifest: tree, used })
+    let merged_lines =
+        tree.entries.iter().filter_map(|e| by_path.get(&e.path).filter(|f| f.hash == e.hash).cloned()).collect();
+    Ok(Resolved { manifest: tree, used, merged_lines })
 }
 
 fn value_json(v: Option<FileValue>) -> Value {
@@ -828,11 +876,14 @@ fn write_merge(
     decide_args: &super::review::DecideArgs,
     out: Output,
 ) -> Result<ExitCode> {
-    let resolved = match build(ix, &target) {
+    let resolved = match build(s.graph(), ix, &target) {
         Ok(r) => r,
-        Err((step, MergeError::Unresolved(conflicts))) => {
+        Err((step, MergeError::Unresolved(conflicts), made)) => {
             let label = &target.steps[step].label;
             let names = Names::load(s)?;
+            // Where a text conflict's lines conflict, for the versions this replica holds or an earlier
+            // step's line merge made.
+            let text_regions = |c: &Conflict| files::text_conflicts(c, |h| file_bytes(s.graph(), ix, &made, h));
             let offered = |c: &Conflict| -> Vec<(ContributionId, AgentId, Option<FileValue>)> {
                 ix.resolutions()
                     .for_key(&c.key)
@@ -855,7 +906,8 @@ fn write_merge(
                             })
                             .collect();
                         json!({"path": c.key.path, "base": value_json(c.key.base), "into": value_json(c.ours),
-                               "from": value_json(c.theirs), "offered": offered})
+                               "from": value_json(c.theirs), "offered": offered,
+                               "text_conflicts": text_regions(c).map(|r| r.iter().map(|(a, b)| json!([a, b])).collect::<Vec<_>>())})
                     })
                     .collect();
                 print_json(&json!({"merge": target.about, "step": label, "conflicts": rows, "manifest": Value::Null,
@@ -870,6 +922,17 @@ fn write_merge(
                         value_text(c.ours),
                         value_text(c.theirs)
                     );
+                    match text_regions(c) {
+                        Some(r) if r.is_empty() => println!("  its lines merge; its modes don't"),
+                        Some(r) => {
+                            let shown: Vec<String> = r
+                                .iter()
+                                .map(|(a, b)| if a == b { a.to_string() } else { format!("{a}-{b}") })
+                                .collect();
+                            println!("  {} conflicting regions, at base lines {}", r.len(), shown.join(", "));
+                        }
+                        None => {}
+                    }
                     for (id, author, result) in offered(c) {
                         println!(
                             "  offered: resolution {id} by {}, result {}; adopt it with --take {id}",
@@ -880,14 +943,14 @@ fn write_merge(
                 }
                 println!(
                     "settle each with `bracken weave resolve <path> {} --take into|from|<resolution>` (or --delete, or \
-                     --file <f>)",
+                     --file <f>; --markers <f> writes a text conflict out to edit)",
                     target.selector
                 );
             }
             decide(false);
             bail!("{} conflicts have no resolution, so nothing was written", conflicts.len());
         }
-        Err((step, e)) => bail!("merging {}: {e}; nothing was written", target.steps[step].label),
+        Err((step, e, _)) => bail!("merging {}: {e}; nothing was written", target.steps[step].label),
     };
     let hash = resolved.manifest.content_hash();
     // Mirroring a git commit, the merge must come out as git's tree, or nothing is written: never forced.
@@ -909,7 +972,10 @@ fn write_merge(
         bail!("the merged tree differs from {}'s at {} paths, so nothing was written", m.commit, differs.len());
     }
     let held = ix.manifest(&hash).is_some();
-    let missing = ix.missing(&resolved.manifest);
+    // The line merge's file versions are written with the tree, so only the others must be held.
+    let made: std::collections::BTreeSet<&str> = resolved.merged_lines.iter().map(|f| f.name.as_str()).collect();
+    let missing: Vec<String> =
+        ix.missing(&resolved.manifest).into_iter().filter(|p| !made.contains(p.as_str())).collect();
     if !missing.is_empty() {
         bail!(
             "the merged tree isn't complete here: this replica lacks the files of {} paths, such as {:?}; nothing was written",
@@ -933,13 +999,15 @@ fn write_merge(
     decide_args.apply(s, ix, lines, &mut decision)?;
     let names = Names::load(s)?;
     let used = used_resolutions(s, &resolved.used, &names);
+    let line_merged: Vec<&str> = resolved.merged_lines.iter().map(|f| f.name.as_str()).collect();
     if dry_run {
         if out.json {
             print_json(&json!({"merge": target.about, "conflicts": [], "manifest": hash.to_string(),
                                "manifest_new": !held, "resolutions": resolved.used, "used": used,
-                               "parents": decision.parents, "decision": Value::Null}));
+                               "merged_lines": line_merged, "parents": decision.parents, "decision": Value::Null}));
         } else {
             print_used(&used);
+            print_merged_lines(&line_merged);
             let state = if held { "held" } else { "new" };
             println!("manifest {hash} ({state}; no conflicts left; dry run, nothing written)");
         }
@@ -951,7 +1019,11 @@ fn write_merge(
         Err(Unqualified::ManifestNotHeld(_)) if !held => {}
         Err(why) => bail!("the decision wouldn't qualify, so nothing was written: {}", refusal(&why)),
     }
-    let (_, failure) = write_tree(s, &who, &[], &resolved.manifest, held)?;
+    // The line merge's file versions this replica lacks, once each, as import writes them.
+    let mut seen = std::collections::BTreeSet::new();
+    let new: Vec<&import::FileVersion> =
+        resolved.merged_lines.iter().filter(|f| !ix.holds_file(&f.hash) && seen.insert(f.hash)).collect();
+    let (_, failure) = write_tree(s, &who, &new, &resolved.manifest, held)?;
     if let Some(e) = failure {
         decide(false);
         return Err(e.context("nothing was written"));
@@ -988,10 +1060,12 @@ fn write_merge(
     if out.json {
         print_json(&json!({"manifest": hash.to_string(), "manifest_new": !held, "decision": id, "line": target.line,
                            "parents": decision.parents, "proposals": decision.proposals,
-                           "resolutions": decision.resolutions, "used": used, "results": results}));
+                           "resolutions": decision.resolutions, "used": used, "merged_lines": line_merged,
+                           "results": results}));
     } else {
         println!("manifest {hash}");
         print_used(&used);
+        print_merged_lines(&line_merged);
         println!("decision {id}");
     }
     Ok(ExitCode::SUCCESS)
@@ -1010,6 +1084,13 @@ fn used_resolutions(s: &Store, used: &[ContributionId], names: &Names) -> Vec<Va
         .collect()
 }
 
+/// The paths a merge merged line by line, which no one wrote as a whole (task 7cbd0a0ce7d0).
+fn print_merged_lines(paths: &[&str]) {
+    for path in paths {
+        println!("merged lines: {}", crate::terminal::printable(path));
+    }
+}
+
 fn print_used(used: &[Value]) {
     for u in used {
         let result = match &u["result"] {
@@ -1026,23 +1107,29 @@ fn print_used(used: &[Value]) {
     }
 }
 
-/// The first conflict at `path` that no integrator's resolution settles, and the step it is in. A step
-/// whose conflict there is settled is applied and passed (finding 90de879d935c). With none unsettled, the
-/// last settled one, as a conflict may get another resolution (decision 91c12b4da2ad).
-fn conflict_at(ix: &Index, target: &Target, path: &str) -> Result<(String, Conflict)> {
+/// The first conflict at `path` that neither an integrator's resolution nor the line merge settles, and
+/// the step it is in, with what the line merge made in the steps before. A step whose conflict there is
+/// settled is applied and passed (finding 90de879d935c). With none unsettled, the last settled one, as a
+/// conflict may get another resolution (decision 91c12b4da2ad), and one may overrule a line merge.
+fn conflict_at(g: &manyroot::Graph, ix: &Index, target: &Target, path: &str) -> Result<(String, Conflict, Made)> {
     let mut tree = target.start.clone();
     let mut settled = None;
+    let mut made = BTreeMap::new();
     for step in &target.steps {
         let merged = files::three_way(&step.base, &tree, &step.from);
-        if let Some(c) = merged.conflicts.iter().find(|c| c.key.path == path) {
-            if target.applied.for_key(&c.key).is_empty() {
-                return Ok((step.label.clone(), c.clone()));
+        let here = merged.conflicts.iter().find(|c| c.key.path == path);
+        match resolve_step(g, ix, &merged, &target.applied, &made) {
+            Ok(r) => {
+                if let Some(c) = here {
+                    settled = Some((step.label.clone(), c.clone(), made.clone()));
+                }
+                tree = r.manifest;
+                made.extend(r.merged_lines.into_iter().map(|f| (f.hash, f)));
             }
-            settled = Some((step.label.clone(), c.clone()));
-        }
-        match files::resolve(&merged, &target.applied, |h| ix.file_size(h)) {
-            Ok(r) => tree = r.manifest,
             Err(MergeError::Unresolved(cs)) => {
+                if let Some(c) = cs.iter().find(|c| c.key.path == path) {
+                    return Ok((step.label.clone(), c.clone(), made));
+                }
                 if let Some(found) = settled {
                     return Ok(found);
                 }
@@ -1053,16 +1140,22 @@ fn conflict_at(ix: &Index, target: &Target, path: &str) -> Result<(String, Confl
                     paths.join(", ")
                 );
             }
-            Err(e) => bail!("merging {}: {e}", step.label),
+            Err(e) => match here {
+                Some(c) if target.applied.for_key(&c.key).is_empty() => {
+                    return Ok((step.label.clone(), c.clone(), made));
+                }
+                _ => bail!("merging {}: {e}", step.label),
+            },
         }
     }
     settled.context(format!("this merge has no conflict at {path:?}"))
 }
 
 pub(crate) fn resolve(s: &mut Store, agent: Option<&str>, args: ResolveArgs) -> Result<ExitCode> {
-    let ResolveArgs { path, into, from, base, proposals, line, take, delete, file, mode, dry_run, repo, out } = args;
+    let ResolveArgs { path, into, from, base, proposals, line, take, delete, file, markers, mode, dry_run, repo, out } =
+        args;
     let ix = Index::build(s.graph());
-    if !dry_run {
+    if !dry_run && markers.is_none() {
         require_marker(&ix)?;
     }
     let named: Vec<Option<&str>> = [into.as_deref(), from.as_deref(), base.as_deref(), line.as_deref()]
@@ -1074,7 +1167,10 @@ pub(crate) fn resolve(s: &mut Store, agent: Option<&str>, args: ResolveArgs) -> 
         (Some(into), Some(from)) => lines_target(s, &lines, &ix, into, from, base.as_deref())?,
         _ => proposals_target(s, &lines, &ix, line.as_deref(), &proposals)?,
     };
-    let (label, conflict) = conflict_at(&ix, &target, &path)?;
+    let (label, conflict, made) = conflict_at(s.graph(), &ix, &target, &path)?;
+    if let Some(to) = markers {
+        return write_markers(s, &ix, &made, &label, &conflict, &repo, &to, out);
+    }
     let mode = mode.map(|m| match m {
         ModeArg::File => Mode::File,
         ModeArg::Executable => Mode::Executable,
@@ -1104,7 +1200,7 @@ pub(crate) fn resolve(s: &mut Store, agent: Option<&str>, args: ResolveArgs) -> 
             let default = if executable { Mode::Executable } else { Mode::File };
             Some(FileValue { hash, mode: mode.unwrap_or(default) })
         }
-        (None, false, None) => unreachable!("clap requires one of --take, --delete and --file"),
+        (None, false, None) => unreachable!("clap requires one of --take, --delete, --file and --markers"),
     };
     let resolution = Resolution::new(path.clone(), conflict.key.base, conflict.key.sides, result);
     resolution.validate().context("the resolution isn't valid, and nothing was written")?;
@@ -1159,6 +1255,90 @@ pub(crate) fn resolve(s: &mut Store, agent: Option<&str>, args: ResolveArgs) -> 
     Ok(ExitCode::SUCCESS)
 }
 
+/// `resolve --markers`: writes the conflict's marked merge to the new file `to`, outside the Ground.
+#[allow(clippy::too_many_arguments)]
+fn write_markers(
+    s: &Store,
+    ix: &Index,
+    made: &Made,
+    label: &str,
+    conflict: &Conflict,
+    repo: &Path,
+    to: &Path,
+    out: Output,
+) -> Result<ExitCode> {
+    let path = &conflict.key.path;
+    let shown = to.display();
+    // Checked before anything is written, so --json can always name it (finding 4c4e1914f2bf).
+    let named = to.to_str().with_context(|| format!("--markers {shown}: its path isn't UTF-8"))?;
+    let content = |h: &ContentHash| file_bytes(s.graph(), ix, made, h);
+    let labels = bracken_tree::text_merge::Labels { ours: "into", base: "base", theirs: "from" };
+    let (Some(regions), Some(bytes)) =
+        (files::text_conflicts(conflict, content), files::conflict_markers(conflict, content, &labels))
+    else {
+        bail!(
+            "--markers: the conflict at {path:?} isn't one of text: its base and both sides must be regular \
+             files this replica holds, and text (at most 8 MiB, UTF-8, no NUL), with each side's diff within \
+             the line merge's {}-line cap; settle it with --take, --delete or --file",
+            bracken_tree::text_merge::MAX_DIFF_LINES
+        );
+    };
+    // Only where --file will take it back (finding d49f362be57f), and never into the Ground. The file
+    // doesn't exist yet, so its directory is resolved and its name joined.
+    let (Some(parent), Some(name)) = (to.parent(), to.file_name()) else {
+        bail!("--markers {shown}: name a file");
+    };
+    let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+    let real = std::fs::canonicalize(parent).with_context(|| format!("--markers {shown}"))?.join(name);
+    let ground = std::fs::canonicalize(s.dir()).context("finding the Ground's directory")?;
+    ensure!(!real.starts_with(&ground), "--markers {shown}: it is inside the Ground {}", ground.display());
+    checkout_path(repo, &real, "--markers", &shown.to_string())?;
+    // Executable where the sides' modes merge to executable, so --file records that mode back (finding
+    // 445429f73583). Where they don't merge, --mode chooses.
+    let (b, x, y) = (conflict.key.base, conflict.ours, conflict.theirs);
+    let mode = match (b, x, y) {
+        (Some(b), Some(x), Some(y)) => files::merge_mode(b.mode, x.mode, y.mode),
+        _ => None,
+    };
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut open, if mode == Some(Mode::Executable) { 0o755 } else { 0o644 });
+    let mut f = match open.open(to) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            bail!("--markers {shown}: it already exists, and markers never overwrite a file; name a new one")
+        }
+        Err(e) => return Err(e).with_context(|| format!("--markers {shown}")),
+    };
+    std::io::Write::write_all(&mut f, &bytes).with_context(|| format!("--markers {shown}"))?;
+    if out.json {
+        let mode = mode.map(|m| format!("{:o}", m.bits()));
+        print_json(&json!({"path": path, "merging": label, "markers": named, "mode": mode,
+                           "text_conflicts": regions.iter().map(|(a, b)| json!([a, b])).collect::<Vec<_>>()}));
+    } else {
+        let what = if regions.is_empty() {
+            "no conflicting regions, as its lines merge".to_owned()
+        } else {
+            let at: Vec<String> = regions.iter().map(|(a, b)| format!("{a}-{b}")).collect();
+            format!("{} conflicting regions, at base lines {}", regions.len(), at.join(", "))
+        };
+        println!("markers {shown} for {} merging {label}: {what}", crate::terminal::printable(path));
+        match mode {
+            Some(m) => println!(
+                "edit it, then settle the conflict with the same selector and --file {shown}; it is mode {:o}, \
+                 as the sides' modes merge",
+                m.bits()
+            ),
+            None => println!(
+                "edit it, then settle the conflict with the same selector, --file {shown} and --mode, as the \
+                 sides' modes conflict"
+            ),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 /// The result of the resolution `given` names, which must settle exactly this conflict.
 fn adopted(s: &Store, ix: &Index, conflict: &Conflict, given: &str) -> Result<Option<FileValue>> {
     let id =
@@ -1182,29 +1362,8 @@ fn adopted(s: &Store, ix: &Index, conflict: &Conflict, given: &str) -> Result<Op
 fn resolution_file(s: &Store, repo: &Path, file: &Path) -> Result<(Vec<u8>, bool)> {
     let shown = file.display();
     let real = std::fs::canonicalize(file).with_context(|| format!("--file {shown}"))?;
-    let top = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .context("running git")?;
-    ensure!(top.status.success(), "--file needs a git checkout: {}", String::from_utf8_lossy(&top.stderr).trim());
-    let top = String::from_utf8(top.stdout).context("the checkout's path isn't UTF-8")?;
-    let top = std::fs::canonicalize(top.trim_end_matches('\n')).context("resolving the checkout's path")?;
-    let Ok(relative) = real.strip_prefix(&top) else {
-        bail!("--file {shown}: it is outside the checkout {}; give a file inside its work tree", top.display());
-    };
-    let relative = relative.to_str().with_context(|| format!("--file {shown}: its path isn't UTF-8"))?;
-    let components: Vec<String> = relative.split('/').map(path::fold).collect();
-    if components.iter().any(|c| c == ".git") {
-        bail!("--file {shown}: it is inside a .git directory");
-    }
-    if components.first().is_some_and(|c| c.starts_with(".bracken")) {
-        bail!("--file {shown}: it is inside a .bracken root entry");
-    }
-    if let Some(rule) = secrets::deny_listed(relative) {
-        bail!("--file {shown}: {relative:?} looks like a secret: {rule}; nothing was written");
-    }
+    let (top, relative) = checkout_path(repo, &real, "--file", &shown.to_string())?;
+    let relative = relative.as_str();
     // One open, beneath the checkout and following no symlink, so the checks above and the bytes read
     // are about the same file (finding 0bbc434b2588).
     #[cfg(unix)]
@@ -1215,4 +1374,34 @@ fn resolution_file(s: &Store, repo: &Path, file: &Path) -> Result<(Vec<u8>, bool
         bail!("--file {shown}: its content looks like a secret: {rule}; nothing was written");
     }
     Ok((read.bytes, read.executable))
+}
+
+/// The checkout's top and `real`'s path beneath it, for `flag` (`--file`, or `--markers`, which writes
+/// a file only where `--file` will read it): `real`, a resolved path, must be inside the work tree of
+/// the git checkout at `repo`, outside `.git` and every `.bracken*` root entry, and pass the deny-list.
+fn checkout_path(repo: &Path, real: &Path, flag: &str, shown: &str) -> Result<(PathBuf, String)> {
+    let top = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("running git")?;
+    ensure!(top.status.success(), "{flag} needs a git checkout: {}", String::from_utf8_lossy(&top.stderr).trim());
+    let top = String::from_utf8(top.stdout).context("the checkout's path isn't UTF-8")?;
+    let top = std::fs::canonicalize(top.trim_end_matches('\n')).context("resolving the checkout's path")?;
+    let Ok(relative) = real.strip_prefix(&top) else {
+        bail!("{flag} {shown}: it is outside the checkout {}; give a file inside its work tree", top.display());
+    };
+    let relative = relative.to_str().with_context(|| format!("{flag} {shown}: its path isn't UTF-8"))?;
+    let components: Vec<String> = relative.split('/').map(path::fold).collect();
+    if components.iter().any(|c| c == ".git") {
+        bail!("{flag} {shown}: it is inside a .git directory");
+    }
+    if components.first().is_some_and(|c| c.starts_with(".bracken")) {
+        bail!("{flag} {shown}: it is inside a .bracken root entry");
+    }
+    if let Some(rule) = secrets::deny_listed(relative) {
+        bail!("{flag} {shown}: {relative:?} looks like a secret: {rule}; nothing was written");
+    }
+    Ok((top, relative.to_owned()))
 }

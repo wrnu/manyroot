@@ -12,6 +12,7 @@ blake3.workspace = true
 ciborium.workspace = true
 hex.workspace = true
 icu_casemap.workspace = true
+imara-diff.workspace = true
 manyroot.workspace = true
 serde.workspace = true
 thiserror.workspace = true
