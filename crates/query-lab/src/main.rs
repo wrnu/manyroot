@@ -309,6 +309,8 @@ fn best<T>(runs: usize, mut f: impl FnMut() -> Result<T>) -> Result<(Duration, T
 
 fn scale(dir: &std::path::Path, snap: &std::path::Path, triager: &str, runs: usize) -> Result<()> {
     use bracken_query_lab::snapshot;
+    // Before anything below removes the snapshot at `snap`.
+    snapshot::ensure_outside_grounds(snap)?;
     let (open, g) = best(runs, || bracken_query_lab::open(dir))?;
     println!("{} contributions", g.len());
     println!("{:<44} {:>10.1} ms", "Store::open + tables (verifies everything)", ms(open));
