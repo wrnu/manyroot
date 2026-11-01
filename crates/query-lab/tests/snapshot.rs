@@ -239,3 +239,49 @@ fn only_a_generated_ground_can_be_extended() {
     fs::remove_file(dir.join("query-lab-synthetic")).expect("removed");
     assert!(generate::ensure_synthetic(&dir).is_err(), "no marker");
 }
+
+#[test]
+fn scale_removes_nothing_inside_a_ground() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let dir = tmp.path().join("g");
+    replica(&dir, 50);
+    // `scale` removes its snapshot before each timed build: inside a Ground, that would be the Ground's.
+    let inside = dir.join("ground.json");
+    let before = fs::read(&inside).expect("written");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_query-lab"))
+        .args([
+            "scale".as_ref(),
+            dir.as_os_str(),
+            "--snapshot".as_ref(),
+            inside.as_os_str(),
+            "--runs".as_ref(),
+            "1".as_ref(),
+        ])
+        .output()
+        .expect("runs");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("inside the Ground"), "{out:?}");
+    assert_eq!(fs::read(&inside).expect("still there"), before);
+}
+
+#[test]
+fn an_object_named_in_uppercase_is_refused() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let (dir, snap) = (tmp.path().join("g"), tmp.path().join("snap"));
+    let g = replica(&dir, 50);
+    snapshot::open(&dir, &snap).expect("opens");
+    let c = Contribution::create(
+        g.graph.ground(),
+        &g.identities[1],
+        g.graph.heads().collect::<Vec<_>>(),
+        1,
+        Body::Claim { statement: "shouting".into(), tags: vec![] },
+    );
+    let lower = object(&dir, &c);
+    let upper = lower.with_file_name(lower.file_name().expect("named").to_string_lossy().to_uppercase());
+    assert_ne!(lower, upper, "the id has a letter in its name");
+    fs::write(&upper, c.encode()).expect("written");
+    let err = snapshot::open(&dir, &snap).err().expect("refused").to_string();
+    assert!(err.contains("lowercase"), "{err}");
+    assert!(manyroot::Store::open(&dir).is_err(), "Store::open refuses it too");
+}

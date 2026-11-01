@@ -218,6 +218,12 @@ fn listed(dir: &Path) -> Result<HashSet<ContributionId>> {
             }
             let id: ContributionId =
                 format!("{prefix}{rest}").parse().with_context(|| format!("objects/{prefix}/{rest} isn't an id"))?;
+            // Only the lowercase name is the object's path, as `Store::open` holds: on a case-insensitive
+            // file system the lowercase read would find an uppercase name, so refuse it here.
+            ensure!(
+                id.to_hex() == format!("{prefix}{rest}"),
+                "objects/{prefix}/{rest} isn't its id's path (ids are lowercase hex)"
+            );
             out.insert(id);
         }
     }
@@ -282,7 +288,7 @@ fn check_new(
 
 /// Refuses a snapshot path inside a Ground: in a directory holding `ground.json`, or one of its
 /// subdirectories, or anywhere under a `.bracken`. The snapshot lives outside every replica.
-fn ensure_outside_grounds(path: &Path) -> Result<()> {
+pub fn ensure_outside_grounds(path: &Path) -> Result<()> {
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let parent = parent.canonicalize().with_context(|| format!("{} has no directory", path.display()))?;
     for dir in parent.ancestors() {
