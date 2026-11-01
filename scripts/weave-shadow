@@ -35,9 +35,10 @@
 #           differing paths in the note;
 #         - but where Weave's tree is exactly git's with each differing path brought back by a proposal
 #           based on an ancestor of its PR's merge-base (scripts/weave-propose's fallback, when the shadow
-#           hadn't recorded the merge-base: a forge squash), from a commit since undone, it isn't Weave's
-#           merge that is wrong: the commit's tree is imported, noted as from an ancestor base, and counted
-#           apart from mismatches;
+#           hadn't recorded the merge-base: a forge squash), from a commit since undone, and in a batch no
+#           other proposal changed that path but to bring the same back, it isn't Weave's merge that is
+#           wrong: the commit's tree is imported, noted as from an ancestor base, and counted apart from
+#           mismatches;
 #         - with no --proposal, or none for one of the PRs, the commit's tree is imported, noted as having
 #           no proposal (and for which PRs).
 #       Every decision's note says which, and each run ends by counting them on line main since stage 2a
@@ -181,10 +182,12 @@ entry() { git --literal-pathspecs -C "$repo" ls-tree --full-tree "$1" -- "$2" | 
 # with each differing path brought back from an ancestor base (finding 1553d7b4898a). A path p is brought
 # back by a proposal based on commit F, of PR head H with merge-base B, only if the commits between F and B
 # changed it (F:p != B:p), line main's head still holds it as F did ($sha^1:p == F:p), so a correct merge
-# takes the PR's side, and git's merge doesn't (H:p != $sha:p). Weave's tree must then be $sha's with H:p
-# at every such p: the shadow builds that tree and compares its manifest with Weave's.
+# takes the PR's side, and git's merge doesn't (H:p != $sha:p). In a batch, every other proposal must leave
+# p as its own base had it, or bring the same p back itself: one that changed p otherwise has a side Weave's
+# merge could have dropped there (finding 4dd7841ae9c7). Weave's tree must then be $sha's with H:p at every
+# such p: the shadow builds that tree and compares its manifest with Weave's.
 resurrected() {
-  local p a f b h e mode type object idx tree expected want
+  local p a f b h e j fj bj hj mode type object idx tree expected want
   idx=$(mktemp -d)
   GIT_INDEX_FILE=$idx/index git -C "$repo" read-tree "$sha"
   while IFS= read -r p; do
@@ -198,6 +201,15 @@ resurrected() {
       break
     done
     [ -n "$e" ] || { rm -rf -- "$idx"; return 1; }
+    for j in ${members[@]+"${members[@]}"}; do
+      read -r fj bj hj <<<"$j"
+      [ "$hj" != "$h" ] || continue
+      [ "$(entry "$hj" "$p")" = "$(entry "$fj" "$p")" ] && continue
+      [ "$(entry "$fj" "$p")" != "$(entry "$bj" "$p")" ] && [ "$(entry "$sha^1" "$p")" = "$(entry "$fj" "$p")" ] &&
+        [ "$(entry "$hj" "$p")" = "$(entry "$h" "$p")" ] && continue
+      rm -rf -- "$idx"
+      return 1
+    done
     if [ "$e" = deleted ]; then
       GIT_INDEX_FILE=$idx/index git --literal-pathspecs -C "$repo" update-index --force-remove -- "$p"
     else
@@ -229,7 +241,7 @@ else
     squashes=$sha
   fi
   # Each PR's proposal, as "<n>=<id>" (no associative arrays: macOS's bash is 3.2).
-  prs=() got=() ancestral=()
+  prs=() got=() ancestral=() members=()
   of_pr() { local e; for e in ${got[@]+"${got[@]}"}; do [ "${e%%=*}" != "$1" ] || { echo "${e#*=}"; return; }; done; }
   for c in $squashes; do
     subject=$(git -C "$repo" log -1 --format=%s "$c")
@@ -246,7 +258,8 @@ else
     git -C "$repo" diff --quiet "$recorded" "$sha^1" -- . ':(exclude).bracken' ||
       fail "line main's head mirrors $recorded, not $sha's first parent: shadow the merges in order, one at a time"
     # Each proposal is of a PR this merge brings in, and of the head that merged: the one named by the PR's
-    # pr claim that carries the manager's live 'merge gate @ <head>' pass (scripts/merge), and by that claim's
+    # pr claim that carries the manager's live 'merge gate @ <head>' pass (scripts/merge; a pass, not a
+    # failed gate: task 0a58850fa794), and by that claim's
     # author (findings 1f66448c728d, f168bd561a98, c40a5a70c5de). The claims are pulled from the team server
     # first, as the manager, or it fails: the last ones may not be in the main checkout's replica yet.
     coord() { BK_PULL=required BRACKEN_AGENT=manager "$main/scripts/bk" "$@"; }
@@ -269,7 +282,8 @@ else
         claim=$(coord show "$id" --json) || fail "can't read pr claim $id in the coordination Ground"
         c=$(jq -r '.body.statement // "" | capture("@ (?<sha>[0-9a-f]{40})").sha // empty' <<<"$claim")
         [ -n "$c" ] && jq -e --arg sha "$c" 'any(.referrers[]?; .kind == "evidence" and .retracted == false
-          and .author_name == "manager" and .body.method == "merge gate @ " + $sha)' <<<"$claim" >/dev/null || continue
+          and .author_name == "manager" and .body.verdict == "pass" and .body.method == "merge gate @ " + $sha)' \
+          <<<"$claim" >/dev/null || continue
         gated=$id merged_head=$c by=$(jq -r '.author_name // empty' <<<"$claim")
         break
       done
@@ -289,6 +303,7 @@ else
       fork=$(git -C "$repo" merge-base "$head_sha" "$sha^1") || fail "PR #$n's head $head_sha shares no history with $sha^1"
       [ "$from" = "$(nearest "$fork" "$(jq -r '.timestamp_ms // empty' <<<"$record")")" ] ||
         fail "proposal $p is based on $from's decision, not where scripts/weave-propose would base it"
+      members+=("$from $fork $head_sha")
       [ "$from" = "$fork" ] || ancestral+=("$from $fork $head_sha")
     done
   fi
