@@ -198,8 +198,8 @@ Only then do replicates and spread matter.
 
 The grader runs agent code, and agents must never see hidden tests or the
 golden solution. Candidate B's design applies in full:
-- a pinned interpreter (path and hash) run as `-I -S -B`, with a cleared
-  environment, reads only of the copy under test and the standard library,
+- a pinned interpreter (as built, an image pinned by digest) run as
+  `-I -S -B`, with a cleared environment, reads only of the copy under test and the standard library,
   a fresh scratch directory for each graded version, no network, no process
   but the interpreter, and limits on CPU, memory and output;
 - hidden tests stay in the grader's own process: it sends one case's inputs
@@ -226,72 +226,87 @@ Requirements for building the runner (from security's review, evidence
 That execution profile is a new risky surface, and gets its own tests and
 security review, as Candidate B planned.
 
-**The execution profile as built** (`crates/experiment/src/python.rs`, task
-`9345098e82aa`), on macOS only; elsewhere agent code is refused:
-- **The interpreter** is pinned with `--python <path>`: resolved, asked
-  its version, which must be the project's minor version, and given a
-  digest: blake3 over every file of its installation but `site-packages`
-  (the standard library and its `__pycache__`, the framework's libpython)
-  and over the libraries outside it that it loads. With `--python-digest`,
-  a pin refuses an interpreter whose digest is another; a run's plan is to
-  record it, which isn't wired yet. Before each run the same files' paths,
-  inodes, sizes, modes and modification and change times are checked
-  against the pin's, so a file changed since is refused. A macOS framework
-  build's `bin/python3.x` only starts the interpreter in its `Python.app`,
-  an exec the profile refuses, so that interpreter is the one pinned. It
-  runs as `python -I -S -B -X utf8` with only `HOME` and `TMPDIR` set, both
-  the scratch directory.
-- **Reads:** the interpreter's installation, the libraries it and its
-  standard library's extension modules load (found from their Mach-O load
-  commands when it is pinned, such as Homebrew's mpdecimal and OpenSSL), the
-  system's libraries and time zone data, and the scratch directory.
-- **Metadata** only of the paths looked up on the way to those: each
-  directory above them, and each symlink and what it leads through (such as
-  `/opt/homebrew/opt/sqlite`). So it can't read a path's metadata or list
-  anything of the owner's. Whether a path exists still shows, and
-  `sandbox-exec` can't hide it: a refused path fails with `EPERM`, a
-  missing one with `ENOENT`, and `os.access` answers for either (finding
-  `c932586417301`). Nothing else of the path shows, but it means no agent
-  may ever be given the private store's path: not in a prompt, an issue,
-  a turn's configuration, a Ground, or the arguments or environment of
-  anything the grader runs.
-- **No other process:** no process information, and no `kern.proc` sysctl.
-  Either deny alone still lets `KERN_PROCARGS2` read another process's
-  arguments and environment, its parent's included (note `116ae2144d9d`);
-  together they refuse it, by number and by name, and listing and naming
-  processes, while `os.uname` still works.
-- **No mach service, no shared memory or semaphores, no Unix sockets.**
-- **Writes:** the scratch directory only, made fresh (`0700`) for each run,
-  holding a copy of the tree, and removed after, whatever the code did to
-  its permissions.
-- **No fork, no exec** but the interpreter's, **no network.**
+**The execution profile as built** (`crates/experiment/src/python.rs`, tasks
+`9345098e82aa` and `879a58e77bde`, decision `ac22cedd8fee`): agent code runs
+in a container on Docker (Docker Desktop on the Mac), where the kernel
+enforces the limits that `sandbox-exec` couldn't (disk, memory and
+processes). It runs on Linux too. The agent harnesses and Weave's check
+runner stay on `sandbox-exec` for now.
+- **The image** is pinned by digest with `--python <name>@sha256:<hex>`:
+  `python:3.12@sha256:17b9724493d9…` by default (`python::IMAGE`). A pin
+  refuses an image not named by its digest, one that isn't here by that
+  digest (it isn't pulled: `docker pull` it first), and one whose Python
+  isn't the project's minor version. Every container runs it by that name,
+  so by that digest.
+- **In and out:** a run's inputs (the tree, the runner, a command's working
+  files) are written to a fresh `0700` directory of the host's, mounted
+  read-only at `/in`, and copied into the scratch directory, `/scratch`,
+  before the code starts. Nothing else of the host's is mounted, so no path
+  of the owner's exists in the container. What comes out is the code's
+  output, its exit, and, for a grader command, the regular files of its
+  working directory, collected once it has ended without following a
+  symlink. The host's directory is removed after the run, and the container
+  with it.
+- **The container:** `--network none`, `--read-only`,
+  `--security-opt no-new-privileges`, `--cap-drop ALL` but `SETUID`,
+  `SETGID` and `SETPCAP`, which the supervisor needs to start the code as
+  another user and gives up, with the whole bounding set, before any code
+  runs. The code runs as `nobody` (65534), with no capability, as
+  `python -I -S -B -X utf8`, with only `HOME` and `TMPDIR` (both the scratch
+  directory), `PATH` and `LANG` set. It can fork and exec inside the
+  container, within its process limit.
 - **Limits:** CPU time (`SIGXCPU`), file size (16 MiB or the output limit if
-  larger) and open files (256) as rlimits. macOS doesn't enforce
-  `RLIMIT_AS`, so memory is the child's footprint, which the parent reads
-  every 20 ms and kills the run past its limit. Output is read up to its
-  limit, then the run is killed; so is a run past its wall time, or one
-  whose scratch directory holds more than `scratch_mb` or 10,000 files and
-  directories, checked every 100 ms. The check never follows a symlink
-  or changes anything while the code runs, so the code can't point it
-  elsewhere by swapping a directory for a symlink; it opens each directory
-  by name in its open parent, and counts one it can't read, such as one
-  the code took the owner's access to, as past the limit. The owner's
-  access is given back only after the run, for removing the directory.
-  The walk keeps open only the directories on the path it is walking, so
-  hundreds of siblings don't exhaust the parent's open files, and a run
-  that ends of itself is checked once more. Killing ends the child's
-  process group.
+  larger) and open files (256) as rlimits. Memory is the container's cgroup
+  limit, with no swap: the run's `memory_mb`, **plus its `scratch_mb`**,
+  since the scratch directory is a `tmpfs` held in memory and its pages
+  count against the container's limit, plus 16 MiB for the container's init
+  and the supervisor. A run killed for it ends as `memory` (Docker's
+  `OOMKilled`). Processes: 64 in the container. The scratch directory is a
+  `tmpfs` of `scratch_mb` and 10,000 files and directories: a hard bound, so
+  a write past it fails with `ENOSPC`, and that holds for what no file's
+  size shows, too (files unlinked but held open, mapped and closed,
+  extended attributes, which take from the files' share, a KiB a file; on
+  the scratch directory itself they're refused, as it isn't the code's).
+  So a run's scratch use is at most `scratch_mb` plus 10 MiB of
+  attributes. Output is read up to its limit, then the container is
+  killed; so is one past its wall time, counted from when the code starts,
+  as a container takes a second or more to start on a loaded machine.
+  Killing a container ends everything in it, and a container a killed
+  runner left behind is removed by the next runner's first run.
+- **The supervisor** (`python/supervisor.py`), the container's first
+  process under its init, copies the inputs in and starts the code, both as
+  the code's user, then becomes a user of its own (65533), which the code
+  can't signal, trace or read. It relays the code's output to the runner in
+  frames the code can't forge, as the code never writes to the container's
+  output itself, and it says the container's CPU time every 0.1 s (the
+  grader's budget for each call) and, once the code has ended, whether the
+  scratch directory was full (less than 64 KiB or 128 files left) at any
+  check: a run that ended of itself, or by an error or a signal, with it
+  full ends as `scratch`. That is all its word decides: it never widens a
+  limit or marks a pass. A mapped page past the limit is `SIGBUS`, which
+  ends the code at once and frees its pages, so no check may see the
+  directory full: that run ends as the signal, with its write refused.
 
 `run_tests` runs a tree's public tests there with `unittest`, and reports
 each test's outcome (pass, fail, error or skip) and the last 16 KiB of their
 output. It is feedback for the agent, not a grade: the tests share the
-child with the code under test. `bracken-experiment run-tests --project
-<dir> [--tree <dir>] --python <path> [--python-digest <digest>]` runs
-it, on the seed by default.
+container with the code under test. `bracken-experiment run-tests --project
+<dir> [--tree <dir>] --python <image>` runs it, on the seed by default.
 
-A run's plan records the interpreter's path, version and digest
+A run's plan records the image, by digest, and its Python's version
 (`python`), and every run of agent code pins it from there again, refused
-if either has changed (`Python::from_plan`).
+if the image isn't here by that digest or its version has changed
+(`Python::from_plan`).
+
+**Overhead** (measured for task `879a58e77bde` on this Mac's Docker
+Desktop, at load averages of 150 to 370 from other agents' builds): a run
+costs 0.6 s to 4.3 s on top of the code's own time, to make, start, inspect
+and remove its container: a median of 2.3 s over ten runs at load 236
+(`python::tests::macos_only::overhead`, run by hand). The grader starts one for each
+group's host, one for its server (again after a crash) and one for each
+command a test runs: while the host waits on one, its wall time counts only
+the code's own time there, not the containers' starts and removals, and a
+call's doesn't count its server's start.
 
 ## Grading
 
@@ -367,8 +382,8 @@ before the first change is released, where every group that applies then
 must pass (answer `c473d137f5b7`). Both must, before a project's hidden set is
 approved.
 
-`bracken-experiment project grade <dir> --hidden <store> --python <path>
-[--python-digest <digest>] (--tree <dir> [--share <s>] | --golden)
+`bracken-experiment project grade <dir> --hidden <store> --python <image>
+(--tree <dir> [--share <s>] | --golden)
 [--json]` grades a tree, or runs the approval check. It prints counts per
 item only.
 
@@ -376,13 +391,13 @@ item only.
 
 As built so far (task `e4970250b3e4`, design note `43554a820efb`, answer
 `07959d6d9bc0`): `bracken-experiment run --mode weave --project <dir>
---python <path> [--python-digest <digest>] [--hold-change]`, and `mock-run`
+--python <image> [--hold-change]`, and `mock-run`
 the same way, runs a project's agents through **Weave mode**
 (`src/weave_mode.rs`). `grade-run` grades the run after it ends.
 
 - **The plan** records the project (its directory, a digest of all of it,
   each item's release share, its hidden reference and the hash of each text
-  agents get), the pinned interpreter, and the configuration's
+  agents get), the pinned Python image, and the configuration's
   **integrator setting**: for now `any-agent`, every agent an integrator.
   The run refuses a project without `--python`, Weave mode without a
   project, and any other mode with one. Neither the plan nor anything else
@@ -422,7 +437,7 @@ the same way, runs a project's agents through **Weave mode**
   and puts the tree back as it was on any failure. A tree from a head that
   is no longer the line's reaches it as a proposal, which merges.
 - **`run_tests`** runs the public tests on the agent's working tree, in the
-  Python profile with the interpreter pinned from the plan. The driver runs
+  Python profile with the image pinned from the plan. The driver runs
   it, not the agent's worker, since a sandboxed process can't start another
   sandbox.
 - **The change:** the items not released at the start go out together once
@@ -444,7 +459,7 @@ the same way, runs a project's agents through **Weave mode**
   tree, and the line at the end as `end`, with the hidden set
   (`src/grade_run.rs`), checking each out of the run's hub by the manifest
   id its event names (on a forked line, the first head's, and the grade says
-  it was forked). It takes the project and the interpreter from the plan,
+  it was forked). It takes the project and the image from the plan,
   refusing a project changed since, and the store only from `--hidden`,
   which it checks against the project's digest. A tree is graded at share 1
   if the change had gone out before it, else at share 0, so the change's

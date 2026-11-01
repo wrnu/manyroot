@@ -78,7 +78,7 @@ mod macos_only {
     use bracken_experiment::mock::MockBackend;
     use bracken_experiment::plan::{PlanInputs, ProjectPlan};
     use bracken_experiment::project::{Project, digest};
-    use bracken_experiment::python::Python;
+    use bracken_experiment::python::PythonPin;
     use bracken_experiment::weave_mode::ANY_AGENT;
 
     /// What the hidden tests are marked with, in their files' names, their tests' names and their text.
@@ -94,10 +94,9 @@ mod macos_only {
         b
     }
 
-    fn pin() -> bracken_experiment::python::PythonPin {
-        let path = std::env::var_os("BRACKEN_TEST_PYTHON").unwrap_or_else(|| "/opt/homebrew/bin/python3.12".into());
-        assert!(Path::new(&path).exists(), "this test needs Python 3.12 at {path:?} (or set BRACKEN_TEST_PYTHON)");
-        Python::pin(Path::new(&path), "3.12", None).expect("pinned").plan_pin()
+    /// The image these tests pin, as `python::tests` does; None, having said why, where they can't run.
+    fn pin() -> Option<bracken_experiment::python::PythonPin> {
+        bracken_experiment::python::for_tests().map(|p| p.plan_pin())
     }
 
     /// The tiny fixture copied into `root/tiny`, its hidden set a throwaway store in `root/store`, four groups:
@@ -145,7 +144,15 @@ mod macos_only {
         (p, root.join("store"))
     }
 
-    fn config(root: PathBuf, agents: usize, turns: u32, project: &Path, hold_change: bool, sandbox: bool) -> RunConfig {
+    fn config(
+        python: PythonPin,
+        root: PathBuf,
+        agents: usize,
+        turns: u32,
+        project: &Path,
+        hold_change: bool,
+        sandbox: bool,
+    ) -> RunConfig {
         RunConfig {
             root,
             mode: "weave",
@@ -159,7 +166,7 @@ mod macos_only {
             turn_limit: TURN_LIMIT,
             plan: PlanInputs {
                 project: Some(ProjectPlan::of(&Project::load(project).expect("the project")).expect("its plan")),
-                python: Some(pin()),
+                python: Some(python),
                 integrator: Some(ANY_AGENT.into()),
                 hold_change,
                 ..PlanInputs::default()
@@ -195,10 +202,11 @@ mod macos_only {
     /// Nothing of the hidden set or the store's path is in the run, its Grounds or the grades.
     #[test]
     fn a_project_run_is_graded_after_it_ends() {
+        let Some(python) = pin() else { return };
         let tmp = tempfile::tempdir().expect("a temp dir");
         let root = std::fs::canonicalize(tmp.path()).expect("resolved");
         let (project, store) = project_and_store(&root);
-        let cfg = config(root.join("run"), 2, 3, &project, false, true);
+        let cfg = config(python, root.join("run"), 2, 3, &project, false, true);
         let mock = MockBackend { seed: 1, shim: Some(bin()), lockstep: true, ..MockBackend::default() };
         run(&cfg, &mock).expect("the run");
 
@@ -315,10 +323,11 @@ mod macos_only {
     /// text among what agents are given. Graded, no point has the change.
     #[test]
     fn a_held_change_is_never_released() {
+        let Some(python) = pin() else { return };
         let tmp = tempfile::tempdir().expect("a temp dir");
         let root = std::fs::canonicalize(tmp.path()).expect("resolved");
         let (project, store) = project_and_store(&root);
-        let cfg = config(root.join("run"), 1, 2, &project, true, false);
+        let cfg = config(python, root.join("run"), 1, 2, &project, true, false);
         let mock = MockBackend { seed: 1, shim: Some(bin()), lockstep: true, ..MockBackend::default() };
         run(&cfg, &mock).expect("the run");
         let log = std::fs::read_to_string(cfg.root.join("events.jsonl")).expect("the events");

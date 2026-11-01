@@ -266,7 +266,7 @@ struct Run<'a> {
     lockstep: Option<(Mutex<Lockstep>, Condvar)>,
     /// The digest of the hub's integrated library at the last snapshot.
     integrated: Mutex<String>,
-    /// A project run's project, its interpreter pinned from the plan, and when its change goes out.
+    /// A project run's project, its Python image pinned from the plan, and when its change goes out.
     project: Option<ProjectRun>,
 }
 
@@ -279,7 +279,7 @@ struct ProjectRun {
     change: Option<(f64, u32)>,
 }
 
-/// The project a run's plan names, loaded and checked against the plan, and its pinned interpreter; None for a
+/// The project a run's plan names, loaded and checked against the plan, and its pinned Python image; None for a
 /// run of a task. Weave mode needs both: a project, and the Python pin every run of agent code uses (answer
 /// `5e40cacdbfb4`); no other mode takes a project.
 fn project_run(cfg: &RunConfig, mode: &dyn Mode) -> Result<Option<ProjectRun>, String> {
@@ -623,7 +623,7 @@ impl Run<'_> {
     }
 
     /// A project run's `run_tests`: the project's public tests on agent `i`'s working tree, run here under the
-    /// Python profile with the interpreter pinned from the plan, since a sandboxed worker can't start another
+    /// Python profile with the image pinned from the plan, since a sandboxed worker can't start another
     /// sandbox. Public tests only; never a hidden one.
     fn run_tests(&self, i: usize) -> Result<Value, String> {
         let p = self.project.as_ref().ok_or("not a project run")?;

@@ -102,20 +102,21 @@ fn a_hidden_set_is_checked_by_digest_and_reported_in_counts() {
     assert_eq!(v["hidden"]["checked"]["groups"], 3);
 }
 
-#[cfg(target_os = "macos")]
+/// These need Docker: where it isn't running, each says so and passes without checking anything. In `macos_only`
+/// though they don't need macOS, so the counted run's Mac side runs them (docs/development.md).
 mod macos_only {
     use super::*;
 
-    fn python() -> std::ffi::OsString {
-        let python = std::env::var_os("BRACKEN_TEST_PYTHON").unwrap_or_else(|| "/opt/homebrew/bin/python3.12".into());
-        assert!(Path::new(&python).exists(), "this test needs Python 3.12 at {python:?} (or set BRACKEN_TEST_PYTHON)");
-        python
+    /// The image these tests pin, as `python::tests` does; None, having said why, where they can't run.
+    fn python() -> Option<String> {
+        bracken_experiment::python::for_tests().map(|p| p.image)
     }
 
     /// `project grade` grades a tree and runs the approval check, saying only counts per item: no test's
     /// name or content.
     #[test]
     fn grade_says_counts_per_item_and_runs_the_approval_check() {
+        let Some(python) = python() else { return };
         let tmp = tempfile::tempdir().expect("a temp dir");
         let project = tmp.path().join("project");
         copy(&fixture(), &project);
@@ -144,7 +145,7 @@ mod macos_only {
                 .arg("--hidden")
                 .arg(tmp.path().join("store"))
                 .arg("--python")
-                .arg(python())
+                .arg(&python)
                 .args(extra)
                 .output()
                 .expect("project grade runs")
@@ -163,11 +164,10 @@ mod macos_only {
         }
     }
 
-    /// `run-tests` runs the example's public test under the Python profile, with the interpreter it pins.
+    /// `run-tests` runs the example's public test under the Python profile, with the image it pins.
     #[test]
     fn run_tests_runs_the_example_projects_public_tests() {
-        let python = std::env::var_os("BRACKEN_TEST_PYTHON").unwrap_or_else(|| "/opt/homebrew/bin/python3.12".into());
-        assert!(Path::new(&python).exists(), "this test needs Python 3.12 at {python:?} (or set BRACKEN_TEST_PYTHON)");
+        let Some(python) = python() else { return };
         let out = Command::new(bin())
             .args(["run-tests", "--project"])
             .arg(fixture())

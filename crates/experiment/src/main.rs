@@ -77,13 +77,10 @@ enum Cmd {
         /// Weave mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
         #[arg(long)]
         project: Option<PathBuf>,
-        /// A project run: the Python interpreter to pin, whose version must be the project's. The plan records
-        /// it, and every run of agent code pins it from there.
+        /// A project run: the Python image to pin, by digest (`name@sha256:<hex>`), whose Python must be the
+        /// project's version. The plan records it, and every run of agent code pins it from there.
         #[arg(long, requires = "project")]
-        python: Option<PathBuf>,
-        /// A project run: the digest the interpreter must have.
-        #[arg(long, requires = "python")]
-        python_digest: Option<String>,
+        python: Option<String>,
         /// A project run: hold the project's change back, so only the items released at the start go out.
         #[arg(long, requires = "project")]
         hold_change: bool,
@@ -153,13 +150,10 @@ enum Cmd {
         /// Weave mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
         #[arg(long)]
         project: Option<PathBuf>,
-        /// A project run: the Python interpreter to pin, whose version must be the project's. The plan records
-        /// it, and every run of agent code pins it from there.
+        /// A project run: the Python image to pin, by digest (`name@sha256:<hex>`), whose Python must be the
+        /// project's version. The plan records it, and every run of agent code pins it from there.
         #[arg(long, requires = "project")]
-        python: Option<PathBuf>,
-        /// A project run: the digest the interpreter must have.
-        #[arg(long, requires = "python")]
-        python_digest: Option<String>,
+        python: Option<String>,
         /// A project run: hold the project's change back, so only the items released at the start go out.
         #[arg(long, requires = "project")]
         hold_change: bool,
@@ -183,19 +177,16 @@ enum Cmd {
     /// Evaluation projects (docs/design/eval-suite.md, Project format).
     #[command(subcommand)]
     Project(ProjectCmd),
-    /// Run a project's public tests on a tree (the seed by default) with the pinned interpreter, under the
+    /// Run a project's public tests on a tree (the seed by default) in the pinned Python image, under the
     /// Python profile (docs/design/eval-suite.md, Isolation).
     RunTests {
         #[arg(long)]
         project: PathBuf,
         #[arg(long)]
         tree: Option<PathBuf>,
-        /// The Python interpreter to pin: its version must be the project's.
+        /// The Python image to pin, by digest (`name@sha256:<hex>`): its Python must be the project's version.
         #[arg(long)]
-        python: PathBuf,
-        /// The digest the interpreter must have, as a run's plan records it.
-        #[arg(long)]
-        python_digest: Option<String>,
+        python: String,
         #[arg(long)]
         json: bool,
     },
@@ -248,7 +239,6 @@ fn main() {
             agents,
             project,
             python,
-            python_digest,
             hold_change,
             turns,
             harness,
@@ -267,7 +257,7 @@ fn main() {
             accept_rule,
             mode_token_cap,
         } => agent_run(AgentRun {
-            project: project_inputs(project.as_deref(), python.as_deref(), python_digest.as_deref(), hold_change)
+            project: project_inputs(project.as_deref(), python.as_deref(), hold_change)
                 .unwrap_or_else(|e| refuse_run(&e)),
             mode_token_cap,
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
@@ -299,7 +289,6 @@ fn main() {
             agents,
             project,
             python,
-            python_digest,
             hold_change,
             turns,
             seed,
@@ -309,14 +298,13 @@ fn main() {
             accept_rule,
         } => {
             let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
-            let inputs =
-                match project_inputs(project.as_deref(), python.as_deref(), python_digest.as_deref(), hold_change) {
-                    Ok(inputs) => inputs,
-                    Err(e) => {
-                        eprintln!("bracken-experiment: {e}");
-                        std::process::exit(1);
-                    }
-                };
+            let inputs = match project_inputs(project.as_deref(), python.as_deref(), hold_change) {
+                Ok(inputs) => inputs,
+                Err(e) => {
+                    eprintln!("bracken-experiment: {e}");
+                    std::process::exit(1);
+                }
+            };
             let plan = PlanInputs {
                 task: task_named(&task),
                 backend_seed: seed,
@@ -328,9 +316,7 @@ fn main() {
         }
         Cmd::Project(ProjectCmd::Check { dir, hidden, json }) => project_check(&dir, hidden.as_deref(), json),
         Cmd::Project(cmd @ ProjectCmd::Grade { .. }) => project_grade(cmd),
-        Cmd::RunTests { project, tree, python, python_digest, json } => {
-            run_tests(&project, tree.as_deref(), &python, python_digest.as_deref(), json)
-        }
+        Cmd::RunTests { project, tree, python, json } => run_tests(&project, tree.as_deref(), &python, json),
         Cmd::GradeRun { dir, hidden, grades, bracken, json } => std::env::current_exe()
             .map_err(|e| e.to_string())
             .map(|me| bracken.unwrap_or_else(|| me.with_file_name("bracken")))
@@ -353,23 +339,22 @@ fn main() {
     }
 }
 
-/// A project run's plan inputs, from `--project`, `--python`, `--python-digest` and `--hold-change`: the project
-/// as the plan records it, the interpreter pinned, the configuration's integrator setting and whether the change
+/// A project run's plan inputs, from `--project`, `--python` and `--hold-change`: the project
+/// as the plan records it, the image pinned, the configuration's integrator setting and whether the change
 /// is held back. None of them without a project; a project without `--python` is refused (answer
 /// `5e40cacdbfb4`), and so is holding back a change a project hasn't.
 fn project_inputs(
     project: Option<&std::path::Path>,
-    python: Option<&std::path::Path>,
-    digest: Option<&str>,
+    python: Option<&str>,
     hold_change: bool,
 ) -> Result<ProjectInputs, String> {
     let Some(dir) = project else { return Ok(ProjectInputs::default()) };
     let project = bracken_experiment::project::Project::load(dir)?;
-    let python = python.ok_or("a project run needs --python, the interpreter to pin")?;
+    let python = python.ok_or("a project run needs --python, the Python image to pin")?;
     if hold_change && project.first_change().is_none() {
         return Err(format!("--hold-change: project {} has no change to hold back", project.name));
     }
-    let pin = bracken_experiment::python::Python::pin(python, &project.python, digest)?.plan_pin();
+    let pin = bracken_experiment::python::Python::pin(python, &project.python)?.plan_pin();
     Ok(ProjectInputs {
         project: Some(ProjectPlan::of(&project)?),
         python: Some(pin),
@@ -701,12 +686,9 @@ enum ProjectCmd {
         /// The private store holding the project's hidden set.
         #[arg(long)]
         hidden: PathBuf,
-        /// The Python interpreter to pin: its version must be the project's.
+        /// The Python image to pin, by digest (`name@sha256:<hex>`): its Python must be the project's version.
         #[arg(long)]
-        python: PathBuf,
-        /// The digest the interpreter must have, as a run's plan records it.
-        #[arg(long)]
-        python_digest: Option<String>,
+        python: String,
         /// The tree to grade, laid out as the seed is.
         #[arg(long, required_unless_present = "golden", conflicts_with = "golden")]
         tree: Option<PathBuf>,
@@ -724,7 +706,7 @@ fn project_grade(cmd: ProjectCmd) -> Result<(), String> {
     use bracken_experiment::project::{HiddenSet, Project};
     use bracken_experiment::project_grader::{Grade, Tree, golden_check, grade};
     use bracken_experiment::python::Python;
-    let ProjectCmd::Grade { dir, hidden, python, python_digest, tree, golden, share, json } = cmd else {
+    let ProjectCmd::Grade { dir, hidden, python, tree, golden, share, json } = cmd else {
         unreachable!("only Grade is passed here")
     };
     if !(0.0..=1.0).contains(&share) {
@@ -732,7 +714,7 @@ fn project_grade(cmd: ProjectCmd) -> Result<(), String> {
     }
     let project = Project::load(&dir)?;
     let set = HiddenSet::open(&project, &hidden)?;
-    let python = Python::pin(&python, &project.python, python_digest.as_deref())?;
+    let python = Python::pin(&python, &project.python)?;
     let lines = |name: &str, g: &Grade| {
         println!("{name} at share {}: {}", g.share, if g.all_pass() { "all pass" } else { "not all pass" });
         for i in &g.items {
@@ -815,13 +797,12 @@ fn project_check(dir: &std::path::Path, hidden: Option<&std::path::Path>, json: 
 fn run_tests(
     project: &std::path::Path,
     tree: Option<&std::path::Path>,
-    python: &std::path::Path,
-    python_digest: Option<&str>,
+    python: &str,
     json: bool,
 ) -> Result<(), String> {
     use bracken_experiment::python::{Python, run_tests};
     let project = bracken_experiment::project::Project::load(project)?;
-    let python = Python::pin(python, &project.python, python_digest)?;
+    let python = Python::pin(python, &project.python)?;
     let run = run_tests(&python, &project, tree.unwrap_or(&project.seed))?;
     if json {
         println!("{}", serde_json::json!({"python": python, "run": run}));
