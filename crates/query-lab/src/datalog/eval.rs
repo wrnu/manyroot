@@ -326,6 +326,38 @@ fn plan(db: &Db, rule: &CRule, delta: Option<usize>) -> Result<Vec<Step>> {
     Ok(steps)
 }
 
+/// Builds, before a rule runs, every index its steps will read, so that running it only reads relations.
+fn prepare(db: &Db, rule: &CRule, steps: &[Step]) {
+    let mut bound = vec![false; rule.nvars];
+    let mask_of = |args: &[CTerm], bound: &[bool]| {
+        args.iter().enumerate().fold(0u64, |m, (i, a)| match a {
+            CTerm::Const(_) => m | 1 << i,
+            CTerm::Var(v) if bound[*v] => m | 1 << i,
+            _ => m,
+        })
+    };
+    for step in steps {
+        match *step {
+            Step::Scan { lit, mask, delta } => {
+                let CLit::Pos { pred, args } = &rule.body[lit] else { unreachable!("scans read atoms") };
+                if !delta && mask != 0 {
+                    db.rels[pred].ensure_index(mask);
+                }
+                vars_of(args).into_iter().for_each(|v| bound[v] = true);
+            }
+            Step::Assign { var, .. } => bound[var] = true,
+            Step::Filter { lit } => {
+                if let CLit::Neg { pred, args } | CLit::Count { pred, args, .. } = &rule.body[lit] {
+                    let mask = mask_of(args, &bound);
+                    if mask != 0 {
+                        db.rels[pred].ensure_index(mask);
+                    }
+                }
+            }
+        }
+    }
+}
+
 struct Exec<'a> {
     db: &'a Db,
     rule: &'a CRule,
@@ -335,7 +367,12 @@ struct Exec<'a> {
     out: Vec<Tuple>,
 }
 
-impl Exec<'_> {
+impl<'a> Exec<'a> {
+    fn new(db: &'a Db, rule: &'a CRule, steps: &'a [Step], delta: (usize, usize)) -> Exec<'a> {
+        prepare(db, rule, steps);
+        Exec { db, rule, steps, delta, out: Vec::new() }
+    }
+
     fn value(t: &CTerm, b: &[Option<Value>]) -> Option<Value> {
         match t {
             CTerm::Var(v) => b[*v],
@@ -379,26 +416,6 @@ impl Exec<'_> {
         true
     }
 
-    /// The tuples of `pred` matching the bound columns `mask` names.
-    fn matching(&self, pred: &str, args: &[CTerm], mask: u64, b: &[Option<Value>]) -> Vec<Tuple> {
-        let Some(rel) = self.db.rels.get(pred) else { return Vec::new() };
-        if mask == 0 {
-            return rel.tuples.clone();
-        }
-        let k: Tuple = args
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| mask & (1 << i) != 0)
-            .map(|(_, a)| Self::value(a, b).expect("masked columns are bound"))
-            .collect();
-        rel.ensure_index(mask);
-        let indexes = rel.indexes.borrow();
-        indexes[&mask]
-            .map
-            .get(&k)
-            .map_or_else(Vec::new, |rows| rows.iter().map(|n| rel.tuples[*n as usize].clone()).collect())
-    }
-
     fn mask_of(args: &[CTerm], b: &[Option<Value>]) -> u64 {
         let mut mask = 0;
         for (i, a) in args.iter().enumerate() {
@@ -409,27 +426,65 @@ impl Exec<'_> {
         mask
     }
 
+    fn key(args: &[CTerm], mask: u64, b: &[Option<Value>]) -> Tuple {
+        args.iter()
+            .enumerate()
+            .filter(|(i, _)| mask & (1 << i) != 0)
+            .map(|(_, a)| Self::value(a, b).expect("masked columns are bound"))
+            .collect()
+    }
+
+    /// The rows of `rel` whose columns in `mask` hold `key`, read from the index `prepare` built.
+    fn with_rows<T>(rel: &Relation, mask: u64, key: &[Value], f: impl FnOnce(&[u32]) -> T) -> T {
+        let indexes = rel.indexes.borrow();
+        let index = indexes.get(&mask).expect("prepare builds every index a rule reads");
+        f(index.map.get(key).map_or(&[], Vec::as_slice))
+    }
+
+    fn try_tuple(
+        &mut self,
+        args: &[CTerm],
+        t: &[Value],
+        at: usize,
+        b: &mut Vec<Option<Value>>,
+        newly: &mut Vec<usize>,
+    ) {
+        if Self::unify(args, t, b, newly) {
+            self.run(at + 1, b);
+        }
+        for v in newly.drain(..) {
+            b[v] = None;
+        }
+    }
+
     fn run(&mut self, at: usize, b: &mut Vec<Option<Value>>) {
         let Some(step) = self.steps.get(at) else {
             let t: Tuple = self.rule.head.iter().map(|h| Self::value(h, b).expect("heads are bound")).collect();
             self.out.push(t);
             return;
         };
+        let (db, rule): (&'a Db, &'a CRule) = (self.db, self.rule);
         match *step {
             Step::Scan { lit, mask, delta } => {
-                let CLit::Pos { pred, args } = &self.rule.body[lit] else { unreachable!("scans read atoms") };
-                let found = if delta {
-                    self.db.rels[pred].tuples[self.delta.0..self.delta.1].to_vec()
-                } else {
-                    self.matching(pred, args, mask, b)
-                };
+                let CLit::Pos { pred, args } = &rule.body[lit] else { unreachable!("scans read atoms") };
+                let rel = &db.rels[pred];
                 let mut newly = Vec::new();
-                for t in &found {
-                    if Self::unify(args, t, b, &mut newly) {
-                        self.run(at + 1, b);
+                if delta {
+                    for t in &rel.tuples[self.delta.0..self.delta.1] {
+                        self.try_tuple(args, t, at, b, &mut newly);
                     }
-                    for v in newly.drain(..) {
-                        b[v] = None;
+                } else if mask == 0 {
+                    for t in &rel.tuples {
+                        self.try_tuple(args, t, at, b, &mut newly);
+                    }
+                } else {
+                    let key = Self::key(args, mask, b);
+                    let indexes = rel.indexes.borrow();
+                    let index = indexes.get(&mask).expect("prepare builds every index a rule reads");
+                    if let Some(rows) = index.map.get(&key) {
+                        for n in rows {
+                            self.try_tuple(args, &rel.tuples[*n as usize], at, b, &mut newly);
+                        }
                     }
                 }
             }
@@ -439,18 +494,24 @@ impl Exec<'_> {
                 b[var] = None;
             }
             Step::Filter { lit } => {
-                if self.filter(&self.rule.body[lit], b) {
+                if self.filter(&rule.body[lit], b) {
                     self.run(at + 1, b);
                 }
             }
         }
     }
 
+    /// A negation, count or comparison, all of whose variables (but a count's own) are bound.
     fn filter(&self, lit: &CLit, b: &[Option<Value>]) -> bool {
-        let unifies = |args: &[CTerm], t: &[Value]| Self::unify(args, t, &mut b.to_vec(), &mut Vec::new());
         match lit {
             CLit::Neg { pred, args } => {
-                !self.matching(pred, args, Self::mask_of(args, b), b).iter().any(|t| unifies(args, t))
+                let rel = &self.db.rels[pred];
+                let mask = Self::mask_of(args, b);
+                if mask == 0 {
+                    return rel.tuples.is_empty();
+                }
+                // Every argument is bound or `_`, so any row the index finds matches.
+                Self::with_rows(rel, mask, &Self::key(args, mask, b), |rows| rows.is_empty())
             }
             CLit::Cmp(x, op, y) => match (Self::value(x, b), Self::value(y, b)) {
                 (Some(x), Some(y)) => Self::compare(x, *op, y),
@@ -463,13 +524,16 @@ impl Exec<'_> {
                 _ => false,
             },
             CLit::Count { pred, args, var, op, rhs } => {
+                let rel = &self.db.rels[pred];
                 let col = args.iter().position(|a| matches!(a, CTerm::Var(v) if v == var));
-                let distinct: HashSet<Value> = self
-                    .matching(pred, args, Self::mask_of(args, b), b)
-                    .iter()
-                    .filter(|t| unifies(args, t))
-                    .filter_map(|t| col.map(|c| t[c]))
-                    .collect();
+                let mask = Self::mask_of(args, b);
+                let distinct: HashSet<Value> = if mask == 0 {
+                    rel.tuples.iter().filter_map(|t| col.map(|c| t[c])).collect()
+                } else {
+                    Self::with_rows(rel, mask, &Self::key(args, mask, b), |rows| {
+                        rows.iter().filter_map(|n| col.map(|c| rel.tuples[*n as usize][c])).collect()
+                    })
+                };
                 let n = Value::Int(i64::try_from(distinct.len()).expect("counts fit"));
                 Self::value(rhs, b).is_some_and(|r| Self::compare(n, *op, r))
             }
@@ -633,7 +697,7 @@ pub fn query(db: &mut Db, program: &Program, body: &[Literal]) -> Result<Answer>
     let c = compile_rule(db, &rule)?;
     check_preds(db, &c.body, &defined)?;
     let steps = plan(db, &c, None)?;
-    let mut exec = Exec { db, rule: &c, steps: &steps, delta: (0, 0), out: Vec::new() };
+    let mut exec = Exec::new(db, &c, &steps, (0, 0));
     exec.run(0, &mut vec![None; c.nvars]);
     let mut rows: Vec<Vec<Value>> = exec.out.into_iter().map(|t| t.into_vec()).collect();
     rows.sort();
@@ -670,7 +734,7 @@ fn fixpoint(db: &mut Db, rules: &[CRule], preds: &[String], derived: &mut usize)
                     let CLit::Pos { pred, .. } = &r.body[i] else { unreachable!("deltas are atoms") };
                     delta[pred]
                 });
-                let mut exec = Exec { db, rule: r, steps: &steps, delta: range, out: Vec::new() };
+                let mut exec = Exec::new(db, r, &steps, range);
                 exec.run(0, &mut vec![None; r.nvars]);
                 new.extend(exec.out.into_iter().map(|t| (r.head_pred.clone(), t)));
             }

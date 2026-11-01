@@ -28,6 +28,8 @@ pub mod eval;
 pub mod magic;
 pub mod parse;
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use manyroot::{BodyKind, Verdict};
 
@@ -133,7 +135,18 @@ pub fn database(g: &Ground, opts: &Options) -> Result<Db> {
         let name = g.agent_names[a].clone().unwrap_or_else(|| g.agents[a].to_hex());
         let n = db.sym(&name);
         db.add("agent", &[Value::Agent(a as u32), n]);
-        if opts.validators.is_empty() {
+    }
+    bind(&mut db, g, opts)?;
+    Ok(db)
+}
+
+/// Sets what depends on the options: the parameters, and the `validator` relation.
+fn bind(db: &mut Db, g: &Ground, opts: &Options) -> Result<()> {
+    db.params.clear();
+    let validators = db.relation("validator", 1);
+    *validators = eval::Relation::new(1);
+    if opts.validators.is_empty() {
+        for a in 0..g.agents.len() {
             db.add("validator", &[Value::Agent(a as u32)]);
         }
     }
@@ -150,7 +163,43 @@ pub fn database(g: &Ground, opts: &Options) -> Result<Db> {
     for (name, id) in opts.ids {
         db.params.insert(name.clone(), Value::Id(g.resolve(id)?));
     }
-    Ok(db)
+    Ok(())
+}
+
+/// The base relations of one Ground, built once and kept across programs (design note section 5(a), load
+/// once and answer many). Each program's derived relations are dropped after it, since they depend on its
+/// parameters.
+pub struct Session<'g> {
+    g: &'g Ground,
+    pub db: Db,
+    base: HashSet<String>,
+    prelude: Program,
+}
+
+impl<'g> Session<'g> {
+    pub fn new(g: &'g Ground) -> Result<Session<'g>> {
+        let db = database(g, &Options::default())?;
+        let base = db.rels.keys().cloned().collect();
+        Ok(Session { g, db, base, prelude: parse(PRELUDE).context("the prelude")? })
+    }
+
+    pub fn run(&mut self, opts: &Options, text: &str) -> Result<Vec<Answer>> {
+        bind(&mut self.db, self.g, opts)?;
+        let mut program = self.prelude.clone();
+        let user = parse(text)?;
+        program.rules.extend(user.rules);
+        let mut answers = Vec::new();
+        let result = (|| {
+            for (n, q) in user.queries.iter().enumerate() {
+                let body = if opts.magic { magic::rewrite(&mut program, q, n) } else { q.clone() };
+                answers.push(eval::query(&mut self.db, &program, &body)?);
+            }
+            Ok::<(), anyhow::Error>(())
+        })();
+        let base = &self.base;
+        self.db.rels.retain(|name, _| base.contains(name));
+        result.map(|()| answers)
+    }
 }
 
 /// Runs `text` (rules, then queries) on top of the prelude. Returns the database, with everything the

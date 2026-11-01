@@ -261,3 +261,30 @@ fn the_demand_transformation_changes_no_answer_and_derives_less() {
         }
     }
 }
+
+#[test]
+fn a_session_answers_as_fresh_runs_do_whatever_ran_before() {
+    let (_, ground) = generated(4);
+    let mut session = datalog::Session::new(&ground).expect("builds");
+    let a = ground.ids[ground.len() / 3].to_hex();
+    let b = ground.ids[ground.len() / 2].to_hex();
+    // Each: its id parameters, its min passes, and the program.
+    type Program<'a> = (Vec<(String, String)>, i64, &'a str);
+    let programs: Vec<Program> = vec![
+        (vec![("d".into(), a.clone())], 1, "?- ancestor(X, $d)."),
+        (vec![("d".into(), b.clone())], 1, "?- ancestor(X, $d)."),
+        (vec![], 2, "?- accepted(X)."),
+        (vec![], 1, "?- accepted(X)."),
+        (vec![("claim".into(), a)], 1, "?- gate_blocking(F).\n?- gate_current(C)."),
+        (vec![("claim".into(), b)], 1, "?- gate_blocking(F).\n?- gate_current(C)."),
+    ];
+    for (ids, min_passes, text) in &programs {
+        let opts = Options { ids, min_passes: *min_passes, ..Options::default() };
+        let ours = session.run(&opts, text).expect("runs");
+        let (_, fresh) = datalog::run(&ground, &opts, text).expect("runs");
+        assert_eq!(ours.len(), fresh.len(), "{text}: as many answers");
+        for (x, y) in ours.iter().zip(&fresh) {
+            assert_eq!(x.rows, y.rows, "{text} with {ids:?}, min passes {min_passes}");
+        }
+    }
+}

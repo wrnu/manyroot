@@ -3,7 +3,14 @@
 //! concurrent branches, retraction chains, supersessions by a subject's author and by others, triage and
 //! merge-gate passes, so every rule of the prelude has cases to decide.
 
-use manyroot::{AgentId, Body, Contribution, ContributionId, Graph, GroundId, Identity, RelationKind, Verdict};
+use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
+
+use anyhow::{Context, Result};
+use manyroot::{
+    AgentId, Body, Contribution, ContributionId, Graph, GroundId, GroundInfo, Identity, RelationKind, Verdict,
+};
 
 /// A small, fast, deterministic generator (xorshift64*); quality is beside the point.
 pub struct Rng(u64);
@@ -42,19 +49,28 @@ pub struct Generated {
 
 /// About `n` contributions by `agents` agents, the first named `manager`.
 pub fn ground(seed: u64, n: usize, agents: usize) -> Generated {
-    let mut rng = Rng::new(seed);
     let ground = GroundId([seed as u8; 32]);
     let identities: Vec<Identity> = (0..agents.max(2))
         .map(|i| Identity::generate(&if i == 0 { "manager".to_owned() } else { format!("agent-{i}") }).expect("a key"))
         .collect();
     let names = identities.iter().map(|i| (i.name().to_owned(), i.agent_id())).collect();
     let mut graph = Graph::new(ground);
+    grow(&mut graph, &identities, seed, n);
+    Generated { graph, names, identities }
+}
+
+/// Adds about `n` contributions by `identities` (the first is the triager) on top of what `graph` holds,
+/// building on its heads. Returns the ids added, in order.
+pub fn grow(graph: &mut Graph, identities: &[Identity], seed: u64, n: usize) -> Vec<ContributionId> {
+    let mut rng = Rng::new(seed);
+    let ground = graph.ground();
     // Every contribution with its author's index, and the subjects with theirs, in order.
     let mut all: Vec<(ContributionId, usize)> = Vec::new();
     let mut subjects: Vec<(ContributionId, usize)> = Vec::new();
     let mut claims_by: Vec<Vec<ContributionId>> = vec![Vec::new(); identities.len()];
     let mut written_by: Vec<Vec<ContributionId>> = vec![Vec::new(); identities.len()];
     let mut prs: Vec<ContributionId> = Vec::new();
+    let mut is_pr: HashSet<ContributionId> = HashSet::new();
     let mut tasks: Vec<ContributionId> = Vec::new();
     let mut findings: Vec<(ContributionId, usize)> = Vec::new();
     let mut ts = 1_790_000_000_000u64;
@@ -85,7 +101,7 @@ pub fn ground(seed: u64, n: usize, agents: usize) -> Generated {
             // Evidence on a recent subject: the manager triaging a finding, a merge gate, or a test run.
             let (target, _) = subjects[rng.recent(subjects.len(), 200)];
             let verdict = if rng.chance(80) { Verdict::Pass } else { Verdict::Fail };
-            let method = if who == 0 && prs.contains(&target) && rng.chance(40) {
+            let method = if who == 0 && is_pr.contains(&target) && rng.chance(40) {
                 format!("merge gate @ {:040x}", rng.word())
             } else {
                 "cargo test".to_owned()
@@ -174,6 +190,7 @@ pub fn ground(seed: u64, n: usize, agents: usize) -> Generated {
             claims_by[me].push(id);
             if tags_of.iter().any(|t| t == "pr") {
                 prs.push(id);
+                is_pr.insert(id);
             }
             if tags_of.iter().any(|t| t == "finding") {
                 findings.push((id, me));
@@ -183,5 +200,59 @@ pub fn ground(seed: u64, n: usize, agents: usize) -> Generated {
             }
         }
     }
-    Generated { graph, names, identities }
+    all.into_iter().map(|(id, _)| id).collect()
+}
+
+/// The file `write` puts beside `ground.json`, holding the Ground's id: what marks a replica as one this
+/// tool generated.
+const MARKER: &str = "query-lab-synthetic";
+
+/// Refuses any replica `write` didn't create: one without the marker naming its own Ground, one holding
+/// `identities/` (no generated replica has keys on disk), or a `.bracken`. Only those may be extended.
+pub fn ensure_synthetic(dir: &Path) -> Result<()> {
+    let info: GroundInfo = serde_json::from_str(
+        &fs::read_to_string(dir.join("ground.json")).with_context(|| format!("{} isn't a replica", dir.display()))?,
+    )?;
+    let marker = fs::read_to_string(dir.join(MARKER)).unwrap_or_default();
+    anyhow::ensure!(
+        marker.trim() == info.ground.to_hex()
+            && !dir.join("identities").exists()
+            && dir.canonicalize()?.file_name() != Some(".bracken".as_ref()),
+        "{} isn't a synthetic Ground this tool generated; only those can be extended",
+        dir.display()
+    );
+    Ok(())
+}
+
+/// Writes a generated Ground as a replica directory: `ground.json`, `objects/` and the public name map
+/// `agents/`. No private key is written: the identities stay in memory.
+pub fn write(
+    dir: &Path,
+    graph: &Graph,
+    names: &[(String, AgentId)],
+    ids: impl IntoIterator<Item = ContributionId>,
+) -> Result<()> {
+    let info = GroundInfo { ground: graph.ground(), name: "synthetic".into() };
+    let manifest = dir.join("ground.json");
+    if !manifest.exists() {
+        fs::create_dir_all(dir)?;
+        fs::write(&manifest, serde_json::to_string_pretty(&info)? + "\n")?;
+        fs::write(dir.join(MARKER), graph.ground().to_hex() + "\n")?;
+    }
+    fs::create_dir_all(dir.join("agents"))?;
+    for (name, agent) in names {
+        let entry = serde_json::json!({ "name": name, "agent": agent });
+        fs::write(dir.join("agents").join(format!("{name}.json")), serde_json::to_string_pretty(&entry)? + "\n")?;
+    }
+    let mut shards = HashSet::new();
+    for id in ids {
+        let hex = id.to_hex();
+        let shard = dir.join("objects").join(&hex[..2]);
+        if shards.insert(hex[..2].to_owned()) {
+            fs::create_dir_all(&shard)?;
+        }
+        let c = graph.get(&id).context("a written id is in the graph")?;
+        fs::write(shard.join(&hex[2..]), c.encode())?;
+    }
+    Ok(())
 }

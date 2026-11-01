@@ -1,16 +1,16 @@
 //! The tables queries read: every contribution of a Ground as a dense row, numbered in causal order, with
-//! the indexes the queries need. Built once from a loaded [`Graph`], read-only afterwards.
+//! the indexes the queries need. Built once, from a loaded [`Graph`] or a snapshot, read-only afterwards.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
-use manyroot::{AgentId, Body, BodyKind, ContributionId, Graph, RelationKind, Verdict};
+use manyroot::{AgentId, Body, BodyKind, Contribution, ContributionId, Graph, RelationKind, Verdict};
 
 /// A contribution's place in causal order, which is also its row. A row's parents and references all
 /// have smaller rows.
 pub type Row = u32;
 
 /// What a row says, with references as rows. Text is kept for output and for method matching.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Fact {
     Claim { statement: String, tags: Vec<u32> },
     Artifact { name: String, media_type: String },
@@ -63,20 +63,108 @@ pub struct Ground {
     pub by_tag: Vec<Vec<Row>>,
 }
 
+/// One contribution as the tables need it: no signature, details or artifact content. A snapshot stores
+/// these, so loading one needs no decoding, hashing or verifying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub id: ContributionId,
+    pub author: AgentId,
+    pub timestamp_ms: u64,
+    pub parents: Vec<ContributionId>,
+    pub body: EntryBody,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryBody {
+    Claim { statement: String, tags: Vec<String> },
+    Artifact { name: String, media_type: String },
+    Relation { from: ContributionId, kind: RelationKind, to: ContributionId },
+    Evidence { target: ContributionId, verdict: Verdict, method: String },
+    Retract { target: ContributionId },
+}
+
+impl Entry {
+    pub fn of(c: &Contribution) -> Entry {
+        let body = match c.body() {
+            Body::Claim { statement, tags } => EntryBody::Claim { statement: statement.clone(), tags: tags.clone() },
+            Body::Artifact { name, media_type, .. } => {
+                EntryBody::Artifact { name: name.clone(), media_type: media_type.clone() }
+            }
+            Body::Relation { from, kind, to, .. } => EntryBody::Relation { from: *from, kind: *kind, to: *to },
+            Body::Evidence { target, verdict, method, .. } => {
+                EntryBody::Evidence { target: *target, verdict: *verdict, method: method.clone() }
+            }
+            Body::Retract { target, .. } => EntryBody::Retract { target: *target },
+        };
+        Entry {
+            id: c.id(),
+            author: c.author(),
+            timestamp_ms: c.content().timestamp_ms,
+            parents: c.parents().to_vec(),
+            body,
+        }
+    }
+
+    /// The ids the body talks about.
+    pub fn references(&self) -> Vec<ContributionId> {
+        match &self.body {
+            EntryBody::Claim { .. } | EntryBody::Artifact { .. } => vec![],
+            EntryBody::Relation { from, to, .. } => vec![*from, *to],
+            EntryBody::Evidence { target, .. } | EntryBody::Retract { target } => vec![*target],
+        }
+    }
+}
+
+/// Entries in the protocol's causal order (protocol.md, Derived state): a topological order breaking ties
+/// by ascending id, the order `Graph::topo_order` gives, so rows are the same however the entries arrived.
+/// Every parent must be among the entries.
+pub fn causal_order(mut entries: Vec<Entry>) -> Vec<Entry> {
+    let index: HashMap<ContributionId, usize> = entries.iter().enumerate().map(|(i, e)| (e.id, i)).collect();
+    let mut waiting: Vec<usize> = entries.iter().map(|e| e.parents.len()).collect();
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); entries.len()];
+    for (i, e) in entries.iter().enumerate() {
+        for p in &e.parents {
+            children[index[p]].push(i);
+        }
+    }
+    let mut ready: BTreeSet<(ContributionId, usize)> =
+        entries.iter().enumerate().filter(|(i, _)| waiting[*i] == 0).map(|(i, e)| (e.id, i)).collect();
+    let mut order = Vec::with_capacity(entries.len());
+    while let Some((_, i)) = ready.pop_first() {
+        order.push(i);
+        for c in &children[i] {
+            waiting[*c] -= 1;
+            if waiting[*c] == 0 {
+                ready.insert((entries[*c].id, *c));
+            }
+        }
+    }
+    assert_eq!(order.len(), entries.len(), "every parent is among the entries, so nothing waits forever");
+    let mut slots: Vec<Option<Entry>> = entries.drain(..).map(Some).collect();
+    order.into_iter().map(|i| slots[i].take().expect("each entry once")).collect()
+}
+
 impl Ground {
     /// `names` maps public keys to local names, as `Store::agents` lists them.
     pub fn from_graph(graph: &Graph, names: &[(String, AgentId)]) -> Ground {
-        let order = graph.topo_order();
+        let entries =
+            graph.topo_order().iter().map(|id| Entry::of(graph.get(id).expect("ordered ids exist"))).collect();
+        Ground::from_ordered(entries, names)
+    }
+
+    /// From entries already in causal order (see [`causal_order`]).
+    pub fn from_ordered(entries: Vec<Entry>, names: &[(String, AgentId)]) -> Ground {
         let row_of: HashMap<ContributionId, Row> =
-            order.iter().enumerate().map(|(i, id)| (*id, u32::try_from(i).expect("fewer than 2^32 rows"))).collect();
+            entries.iter().enumerate().map(|(i, e)| (e.id, u32::try_from(i).expect("fewer than 2^32 rows"))).collect();
+        let n = entries.len();
         let mut g = Ground {
-            ids: order.clone(),
+            ids: entries.iter().map(|e| e.id).collect(),
             row_of,
-            author: Vec::with_capacity(order.len()),
-            timestamp_ms: Vec::with_capacity(order.len()),
-            fact: Vec::with_capacity(order.len()),
-            parents: Vec::with_capacity(order.len()),
-            referrers: vec![Vec::new(); order.len()],
+            author: Vec::with_capacity(n),
+            timestamp_ms: Vec::with_capacity(n),
+            fact: Vec::with_capacity(n),
+            parents: Vec::with_capacity(n),
+            referrers: vec![Vec::new(); n],
             heads: Vec::new(),
             agents: Vec::new(),
             agent_names: Vec::new(),
@@ -85,34 +173,36 @@ impl Ground {
             by_tag: Vec::new(),
         };
         let mut agent_of: HashMap<AgentId, u32> = HashMap::new();
-        for (row, id) in order.iter().enumerate() {
-            let c = graph.get(id).expect("ordered ids are in the graph");
-            let author = *agent_of.entry(c.author()).or_insert_with(|| {
-                g.agents.push(c.author());
-                g.agent_names.push(names.iter().find(|(_, a)| *a == c.author()).map(|(n, _)| n.clone()));
+        let mut has_child = vec![false; n];
+        for (row, e) in entries.into_iter().enumerate() {
+            let author = *agent_of.entry(e.author).or_insert_with(|| {
+                g.agents.push(e.author);
+                g.agent_names.push(names.iter().find(|(_, a)| *a == e.author).map(|(n, _)| n.clone()));
                 u32::try_from(g.agents.len() - 1).expect("fewer than 2^32 agents")
             });
             g.author.push(author);
-            g.timestamp_ms.push(c.content().timestamp_ms);
-            g.parents.push(c.parents().iter().map(|p| g.row_of[p]).collect());
-            let fact = match c.body() {
-                Body::Claim { statement, tags } => {
+            g.timestamp_ms.push(e.timestamp_ms);
+            let parents: Vec<Row> = e.parents.iter().map(|p| g.row_of[p]).collect();
+            for p in &parents {
+                has_child[*p as usize] = true;
+            }
+            g.parents.push(parents);
+            let fact = match e.body {
+                EntryBody::Claim { statement, tags } => {
                     let tags = tags.iter().map(|t| g.intern_tag(t)).collect::<Vec<_>>();
                     for t in &tags {
                         g.by_tag[*t as usize].push(row as Row);
                     }
-                    Fact::Claim { statement: statement.clone(), tags }
+                    Fact::Claim { statement, tags }
                 }
-                Body::Artifact { name, media_type, .. } => {
-                    Fact::Artifact { name: name.clone(), media_type: media_type.clone() }
+                EntryBody::Artifact { name, media_type } => Fact::Artifact { name, media_type },
+                EntryBody::Relation { from, kind, to } => {
+                    Fact::Relation { from: g.row_of[&from], kind, to: g.row_of[&to] }
                 }
-                Body::Relation { from, kind, to, .. } => {
-                    Fact::Relation { from: g.row_of[from], kind: *kind, to: g.row_of[to] }
+                EntryBody::Evidence { target, verdict, method } => {
+                    Fact::Evidence { target: g.row_of[&target], verdict, method }
                 }
-                Body::Evidence { target, verdict, method, .. } => {
-                    Fact::Evidence { target: g.row_of[target], verdict: *verdict, method: method.clone() }
-                }
-                Body::Retract { target, .. } => Fact::Retract { target: g.row_of[target] },
+                EntryBody::Retract { target } => Fact::Retract { target: g.row_of[&target] },
             };
             let mut refs = fact.references();
             refs.dedup();
@@ -121,8 +211,7 @@ impl Ground {
             }
             g.fact.push(fact);
         }
-        g.heads = graph.heads().map(|h| g.row_of[&h]).collect();
-        g.heads.sort_unstable();
+        g.heads = (0..n as Row).filter(|r| !has_child[*r as usize]).collect();
         g
     }
 

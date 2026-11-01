@@ -311,6 +311,18 @@ pub fn run(dir: &Path, bracken: &Path, g: &Ground, cases: &[Case], runs: usize) 
     Ok(out)
 }
 
+/// As [`answer`], with the Datalog base relations already built.
+pub fn answer_in(session: &mut datalog::Session, g: &Ground, ours: &Ours) -> Result<Vec<u32>> {
+    match ours {
+        Ours::Pipeline(text) => pipeline::run(g, &pipeline::parse(text)?),
+        Ours::Datalog { program, triager, min_passes, ids } => {
+            let opts = Options { triager: Some(triager), validators: &[], min_passes: *min_passes, ids, magic: true };
+            let answers = session.run(&opts, program)?;
+            Ok(datalog::ids(answers.last().context("a program with a query")?))
+        }
+    }
+}
+
 pub fn answer(g: &Ground, ours: &Ours) -> Result<Vec<u32>> {
     match ours {
         Ours::Pipeline(text) => pipeline::run(g, &pipeline::parse(text)?),
