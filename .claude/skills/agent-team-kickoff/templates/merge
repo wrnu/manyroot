@@ -246,6 +246,17 @@ fi
 triager=manager
 found=$(bk findings "$full" --triager "$triager" --json) ||
   fail "couldn't read the findings against $full, so the findings check can't decide"
+# The read's shape first, in one jq: a jq error inside the for lists below would go unnoticed, since
+# errexit doesn't cover a command substitution there (finding d9682243cef7). Slurped (-s), so it judges
+# the whole output as exactly one document, not just the last of several; and every id and task is 64
+# lowercase hex, so none can split away in a for list (finding 6fd12dd898ee).
+jq -es 'length == 1 and (.[0] | (.findings | type) == "array" and (.blocking | type) == "number"
+  and all(.findings[]; (.id | type) == "string" and (.id | test("^[0-9a-f]{64}$"))
+    and (.triage | IN("untriaged", "confirmed", "deferred", "rejected"))
+    and (.triage != "deferred" or ((.task | type) == "string" and (.task | test("^[0-9a-f]{64}$")))))
+  and .blocking == ([.findings[] | select(.triage == "untriaged" or .triage == "confirmed")] | length))' \
+  <<<"$found" >/dev/null ||
+  fail "bracken findings --json for $full isn't in the shape this check reads, so the findings check can't decide"
 findings_count=$(jq '.findings | length' <<<"$found")
 untriaged=() undeferred=() deferred=()
 for f in $(jq -r '.findings[] | select(.triage == "untriaged") | .id[:12]' <<<"$found"); do untriaged+=("$f"); done
@@ -253,6 +264,7 @@ for f in $(jq -r '.findings[] | select(.triage == "confirmed") | .id[:12]' <<<"$
 for f in $(jq -r '.findings[] | select(.triage == "deferred") | "\(.id[:12])->\(.task[:12])"' <<<"$found"); do
   deferred+=("$f")
 done
+# And what the for lists read agrees with the count, in case anything slipped past the shape check.
 [ "$(jq '.blocking' <<<"$found")" -eq $((${#untriaged[@]} + ${#undeferred[@]})) ] ||
   fail "bracken findings' blocking count disagrees with its findings, so the findings check can't decide"
 if [ ${#untriaged[@]} -eq 0 ] && [ ${#undeferred[@]} -eq 0 ]; then

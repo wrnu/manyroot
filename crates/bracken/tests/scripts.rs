@@ -6104,6 +6104,79 @@ fn merge_batch_refuses_when_a_findings_read_fails() {
     }
 }
 
+/// Task d5dc6c27c7f2 (finding d9682243cef7): merge's findings check decides through the real binary's
+/// `findings`. An untriaged finding refuses the merge, a confirmed one too; one the manager deferred to a
+/// current task of theirs doesn't. And a `findings --json` in any other shape refuses it, whatever it
+/// says, even with nothing blocking.
+#[test]
+fn merge_decides_findings_through_the_binary_and_refuses_another_shape() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 1, &[], false);
+        assert!(b.verify(&[1]).status.success(), "{scripts}");
+        let claim = b.claims[0].clone();
+        let dry = |b: &Batch| b.merge(&["1", &claim[..12], "--dry-run"]);
+        assert!(dry(&b).status.success(), "{scripts}: {}", text(&dry(&b)));
+        let finding = bk(&b.dir, &["claim", "member 1 breaks x", "--tag", "finding", "--as", "val"]);
+        bk(&b.dir, &["relate", &finding, "contradicts", &claim, "--as", "val"]);
+        let f = &finding[..12];
+
+        let out = dry(&b);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: untriaged: {said}");
+        assert!(said.contains(&format!("untriaged (no manager evidence): {f};")), "{scripts}: {said}");
+
+        bk(&b.dir, &["evidence", &finding, "pass", "--method", "triage", "--as", "manager"]);
+        let out = dry(&b);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: confirmed: {said}");
+        assert!(said.contains("untriaged (no manager evidence): none;"), "{scripts}: {said}");
+        assert!(said.contains(&format!("depends_on it): {f}")), "{scripts}: {said}");
+
+        let task = bk(&b.dir, &["claim", "fix x later", "--tag", "task", "--tag", "deferred", "--as", "manager"]);
+        bk(&b.dir, &["relate", &task, "depends_on", &finding, "--as", "manager"]);
+        let out = dry(&b);
+        let said = text(&out);
+        assert!(out.status.success(), "{scripts}: deferred: {said}");
+        assert!(said.contains(&format!("confirmed and deferred: {f}->{}", &task[..12])), "{scripts}: {said}");
+
+        // The same Ground, but `findings --json` answers in another shape: refused every time.
+        let wrapper = b.tmp.path().join("stubs/shaped-bracken");
+        write_executable(
+            &wrapper,
+            "#!/usr/bin/env bash\nfor a in \"$@\"; do [ \"$a\" != findings ] || { cat \"$T/shape\"; exit 0; }; done\n\
+             exec \"$REAL_BRACKEN\" \"$@\"\n",
+        );
+        let id = "a".repeat(64);
+        for shape in [
+            r#"{"findings":5,"blocking":0}"#.to_owned(),
+            format!(r#"{{"findings":[{{"id":"{id}","triage":"weird"}}],"blocking":0}}"#),
+            format!(r#"{{"findings":[{{"id":"{id}","triage":"deferred","task":null}}],"blocking":0}}"#),
+            format!(r#"{{"findings":[{{"id":"{id}","triage":"untriaged"}}],"blocking":0}}"#),
+            r#"{"findings":[],"blocking":"0"}"#.to_owned(),
+            r#"{"findings":[{"id":"short","triage":"rejected"}],"blocking":0}"#.to_owned(),
+            // Finding 6fd12dd898ee: two documents, the last of them clean, and an id that splits away.
+            format!(
+                "{{\"findings\":[{{\"id\":\"{id}\",\"triage\":\"untriaged\"}}],\"blocking\":1}}\n{{\"findings\":[],\"blocking\":0}}"
+            ),
+            format!(r#"{{"findings":[{{"id":"{}","triage":"untriaged"}}],"blocking":1}}"#, " ".repeat(64)),
+            format!(
+                r#"{{"findings":[{{"id":"{}","triage":"deferred","task":"{}"}}],"blocking":0}}"#,
+                id,
+                "A".repeat(64)
+            ),
+        ] {
+            std::fs::write(b.tmp.path().join("shape"), &shape).unwrap();
+            let mut all = vec!["1", &claim[..12], "--dry-run"];
+            all.extend(["--validator", "val", "--min-passes", "1", "--as", "manager"]);
+            let out = b.command("scripts/merge", &all).env("BRACKEN_BIN", &wrapper).output().unwrap();
+            let said = text(&out);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {shape}: {said}");
+            assert!(said.contains("isn't in the shape this check reads"), "{scripts}: {shape}: {said}");
+        }
+        assert!(b.merged().is_empty(), "{scripts}: a dry run merged");
+    }
+}
+
 impl Batch {
     /// The manager's passes on PR #n's claim, by the batch claim each names.
     fn passes_by_batch(&self, n: usize) -> Vec<String> {
