@@ -31,6 +31,11 @@ thiserror = "2"
 unicode-normalization = "0.1"
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 
+# Line tables keep file and line numbers in panics and backtraces but drop the rest of the debug info,
+# most of a dev build's size (owner decision 8ac9b0239d90). Tests inherit it.
+[profile.dev]
+debug = "line-tables-only"
+
 # Dependencies optimized in dev builds and tests: signing and hashing at opt-level 0 made the demo's
 # adversary tests 3x slower, and the full test table too slow for a 4-vCPU boat box (task 489bfeb6b5af).
 # The workspace's own crates stay unoptimized, for debugging.

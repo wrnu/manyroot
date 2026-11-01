@@ -89,6 +89,9 @@ cd "$(git -C "$here" rev-parse --show-toplevel)"
 mode_line() { [ -z "${TEST_TABLE_MODE:-}" ] || echo "test-table: counted run mode: $TEST_TABLE_MODE"; }
 fail() { echo "test-table: $*" >&2; mode_line >&2; exit 1; }
 timeout=$(command -v timeout || command -v gtimeout) || fail "needs timeout (on macOS, gtimeout from coreutils)"
+# Every compile here runs afresh and refreshes sccache's entry, never reading one: a counted run never
+# rests on entries a branch's build wrote (finding 292898be0ce0; scripts/rustc-wrapper passes it on).
+export SCCACHE_RECACHE=1
 
 # Whether box $1 may still exist: listed in any state, or boat can't say. --all, because plain list
 # shows only running boxes, and one left stopped, pending, stopping or in error keeps its data.
