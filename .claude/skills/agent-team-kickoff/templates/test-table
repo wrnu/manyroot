@@ -82,6 +82,9 @@
 # fails through a check here, ends with 'test-table: counted run mode: <it>', so the evidence's details
 # hold it.
 set -euo pipefail
+# The tests decide for themselves whether a read goes through the verified snapshot: a full check
+# asked for by whoever runs the table mustn't reach them (finding 607273d1d193).
+unset BRACKEN_FULL_CHECK
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 cd "$(git -C "$here" rev-parse --show-toplevel)"

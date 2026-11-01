@@ -19,7 +19,7 @@
 //! any number of agent processes can write to one replica without locking:
 //! two processes writing concurrently just produce concurrent contributions.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -52,6 +52,10 @@ pub enum StoreError {
     UnknownIdentity(String),
     #[error("the name {0:?} is already taken")]
     NameTaken(String),
+    /// A contribution handed to [`Store::open_trusting`] doesn't fit the replica: open it with
+    /// [`Store::open`] instead.
+    #[error("trusted contribution {id}: {reason}")]
+    Untrusted { id: ContributionId, reason: String },
     #[error("cannot sync ground {0} with ground {1}")]
     DifferentGrounds(GroundId, GroundId),
     #[error("sync: {0}")]
@@ -107,44 +111,120 @@ impl Store {
 
     /// Opens a replica and verifies every contribution in it.
     pub fn open(dir: &Path) -> Result<Store, StoreError> {
-        let manifest = dir.join("ground.json");
-        let text = match fs::read_to_string(&manifest) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(StoreError::NotAGround(dir.to_owned())),
-            Err(e) => return Err(io(&manifest)(e)),
-        };
-        let info: GroundInfo = serde_json::from_str(&text)
-            .map_err(|e| StoreError::Corrupt { path: manifest.clone(), reason: e.to_string() })?;
+        Self::open_trusting(dir, Vec::new())
+    }
 
+    /// Opens a replica as [`Store::open`] does, except that it adds the `trusted` contributions without
+    /// reading their objects or checking them again: what makes a cached read fast.
+    ///
+    /// **The caller vouches for every trusted contribution**: that it decoded it from this replica's
+    /// object of the same id, and that it passed every validity rule, in an earlier open of this
+    /// replica. Nothing here re-checks a trusted contribution's signature or rules. Its object must
+    /// still be listed in `objects/` as a regular file (the listing's own file type, so a link, a
+    /// directory or a missing file under its name doesn't count), but its bytes aren't read. So **an
+    /// object overwritten on disk after the caller cached it goes unnoticed, and so does one made
+    /// unreadable**, where [`Store::open`] would refuse the replica.
+    ///
+    /// Every other object is read, decoded and checked exactly as [`Store::open`] checks it, all of
+    /// the protocol's validity rules through [`Graph::insert`]. Contributions go into the graph in the
+    /// order the full open's import uses (parents first, ready ones by id), so the graph is the same
+    /// to the last child list, and a replica that fails gives the same error. `trusted` must be in a causal order
+    /// (each parent before its children), each of this Ground and listed once. Any contribution
+    /// that doesn't fit gives [`StoreError::Untrusted`]: one whose object is gone or isn't a regular
+    /// file, of another Ground, listed twice, or before one of its parents. So does a trusted parent that's missing.
+    /// The caller then opens with [`Store::open`], which reports what's really wrong, if anything.
+    pub fn open_trusting(dir: &Path, trusted: Vec<Contribution>) -> Result<Store, StoreError> {
+        let info = read_info(dir)?;
+        let files = object_files(dir)?;
+        let mut graph = Graph::new(info.ground);
         let mut batch = Vec::new();
-        let objects = dir.join("objects");
-        let shards = match fs::read_dir(&objects) {
-            Ok(shards) => shards.collect::<Vec<_>>(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(io(&objects)(e)),
-        };
-        for shard in shards {
-            let shard = shard.map_err(io(&objects))?.path();
-            if !shard.is_dir() {
-                continue;
+        if trusted.is_empty() {
+            for (path, _) in files {
+                batch.push(read_object(dir, path)?);
             }
-            for entry in fs::read_dir(&shard).map_err(io(&shard))? {
-                let path = entry.map_err(io(&shard))?.path();
-                let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
-                if file_name.starts_with('.') {
-                    continue; // in-flight write from another process
-                }
-                let bytes = fs::read(&path).map_err(io(&path))?;
-                let c = Contribution::decode(&bytes)
-                    .map_err(|e| StoreError::Corrupt { path: path.clone(), reason: e.to_string() })?;
-                if path != object_path(dir, &c.id()) {
-                    return Err(StoreError::Corrupt { path, reason: format!("content hashes to {}", c.id()) });
-                }
-                batch.push(c);
+        } else {
+            // Name every object by the id its file name spells, only in its canonical (lowercase)
+            // spelling, as the full open's check of each path against its content does.
+            let mut on_disk: HashMap<ContributionId, (PathBuf, bool)> = HashMap::new();
+            for (path, regular) in files {
+                let shard = path.parent().and_then(Path::file_name).and_then(|n| n.to_str()).unwrap_or_default();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+                let id =
+                    format!("{shard}{name}").parse::<ContributionId>().ok().filter(|id| object_path(dir, id) == path);
+                let Some(id) = id else {
+                    return Err(StoreError::Corrupt { path, reason: "not named by a contribution id".into() });
+                };
+                on_disk.insert(id, (path, regular));
             }
+            let mut seen: HashSet<ContributionId> = HashSet::new();
+            let mut pool: HashMap<ContributionId, (Contribution, bool)> = HashMap::new();
+            for c in trusted {
+                let id = c.id();
+                let untrusted = |reason: String| StoreError::Untrusted { id, reason };
+                if c.ground() != info.ground {
+                    return Err(untrusted("it belongs to another Ground".into()));
+                }
+                if seen.contains(&id) {
+                    return Err(untrusted("it is listed twice".into()));
+                }
+                match on_disk.remove(&id) {
+                    None => return Err(untrusted("its object isn't in the replica".into())),
+                    Some((_, false)) => return Err(untrusted("its object isn't a regular file".into())),
+                    Some((_, true)) => {}
+                }
+                if let Some(p) = c.parents().iter().find(|p| !seen.contains(p)) {
+                    return Err(untrusted(format!("its parent {p} isn't trusted before it")));
+                }
+                seen.insert(id);
+                pool.insert(id, (c, true));
+            }
+            let mut rest: Vec<(ContributionId, PathBuf)> = on_disk.into_iter().map(|(id, (p, _))| (id, p)).collect();
+            rest.sort();
+            for (_, path) in rest {
+                let c = read_object(dir, path)?;
+                pool.insert(c.id(), (c, false));
+            }
+            // `Graph::import_with`'s walk, Kahn's algorithm with ready ids taken smallest first, over the
+            // trusted and new together: the trusted are added as they are, the new through `insert`.
+            let mut waiting_on: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
+            let mut missing_count: HashMap<ContributionId, usize> = HashMap::new();
+            let mut ready: BTreeSet<ContributionId> = BTreeSet::new();
+            for (id, (c, _)) in &pool {
+                let missing: HashSet<_> = c.parents().iter().collect();
+                for p in &missing {
+                    waiting_on.entry(**p).or_default().push(*id);
+                }
+                if missing.is_empty() {
+                    ready.insert(*id);
+                } else {
+                    missing_count.insert(*id, missing.len());
+                }
+            }
+            while let Some(id) = ready.pop_first() {
+                let (c, is_trusted) = pool.remove(&id).expect("ready ids are pending");
+                if is_trusted {
+                    graph.insert_checked(c);
+                } else if let Err(why) = graph.insert(c) {
+                    return Err(StoreError::Corrupt { path: object_path(dir, &id), reason: why.to_string() });
+                }
+                for child in waiting_on.remove(&id).unwrap_or_default() {
+                    let n = missing_count.get_mut(&child).expect("waiting child has a count");
+                    *n -= 1;
+                    if *n == 0 {
+                        missing_count.remove(&child);
+                        ready.insert(child);
+                    }
+                }
+            }
+            if let Some(id) = pool.keys().min() {
+                return Err(StoreError::Corrupt {
+                    path: object_path(dir, id),
+                    reason: "an ancestor is missing from the replica".into(),
+                });
+            }
+            return Ok(Store { dir: dir.to_owned(), info, graph });
         }
 
-        let mut graph = Graph::new(info.ground);
         let report = graph.import(batch);
         if let Some((id, why)) = report.rejected.first() {
             return Err(StoreError::Corrupt { path: object_path(dir, id), reason: why.to_string() });
@@ -335,6 +415,57 @@ fn merge(into: &mut ImportReport, from: ImportReport) {
     into.already_present += from.already_present;
     into.rejected.extend(from.rejected);
     into.unresolved.extend(from.unresolved);
+}
+
+fn read_info(dir: &Path) -> Result<GroundInfo, StoreError> {
+    let manifest = dir.join("ground.json");
+    let text = match fs::read_to_string(&manifest) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(StoreError::NotAGround(dir.to_owned())),
+        Err(e) => return Err(io(&manifest)(e)),
+    };
+    serde_json::from_str(&text).map_err(|e| StoreError::Corrupt { path: manifest.clone(), reason: e.to_string() })
+}
+
+/// Every object file's path, and whether the listing says it's a regular file (never following a link):
+/// each entry in a directory under `objects/`, but those whose names start with a dot (another
+/// process's write in flight) or aren't UTF-8.
+fn object_files(dir: &Path) -> Result<Vec<(PathBuf, bool)>, StoreError> {
+    let mut out = Vec::new();
+    let objects = dir.join("objects");
+    let shards = match fs::read_dir(&objects) {
+        Ok(shards) => shards.collect::<Vec<_>>(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(io(&objects)(e)),
+    };
+    for shard in shards {
+        let shard = shard.map_err(io(&objects))?.path();
+        if !shard.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&shard).map_err(io(&shard))? {
+            let entry = entry.map_err(io(&shard))?;
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+            if file_name.starts_with('.') {
+                continue; // in-flight write from another process
+            }
+            let regular = entry.file_type().map_err(io(&path))?.is_file();
+            out.push((path, regular));
+        }
+    }
+    Ok(out)
+}
+
+/// Reads and decodes one object, refusing it unless its path is its id's.
+fn read_object(dir: &Path, path: PathBuf) -> Result<Contribution, StoreError> {
+    let bytes = fs::read(&path).map_err(io(&path))?;
+    let c =
+        Contribution::decode(&bytes).map_err(|e| StoreError::Corrupt { path: path.clone(), reason: e.to_string() })?;
+    if path != object_path(dir, &c.id()) {
+        return Err(StoreError::Corrupt { path, reason: format!("content hashes to {}", c.id()) });
+    }
+    Ok(c)
 }
 
 fn object_path(dir: &Path, id: &ContributionId) -> PathBuf {

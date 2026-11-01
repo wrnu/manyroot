@@ -41,6 +41,9 @@
 set -euo pipefail
 # Byte-wise matching, whatever the caller's locale: the path checks below mustn't depend on it.
 export LC_ALL=C
+# Every Ground read here is a full check, never through the verified snapshot (docs/cli.md, The
+# verified snapshot): it re-reads and re-verifies every contribution, as it always has.
+export BRACKEN_FULL_CHECK=1
 
 [ $# -eq 2 ] || { echo "usage: ground-guards <base> <head>" >&2; exit 2; }
 fail() { echo "ground-guards: $*" >&2; exit 1; }

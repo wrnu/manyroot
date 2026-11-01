@@ -170,7 +170,9 @@ for tool in curl jq; do command -v "$tool" >/dev/null || fail "needs $tool"; don
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 # With a team server set up, the gate decides only on a replica that has just pulled from it
 # (network-sync.md section 5): every read below must pull, with no fallback to the local replica.
-bk() { BK_PULL=required BRACKEN_AGENT=${agent:-manager} "$here/bk" "$@"; }
+# Its own Ground reads are full checks, never through the verified snapshot (docs/cli.md, The verified
+# snapshot); only these, never the tests it runs (finding 607273d1d193).
+bk() { BK_PULL=required BRACKEN_FULL_CHECK=1 BRACKEN_AGENT=${agent:-manager} "$here/bk" "$@"; }
 bk heads >/dev/null || fail "can't pull from the team server, so the gate won't decide on a replica that may be behind"
 if [ -f "$main/.bracken-team" ]; then
   echo "team server: every read pulls from $(cat "$(cat "$main/.bracken-team")/url")"
@@ -635,7 +637,7 @@ if [ "${1:-}" = --batch ]; then
   done
   for ((k = 0; k < ${#rest[@]}; k++)); do [ "${rest[k]}" != --as ] || agent=${rest[k + 1]:-}; done
   command -v jq >/dev/null || fail "needs jq"
-  bk() { BK_PULL=required BRACKEN_AGENT=${agent:-manager} "$here/bk" "$@"; }
+  bk() { BK_PULL=required BRACKEN_FULL_CHECK=1 BRACKEN_AGENT=${agent:-manager} "$here/bk" "$@"; }
   read_batch "$batch" || fail "$batch_why"
   # Which members the Ground says merged: a live manager 'merge gate @ <sha>' pass on the claim.
   gated() {

@@ -6,6 +6,10 @@
 .bracken/identities/
 .bracken/objects/**/.tmp-*
 
+# bracken's verified snapshot, a local cache of its own verification (docs/cli.md); cache/ also
+# ignores itself, for every other repository.
+.bracken/cache/
+
 # The pinned team binary (a build artifact)
 .bracken-bin/
 

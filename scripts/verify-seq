@@ -239,7 +239,9 @@ verify() {
 logs=$(mktemp -d)
 pids=()
 interrupted=false
-bk() { BRACKEN_AGENT=manager "$here/bk" "$@"; }
+# Its own Ground reads are full checks, never through the verified snapshot (docs/cli.md, The verified
+# snapshot); only these, never the tests it runs (finding 607273d1d193).
+bk() { BRACKEN_FULL_CHECK=1 BRACKEN_AGENT=manager "$here/bk" "$@"; }
 stop_jobs() {
   local pid
   interrupted=true

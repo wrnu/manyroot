@@ -3,8 +3,8 @@
 //!
 //! The page and its scripts are embedded in the binary. The JSON API is the shapes of
 //! docs/design/visualizer.md section 1, built from the same library calls and field names as the
-//! CLI's `--json` forms. Nothing here writes: the replica is read with `Store::open` (and re-read
-//! when its object count changes), and every endpoint is a GET. Agents' names come from the public
+//! CLI's `--json` forms. Nothing here writes: the replica is read through its verified snapshot, never writing
+//! it (crate::snapshot), and re-read when its object count changes, and every endpoint is a GET. Agents' names come from the public
 //! `agents/` directory only, never from `identities/`, so no private key is ever in this process.
 //!
 //! Ground text is untrusted. It goes out only as JSON string values, with `<`, `>`, `&`, U+2028 and
@@ -543,7 +543,7 @@ impl Viewer {
             if now == last.signature {
                 continue;
             }
-            let next = Store::open(&self.dir).map_err(anyhow::Error::from).and_then(|store| {
+            let next = crate::snapshot::open(&self.dir, crate::snapshot::Refresh::No).and_then(|store| {
                 std::thread::sleep(self.reread_delay);
                 Snapshot::new(store, &self.policy, Some(&last), now)
             });
@@ -562,7 +562,7 @@ impl Viewer {
     fn new(dir: &Path, policy: Policy, runs: Option<Value>) -> Result<Viewer> {
         let dir = dir.to_owned();
         let first = signature(&dir)?;
-        let snapshot = Snapshot::new(Store::open(&dir)?, &policy, None, first)?;
+        let snapshot = Snapshot::new(crate::snapshot::open(&dir, crate::snapshot::Refresh::No)?, &policy, None, first)?;
         let reread_delay = std::env::var("BRACKEN_VIEW_REREAD_DELAY_MS")
             .ok()
             .and_then(|ms| ms.parse().ok())

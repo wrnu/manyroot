@@ -56,6 +56,7 @@ fn the_binary_reads_the_coordination_fixture_unchanged() {
             .current_dir(tmp.path())
             .env("BRACKEN_DIR", &ground)
             .env_remove("BRACKEN_AGENT")
+            .env_remove("BRACKEN_FULL_CHECK")
             .output()
             .expect("bracken runs");
         assert!(out.status.success(), "bracken {args:?}: {}", String::from_utf8_lossy(&out.stderr));
@@ -86,5 +87,12 @@ fn the_binary_reads_the_coordination_fixture_unchanged() {
         assert_eq!(accepted["conflicts"], expected["evaluation"]["conflicts"], "{name}");
     }
     assert_eq!(bracken(&["weave", "check"]).trim(), "no problems");
-    assert_eq!(files(&ground), before, "reading wrote to the Ground");
+    // Reads write nothing to the Ground. They may write their own local cache beside it, the verified
+    // snapshot in cache/ (task ac538d60e8f9, docs/cli.md), which git ignores and nothing replicates.
+    let mut after = files(&ground);
+    let cache: Vec<PathBuf> = after.keys().filter(|p| p.starts_with("cache")).cloned().collect();
+    assert_eq!(cache, [PathBuf::from("cache/.gitignore"), PathBuf::from("cache/snapshot")], "only the snapshot");
+    assert!(String::from_utf8_lossy(&after[&PathBuf::from("cache/.gitignore")]).lines().any(|l| l == "*"));
+    after.retain(|p, _| !p.starts_with("cache"));
+    assert_eq!(after, before, "reading wrote to the Ground");
 }

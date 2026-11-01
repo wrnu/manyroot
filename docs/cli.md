@@ -92,6 +92,35 @@ Untriaged and confirmed ones block the claim. These are `log --open`'s rules, wh
 `findings` looks at the claim itself, current or not, merged or not, as the merge gate does. `--json` gives
 `{"claim", "triager", "triager_name", "findings": [{"id", "triage", "task", "blocks"}], "blocking"}`.
 
+## The verified snapshot
+
+Every read and write opens the replica through `cache/snapshot` in it (`.bracken/cache/snapshot`): the
+contributions this replica's readers have already verified, in one file (owner decision `96e282819607`).
+A read lists `objects/`, adds the snapshot's contributions without reading their objects or checking
+them again, and reads and checks only the objects the snapshot lacks, every validity rule as a full open
+checks them (protocol.md, Validity). A command that writes rewrites the snapshot as it ends, so the
+reads after it find nothing new and write nothing; a read rewrites it only when objects arrived another
+way, such as a git pull. At this repository's size that skips the signature checks and per-file reads
+that are most of a read's cost.
+
+- **The trade.** An object the snapshot holds isn't read again, so if its bytes are overwritten on disk
+  later, or made unreadable, a cached read doesn't notice, where a full check refuses the replica. A
+  deleted object is noticed, since every read lists `objects/`, and so is one replaced by a link, a
+  directory or anything but a regular file. Anyone who can write `cache/` could hide or alter
+  contributions from this replica's readers, but they could already write the replica, keys included.
+- **Falling back.** A snapshot that doesn't fit the replica (damaged, of another Ground, naming an object
+  that's gone or out of causal order) is ignored: the read is a full check, which then rewrites it. A
+  new object that breaks a rule fails the read exactly as a full check does.
+- **Forcing a full check.** `BRACKEN_FULL_CHECK=1` makes every read a full check that neither reads nor
+  writes the snapshot. `scripts/merge`, `scripts/verify-seq` and `scripts/ground-guards` set it.
+  `bracken verify [--json]` re-reads and checks every object once, prints how many, and rewrites the
+  snapshot; it fails, as a full check does, if any object is damaged or overwritten.
+- **On disk.** `cache/` holds a `.gitignore` of `*`, so git never commits it, and nothing is written
+  outside it. The snapshot goes to a temporary file of its own, created fresh (never through a link),
+  then renamed into place. A `cache` that isn't a real directory is never written to. `bracken view`
+  reads through the snapshot but never writes it. The snapshot is never synced: each replica builds its
+  own.
+
 ## The web view
 
 `bracken view [--port N]` serves a read-only web view of the replica on 127.0.0.1, with its JSON API
