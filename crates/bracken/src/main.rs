@@ -21,6 +21,7 @@ mod listing;
 mod remote;
 mod runs;
 mod serve;
+mod snapshot;
 mod terminal;
 mod verify;
 mod view;
@@ -267,6 +268,12 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
+    /// Re-read and check every contribution, as every read does with BRACKEN_FULL_CHECK=1, then rewrite
+    /// the verified snapshot that other reads trust.
+    Verify {
+        #[command(flatten)]
+        out: Output,
+    },
     /// The accepted layer under a validation policy, and its conflicts.
     Accepted {
         #[command(flatten)]
@@ -462,16 +469,36 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Weave(weave::WeaveCommand::Init { purpose, out }) => {
             return weave::init(cli.dir.as_deref(), cli.agent.as_deref(), purpose, out);
         }
-        command => return run_in_store(open_store(cli.dir.as_deref())?, cli.agent.as_deref(), command),
+        Command::Verify { out } => {
+            let s = snapshot::verify(&ground_dir(cli.dir.as_deref())?)?;
+            let n = s.graph().len();
+            let written = !snapshot::full_check();
+            if out.json {
+                print_json(&json!({"contributions": n, "snapshot_written": written}));
+            } else {
+                let note = if written { "; snapshot rewritten" } else { "; BRACKEN_FULL_CHECK is set, so no snapshot" };
+                println!("{n} contributions verified{note}");
+            }
+        }
+        command => {
+            // The view never writes, not even the snapshot.
+            let refresh =
+                if matches!(command, Command::View { .. }) { snapshot::Refresh::No } else { snapshot::Refresh::Yes };
+            let s = snapshot::Refreshing::open(&ground_dir(cli.dir.as_deref())?, refresh)?;
+            return run_in_store(s, cli.agent.as_deref(), command);
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
 
-fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<ExitCode> {
+/// Runs a command on the replica, opened through its verified snapshot (docs/cli.md, The verified snapshot).
+fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Command) -> Result<ExitCode> {
     match command {
-        Command::Init { .. } | Command::Join { .. } => unreachable!("handled before opening a store"),
+        Command::Init { .. } | Command::Join { .. } | Command::Verify { .. } => {
+            unreachable!("handled before opening a store")
+        }
         Command::Weave(command) => return weave::run(&mut s, agent, command),
-        Command::Watch(args) => return watch::run(s, agent, args),
+        Command::Watch(args) => return watch::run(s.into_inner(), agent, args),
         Command::Id(IdCommand::New { name }) => {
             let id = s.create_identity(&name)?;
             println!("{}", id.agent_id());
@@ -924,7 +951,7 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 idle: std::time::Duration::from_secs(idle),
                 max_sessions,
             };
-            let intake = serve::Intake::new(s, policy, first_seen.as_deref())?;
+            let intake = serve::Intake::new(s.into_inner(), policy, first_seen.as_deref())?;
             match tokens {
                 Some(tokens) => serve::serve_http(intake, tokens, port)?,
                 None => serve::serve_stdio(intake)?,
@@ -961,15 +988,16 @@ fn default_name(dir: &Path) -> String {
     project.and_then(|p| p.file_name()).map_or_else(|| "ground".into(), |n| n.to_string_lossy().into_owned())
 }
 
-fn open_store(dir: Option<&Path>) -> Result<Store> {
+/// The replica `--dir` names, else the nearest `.bracken` here or above.
+fn ground_dir(dir: Option<&Path>) -> Result<PathBuf> {
     if let Some(dir) = dir {
-        return Ok(Store::open(dir)?);
+        return Ok(dir.to_owned());
     }
     let cwd = std::env::current_dir()?;
     for ancestor in cwd.ancestors() {
         let candidate = ancestor.join(DIR_NAME);
         if candidate.join("ground.json").is_file() {
-            return Ok(Store::open(&candidate)?);
+            return Ok(candidate);
         }
     }
     bail!("not in a Bracken workspace (no {DIR_NAME} here or in any parent); run `bracken init`")

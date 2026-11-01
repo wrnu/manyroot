@@ -234,7 +234,7 @@ impl Source for Local {
 
 impl Local {
     fn reread(&mut self) -> Result<()> {
-        self.store = Store::open(self.store.dir())?;
+        self.store = crate::snapshot::open(self.store.dir(), crate::snapshot::Refresh::Yes)?;
         if let Some((url, token)) = &self.sync {
             let bounds = wire::Bounds { deadline: Duration::from_secs(30), ..wire::Bounds::default() };
             if let Err(e) = remote::sync_http(&mut self.store, url, token, bounds) {

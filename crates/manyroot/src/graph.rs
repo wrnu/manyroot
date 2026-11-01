@@ -191,7 +191,7 @@ impl Graph {
         Ok(true)
     }
 
-    fn insert_checked(&mut self, c: Contribution) {
+    pub(crate) fn insert_checked(&mut self, c: Contribution) {
         let id = c.id();
         for p in c.parents() {
             self.children.entry(*p).or_default().push(id);

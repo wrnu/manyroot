@@ -204,26 +204,25 @@ fn listed(dir: &Path) -> Result<HashSet<ContributionId>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
         Err(e) => return Err(e).context("reading objects/"),
     };
+    // As `Store::open` lists them: every file in every directory under objects/, but dot-files (another
+    // process's write in flight) and names that aren't UTF-8. Each must be at its id's own path, exactly
+    // (finding 9735ea39163a): two lowercase hex digits, then the rest. So a wrongly sharded copy
+    // (objects/180/a5... beside objects/18/0a5...), an uppercase name (which a case-insensitive file system
+    // would find under the lowercase one) and a shard whose name isn't UTF-8 are refused, as there.
     for shard in shards {
         let shard = shard?.path();
-        let Some(prefix) = shard.file_name().and_then(|n| n.to_str()).map(str::to_owned) else { continue };
         if !shard.is_dir() {
             continue;
         }
+        let prefix = shard.file_name().and_then(|n| n.to_str()).unwrap_or_default().to_owned();
         for entry in fs::read_dir(&shard)? {
-            let name = entry?.file_name();
-            let Some(rest) = name.to_str() else { continue };
+            let path = entry?.path();
+            let Some(rest) = path.file_name().and_then(|n| n.to_str()) else { continue };
             if rest.starts_with('.') {
                 continue; // in-flight write from another process
             }
-            let id: ContributionId =
-                format!("{prefix}{rest}").parse().with_context(|| format!("objects/{prefix}/{rest} isn't an id"))?;
-            // Only the lowercase name is the object's path, as `Store::open` holds: on a case-insensitive
-            // file system the lowercase read would find an uppercase name, so refuse it here.
-            ensure!(
-                id.to_hex() == format!("{prefix}{rest}"),
-                "objects/{prefix}/{rest} isn't its id's path (ids are lowercase hex)"
-            );
+            let id = format!("{prefix}{rest}").parse::<ContributionId>().ok().filter(|id| object_path(dir, id) == path);
+            let Some(id) = id else { bail!("{} isn't an object's path (objects/<2 hex>/<62 hex>)", path.display()) };
             out.insert(id);
         }
     }

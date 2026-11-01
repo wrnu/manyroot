@@ -273,7 +273,8 @@ pub(crate) mod macos_only {
     }
 
     /// A runner killed while its container runs leaves it behind, and the next runner's sweep removes it. The runner
-    /// is this test binary, running the ignored test below, killed with SIGKILL.
+    /// is this test binary, running the ignored test below, killed with SIGKILL. Another test run's sweep at the same
+    /// time may remove it first, which is the same sweep: so it's checked as there only while its runner lives.
     #[test]
     fn a_killed_runners_container_is_swept_by_the_next() {
         if python().is_none() {
@@ -293,15 +294,26 @@ pub(crate) mod macos_only {
             lines.by_ref().map_while(Result::ok).any(|l| l.ends_with("running")),
             "the runner started its container"
         );
-        let _ = runner.kill();
-        let _ = runner.wait();
         let theirs = || {
             let out = docker(&["ps", "-aq", "--filter", &format!("label={LABEL}={pid}")]).expect("docker ps");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        assert_ne!(theirs(), "", "still there once its runner was killed");
-        sweep_now();
-        assert_eq!(theirs(), "", "removed by the sweep");
+        // Seen while its runner is alive, which no sweep removes.
+        assert_ne!(theirs(), "", "there while its runner runs");
+        let _ = runner.kill();
+        let _ = runner.wait();
+        // Once its runner is dead, any process's first container sweeps it: another test run's, at the same time,
+        // may already have, or be part way through removing it, so this one's own removal fails and it is still
+        // listed for a moment (task b7b88eed51c5). So it sweeps until it's gone, for a while on a loaded machine.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            sweep_now();
+            if theirs().is_empty() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "still there a minute after its runner was killed: {}", theirs());
+            std::thread::sleep(Duration::from_secs(1));
+        }
     }
 
     #[test]

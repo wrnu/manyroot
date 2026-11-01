@@ -1325,9 +1325,12 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
         std::fs::create_dir_all(&stubs).unwrap();
         write_executable(
             &stubs.join("cargo"),
-            "#!/bin/sh\necho \"cargo $*\" >>\"$LOG\"\ncase \"$*\" in *\"$FAIL_ON\"*) [ -n \"$FAIL_ON\" ] && exit 3 ;; esac\nexit 0\n",
+            "#!/bin/sh\necho \"cargo $*\" >>\"$LOG\"\n[ -z \"${BRACKEN_FULL_CHECK+x}\" ] || echo 'BRACKEN_FULL_CHECK reached cargo' >>\"$LOG\"\n\
+             case \"$*\" in *\"$FAIL_ON\"*) [ -n \"$FAIL_ON\" ] && exit 3 ;; esac\nexit 0\n",
         );
         let log = tmp.path().join("log");
+        // A caller's BRACKEN_FULL_CHECK never reaches the tests (finding 607273d1d193): the calls below
+        // would hold a line saying so.
         let table_run = |fail_on: &str| {
             let _ = std::fs::remove_file(&log);
             let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
@@ -1335,6 +1338,7 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
                 .env("PATH", path)
                 .env("LOG", &log)
                 .env("FAIL_ON", fail_on)
+                .env("BRACKEN_FULL_CHECK", "1")
                 .output()
                 .unwrap();
             (out, std::fs::read_to_string(&log).unwrap_or_default())
@@ -2559,7 +2563,8 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
         let (tmp, dir) = repo(&[("scripts/verify-seq", &seq)], ".bracken/\n", |dir| {
             write_executable(
                 &dir.join("scripts/bk-evidence"),
-                "#!/bin/sh\necho \"$PWD|$*\" >>\"$LOG\"\necho bk-evidence: recorded pass aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '(exit 0)' >&2\n",
+                "#!/bin/sh\necho \"$PWD|$*\" >>\"$LOG\"\necho bk-evidence: recorded pass aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa '(exit 0)' >&2\n\
+                 [ -z \"${BRACKEN_FULL_CHECK+x}\" ] || echo leaked >\"$LOG.full\"\n",
             );
         });
         let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
@@ -2578,6 +2583,8 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
             }
             let out = c.output().unwrap();
             assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+            // Its own reads are full checks; the run it records isn't one (finding 607273d1d193).
+            assert!(!log.with_extension("full").exists(), "{scripts}: BRACKEN_FULL_CHECK reached the tests");
             let line = std::fs::read_to_string(&log).unwrap();
             let (cwd, got) = line.trim_end().split_once('|').unwrap();
             assert!(cwd.ends_with(&format!("verify-{sha}")), "{scripts}: ran in {cwd}");

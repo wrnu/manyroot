@@ -264,6 +264,41 @@ fn scale_removes_nothing_inside_a_ground() {
     assert_eq!(fs::read(&inside).expect("still there"), before);
 }
 
+/// Finding 9735ea39163a: each listed object must be at its id's own path, as `Store::open` requires.
+#[test]
+fn an_object_at_another_path_than_its_ids_is_refused() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let (dir, snap) = (tmp.path().join("g"), tmp.path().join("snap"));
+    let g = replica(&dir, 50);
+    snapshot::open(&dir, &snap).expect("opens");
+    let id = g.graph.topo_order()[0];
+    let hex = id.to_hex();
+    let bytes = fs::read(dir.join("objects").join(&hex[..2]).join(&hex[2..])).expect("present");
+
+    // A wrongly sharded copy beside the right one: three hex digits of shard, the same 64 in all.
+    let wrong = dir.join("objects").join(&hex[..3]);
+    fs::create_dir(&wrong).expect("made");
+    fs::write(wrong.join(&hex[3..]), &bytes).expect("written");
+    let err = snapshot::open(&dir, &snap).err().expect("refused").to_string();
+    assert!(err.contains("isn't an object's path"), "{err}");
+    assert!(manyroot::Store::open(&dir).is_err(), "Store::open refuses it too");
+    fs::remove_dir_all(&wrong).expect("removed");
+
+    // A shard whose name isn't UTF-8, holding a file named like the rest of an id. Only where the file
+    // system takes such a name: Linux's do, macOS's APFS refuses it ("Illegal byte sequence").
+    #[cfg(unix)]
+    if let odd = dir.join("objects").join(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(b"\xff\xfe"))
+        && fs::create_dir(&odd).is_ok()
+    {
+        fs::write(odd.join(&hex[2..]), &bytes).expect("written");
+        let err = snapshot::open(&dir, &snap).err().expect("refused").to_string();
+        assert!(err.contains("isn't an object's path"), "{err}");
+        assert!(manyroot::Store::open(&dir).is_err(), "Store::open refuses it too");
+        fs::remove_dir_all(&odd).expect("removed");
+    }
+    snapshot::open(&dir, &snap).expect("valid again");
+}
+
 #[test]
 fn an_object_named_in_uppercase_is_refused() {
     let tmp = tempfile::tempdir().expect("a temp dir");
@@ -282,6 +317,6 @@ fn an_object_named_in_uppercase_is_refused() {
     assert_ne!(lower, upper, "the id has a letter in its name");
     fs::write(&upper, c.encode()).expect("written");
     let err = snapshot::open(&dir, &snap).err().expect("refused").to_string();
-    assert!(err.contains("lowercase"), "{err}");
+    assert!(err.contains("isn't an object's path"), "{err}");
     assert!(manyroot::Store::open(&dir).is_err(), "Store::open refuses it too");
 }
