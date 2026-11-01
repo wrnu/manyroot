@@ -21,6 +21,8 @@ hex = "0.4"
 httparse = "1"
 humantime = "2"
 icu_casemap = "2"
+# Pinned exactly: the line merge's results are part of what the format guard pins (task 7cbd0a0ce7d0).
+imara-diff = { version = "=0.2.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"

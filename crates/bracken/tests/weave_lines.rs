@@ -527,6 +527,241 @@ fn proposals_merge_in_order_and_a_conflict_waits_for_a_resolution() {
     assert!(err.contains("is a decision, not a proposal"), "{err}");
 }
 
+/// Task 7cbd0a0ce7d0: two proposals from one base change a text file in lines apart. The second merges
+/// line by line: the merged file version is written with the tree, named in the output, and no
+/// resolution is used. Lines next to each other still conflict, and the listing names where.
+#[test]
+fn a_text_file_changed_on_both_sides_merges_line_by_line() {
+    let w = Weave::new();
+    w.commit("c.txt", b"1\n2\n3\n4\n5\n");
+    let base = w.integrate_on(&w.ground, AS);
+    w.write("c.txt", b"one\n2\n3\n4\n5\n");
+    w.stage();
+    let p1 = w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal");
+    w.write("c.txt", b"1\n2\n3\n4\nfive\n");
+    w.stage();
+    let p2 = w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal");
+    w.write("c.txt", b"1\ntwo\n3\n4\n5\n");
+    w.stage();
+    let p3 = w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal");
+    w.write("c.txt", b"1\n2\nthree\n4\n5\n");
+    w.stage();
+    let p4 = w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal");
+    let merged = b"one\n2\n3\n4\nfive\n";
+
+    // The merge names the path it merged by lines and uses no resolution.
+    let done = w.json(&["weave", "integrate", "--proposals", &p1, &p2, "--as", AS, "--json"]);
+    assert_eq!(done["merged_lines"], json!(["c.txt"]));
+    assert_eq!(done["resolutions"], json!([]));
+    let d = done["decision"].as_str().expect("a decision").to_owned();
+    let diff = w.json(&["weave", "diff", &base, &d, "--json"]);
+    assert_eq!(diff["files"][0]["path"], "c.txt");
+    assert_eq!(diff["files"][0]["after"]["hash"], hash(merged));
+    assert_eq!(w.ok(&["weave", "check"]).trim(), "no problems");
+    let out = w.ok(&["weave", "integrate", "--proposals", &p4, "--as", AS]);
+    assert!(out.contains("merged lines: c.txt\n"), "{out}");
+
+    // #3 changed line 2, touching #1's line 1 and #4's line 3: one region, lines 1 to 3, conflicts.
+    let out = w.run_on(&w.ground, &["weave", "integrate", "--proposals", &p3, "--as", AS, "--json"]);
+    assert!(!out.status.success());
+    let listed: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(listed["conflicts"][0]["path"], "c.txt");
+    assert_eq!(listed["conflicts"][0]["text_conflicts"], json!([[1, 3]]));
+    let text = w.run_on(&w.ground, &["weave", "integrate", "--proposals", &p3, "--as", AS]);
+    let text = String::from_utf8_lossy(&text.stdout);
+    assert!(text.contains("1 conflicting regions, at base lines 1-3"), "{text}");
+}
+
+/// c.txt, lines 1 to 5, and three proposals from one base changing its line 1, line 5 and line 2: in
+/// one integrate, #2's step merges by lines, and #3's conflicts with the version that made, which nothing
+/// holds yet. The base and the proposals.
+fn three_on_c(w: &Weave) -> (String, Vec<String>) {
+    w.commit("c.txt", b"1\n2\n3\n4\n5\n");
+    let base = w.integrate_on(&w.ground, AS);
+    let mut ps = Vec::new();
+    for bytes in ["one\n2\n3\n4\n5\n", "1\n2\n3\n4\nfive\n", "1\ntwo\n3\n4\n5\n"] {
+        w.write("c.txt", bytes.as_bytes());
+        w.stage();
+        ps.push(w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal"));
+    }
+    (base, ps)
+}
+
+/// Three proposals in one integrate: #2's step merges c.txt by lines, and #3's conflicts with the
+/// version that made, which nothing holds yet. The listing reads its lines from the merge, and resolve
+/// settles #3's conflict, not #2's, which the line merge settled.
+#[test]
+fn resolve_and_the_listing_see_a_version_an_earlier_step_merged_by_lines() {
+    let w = Weave::new();
+    let (base, ps) = three_on_c(&w);
+    let sel: Vec<&str> = ["--proposals"].into_iter().chain(ps.iter().map(String::as_str)).collect();
+    let merged = b"one\n2\n3\n4\nfive\n";
+
+    let out = w.run_on(&w.ground, &[&["weave", "integrate"][..], &sel, &["--as", AS, "--json"]].concat());
+    assert!(!out.status.success());
+    let listed: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert_eq!(listed["step"], json!(format!("proposal {}", &ps[2][..12])));
+    assert_eq!(listed["conflicts"][0]["into"]["hash"], hash(merged));
+    assert_eq!(listed["conflicts"][0]["text_conflicts"], json!([[1, 2]]));
+
+    // Taking into keeps the version #2's step merged, which nothing holds yet: the integrate writes it
+    // (finding fa1c271c4db7).
+    let resolve = [&["weave", "resolve", "c.txt"][..], &sel, &["--take", "into", "--dry-run", "--json"]].concat();
+    let dry = w.json(&resolve);
+    assert_eq!(dry["merging"], listed["step"]);
+    assert_eq!(dry["sides"].as_array().expect("sides").iter().filter(|v| v["hash"] == hash(merged)).count(), 1);
+    assert_eq!(dry["result"]["hash"], hash(merged));
+    let r = w.id_of(&[&resolve[..resolve.len() - 2], &["--as", AS, "--json"]].concat(), "resolution");
+    let done = w.json(&[&["weave", "integrate"][..], &sel, &["--as", AS, "--json"]].concat());
+    assert_eq!(done["resolutions"], json!([r]));
+    assert_eq!(done["merged_lines"], json!(["c.txt"]));
+    let diff = w.json(&["weave", "diff", &base, done["decision"].as_str().expect("id"), "--json"]);
+    assert_eq!(diff["files"][0]["after"]["hash"], hash(merged));
+    assert_eq!(w.ok(&["weave", "check"]).trim(), "no problems");
+}
+
+/// Finding f34ae4b848c0: a merge names the paths it merged by lines, by path. Another path holding the
+/// same bytes isn't one of them.
+#[test]
+fn merged_lines_name_paths_not_bytes() {
+    let w = Weave::new();
+    w.commit("c.txt", b"1\n2\n3\n4\n5\n");
+    let base = w.integrate_on(&w.ground, AS);
+    let merged = b"one\n2\n3\n4\nfive\n";
+    w.write("c.txt", b"one\n2\n3\n4\n5\n");
+    w.stage();
+    let p1 = w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal");
+    w.write("c.txt", b"1\n2\n3\n4\nfive\n");
+    w.write("q.txt", merged);
+    w.stage();
+    let p2 = w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal");
+    let done = w.json(&["weave", "integrate", "--proposals", &p1, &p2, "--as", AS, "--json"]);
+    assert_eq!(done["merged_lines"], json!(["c.txt"]));
+    let diff = w.json(&["weave", "diff", &base, done["decision"].as_str().expect("id"), "--json"]);
+    let after: Vec<(&str, &str)> = diff["files"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|f| (f["path"].as_str().expect("path"), f["after"]["hash"].as_str().expect("hash")))
+        .collect();
+    assert_eq!(after, [("c.txt", hash(merged).as_str()), ("q.txt", hash(merged).as_str())]);
+}
+
+/// Task 7cbd0a0ce7d0's second part: `resolve --markers` writes a text conflict out to edit, writing
+/// nothing to the Ground, and `--file` records the edit. The conflict's into side is a version an earlier
+/// step's line merge made, so the markers read it from the merge.
+#[test]
+fn markers_write_a_text_conflict_out_to_edit_and_file_records_it() {
+    let w = Weave::new();
+    let (base, ps) = three_on_c(&w);
+    let sel: Vec<&str> = ["--proposals"].into_iter().chain(ps.iter().map(String::as_str)).collect();
+    fn args<'a>(sel: &[&'a str], rest: &[&'a str]) -> Vec<&'a str> {
+        [&["weave", "resolve", "c.txt"][..], sel, rest].concat()
+    }
+
+    let before = w.contributions();
+    let text = w.ok(&args(&sel, &["--markers", "c.merge"]));
+    let step = format!("proposal {}", &ps[2][..12]);
+    assert!(
+        text.contains(&format!("markers c.merge for c.txt merging {step}: 1 conflicting regions, at base lines 1-2\n")),
+        "{text}"
+    );
+    assert!(text.contains("--file c.merge"), "{text}");
+    let marked = "<<<<<<< into\none\n2\n||||||| base\n1\n2\n=======\n1\ntwo\n>>>>>>> from\n3\n4\nfive\n";
+    assert_eq!(fs::read_to_string(w.repo.join("c.merge")).expect("written"), marked);
+    let json = w.json(&args(&sel, &["--markers", "c2.merge", "--json"]));
+    assert_eq!(
+        (json["path"].as_str(), json["markers"].as_str(), json["merging"].as_str()),
+        (Some("c.txt"), Some("c2.merge"), Some(step.as_str()))
+    );
+    assert_eq!(json["text_conflicts"], json!([[1, 2]]));
+    assert_eq!(json["mode"], "100644");
+    assert_eq!(w.contributions(), before, "markers write nothing to the Ground");
+
+    // Never over a file, never into the Ground, and never with what only a resolution takes.
+    let err = w.fails(&args(&sel, &["--markers", "c.merge"]));
+    assert!(err.contains("--markers c.merge: it already exists, and markers never overwrite a file"), "{err}");
+    assert_eq!(fs::read_to_string(w.repo.join("c.merge")).expect("kept"), marked);
+    let inside = w.ground.join("c.merge");
+    let err = w.fails(&args(&sel, &["--markers", inside.to_str().expect("UTF-8")]));
+    assert!(err.contains("it is inside the Ground"), "{err}");
+    assert!(!inside.exists());
+    // Only where --file takes it back (finding d49f362be57f).
+    let outside = w.tmp.path().join("c.merge");
+    for (to, expected) in [
+        (".git/hooks/pre-commit", "it is inside a .git directory"),
+        (".bracken-x", "it is inside a .bracken root entry"),
+        (outside.to_str().expect("UTF-8"), "it is outside the checkout"),
+        (".env", "looks like a secret"),
+    ] {
+        let err = w.fails(&args(&sel, &["--markers", to]));
+        assert!(err.contains(expected), "{to}: {err}");
+    }
+    assert!(!w.repo.join(".git/hooks/pre-commit").exists() && !outside.exists() && !w.repo.join(".env").exists());
+    for extra in [&["--dry-run"][..], &["--delete"], &["--mode", "executable"], &["--take", "into"]] {
+        let err = w.fails(&args(&sel, &[&["--markers", "c3.merge"][..], extra].concat()));
+        assert!(err.contains("cannot be used with"), "{extra:?}: {err}");
+    }
+    let err = w.fails(&[&["weave", "resolve", "a.txt"][..], &sel, &["--markers", "a.merge"]].concat());
+    assert!(err.contains("stops at conflicts at c.txt, and none at \"a.txt\""), "{err}");
+    assert!(!w.repo.join("c3.merge").exists() && !w.repo.join("a.merge").exists());
+
+    // The edited file settles it.
+    fs::write(w.repo.join("c.merge"), b"one\ntwo\n3\n4\nfive\n").expect("edit");
+    let r = w.id_of(&args(&sel, &["--file", "c.merge", "--as", AS, "--json"]), "resolution");
+    let done = w.json(&[&["weave", "integrate"][..], &sel, &["--as", AS, "--json"]].concat());
+    assert_eq!(done["resolutions"], json!([r]));
+    let diff = w.json(&["weave", "diff", &base, done["decision"].as_str().expect("id"), "--json"]);
+    assert_eq!(diff["files"][0]["after"]["hash"], hash(b"one\ntwo\n3\n4\nfive\n"));
+    assert_eq!(w.ok(&["weave", "check"]).trim(), "no problems");
+}
+
+/// Finding 445429f73583: the markers of an executable file are executable, so --file records the mode
+/// both sides kept.
+#[test]
+fn markers_keep_the_mode_the_sides_merge_to() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Weave::new();
+    w.write("s.sh", b"#!/bin/sh\n1\n2\n3\n");
+    fs::set_permissions(w.repo.join("s.sh"), fs::Permissions::from_mode(0o755)).expect("chmod");
+    w.stage();
+    w.git(&["commit", "-q", "-m", "s.sh"]);
+    let base = w.integrate_on(&w.ground, AS);
+    let mut ps = Vec::new();
+    for bytes in [&b"#!/bin/sh\n1\ntwo\n3\n"[..], b"#!/bin/sh\n1\ndeux\n3\n"] {
+        w.write("s.sh", bytes);
+        w.stage();
+        ps.push(w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal"));
+    }
+    let sel = ["weave", "resolve", "s.sh", "--proposals", &ps[0], &ps[1]];
+    let json = w.json(&[&sel[..], &["--markers", "s.merge", "--json"]].concat());
+    assert_eq!(json["mode"], "100755");
+    let mode = fs::metadata(w.repo.join("s.merge")).expect("written").permissions().mode();
+    assert_eq!(mode & 0o111, 0o111, "{mode:o}");
+    fs::write(w.repo.join("s.merge"), b"#!/bin/sh\n1\nzwei\n3\n").expect("edit");
+    let dry = w.json(&[&sel[..], &["--file", "s.merge", "--dry-run", "--json"]].concat());
+    assert_eq!(dry["result"]["mode"], "100755");
+    let text = w.ok(&[&sel[..], &["--markers", "t.merge"]].concat());
+    assert!(text.contains("it is mode 100755, as the sides' modes merge"), "{text}");
+}
+
+/// A conflict that isn't of text has no markers: here a.txt's line, Latin-1, changed two ways.
+#[test]
+fn markers_refuse_a_conflict_that_isnt_text() {
+    let w = Weave::new();
+    w.commit("a.txt", b"caf\xe9\n");
+    let base = w.integrate_on(&w.ground, AS);
+    let mut ps = Vec::new();
+    for bytes in [&b"caf\xe9 1\n"[..], b"caf\xe9 2\n"] {
+        w.write("a.txt", bytes);
+        w.stage();
+        ps.push(w.id_of(&["weave", "propose", "--index", "--base", &base, "--as", AS, "--json"], "proposal"));
+    }
+    let err = w.fails(&["weave", "resolve", "a.txt", "--proposals", &ps[0], &ps[1], "--markers", "a.merge"]);
+    assert!(err.contains("--markers: the conflict at \"a.txt\" isn't one of text"), "{err}");
+    assert!(!w.repo.join("a.merge").exists());
+}
+
 /// Two lines, main and dev, where dev branched from main's first decision; each then moves.
 fn branched(w: &Weave) -> (String, String) {
     w.integrate_on(&w.ground, AS);
@@ -534,9 +769,10 @@ fn branched(w: &Weave) -> (String, String) {
     w.ok(&["weave", "line", "merge", "main", "--into", "dev", "--as", AS]);
     w.commit("a.txt", b"two\n");
     let m2 = w.integrate_on(&w.ground, AS);
-    // dev makes a.txt executable, without changing its bytes.
+    // dev makes a.txt executable and changes its one line, so the two conflict. A mode change alone
+    // would merge with main's content change (task 7cbd0a0ce7d0).
     use std::os::unix::fs::PermissionsExt;
-    w.write("a.txt", b"one\n");
+    w.write("a.txt", b"uno\n");
     fs::set_permissions(w.repo.join("a.txt"), fs::Permissions::from_mode(0o755)).expect("chmod");
     w.stage();
     w.git(&["commit", "-q", "-m", "exec"]);
@@ -549,7 +785,7 @@ fn line_merge_lists_a_mode_conflict_and_a_resolution_settles_it() {
     let w = Weave::new();
     let (m2, d2) = branched(&w);
 
-    // The content change on main against the mode change on dev is a conflict.
+    // main's content change against dev's content and mode change is a conflict.
     let before = w.contributions();
     let out = w.run_on(&w.ground, &["weave", "line", "merge", "dev", "--into", "main", "--dry-run", "--json"]);
     assert!(!out.status.success());
@@ -597,7 +833,7 @@ fn line_merge_lists_a_mode_conflict_and_a_resolution_settles_it() {
         "--dry-run",
         "--json",
     ]);
-    assert_eq!(adopted["result"], json!({"hash": hash(b"one\n"), "mode": "100755"}));
+    assert_eq!(adopted["result"], json!({"hash": hash(b"uno\n"), "mode": "100755"}));
     let err = w.fails(&["weave", "resolve", "a.txt", "--into", "main", "--from", "dev", "--take", &m2]);
     assert!(err.contains("is a decision, not a resolution"), "{err}");
 

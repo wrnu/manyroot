@@ -4955,6 +4955,11 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
 
     // The first commit, as stage 1 records it.
     write("x.txt", "one\ntwo\nthree\nfour\nfive\n");
+    // Not UTF-8 (a Latin-1 é), so Weave merges it per file, where git merges its lines.
+    let latin1 = |first: &[u8], last: &[u8]| {
+        std::fs::write(dir.join("y.txt"), [first, b"\ntwo\ncaf\xe9\nfour\n", last, b"\n"].concat()).unwrap()
+    };
+    latin1(b"one", b"five");
     let c0 = commit("x");
     origin_main(&c0);
     shadowed(&[&c0], "first");
@@ -4979,11 +4984,18 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
         "{out}"
     );
 
-    // PRs #2 and #3 both change x.txt, in different lines: git merges both, Weave merges #3 and conflicts on
-    // #2, which falls back to the import, noted with the path.
-    branch("f2", &|| write("x.txt", "ONE\ntwo\nthree\nfour\nfive\n"));
+    // PRs #2 and #3 both change x.txt and y.txt, in different lines: git merges both. Weave merges #3, and
+    // on #2 merges x.txt line by line (task 7cbd0a0ce7d0) but not y.txt, which isn't UTF-8 text, so it
+    // conflicts and falls back to the import, noted with the path.
+    branch("f2", &|| {
+        write("x.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+        latin1(b"ONE", b"five");
+    });
     let p2 = proposal("2");
-    branch("f3", &|| write("x.txt", "one\ntwo\nthree\nfour\nFIVE\n"));
+    branch("f3", &|| {
+        write("x.txt", "one\ntwo\nthree\nfour\nFIVE\n");
+        latin1(b"one", b"FIVE");
+    });
     let p3 = proposal("3");
     let m3 = squash("f3", "3");
     // A proposal must be of the PR merged: #2's isn't #3's.
@@ -5152,7 +5164,7 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
             format!("shadow of {m6}: no proposal"),
             format!("shadow of {m5}: no proposal"),
             format!("shadow of {m4}: proposal {p4} mismatched at extra.txt"),
-            format!("shadow of {m2}: proposal {p2} conflicted at x.txt"),
+            format!("shadow of {m2}: proposal {p2} conflicted at y.txt"),
             format!("shadow of {m3}: merged proposal {p3}"),
             format!("shadow of {m1}: merged proposal {p1}"),
             format!("shadow of {c0}"),

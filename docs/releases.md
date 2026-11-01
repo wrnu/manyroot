@@ -67,6 +67,16 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-10-31: Weave merges text files line by line
+
+Task `7cbd0a0ce7d0` (design `68b57f9aed6d`, answers `c8a511445626` and `55e0a67c68a2`). Not a format change: no record, field or validity rule changes, and views never recompute a merge, so every existing Weave Ground opens and means what it did.
+
+- **What changed:** `weave line merge` and `weave integrate` merge a conflicting file line by line when its three versions are text (docs/design/weave.md, *Per-file merge*).
+- **Merges already recorded:** none needs migrating. An integrator's resolution of a conflict's key still comes first, so each recomputes the same tree. A new merge of the same heads may now succeed where one fell back or stopped before.
+- **Bounded:** a file merges line by line only if each side's diff leaves at most 10,000 lines of the base and of the side once their common first and last lines are set aside, and the merge fits one file version. Over either, it stays a per-file conflict, as before (findings `933f535c9476` and `d189e282cdee`, answer `47a1c1088fd6`).
+- **New dependency:** imara-diff 0.2.0, licensed Apache-2.0 only, not MIT OR Apache-2.0 like this repository. It can be distributed with this repository under either of its licences, but anything that ships imara-diff, such as a built `bracken` binary, must carry a copy of the Apache-2.0 licence for it (its section 4; the crate has no NOTICE file). Nothing is published yet, so there is nothing to do now; publishing needs the owner's go anyway. Its dependencies, hashbrown, foldhash and memchr, were already in `Cargo.lock`.
+- **Pinned:** imara-diff, exactly. The format guard's line-merge vectors and its oracle's pinned list of cases where git differs fail on any change to the crate or the algorithm. Updating them is a protocol-class change, never a way to make the tests pass.
+
 ### 2026-10-31: Weave's payload formats are pinned
 
 Task `3be1b325a43e` (Weave build step 8, docs/design/weave.md section 5).

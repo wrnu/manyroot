@@ -659,6 +659,75 @@ base `B` with sides `X` and `Y`:
 - Otherwise it is a **conflict**, including added on both sides with
   different content or mode, and deleted on one side while changed on the
   other.
+  - A resolution with the key `(path, B, {X, Y})` settles it first: see
+    below. Without one, a conflict may still merge line by line.
+  - **Line merge** (task `7cbd0a0ce7d0`, design `68b57f9aed6d`, answers
+    `c8a511445626` and `55e0a67c68a2`). A conflict merges line by line only
+    when all of these hold:
+    - `B`, `X` and `Y` are all present, so an add on both sides and a
+      delete against a change stay conflicts;
+    - none is a symlink;
+    - their modes merge as values do: equal sides are taken, and a side
+      equal to `B` gives way to the other;
+    - each is text: at most 8 MiB, valid UTF-8 and no NUL byte;
+    - each side's diff is within the cap: once the lines `B` and the side
+      share at their start and their end are set aside, at most 10,000
+      lines are left of each (finding `933f535c9476`, answer
+      `47a1c1088fd6`). The histogram diff is quadratic in lines that occur
+      once, so the cap bounds an integrator's wait to seconds. It counts
+      lines, never time, so it is deterministic, and the format guard pins
+      it just under and just over. This repository's largest text file is
+      about 6,500 lines, so every file of ours merges in full; a bigger
+      rewrite stays a conflict, which falls back safely;
+    - the merged bytes fit one file version (16,711,680 bytes; finding
+      `d189e282cdee`), which two 8 MiB sides can exceed.
+  - **How it merges.** A line ends after each `\n`, so a last line without
+    one is a line of its own. Nothing is normalised. Each side is diffed
+    against `B` with imara-diff's histogram algorithm, pinned exactly, its
+    hunks slid as far down as they go. Hunks of the two sides whose `B`
+    ranges overlap or touch, one ending where the other starts, form a
+    region. A region with hunks of one side takes that side, and one with
+    both sides is clean only if both give the same lines. Any region left
+    unclean leaves the whole file a conflict, keyed as above, so the
+    resolution record doesn't change. The merged bytes are a new file
+    version, written with the tree, and the merge names each such path
+    (`merged lines: <path>`, and `merged_lines` in `--json`): the paths a
+    step merged by lines whose version the final tree still holds, by
+    path, never by content (finding `f34ae4b848c0`). A resolution may take
+    such a version, as `--take into` after a line merge does, and it is
+    written with the tree too (finding `fa1c271c4db7`).
+  - **It is Weave's own rule, not git's.** It is deterministic, a function
+    of the three files' bytes only, and the format guard pins its results
+    with golden vectors. It agrees with `git merge-file
+    --diff-algorithm=histogram` in nearly all cases, but not byte for
+    byte. Where repeated lines can be aligned more than one way, imara-diff
+    and git's xdiff may choose differently: on 20,000 generated triples
+    built to repeat lines, 20 of them, about 0.1%. The cases the format
+    guard's oracle finds on its seed are pinned there, so a change to the
+    crate or to git that moves them is reviewed. Under `--mirrors` a
+    difference is a fallback, never a wrong tree.
+  - A resolution comes before the line merge. So every merge recorded
+    before line merging computes the same tree again, and an integrator
+    can overrule a clean textual merge that is wrong in meaning.
+  - The conflict listing names, for a conflict whose versions this replica
+    holds, or an earlier step's line merge made, and that are text, the
+    base lines where they conflict (`text_conflicts` in `--json`).
+  - `resolve <path> <selector> --markers <f>` helps a person settle such a
+    conflict. It writes nothing to the Ground: it writes the new file `<f>`,
+    never over an existing file, and only where `--file` will take it back:
+    inside the checkout's work tree, outside `.git`, every `.bracken*` root
+    entry and the Ground, and past the deny-list (finding `d49f362be57f`).
+    It is executable where the sides' modes merge to executable, so
+    `--file` records that mode (finding `445429f73583`); where they don't
+    merge, `--mode` chooses. It holds the line
+    merge with each conflicting region between diff3-style markers
+    (`<<<<<<< into`, the line's lines, `||||||| base`, the base's,
+    `=======`, the side merged in, `>>>>>>> from`). A section without a
+    final line end gets one before the next marker. The person edits it and
+    records it with `resolve --file <f>`. The markers are an editing aid
+    only, and never enter a tree or a key. A conflict that isn't of text
+    (absent on a side, a symlink, not held, not text, or over the diff
+    cap) is refused.
   - A resolution with the key `(path, B, {X, Y})` settles it, if an
     integrator of the target line, under its current policy, wrote it. If
     there are several, a merge or integrate applies the one with the
@@ -795,10 +864,13 @@ or commit them first. On top of git's view:
   hashes, and what is new to the Ground. It also lists what is excluded and
   what is refused, and writes nothing. `propose` and `resolve` take it too.
 - **`resolve` finds the conflict to settle** by rebuilding the merge step
-  by step. It takes the first conflict at the path that no integrator's
-  resolution settles, applying and passing a step whose conflict there is
-  settled. So with several proposals that conflict at one path in turn,
-  each gets its resolution (finding `90de879d935c`).
+  by step. It takes the first conflict at the path that neither an
+  integrator's resolution nor the line merge settles, applying and passing
+  a step whose conflict there is settled. So with several proposals that
+  conflict at one path in turn, each gets its resolution (finding
+  `90de879d935c`), and the one it settles is the one the listing showed.
+  With none unsettled, it takes the last settled one, so a conflict may
+  get another resolution, or one that overrules a line merge.
 - **`resolve --file <f>`** takes a file from disk, so it has extra
   refusals. `<f>`, after `realpath`, must be inside the current git
   checkout's working tree and outside its `.git/` and every `.bracken*`
@@ -855,7 +927,7 @@ never write outside the target directory, and never follow a symlink
 | `weave checkout [--at D] <dir>` | Materializes a manifest into an empty directory, or updates a directory that is clean against it. If writing fails part way, it removes what it wrote, or names what it couldn't remove. |
 | `weave line create <name> [--dry-run] [--integrator ...] [--validator ...] [--goal-setter ...] [--check NAME=ARGV ...] [--max-known N] [--max-age N] [--protected P ...] --owner-decision <id>`, `weave line policy <line> [--dry-run] [--from <version>] [--name n] [--clear <field>]... ... --owner-decision <id>` | Creates a line (with no integrator or goal setter given, its author is the only one), or writes a new policy version, starting from the current one, that supersedes every current version, so it also settles a diverged chain. On a diverged chain it refuses, listing the current versions, unless `--from` names the one to start from (finding `4eead6290997`). Only the line's author can change a policy. `--owner-decision` is required, as 12 to 64 hex digits. Prints `line <id>`, then `relation <id> (supersedes)` for each relation. `--dry-run` shows the policy, and what it would supersede, and writes nothing. |
 | `weave line merge <from> --into <line> [--base D] [--dry-run] [--note text]` | Integrator: merges `<from>`'s head into `<line>`'s, file by file against the merge base (`--base` only chooses among several). With every conflict resolved by an integrator's resolution, it writes the merged manifest and a decision on `<line>` whose parents are both heads, judged by rules 1-4, so its author must be an integrator of `<line>`. With a conflict unresolved, or with `--dry-run`, it lists the conflicts, with the resolutions offered for each, and writes nothing. It lists the resolutions it used. A line with no decision yet starts from `<from>`'s head, its first decision having that head as its only parent (answer `12000ab70ae5`). |
-| `weave resolve <path> (--into L --from L2 [--base D] \| --proposals P... [--line L]) (--take into\|from\|<resolution> \| --delete \| --file <f>) [--mode m] [--dry-run]` | Writes a resolution for the conflict at `<path>`. It takes the selector of the command that listed the conflict (`line merge`'s `--into`, `--from` and `--base`, or `integrate`'s `--proposals`), rebuilds that merge, and recomputes the key, so nobody types file values. `into` is the line's side, `from` the side merged in, and a resolution id adopts that resolution's result. A conflict may get another resolution even if it has one. `--file` has the refusals above (answer `12000ab70ae5`). |
+| `weave resolve <path> (--into L --from L2 [--base D] \| --proposals P... [--line L]) (--take into\|from\|<resolution> \| --delete \| --file <f> \| --markers <f>) [--mode m] [--dry-run]` | Writes a resolution for the conflict at `<path>`. It takes the selector of the command that listed the conflict (`line merge`'s `--into`, `--from` and `--base`, or `integrate`'s `--proposals`), rebuilds that merge, and recomputes the key, so nobody types file values. `into` is the line's side, `from` the side merged in, and a resolution id adopts that resolution's result. A conflict may get another resolution even if it has one. `--file` has the refusals above (answer `12000ab70ae5`). `--markers <f>` writes no resolution: it writes a text conflict's marked merge to a new file to edit, for `--file`. |
 | `weave verify --git <rev> [--at D \| --manifest H]` | Compares a manifest with a git commit's tree: the same paths, modes and bytes, with the excluded root entries left out. Used throughout the dogfood. |
 | `weave check` | Lists Weave payloads that are invalid or break the ancestor rule, manifests not yet complete, markers past the one that counts, and policy versions ignored for citing no owner decision. It exits non-zero when it lists any. |
 
