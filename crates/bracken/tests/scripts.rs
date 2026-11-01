@@ -5944,14 +5944,12 @@ fn merge_batch_refuses_when_a_findings_read_fails() {
         assert!(b.verify(&[1, 2]).status.success(), "{scripts}");
         let finding = bk(&b.dir, &["claim", "member 2 breaks x", "--tag", "finding", "--as", "val"]);
         bk(&b.dir, &["relate", &finding, "contradicts", &b.claims[1], "--as", "val"]);
-        // bracken, failing `show` of the finding alone, as a pull that drops would.
+        // bracken, failing the `findings` read alone, as a pull that drops would.
         let wrapper = b.tmp.path().join("stubs/failing-bracken");
         write_executable(
             &wrapper,
-            &format!(
-                "#!/usr/bin/env bash\nset -o pipefail\nfor a in \"$@\"; do [ \"$a\" != {finding} ] || {{ echo 'pull dropped' >&2; exit 1; }}; done\n\
-                 \"$REAL_BRACKEN\" \"$@\" | cat\n"
-            ),
+            "#!/usr/bin/env bash\nset -o pipefail\nfor a in \"$@\"; do [ \"$a\" != findings ] || { echo 'pull dropped' >&2; exit 1; }; done\n\
+             \"$REAL_BRACKEN\" \"$@\" | cat\n",
         );
         for (form, args) in
             [("batch", vec!["--batch", &b.batch_claim()[..12]]), ("plain", vec!["2", &b.claims[1][..12]])]
@@ -5961,7 +5959,7 @@ fn merge_batch_refuses_when_a_findings_read_fails() {
             let out = b.command("scripts/merge", &all).env("BRACKEN_BIN", &wrapper).output().unwrap();
             let said = text(&out);
             assert_eq!(out.status.code(), Some(1), "{scripts}: {form}: {said}");
-            assert!(said.contains(&format!("couldn't read finding {finding}")), "{scripts}: {form}: {said}");
+            assert!(said.contains("couldn't read the findings against"), "{scripts}: {form}: {said}");
             assert!(b.merged().is_empty(), "{scripts}: {form}: merged past an unread finding");
         }
     }

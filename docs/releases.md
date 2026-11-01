@@ -59,7 +59,7 @@ If the new binary can't open the Ground, reinstall the previous commit's binary 
 
 **Upgrade after merging task e75a246bf541** (`evidence --details-file`). From that merge, `scripts/bk-evidence` passes the output tail through a file, and it refuses to run, naming this step, until the pinned binary has `--details-file`. Upgrade right after the merge. Until then, wait for the upgrade (it takes minutes) rather than record evidence by hand, which would put the output back on a command line and lose the real exit code.
 
-**Upgrade after merging task dea48fd16754** (`findings <claim>`, the merge gate's findings check as one CLI read). Nothing reads it yet: `scripts/merge` keeps its own copy of the check until the pin has `findings`, and a second PR then switches it (answer `945b6e49fa35`). So upgrade after this merge and before that one; the switch's head runs against the new pin.
+**Upgrade after merging task dea48fd16754** (`findings <claim>`, the merge gate's findings check as one CLI read). Nothing reads it yet: `scripts/merge` keeps its own copy of the check until the pin has `findings`, and a second PR then switches it (answer `945b6e49fa35`). So upgrade after this merge and before that one; the switch's head runs against the new pin. From the switch on, `scripts/merge` refuses to decide its findings check on a pin without `findings` (its read fails), so a rollback of the pin past that merge needs the switch reverted too.
 
 ## Protocol and storage migrations
 
