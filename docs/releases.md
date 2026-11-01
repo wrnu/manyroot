@@ -59,6 +59,8 @@ If the new binary can't open the Ground, reinstall the previous commit's binary 
 
 **Upgrade after merging task e75a246bf541** (`evidence --details-file`). From that merge, `scripts/bk-evidence` passes the output tail through a file, and it refuses to run, naming this step, until the pinned binary has `--details-file`. Upgrade right after the merge. Until then, wait for the upgrade (it takes minutes) rather than record evidence by hand, which would put the output back on a command line and lose the real exit code.
 
+**Upgrade after merging task dea48fd16754** (`findings <claim>`, the merge gate's findings check as one CLI read). Nothing reads it yet: `scripts/merge` keeps its own copy of the check until the pin has `findings`, and a second PR then switches it (answer `945b6e49fa35`). So upgrade after this merge and before that one; the switch's head runs against the new pin.
+
 ## Protocol and storage migrations
 
 Each protocol or storage change adds an entry here: what changed, whether existing Grounds still open, and if not, how to carry them forward. Re-encoding a contribution changes its id, so it has to be signed again, and that needs its author's private key. Without the keys, old contributions stay readable only by a binary that still understands the old format. So a protocol change either keeps reading the old format, or migrates while every key still exists.

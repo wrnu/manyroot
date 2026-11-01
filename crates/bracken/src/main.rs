@@ -250,6 +250,18 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
+    /// The merge gate's findings check for one claim: each finding with a contradicts link to it that still
+    /// counts, and how the triager has dealt with it (untriaged, confirmed, deferred to a task, rejected).
+    /// Untriaged and confirmed ones block the claim. The rules are `log --open`'s, for the claim itself, merged
+    /// or not; scripts/merge reads this (task `dea48fd16754`).
+    Findings {
+        claim: String,
+        /// The identity whose evidence triages findings.
+        #[arg(long, value_name = "NAME", default_value = "manager")]
+        triager: String,
+        #[command(flatten)]
+        out: Output,
+    },
     /// List open conflicts among everything not retracted.
     Conflicts {
         #[command(flatten)]
@@ -718,6 +730,40 @@ fn run_in_store(mut s: Store, agent: Option<&str>, command: Command) -> Result<E
                 if since.is_some() {
                     println!("cursor: {}", listing::cursor(g));
                 }
+            }
+        }
+        Command::Findings { claim, triager, out } => {
+            let names = Names::load(&s)?;
+            let triager_key = names.resolve(&triager).with_context(|| format!("who triages? no identity {triager}"))?;
+            let g = s.graph();
+            let claim = resolve(&s, &claim)?;
+            let view = CurrentView::new(g, &g.topo_order());
+            let found = findings_against(g, &view, triager_key, &claim);
+            let blocking = found.iter().filter(|(_, t)| t.blocks()).count();
+            if out.json {
+                let findings: Vec<Value> = found
+                    .iter()
+                    .map(|(f, t)| {
+                        let task = if let Triage::Deferred(task) = t { Some(*task) } else { None };
+                        json!({"id": f, "triage": t.name(), "task": task, "blocks": t.blocks()})
+                    })
+                    .collect();
+                print_json(&json!({
+                    "claim": claim,
+                    "triager": triager_key,
+                    "triager_name": names.0.get(&triager_key),
+                    "findings": findings,
+                    "blocking": blocking,
+                }));
+            } else {
+                let prefixes = listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS);
+                for (f, t) in &found {
+                    let task =
+                        if let Triage::Deferred(task) = t { format!(" -> {}", prefixes[task]) } else { String::new() };
+                    let mark = if t.blocks() { "blocks" } else { "ok" };
+                    println!("{} {mark} {}{task}", prefixes[f], t.name());
+                }
+                println!("{} against {}, {blocking} blocking", found.len(), prefixes[&claim]);
             }
         }
         Command::Show { id, policy, out } => {
@@ -1719,44 +1765,123 @@ fn merged(g: &Graph, triager: AgentId, id: &ContributionId) -> bool {
     })
 }
 
-/// A finding `log --open` lists, whatever its kind or tags: one `scripts/merge`'s findings check (section
-/// 3) would block a current head on, under the same rules, which this mirrors; change both together (findings `090f4645800f`,
-/// `7c38339206c5`). Not retracted; with a contradicts relation from it to a contribution `view` shows that
-/// still counts: live, or retracted by someone other than the finding's author and `triager` (a retract
-/// is always its relation's author's); untriaged (no live evidence of `triager`'s on it) or confirmed (a
-/// live pass of theirs, which a fail beside it doesn't undo) and not deferred (no live depends_on of
-/// theirs from a task of theirs that `view` shows, tagged `deferred`). Others' evidence doesn't triage.
-fn open_finding(g: &Graph, view: &CurrentView, triager: AgentId, c: &Contribution) -> bool {
-    if g.is_retracted(&c.id()) {
-        return false;
+/// How the triager has dealt with a finding (process 4.2). Only the triager's live evidence triages: none
+/// leaves it untriaged; a pass confirms it, whatever else they or anyone gave; anything else rejects it. A
+/// confirmed finding is deferred by a live depends_on of the triager's to it, from a task of theirs that
+/// `view` shows, tagged `deferred` (the first such, in referrer order). Anyone else's evidence or deferral
+/// counts for nothing. This and [`link_counts`] are the one definition of the merge gate's findings check:
+/// `log --open` and `findings` both read them, and scripts/merge reads `findings`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Triage {
+    Untriaged,
+    Confirmed,
+    Deferred(ContributionId),
+    Rejected,
+}
+
+impl Triage {
+    /// Whether it blocks a head: untriaged, or confirmed and not deferred.
+    fn blocks(self) -> bool {
+        matches!(self, Triage::Untriaged | Triage::Confirmed)
     }
-    let (mut against_current, mut triaged, mut confirmed, mut deferred) = (false, false, false, false);
-    for r in g.referrers(&c.id()) {
-        let live = !g.is_retracted(&r.id());
+
+    fn name(self) -> &'static str {
+        match self {
+            Triage::Untriaged => "untriaged",
+            Triage::Confirmed => "confirmed",
+            Triage::Deferred(_) => "deferred",
+            Triage::Rejected => "rejected",
+        }
+    }
+}
+
+fn triage(g: &Graph, view: &CurrentView, triager: AgentId, finding: &ContributionId) -> Triage {
+    let (mut triaged, mut confirmed, mut deferred) = (false, false, None);
+    for r in g.referrers(finding) {
+        if g.is_retracted(&r.id()) || r.author() != triager {
+            continue;
+        }
         match r.body() {
-            Body::Relation { from, kind: RelationKind::Contradicts, to, .. } if *from == c.id() => {
-                let counts = live || (r.author() != c.author() && r.author() != triager);
-                against_current |=
-                    counts && g.get(to).is_some() && !view.hidden.contains(to) && !merged(g, triager, to);
-            }
-            Body::Evidence { target, verdict, .. } if *target == c.id() && live && r.author() == triager => {
+            Body::Evidence { target, verdict, .. } if target == finding => {
                 triaged = true;
                 confirmed |= *verdict == Verdict::Pass;
             }
-            Body::Relation { from, kind: RelationKind::DependsOn, to, .. }
-                if *to == c.id() && live && r.author() == triager =>
-            {
-                deferred |= g.get(from).is_some_and(|t| {
+            Body::Relation { from, kind: RelationKind::DependsOn, to, .. } if to == finding && deferred.is_none() => {
+                let defers = g.get(from).is_some_and(|t| {
                     t.author() == triager
                         && !view.hidden.contains(from)
                         && matches!(t.body(), Body::Claim { tags, .. } if tags.iter().any(|x| x == "task")
                             && tags.iter().any(|x| x == "deferred"))
                 });
+                if defers {
+                    deferred = Some(*from);
+                }
             }
             _ => {}
         }
     }
-    against_current && (!triaged || (confirmed && !deferred))
+    match (triaged, confirmed, deferred) {
+        (false, ..) => Triage::Untriaged,
+        (true, true, Some(task)) => Triage::Deferred(task),
+        (true, true, None) => Triage::Confirmed,
+        (true, false, _) => Triage::Rejected,
+    }
+}
+
+/// Whether a contradicts relation from `finding` still counts: live, or retracted by someone other than the
+/// finding's author and `triager` (a retract is always its relation's author's), so no one else can drop a
+/// finding by retracting their own link to it (finding `7c38339206c5`).
+fn link_counts(g: &Graph, triager: AgentId, finding: &Contribution, link: &Contribution) -> bool {
+    !g.is_retracted(&link.id()) || (link.author() != finding.author() && link.author() != triager)
+}
+
+/// A finding `log --open` lists, whatever its kind or tags (finding `8c90edd63f5c`): one the merge gate would
+/// block a current head on. Not retracted; with a contradicts relation from it that [`link_counts`], to a
+/// contribution `view` shows and the triager hasn't merged; and blocking by its [`triage`].
+fn open_finding(g: &Graph, view: &CurrentView, triager: AgentId, c: &Contribution) -> bool {
+    if g.is_retracted(&c.id()) {
+        return false;
+    }
+    let against_current = g.referrers(&c.id()).any(|r| {
+        matches!(r.body(), Body::Relation { from, kind: RelationKind::Contradicts, to, .. }
+            if *from == c.id() && g.get(to).is_some() && !view.hidden.contains(to) && !merged(g, triager, to))
+            && link_counts(g, triager, c, r)
+    });
+    against_current && triage(g, view, triager, &c.id()).blocks()
+}
+
+/// The merge gate's findings check for one claim (scripts/merge, section 3): every contribution with a
+/// contradicts relation to it, in id order, that isn't retracted and has a link that [`link_counts`], with its
+/// [`triage`]. Unlike `log --open`, it looks at the claim itself, current or not, merged or not.
+fn findings_against(
+    g: &Graph,
+    view: &CurrentView,
+    triager: AgentId,
+    claim: &ContributionId,
+) -> Vec<(ContributionId, Triage)> {
+    let links: Vec<&Contribution> = g
+        .referrers(claim)
+        .filter(|r| matches!(r.body(), Body::Relation { kind: RelationKind::Contradicts, to, .. } if to == claim))
+        .collect();
+    let mut from: Vec<ContributionId> = links
+        .iter()
+        .filter_map(|r| match r.body() {
+            Body::Relation { from, .. } => Some(*from),
+            _ => None,
+        })
+        .collect();
+    from.sort();
+    from.dedup();
+    from.into_iter()
+        .filter(|f| !g.is_retracted(f))
+        .filter(|f| {
+            let finding = g.get(f).expect("a relation's ends exist");
+            links.iter().any(|r| {
+                matches!(r.body(), Body::Relation { from, .. } if from == f) && link_counts(g, triager, finding, r)
+            })
+        })
+        .map(|f| (f, triage(g, view, triager, &f)))
+        .collect()
 }
 
 /// What `log --current` shows.

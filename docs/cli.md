@@ -78,8 +78,19 @@ bracken status --full                # per claim: what implements it, with passe
 bracken status --all                 # plus the claims nothing implements yet
 bracken intend $REQ --for 30m        # "I'm on this": shown in status and show until it ends
 bracken conflicts                    # divergences and contradictions
+bracken findings $PR --json          # the merge gate's findings check for one claim: each finding linked to it,
+                                     # untriaged, confirmed, deferred (with the task) or rejected, and which block
 bracken show $REQ --json             # every read command supports --json
 ```
+
+`findings <claim> [--triager NAME]` (manager by default) lists every contribution with a `contradicts`
+relation to the claim that isn't retracted and has a link that still counts: live, or retracted by
+someone other than the finding's author and the triager. Each gets its triage, from the triager's live
+evidence only: `untriaged` (none), `confirmed` (a pass, whatever else), `deferred` (confirmed, with a live
+`depends_on` of the triager's from a current task of theirs tagged `deferred`), or `rejected` (no pass).
+Untriaged and confirmed ones block the claim. These are `log --open`'s rules, which share the code, but
+`findings` looks at the claim itself, current or not, merged or not, as the merge gate does. `--json` gives
+`{"claim", "triager", "triager_name", "findings": [{"id", "triage", "task", "blocks"}], "blocking"}`.
 
 ## The web view
 
