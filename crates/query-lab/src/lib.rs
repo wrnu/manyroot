@@ -12,6 +12,7 @@ pub mod ground;
 pub mod output;
 pub mod pipeline;
 pub mod profile;
+pub mod snapshot;
 
 use std::path::Path;
 
