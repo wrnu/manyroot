@@ -2577,7 +2577,9 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
         ] {
             let _ = std::fs::remove_file(&log);
             let mut c = command(&dir.join("scripts"), "./verify-seq", &[&format!("abc123:{sha}")]);
-            c.env("LOG", &log).env("TMPDIR", &scratch).env_remove("ON");
+            // Whatever this test's own environment holds (finding 6524b6f14aa3): the stub below says
+            // whether verify-seq handed the full check on, not whether the caller had it.
+            c.env("LOG", &log).env("TMPDIR", &scratch).env_remove("ON").env_remove("BRACKEN_FULL_CHECK");
             if let Some(on) = on {
                 c.env("ON", on);
             }
