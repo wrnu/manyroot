@@ -83,16 +83,17 @@ Rust build artifacts were filling the disk: about 10 GB per worktree's `target/`
   - The manager's counted runs never read the cache. `scripts/test-table` sets `SCCACHE_RECACHE=1`, so every compile of the Mac half of `--split`, and of a local table, runs afresh and refreshes its entry. A merge never rests on cache entries a branch's build wrote.
 
 **What sccache sees.** sccache's client sends its environment to a long-lived server, which runs the compiler with it. So the wrapper gives sccache only what a compile needs:
-- cargo's and rustc's variables, all of them (`CARGO*`, `RUST*`, `CLIPPY*`, `DEP_*`), even with `AUTH` or `TOKEN` in a name, as in `CARGO_PKG_AUTHORS` (finding `58223509a78e`), but not a registry credential (`CARGO_REGISTRY*`, `CARGO_REGISTRIES*`);
+- the names cargo sets for a compile (`CARGO_PKG_*`, `CARGO_BIN_EXE_*`, `CARGO_MANIFEST_*`, `CARGO_CRATE_NAME`, `CARGO_PRIMARY_PACKAGE`, `CARGO_CFG_*`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_MAKEFLAGS`, `DEP_*` and a few more, listed in the wrapper), even with `AUTH` or `TOKEN` in a name, as in `CARGO_PKG_AUTHORS` (finding `58223509a78e`);
+- `RUSTC*`, `RUST_*` and `CLIPPY_*`, unless the name looks like a secret;
 - `OUT_DIR` and the build-script variables;
 - `PATH`, `HOME`, `TMPDIR`, the locale, and the C toolchain's variables;
 - and `SCCACHE_*`.
 
-It never passes a name containing `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL` or `AUTH`, or ending in `_KEY`, and never one it doesn't list. It prints nothing and logs nothing: it drops `SCCACHE_LOG` and `SCCACHE_ERROR_LOG` too.
+Apart from the names cargo sets for a compile, it never passes a name containing `TOKEN`, `SECRET`, `PASSWORD`, `CREDENTIAL` or `AUTH`, or ending in `_KEY`, so a user's `CARGO_FORGE_TOKEN` or a registry token stays out (finding `289f76c488af`), and never one it doesn't list. It prints nothing and logs nothing: it drops `SCCACHE_LOG` and `SCCACHE_ERROR_LOG` too.
 
 If a dependency's build script sets a variable for its crate's compile (`cargo:rustc-env=NAME=…`), that variable must be in the wrapper's `KEEP` list. Otherwise the crate fails to compile with "environment variable not defined". None of today's dependencies built on macOS or Linux sets one.
 
-If the server can't be reached, as in a sandbox that blocks its socket, the compile runs without the cache (`SCCACHE_IGNORE_SERVER_IO_ERROR=1`).
+If sccache can't reach or start its server, as in a sandbox that denies its socket, sccache prints its error (`sccache: error: …`) and exits 2 before the compiler runs. The wrapper then runs the compiler itself, so the build goes on without the cache (finding `20a5ceea1005`). An error while reading the server's answer is ignored the same way (`SCCACHE_IGNORE_SERVER_IO_ERROR=1`). rustc never exits 2, so no failed compile is run twice.
 
 **When the server crashes.** A server that dies mid-build, killed (`kill -9`) or out of memory, fails the build in progress, though sccache says it's compiling locally instead (finding `5c32bca03ce6`). The reviewer saw `failed to build archive … memory map must have a non-zero length`, twice in two tries. The compile the dead server had started and sccache's local retry seem to collide on the same output. Rerun the same build: it succeeds, with a new server. A build failing just after such a crash, a counted run's included, is that, not a fault in the change. So stop the server with `--stop-server` (below), which no build notices, and never kill it.
 

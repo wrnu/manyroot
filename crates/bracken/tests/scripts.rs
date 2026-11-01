@@ -6723,6 +6723,9 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
             .env("CARGO_BIN_EXE_a-b", "/bin/a-b")
             .env("CARGO_PKG_AUTHORS", "Ann")
             .env("CARGO_BIN_EXE_tokenizer", "/bin/tokenizer")
+            .env("CARGO_FORGE_TOKEN", "s4")
+            .env("RUST_API_KEY", "s5")
+            .env("RUSTC_BOOTSTRAP", "1")
             .env("SCCACHE_SERVER_PORT", "4226")
             .env("SCCACHE_RECACHE", "1")
             .env("OUT_DIR", "/out")
@@ -6761,6 +6764,7 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
         "CARGO_BIN_EXE_tokenizer=/bin/tokenizer",
         // A counted run's, from test-table.
         "SCCACHE_RECACHE=1",
+        "RUSTC_BOOTSTRAP=1",
         // The server on a unix socket in a 0700 directory of this user's, never a port (finding 292898be0ce0).
         &socket,
         "OUT_DIR=/out",
@@ -6777,6 +6781,9 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
         "SCCACHE_LOG",
         "SCCACHE_SERVER_PORT",
         "UNLISTED",
+        // Not cargo's own, though they start like them (finding 289f76c488af).
+        "CARGO_FORGE_TOKEN",
+        "RUST_API_KEY",
     ] {
         assert!(!s.contains(gone), "{bash:?}: {gone}: {s}");
     }
@@ -6786,4 +6793,28 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
     let s = compile(&with, "clippy-driver", &[]);
     assert!(s.starts_with("clippy-driver --crate-name x\n"), "{s}");
     assert!(has(&s, "ANTHROPIC_AUTH_TOKEN=s1"), "{s}");
+
+    // sccache failing to reach or start its server exits 2 before the compiler runs: the wrapper runs the
+    // compiler itself (finding 20a5ceea1005). Any other exit, the compile's own, is passed on as it is.
+    let failing = stubs.parent().unwrap().join("failing");
+    std::fs::create_dir_all(&failing).unwrap();
+    for (code, ran) in [(2, "rustc"), (1, "sccache"), (101, "sccache")] {
+        write_executable(
+            &failing.join("sccache"),
+            &format!("#!/bin/bash\necho sccache \"$@\" >\"{}\"\nexit {code}\n", seen.display()),
+        );
+        let mut command = Command::new(bash);
+        command
+            .arg(wrapper)
+            .arg(bin.join("rustc"))
+            .args(["--crate-name", "x"])
+            .env_clear()
+            .env("PATH", format!("{}:{base}", failing.display()))
+            .env("HOME", home);
+        let out = command.output().unwrap();
+        let s = std::fs::read_to_string(seen).unwrap();
+        assert!(s.starts_with(&format!("{ran} ")), "{bash:?}: sccache exit {code}: {s}");
+        let want = if code == 2 { 0 } else { code };
+        assert_eq!(out.status.code(), Some(want), "{bash:?}: sccache exit {code}");
+    }
 }
