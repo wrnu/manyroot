@@ -1802,6 +1802,9 @@ fn test_table_remote_p_runs_only_the_named_packages_tests() {
         let script = inner();
         assert!(script.ends_with("\ncargo test --locked -p bracken -p bracken-tree"), "{scripts}: {script}");
         assert!(script.contains("git checkout -q tested"), "{scripts}: the same setup: {script}");
+        // Every crate the host's graph needs, before any test (task 53efd11c6e4a).
+        let fetch = "setup cargo fetch --locked --target \"$(rustc -vV | sed -n \"s/^host: //p\")\"";
+        assert!(script.lines().any(|l| l == fetch), "{scripts}: the box doesn't fetch first: {script}");
         assert!(!script.contains("scripts/test-table"), "{scripts}: the box ran the table: {script}");
         assert!(stdout.contains("cargo test --locked -p bracken -p bracken-tree passed at "), "{scripts}: {stdout}");
         assert!(stdout.contains("in a box; not the whole table"), "{scripts}: {stdout}");
@@ -2947,6 +2950,7 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         let inner = read("args");
         for line in [
             "setup $sudo apt-get install -y -qq git b3sum curl jq",
+            "setup cargo fetch --locked --target \"$(rustc -vV | sed -n \"s/^host: //p\")\"",
             "cargo build --locked -q -p bracken --bin bracken",
             "BRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table --light -p demo -p agent",
             "scripts/test-table --lists -p demo -p agent",

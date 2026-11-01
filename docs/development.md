@@ -240,6 +240,7 @@ A box is Ubuntu 24.04 (x86_64) with Rust 1.97 (cargo, clippy, rustfmt), cc, git 
 | The table's tests | cargo-nextest 0.9.150 (decision `4bf44934cb67` (4)) | Its pinned `x86_64-unknown-linux-gnu` release tarball, downloaded with `curl` and checked against the sha256 in `scripts/test-table` before it's unpacked; a mismatch stops the box |
 | The Ground guards | a `bracken` binary | `BRACKEN_BIN="$PWD/target/debug/bracken"`, built by the table's tests |
 | The table's Linux-target clippy | the `x86_64-unknown-linux-gnu` target | Native in the box |
+| bracken-scope's tests (`cargo metadata --offline` of a whole commit) | every crate the host's package graph needs, dev-dependencies of packages a `-p` list leaves out included | `cargo fetch --locked --target <host>`, after the checkout (task `53efd11c6e4a`) |
 
 `--remote` installs the PPA's git, `b3sum` and the pinned cargo-nextest in every box, quietly unless that fails: then it prints the failing command, its exit and its output, and stops; anything a future test needs goes in its inner script too, and in this table. On Linux, the experiment's sandboxed tests are skipped with a printed reason (`needs macOS sandbox-exec`): `sandbox-exec` exists only on macOS, and they still run there. The workspace builds dependencies at `opt-level = 2` even in debug (`Cargo.toml`), which made the demo's adversary tests three times faster; without it they alone took 13 minutes in a box.
 
