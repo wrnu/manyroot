@@ -371,17 +371,15 @@ mod macos_only {
     use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, run};
     use bracken_experiment::mock::MockBackend;
     use bracken_experiment::plan::{PlanInputs, ProjectPlan};
-    use bracken_experiment::python::Python;
 
     fn events(path: &Path) -> Vec<Value> {
         let text = std::fs::read_to_string(path).expect("the event log");
         text.lines().map(|l| serde_json::from_str(l).expect("a JSON line")).collect()
     }
 
-    fn pin() -> bracken_experiment::python::PythonPin {
-        let path = std::env::var_os("BRACKEN_TEST_PYTHON").unwrap_or_else(|| "/opt/homebrew/bin/python3.12".into());
-        assert!(Path::new(&path).exists(), "this test needs Python 3.12 at {path:?} (or set BRACKEN_TEST_PYTHON)");
-        Python::pin(Path::new(&path), "3.12", None).expect("pinned").plan_pin()
+    /// The image these tests pin, as `python::tests` does; None, having said why, where they can't run.
+    fn pin() -> Option<bracken_experiment::python::PythonPin> {
+        bracken_experiment::python::for_tests().map(|p| p.plan_pin())
     }
 
     /// Agents playing at once, not in lockstep: every agent integrates its first turn before it syncs, so the
@@ -390,6 +388,7 @@ mod macos_only {
     /// head's work. The mock writes only new files, so a parent's file missing from a merge is lost work.
     #[test]
     fn concurrent_agents_fork_the_line_and_every_merge_keeps_both_heads() {
+        let Some(pin) = pin() else { return };
         let project = ProjectPlan::of(&Project::load(&tiny()).expect("the fixture")).expect("its plan");
         let dir = tempfile::tempdir().expect("a temp dir");
         let cfg = RunConfig {
@@ -405,7 +404,7 @@ mod macos_only {
             turn_limit: TURN_LIMIT,
             plan: PlanInputs {
                 project: Some(project),
-                python: Some(pin()),
+                python: Some(pin),
                 integrator: Some(ANY_AGENT.into()),
                 ..PlanInputs::default()
             },
@@ -488,9 +487,7 @@ mod macos_only {
     /// public tests run on each agent's tree through the driver, and every agent's module reaches the line.
     #[test]
     fn a_weave_mock_run_goes_end_to_end_sandboxed() {
-        let path = std::env::var_os("BRACKEN_TEST_PYTHON").unwrap_or_else(|| "/opt/homebrew/bin/python3.12".into());
-        assert!(Path::new(&path).exists(), "this test needs Python 3.12 at {path:?} (or set BRACKEN_TEST_PYTHON)");
-        let pin = Python::pin(Path::new(&path), "3.12", None).expect("pinned").plan_pin();
+        let Some(pin) = pin() else { return };
         let project = ProjectPlan::of(&Project::load(&tiny()).expect("the fixture")).expect("its plan");
         let dir = tempfile::tempdir().expect("a temp dir");
         let cfg = RunConfig {
@@ -552,7 +549,7 @@ mod macos_only {
         let plan: Value =
             serde_json::from_slice(&std::fs::read(cfg.root.join("plan.json")).expect("the plan")).expect("JSON");
         assert_eq!(plan["inputs"]["project"]["name"], "tiny");
-        assert!(plan["inputs"]["python"]["digest"].is_string(), "{plan}");
+        assert!(plan["inputs"]["python"]["image"].as_str().is_some_and(|i| i.contains("@sha256:")), "{plan}");
         assert_eq!(plan["inputs"]["integrator"], ANY_AGENT);
         assert_eq!(plan["change_after"], 3);
         let text = serde_json::to_string(&plan).expect("JSON").to_lowercase();

@@ -1,12 +1,12 @@
 //! The grader for evaluation projects (`docs/design/eval-suite.md`, Grading): runs a project's hidden tests on a
 //! tree and counts their outcomes per item, without the tests or the code under test ever meeting.
 //!
-//! Each group's test file runs in its own **host**: the pinned interpreter under the Python profile, with a
-//! scratch directory holding the hidden set's `tests/` as read and digested, and nothing of the code under test.
-//! The host never imports or runs that code. Importing the package gives a proxy, and each use of it comes here
-//! as a line, which goes on to the **server**: the interpreter under the same profile, in another scratch
-//! directory, with the tree. A `python -m <package>` a test starts comes here too, and runs in a fresh child with
-//! the tree and the test's working files. So agent code runs only in the profile, with no way to the hidden
+//! Each group's test file runs in its own **host**: a container of the pinned image under the Python profile,
+//! with a scratch directory holding the hidden set's `tests/` as read and digested, and nothing of the code under
+//! test. The host never imports or runs that code. Importing the package gives a proxy, and each use of it comes
+//! here as a line, which goes on to the **server**: another container under the same profile, with the tree. A
+//! `python -m <package>` a test starts comes here too, and runs in a fresh container with the tree and the test's
+//! working files, which come back once it has ended. So agent code runs only in the profile, with no way to the hidden
 //! tests (note 9891289fb39c), and its values come back as data the host compares, or as handles that equal
 //! only themselves.
 //!
@@ -230,15 +230,24 @@ fn run_group(
     std::fs::create_dir(&home).map_err(|e| format!("making the host's directory: {e}"))?;
     let host_limits = longer(&project.limits, HOST_MEMORY_MB, HOST_OUTPUT);
     let args = [
-        host.into_os_string(),
-        tests.into_os_string(),
+        scratch.inside(&host),
+        scratch.inside(&tests),
         file.into(),
         project.package.clone().into(),
-        home.into_os_string(),
+        scratch.inside(&home),
     ];
     let mut running = python.start(&scratch, &args, &host_limits)?;
-    let deadline = Instant::now() + Duration::from_secs(host_limits.wall_seconds.into());
-    let mut server = Server { python, project, set, tree, running: None, generation: 0 };
+    let mut deadline = running.started() + Duration::from_secs(host_limits.wall_seconds.into());
+    let mut server = Server {
+        python,
+        project,
+        set,
+        tree,
+        running: None,
+        generation: 0,
+        starting: Duration::ZERO,
+        counted: Duration::ZERO,
+    };
     // What the host has said as it went (finding e7d128464936): the number of tests, each test's start (its index),
     // each outcome, each test's end.
     let (mut total, mut done, mut so_far, mut counts) = (0u32, 0u32, Counts::default(), None);
@@ -246,19 +255,26 @@ fn run_group(
     // outside any test, such as a class fixture's error (finding bcecc7c3f6e3).
     let (mut outcomes, mut current, mut outside) = (Vec::<Option<Outcome>>::new(), None::<usize>, None::<Outcome>);
     while let Some(line) = running.next(deadline) {
+        // The host's wall time stands still while it waits on another container, and doesn't count the time that
+        // container took to start: a second or more on a loaded machine, and not the host's.
+        let waiting = Instant::now();
+        running.pause();
         let reply = match line.split_once(' ') {
             Some(("S", request)) => server.ask(request, deadline)?,
-            Some(("C", request)) => command(python, project, set, tree, request)?,
+            Some(("C", request)) => command(python, project, set, tree, request, &mut server.counted)?,
             Some(("N", n)) => {
+                running.resume(Duration::ZERO);
                 total = n.parse::<u32>().unwrap_or(0).min(MAX_TESTS);
                 outcomes = vec![None; total as usize];
                 continue;
             }
             Some(("B", i)) => {
+                running.resume(Duration::ZERO);
                 current = i.parse::<usize>().ok().filter(|i| *i < outcomes.len());
                 continue;
             }
             Some(("O", kind)) => {
+                running.resume(Duration::ZERO);
                 so_far.add_one(kind);
                 let o = Some(Outcome::named(kind));
                 match current {
@@ -268,6 +284,7 @@ fn run_group(
                 continue;
             }
             Some(("D", _)) => {
+                running.resume(Duration::ZERO);
                 done += 1;
                 // A test that said nothing, which unittest doesn't do, counts as an error.
                 if let Some(i) = current.take() {
@@ -281,6 +298,9 @@ fn run_group(
             }
             _ => break,
         };
+        let lost = waiting.elapsed().saturating_sub(std::mem::take(&mut server.counted));
+        running.resume(lost);
+        deadline += lost;
         if running.send(&reply).is_err() {
             break;
         }
@@ -343,10 +363,16 @@ struct Server<'a> {
     tree: &'a Tree<'a>,
     running: Option<(Scratch, Running)>,
     generation: u32,
+    /// How long this call's server took to start, if it was started for it.
+    starting: Duration,
+    /// How long the code under test has run for the host since its deadline last moved: its own time, unlike the
+    /// containers' starts and removals.
+    counted: Duration,
 }
 
 impl Server<'_> {
     fn ask(&mut self, request: &str, deadline: Instant) -> Result<String, String> {
+        self.starting = Duration::ZERO;
         if self.running.is_none() {
             self.generation += 1;
             let scratch = Scratch::new()?;
@@ -355,8 +381,8 @@ impl Server<'_> {
             let script = scratch.dir.join("server.py");
             std::fs::write(&script, SERVER).map_err(|e| format!("writing the server: {e}"))?;
             let args = [
-                script.into_os_string(),
-                tree.into_os_string(),
+                scratch.inside(&script),
+                scratch.inside(&tree),
                 self.project.package.clone().into(),
                 self.generation.to_string().into(),
             ];
@@ -364,18 +390,28 @@ impl Server<'_> {
             // The CPU limit the operating system keeps is the group's wall time: each call's is kept below.
             let group = longer(limits, limits.memory_mb, limits.output_bytes);
             let group = Limits { cpu_seconds: group.wall_seconds, ..group };
+            let asked = Instant::now();
             let running = self.python.start(&scratch, &args, &group)?;
+            self.starting += running.started().saturating_duration_since(asked);
             self.running = Some((scratch, running));
         }
         let limits = self.project.limits;
-        let call = deadline.min(Instant::now() + Duration::from_secs(limits.wall_seconds.into()));
+        // From when the server started, if it has just been: its container's start isn't the call's, nor the
+        // host's, whose deadline moves by it once this call is answered.
+        let (_, running) = self.running.as_ref().expect("started");
+        let call = (deadline + self.starting)
+            .min(running.started().max(Instant::now()) + Duration::from_secs(limits.wall_seconds.into()));
         let budget = Duration::from_secs(limits.cpu_seconds.into());
         let (_, running) = self.running.as_mut().expect("started");
         let start = running.cpu().unwrap_or_default();
+        let sent = Instant::now();
         if running.send(request).is_ok() {
             loop {
                 match running.next_line(call.min(Instant::now() + 5 * POLL)) {
-                    Line::Got(reply) => return Ok(reply),
+                    Line::Got(reply) => {
+                        self.counted += sent.elapsed();
+                        return Ok(reply);
+                    }
                     Line::Closed => break,
                     Line::Late => {
                         let used = running.cpu().map(|c| c.saturating_sub(start));
@@ -386,6 +422,7 @@ impl Server<'_> {
                 }
             }
         }
+        self.counted += sent.elapsed();
         let (_, running) = self.running.take().expect("started");
         Ok(serde_json::json!({"gone": describe(&running.finish())}).to_string())
     }
@@ -409,7 +446,15 @@ struct CommandRequest {
 
 /// Runs `python -m <module> <argv>` for a test, in a fresh child with the tree and the test's working files, and
 /// gives back its exit code, its output and the working files after it.
-fn command(python: &Python, project: &Project, set: &HiddenSet, tree: &Tree, request: &str) -> Result<String, String> {
+/// Adds the time the command ran, its own and so the host's, to `counted`.
+fn command(
+    python: &Python,
+    project: &Project,
+    set: &HiddenSet,
+    tree: &Tree,
+    request: &str,
+    counted: &mut Duration,
+) -> Result<String, String> {
     let r: CommandRequest = match serde_json::from_str(request) {
         Ok(r) => r,
         Err(_) => return Ok(serde_json::json!({"gone": "an unreadable command"}).to_string()),
@@ -432,10 +477,11 @@ fn command(python: &Python, project: &Project, set: &HiddenSet, tree: &Tree, req
     let cli = scratch.dir.join("cli.py");
     std::fs::write(&cli, CLI).map_err(|e| format!("writing the command runner: {e}"))?;
     let mut args: Vec<OsString> =
-        vec![cli.into_os_string(), tree_dir.into_os_string(), work.clone().into_os_string(), r.module.into()];
+        vec![scratch.inside(&cli), scratch.inside(&tree_dir), scratch.inside(&work), r.module.into()];
     args.extend(r.argv.into_iter().map(OsString::from));
     let input = hex::decode(&r.stdin).map_err(|_| "input that isn't hex")?;
-    let out = python.run_with_input(&scratch, &args, &project.limits, Some(input))?;
+    let out = python.run_with_input(&scratch, &args, &project.limits, Some(input), Some("work"))?;
+    *counted += out.ran;
     let (code, mut stderr) = match &out.exit {
         Exit::Code(code) => (*code, out.stderr),
         Exit::Signal(signal) => (-signal, out.stderr),
@@ -445,36 +491,10 @@ fn command(python: &Python, project: &Project, set: &HiddenSet, tree: &Tree, req
         ),
     };
     stderr.truncate(MAX_WORK_BYTES);
-    let files: Vec<(String, String)> = work_files(&work)?.into_iter().map(|(rel, b)| (rel, hex::encode(b))).collect();
+    // The working files after it, as the supervisor collected them: at most MAX_WORK_BYTES.
+    let files: Vec<(String, String)> = out.files.iter().map(|(rel, b)| (rel.clone(), hex::encode(b))).collect();
     Ok(serde_json::json!({"code": code, "stdout": hex::encode(&out.stdout), "stderr": hex::encode(&stderr), "files": files})
         .to_string())
-}
-
-/// The regular files under `work`, by path relative to it, after a command: no symlink is followed, and at most
-/// [`MAX_WORK_BYTES`] in all.
-fn work_files(work: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let (mut out, mut total) = (Vec::new(), 0usize);
-    let mut stack = vec![(work.to_path_buf(), String::new())];
-    while let Some((dir, rel)) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let Ok(name) = entry.file_name().into_string() else { continue };
-            let rel = if rel.is_empty() { name } else { format!("{rel}/{name}") };
-            let Ok(meta) = std::fs::symlink_metadata(entry.path()) else { continue };
-            if meta.is_dir() {
-                stack.push((entry.path(), rel));
-            } else if meta.is_file() {
-                total += meta.len() as usize;
-                if total > MAX_WORK_BYTES {
-                    return Ok(out);
-                }
-                if let Ok(bytes) = std::fs::read(entry.path()) {
-                    out.push((rel, bytes));
-                }
-            }
-        }
-    }
-    Ok(out)
 }
 
 #[cfg(test)]

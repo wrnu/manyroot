@@ -1,18 +1,26 @@
-//! The Python execution profile (`docs/design/eval-suite.md`, Isolation; phase2-task.md's Candidate B): agent
-//! code runs only here, in the pinned interpreter, under the `python` sandbox profile, with the operating
-//! system's limits, in a scratch directory made fresh for each run and removed after.
+//! The Python execution profile (`docs/design/eval-suite.md`, Isolation; decision ac22cedd8fee): agent code
+//! runs only here, in a container of the pinned Python image on Docker, under the kernel's limits, in a scratch
+//! directory made fresh for each run and gone after it.
 //!
-//! - **The interpreter** is pinned by path, version and a digest of everything it can read and run
-//!   ([`Python::pin`]): the real executable, never a shim (gotcha `e5274831`), run as `python -I -S -B -X utf8`
-//!   with a cleared environment. Each run first checks its files haven't changed since ([`Python::check`]).
-//! - **Reads**: the interpreter's own installation and the libraries it loads, found from their Mach-O load
-//!   commands when it is pinned; the system's time zone data; the scratch directory. Nothing of the owner's:
-//!   no other path's metadata, and no other process's information.
-//! - **Writes**: the scratch directory only. **No fork, no exec** but the interpreter's own, **no network**.
-//! - **Limits**: CPU time, file size and open files as rlimits; memory as the child's footprint, which the
-//!   parent reads every [`POLL`] and kills past its limit, since macOS doesn't enforce `RLIMIT_AS`; output
-//!   read up to its limit, then killed; wall time, then killed; the scratch directory's size and files,
-//!   checked every [`SCRATCH_POLL`], then killed. Killing ends the child's process group.
+//! - **The image** is pinned by digest ([`Python::pin`]): a run's plan records it, and a run refuses an image
+//!   that isn't here by that digest, or whose Python isn't the project's version.
+//! - **In and out**: a run's inputs, such as the tree and the runner, are written to a directory of the host's
+//!   ([`Scratch`]), mounted read-only at `/in` and copied into the scratch directory, `/scratch`, before the code
+//!   starts. Nothing else of the host's is mounted. Results come out as the code's output, its exit, and the
+//!   files of a directory a run names ([`Outcome::files`]).
+//! - **The container**: no network, a read-only root, no new privileges, every capability dropped but the three
+//!   the supervisor needs to start the code as another user, which are gone before any code runs. The code
+//!   runs as `nobody`, as `python -I -S -B -X utf8` with an environment of its own.
+//! - **Limits**: CPU time, file size and open files as rlimits; memory as the container's, the run's memory
+//!   limit plus its scratch size, since the scratch directory is held in memory, plus [`SUPERVISOR_MB`];
+//!   processes as the container's; the scratch directory as its size and [`MAX_SCRATCH_FILES`]; output read up
+//!   to its limit, then the container killed; wall time from when the code starts, then killed. Killing a
+//!   container ends everything in it.
+//! - **The supervisor** (`python/supervisor.py`), the container's first process under its init, starts the code
+//!   and relays its output in frames the code can't forge. It runs as a user of its own, which the code can't
+//!   signal or read. It says only whether the scratch directory was full, which is how a run that ended of
+//!   itself counts as [`Exit::Scratch`], and the CPU time used so far ([`Running::cpu`]). Its word never
+//!   widens a limit or marks a pass.
 //!
 //! [`run_tests`] runs a tree's public tests here: feedback for the agent, never a grade.
 
@@ -20,359 +28,263 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
 use crate::project::{Limits, Project};
-use crate::sandbox::{PythonPaths, Sandbox};
 
-/// How often a running child's footprint and wall time are checked.
+/// The image a project run pins by default: Python 3.12 (decision c008b959c572), by digest.
+pub const IMAGE: &str = "python:3.12@sha256:17b9724493d916f56565c131f389faff2597f46dec6ce09516f95125bc9f519f";
+/// How often a running container's output and wall time are checked.
 pub const POLL: Duration = Duration::from_millis(20);
-/// The most open files a child may have.
+/// The most open files a process may have.
 const MAX_OPEN_FILES: u64 = 256;
-/// How often the scratch directory's size is checked.
-pub const SCRATCH_POLL: Duration = Duration::from_millis(100);
-/// The most files and directories a child's scratch directory may hold.
+/// The most processes a container may hold: its init, the supervisor and the code's.
+const MAX_PROCESSES: u32 = 64;
+/// The most files and directories a run's scratch directory may hold.
 pub const MAX_SCRATCH_FILES: u64 = 10_000;
+/// The memory the container's init and the supervisor may use, on top of the run's.
+pub const SUPERVISOR_MB: u32 = 16;
+/// How long a container may take to start the code, which the wall time doesn't count.
+const START_GRACE: Duration = Duration::from_secs(60);
+/// Where the scratch directory is, in the container.
+pub const SCRATCH: &str = "/scratch";
+/// The label each container is given: the pid of the process that started it, for [`sweep`].
+const LABEL: &str = "bracken.python-runner";
+/// The most bytes of one frame from the supervisor: a collected file is the longest.
+const MAX_FRAME: usize = 64 << 20;
 /// The runner [`run_tests`] starts, as it is in this binary.
 const RUN_TESTS: &str = include_str!("python/run_tests.py");
-/// What the interpreter is asked when it is pinned: its version and installation.
-const PROBE: &str = "import json, sys, sysconfig; print(json.dumps({'version': '%d.%d.%d' % sys.version_info[:3], \
-                     'prefix': sys.base_prefix, 'stdlib': sysconfig.get_path('stdlib'), \
-                     'platstdlib': sysconfig.get_path('platstdlib')}))";
+const SUPERVISOR: &str = include_str!("python/supervisor.py");
+/// What the image is asked when it is pinned: its Python's version.
+const PROBE: &str = "import sys; print('%d.%d.%d' % sys.version_info[:3])";
 
-/// The interpreter as a run's plan records it, and pins it from again (decision c008b959c572): a run refuses
-/// an interpreter whose digest or version isn't the plan's.
+/// The image as a run's plan records it, and pins it from again (decisions c008b959c572, ac22cedd8fee): a run
+/// refuses an image that isn't here by the plan's digest, or whose version isn't the plan's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PythonPin {
-    pub path: PathBuf,
+    /// Pinned by digest, as `name@sha256:<hex>`.
+    pub image: String,
     pub version: String,
-    pub digest: String,
 }
 
-/// The pinned interpreter.
+/// The pinned image.
 #[derive(Debug, Clone, Serialize)]
 pub struct Python {
-    /// The real executable, resolved.
-    pub executable: PathBuf,
-    /// blake3 over every file of the installation but `site-packages` (the standard library, its compiled
-    /// `__pycache__`, the framework's libpython, the executable) and the libraries outside it: what it can read
-    /// and run. A plan records it, and a pin refuses an interpreter whose digest isn't the one expected.
+    /// Pinned by digest, as `name@sha256:<hex>`: every container runs it by this name, so by this digest.
+    pub image: String,
+    /// The digest, `sha256:<hex>`.
     pub digest: String,
-    /// The same files' paths and metadata (inode, size, mode, modification and change times), to check before
-    /// each run that none has changed: a change time can't be set back.
-    #[serde(skip)]
-    stamp: String,
-    /// Such as `3.12.16`.
+    /// Its Python's, such as `3.12.13`.
     pub version: String,
-    /// Its installation, which the profile lets it read.
-    pub prefix: PathBuf,
-    /// The libraries outside the installation it loads, which the profile lets it read one by one.
-    pub libraries: Vec<PathBuf>,
-    /// The names it loads them by where those aren't the resolved paths, such as Homebrew's
-    /// `/opt/homebrew/opt/sqlite/lib/libsqlite3.dylib`: the profile lets it look up each link on the way.
-    pub links: Vec<PathBuf>,
 }
 
 impl Python {
-    /// Pins the interpreter at `path` for a project written for Python `minor` (such as `3.12`): resolves it,
-    /// hashes it, asks it its version and installation, and finds the libraries it and its standard
-    /// library's extension modules load. Refuses another minor version.
-    ///
-    /// A macOS framework build's `bin/python3.x` only starts the interpreter in its `Python.app`, a second
-    /// exec the profile refuses; so that interpreter is the one pinned and run. With `expected`, refuses an
-    /// interpreter whose [`Python::digest`] is another.
-    pub fn pin(path: &Path, minor: &str, expected: Option<&str>) -> Result<Python, String> {
-        let given = std::fs::canonicalize(path).map_err(|e| format!("python {}: {e}", path.display()))?;
-        let probe = probe(&given)?;
-        let app = Path::new(&probe.prefix).join("Resources/Python.app/Contents/MacOS/Python");
-        let (executable, probe) = match std::fs::canonicalize(&app) {
-            Ok(app) if app != given => (app.clone(), self::probe(&app)?),
-            _ => (given, probe),
-        };
-        let Probe { version, prefix, stdlib, platstdlib } = probe;
+    /// Pins `image` for a project written for Python `minor` (such as `3.12`): refuses an image not named by
+    /// its digest, one that isn't here by that digest (it isn't pulled: `docker pull` it first), and one whose
+    /// Python is another minor version.
+    pub fn pin(image: &str, minor: &str) -> Result<Python, String> {
+        let digest = image
+            .rsplit_once('@')
+            .map(|(_, d)| d)
+            .filter(|d| {
+                d.strip_prefix("sha256:").is_some_and(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            })
+            .ok_or_else(|| format!("python image {image}: pin it by digest, as name@sha256:<64 hex digits>"))?;
+        let out = docker(&["image", "inspect", "--format", "{{json .RepoDigests}}", image])?;
+        if !out.status.success() {
+            return Err(format!(
+                "python image {image} isn't here (docker pull it first): {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let digests: Vec<String> =
+            serde_json::from_slice(&out.stdout).map_err(|e| format!("docker image inspect: {e}"))?;
+        if !digests.iter().any(|d| d.rsplit_once('@').is_some_and(|(_, d)| d == digest)) {
+            return Err(format!("python image {image}: the image here has digests {digests:?}, not {digest}"));
+        }
+        let probe = docker(&[
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--user",
+            "65534:65534",
+            image,
+            "python",
+            "-I",
+            "-S",
+            "-c",
+            PROBE,
+        ])?;
+        let version = String::from_utf8_lossy(&probe.stdout).trim().to_string();
+        if !probe.status.success() || version.is_empty() {
+            return Err(format!(
+                "python image {image} didn't say its version: {}",
+                String::from_utf8_lossy(&probe.stderr)
+            ));
+        }
         if version.rsplit_once('.').map(|(m, _)| m) != Some(minor) {
-            return Err(format!("python {} is {version}; the project is written for {minor}", executable.display()));
+            return Err(format!("python image {image} has Python {version}; the project is written for {minor}"));
         }
-        let prefix = std::fs::canonicalize(prefix).map_err(|e| format!("python's prefix: {e}"))?;
-        let mut objects = vec![executable.clone()];
-        for dir in [stdlib, platstdlib] {
-            objects.extend(extension_modules(Path::new(&dir)));
-        }
-        let (libraries, links) = libraries(&objects, &prefix)?;
-        // The stamp before and after the digest: a file changed while it was hashed is caught.
-        let stamp = fingerprint(&prefix, &executable, &libraries, Fingerprint::Metadata)?;
-        let digest = fingerprint(&prefix, &executable, &libraries, Fingerprint::Contents)?;
-        if fingerprint(&prefix, &executable, &libraries, Fingerprint::Metadata)? != stamp {
-            return Err(format!("python {}'s files changed while it was pinned", executable.display()));
-        }
-        if let Some(expected) = expected
-            && expected != digest
-        {
-            return Err(format!("python {}'s digest is {digest}, not the expected {expected}", executable.display()));
-        }
-        Ok(Python { digest, stamp, executable, version, prefix, libraries, links })
+        Ok(Python { image: image.to_string(), digest: digest.to_string(), version })
     }
 
     /// What a plan records of it.
     pub fn plan_pin(&self) -> PythonPin {
-        PythonPin { path: self.executable.clone(), version: self.version.clone(), digest: self.digest.clone() }
+        PythonPin { image: self.image.clone(), version: self.version.clone() }
     }
 
-    /// The interpreter `pin` names, pinned again: refused unless its digest and version are the pin's.
+    /// The image `pin` names, pinned again: refused unless it is here by the pin's digest, with its version.
     pub fn from_plan(pin: &PythonPin, minor: &str) -> Result<Python, String> {
-        let python = Python::pin(&pin.path, minor, Some(&pin.digest))?;
+        let python = Python::pin(&pin.image, minor)?;
         if python.version != pin.version {
-            return Err(format!("python {} is {}, not the plan's {}", pin.path.display(), python.version, pin.version));
+            return Err(format!(
+                "python image {} has Python {}, not the plan's {}",
+                pin.image, python.version, pin.version
+            ));
         }
         Ok(python)
     }
 
-    /// Refuses if any of the interpreter's files has changed since it was pinned.
-    pub fn check(&self) -> Result<(), String> {
-        if fingerprint(&self.prefix, &self.executable, &self.libraries, Fingerprint::Metadata)? != self.stamp {
-            return Err(format!("python {}'s files have changed since it was pinned", self.executable.display()));
-        }
-        Ok(())
-    }
-
     /// Runs `args` after the interpreter's own flags in `scratch`, under the profile and `limits`.
     pub fn run(&self, scratch: &Scratch, args: &[OsString], limits: &Limits) -> Result<Outcome, String> {
-        self.run_with_input(scratch, args, limits, None)
+        self.run_with_input(scratch, args, limits, None, None)
     }
 
-    /// [`Python::run`], with `input` written to its standard input.
+    /// [`Python::run`], with `input` written to its standard input, and with `collect`, the regular files under
+    /// that directory of the scratch directory given back once the code has ended ([`Outcome::files`]).
     pub fn run_with_input(
         &self,
         scratch: &Scratch,
         args: &[OsString],
         limits: &Limits,
         input: Option<Vec<u8>>,
+        collect: Option<&str>,
     ) -> Result<Outcome, String> {
-        let mut cmd = self.command(scratch, args)?;
-        if input.is_some() {
-            cmd.stdin(Stdio::piped());
+        let cap = usize::try_from(limits.output_bytes).unwrap_or(usize::MAX);
+        let mut container = Container::start(self, scratch, args, limits, collect, None)?;
+        if let (Some(input), Some(mut stdin)) = (input, container.client.stdin.take()) {
+            std::thread::spawn(move || {
+                let _ = std::io::Write::write_all(&mut stdin, &input);
+            });
         }
-        run_limited(cmd, limits, &scratch.dir, input)
+        drop(container.client.stdin.take());
+        let killed = loop {
+            if container.client.try_wait().map_err(|e| format!("waiting for docker: {e}"))?.is_some() {
+                break None;
+            }
+            if let Some(why) = container.over(limits) {
+                container.kill();
+                break Some(why);
+            }
+            std::thread::sleep(POLL);
+        };
+        let ended = Instant::now();
+        let (exit, shared) = container.end(killed)?;
+        let take = |m: &Mutex<Vec<u8>>| std::mem::take(&mut *m.lock().unwrap_or_else(|e| e.into_inner()));
+        let (mut stdout, mut stderr) = (take(&shared.stdout), take(&shared.stderr));
+        stdout.truncate(cap);
+        stderr.truncate(cap);
+        let files = std::mem::take(&mut *shared.files.lock().unwrap_or_else(|e| e.into_inner()));
+        let started = *shared.started.lock().unwrap_or_else(|e| e.into_inner());
+        let ran = started.map_or(Duration::ZERO, |at| ended.saturating_duration_since(at));
+        Ok(Outcome { exit, stdout, stderr, files, ran })
     }
 
     /// Starts `args` in `scratch` under the profile and `limits`, to talk to a line at a time ([`Running`]).
     pub fn start(&self, scratch: &Scratch, args: &[OsString], limits: &Limits) -> Result<Running, String> {
-        let mut cmd = self.command(scratch, args)?;
-        cmd.stdin(Stdio::piped());
-        Running::start(cmd, limits, &scratch.dir)
-    }
-
-    /// The command [`Python::run`] runs: `args` in `scratch` under the profile, with nothing of this process's
-    /// environment. Refused elsewhere than macOS, and if the interpreter's files have changed since the pin.
-    fn command(&self, scratch: &Scratch, args: &[OsString]) -> Result<Command, String> {
-        if !cfg!(target_os = "macos") {
-            return Err("agent code runs only under macOS's sandbox-exec; this system has none".into());
-        }
-        self.check()?;
-        let sandbox = Sandbox::python(&PythonPaths {
-            python: &self.executable,
-            prefix: &self.prefix,
-            libraries: &self.libraries,
-            links: &self.links,
-            scratch: &scratch.dir,
-        })?;
-        let mut cmd = sandbox.command(&self.executable);
-        cmd.args(["-I", "-S", "-B", "-X", "utf8"])
-            .args(args)
-            .current_dir(&scratch.dir)
-            .env_clear()
-            .env("HOME", &scratch.dir)
-            .env("TMPDIR", &scratch.dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        Ok(cmd)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Fingerprint {
-    Contents,
-    Metadata,
-}
-
-/// blake3 over every entry under `prefix` but `site-packages` directories, in path order, then `executable` if
-/// it is outside, and each of `libraries`: each by its path and, as `what` says, its contents' blake3 or its
-/// metadata. A symlink is taken as its target's text, never followed.
-fn fingerprint(prefix: &Path, executable: &Path, libraries: &[PathBuf], what: Fingerprint) -> Result<String, String> {
-    use std::os::unix::fs::MetadataExt;
-    let mut paths = Vec::new();
-    let mut stack = vec![prefix.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))? {
-            let path = entry.map_err(|e| format!("{}: {e}", dir.display()))?.path();
-            let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-            if meta.is_dir() && path.file_name().is_some_and(|n| n != "site-packages") {
-                stack.push(path.clone());
-            }
-            if !(meta.is_dir() && path.file_name().is_some_and(|n| n == "site-packages")) {
-                paths.push(path);
-            }
-        }
-    }
-    paths.sort();
-    if !executable.starts_with(prefix) {
-        paths.push(executable.to_path_buf());
-    }
-    paths.extend(libraries.iter().cloned());
-    let mut listing = blake3::Hasher::new();
-    for path in paths {
-        let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let entry = match what {
-            Fingerprint::Metadata => format!(
-                "{} {} {} {} {} {}",
-                meta.ino(),
-                meta.size(),
-                meta.mode(),
-                meta.mtime_nsec() + meta.mtime() * 1_000_000_000,
-                meta.ctime_nsec() + meta.ctime() * 1_000_000_000,
-                meta.file_type().is_symlink()
-            ),
-            Fingerprint::Contents if meta.is_file() => {
-                let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                blake3::hash(&bytes).to_hex().to_string()
-            }
-            Fingerprint::Contents if meta.file_type().is_symlink() => {
-                let target = std::fs::read_link(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-                format!("-> {}", target.display())
-            }
-            Fingerprint::Contents => "dir".into(),
-        };
-        listing.update(format!("{}\0{entry}\n", path.display()).as_bytes());
-    }
-    Ok(listing.finalize().to_hex().to_string())
-}
-
-/// Opening a directory without following a symlink.
-const NOFOLLOW_DIR: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
-    .union(rustix::fs::OFlags::DIRECTORY)
-    .union(rustix::fs::OFlags::NOFOLLOW)
-    .union(rustix::fs::OFlags::CLOEXEC);
-
-/// The bytes and the entries under `dir`, stopping once either passes its limit. It runs while the code does,
-/// so it never acts on a path the code could swap for a symlink (finding b9a13da2a14c): each directory is opened
-/// by name in its already open parent without following a symlink, each entry looked at the same way, and
-/// nothing is changed. A directory it can't read, such as one the code has taken the owner's access to, counts
-/// as past the limit (finding b4014e7dbbd8). It walks depth first, so only the directories on the path it is
-/// walking are open, two descriptors each, however many siblings they have (finding 0dfdb731d17a); a tree too
-/// deep for the parent's open-file limit counts as past the limit too.
-fn usage(dir: &Path, max_bytes: u64) -> (u64, u64) {
-    use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, openat, statat};
-    use rustix::io::Errno;
-    let past = (max_bytes.saturating_add(1), 0);
-    let open = |fd: std::os::fd::OwnedFd| Dir::read_from(&fd).map(|list| (fd, list));
-    let Ok(top) = openat(CWD, dir, NOFOLLOW_DIR, Mode::empty()).and_then(open) else { return past };
-    let (mut bytes, mut entries) = (0u64, 0u64);
-    let mut path = vec![top];
-    while let Some((fd, list)) = path.last_mut() {
-        let entry = match list.next() {
-            None => {
-                path.pop();
-                continue;
-            }
-            Some(Err(_)) => return past,
-            Some(Ok(entry)) => entry,
-        };
-        let name = entry.file_name();
-        if name == c"." || name == c".." {
-            continue;
-        }
-        entries += 1;
-        let mut child = None;
-        match statat(&*fd, name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => {
-                bytes = bytes.saturating_add(u64::try_from(stat.st_size).unwrap_or(0));
-                if FileType::from_raw_mode(stat.st_mode as _) == FileType::Directory {
-                    match openat(&*fd, name, NOFOLLOW_DIR, Mode::empty()).and_then(open) {
-                        Ok(opened) => child = Some(opened),
-                        // Gone, or swapped for something else since: what it held is still found where it is.
-                        Err(Errno::NOENT | Errno::LOOP | Errno::NOTDIR) => {}
-                        Err(_) => return past,
-                    }
+        let (send, lines) = std::sync::mpsc::channel();
+        let mut container = Container::start(self, scratch, args, limits, None, Some(send))?;
+        let stdin = container.client.stdin.take();
+        let (stop, why) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
+        let (name, shared, limits, spawned) =
+            (container.name.clone(), container.shared.clone(), *limits, container.spawned);
+        let (stopping, reason) = (stop.clone(), why.clone());
+        let watch = std::thread::spawn(move || {
+            while !stopping.load(Ordering::SeqCst) {
+                if let Some(over) = over(&shared, &limits, spawned) {
+                    kill(&name);
+                    *reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(over);
+                    return;
                 }
+                std::thread::sleep(POLL);
             }
-            Err(Errno::NOENT) => {}
-            Err(_) => return past,
-        }
-        if bytes > max_bytes || entries > MAX_SCRATCH_FILES {
-            return (bytes, entries);
-        }
-        path.extend(child);
+        });
+        Ok(Running { container: Some(container), stdin, lines, stop, why, watch: Some(watch) })
     }
-    (bytes, entries)
 }
 
-/// What an interpreter says of itself.
-#[derive(serde::Deserialize)]
-struct Probe {
-    version: String,
-    prefix: String,
-    stdlib: String,
-    platstdlib: String,
+/// Runs `docker` with `args`, and waits for it.
+fn docker(args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("docker").args(args).stdin(Stdio::null()).output().map_err(|e| format!("running docker: {e}"))
 }
 
-/// Asks the interpreter at `executable`, outside any sandbox and with a cleared environment, what it is.
-fn probe(executable: &Path) -> Result<Probe, String> {
-    let out = Command::new(executable)
-        .args(["-I", "-S", "-B", "-c", PROBE])
-        .env_clear()
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("running python {}: {e}", executable.display()))?;
-    serde_json::from_slice(&out.stdout).map_err(|_| format!("python {} didn't say what it is", executable.display()))
+/// Whether Docker is running here: tests that need it are skipped, and say so, where it isn't.
+pub fn docker_running() -> bool {
+    static RUNNING: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *RUNNING.get_or_init(|| docker(&["info", "--format", "{{.ServerVersion}}"]).is_ok_and(|o| o.status.success()))
 }
 
-/// The `.so` files in `dir` and its subdirectories: the standard library's extension modules.
-fn extension_modules(dir: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else { continue };
-        for e in entries.flatten() {
-            let p = e.path();
-            match e.file_type() {
-                Ok(t) if t.is_dir() && p.file_name().is_some_and(|n| n != "site-packages") => stack.push(p),
-                Ok(t) if t.is_file() && p.extension().is_some_and(|x| x == "so") => out.push(p),
-                _ => {}
-            }
-        }
+/// The image tests pin: [`IMAGE`], or the one `BRACKEN_TEST_PYTHON_IMAGE` names. None, having said why, where
+/// Docker isn't running, or, elsewhere than macOS, where the image isn't pulled, as in the test boxes. On macOS,
+/// where the counted run runs these tests (docs/development.md), an image not pulled fails them.
+#[doc(hidden)]
+pub fn for_tests() -> Option<Python> {
+    if !docker_running() {
+        eprintln!("skipped: Docker isn't running here, and this test runs agent code in a container");
+        return None;
     }
-    out
+    let image = std::env::var("BRACKEN_TEST_PYTHON_IMAGE").unwrap_or_else(|_| IMAGE.into());
+    match Python::pin(&image, "3.12") {
+        Ok(python) => Some(python),
+        Err(e) if !cfg!(target_os = "macos") && e.contains("isn't here") => {
+            eprintln!("skipped: {e}");
+            None
+        }
+        Err(e) => panic!("{e} (docker pull {image})"),
+    }
 }
 
-/// The libraries `objects` load, and those load in turn, resolved, outside `prefix` and the system's (which
-/// every profile may read); and the names they're loaded by that aren't those.
-fn libraries(objects: &[PathBuf], prefix: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut links = std::collections::BTreeSet::new();
-    let mut queue: Vec<PathBuf> = objects.to_vec();
-    while let Some(object) = queue.pop() {
-        let bytes = std::fs::read(&object).map_err(|e| format!("{}: {e}", object.display()))?;
-        for name in macho::dylibs(&bytes).map_err(|e| format!("{}: {e}", object.display()))? {
-            if name.starts_with('@') || name.starts_with("/usr/lib/") || name.starts_with("/System/") {
-                continue;
-            }
-            let lib = std::fs::canonicalize(&name).map_err(|e| format!("{} loads {name}: {e}", object.display()))?;
-            if lib.starts_with(prefix) {
-                continue;
-            }
-            if lib != Path::new(&name) {
-                links.insert(PathBuf::from(&name));
-            }
-            if seen.insert(lib.clone()) {
-                queue.push(lib);
-            }
-        }
+/// Ends the container `name`, and everything in it. It may have ended already.
+fn kill(name: &str) {
+    let _ = docker(&["kill", name]);
+}
+
+/// Removes the containers of runners that have ended, which a runner killed before it removed its own leaves
+/// behind: once a process, before its first container.
+fn sweep() {
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    SWEPT.call_once(sweep_now);
+}
+
+/// [`sweep`], whether or not this process has swept before.
+fn sweep_now() {
+    let format = format!("{{{{.Names}}}} {{{{.Label \"{LABEL}\"}}}}");
+    let Ok(out) = docker(&["ps", "-a", "--filter", &format!("label={LABEL}"), "--format", &format]) else { return };
+    let dead: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(_, pid)| {
+            let pid = pid.parse::<i32>().ok().and_then(rustix::process::Pid::from_raw);
+            pid.is_none_or(|pid| rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH))
+        })
+        .map(|(name, _)| name.to_string())
+        .collect();
+    if !dead.is_empty() {
+        let mut args = vec!["rm", "-f"];
+        args.extend(dead.iter().map(String::as_str));
+        let _ = docker(&args);
     }
-    Ok((seen.into_iter().collect(), links.into_iter().collect()))
 }
 
 /// How a run ended.
@@ -383,9 +295,11 @@ pub enum Exit {
     /// Killed by a signal: `SIGXCPU` (24) is the CPU limit, `SIGXFSZ` (25) the file size limit.
     Signal(i32),
     WallTime,
+    /// Killed for passing the container's memory limit.
     Memory,
     Output,
-    /// Its scratch directory passed its size or [`MAX_SCRATCH_FILES`].
+    /// Ended, of itself or by an error or a signal, with its scratch directory full, of bytes or of files, at a
+    /// check: the scratch directory can't hold more, so the code's next write failed.
     Scratch,
 }
 
@@ -395,12 +309,19 @@ pub struct Outcome {
     pub exit: Exit,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// The regular files of the directory the run named to collect, by path relative to it: those the
+    /// supervisor could read, and 32 MiB at most. None otherwise.
+    pub files: Vec<(String, Vec<u8>)>,
+    /// How long the code ran: from when it started to when its container ended, without the container's start
+    /// and removal.
+    pub ran: Duration,
 }
 
-/// A directory made fresh for one run, `0700`, in the system's temporary directory, and removed when
-/// dropped, whatever the run did to the permissions inside it.
+/// A run's inputs: a directory made fresh for it, `0700`, in the system's temporary directory, and removed when
+/// dropped. The container sees it at `/in`, read-only, and copies it into the scratch directory before the code
+/// starts: what's at `dir/x` here is at `/scratch/x` there ([`Scratch::inside`]).
 pub struct Scratch {
-    /// Resolved, as the sandbox's rules see it.
+    /// Resolved.
     pub dir: PathBuf,
 }
 
@@ -420,45 +341,23 @@ impl Scratch {
         Err(format!("no fresh scratch directory in {}", tmp.display()))
     }
 
-    /// Copies the tree at `from` into the scratch directory as `name`: regular files and directories only.
+    /// Copies the tree at `from` into the directory as `name`: regular files and directories only.
     pub fn copy_tree(&self, from: &Path, name: &str) -> Result<PathBuf, String> {
         let to = self.dir.join(name);
         copy_tree(from, &to)?;
         Ok(to)
     }
+
+    /// Where `path`, in [`Scratch::dir`], is in the container once copied: in the scratch directory.
+    pub fn inside(&self, path: &Path) -> OsString {
+        let rel = path.strip_prefix(&self.dir).expect("a path in the scratch directory");
+        Path::new(SCRATCH).join(rel).into_os_string()
+    }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        unlock(&self.dir);
         let _ = std::fs::remove_dir_all(&self.dir);
-    }
-}
-
-/// Gives back the owner's access to every directory under `dir`, which the run may have taken away: only once
-/// the run has ended, and never through a symlink, each directory changed and opened by name in its open parent.
-fn unlock(dir: &Path) {
-    use rustix::fs::{AtFlags, CWD, Mode, chmodat, openat};
-    let _ = chmodat(CWD, dir, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW);
-    if let Ok(fd) = openat(CWD, dir, NOFOLLOW_DIR, Mode::empty()) {
-        unlock_in(&fd);
-    }
-}
-
-fn unlock_in(fd: &std::os::fd::OwnedFd) {
-    use rustix::fs::{AtFlags, Dir, FileType, Mode, chmodat, openat, statat};
-    let Ok(list) = Dir::read_from(fd) else { return };
-    for entry in list.flatten() {
-        let name = entry.file_name();
-        let is_dir = statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)
-            .is_ok_and(|s| FileType::from_raw_mode(s.st_mode as _) == FileType::Directory);
-        if name == c"." || name == c".." || !is_dir {
-            continue;
-        }
-        let _ = chmodat(fd, name, Mode::RWXU, AtFlags::SYMLINK_NOFOLLOW);
-        if let Ok(child) = openat(fd, name, NOFOLLOW_DIR, Mode::empty()) {
-            unlock_in(&child);
-        }
     }
 }
 
@@ -479,208 +378,268 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Puts `cmd` in a process group of its own, with the rlimits.
-fn limit(cmd: &mut Command, limits: &Limits) {
-    use std::os::unix::process::CommandExt;
-    let cpu = u64::from(limits.cpu_seconds);
-    // What the code may write to one file: as much as it may print, and at least 16 MiB.
-    let fsize = limits.output_bytes.max(16 << 20);
-    cmd.process_group(0);
-    // SAFETY: between fork and exec this only makes setrlimit system calls, which allocate nothing and take
-    // no lock.
-    unsafe {
-        cmd.pre_exec(move || {
-            use rustix::process::{Resource, Rlimit, setrlimit};
-            let limit = |soft: u64, hard: u64| Rlimit { current: Some(soft), maximum: Some(hard) };
-            setrlimit(Resource::Cpu, limit(cpu, cpu + 1))?;
-            setrlimit(Resource::Fsize, limit(fsize, fsize))?;
-            setrlimit(Resource::Nofile, limit(MAX_OPEN_FILES, MAX_OPEN_FILES))?;
-            setrlimit(Resource::Core, limit(0, 0))?;
-            Ok(())
-        });
+/// What the supervisor says last: the code's exit status (negative for a signal; none if the inputs weren't
+/// copied), and whether the scratch directory was full at any check.
+#[derive(serde::Deserialize)]
+struct End {
+    status: Option<i32>,
+    scratch: bool,
+}
+
+/// What a container's frames have said so far, as the reader on its output thread keeps it.
+#[derive(Default)]
+struct Shared {
+    /// A stream passed the output limit, or a line was longer than [`MAX_LINE`].
+    full: AtomicBool,
+    /// When the first frame came: the code had started.
+    started: Mutex<Option<Instant>>,
+    /// The frames have ended: the container has.
+    done: AtomicBool,
+    /// Milliseconds more of wall time the caller has given it ([`Running::resume`]).
+    extra: AtomicU64,
+    /// Since when its wall time has stood still, if it has ([`Running::pause`]).
+    paused: Mutex<Option<Instant>>,
+    /// The container's CPU time, in microseconds.
+    cpu: AtomicU64,
+    stdout: Mutex<Vec<u8>>,
+    stderr: Mutex<Vec<u8>>,
+    files: Mutex<Vec<(String, Vec<u8>)>>,
+    end: Mutex<Option<End>>,
+}
+
+/// The limit a container has passed, if it has passed one: its output, or its wall time from when the code
+/// started (or, until it has, from when the container was asked for, with [`START_GRACE`] more).
+fn over(shared: &Shared, limits: &Limits, spawned: Instant) -> Option<Exit> {
+    let started = *shared.started.lock().unwrap_or_else(|e| e.into_inner());
+    let extra = Duration::from_millis(shared.extra.load(Ordering::SeqCst));
+    let deadline = started.unwrap_or(spawned + START_GRACE) + Duration::from_secs(limits.wall_seconds.into()) + extra;
+    let now = shared.paused.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(Instant::now);
+    if shared.full.load(Ordering::SeqCst) {
+        Some(Exit::Output)
+    } else if now > deadline {
+        Some(Exit::WallTime)
+    } else {
+        None
     }
 }
 
-/// The limits the parent checks a running child against, every [`POLL`]: its output, wall time, memory
-/// footprint and scratch directory (every [`SCRATCH_POLL`]).
-struct Watch {
-    full: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    deadline: Instant,
-    memory: u64,
-    scratch: PathBuf,
-    scratch_bytes: u64,
-    next_scratch: Instant,
+/// One run's container: the `docker run` client attached to it, and the threads reading its output.
+struct Container {
+    name: String,
+    client: Child,
+    spawned: Instant,
+    shared: Arc<Shared>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    errors: Option<std::thread::JoinHandle<Vec<u8>>>,
 }
 
-impl Watch {
-    fn new(limits: &Limits, scratch: &Path, full: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Watch {
-        Watch {
-            full,
-            deadline: Instant::now() + Duration::from_secs(limits.wall_seconds.into()),
-            memory: u64::from(limits.memory_mb) << 20,
-            scratch: scratch.to_path_buf(),
-            scratch_bytes: u64::from(limits.scratch_mb) << 20,
-            next_scratch: Instant::now(),
+impl Container {
+    /// Starts `args` in a container of `python`'s image, with `scratch` as its inputs, under `limits`. With
+    /// `lines`, the code's standard output goes there a line at a time, and only its standard error counts
+    /// toward the output limit.
+    fn start(
+        python: &Python,
+        scratch: &Scratch,
+        args: &[OsString],
+        limits: &Limits,
+        collect: Option<&str>,
+        lines: Option<std::sync::mpsc::Sender<String>>,
+    ) -> Result<Container, String> {
+        sweep();
+        let argv: Vec<&str> = args
+            .iter()
+            .map(|a| a.to_str().ok_or_else(|| format!("an argument that isn't UTF-8: {a:?}")))
+            .collect::<Result<_, _>>()?;
+        let spec = serde_json::json!({"argv": argv, "cwd": SCRATCH, "collect": collect}).to_string();
+        let source =
+            scratch.dir.to_str().filter(|s| !s.contains(',')).ok_or("a scratch directory docker can't mount")?;
+        let seed = format!("{:?}{}{}", Instant::now(), std::process::id(), source);
+        let name = format!("bracken-python-{}", &blake3::hash(seed.as_bytes()).to_hex()[..16]);
+        let memory = u64::from(limits.memory_mb) + u64::from(limits.scratch_mb) + u64::from(SUPERVISOR_MB);
+        let cpu = u64::from(limits.cpu_seconds);
+        // What the code may write to one file: as much as it may print, and at least 16 MiB.
+        let fsize = limits.output_bytes.max(16 << 20);
+        let mut cmd = Command::new("docker");
+        cmd.args(["run", "-i", "--name", &name, "--label", &format!("{LABEL}={}", std::process::id())])
+            .args(["--log-driver", "none", "--init", "--network", "none", "--read-only"])
+            .arg("--tmpfs")
+            .arg(format!("{SCRATCH}:rw,size={}m,nr_inodes={MAX_SCRATCH_FILES},mode=1777", limits.scratch_mb))
+            .args(["--memory", &format!("{memory}m"), "--memory-swap", &format!("{memory}m")])
+            .args(["--cpus", "1", "--pids-limit", &MAX_PROCESSES.to_string()])
+            .args(["--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "SETPCAP"])
+            .args(["--security-opt", "no-new-privileges", "--user", "0:0"])
+            .args(["--ulimit", &format!("cpu={cpu}:{}", cpu + 1), "--ulimit", &format!("fsize={fsize}:{fsize}")])
+            .args(["--ulimit", &format!("nofile={MAX_OPEN_FILES}:{MAX_OPEN_FILES}"), "--ulimit", "core=0:0"])
+            .args(["-w", SCRATCH, "--mount", &format!("type=bind,source={source},target=/in,readonly")])
+            .args([python.image.as_str(), "python", "-I", "-S", "-B", "-c", SUPERVISOR, &spec])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let spawned = Instant::now();
+        let mut client = cmd.spawn().map_err(|e| format!("running docker: {e}"))?;
+        let shared = Arc::new(Shared::default());
+        let cap = usize::try_from(limits.output_bytes).unwrap_or(usize::MAX);
+        let (out, keep) = (client.stdout.take().expect("piped"), shared.clone());
+        let reader = std::thread::spawn(move || read_frames(out, &keep, cap, lines));
+        let mut err = client.stderr.take().expect("piped");
+        let errors = std::thread::spawn(move || {
+            let mut text = Vec::new();
+            let _ = (&mut err).take(64 << 10).read_to_end(&mut text);
+            let _ = std::io::copy(&mut err, &mut std::io::sink());
+            text
+        });
+        Ok(Container { name, client, spawned, shared, reader: Some(reader), errors: Some(errors) })
+    }
+
+    fn over(&self, limits: &Limits) -> Option<Exit> {
+        over(&self.shared, limits, self.spawned)
+    }
+
+    /// Ends the container, and everything in it: once it is there, if it isn't yet (a kill asked for before
+    /// docker has made it would miss it), unless the client ends first, or after [`START_GRACE`].
+    fn kill(&mut self) {
+        let deadline = Instant::now() + START_GRACE;
+        while !docker(&["kill", &self.name]).is_ok_and(|o| o.status.success())
+            && self.client.try_wait().is_ok_and(|s| s.is_none())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(5 * POLL);
         }
     }
 
-    /// The limit the child `pid` has passed, if it has passed one.
-    fn over(&mut self, pid: u32) -> Option<Exit> {
-        if self.full.load(std::sync::atomic::Ordering::SeqCst) {
-            Some(Exit::Output)
-        } else if Instant::now() > self.deadline {
-            Some(Exit::WallTime)
-        } else if footprint(pid).is_some_and(|bytes| bytes > self.memory) {
-            Some(Exit::Memory)
-        } else if Instant::now() >= self.next_scratch && {
-            self.next_scratch = Instant::now() + SCRATCH_POLL;
-            self.scratch_over()
-        } {
-            Some(Exit::Scratch)
+    /// Waits for the container to end, removes it, and says how the run ended: `killed` if the runner killed it
+    /// for a limit; otherwise as the kernel or the supervisor says.
+    fn end(mut self, killed: Option<Exit>) -> Result<(Exit, Arc<Shared>), String> {
+        let status = self.client.wait().map_err(|e| format!("waiting for docker: {e}"))?;
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+        let errors = self.errors.take().and_then(|e| e.join().ok()).unwrap_or_default();
+        let state = docker(&["inspect", "--format", "{{.State.OOMKilled}}", &self.name]);
+        let _ = docker(&["rm", "-f", &self.name]);
+        let oom = state.is_ok_and(|s| String::from_utf8_lossy(&s.stdout).trim() == "true");
+        let shared = self.shared.clone();
+        let end = shared.end.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let started = shared.started.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+        let errors = String::from_utf8_lossy(&errors);
+        let exit = if shared.full.load(Ordering::SeqCst) {
+            Exit::Output
+        } else if let Some(why) = killed {
+            why
+        } else if oom {
+            Exit::Memory
         } else {
-            None
-        }
-    }
-
-    /// Whether the scratch directory holds more than its limits allow.
-    fn scratch_over(&self) -> bool {
-        let (bytes, entries) = usage(&self.scratch, self.scratch_bytes);
-        bytes > self.scratch_bytes || entries > MAX_SCRATCH_FILES
-    }
-
-    /// How a run that ended `ended` counts: past the scratch limit if it ended of itself with the directory over
-    /// it, which the last poll may have missed (task 950f77ad7e4a).
-    fn last(&self, ended: Exit) -> Exit {
-        match ended {
-            Exit::Code(_) | Exit::Signal(_) if self.scratch_over() => Exit::Scratch,
-            ended => ended,
-        }
-    }
-}
-
-/// Starts `cmd` with the rlimits, writes `input` to it, and waits for it within the rest of `limits`.
-fn run_limited(mut cmd: Command, limits: &Limits, scratch: &Path, input: Option<Vec<u8>>) -> Result<Outcome, String> {
-    limit(&mut cmd, limits);
-    let mut child = cmd.spawn().map_err(|e| format!("starting python: {e}"))?;
-    if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-        std::thread::spawn(move || {
-            let _ = std::io::Write::write_all(&mut stdin, &input);
-        });
-    }
-    let cap = usize::try_from(limits.output_bytes).unwrap_or(usize::MAX);
-    let full = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stdout = reader(child.stdout.take().expect("piped"), cap, full.clone());
-    let stderr = reader(child.stderr.take().expect("piped"), cap, full.clone());
-    let mut watch = Watch::new(limits, scratch, full.clone());
-    let ended = loop {
-        if let Some(status) = child.try_wait().map_err(|e| format!("waiting for python: {e}"))? {
-            break exit_of(status);
-        }
-        if let Some(why) = watch.over(child.id()) {
-            kill(&mut child);
-            break why;
-        }
-        std::thread::sleep(POLL);
-    };
-    let ended = watch.last(ended);
-    // Not the group again: once reaped, its id may be another process group's, and with no fork it held only the child.
-    let (out, err) = (stdout.join().unwrap_or_default(), stderr.join().unwrap_or_default());
-    let exit = if full.load(std::sync::atomic::Ordering::SeqCst) { Exit::Output } else { ended };
-    Ok(Outcome { exit, stdout: out, stderr: err })
-}
-
-/// Reads `from` up to `cap` bytes on its own thread. Past the cap it sets `full` and stops, and the run is
-/// killed.
-fn reader(
-    mut from: impl Read + Send + 'static,
-    cap: usize,
-    full: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> std::thread::JoinHandle<Vec<u8>> {
-    std::thread::spawn(move || {
-        let mut out = Vec::new();
-        let mut buf = [0u8; 8192];
-        loop {
-            match from.read(&mut buf) {
-                Ok(0) | Err(_) => return out,
-                Ok(n) if out.len() + n > cap => {
-                    out.extend_from_slice(&buf[..cap - out.len()]);
-                    full.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return out;
+            match end {
+                Some(End { scratch: true, .. }) => Exit::Scratch,
+                Some(End { status: Some(s), .. }) if s < 0 => Exit::Signal(-s),
+                Some(End { status: Some(s), .. }) => Exit::Code(s),
+                Some(End { status: None, .. }) => return Err(format!("the run's inputs weren't copied: {errors}")),
+                // Docker's own failures to run it.
+                None if !started && matches!(status.code(), Some(125..=127)) => {
+                    return Err(format!("docker run: {}", errors.trim()));
                 }
-                Ok(n) => out.extend_from_slice(&buf[..n]),
+                // Ended before the supervisor said how: as docker says, a signal as 128 more.
+                None => match status.code() {
+                    Some(code) if code > 128 => Exit::Signal(code - 128),
+                    Some(code) => Exit::Code(code),
+                    None => Exit::Code(-1),
+                },
             }
+        };
+        Ok((exit, shared))
+    }
+}
+
+impl Drop for Container {
+    fn drop(&mut self) {
+        if self.reader.is_some() {
+            self.kill();
+            let _ = self.client.wait();
+            let _ = docker(&["rm", "-f", &self.name]);
         }
-    })
+    }
+}
+
+/// Reads the supervisor's frames from `from` into `shared` until it ends: the code's output up to `cap` bytes a
+/// stream (with `lines`, its standard output a line at a time instead), past which `full` is set and the rest is
+/// read and dropped.
+fn read_frames(from: impl Read, shared: &Shared, cap: usize, lines: Option<std::sync::mpsc::Sender<String>>) {
+    let mut from = std::io::BufReader::new(from);
+    let mut line = Vec::new();
+    let mut header = [0u8; 5];
+    while from.read_exact(&mut header).is_ok() {
+        let len = u32::from_be_bytes(header[1..].try_into().expect("four bytes")) as usize;
+        if len > MAX_FRAME {
+            break;
+        }
+        let mut payload = vec![0; len];
+        if from.read_exact(&mut payload).is_err() {
+            break;
+        }
+        shared.started.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Instant::now);
+        match (header[0], &lines) {
+            (b'o', Some(lines)) => {
+                for &b in &payload {
+                    if b == b'\n' {
+                        let _ = lines.send(String::from_utf8_lossy(&line).into_owned());
+                        line.clear();
+                    } else if line.len() >= MAX_LINE {
+                        shared.full.store(true, Ordering::SeqCst);
+                    } else {
+                        line.push(b);
+                    }
+                }
+            }
+            (b'o', None) => keep(&shared.stdout, &payload, cap, &shared.full),
+            (b'e', _) => keep(&shared.stderr, &payload, cap, &shared.full),
+            (b'c', _) => {
+                let usec = std::str::from_utf8(&payload).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                shared.cpu.store(usec, Ordering::SeqCst);
+            }
+            (b'f', _) => {
+                if let Some(at) = payload.iter().position(|&b| b == 0) {
+                    let path = String::from_utf8_lossy(&payload[..at]).into_owned();
+                    let bytes = payload[at + 1..].to_vec();
+                    shared.files.lock().unwrap_or_else(|e| e.into_inner()).push((path, bytes));
+                }
+            }
+            (b'x', _) => *shared.end.lock().unwrap_or_else(|e| e.into_inner()) = serde_json::from_slice(&payload).ok(),
+            _ => break,
+        }
+    }
+    // Drained, so the client can end.
+    let _ = std::io::copy(&mut from, &mut std::io::sink());
+    shared.done.store(true, Ordering::SeqCst);
+}
+
+/// Adds `bytes` to `to`, up to `cap`; past it, sets `full`.
+fn keep(to: &Mutex<Vec<u8>>, bytes: &[u8], cap: usize, full: &AtomicBool) {
+    let mut to = to.lock().unwrap_or_else(|e| e.into_inner());
+    if to.len() + bytes.len() > cap {
+        let room = cap.saturating_sub(to.len());
+        to.extend_from_slice(&bytes[..room]);
+        full.store(true, Ordering::SeqCst);
+    } else {
+        to.extend_from_slice(bytes);
+    }
 }
 
 /// A child started with [`Python::start`]: lines go to its standard input, and come from its standard output, at
-/// most [`MAX_LINE`] bytes each. A watchdog ends it past a limit ([`Watch`]), when its standard error passes the
-/// output limit, or when a line is longer than [`MAX_LINE`]: the run is killed, and [`Running::finish`] says why.
-/// The child is reaped only once the watchdog has stopped, so it never signals a group whose id is free.
+/// most [`MAX_LINE`] bytes each. A watchdog ends it past a limit, when its standard error passes the output
+/// limit, or when a line is longer than [`MAX_LINE`]: the container is killed, and [`Running::finish`] says why.
 pub struct Running {
-    child: Child,
+    container: Option<Container>,
     stdin: Option<std::process::ChildStdin>,
     lines: std::sync::mpsc::Receiver<String>,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    why: std::sync::Arc<std::sync::Mutex<Option<Exit>>>,
+    stop: Arc<AtomicBool>,
+    why: Arc<Mutex<Option<Exit>>>,
     watch: Option<std::thread::JoinHandle<()>>,
-    /// For the scratch check once it has ended.
-    last: Watch,
 }
 
 /// The longest line a [`Running`] child may send.
 pub const MAX_LINE: usize = 64 << 20;
 
 impl Running {
-    fn start(mut cmd: Command, limits: &Limits, scratch: &Path) -> Result<Running, String> {
-        use std::io::BufRead;
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::{Arc, Mutex};
-        limit(&mut cmd, limits);
-        let mut child = cmd.spawn().map_err(|e| format!("starting python: {e}"))?;
-        let full = Arc::new(AtomicBool::new(false));
-        let cap = usize::try_from(limits.output_bytes).unwrap_or(usize::MAX);
-        drop(reader(child.stderr.take().expect("piped"), cap, full.clone()));
-        let (send, lines) = std::sync::mpsc::channel();
-        let (out, too_long) = (child.stdout.take().expect("piped"), full.clone());
-        std::thread::spawn(move || {
-            let mut out = std::io::BufReader::new(out);
-            loop {
-                let mut line = Vec::new();
-                match std::io::Read::take(&mut out, MAX_LINE as u64 + 1).read_until(b'\n', &mut line) {
-                    Ok(0) | Err(_) => return,
-                    Ok(_) if line.last() != Some(&b'\n') => {
-                        too_long.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                    Ok(_) => {
-                        line.pop();
-                        if send.send(String::from_utf8_lossy(&line).into_owned()).is_err() {
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-        let (stop, why) = (Arc::new(AtomicBool::new(false)), Arc::new(Mutex::new(None)));
-        let mut limits_watch = Watch::new(limits, scratch, full);
-        let last = Watch::new(limits, scratch, Arc::new(AtomicBool::new(false)));
-        let (pid, watching, reason) = (child.id(), stop.clone(), why.clone());
-        let watch = std::thread::spawn(move || {
-            while !watching.load(Ordering::SeqCst) {
-                if let Some(over) = limits_watch.over(pid) {
-                    // Not reaped until the watchdog has stopped, so the group is still the child's.
-                    kill_pid_group(pid);
-                    *reason.lock().unwrap_or_else(|e| e.into_inner()) = Some(over);
-                    return;
-                }
-                std::thread::sleep(POLL);
-            }
-        });
-        let stdin = child.stdin.take();
-        Ok(Running { child, stdin, lines, stop, why, watch: Some(watch), last })
-    }
-
     /// Sends one line.
     pub fn send(&mut self, line: &str) -> Result<(), String> {
         let stdin = self.stdin.as_mut().ok_or("the child's input is closed")?;
@@ -708,48 +667,68 @@ impl Running {
         }
     }
 
-    /// The CPU time the child has used so far; `None` once that can't be read.
+    /// When the code started, waiting for it to, up to [`START_GRACE`]; now if it ended or didn't start in that
+    /// time. A container takes a while to start, which a caller's own deadlines shouldn't count, as its wall
+    /// time doesn't.
+    pub fn started(&self) -> Instant {
+        let Some(container) = self.container.as_ref() else { return Instant::now() };
+        let shared = &container.shared;
+        loop {
+            if let Some(at) = *shared.started.lock().unwrap_or_else(|e| e.into_inner()) {
+                return at;
+            }
+            if shared.done.load(Ordering::SeqCst) || container.spawned.elapsed() > START_GRACE {
+                return Instant::now();
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+
+    /// Stops its wall time, while it waits on something that may not count toward it, such as another container
+    /// starting: its watchdog can't end it for wall time until [`Running::resume`].
+    pub fn pause(&self) {
+        if let Some(container) = self.container.as_ref() {
+            container.shared.paused.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// Starts its wall time again, with `skip`, at most the time it stood still, not counted.
+    pub fn resume(&self, skip: Duration) {
+        if let Some(container) = self.container.as_ref() {
+            let since = container.shared.paused.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let skip = since.map_or(Duration::ZERO, |at| skip.min(at.elapsed()));
+            let ms = u64::try_from(skip.as_millis()).unwrap_or(u64::MAX);
+            container.shared.extra.fetch_add(ms, Ordering::SeqCst);
+        }
+    }
+
+    /// The CPU time the container has used so far, as the supervisor last said it: every 0.1 s.
     pub fn cpu(&self) -> Option<Duration> {
-        cpu_time(self.child.id())
+        let container = self.container.as_ref()?;
+        Some(Duration::from_micros(container.shared.cpu.load(Ordering::SeqCst)))
     }
 
     /// Ends the child, and says how it ended: the limit it passed, if one did.
     pub fn finish(mut self) -> Exit {
-        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.stop.store(true, Ordering::SeqCst);
         if let Some(watch) = self.watch.take() {
             let _ = watch.join();
         }
         drop(self.stdin.take());
-        // Not reaped yet, so its group's id is still its own.
-        kill_group(&self.child);
-        let status = self.child.wait();
+        let mut container = self.container.take().expect("not yet finished");
         let why = self.why.lock().unwrap_or_else(|e| e.into_inner()).take();
-        why.unwrap_or_else(|| self.last.last(status.map(exit_of).unwrap_or(Exit::Code(-1))))
+        // Ended now if it hasn't ended itself: what the code does after its input closes is never waited for.
+        if container.shared.end.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            container.kill();
+        }
+        container.end(why).map(|(exit, _)| exit).unwrap_or(Exit::Code(-1))
     }
 }
 
-fn exit_of(status: std::process::ExitStatus) -> Exit {
-    use std::os::unix::process::ExitStatusExt;
-    match (status.code(), status.signal()) {
-        (Some(code), _) => Exit::Code(code),
-        (None, Some(signal)) => Exit::Signal(signal),
-        (None, None) => Exit::Code(-1),
-    }
-}
-
-fn kill(child: &mut Child) {
-    kill_group(child);
-    let _ = child.wait();
-}
-
-/// Kills the child's process group: the child and anything that shares it. Only while it is unreaped.
-fn kill_group(child: &Child) {
-    kill_pid_group(child.id());
-}
-
-fn kill_pid_group(pid: u32) {
-    if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+impl Drop for Running {
+    /// The watchdog stops, and the container, if [`Running::finish`] didn't end it, is ended and removed.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
     }
 }
 
@@ -760,75 +739,6 @@ pub enum Line {
     Late,
     /// The child's output has ended.
     Closed,
-}
-
-/// The child's memory footprint in bytes, as macOS counts it for memory pressure; `None` once it has gone.
-#[cfg(target_os = "macos")]
-fn footprint(pid: u32) -> Option<u64> {
-    rusage(pid).map(|info| info.phys_footprint)
-}
-
-/// The child's CPU time, user and system; `None` once it has gone.
-#[cfg(target_os = "macos")]
-fn cpu_time(pid: u32) -> Option<Duration> {
-    #[repr(C)]
-    struct Timebase {
-        numer: u32,
-        denom: u32,
-    }
-    unsafe extern "C" {
-        fn mach_timebase_info(info: *mut Timebase) -> i32;
-    }
-    let info = rusage(pid)?;
-    let mut timebase = Timebase { numer: 0, denom: 0 };
-    // SAFETY: `timebase` is a `mach_timebase_info_data_t` and lives through the call.
-    if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
-        return None;
-    }
-    // The times are in mach absolute time units: nanoseconds only on Intel.
-    let ticks = u128::from(info.user_time) + u128::from(info.system_time);
-    let nanos = ticks * u128::from(timebase.numer) / u128::from(timebase.denom);
-    Some(Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX)))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn cpu_time(_pid: u32) -> Option<Duration> {
-    None
-}
-
-/// `rusage_info_v0` from `<sys/resource.h>`.
-#[cfg(target_os = "macos")]
-#[repr(C)]
-#[derive(Default)]
-struct RusageInfoV0 {
-    uuid: [u8; 16],
-    user_time: u64,
-    system_time: u64,
-    pkg_idle_wkups: u64,
-    interrupt_wkups: u64,
-    pageins: u64,
-    wired_size: u64,
-    resident_size: u64,
-    phys_footprint: u64,
-    proc_start_abstime: u64,
-    proc_exit_abstime: u64,
-}
-
-/// The child's resource use; `None` once it has gone.
-#[cfg(target_os = "macos")]
-fn rusage(pid: u32) -> Option<RusageInfoV0> {
-    unsafe extern "C" {
-        fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut RusageInfoV0) -> i32;
-    }
-    let mut info = RusageInfoV0::default();
-    // SAFETY: `info` is a `rusage_info_v0`, the flavor 0 (`RUSAGE_INFO_V0`) asks for, and lives through the call.
-    let ok = unsafe { proc_pid_rusage(pid as i32, 0, &mut info) } == 0;
-    ok.then_some(info)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn footprint(_pid: u32) -> Option<u64> {
-    None
 }
 
 /// What [`run_tests`] found: each test by id and outcome (`pass`, `fail`, `error` or `skip`).
@@ -851,8 +761,8 @@ impl TestRun {
     }
 }
 
-/// Runs `project`'s public tests on a copy of `tree` (laid out as the seed is) with the pinned interpreter,
-/// under the profile and the project's limits.
+/// Runs `project`'s public tests on a copy of `tree` (laid out as the seed is) in the pinned image, under the
+/// profile and the project's limits.
 pub fn run_tests(python: &Python, project: &Project, tree: &Path) -> Result<TestRun, String> {
     let scratch = Scratch::new()?;
     let copy = scratch.copy_tree(tree, "tree")?;
@@ -860,7 +770,7 @@ pub fn run_tests(python: &Python, project: &Project, tree: &Path) -> Result<Test
     std::fs::write(&runner, RUN_TESTS).map_err(|e| format!("writing the runner: {e}"))?;
     let tests = project.public_tests.strip_prefix(&project.seed).expect("checked to be in the seed");
     let marker = format!("bracken-run-tests-{}:", blake3::hash(scratch.dir.as_os_str().as_encoded_bytes()).to_hex());
-    let args = [runner.into_os_string(), copy.into_os_string(), tests.as_os_str().to_owned(), marker.clone().into()];
+    let args = [scratch.inside(&runner), scratch.inside(&copy), tests.as_os_str().to_owned(), marker.clone().into()];
     let outcome = python.run(&scratch, &args, &project.limits)?;
     let stdout = String::from_utf8_lossy(&outcome.stdout);
     let reported = stdout
@@ -875,57 +785,5 @@ pub fn run_tests(python: &Python, project: &Project, tree: &Path) -> Result<Test
     Ok(TestRun { reported, tests, exit: outcome.exit, output })
 }
 
-/// Reading Mach-O load commands: just enough to list the libraries a binary loads.
-mod macho {
-    const MH_MAGIC_64: u32 = 0xfeed_facf;
-    const FAT_MAGIC: u32 = 0xcafe_babe;
-    const LC_LOAD_DYLIB: u32 = 0xc;
-    const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
-    const LC_REEXPORT_DYLIB: u32 = 0x8000_001f;
-    const LC_LOAD_UPWARD_DYLIB: u32 = 0x8000_0023;
-    /// This machine's CPU type: arm64 or x86_64.
-    const CPU_TYPE: u32 = if cfg!(target_arch = "aarch64") { 0x0100_000c } else { 0x0100_0007 };
-
-    fn u32_at(b: &[u8], at: usize, big: bool) -> Result<u32, String> {
-        let s: [u8; 4] = b.get(at..at + 4).and_then(|s| s.try_into().ok()).ok_or("cut short")?;
-        Ok(if big { u32::from_be_bytes(s) } else { u32::from_le_bytes(s) })
-    }
-
-    /// The install names of the libraries a 64-bit Mach-O binary loads; for a universal binary, those of this
-    /// machine's slice.
-    pub fn dylibs(b: &[u8]) -> Result<Vec<String>, String> {
-        if u32_at(b, 0, true)? == FAT_MAGIC {
-            let n = u32_at(b, 4, true)? as usize;
-            for i in 0..n.min(64) {
-                let at = 8 + i * 20;
-                if u32_at(b, at, true)? == CPU_TYPE {
-                    let (offset, size) = (u32_at(b, at + 8, true)? as usize, u32_at(b, at + 12, true)? as usize);
-                    return dylibs(b.get(offset..offset + size).ok_or("a slice past the end")?);
-                }
-            }
-            return Err("no slice for this machine".into());
-        }
-        if u32_at(b, 0, false)? != MH_MAGIC_64 {
-            return Err("not a 64-bit Mach-O binary".into());
-        }
-        let ncmds = u32_at(b, 16, false)? as usize;
-        let (mut at, mut out) = (32, Vec::new());
-        for _ in 0..ncmds {
-            let (cmd, size) = (u32_at(b, at, false)?, u32_at(b, at + 4, false)? as usize);
-            if size < 8 {
-                return Err("a load command shorter than its header".into());
-            }
-            if [LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB, LC_REEXPORT_DYLIB, LC_LOAD_UPWARD_DYLIB].contains(&cmd) {
-                let command = b.get(at..at + size).ok_or("a load command past the end")?;
-                let name = command.get(u32_at(b, at + 8, false)? as usize..).ok_or("a name past its command")?;
-                let name = name.split(|&c| c == 0).next().unwrap_or_default();
-                out.push(String::from_utf8(name.to_vec()).map_err(|_| "a library name that isn't UTF-8")?);
-            }
-            at += size;
-        }
-        Ok(out)
-    }
-}
-
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

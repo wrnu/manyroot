@@ -1,4 +1,8 @@
-#[cfg(target_os = "macos")]
+//! These need Docker, as `python::tests` do: where it isn't running, each says so and passes without checking
+//! anything.
+
+/// In `macos_only` though they don't need macOS, so the counted run's Mac side runs them: Docker is on this Mac
+/// and not in the test boxes, where they skip (decision ac22cedd8fee, docs/development.md).
 mod macos_only {
     use std::path::{Path, PathBuf};
 
@@ -6,17 +10,11 @@ mod macos_only {
 
     use super::super::*;
     use crate::project::digest;
+    use crate::python::tests::macos_only::python;
 
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");
         std::fs::write(path, text).expect("a file");
-    }
-
-    /// The interpreter these tests pin, as `python::tests` does.
-    fn python() -> Python {
-        let path = std::env::var_os("BRACKEN_TEST_PYTHON").unwrap_or_else(|| "/opt/homebrew/bin/python3.12".into());
-        assert!(Path::new(&path).exists(), "these tests need Python 3.12 at {path:?} (or set BRACKEN_TEST_PYTHON)");
-        Python::pin(Path::new(&path), "3.12", None).expect("pinned")
     }
 
     /// `sum` and `mean-empty` at the start, and `decimals` at half the run, changing `sum`.
@@ -153,8 +151,9 @@ mod macos_only {
     /// ed723694b473); the command runs with its working directory's files coming back.
     #[test]
     fn the_golden_trees_pass_the_approval_check() {
+        let Some(python) = python() else { return };
         let s = setup(groups(), &TESTS);
-        let check = golden_check(&python(), &s.project, &s.set).expect("graded");
+        let check = golden_check(&python, &s.project, &s.set).expect("graded");
         assert!(check.passed(), "{check:#?}");
         assert_eq!(indexes(&check.after), [1, 2, 3], "after the change: sum's new tests, mean's, the command's");
         let before = check.before.expect("the project has a change");
@@ -169,8 +168,8 @@ mod macos_only {
     /// change, graded after it, fails just what changed.
     #[test]
     fn a_tree_is_graded_per_item_in_counts() {
+        let Some(python) = python() else { return };
         let s = setup(groups(), &TESTS);
-        let python = python();
         let seed = grade(&python, &s.project, &s.set, Tree::Dir(&s.project.seed), 1.0).expect("graded");
         assert!(!seed.all_pass());
         assert_eq!(seed.items.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["sum", "mean-empty", "decimals"]);
@@ -190,6 +189,7 @@ mod macos_only {
     /// the store, nor the host's copy of the tests, while it can read its own tree.
     #[test]
     fn agent_code_reads_no_hidden_test_imported_or_as_a_command() {
+        let Some(python) = python() else { return };
         const PEEK: &str = "import os, subprocess, sys, tempfile, unittest\nimport tiny.peek as peek\n\
             STORE = '{ROOT}/store/tiny@1/tests/test_peek.py'\n\nclass T(unittest.TestCase):\n\
             \x20   def test_own_tree(self):\n        self.assertIs(peek.own(), True)\n\
@@ -228,18 +228,18 @@ mod macos_only {
         );
         write(&tree.join("tiny/ls.py"), "import json, os\nprint(json.dumps(sorted(os.listdir('.'))))\n");
         write(&tree.join("tiny/write.py"), "import sys\nopen(sys.argv[1], 'w').write('written')\n");
-        let g = grade(&python(), &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
+        let g = grade(&python, &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
         assert_eq!(g.groups[0].counts, Counts { pass: 7, ..Counts::default() }, "{g:#?}");
     }
 
     /// A tree, and one group of `tests` judging `mean-empty`, graded at the end with the project's `limits`.
-    fn graded(stats: &str, test: &str, limits: &Value) -> GroupGrade {
+    fn graded(python: &Python, stats: &str, test: &str, limits: &Value) -> GroupGrade {
         let groups = json!([{"item": "mean-empty", "file": "tests/test_x.py", "applies": "always"}]);
         let s = setup_with(groups, &[("test_x.py", test)], limits);
         let tree = s.root.join("tree");
         write(&tree.join("tiny/__init__.py"), "");
         write(&tree.join("tiny/stats.py"), stats);
-        let mut g = grade(&python(), &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
+        let mut g = grade(python, &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
         g.groups.remove(0)
     }
 
@@ -250,6 +250,7 @@ mod macos_only {
     /// import it (finding 998cb1f3da18).
     #[test]
     fn agent_code_cant_forge_a_pass() {
+        let Some(python) = python() else { return };
         let stats = "import fractions\n\nclass Yes(list):\n    def __contains__(self, x):\n        return True\n\n\
                      def lib():\n    return fractions\n\ndef valid(x):\n    raise StopIteration\n\n\
                      def items():\n    return Yes([1])\n\n\
@@ -275,7 +276,7 @@ mod macos_only {
                     \x20   def test_no_lazy_import_for_a_claimed_class(self):\n\
                     \x20       with self.assertRaises(Exception):\n            stats.lazy()\n\
                     \x20       self.assertNotIn('unittest.async_case', sys.modules)\n";
-        let g = graded(stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
         assert_eq!(g.counts, Counts { pass: 5, ..Counts::default() }, "{g:#?}");
     }
 
@@ -284,6 +285,7 @@ mod macos_only {
     /// that wasn't a module's attribute is that test's error, never another object.
     #[test]
     fn a_crashed_server_costs_only_its_test() {
+        let Some(python) = python() else { return };
         let stats = "import os\n\nclass Box:\n    def three(self):\n        return 3\n\nbox = Box()\n\n\
                      def f():\n    return 3\n\ndef crash():\n    os.abort()\n";
         let test = "import unittest\nfrom tiny.stats import f, crash, box\nthree = box.three\n\n\
@@ -292,7 +294,7 @@ mod macos_only {
                     \x20   def test_b_an_import_found_again(self):\n        self.assertEqual(f(), 3)\n\
                     \x20   def test_c_a_module_attribute_found_again(self):\n        self.assertEqual(box.three(), 3)\n\
                     \x20   def test_d_an_object_of_the_crashed_server(self):\n        three()\n";
-        let g = graded(stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
         assert_eq!(g.counts, Counts { pass: 2, error: 2, ..Counts::default() }, "{g:#?}");
         use Outcome::*;
         assert_eq!(g.outcomes, [Error, Pass, Pass, Error], "one per test, in the order they ran");
@@ -303,6 +305,7 @@ mod macos_only {
     /// own test's error.
     #[test]
     fn each_call_has_its_own_cpu_budget() {
+        let Some(python) = python() else { return };
         let stats = "import time\n\ndef spin(seconds):\n    end = time.process_time() + seconds\n\
                      \x20   while time.process_time() < end:\n        pass\n    return 1\n";
         let mut test = String::from("import unittest\nimport tiny.stats as stats\n\nclass T(unittest.TestCase):\n");
@@ -310,7 +313,7 @@ mod macos_only {
             test.push_str(&format!("    def test_a{i}(self):\n        self.assertEqual(stats.spin(0.6), 1)\n"));
         }
         test.push_str("    def test_b_too_long(self):\n        stats.spin(5)\n");
-        let g = graded(stats, &test, &json!({"cpu_seconds": 1, "wall_seconds": 30}));
+        let g = graded(&python, stats, &test, &json!({"cpu_seconds": 1, "wall_seconds": 30}));
         assert_eq!(g.counts, Counts { pass: 8, error: 1, ..Counts::default() }, "{g:#?}");
     }
 
@@ -318,6 +321,7 @@ mod macos_only {
     /// did (finding bcecc7c3f6e3): one outcome per test, by index, in the suite's order.
     #[test]
     fn a_class_fixture_error_is_its_own_tests_outcome() {
+        let Some(python) = python() else { return };
         let test = "import unittest\nimport tiny.stats as stats\n\n\
                     class A(unittest.TestCase):\n\
                     \x20   @classmethod\n    def setUpClass(cls):\n        raise RuntimeError('no fixture')\n\
@@ -325,7 +329,7 @@ mod macos_only {
                     class B(unittest.TestCase):\n\
                     \x20   def test_b1(self):\n        self.assertEqual(stats.f(), 1)\n\
                     \x20   def test_b2(self):\n        self.assertEqual(stats.f(), 1)\n";
-        let g = graded("def f():\n    return 1\n", test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        let g = graded(&python, "def f():\n    return 1\n", test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
         assert_eq!(g.counts, Counts { pass: 2, error: 1, ..Counts::default() }, "{g:#?}");
         use Outcome::*;
         assert_eq!(g.outcomes, [Error, Pass, Pass], "{g:#?}");
@@ -335,6 +339,7 @@ mod macos_only {
     /// failures (finding e7d128464936). Each hanging call ends at one run's wall time, a second here, as an error.
     #[test]
     fn an_unfinished_host_keeps_its_outcomes() {
+        let Some(python) = python() else { return };
         let stats = "import time\n\ndef ok():\n    return 1\n\ndef hang():\n    time.sleep(60)\n";
         let mut test = String::from("import unittest\nimport tiny.stats as stats\n\nclass T(unittest.TestCase):\n");
         for i in 0..3 {
@@ -343,7 +348,7 @@ mod macos_only {
         for i in 0..6 {
             test.push_str(&format!("    def test_h{i}(self):\n        stats.hang()\n"));
         }
-        let g = graded(stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": 1}));
+        let g = graded(&python, stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": 1}));
         assert!(g.unfinished.is_some(), "{g:#?}");
         let c = g.counts;
         assert_eq!((c.pass, c.pass + c.fail + c.error), (3, 9), "{g:#?}");
