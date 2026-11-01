@@ -10,10 +10,15 @@
 # mode 0700, never on a TCP port another local process could reach (finding 292898be0ce0). If that
 # directory is anything else (a symlink, someone else's, another mode), the compile skips sccache.
 #
+# When sccache can't reach or start its server (a sandbox that denies the socket, a server that won't
+# start), it exits 2 before the compiler runs; the wrapper then runs the compiler itself, so the build goes
+# on uncached (finding 20a5ceea1005). rustc exits 0, 1 or 101, never 2.
+#
 # sccache's client sends its environment to the server, which runs the compiler with it. So sccache gets
-# only what a compile needs: cargo's and rustc's variables (all of them, CARGO_PKG_AUTHORS and
-# CARGO_BIN_EXE_<name> included, but no registry credential), then the names in KEEP and the prefixes
-# below, never one that looks like a secret. Nothing else in the caller's environment (tokens, keys)
+# only what a compile needs: the names cargo sets for a compile (CARGO_PKG_*, CARGO_BIN_EXE_*,
+# CARGO_MANIFEST_*, CARGO_CRATE_NAME and the rest in the case below, even with AUTH or TOKEN in a name),
+# then, never one that looks like a secret, the names in KEEP and the prefixes below (finding
+# 289f76c488af: a user's CARGO_FORGE_TOKEN stays out). Nothing else in the caller's environment (tokens, keys)
 # reaches the server. A build script's `cargo:rustc-env` variable passes only if it's listed here: if a
 # dependency needs one, the build fails with "environment variable not defined", and the fix is to add
 # its name to KEEP.
@@ -50,19 +55,25 @@ kept=()
 while IFS= read -r -d '' entry; do
   name=${entry%%=*}
   case "$name" in
-    CARGO_REGISTRY* | CARGO_REGISTRIES* | SCCACHE_LOG | SCCACHE_ERROR_LOG | SCCACHE_SERVER_*) continue ;;
-    # Cargo's and rustc's own, before the secret patterns: CARGO_PKG_AUTHORS has AUTH in it (finding
-    # 58223509a78e).
-    CARGO* | RUST* | CLIPPY* | __CARGO* | DEP_*) ;;
+    SCCACHE_LOG | SCCACHE_ERROR_LOG | SCCACHE_SERVER_*) continue ;;
+    # What cargo sets for a compile, before the secret patterns: CARGO_PKG_AUTHORS has AUTH in it (finding
+    # 58223509a78e), and a binary may be called tokenizer.
+    CARGO | CARGO_PKG_* | CARGO_BIN_EXE_* | CARGO_BIN_NAME | CARGO_CRATE_NAME | CARGO_MANIFEST_* | \
+      CARGO_PRIMARY_PACKAGE | CARGO_CFG_* | CARGO_ENCODED_RUSTFLAGS | CARGO_MAKEFLAGS | CARGO_TARGET_TMPDIR | \
+      CARGO_RUSTC_CURRENT_DIR | __CARGO_* | DEP_*) ;;
     *TOKEN* | *SECRET* | *PASSWORD* | *PASSWD* | *CREDENTIAL* | *_KEY | *_KEY_* | *AUTH*) continue ;;
-    SCCACHE_* | LC_*) ;;
+    RUSTC* | RUST_* | CLIPPY_* | SCCACHE_* | LC_*) ;;
     *) [[ "$KEEP" == *" $name "* ]] || continue ;;
   esac
   kept+=("$entry")
 done < <(/usr/bin/env -0)
 
-exec /usr/bin/env -i "${kept[@]}" \
+rc=0
+/usr/bin/env -i "${kept[@]}" \
   SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-15G}" \
   SCCACHE_IGNORE_SERVER_IO_ERROR="${SCCACHE_IGNORE_SERVER_IO_ERROR:-1}" \
   SCCACHE_SERVER_UDS="$socket_dir/server.sock" \
-  "$sccache" "$@"
+  "$sccache" "$@" || rc=$?
+# 2 is sccache's own failure, before the compiler ran: compile without it.
+[[ $rc -ne 2 ]] || exec "$@"
+exit "$rc"
