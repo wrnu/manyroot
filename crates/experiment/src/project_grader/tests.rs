@@ -1,6 +1,16 @@
 //! These need Docker, as `python::tests` do: where it isn't running, each says so and passes without checking
 //! anything.
 
+/// Other containers' starts move the host's deadline by one more of its wall time at most, however many there are
+/// (finding 9391e821d0da): a server crashed on every call, restarted each time, can't stretch a group without end.
+#[test]
+fn the_hosts_deadline_moves_a_bounded_amount() {
+    use std::time::Duration;
+    let mut allowance = super::Allowance(Duration::from_secs(4));
+    let moved: Vec<Duration> = [3, 3, 3].into_iter().map(|s| allowance.take(Duration::from_secs(s))).collect();
+    assert_eq!(moved, [3, 1, 0].map(Duration::from_secs));
+}
+
 /// In `macos_only` though they don't need macOS, so the counted run's Mac side runs them: Docker is on this Mac
 /// and not in the test boxes, where they skip (decision ac22cedd8fee, docs/development.md).
 mod macos_only {
@@ -234,13 +244,59 @@ mod macos_only {
 
     /// A tree, and one group of `tests` judging `mean-empty`, graded at the end with the project's `limits`.
     fn graded(python: &Python, stats: &str, test: &str, limits: &Value) -> GroupGrade {
+        graded_padded(python, stats, test, limits, 0)
+    }
+
+    /// [`graded`], with `pad` small files more in the tree: each server start copies them in, about 7 ms a file on
+    /// Docker Desktop, so they make every start slow, and none of that time is the code's.
+    fn graded_padded(python: &Python, stats: &str, test: &str, limits: &Value, pad: usize) -> GroupGrade {
         let groups = json!([{"item": "mean-empty", "file": "tests/test_x.py", "applies": "always"}]);
         let s = setup_with(groups, &[("test_x.py", test)], limits);
         let tree = s.root.join("tree");
         write(&tree.join("tiny/__init__.py"), "");
         write(&tree.join("tiny/stats.py"), stats);
+        for i in 0..pad {
+            write(&tree.join(format!("pad/f{i}.txt")), "x");
+        }
         let mut g = grade(python, &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
         g.groups.remove(0)
+    }
+
+    /// A slow first server start doesn't count against the host's wall time (finding 783ef2c1346d, the failure
+    /// of #207's counted run): the tree's 1500 files make it take about 10 s, which would leave the host none of its
+    /// 4 s if it drew on the allowance, so none of its calls would pass. They're quick, and one passing is enough:
+    /// on a machine loaded enough, the host's own start and four calls that each slept half a second outran its
+    /// 4 s (evidence 3c0248f8b699).
+    #[test]
+    fn a_slow_first_server_start_doesnt_cost_the_host() {
+        let Some(python) = python() else { return };
+        let stats = "def one():\n    return 1\n";
+        let mut test = String::from("import unittest\nimport tiny.stats as stats\n\nclass T(unittest.TestCase):\n");
+        for i in 0..4 {
+            test.push_str(&format!("    def test_n{i}(self):\n        self.assertEqual(stats.one(), 1)\n"));
+        }
+        let g = graded_padded(&python, stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": 1}), 1500);
+        assert!(g.counts.pass > 0, "{g:#?}");
+    }
+
+    /// Other containers' starts, after the group's first server's, do draw on the allowance (finding 783ef2c1346d):
+    /// twenty commands, each a container of its own copying a tree of 300 files in, a couple of seconds each and
+    /// almost none of it the code's, leave the group unfinished once one more host wall time of them is spent.
+    /// Without the allowance all twenty would pass. Commands, not server restarts: a restart follows a crash, and
+    /// telling the crash came is the code's time, which would end the host whatever the allowance did.
+    #[test]
+    fn uncounted_container_starts_draw_on_the_allowance() {
+        let Some(python) = python() else { return };
+        let stats = "def f():\n    return 1\n";
+        let mut test = String::from("import subprocess, sys, unittest\n\nclass T(unittest.TestCase):\n");
+        for i in 0..20 {
+            test.push_str(&format!(
+                "    def test_c{i:02}(self):\n        out = subprocess.run([sys.executable, '-m', 'tiny.stats'], capture_output=True)\n\
+                 \x20       self.assertEqual(out.returncode, 0, out.stderr)\n"
+            ));
+        }
+        let g = graded_padded(&python, stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": 1}), 300);
+        assert!(g.unfinished.is_some() && g.counts.pass < 20, "{g:#?}");
     }
 
     /// Agent code can't forge a pass (findings 734e5389e188, d077f100ac33, d1f7d7880644): by naming a module of

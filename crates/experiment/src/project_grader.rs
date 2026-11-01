@@ -238,6 +238,7 @@ fn run_group(
     ];
     let mut running = python.start(&scratch, &args, &host_limits)?;
     let mut deadline = running.started() + Duration::from_secs(host_limits.wall_seconds.into());
+    let mut may_move = Allowance(Duration::from_secs(host_limits.wall_seconds.into()));
     let mut server = Server {
         python,
         project,
@@ -247,6 +248,7 @@ fn run_group(
         generation: 0,
         starting: Duration::ZERO,
         counted: Duration::ZERO,
+        first: Duration::ZERO,
     };
     // What the host has said as it went (finding e7d128464936): the number of tests, each test's start (its index),
     // each outcome, each test's end.
@@ -298,7 +300,11 @@ fn run_group(
             }
             _ => break,
         };
-        let lost = waiting.elapsed().saturating_sub(std::mem::take(&mut server.counted));
+        // The group's first server start is a cost of grading it, however slow, so it moves the deadline without
+        // drawing on the allowance: only what the code can cause, restarts and commands, does.
+        let uncounted = waiting.elapsed().saturating_sub(std::mem::take(&mut server.counted));
+        let first = std::mem::take(&mut server.first).min(uncounted);
+        let lost = first + may_move.take(uncounted - first);
         running.resume(lost);
         deadline += lost;
         if running.send(&reply).is_err() {
@@ -325,6 +331,20 @@ fn run_group(
         // The tests that hadn't ended when the host did count as failures.
         None => (Counts { fail: so_far.fail + total.saturating_sub(done), ..so_far }, outcomes, Some(describe(&exit))),
     })
+}
+
+/// What the host's deadline may still move by for other containers' starts and removals, the group's first
+/// server start aside: one more of its wall time in all (finding 9391e821d0da), so a server crashed on every call
+/// can't stretch a group without end.
+struct Allowance(Duration);
+
+impl Allowance {
+    /// How much of `lost` the deadline moves by: what's left of the allowance at most.
+    fn take(&mut self, lost: Duration) -> Duration {
+        let moved = lost.min(self.0);
+        self.0 -= moved;
+        moved
+    }
 }
 
 /// The project's `limits`, with `HOST_TIMES` its CPU and wall time, for a process that serves a whole test file,
@@ -368,6 +388,9 @@ struct Server<'a> {
     /// How long the code under test has run for the host since its deadline last moved: its own time, unlike the
     /// containers' starts and removals.
     counted: Duration,
+    /// How long the group's first server took to start, if it has just been started: the host's deadline moves
+    /// by it without drawing on its [`Allowance`].
+    first: Duration,
 }
 
 impl Server<'_> {
@@ -393,6 +416,9 @@ impl Server<'_> {
             let asked = Instant::now();
             let running = self.python.start(&scratch, &args, &group)?;
             self.starting += running.started().saturating_duration_since(asked);
+            if self.generation == 1 {
+                self.first = self.starting;
+            }
             self.running = Some((scratch, running));
         }
         let limits = self.project.limits;
