@@ -2319,6 +2319,51 @@ fn code_scope_names_what_needs_the_full_table_and_the_light_scope() {
             out.contains("cargo fmt --check; cargo nextest run -P fast -p bracken-tre; scripts/test-table --remote -p bracken-tre"),
             "{scripts}: {out}"
         );
+        // The fast pass may carry -j <n>, --no-fail-fast and --test-threads <n> anywhere among its -p
+        // arguments (task b1156a629af9), but nothing else, and must still name every package; the --remote
+        // pass takes none of them.
+        let with = |fast: &str, remote: &str| -> [String; 5] {
+            let mut five = all.map(str::to_owned);
+            five[3] = fast.to_owned();
+            five[4] = remote.to_owned();
+            five
+        };
+        let remote = "scripts/test-table --remote -p bracken -p bracken-tree";
+        for fast in [
+            "cargo nextest run -P fast -j 4 -p bracken -p bracken-tree",
+            "cargo nextest run -P fast --no-fail-fast -p bracken -p bracken-tree",
+            "cargo nextest run -P fast --test-threads 4 -p bracken -p bracken-tree",
+            "cargo nextest run -P fast -p bracken -j 4 -p bracken-tree --no-fail-fast",
+            "cargo nextest run -P fast -j 4 --no-fail-fast -p bracken-tree --test-threads 2 -p bracken",
+        ] {
+            let five = with(fast, remote);
+            let five: Vec<&str> = five.iter().map(String::as_str).collect();
+            assert_eq!(passes(&five, &["bracken", "bracken-tree"]), (Some(0), String::new()), "{scripts}: {fast}");
+        }
+        let missing_fast = format!("no pass on {h} of: cargo nextest run -P fast -p bracken -p bracken-tree\n");
+        for fast in [
+            // Fewer packages.
+            "cargo nextest run -P fast -j 4 -p bracken",
+            // Another flag, a flag with no number, a zero, and a flag that isn't one of them.
+            "cargo nextest run -P fast --release -p bracken -p bracken-tree",
+            "cargo nextest run -P fast -j -p bracken -p bracken-tree",
+            "cargo nextest run -P fast --test-threads 0 -p bracken -p bracken-tree",
+            "cargo nextest run -P fast -E all() -p bracken -p bracken-tree",
+            // No package at all.
+            "cargo nextest run -P fast -j 4 --no-fail-fast",
+        ] {
+            let five = with(fast, remote);
+            let five: Vec<&str> = five.iter().map(String::as_str).collect();
+            assert_eq!(
+                passes(&five, &["bracken", "bracken-tree"]),
+                (Some(1), missing_fast.clone()),
+                "{scripts}: {fast}"
+            );
+        }
+        let five = with("cargo nextest run -P fast -p bracken -p bracken-tree", &format!("{remote} -j 4"));
+        let five: Vec<&str> = five.iter().map(String::as_str).collect();
+        let (code, out) = passes(&five, &["bracken", "bracken-tree"]);
+        assert!(code == Some(1) && out.contains("scripts/test-table --remote -p bracken"), "{scripts}: {out}");
     }
 }
 
