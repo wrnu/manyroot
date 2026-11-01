@@ -4863,7 +4863,8 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
         let out = script(name, args);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{name} {args:?}: {stderr}");
-        assert!(stderr.contains(expected), "{name} {args:?}: expected {expected:?} in {stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stderr.contains(expected), "{name} {args:?}: expected {expected:?} in {stderr}{stdout}");
     };
     ok("scripts/weave-shadow", &["--init", "--owner-decision", &approval]);
     let git = |args: &[&str]| git_out(&dir, args);
@@ -5146,6 +5147,106 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
         "{out}"
     );
 
+    // Batches with an ancestor base (task 0a58850fa794, finding 4dd7841ae9c7). #20's squash changes p.txt,
+    // #22 and #23 fork from it unrecorded, so both carry its change, and #21 undoes it before they merge.
+    // #28, from after the undo, leaves p.txt alone. In one batch Weave's merge brings p.txt back, git's
+    // doesn't, and no other member changed p.txt but to bring the same back: an ancestor base, no stop.
+    write("p.txt", "v0\n");
+    let s18 = commit("p");
+    origin_main(&s18);
+    shadowed(&[&s18], "none");
+    branch("f20", &|| write("p.txt", "v1\n"));
+    claim("20");
+    let s20 = squash("f20", "20");
+    branch("f22", &|| write("a22.txt", "22\n"));
+    let p22 = proposal("22");
+    branch("f23", &|| write("a23.txt", "23\n"));
+    let p23 = proposal("23");
+    git(&["switch", "-q", "main"]);
+    write("p.txt", "v0\n");
+    let s21 = commit("undo p (#21)");
+    origin_main(&s21);
+    shadowed(&[&s20], "none");
+    shadowed(&[&s21], "none");
+    branch("f28", &|| write("a28.txt", "28\n"));
+    let p28 = proposal("28");
+    let b3 = batch(&[("f22", "22"), ("f23", "23"), ("f28", "28")]);
+    for pr in ["22", "23", "28"] {
+        gate(pr);
+    }
+    shadowed(&["--proposal", &p22, "--proposal", &p23, "--proposal", &p28, &b3], "ancestor");
+
+    // The same again, but #27, from after the undo, edits p.txt, and git's merge takes #27's edit. A Weave
+    // that dropped #27's edit would give the tree that bringing #25's p.txt back gives, so the shadow
+    // mustn't call that an ancestor base: it stops. A stand-in scripts/weave plays that Weave for one run;
+    // the real one conflicts at p.txt.
+    branch("f24", &|| write("p.txt", "v1\n"));
+    claim("24");
+    let s24 = squash("f24", "24");
+    branch("f25", &|| write("a25.txt", "25\n"));
+    let p25 = proposal("25");
+    git(&["switch", "-q", "main"]);
+    write("p.txt", "v0\n");
+    let s26 = commit("undo p again (#26)");
+    origin_main(&s26);
+    shadowed(&[&s24], "none");
+    shadowed(&[&s26], "none");
+    branch("f27", &|| write("p.txt", "X\n"));
+    let p27 = proposal("27");
+    let b4 = batch(&[("f25", "25"), ("f27", "27")]);
+    gate("25");
+    // Only a pass is the merge gate's: a failed 'merge gate' doesn't count.
+    let (id27, sha27) = claimed.borrow()["27"].clone();
+    bk(&dir, &["evidence", &id27, "fail", "--method", &format!("merge gate @ {sha27}"), "--as", "manager"]);
+    refused(
+        "scripts/weave-shadow",
+        &["--proposal", &p25, "--proposal", &p27, &b4],
+        "carries the manager's merge gate pass",
+    );
+    gate("27");
+    let dropped = {
+        let index = tmp.path().join("dropped-index");
+        let scratch = |args: &[&str]| {
+            let out = command(&dir, "git", args).env("GIT_INDEX_FILE", &index).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        scratch(&["read-tree", &b4]);
+        let v1 = git(&["rev-parse", &format!("{s24}:p.txt")]);
+        scratch(&["update-index", "--cacheinfo", &format!("100644,{v1},p.txt")]);
+        let c = git(&["commit-tree", &scratch(&["write-tree"]), "-p", &b4, "-m", "#27's edit dropped"]);
+        let import = ok(
+            "scripts/weave",
+            &["weave", "import", "--from-git", &c, "--repo", dir.to_str().unwrap(), "--dry-run", "--json"],
+        );
+        serde_json::from_str::<serde_json::Value>(&import).unwrap()["manifest"].as_str().unwrap().to_owned()
+    };
+    let real = dir.join("scripts/weave.real");
+    std::fs::rename(dir.join("scripts/weave"), &real).unwrap();
+    std::fs::write(
+        dir.join("scripts/weave.out"),
+        serde_json::json!({"differs": [{"path": "p.txt", "change": "modified"}], "manifest": dropped}).to_string(),
+    )
+    .unwrap();
+    write_executable(
+        &dir.join("scripts/weave"),
+        "#!/usr/bin/env bash\nhere=$(dirname \"$0\")\n\
+         case \" $* \" in *' weave integrate --proposals '*) cat \"$here/weave.out\"; exit 1 ;; esac\n\
+         exec \"$here/weave.real\" \"$@\"\n",
+    );
+    let before = count();
+    refused("scripts/weave-shadow", &["--proposal", &p25, "--proposal", &p27, &b4], "Stop and report it");
+    assert_eq!(count(), before, "a mismatch wrote something");
+    std::fs::rename(&real, dir.join("scripts/weave")).unwrap();
+    std::fs::remove_file(dir.join("scripts/weave.out")).unwrap();
+    let out = shadowed(&["--proposal", &p25, "--proposal", &p27, &b4], "conflict");
+    assert!(
+        out.contains(
+            "stage 2a so far: 21 merges, 4 by Weave's own merge; fallbacks: 11 no proposal, 2 conflict, 2 mismatch, 2 ancestor base"
+        ),
+        "{out}"
+    );
+
     let log =
         serde_json::from_str::<serde_json::Value>(&ok("scripts/weave", &["weave", "log", "--limit", "100", "--json"]))
             .unwrap();
@@ -5153,6 +5254,13 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     assert_eq!(
         notes,
         [
+            format!("shadow of {b4}: proposals {p25} {p27} conflicted at p.txt"),
+            format!("shadow of {s26}: no proposal for PR #26"),
+            format!("shadow of {s24}: no proposal for PR #24"),
+            format!("shadow of {b3}: proposals {p22} {p23} {p28} differed at p.txt, from an ancestor base"),
+            format!("shadow of {s21}: no proposal for PR #21"),
+            format!("shadow of {s20}: no proposal for PR #20"),
+            format!("shadow of {s18}: no proposal"),
             format!("shadow of {s17}: proposal {p17} mismatched at k.txt"),
             format!("shadow of {s15}: no proposal for PR #15"),
             format!("shadow of {s13}: proposal {p13} differed at g.txt, from an ancestor base"),
