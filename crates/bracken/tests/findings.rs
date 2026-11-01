@@ -3,9 +3,8 @@
 //! It runs both on the cases `log --open`'s test covers and on seeded random Grounds, for every pr claim and
 //! two triagers, and requires the same untriaged, undeferred and deferred findings and the same count.
 //!
-//! Until scripts/merge reads `findings`, a guard checks that the script (and the kickoff template) still holds
-//! the oracle's text byte for byte, so the two can't drift apart unnoticed. Once it does, the guard goes and
-//! the oracle stays, as the record of what the rule was.
+//! scripts/merge now reads `findings` (the second PR of answer `945b6e49fa35`): a guard checks that it (and the
+//! kickoff template) does, and holds no copy of the rules. The oracle stays, as the record of what the rule was.
 
 use std::path::Path;
 use std::process::Command;
@@ -115,16 +114,15 @@ fn agree(dir: &Path, claims: &[ContributionId]) -> usize {
     nonempty
 }
 
+/// scripts/merge's findings check is `bracken findings` (task dea48fd16754), not a copy of its rules: the
+/// copy above is only the oracle now.
 #[test]
-fn the_oracle_is_still_what_scripts_merge_runs() {
+fn scripts_merge_reads_findings_and_keeps_no_copy() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for script in ["scripts/merge", ".claude/skills/agent-team-kickoff/templates/merge"] {
         let text = std::fs::read_to_string(root.join(script)).expect("readable");
-        assert!(
-            text.contains(OLD_CHECK),
-            "{script}'s findings check changed: it should read `bracken findings` now (task dea48fd16754); \
-             if it does, drop this guard and keep the oracle"
-        );
+        assert!(text.contains(r#"bk findings "$full" --triager "$triager" --json"#), "{script} reads findings");
+        assert!(!text.contains("current_tasks=") && !text.contains("verdicts="), "{script} keeps no copy of its rules");
     }
 }
 

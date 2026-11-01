@@ -253,7 +253,7 @@ enum Command {
     /// The merge gate's findings check for one claim: each finding with a contradicts link to it that still
     /// counts, and how the triager has dealt with it (untriaged, confirmed, deferred to a task, rejected).
     /// Untriaged and confirmed ones block the claim. The rules are `log --open`'s, for the claim itself, merged
-    /// or not; scripts/merge reads this (task `dea48fd16754`).
+    /// or not. scripts/merge's findings check is this command (task `dea48fd16754`).
     Findings {
         claim: String,
         /// The identity whose evidence triages findings.

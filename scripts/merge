@@ -236,45 +236,23 @@ else
   check FAIL gate "$status under $policy_text, not accepted"
 fi
 
-# 3. Findings: every contribution that contradicts the claim. A contradicts relation stops
-# counting only when it's retracted by the finding's author or the triager (a retract is always
-# by the relation's author), so no one else can drop a finding by retracting their own link to it.
-# `bracken log --open` (open_finding in crates/bracken/src/main.rs) mirrors these rules: change both.
-# It also treats a pr claim carrying the manager's 'merge gate' pass as merged, closing findings against
-# it; this check only looks at the PR it merges, so that doesn't arise here.
+# 3. Findings: `bracken findings` is the check, one definition shared with `bracken log --open`
+# (task dea48fd16754, docs/cli.md): every contribution with a contradicts relation to the claim that
+# isn't retracted and whose link still counts (live, or retracted by someone other than the finding's
+# author and the triager), each triaged from the triager's live evidence. Untriaged and confirmed
+# findings block; a confirmed one deferred to a current task of the triager's doesn't.
 triager=manager
-contradicts=$(jq -c --arg id "$full" '[.referrers[] | select(.kind == "relation"
-  and .body.kind == "contradicts" and .body.to == $id)]' <<<"$shown")
-findings=$(jq -r '[.[].body.from] | unique | .[]' <<<"$contradicts")
-untriaged=() undeferred=() deferred=() findings_count=0
-current_tasks=$(bk log --tag task --current --json) || fail "couldn't read the current tasks"
-for f in $findings; do
-  about=$(bk show "$f" --json) || fail "couldn't read finding $f, so the findings check can't decide"
-  [ "$(jq -r .retracted <<<"$about")" = false ] || continue
-  jq -e --arg f "$f" --arg by "$(jq -r .author <<<"$about")" --arg who "$triager" 'any(.[]; .body.from == $f
-    and (.retracted == false or (.author != $by and .author_name != $who)))' <<<"$contradicts" >/dev/null || continue
-  findings_count=$((findings_count + 1))
-  verdicts=$(jq -r --arg who "$triager" --arg f "$f" '[.referrers[] | select(.kind == "evidence"
-    and .retracted == false and .author_name == $who and .body.target == $f) | .body.verdict] | unique | join(" ")' <<<"$about")
-  case " $verdicts " in
-    "  ") untriaged+=("${f:0:12}"); continue ;;
-    *" pass "*) ;;
-    *) continue ;; # rejected: stays on record, doesn't block
-  esac
-  # Only the triager defers (process 4.2): both the depends_on relation and the task must be theirs,
-  # and the task current: not retracted, and not superseded by its author.
-  task=""
-  for t in $(jq -r --arg f "$f" --arg who "$triager" '.referrers[] | select(.kind == "relation"
-    and .retracted == false and .author_name == $who and .body.kind == "depends_on" and .body.to == $f)
-    | .body.from' <<<"$about"); do
-    if jq -e --arg t "$t" --arg who "$triager" 'any(.[]; .id == $t and .author_name == $who
-      and (.body.tags | index("deferred")))' <<<"$current_tasks" >/dev/null; then
-      task=$t
-      break
-    fi
-  done
-  if [ -n "$task" ]; then deferred+=("${f:0:12}->${task:0:12}"); else undeferred+=("${f:0:12}"); fi
+found=$(bk findings "$full" --triager "$triager" --json) ||
+  fail "couldn't read the findings against $full, so the findings check can't decide"
+findings_count=$(jq '.findings | length' <<<"$found")
+untriaged=() undeferred=() deferred=()
+for f in $(jq -r '.findings[] | select(.triage == "untriaged") | .id[:12]' <<<"$found"); do untriaged+=("$f"); done
+for f in $(jq -r '.findings[] | select(.triage == "confirmed") | .id[:12]' <<<"$found"); do undeferred+=("$f"); done
+for f in $(jq -r '.findings[] | select(.triage == "deferred") | "\(.id[:12])->\(.task[:12])"' <<<"$found"); do
+  deferred+=("$f")
 done
+[ "$(jq '.blocking' <<<"$found")" -eq $((${#untriaged[@]} + ${#undeferred[@]})) ] ||
+  fail "bracken findings' blocking count disagrees with its findings, so the findings check can't decide"
 if [ ${#untriaged[@]} -eq 0 ] && [ ${#undeferred[@]} -eq 0 ]; then
   findings_text="$findings_count against the claim, all triaged by $triager; confirmed and deferred: ${deferred[*]:-none}"
   check ok findings "$findings_text"
