@@ -8,8 +8,12 @@ run here:
   compared, hashed or ordered, not even with themselves (decision d1fc04a4f896), and whose `in` is answered here
   from their items. One exception, Python's own: a list, a tuple or `in` checks identity before `__eq__`, so one
   and the same proxy object, held twice by a test, matches itself there; every value got from the code is a new
-  proxy, so two never do (finding c9626960bb86). Only the package and its submodules ever become proxy modules,
-  and only when this process imports them (finding 734e5389e188).
+  proxy, so two never do (finding c9626960bb86). The code's exception classes and the package's modules aren't
+  proxies but the host's own, one for each name, and the server sends a name only for the object it gives there
+  and the first sent under it (decision 0f7f0b4b048b): within one server a name stands for one object, unless the
+  code rewrites its own server's state, which shares its process, the same limit as the server's every answer has
+  (findings 899e1616f407, a1e72cb9c89d). Only the package and its submodules ever become proxy modules, and only
+  when this process imports them (finding 734e5389e188).
 - an io.StringIO given to the code, or standard output or error redirected to one around a call, is given
   as a stream of the server's holding the same text, and holds what the code wrote to it there once the call
   returns or raises (task 6a80d88373a5).
@@ -167,19 +171,30 @@ def real_class(module, qualname):
 
 
 def exception_class(described, depth=0):
-    """The class standing here for the code's class `described`, [module, qualname, [bases described]]: one
-    for each, by name, with the mirrors of its bases as its own."""
+    """The class standing here for the code's class `described`, [module, qualname, [bases described], own]: one
+    for each name, with the mirrors of its bases as its own. A class the server sent with `own`, its generation
+    and handle, isn't the object its name gives there, or another was sent under that name first: it gets a class
+    of its own, never Python's of that name nor another of the code's (decision 0f7f0b4b048b). The first such class
+    the server sent under its module and qualname is kept by them, apart from the named ones, so a test's class of
+    it still catches it after a restart (finding 90ae40b8ad52); any later one by its generation and handle."""
     if depth > 64:
         raise GraderError("a class nested too deeply")
     module, qualname, bases = str(described[0]), str(described[1]), described[2]
-    real = real_class(module, qualname)
-    if real is not None:
-        return real
-    key = (module, qualname)
+    own = described[3] if len(described) > 3 else None
+    if own is None:
+        real = real_class(module, qualname)
+        if real is not None:
+            return real
+        key = (module, qualname)
+    elif len(own) > 2 and own[2] is True:
+        key = ("unnamed", module, qualname)
+    else:
+        key = ("own", int(own[0]), int(own[1]))
     if key not in classes:
         mirrored = []
         for base in bases:
-            if [str(base[0]), str(base[1])] in (["builtins", "object"], ["builtins", "BaseException"]):
+            root = [str(base[0]), str(base[1])] in (["builtins", "object"], ["builtins", "BaseException"])
+            if root and len(base) > 3 and base[3] is None:
                 continue
             cls = exception_class(base, depth + 1)
             if cls not in mirrored:

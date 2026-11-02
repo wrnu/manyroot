@@ -303,9 +303,13 @@ container with the code under test. `bracken-experiment run-tests --project
 
 **Not defended (finding `a1e72cb9c89d`, deferred to task `6202d01435a9`):**
 the grader's server is the code's own process, so the code can reach the
-server's sealed names through frames or `gc`, or replace builtins it uses;
-since no object of the code is compared (decision `d1fc04a4f896`), that can
-forge only a plain value the server reports, as any of its answers could.
+server's state: its names through `__main__`, its sealed copy of them
+through frames or `gc`, or the builtins it uses. That can forge anything the
+server reports: a plain value, as any of its answers could, or the name it
+sends for one of the code's exception classes or the package's modules, the
+only values of the code's besides plain ones that compare, so that two of
+them match as one (decision `0f7f0b4b048b`, finding `899e1616f407`). A proxy
+stays out of its reach: it is never compared.
 
 A run's plan records the image, by digest, and its Python's version
 (`python`), and every run of agent code pins it from there again, refused
@@ -364,20 +368,26 @@ message. The tests and the code under test never share a process:
 - **An exception** comes back as its class, with its module, name and
   bases. The host raises one class per class of the code's, of that name,
   whose bases are the mirrors of its bases, so `issubclass` holds along the
-  code's own hierarchy. A class of Python's own, builtin or of the standard
+  code's own hierarchy. A class goes by its name only if it is the object
+  its module and name give in the server, and the first sent under that
+  name; any other gets a class of its own, never Python's of that name nor
+  another of the code's (decision `0f7f0b4b048b`): one class for the
+  server's life, however often it comes, and the first such under its module
+  and name carries across a restart by them, as a named class does (finding
+  `90ae40b8ad52`). A class of Python's own, builtin or of the standard
   library, is raised as itself, but strictly: only from a module the host
-  has already loaded, the name walked through classes only, and only a
-  class whose own module and name are the ones claimed (finding
-  `d1f7d7880644`). One whose constructor takes other arguments, such as
-  `json.JSONDecodeError`, is made with the message as its arguments
-  (finding `ed723694b473`). So `assertRaises` with the package's class
-  or one of its bases, a builtin or a standard library class works, and so
-  do checks of the class's name (answer `c473d137f5b7`, finding
-  `621c185d3e6f`). Never as themselves: `StopIteration`,
-  `StopAsyncIteration` and anything of `unittest`, which would stop the
-  host's iterator or skip a test (finding `d077f100ac33`). The exception
-  keeps its own attributes that are plain data or the package's objects,
-  such as a parse error's line (task `6a80d88373a5`).
+  has already loaded, the name walked through classes only, and only a class
+  whose own module and name are the ones claimed (finding `d1f7d7880644`).
+  One whose constructor takes other arguments, such as
+  `json.JSONDecodeError`, is made with the message as its arguments (finding
+  `ed723694b473`). So `assertRaises` with the package's class or one of its
+  bases, a builtin or a standard library class works, and so do checks of
+  the class's name (answer `c473d137f5b7`, finding `621c185d3e6f`). Never as
+  themselves: `StopIteration`, `StopAsyncIteration` and anything of
+  `unittest`, which would stop the host's iterator or skip a test (finding
+  `d077f100ac33`). The exception keeps its own attributes that are plain
+  data or the package's objects, such as a parse error's line (task
+  `6a80d88373a5`).
 - **Operators and equality:** the code's own operators never answer a
   test's check of a value (finding `c823af485f19`). Arithmetic, reflected
   and unary operators on the code's objects are done by the code, and their
@@ -398,16 +408,34 @@ message. The tests and the code under test never share a process:
   each type checked by identity (a subclass, of int or str too, is never
   plain). Such a value the code gives back, an attribute's, a method's,
   `str()`'s or `repr()`'s, comes to the host as data, and is compared there.
-  Anything else stays the code's, a proxy, and equality, ordering or
-  hashing with one raises in the test, never answering: against another of
-  the code's objects, itself, or a plain value, or inside a plain
-  container. The one exception is Python's own (finding `c9626960bb86`): a
-  list's or a tuple's comparison and `in` check identity before `__eq__`,
-  so one and the same proxy object, held twice by a test, matches itself
-  there: `[p] == [p]`, `(p,) == (p,)` and `p in [p]` are true. Every value
-  got from the code is a new proxy, so two never match, not even two got
-  from the same object, and the code can't make a test pass this way. A
-  builtin type is known by identity alone, among Python's own
+  Anything else stays the code's, a proxy, and equality, ordering or hashing
+  with one raises in the test, never answering: against another of the
+  code's objects, itself, or a plain value, or inside a plain container. The
+  one exception for a proxy is Python's own (finding `c9626960bb86`): a
+  list's or a tuple's comparison and `in` check identity before `__eq__`, so
+  one and the same proxy object, held twice by a test, matches itself there:
+  `[p] == [p]`, `(p,) == (p,)` and `p in [p]` are true. Every value got from
+  the code is a new proxy, so two never match, not even two got from the
+  same object: the code can't make a test pass this way with a proxy. Two
+  kinds of the code's values aren't proxies, as `assertRaises`, `except` and
+  `import` need them to be the host's own: its exception classes and the
+  package's modules. The host keeps one of each for a name, a module only
+  once this process has imported it (another is a new module each time it
+  comes, finding `e611253cfb91`), and they compare by identity, so within
+  one server one name stands for one object (decision `0f7f0b4b048b`): a
+  class or a module goes by its name only if it is the object that name
+  gives there, by its module and qualified name or by `sys.modules`, and the
+  first sent under it. Otherwise a module is a proxy, and a class is one of
+  its own, matching nothing else, one class for the server's life however
+  often it comes. So two of them match only when they are one object in the
+  server, with two residuals. A name carries across a server's restart, as a
+  test file binds the code's classes when it imports them, so code that ends
+  its own server between two fetches can have two objects, one in each
+  generation, match as one. And the server is the code's own process: code
+  that rewrites the server's state, such as its record of names
+  (`__main__`'s), can send any object under any name, as it could forge any
+  plain value the server reports (finding `899e1616f407`; "Not defended"
+  above). A builtin type is known by identity alone, among Python's own
   types taken before any of the code is imported, never by `in`, a hash or
   `==`, nor by a class's `__module__` (findings `98fb18bf3e9c`,
   `a2c5943deae7`). The server's functions run over a copy of its names, and
