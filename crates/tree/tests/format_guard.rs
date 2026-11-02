@@ -8,8 +8,8 @@
 use std::collections::BTreeMap;
 
 use bracken_tree::format::{
-    self, DECISION_MEDIA_TYPE, FILE_MEDIA_TYPE, LINE_MEDIA_TYPE, MANIFEST_MEDIA_TYPE, MARKER_MEDIA_TYPE,
-    MAX_REFERENCES, PROPOSAL_MEDIA_TYPE, RESOLUTION_MEDIA_TYPE, from_cbor, parse_method, to_cbor,
+    self, DECISION_MEDIA_TYPE, Executor, ExecutorKind, FILE_MEDIA_TYPE, LINE_MEDIA_TYPE, MANIFEST_MEDIA_TYPE,
+    MARKER_MEDIA_TYPE, MAX_REFERENCES, PROPOSAL_MEDIA_TYPE, RESOLUTION_MEDIA_TYPE, from_cbor, parse_method, to_cbor,
 };
 use bracken_tree::{
     Answer, Breakage, Change, CheckDefinition, ContentHash, Decision, Disposition, Entry, FileValue, FormatError,
@@ -59,6 +59,7 @@ fn line() -> Line {
         validators: vec![agent(0xa2)],
         goal_setters: vec![agent(0xa3)],
         checks,
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known: 3, max_age: 5, protected: vec!["crates/manyroot".to_owned()] },
         owner_decision: Some("46b91e01edc2".to_owned()),
     }
@@ -188,6 +189,7 @@ fn every_record_round_trips() {
     round_trip(Marker { in_place: Some(id(9)), ..marker() });
     round_trip(line());
     round_trip(Line { owner_decision: None, ..line() });
+    round_trip(with_executor());
     round_trip(decision());
     round_trip(Decision { source: None, ..decision() });
     round_trip(proposal());
@@ -323,6 +325,65 @@ fn line_rules() {
 
     let blank_owner = Line { owner_decision: Some(" ".to_owned()), ..line() };
     assert_eq!(Line::decode(&blank_owner.encode()), Err(FormatError::Blank("owner_decision")));
+
+    // An executor names one of the line's checks, and a relative path inside the runner directory.
+    let mut stray = with_executor();
+    let e = stray.executors.remove("test").expect("the executor");
+    stray.executors.insert("lint".to_owned(), e.clone());
+    assert_eq!(Line::decode(&stray.encode()), Err(FormatError::ExecutorWithoutCheck("lint".to_owned())));
+    for script in ["/usr/bin/true", "../scripts/test-table", "scripts/../test-table", ""] {
+        let mut outside = with_executor();
+        outside.executors.insert("test".to_owned(), Executor { script: script.to_owned(), ..e.clone() });
+        assert!(matches!(Line::decode(&outside.encode()), Err(FormatError::Path { .. })), "{script:?}");
+    }
+}
+
+fn executor(kind: ExecutorKind, script: &str, hash: &[u8]) -> Executor {
+    Executor { kind, script: script.to_owned(), script_hash: ContentHash::of(hash) }
+}
+
+/// [`line`] with its test check run in a box.
+fn with_executor() -> Line {
+    let mut l = line();
+    l.executors.insert("test".to_owned(), executor(ExecutorKind::Box, "scripts/test-table", b"the table"));
+    l
+}
+
+// Plan cc496dcee0e3, section 2: a line without executors encodes as before the field existed, so every
+// recorded policy and the weave-v1 fixtures stay valid, and a line with one encodes the field, so a
+// build that doesn't know it refuses the line rather than run its box check in the sandbox.
+#[test]
+fn executors_are_left_out_when_there_are_none() {
+    let plain = line().encode();
+    let value: Value = ciborium::from_reader(plain.as_slice()).expect("CBOR");
+    let keys: Vec<String> =
+        value.as_map().expect("a map").iter().map(|(k, _)| k.as_text().expect("text keys").to_owned()).collect();
+    assert!(!keys.iter().any(|k| k == "executors"), "{keys:?}");
+
+    let value: Value = ciborium::from_reader(with_executor().encode().as_slice()).expect("CBOR");
+    assert!(value.as_map().expect("a map").iter().any(|(k, _)| k.as_text() == Some("executors")));
+}
+
+// An executor is part of what a result is for: its kind, script and pinned hash change the method.
+#[test]
+fn a_checks_definition_hash_changes_with_its_executor() {
+    let argv = vec!["--weave-box".to_owned()];
+    let plain = CheckDefinition { name: "table", argv: &argv, executor: None };
+    let boxed = executor(ExecutorKind::Box, "scripts/test-table", b"one");
+    let on = |e: &Executor| CheckDefinition { name: "table", argv: &argv, executor: Some(e) }.hash();
+    assert_ne!(plain.hash(), on(&boxed), "the same argv run in a box is another check");
+    assert_ne!(on(&boxed), on(&executor(ExecutorKind::Mac, "scripts/test-table", b"one")), "kind");
+    assert_ne!(on(&boxed), on(&executor(ExecutorKind::Box, "scripts/other", b"one")), "script");
+    assert_ne!(on(&boxed), on(&executor(ExecutorKind::Box, "scripts/test-table", b"two")), "pinned hash");
+    assert_eq!(on(&boxed), on(&boxed.clone()));
+    // Without one, the hash is the old one: [name, argv].
+    assert_eq!(plain.hash(), ContentHash::of(&to_cbor(&("table", &argv))));
+    // The line gives each check its own definition.
+    let l = with_executor();
+    assert_eq!(l.definition("test").and_then(|d| d.executor), l.executors.get("test"));
+    assert_eq!(l.definition("fmt").and_then(|d| d.executor), None);
+    assert_ne!(l.check_method("test"), line().check_method("test"));
+    assert_eq!(l.check_method("fmt"), line().check_method("fmt"));
 }
 
 /// Finding 1873f4834edd: a decision may refer to at most MAX_REFERENCES contributions in all.
@@ -443,15 +504,15 @@ fn a_checks_definition_hash_changes_with_its_argv() {
     let argv = |words: &[&str]| words.iter().map(|w| w.to_string()).collect::<Vec<_>>();
     let test = argv(&["cargo", "test", "--workspace"]);
     let fmt = argv(&["cargo", "fmt", "--check"]);
-    let a = CheckDefinition { name: "test", argv: &test };
-    let b = CheckDefinition { name: "test", argv: &fmt };
-    let c = CheckDefinition { name: "fmt", argv: &fmt };
+    let a = CheckDefinition { name: "test", argv: &test, executor: None };
+    let b = CheckDefinition { name: "test", argv: &fmt, executor: None };
+    let c = CheckDefinition { name: "fmt", argv: &fmt, executor: None };
     assert_ne!(a.hash(), b.hash(), "same name, different argv");
     assert_ne!(b.hash(), c.hash(), "same argv, different name");
-    assert_eq!(a.hash(), CheckDefinition { name: "test", argv: &test.clone() }.hash());
+    assert_eq!(a.hash(), CheckDefinition { name: "test", argv: &test.clone(), executor: None }.hash());
     // Splitting words differently is a different definition.
     let joined = argv(&["cargo", "test --workspace"]);
-    assert_ne!(a.hash(), CheckDefinition { name: "test", argv: &joined }.hash());
+    assert_ne!(a.hash(), CheckDefinition { name: "test", argv: &joined, executor: None }.hash());
 
     assert_eq!(a.method(), format!("test {}", a.hash()));
     assert_eq!(parse_method(&a.method()), Some(("test", a.hash())));

@@ -273,6 +273,7 @@ pub(crate) fn init(dir: Option<&Path>, agent: Option<&str>, purpose: String, out
         validators: vec![],
         goal_setters: vec![who.agent_id()],
         checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
         owner_decision: None,
     };
@@ -606,6 +607,7 @@ fn integrate(
         );
     }
     let lines = lines_for(s, &ix, &[line]);
+    refuse_unreadable(&lines, "integrate")?;
     let line = resolve_line(s, &lines, line, "--line")?;
     let who = super::signer(s, agent)?;
     let parents = lines.heads(&line);
@@ -797,11 +799,31 @@ pub(crate) fn lines_for(s: &Store, ix: &Index, given: &[Option<&str>]) -> Lines 
 /// how many rule-5 questions it asked, so a test can check what a command pays for a line it doesn't name.
 pub(crate) fn judged_for<'a>(s: &Store, ix: &Index, pick: impl FnOnce(&Lines) -> Vec<ContributionId> + 'a) -> Lines {
     let lines = Lines::build_for(s.graph(), ix, pick);
+    if let Some(first) = lines.unreadable_versions().first() {
+        eprintln!(
+            "bracken: warning: {} line version(s) here, such as {first}, don't decode with this build, so a line may be \
+             read under an older version of its policy: upgrade bracken (docs/releases.md)",
+            lines.unreadable_versions().len()
+        );
+    }
     if std::env::var_os("BRACKEN_WEAVE_STATS").is_some() {
         let questions = lines.obligation_stats().questions;
         eprintln!("weave stats: {} decisions judged, {questions} questions", lines.judged_count());
     }
     lines
+}
+
+/// Refuses to run checks or move a line while a line version here doesn't decode with this build: its
+/// predecessor would stand in for it (finding 5d50422b9e11).
+pub(crate) fn refuse_unreadable(lines: &Lines, what: &str) -> Result<()> {
+    if let Some(first) = lines.unreadable_versions().first() {
+        bail!(
+            "{} line version(s) here, such as {first}, don't decode with this build, so {what} could act under an older \
+             policy than the one in force; nothing was done: upgrade bracken (docs/releases.md)",
+            lines.unreadable_versions().len()
+        );
+    }
+    Ok(())
 }
 
 fn resolve_line(s: &Store, lines: &Lines, given: Option<&str>, what: &str) -> Result<ContributionId> {

@@ -69,6 +69,27 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-10-31: Weave line policies gain executors
+
+Task `7fbf11b1a6a5` (plan `cc496dcee0e3`, part one). A line policy has an
+optional `executors` field, naming the checks that run in a box or on the
+Mac through a pinned runner script.
+
+- **Existing Grounds open unchanged.** The field is left out when empty, so
+  every existing line version, and the `weave-v1` fixture, encodes and
+  hashes as before.
+- **Upgrade every reader first, and never roll back.** A line version with
+  executors doesn't decode with a build from before this change, and such a
+  build skips it silently: it reads the line under the version before, with
+  no executors, and could count results or move the line under a policy no
+  longer in force (finding `5d50422b9e11`). So before anyone writes a policy
+  with executors, every binary that reads a Weave Ground, the pinned
+  `.bracken-bin` one and `~/bracken-weave`'s included, must be at least this
+  version, and none is ever reinstalled below it, the rollback above
+  included. From this version on, a line version that doesn't decode is
+  reported, and `validate`, `integrate`, `line policy` and `line merge`
+  refuse until the binary is upgraded.
+
 ### 2026-10-31: Weave merges text files line by line
 
 Task `7cbd0a0ce7d0` (design `68b57f9aed6d`, answers `c8a511445626` and `55e0a67c68a2`). Not a format change: no record, field or validity rule changes, and views never recompute a merge, so every existing Weave Ground opens and means what it did.

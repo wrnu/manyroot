@@ -188,6 +188,7 @@ fn policy(integrators: &[&Identity]) -> Line {
         validators: vec![],
         goal_setters: vec![],
         checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
         owner_decision: Some("decision 0123456789ab".into()),
     }

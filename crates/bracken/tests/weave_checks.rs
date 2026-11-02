@@ -587,4 +587,206 @@ mod macos_only {
             "outside the rustup home's toolchains",
         );
     }
+
+    // Plan cc496dcee0e3, section 2: a box check runs the pinned runner script on a bundle of the manifest's
+    // commit, and its result names the commit, tree, bundle, box and output; a mac check runs in the
+    // commit's checkout with the clean environment, given the box's output. A run that names another commit
+    // is refused with nothing recorded, and so is a runner script that isn't the one the policy pins.
+    #[test]
+    fn box_and_mac_checks_run_the_pinned_script_on_the_manifests_commit() {
+        // b.txt is tracked though the tree's .gitignore names it: the manifest's commit holds it still.
+        let w = Weave::new(&[("a.txt", "one\n"), (".gitignore", "b.txt\n")]);
+        fs::write(w.repo.join("b.txt"), "two\n").expect("write b.txt");
+        w.git(&["add", "-f", "b.txt"]);
+        w.git(&["commit", "-q", "-m", "b"]);
+        let runner = w.outside_checks();
+        let hash = w.integrate();
+        let dir = runner.to_str().expect("UTF-8");
+        let validate = |checks: &[&str]| -> Value {
+            let mut args = vec!["weave", "validate", "--manifest", &hash, "--runner", dir, "--as", VAL, "--json"];
+            for c in checks {
+                args.extend(["--check", c]);
+            }
+            let out = w.run(&args);
+            let mut json: Value = serde_json::from_slice(&out.stdout).unwrap_or(Value::Null);
+            json["stderr"] = String::from_utf8_lossy(&out.stderr).into_owned().into();
+            json
+        };
+
+        // Without --runner, nothing runs.
+        let before = w.contributions();
+        let err = w.fails(&["weave", "validate", "--manifest", &hash, "--check", "table", "--as", VAL]);
+        assert!(err.contains("needs --runner"), "{err}");
+        assert_eq!(w.contributions(), before);
+
+        // The mac check is given first but runs after the box's, with its output.
+        let out = validate(&["mac", "table"]);
+        let results = out["results"].as_array().expect("results");
+        assert_eq!(results.len(), 2, "{out}");
+        let (table, mac) = (&results[0], &results[1]);
+        assert_eq!((table["check"].as_str(), mac["check"].as_str()), (Some("table"), Some("mac")), "{out}");
+        let details_of = |r: &Value| w.show(r["evidence"].as_str().unwrap())["body"]["details"].clone();
+        assert!(table["passed"].as_bool().unwrap(), "{}", details_of(table));
+        assert!(mac["passed"].as_bool().unwrap(), "{}", details_of(mac));
+        assert_eq!(table["box"], "bx_test1");
+        assert_eq!(table["commit"], mac["commit"], "both ran on the manifest's one commit");
+        let evidence = w.show(table["evidence"].as_str().unwrap());
+        let details = evidence["body"]["details"].as_str().expect("details");
+        let commit = table["commit"].as_str().unwrap();
+        for line in [
+            format!("commit {commit}"),
+            format!("tree {}", table["tree"].as_str().unwrap()),
+            format!("bundle sha256:{}", table["bundle_sha256"].as_str().unwrap()),
+            "box bx_test1".to_owned(),
+            "cost exit 0 · $0.01".to_owned(),
+        ] {
+            assert!(details.lines().any(|l| l == line), "{line:?} in {details}");
+        }
+        assert!(details.starts_with(&format!("{hash}\nattempt 1\n")), "{details}");
+        // The output is recorded whole, and hashes as the details say.
+        let log = w.show(table["log"].as_str().expect("a log artifact"));
+        assert_eq!(log["body"]["media_type"], "text/plain");
+        let log_line = details.lines().find(|l| l.starts_with("log ")).expect("a log line");
+        assert!(log_line.ends_with(table["log_hash"].as_str().unwrap()), "{log_line}");
+
+        // A run that names another commit can't stand for the manifest: nothing is recorded.
+        let before = w.contributions();
+        let err = w.fails(&["weave", "validate", "--manifest", &hash, "--check", "lie", "--runner", dir, "--as", VAL]);
+        assert!(err.contains("can't be tied to the manifest"), "{err}");
+        assert_eq!(w.contributions(), before);
+
+        // A failing run is recorded as a fail, with its proof.
+        let out = validate(&["fail"]);
+        assert_eq!(out["results"][0]["passed"], false, "{out}");
+        // A box run that exits 0 without its end line fails (task 58fb9682135e).
+        let out = validate(&["noend"]);
+        assert_eq!(out["results"][0]["passed"], false, "{out}");
+        assert!(details_of(&out["results"][0]).as_str().unwrap().contains("\nend missing\n"), "{out}");
+        // Output over what an artifact may hold: the result is recorded, its log withheld as its size
+        // (finding 2e9d57852ec7).
+        let out = validate(&["big"]);
+        let big = &out["results"][0];
+        assert_eq!(big["passed"], true, "{out}");
+        assert!(big["log"].is_null(), "{out}");
+        let details = details_of(big);
+        let details = details.as_str().unwrap();
+        // Its size and the whole output's hash, though only the last bytes were kept (finding 0fb11da198a5).
+        let mut output = vec![b'y'; 17_000_000];
+        output.extend_from_slice(b"\nthe big box's end\n");
+        let whole = bracken_tree::ContentHash::of(&output);
+        assert!(
+            details.contains(&format!("log withheld: {} bytes, {whole}, over the", output.len())),
+            "{details:.400}"
+        );
+        assert_eq!(big["log_hash"], whole.to_string());
+        assert!(details.ends_with("the big box's end\n"), "the tail is still recorded");
+
+        // A mac check on a manifest with no passing box result here doesn't run (finding ee89e79fbcc1).
+        w.git(&["commit", "-q", "--allow-empty", "-m", "another"]);
+        fs::write(w.repo.join("c.txt"), "three\n").expect("write");
+        w.git(&["add", "c.txt"]);
+        w.git(&["commit", "-q", "-m", "c"]);
+        let other = w.integrate();
+        let before = w.contributions();
+        let err = w.fails(&["weave", "validate", "--manifest", &other, "--check", "mac", "--runner", dir, "--as", VAL]);
+        assert!(err.contains("no box lists to compare with"), "{err}");
+        assert_eq!(w.contributions(), before);
+
+        // The script changed since the policy pinned it: nothing runs.
+        fs::write(runner.join("run.sh"), format!("{RUNNER}\n# changed\n")).expect("write");
+        let before = w.contributions();
+        let err = w.fails(&[
+            "weave",
+            "validate",
+            "--manifest",
+            &hash,
+            "--check",
+            "table",
+            "--again",
+            "--runner",
+            dir,
+            "--as",
+            VAL,
+        ]);
+        assert!(err.contains("the policy pins"), "{err}");
+        assert_eq!(w.contributions(), before);
+
+        // integrate --run leaves box and mac checks to validate.
+        let out: Value =
+            serde_json::from_str(&w.ok(&["weave", "integrate", "--run", "--as", AS, "--json"])).expect("JSON");
+        assert_eq!(out["results"].as_array().map(Vec::len).unwrap_or(0), 0, "{out}");
+    }
+}
+
+/// A runner script standing in for scripts/test-table's --weave-box and --weave-mac (plan cc496dcee0e3):
+/// `box` checks the bundle as the box does and writes what a box would print, `mac` checks it got the
+/// box's log and runs in the manifest's checkout, `lie` names another commit, and `fail` fails.
+#[cfg(target_os = "macos")]
+const RUNNER: &str = r#"#!/bin/bash
+set -eu
+case "$1" in
+  box)
+    [ "$(shasum -a 256 "$WEAVE_BUNDLE" | cut -d' ' -f1)" = "$WEAVE_BUNDLE_SHA256" ] || exit 9
+    d=$(mktemp -d)
+    git -C "$d" init -q
+    git -C "$d" fetch -q "$WEAVE_BUNDLE" weave:tested
+    printf 'bundle %s\nhead %s\ntree %s\nbox bx_test1\ncost exit 0 · $0.01\nend seen\n' "$WEAVE_BUNDLE_SHA256" \
+      "$(git -C "$d" rev-parse tested)" "$(git -C "$d" rev-parse 'tested^{tree}')" >>"$WEAVE_FACTS"
+    echo "the box listed its tests" ;;
+  noend)
+    printf 'bundle %s\nhead %s\ntree %s\nbox bx_test3\n' "$WEAVE_BUNDLE_SHA256" "$WEAVE_COMMIT" "$WEAVE_TREE" >>"$WEAVE_FACTS" ;;
+  big)
+    printf 'bundle %s\nhead %s\ntree %s\nbox bx_test4\nend seen\n' "$WEAVE_BUNDLE_SHA256" "$WEAVE_COMMIT" "$WEAVE_TREE" >>"$WEAVE_FACTS"
+    head -c 17000000 /dev/zero | tr '\0' 'y'
+    echo
+    echo "the big box's end" ;;
+  mac)
+    printf 'head %s\ntree %s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" >>"$WEAVE_FACTS"
+    grep -q 'the box listed its tests' "$WEAVE_INPUTS/table.log" || { echo "no box log"; exit 3; }
+    [ -z "${BRACKEN_PROBE:-}" ] || { echo "saw BRACKEN_PROBE"; exit 5; }
+    [ "$(cat a.txt b.txt)" = "one
+two" ] || { echo "not the manifest's files"; exit 6; }
+    echo "mac ok" ;;
+  lie)
+    printf 'head %s\ntree %s\n' 0123456789012345678901234567890123456789 "$WEAVE_TREE" >>"$WEAVE_FACTS" ;;
+  fail)
+    printf 'bundle %s\nhead %s\ntree %s\nbox bx_test2\n' "$WEAVE_BUNDLE_SHA256" "$WEAVE_COMMIT" "$WEAVE_TREE" >>"$WEAVE_FACTS"
+    echo "a test failed"
+    exit 1 ;;
+esac
+"#;
+
+#[cfg(target_os = "macos")]
+impl Weave {
+    /// The runner directory, holding [`RUNNER`] as run.sh, and line main's checks: `table` in a box,
+    /// `mac` on this Mac, `lie` and `fail` in a box, all through run.sh.
+    fn outside_checks(&self) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let runner = self.base().join("runner");
+        fs::create_dir(&runner).expect("mkdir runner");
+        fs::write(runner.join("run.sh"), RUNNER).expect("write run.sh");
+        fs::set_permissions(runner.join("run.sh"), fs::Permissions::from_mode(0o755)).expect("chmod run.sh");
+        let mut args: Vec<String> =
+            ["weave", "line", "policy", "main", "--clear", "checks", "--validator", VAL].map(String::from).to_vec();
+        for (name, argv, kind) in [
+            ("table", "box", "box"),
+            ("mac", "mac", "mac"),
+            ("lie", "lie", "box"),
+            ("fail", "fail", "box"),
+            ("noend", "noend", "box"),
+            ("big", "big", "box"),
+        ] {
+            args.extend([
+                "--check".to_owned(),
+                format!("{name}={argv}"),
+                "--executor".to_owned(),
+                format!("{name}={kind}:run.sh"),
+            ]);
+        }
+        args.extend(
+            ["--runner", runner.to_str().expect("UTF-8"), "--owner-decision", OD, "--as", AS].map(String::from),
+        );
+        self.ok(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        runner
+    }
 }

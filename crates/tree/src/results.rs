@@ -30,7 +30,7 @@ use manyroot::{AgentId, ContributionId, Graph};
 
 use crate::ancestry::{self, Ancestry, Stats};
 use crate::check::{Exit, RecordedTail};
-use crate::format::{CheckDefinition, Line};
+use crate::format::Line;
 use crate::ground::Index;
 use crate::hash::ContentHash;
 use crate::lines::Lines;
@@ -64,6 +64,27 @@ pub fn details(manifest: &ContentHash, attempt: u64, argv: &[String], exit: &Exi
         }
     };
     format!("{manifest}\nattempt {attempt}\nargv {argv:?}\n{exit}\n\n{tail}")
+}
+
+/// [`details`] for a check that ran outside the sandbox: `run`'s lines (the commit, tree, bundle, box
+/// and log) come after the exit, before the blank line and the tail, so [`parse_details`] reads it as
+/// it reads any result.
+pub fn details_with_run(
+    manifest: &ContentHash,
+    attempt: u64,
+    argv: &[String],
+    exit: &Exit,
+    run: &[String],
+    tail: &RecordedTail,
+) -> String {
+    let tail = match tail {
+        RecordedTail::Text(text) => text.clone(),
+        RecordedTail::Withheld { size, hash, rule } => {
+            format!("output withheld: {size} bytes, {hash}, as it matched {rule}")
+        }
+    };
+    let run: String = run.iter().map(|l| format!("{l}\n")).collect();
+    format!("{manifest}\nattempt {attempt}\nargv {argv:?}\n{exit}\n{run}\n{tail}")
 }
 
 /// The manifest hash and the attempt number a result's details start with, if they are in
@@ -299,10 +320,9 @@ impl Checks {
         let in_epoch = |r: &ContributionId| answer(&self.epochs, &self.epoch_misses, g, version, r);
         let validators: BTreeSet<&AgentId> = policy.validators.iter().filter(|v| *v != author).collect();
         policy
-            .checks
-            .iter()
-            .map(|(name, argv)| {
-                let method = CheckDefinition { name, argv }.method();
+            .definitions()
+            .map(|definition| {
+                let (name, method) = (definition.name, definition.method());
                 let per_validator = validators.iter().map(|v| {
                     let key = (**v, *manifest, method.clone());
                     let eligible = |list: Option<&Vec<ContributionId>>| -> Vec<ContributionId> {
@@ -354,16 +374,15 @@ impl Checks {
                 let Some((_, _, policy, author, manifest)) = q else { return vec![] };
                 let validators: BTreeSet<&AgentId> = policy.validators.iter().filter(|v| *v != author).collect();
                 policy
-                    .checks
-                    .iter()
-                    .map(|(name, argv)| {
-                        let method = CheckDefinition { name, argv }.method();
+                    .definitions()
+                    .map(|definition| {
+                        let (name, method) = (definition.name, definition.method());
                         let keys = validators
                             .iter()
                             .map(|v| (**v, *manifest, method.clone()))
                             .filter(|k| self.by_key.contains_key(k))
                             .collect();
-                        (name.clone(), method, keys)
+                        (name.to_owned(), method, keys)
                     })
                     .collect()
             })

@@ -166,6 +166,12 @@ pub struct Lines {
     default_line: Option<ContributionId>,
     /// Policy versions ignored for want of an owner decision.
     ignored: Vec<ContributionId>,
+    /// Line artifacts, not retracted, that don't decode with this build and would be a policy change if
+    /// they did: a version a newer build wrote, such as one with a field this build doesn't know
+    /// (finding 5d50422b9e11), superseding a known version as a policy change does. Their lines read as
+    /// if they weren't there, so the commands that judge lines say so. One that would change no line
+    /// here is left to `weave check` (finding e89cf76e9ea2).
+    unreadable: Vec<ContributionId>,
     /// What answering the chain questions did.
     stats: Stats,
     /// Every objection, and what rules 5 and 6 read of each decision.
@@ -232,16 +238,18 @@ impl Lines {
 
     fn build_with(g: &Graph, ix: &Index, walking: bool, pick: Option<Pick<'_>>) -> Lines {
         let mut lines = Lines::default();
+        let mut undecoded = Vec::new();
         let order = g.topo_order();
         for id in &order {
             let c = g.get(id).expect("listed by the graph");
             let Body::Artifact { media_type, content, .. } = c.body() else { continue };
             match media_type.as_str() {
-                LINE_MEDIA_TYPE if !g.is_retracted(id) => {
-                    if let Ok(policy) = Line::decode(content) {
+                LINE_MEDIA_TYPE if !g.is_retracted(id) => match Line::decode(content) {
+                    Ok(policy) => {
                         lines.versions.insert(*id, Version { id: *id, author: c.author(), policy });
                     }
-                }
+                    Err(_) => undecoded.push(*id),
+                },
                 PROPOSAL_MEDIA_TYPE => {
                     if let Ok(proposal) = Proposal::decode(content) {
                         if g.is_retracted(id) {
@@ -298,6 +306,21 @@ impl Lines {
             links.retain(|_, list| !list.is_empty());
         }
         lines.ignored = ignored.into_iter().collect();
+        // An undecodable artifact counts only where it would displace a version, by the rule above: it
+        // supersedes a counted version of its own author's, in a relation that author signed.
+        lines.unreadable = undecoded
+            .into_iter()
+            .filter(|id| {
+                let author = g.get(id).expect("listed by the graph").author();
+                g.referrers(id).any(|r| {
+                    matches!(r.body(), Body::Relation { from, kind: RelationKind::Supersedes, to, .. }
+                        if from == id
+                            && lines.versions.get(to).is_some_and(|old| old.author == author)
+                            && r.author() == author
+                            && !g.is_retracted(&r.id()))
+                })
+            })
+            .collect();
         if let Some(pick) = pick {
             lines.restrict(g, ix, pick);
         }
@@ -841,6 +864,12 @@ impl Lines {
     /// the main line weave init writes; ascending.
     pub fn ignored_versions(&self) -> &[ContributionId] {
         &self.ignored
+    }
+
+    /// Line artifacts, not retracted, that this build can't decode, in causal order: while there are
+    /// any, a line may be read under an older version of its policy than the one in force.
+    pub fn unreadable_versions(&self) -> &[ContributionId] {
+        &self.unreadable
     }
 
     /// The line's current policy: the version of its chain no other in the replica supersedes. Several

@@ -256,6 +256,7 @@ fn two_integrators_fork_the_line_and_a_merge_settles_it() {
         validators: vec![],
         goal_setters: vec![alice.parse().expect("a key")],
         checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
         owner_decision: Some("decision 0123456789ab".into()),
     };
@@ -421,6 +422,7 @@ fn a_line_is_created_and_changed_only_with_an_owner_decision_and_by_its_author()
         validators: vec![],
         goal_setters: vec![],
         checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
         owner_decision: None,
     };
@@ -1043,6 +1045,7 @@ fn line_policy_on_a_diverged_chain_needs_from() {
         validators: vec![alice.parse().expect("a key")],
         goal_setters: vec![alice.parse().expect("a key")],
         checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
         owner_decision: Some(OD.into()),
     };
@@ -1255,4 +1258,51 @@ fn integrate_mirrors_a_commit_only_when_the_merge_equals_its_tree() {
     // --mirrors goes with --proposals only.
     let err = w.fails(&["weave", "integrate", "--mirrors", "HEAD", "--as", AS]);
     assert!(err.contains("--proposals"), "{err}");
+}
+
+// Finding 5d50422b9e11: a line artifact this build can't decode (one a newer build wrote, with a field
+// this one doesn't know) that supersedes a version as a policy change does would leave its line read
+// under the version before it. Every read of the lines says so, and integrate refuses, writing nothing.
+// One that changes no line, a stray or one whose supersedes the version's author didn't sign, is listed
+// by weave check only, and blocks nothing (finding e89cf76e9ea2).
+#[test]
+fn a_line_version_that_doesnt_decode_is_reported_and_integrate_refuses() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    let line = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the line").to_owned();
+    let file = w.tmp.path().join("future.cbor");
+    fs::write(&file, b"a policy from a newer build").expect("write");
+    let out = w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", LINE_MEDIA_TYPE, "--as", AS]);
+    let future = out.trim().strip_prefix("artifact ").expect("labelled").to_owned();
+
+    // A stray, and one superseding the line in a relation by someone else: nothing is refused.
+    let quiet = |what: &str| {
+        let out = w.run_on(&w.ground, &["weave", "head", "--json"]);
+        assert!(out.status.success());
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("don't decode"), "{what}: {stderr}");
+    };
+    quiet("a stray");
+    let other = w.ok(&["id", "new", "mallory"]).trim().to_owned();
+    assert!(!other.is_empty());
+    w.ok(&["relate", &future, "supersedes", &line, "--as", "mallory"]);
+    quiet("superseding in another's relation");
+    w.commit("a.txt", b"one and a half\n");
+    w.ok(&["weave", "integrate", "--as", AS]);
+
+    // The line's author supersedes the line with it: now it may be the version in force.
+    w.ok(&["relate", &future, "supersedes", &line, "--as", AS]);
+    let out = w.run_on(&w.ground, &["weave", "head", "--json"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("don't decode with this build") && stderr.contains(&future), "{stderr}");
+
+    w.commit("a.txt", b"two\n");
+    let before = w.contributions();
+    let err = w.fails(&["weave", "integrate", "--as", AS]);
+    assert!(err.contains("don't decode with this build") && err.contains("nothing was done"), "{err}");
+    assert_eq!(w.contributions(), before);
+    // weave check lists it too.
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&future), "{}", String::from_utf8_lossy(&out.stdout));
 }
