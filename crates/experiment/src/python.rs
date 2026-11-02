@@ -57,6 +57,9 @@ const START_GRACE: Duration = Duration::from_secs(60);
 pub const SCRATCH: &str = "/scratch";
 /// The label each container is given: the pid of the process that started it, for [`sweep`].
 const LABEL: &str = "bracken.python-runner";
+/// In tests, a pid for [`LABEL`] in place of this process's ([`owner`]).
+#[cfg(test)]
+const TEST_OWNER: &str = "BRACKEN_TEST_PYTHON_OWNER";
 #[cfg(test)]
 thread_local! {
     /// In tests, the seconds the supervisor waits after its last word before it ends, as a slow container teardown
@@ -309,6 +312,16 @@ fn sweep() {
     SWEPT.call_once(sweep_now);
 }
 
+/// The pid a container's [`LABEL`] names: this process's, or in tests the one [`TEST_OWNER`] names, so a test can
+/// keep a container from every sweep after its runner has ended.
+fn owner() -> u32 {
+    #[cfg(test)]
+    if let Some(pid) = std::env::var(TEST_OWNER).ok().and_then(|p| p.parse().ok()) {
+        return pid;
+    }
+    std::process::id()
+}
+
 /// [`sweep`], whether or not this process has swept before.
 fn sweep_now() {
     let format = format!("{{{{.Names}}}} {{{{.Label \"{LABEL}\"}}}}");
@@ -522,30 +535,21 @@ impl Container {
         let fsize = limits.output_bytes.max(16 << 20);
         let mut cmd = Command::new("docker");
         // Never pulled at run time (finding 5e407a7db683): an image gone since the pin fails the run.
-        cmd.args([
-            "run",
-            "--pull",
-            "never",
-            "-i",
-            "--name",
-            &name,
-            "--label",
-            &format!("{LABEL}={}", std::process::id()),
-        ])
-        .args(["--log-driver", "none", "--init", "--network", "none", "--read-only"])
-        .arg("--tmpfs")
-        .arg(format!("{SCRATCH}:rw,size={}m,nr_inodes={MAX_SCRATCH_FILES},mode=1777", limits.scratch_mb))
-        .args(["--memory", &format!("{memory}m"), "--memory-swap", &format!("{memory}m")])
-        .args(["--cpus", "1", "--pids-limit", &MAX_PROCESSES.to_string()])
-        .args(["--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "SETPCAP"])
-        .args(["--security-opt", "no-new-privileges", "--user", "0:0"])
-        .args(["--ulimit", &format!("cpu={cpu}:{}", cpu + 1), "--ulimit", &format!("fsize={fsize}:{fsize}")])
-        .args(["--ulimit", &format!("nofile={MAX_OPEN_FILES}:{MAX_OPEN_FILES}"), "--ulimit", "core=0:0"])
-        .args(["-w", SCRATCH, "--mount", &format!("type=bind,source={source},target=/in,readonly")])
-        .args([python.image.as_str(), "python", "-I", "-S", "-B", "-c", SUPERVISOR, &spec])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        cmd.args(["run", "--pull", "never", "-i", "--name", &name, "--label", &format!("{LABEL}={}", owner())])
+            .args(["--log-driver", "none", "--init", "--network", "none", "--read-only"])
+            .arg("--tmpfs")
+            .arg(format!("{SCRATCH}:rw,size={}m,nr_inodes={MAX_SCRATCH_FILES},mode=1777", limits.scratch_mb))
+            .args(["--memory", &format!("{memory}m"), "--memory-swap", &format!("{memory}m")])
+            .args(["--cpus", "1", "--pids-limit", &MAX_PROCESSES.to_string()])
+            .args(["--cap-drop", "ALL", "--cap-add", "SETUID", "--cap-add", "SETGID", "--cap-add", "SETPCAP"])
+            .args(["--security-opt", "no-new-privileges", "--user", "0:0"])
+            .args(["--ulimit", &format!("cpu={cpu}:{}", cpu + 1), "--ulimit", &format!("fsize={fsize}:{fsize}")])
+            .args(["--ulimit", &format!("nofile={MAX_OPEN_FILES}:{MAX_OPEN_FILES}"), "--ulimit", "core=0:0"])
+            .args(["-w", SCRATCH, "--mount", &format!("type=bind,source={source},target=/in,readonly")])
+            .args([python.image.as_str(), "python", "-I", "-S", "-B", "-c", SUPERVISOR, &spec])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let spawned = Instant::now();
         let mut client = cmd.spawn().map_err(|e| format!("running docker: {e}"))?;
         let shared = Arc::new(Shared::default());
