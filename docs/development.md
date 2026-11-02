@@ -235,7 +235,7 @@ A box is Ubuntu 24.04 (x86_64) with Rust 1.97 (cargo, clippy, rustfmt), cc, git 
 | Needed by | What | Install in the box |
 |---|---|---|
 | The Ground guards, tests run in a checkout | `git` and a clone with history | The history comes from the bundle (above) |
-| The experiment's git-mode tests | a git newer than Ubuntu's 2.43, which neither traces the programs it starts (`trace: start_command:`) nor fsck-checks a fetched bundle, so the hub there accepted a malformed commit | `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get install -y -qq git` (2.56 in October 2026) |
+| The experiment's git-mode tests | a git newer than Ubuntu's 2.43, which neither traces the programs it starts (`trace: start_command:`) nor fsck-checks a fetched bundle, so the hub there accepted a malformed commit | `sudo add-apt-repository -y ppa:git-core/ppa && sudo apt-get install -y -qq git` (2.56 in October 2026; the tests need 2.46, `MIN_GIT`). test-table tries the PPA four times, 10, 30 and 90 s apart, and falls back to the image's git only if it's 2.46 or later, failing setup otherwise |
 | `scripts/team-server token` and its test | `b3sum` | `apt-get install -y -qq b3sum` (or with `sudo`) |
 | `scripts/cleanup`'s target removal and its tests | `lsof` | `apt-get install -y -qq lsof` (or with `sudo`) |
 | The table's tests | cargo-nextest 0.9.150 (decision `4bf44934cb67` (4)) | Its pinned `x86_64-unknown-linux-gnu` release tarball, downloaded with `curl` and checked against the sha256 in `scripts/test-table` before it's unpacked; a mismatch stops the box |

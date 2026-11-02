@@ -1874,7 +1874,8 @@ fn test_table_box_refuses_a_nextest_tarball_that_doesnt_match_its_pin() {
                 "[ -z \"$SHA_OK\" ] || exit 0\nread -r want file\n[ \"$(shasum -a 256 \"$file\" | cut -d' ' -f1)\" = \"$want\" ]",
             ),
             ("tar", "echo tar >>\"$T/ran\""),
-            ("git", "echo git >>\"$T/ran\""),
+            ("git", "[ \"$1\" = --version ] && { echo 'git version 2.56.0'; exit 0; }\necho git >>\"$T/ran\""),
+            ("timeout", "shift; exec \"$@\""),
         ] {
             write_executable(&tools.join(name), &format!("#!/bin/bash\n{body}\n"));
         }
@@ -1902,6 +1903,111 @@ fn test_table_box_refuses_a_nextest_tarball_that_doesnt_match_its_pin() {
         assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
         assert!(stderr.contains("does not match its pinned sha256; not running it"), "{scripts}: {stderr}");
         assert!(ran.is_empty(), "{scripts}: went on after a mismatch: {ran}");
+    }
+}
+
+/// Task 95302a01f49a: the box's git-core PPA, which Launchpad sometimes times out on. test-table's box
+/// script runs here with stubs for the box's tools. `add-apt-repository` fails the first `$PPA_FAILS`
+/// times; `git --version` says `$IMAGE_GIT` until the PPA's git is installed, then 2.56. Adding the PPA is
+/// tried four times and setup goes on once it works; if it never does, the image's git is used only when
+/// it's 2.46 or later, and otherwise setup fails, saying why. A git still too old after install fails too.
+#[test]
+fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() {
+    for scripts in SCRIPTS {
+        let table = repo_root().join(scripts).join("test-table");
+        let (tmp, dir) = repo(&[("scripts/test-table", &table)], ".bracken/\n", |_| {});
+        assert!(run(&dir, "git", &["update-ref", "refs/remotes/origin/main", "HEAD"]).status.success());
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(
+            &stubs.join("boat"),
+            "#!/bin/bash\ncase \"$1\" in\nrun) printf '%s' \"${!#}\" >\"$T/inner\"; echo 'exit 0 · 1m 00s · default · $0.0010 · bx_stub01 deleted' ;;\nlist) echo '{\"sandboxes\":[]}' ;;\nesac\n",
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let out = command(&dir, "scripts/test-table", &["--remote"]).env("PATH", &path).env("T", tmp.path()).output();
+        assert!(out.unwrap().status.success(), "{scripts}");
+        let inner = std::fs::read_to_string(tmp.path().join("inner")).unwrap();
+
+        let tools = tmp.path().join("box-tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        for (name, body) in [
+            ("sudo", "exec \"$@\""),
+            ("timeout", "[ \"$1\" = 120 ] || exit 9\nshift; exec \"$@\""),
+            (
+                "add-apt-repository",
+                "n=$(cat \"$T/tries\" 2>/dev/null || echo 0); echo $((n + 1)) >\"$T/tries\"\n\
+                 [ \"$n\" -ge \"$PPA_FAILS\" ] || { echo 'TimeoutError: [Errno 110] Connection timed out'; exit 1; }",
+            ),
+            ("apt-get", "echo \"apt-get $*\" >>\"$T/ran\"\ncase \"$*\" in *' git '*) touch \"$T/ppa-git\" ;; esac"),
+            (
+                "git",
+                "[ \"$1\" = --version ] || exit 0\nif [ -e \"$T/ppa-git\" ]; then echo \"git version ${PPA_GIT:-2.56.0}\"; else echo \"git version $IMAGE_GIT\"; fi",
+            ),
+            ("curl", "while [ $# -gt 0 ]; do [ \"$1\" = -o ] && out=$2; shift; done\n: >\"$out\""),
+            ("sha256sum", "exit 0"),
+            ("tar", "echo tar >>\"$T/ran\""),
+            ("sleep", "echo \"sleep $1\" >>\"$T/ran\""),
+        ] {
+            write_executable(&tools.join(name), &format!("#!/bin/bash\n{body}\n"));
+        }
+        let boxed = tmp.path().join("box");
+        std::fs::create_dir_all(&boxed).unwrap();
+        let boxed_run = |fails: &str, image: &str, ppa_git: &str| {
+            for f in ["ran", "tries", "ppa-git"] {
+                let _ = std::fs::remove_file(tmp.path().join(f));
+            }
+            let out = Command::new("/bin/bash")
+                .args(["-c", &inner])
+                .current_dir(&boxed)
+                .env("PATH", format!("{}:/usr/bin:/bin", tools.display()))
+                .env("T", tmp.path())
+                .env("PPA_FAILS", fails)
+                .env("IMAGE_GIT", image)
+                .env("PPA_GIT", ppa_git)
+                .output()
+                .unwrap();
+            let ran = std::fs::read_to_string(tmp.path().join("ran")).unwrap_or_default();
+            let tries = std::fs::read_to_string(tmp.path().join("tries")).unwrap_or_default().trim().to_owned();
+            (out, ran, tries)
+        };
+
+        // Two failures, then the PPA: it waits 10 s and 30 s, installs the PPA's git, and goes on.
+        let (out, ran, tries) = boxed_run("2", "2.43.0", "");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(tries, "3", "{scripts}: {stderr}");
+        assert!(ran.starts_with("sleep 10\nsleep 30\napt-get install"), "{scripts}: {ran}");
+        assert!(ran.contains(" git b3sum ") && ran.contains("\ntar\n"), "{scripts}: went on: {ran}");
+        assert!(stderr.contains("TimeoutError") && stderr.contains("trying again in 10s"), "{scripts}: {stderr}");
+        assert!(!stderr.contains("box setup failed"), "{scripts}: {stderr}");
+
+        // Launchpad down for all four tries, with today's image git (2.43): setup fails, saying why, and
+        // installs nothing.
+        let (out, ran, tries) = boxed_run("9", "2.43.0", "");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!((out.status.code(), tries.as_str()), (Some(1), "4"), "{scripts}: {stderr}");
+        assert!(
+            stderr.contains("box setup failed: couldn't add ppa:git-core/ppa after 4 tries")
+                && stderr.contains("git version 2.43.0 is older than the 2.46"),
+            "{scripts}: {stderr}"
+        );
+        assert_eq!(ran, "sleep 10\nsleep 30\nsleep 90\n", "{scripts}: went on: {ran}");
+
+        // Down for all four, with an image git of 2.46 or later: it says so, uses it, and goes on.
+        for image in ["2.46.0", "2.50.1", "3.0"] {
+            let (out, ran, _) = boxed_run("9", image, "");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!stderr.contains("box setup failed"), "{scripts}: {image}: {stderr}");
+            assert!(stderr.contains(&format!("using the image's git version {image}")), "{scripts}: {stderr}");
+            assert!(ran.contains("apt-get install") && !ran.contains(" git b3sum"), "{scripts}: {ran}");
+            assert!(ran.contains("\ntar\n"), "{scripts}: {image}: went on: {ran}");
+        }
+
+        // The PPA works but installs a git too old: setup fails, saying so.
+        let (out, ran, _) = boxed_run("0", "2.43.0", "2.45.2");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(stderr.contains("box setup failed: git version 2.45.2 is older than the 2.46"), "{scripts}: {stderr}");
+        assert!(!ran.contains("tar"), "{scripts}: went on: {ran}");
     }
 }
 
@@ -3003,7 +3109,7 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         assert!(stdout.trim_end().ends_with("test-table: counted run mode: light: the scope"), "{scripts}: {stdout}");
         let inner = read("args");
         for line in [
-            "setup $sudo apt-get install -y -qq git b3sum curl jq lsof",
+            "  setup $sudo apt-get install -y -qq -o Acquire::Retries=3 git b3sum curl jq lsof",
             "setup cargo fetch --locked --target \"$(rustc -vV | sed -n \"s/^host: //p\")\"",
             "cargo build --locked -q -p bracken --bin bracken",
             "BRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table --light -p demo -p agent",
