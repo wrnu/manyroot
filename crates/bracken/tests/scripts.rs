@@ -6161,6 +6161,9 @@ fn merge_decides_findings_through_the_binary_and_refuses_another_shape() {
                 "{{\"findings\":[{{\"id\":\"{id}\",\"triage\":\"untriaged\"}}],\"blocking\":1}}\n{{\"findings\":[],\"blocking\":0}}"
             ),
             format!(r#"{{"findings":[{{"id":"{}","triage":"untriaged"}}],"blocking":1}}"#, " ".repeat(64)),
+            // Finding b0cec6d917b6: an id, and a task, of 64 hex digits and a final newline.
+            format!(r#"{{"findings":[{{"id":"{id}\n","triage":"rejected"}}],"blocking":0}}"#),
+            format!(r#"{{"findings":[{{"id":"{id}","triage":"deferred","task":"{id}\n"}}],"blocking":0}}"#),
             format!(
                 r#"{{"findings":[{{"id":"{}","triage":"deferred","task":"{}"}}],"blocking":0}}"#,
                 id,
