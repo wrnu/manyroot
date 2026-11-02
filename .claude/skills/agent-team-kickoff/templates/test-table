@@ -191,7 +191,7 @@ setup() {
   "$@" >"$log" 2>&1 || { rc=$?; echo "test-table: box setup failed (exit $rc): $*" >&2; cat "$log" >&2; exit "$rc"; }
 }
 setup $sudo add-apt-repository -y ppa:git-core/ppa
-setup $sudo apt-get install -y -qq git b3sum curl jq
+setup $sudo apt-get install -y -qq git b3sum curl jq lsof
 nextest_tar=cargo-nextest-$nextest_version-x86_64-unknown-linux-gnu.tar.gz
 nextest_dir=$(mktemp -d)
 setup curl -fsSL -o "$nextest_dir/$nextest_tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/$nextest_tar"
