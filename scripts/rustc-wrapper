@@ -13,7 +13,8 @@
 # When sccache can't reach or start its server (a sandbox that denies the socket, a server that won't
 # start), it exits 2 before the compiler runs; the wrapper then runs the compiler itself, so the build goes
 # on uncached (finding 20a5ceea1005). sccache 0.19 also exits 2 when a compile it ran itself was killed by a
-# signal (a crash, the OOM killer), and says so last on stdout: "sccache: Compile terminated by signal <n>".
+# signal (a crash, the OOM killer), and says so last on stdout: "sccache: Compile terminated by signal <n>",
+# at the end of the last line, which the compiler's own stdout may have begun (finding 19b295a1bb9a).
 # That one is passed on, never rerun (finding ec492ce1a7d1); one the server ran ends 254, passed on too.
 # Its errors can't be sorted reliably into before and after the compile (one context, "failed to execute
 # compile", covers both, and the compiler's stderr is in the same stream: findings 5e48b5f2a88e,
@@ -90,7 +91,7 @@ rc=${PIPESTATUS[0]}
 set -e
 [[ $rc -eq 2 ]] || exit "$rc"
 # A compile sccache ran and a signal killed: passed on. Any other 2: compile without sccache.
-if [[ -n $out ]] && tail -n 1 -- "$out" | grep -Eqx 'sccache: Compile terminated by signal [0-9]+'; then
+if [[ -n $out ]] && tail -n 1 -- "$out" | grep -Eq 'sccache: Compile terminated by signal [0-9]+$'; then
   exit 2
 fi
 [[ -z $out ]] || rm -f -- "$out"

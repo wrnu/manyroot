@@ -7303,6 +7303,8 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
     let decoy_killed = "echo 'sccache: error: Operation not permitted (os error 1)' >&2\n\
                         echo 'sccache: Compile terminated by signal 11'";
     let not_last = "echo 'sccache: Compile terminated by signal 11'\necho 'later'";
+    // The compiler's stdout ended without a newline, so sccache's note ends its last line (finding 19b295a1bb9a).
+    let after_partial = "printf 'partial'; echo 'sccache: Compile terminated by signal 11'";
     for (code, says, copy, ran) in [
         (2, startup, true, "rustc"),
         (2, denied, true, "rustc"),
@@ -7311,6 +7313,7 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
         (2, not_last, true, "rustc"),
         (2, killed, true, "sccache"),
         (2, decoy_killed, true, "sccache"),
+        (2, after_partial, true, "sccache"),
         (2, denied, false, "rustc"),
         (2, killed, false, "rustc"),
         (1, "", true, "sccache"),
