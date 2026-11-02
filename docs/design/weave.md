@@ -918,14 +918,14 @@ never write outside the target directory, and never follow a symlink
 | `weave diff <a> <b>` | Per-file difference between two manifests or decisions. Text files show a unified diff. |
 | `weave propose [--line L] [--base D] [--from-git <rev> \| --index] [--summary text] [--dry-run]` | Imports the tree and writes a proposal against `base` (default: the line's head), which must be a qualifying decision on the line. Refuses a tree equal to the base's. |
 | `weave integrate [--line L] [--proposals ... [--mirrors REV]] [--run] [--answer O=DISPOSITION:REASON]... [--breakage CHECK[:PATHS]]... [--goal G]...` | Integrator: builds the candidate and writes the decision, in the order below. Runs no checks unless `--run` is given. Refuses if the result wouldn't qualify. Without proposals it records a given tree, `--from-git <rev>` (the default is `HEAD`, named in the decision's `source`), `--index` or `--manifest H`, with every head of the line as a parent, so on a forked line it settles the fork. With `--proposals P...` it merges each valid proposal in turn onto the line's single head, against the proposal's own base, applies the resolutions the Ground holds, and writes the decision listing the proposals and the resolutions it used. The line defaults to the proposals'. A conflict without a resolution stops it: it lists the conflicts and writes nothing. With `--mirrors REV` (stage 2a), the decision names that git commit as its `source`, and nothing is written unless the merged tree equals the commit's tree as `import` would record it; otherwise it lists the paths that differ. Nothing is imported from the commit. `--answer` answers an objection with a disposition and a reason, or, naming its target (a decision, a manifest artifact or a proposal), every objection to it the disposition is allowed for, or, naming the line, every objection in the decision's window the disposition is allowed for; `--breakage` records known breakage of a check, with the paths it affects, under the line's guardrails; `--goal` names a goal the decision serves. It refuses, naming rule 5, while an objection the decision must answer has no allowed answer (`weave review` lists them), and rule 6 when the breakage breaks a guardrail. |
-| `weave validate --manifest H [--line L] [--check <name>]... [--again] [--timeout SECONDS] [--dry-run]` | Validator: runs the named checks of line `L`'s policy (default: the default line, and all of its checks) on manifest `H` through the check runner, and records each result. Refuses a check it already has a latest result for on `H` unless `--again`. `--timeout` bounds each check (default 1,800 seconds), after which its process group is killed. `--dry-run` shows the line, its validators and what would run, and runs and writes nothing. |
+| `weave validate --manifest H [--line L] [--check <name>]... [--again] [--timeout SECONDS] [--runner DIR] [--dry-run]` | Validator: runs the named checks of line `L`'s policy (default: the default line, and all of its checks) on manifest `H` through the check runner, and records each result. Refuses a check it already has a latest result for on `H` unless `--again`. `--timeout` bounds each check (default 1,800 seconds), after which its process group is killed. A box or mac check (*Checks outside the sandbox*, below) needs `--runner`, the directory its pinned runner script is in; mac checks run after the others. `--dry-run` shows the line, its validators and what would run, and runs and writes nothing. |
 | `weave review [--line L] [--proposal P]` | The reviews of the line's heads, the open objections the next move must answer, each with its basis and the dispositions it allows, and the reviews of each open proposal on the line (one whose change no decision on it lists), carried over by change, with what a decision using it unchanged would have to answer. With `--proposal`, that proposal alone. |
 | `weave head [--line L]` | The head, or the fork's heads, with the manifest hash. |
 | `weave green [--line L]` | Green under the line's current policy: the green decision, none, the ambiguous set, or a diverged chain's versions; and per head, each check's counted passes and fails, with the fails a later attempt replaced, each with its validator and attempt. |
 | `weave log [--line L] [--limit N] [--since D]` | Decisions on a line, newest first in causal order, with their checks and breakage. At most 20 unless `--limit` says otherwise; never prints payloads. |
 | `weave slice [--at D] <path or prefix>...` | Those paths' contents at a decision or manifest, for an agent that needs a part, not the whole. |
 | `weave checkout [--at D] <dir>` | Materializes a manifest into an empty directory, or updates a directory that is clean against it. If writing fails part way, it removes what it wrote, or names what it couldn't remove. |
-| `weave line create <name> [--dry-run] [--integrator ...] [--validator ...] [--goal-setter ...] [--check NAME=ARGV ...] [--max-known N] [--max-age N] [--protected P ...] --owner-decision <id>`, `weave line policy <line> [--dry-run] [--from <version>] [--name n] [--clear <field>]... ... --owner-decision <id>` | Creates a line (with no integrator or goal setter given, its author is the only one), or writes a new policy version, starting from the current one, that supersedes every current version, so it also settles a diverged chain. On a diverged chain it refuses, listing the current versions, unless `--from` names the one to start from (finding `4eead6290997`). Only the line's author can change a policy. `--owner-decision` is required, as 12 to 64 hex digits. Prints `line <id>`, then `relation <id> (supersedes)` for each relation. `--dry-run` shows the policy, and what it would supersede, and writes nothing. |
+| `weave line create <name> [--dry-run] [--integrator ...] [--validator ...] [--goal-setter ...] [--check NAME=ARGV ...] [--executor NAME=KIND:SCRIPT ... --runner DIR] [--max-known N] [--max-age N] [--protected P ...] --owner-decision <id>`, `weave line policy <line> [--dry-run] [--from <version>] [--name n] [--clear <field>]... ... --owner-decision <id>` | Creates a line (with no integrator or goal setter given, its author is the only one), or writes a new policy version, starting from the current one, that supersedes every current version, so it also settles a diverged chain. On a diverged chain it refuses, listing the current versions, unless `--from` names the one to start from (finding `4eead6290997`). Only the line's author can change a policy. `--owner-decision` is required, as 12 to 64 hex digits. `--executor` runs a check outside the sandbox, `KIND` being `box` or `mac`, through `SCRIPT`, a path inside `--runner` whose content hash the policy pins; `--clear executors` drops them, and `--clear checks` drops them with the checks. Prints `line <id>`, then `relation <id> (supersedes)` for each relation. `--dry-run` shows the policy, and what it would supersede, and writes nothing. |
 | `weave line merge <from> --into <line> [--base D] [--dry-run] [--note text]` | Integrator: merges `<from>`'s head into `<line>`'s, file by file against the merge base (`--base` only chooses among several). With every conflict resolved by an integrator's resolution, it writes the merged manifest and a decision on `<line>` whose parents are both heads, judged by rules 1-4, so its author must be an integrator of `<line>`. With a conflict unresolved, or with `--dry-run`, it lists the conflicts, with the resolutions offered for each, and writes nothing. It lists the resolutions it used. A line with no decision yet starts from `<from>`'s head, its first decision having that head as its only parent (answer `12000ab70ae5`). |
 | `weave resolve <path> (--into L --from L2 [--base D] \| --proposals P... [--line L]) (--take into\|from\|<resolution> \| --delete \| --file <f> \| --markers <f>) [--mode m] [--dry-run]` | Writes a resolution for the conflict at `<path>`. It takes the selector of the command that listed the conflict (`line merge`'s `--into`, `--from` and `--base`, or `integrate`'s `--proposals`), rebuilds that merge, and recomputes the key, so nobody types file values. `into` is the line's side, `from` the side merged in, and a resolution id adopts that resolution's result. A conflict may get another resolution even if it has one. `--file` has the refusals above (answer `12000ab70ae5`). `--markers <f>` writes no resolution: it writes a text conflict's marked merge to a new file to edit, for `--file`. |
 | `weave verify --git <rev> [--at D \| --manifest H]` | Compares a manifest with a git commit's tree: the same paths, modes and bytes, with the excluded root entries left out. Used throughout the dogfood. |
@@ -1031,6 +1031,97 @@ nothing else runs a check on a Weave manifest (security note
 
 Stage 2 of the dogfood doesn't start until this runner and its sandbox
 exist, on the validators' path as well as the integrator's.
+
+### Checks outside the sandbox
+
+Some of the test table can't run under the sandbox: the Linux half, which
+runs in a remote box, and tests that use loopback, read the repository's
+git, or apply `sandbox-exec` themselves (plan `cc496dcee0e3`, owner
+decision `9a218021bbf0`). A policy runs such a check through an
+*executor*: the line's optional `executors` field maps a check's name to
+its kind, `box` or `mac`, and a runner script, a relative path inside the
+validator's runner directory (the main checkout), pinned by its content
+hash. The field is left out of the payload when empty, so a line without
+it encodes as before. A line version that has one doesn't decode with a
+build from before the field, since it wouldn't re-encode the same, and such
+a build skips it without a word: it reads the line under the version
+before, which has no executors (finding `5d50422b9e11`). So every binary
+that reads a Weave Ground, the pinned one included, must be at least the
+build that added executors before a policy with them is written, and is
+never rolled back below it (docs/releases.md). From that build on, a line
+version that doesn't decode is reported: `weave head`, `green`, `review`
+and the other reads warn, `weave check` lists it, and `validate`,
+`integrate`, `line policy` and `line merge` refuse, doing nothing, until
+the binary is upgraded. Only an artifact that would change a line counts:
+one that supersedes a version of its own author's, in a relation that
+author signed, as a policy change does. A stray artifact, or one whose
+relation someone else signed, changes no line here, and `weave check` alone
+lists it (finding `e89cf76e9ea2`). The definition hash of a check with
+an executor is that of `[name, argv, executor]`, so a result names the
+kind, the script and its hash, and changing any of them is a new policy
+version, under the owner's decision.
+
+Only `weave validate` runs one, as one of the line's validators, through
+the same command that records every other result, so `scripts/weave` still
+refuses a plain `evidence`. Before it runs:
+- the runner script's content hash must equal the pinned one;
+- the manifest is written by the safe materialization into a fresh
+  directory and made a git commit there, with no configuration, hooks or
+  attribute drivers of the caller's or the system's, and every file added,
+  ignored or not. The commit's import must be exactly the manifest, with
+  nothing excluded or refused, or nothing runs: an attribute that makes git
+  store a file otherwise is refused. That commit, and its tree id, stand
+  for the manifest.
+
+Then a copy of the script, read once and checked against its hash, runs
+from a directory of its own beside the checkout, with the commit, the tree
+id and a facts file in its environment. The script must be
+self-contained: anything else it runs from the runner directory is not
+pinned. The facts file is out of the tree's reach only for a box check,
+whose tree runs in the box; a mac check's tree runs here as the same user
+and could write it, so a mac check's facts prove nothing and aren't
+required.
+- **box**: it also gets a bundle of the commit and the bundle's sha256, and
+  the caller's `PATH`, `HOME`, `USER` and `LOGNAME`, for boat. In the box,
+  before any of the tree's code runs, the runner's inner script prints the
+  bundle's sha256, the commit and the checked-out tree id; the script
+  writes those, the box's id as boat announced it, boat's cost line and,
+  only if the box printed its end line after the table passed, `end`, into
+  the facts file;
+- **mac**: it runs in the commit's checkout on this Mac, with the check
+  runner's environment (no `BRACKEN_*` variable or token path, a fresh
+  `HOME`, `TMPDIR` and `CARGO_HOME` reading the vendor directory offline),
+  the directories of `cargo-nextest`, `timeout` and `jq` on its `PATH`, but
+  no sandbox profile. It's given the output of the validator's latest
+  passing result on the manifest of each box check, which the test table
+  compares its own test list with.
+
+A box check's facts must give the commit, tree, bundle's sha256 and a box
+id (`bx_` and letters, digits, `_` or `-`), or the run is refused and
+nothing is recorded; without `end` it fails. Its result's details give,
+after the exit, the commit, tree, bundle, box, cost, `end seen` or `end
+missing` and output size, then `log <artifact> <hash>`: the whole output,
+recorded as a `text/plain` artifact after the content refusals, or
+`log withheld:` with its size, the whole output's hash (taken as it was
+read, so it covers an output too big to keep) and the reason: it matched a
+refusal, or it is over what an artifact may hold, 15 MiB, a MiB under the
+contribution limit. A mac check runs only given a box check's recorded log: with none
+on the manifest, `validate` refuses it and records nothing for it.
+
+A box or mac check's timeout is an hour by default (`--timeout` sets it),
+past boat's own 2400 s. At its timeout, or when `validate` gets SIGINT,
+SIGTERM or SIGHUP (a Ctrl-C, a kill, a closed terminal), its process group
+gets a SIGTERM and 60 seconds to end, so the box script's trap deletes its
+box, before it is killed. The group has no terminal of its own, so only
+`validate` can pass a Ctrl-C on. An interrupted check records nothing, and
+`validate` fails (finding `02ab829d2caf`). Nothing catches a SIGKILL of
+`validate`: then the script's output pipe breaks, and the script must
+clean up on that too, as test-table's Weave modes do.
+
+Once the tree's code runs it can do whatever its user can, in
+the box or here: the proofs establish which tree ran and that a run
+happened, not that the tree's own tests are honest. `integrate --run`
+runs no box or mac check.
 
 **One counted run per manifest.** A check's result attaches to the manifest
 hash, so each check runs once per manifest for green: a validator runs

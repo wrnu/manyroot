@@ -17,16 +17,28 @@
 //! No sandbox, no run: everything that could refuse is settled before
 //! anything is written, the sandbox's own platform first, and a check that
 //! can't run stops the command and records nothing for it.
+//!
+//! A check with an executor (box or mac) runs outside the sandbox instead,
+//! through the runner script its policy pins, from `--runner` (the main
+//! checkout, which scripts/weave gives), and only `validate` runs one
+//! ([`Runner::run_outside`]). Its result's details also give the commit and
+//! tree that stood for the manifest, the bundle and box for a box check, and
+//! its whole output's content hash: the output is recorded as an artifact
+//! after the content refusals, or withheld as its size and hash. A mac check
+//! is given the logs of this validator's latest passing box results on the
+//! manifest, by check name.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use bracken_tree::ContentHash;
-use bracken_tree::check::{CheckError, Outcome, RecordedTail, Runner, Toolchain, recorded_tail};
-use bracken_tree::format::{CheckDefinition, Line, Manifest};
+use bracken_tree::check::{
+    BoxEnv, CheckError, Inputs, Outcome, OutsideOutcome, RecordedTail, Runner, Toolchain, recorded_tail,
+};
+use bracken_tree::format::{CheckDefinition, Executor, ExecutorKind, Line, Manifest};
 use bracken_tree::ground::Index;
 use bracken_tree::import;
 use bracken_tree::lines::Lines;
@@ -61,20 +73,42 @@ pub(crate) struct ValidateArgs {
     #[arg(long)]
     again: bool,
     /// How long each check may run, in seconds, before its process group is killed: 1 to 604800 (7
-    /// days), default 1800.
+    /// days), default 1800, and 3600 for a box or mac check, whose group gets a SIGTERM and 60 seconds
+    /// first.
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=MAX_TIMEOUT))]
     timeout: Option<u64>,
     /// Show the line, its validators and what would run, and run and write nothing.
     #[arg(long)]
     dry_run: bool,
+    /// The directory a box or mac check's runner script is in: the main checkout, which scripts/weave
+    /// gives. Needed only for such a check.
+    #[arg(long, value_name = "DIR")]
+    runner: Option<PathBuf>,
     #[command(flatten)]
     out: Output,
 }
+
+/// The media type of a box or mac check's recorded output.
+pub(super) const LOG_MEDIA_TYPE: &str = "text/plain";
 
 /// What runs the checks: the runner, and the keys a recorded tail must never hold.
 pub(super) struct Run {
     runner: Runner,
     known: KnownKeys,
+    /// For box and mac checks: the runner directory, a box script's PATH and HOME, and the directories
+    /// of the tools a mac check's script needs.
+    outside: Option<Outside>,
+}
+
+struct Outside {
+    dir: PathBuf,
+    box_env: BoxEnv,
+    tools: Vec<PathBuf>,
+}
+
+/// The content hash of a runner script, for a policy's --executor.
+pub(super) fn runner_script_hash(runner: &Path, script: &str) -> Result<ContentHash> {
+    Ok(bracken_tree::check::script_hash(runner, script)?)
 }
 
 impl Run {
@@ -96,6 +130,10 @@ impl Run {
         let mut runner = Runner::new(vendor);
         runner.toolchain = toolchain()?;
         runner.timeout = Duration::from_secs(timeout.unwrap_or(DEFAULT_TIMEOUT));
+        // A box or mac check's own default is the runner's, an hour: past boat's 2400 s.
+        if let Some(t) = timeout {
+            runner.outside_timeout = Duration::from_secs(t);
+        }
         // --timeout is bounded when parsed; this keeps the runner's deadline from overflowing all the same.
         ensure!(
             std::time::Instant::now().checked_add(runner.timeout).is_some(),
@@ -109,7 +147,30 @@ impl Run {
             let coordination = main.join(".bracken").join("identities");
             known.add_identities_dir(&coordination).with_context(|| format!("reading {}", coordination.display()))?;
         }
-        Ok(Run { runner, known })
+        Ok(Run { runner, known, outside: None })
+    }
+
+    /// Lets box and mac checks run, with their scripts from `dir`. A box script gets the caller's PATH,
+    /// HOME, USER and LOGNAME, for boat; a mac check's PATH gets the directories of the caller's
+    /// cargo-nextest, timeout (or gtimeout) and jq, which the test table needs, after the toolchain's.
+    fn with_outside(mut self, dir: PathBuf) -> Result<Run> {
+        let dir = dir.canonicalize().with_context(|| format!("resolving --runner {}", dir.display()))?;
+        let box_env: BoxEnv = ["PATH", "HOME", "USER", "LOGNAME"]
+            .into_iter()
+            .filter_map(|k| std::env::var_os(k).map(|v| (k.into(), v)))
+            .collect();
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let mut tools: Vec<PathBuf> = Vec::new();
+        for name in ["cargo-nextest", "timeout", "gtimeout", "jq"] {
+            if let Some(found) = std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+                && let Some(parent) = found.parent()
+                && !tools.iter().any(|t| t == parent)
+            {
+                tools.push(parent.to_path_buf());
+            }
+        }
+        self.outside = Some(Outside { dir, box_env, tools });
+        Ok(self)
     }
 }
 
@@ -162,6 +223,7 @@ fn toolchain() -> Result<Option<Toolchain>> {
 struct Planned {
     name: String,
     argv: Vec<String>,
+    executor: Option<Executor>,
     method: String,
     attempt: u64,
 }
@@ -185,12 +247,13 @@ fn current_policy<'l>(lines: &'l Lines, line: &ContributionId) -> Result<(Contri
 }
 
 pub(crate) fn validate(s: &mut Store, agent: Option<&str>, args: ValidateArgs) -> Result<ExitCode> {
-    let ValidateArgs { manifest, line, checks: names, again, timeout, dry_run, out } = args;
+    let ValidateArgs { manifest, line, checks: names, again, timeout, dry_run, runner, out } = args;
     let ix = Index::build(s.graph());
     if !dry_run {
         super::merge::require_marker(&ix)?;
     }
     let lines = super::lines_for(s, &ix, &[line.as_deref()]);
+    super::refuse_unreadable(&lines, "validate")?;
     let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
     let (version, policy) = current_policy(&lines, &line)?;
     let who = crate::signer(s, agent)?;
@@ -235,7 +298,8 @@ pub(crate) fn validate(s: &mut Store, agent: Option<&str>, args: ValidateArgs) -
             refused.push(format!("{name} ({})", ids.join(", ")));
         }
         let attempt = results.next_attempt(&who.agent_id(), &hash, &method);
-        planned.push(Planned { argv: policy.checks[&name].clone(), name, method, attempt });
+        let executor = policy.executors.get(&name).cloned();
+        planned.push(Planned { argv: policy.checks[&name].clone(), executor, name, method, attempt });
     }
     if !refused.is_empty() {
         bail!(
@@ -246,7 +310,10 @@ pub(crate) fn validate(s: &mut Store, agent: Option<&str>, args: ValidateArgs) -
     if dry_run {
         let rows: Vec<Value> = planned
             .iter()
-            .map(|p| json!({"check": p.name, "method": p.method, "argv": p.argv, "attempt": p.attempt}))
+            .map(|p| {
+                json!({"check": p.name, "method": p.method, "argv": p.argv, "attempt": p.attempt,
+                       "executor": p.executor})
+            })
             .collect();
         if out.json {
             let validators: Vec<String> = policy.validators.iter().map(ToString::to_string).collect();
@@ -261,8 +328,38 @@ pub(crate) fn validate(s: &mut Store, agent: Option<&str>, args: ValidateArgs) -
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let run = Run::new(s, timeout)?;
-    let recorded = run_checks(s, &who, &run, &ix, version, &hash, target, held, &planned, out.json);
+    let mut run = Run::new(s, timeout)?;
+    if planned.iter().any(|p| p.executor.is_some()) {
+        let dir = runner
+            .context("a box or mac check needs --runner <dir>, the directory its runner script is in; nothing ran")?;
+        run = run.with_outside(dir)?;
+    }
+    // Mac checks last, given the box results this run recorded too.
+    let (mac, first): (Vec<Planned>, Vec<Planned>) =
+        planned.into_iter().partition(|p| p.executor.as_ref().is_some_and(|e| e.kind == ExecutorKind::Mac));
+    let mut recorded = run_checks(s, &who, &run, &ix, version, &hash, target, held, &first, &Inputs::new(), out.json);
+    if recorded.failure.is_none() && !mac.is_empty() {
+        let ix = Index::build(s.graph());
+        let lines = super::lines_for(s, &ix, &[Some(&line.to_string())]);
+        let results = Checks::build(s.graph(), &ix, &lines);
+        let (_, policy) = current_policy(&lines, &line)?;
+        let inputs = box_logs(s, &results, &who, policy, &hash)?;
+        // A mac check compares with a box's lists: with no passing box result whose output is here, it
+        // doesn't run (finding ee89e79fbcc1).
+        if inputs.is_empty() {
+            decide(false);
+            let e = anyhow::anyhow!(
+                "no passing result of a box check on {hash} by you has its output here, so the mac check has no box \
+                 lists to compare with; nothing ran for it"
+            );
+            return Err(e.context(format!("{} results were recorded before it stopped", recorded.results.len())));
+        }
+        let held = complete_manifest(&ix, &hash)?;
+        let more = run_checks(s, &who, &run, &ix, version, &hash, target, held, &mac, &inputs, out.json);
+        recorded.results.extend(more.results);
+        recorded.passed &= more.passed;
+        recorded.failure = more.failure;
+    }
     if out.json {
         print_json(&json!({"line": line, "policy": version, "manifest": hash.to_string(), "manifest_id": target,
                            "results": recorded.results}));
@@ -292,9 +389,11 @@ pub(super) fn run_for_integrate(
     let (version, policy) = current_policy(&lines, line)?;
     let manifest = complete_manifest(&ix, hash)?;
     let (target, _) = ix.manifest(hash).expect("a held manifest");
+    // Box and mac checks run only through validate.
     let planned: Vec<Planned> = policy
         .checks
         .iter()
+        .filter(|(name, _)| !policy.executors.contains_key(*name))
         .map(|(name, argv)| {
             let method = policy.check_method(name).expect("one of its checks");
             let highest = ix
@@ -303,10 +402,11 @@ pub(super) fn run_for_integrate(
                 .filter(|r| r.author == who.agent_id() && r.manifest == *hash && r.method == method)
                 .filter_map(|r| r.attempt)
                 .max();
-            Planned { name: name.clone(), argv: argv.clone(), method, attempt: highest.unwrap_or(0).saturating_add(1) }
+            let attempt = highest.unwrap_or(0).saturating_add(1);
+            Planned { name: name.clone(), argv: argv.clone(), executor: None, method, attempt }
         })
         .collect();
-    Ok(run_checks(s, who, run, &ix, version, hash, target, manifest, &planned, json))
+    Ok(run_checks(s, who, run, &ix, version, hash, target, manifest, &planned, &Inputs::new(), json))
 }
 
 /// Runs each planned check on `manifest` and records its result on `target`, printing the policy
@@ -323,6 +423,7 @@ fn run_checks(
     target: ContributionId,
     manifest: &Manifest,
     planned: &[Planned],
+    inputs: &Inputs,
     json: bool,
 ) -> Recorded {
     // With --json, stdout holds only the JSON, so what is printed first goes to stderr.
@@ -334,7 +435,20 @@ fn run_checks(
     say(format!("policy {version}"));
     for p in planned {
         say(format!("run {} attempt {}: {}", p.name, p.attempt, crate::terminal::printable(&format!("{:?}", p.argv))));
-        let check = CheckDefinition { name: &p.name, argv: &p.argv };
+        let check = CheckDefinition { name: &p.name, argv: &p.argv, executor: p.executor.as_ref() };
+        if p.executor.is_some() {
+            match run_outside(s, who, run, ix, hash, target, manifest, p, &check, inputs, json) {
+                Ok((result, passed)) => {
+                    recorded.passed &= passed;
+                    recorded.results.push(result);
+                    continue;
+                }
+                Err(e) => {
+                    recorded.failure = Some(e);
+                    return recorded;
+                }
+            }
+        }
         let outcome: Outcome = match run.runner.run(&check, manifest, |h| ix.file(s.graph(), h).map(<[u8]>::to_vec)) {
             Ok(o) => o,
             Err(e) => {
@@ -379,4 +493,122 @@ fn run_checks(
                                      "exit": outcome.exit.to_string(), "withheld": withheld}));
     }
     recorded
+}
+
+/// Runs one box or mac check and records its output, as an artifact, then its result. Returns the
+/// result's JSON and whether it passed; an error when it couldn't run or be tied to the manifest, with
+/// nothing recorded for it.
+#[allow(clippy::too_many_arguments)]
+fn run_outside(
+    s: &mut Store,
+    who: &Identity,
+    run: &Run,
+    ix: &Index,
+    hash: &ContentHash,
+    target: ContributionId,
+    manifest: &Manifest,
+    p: &Planned,
+    check: &CheckDefinition,
+    inputs: &Inputs,
+    json: bool,
+) -> Result<(Value, bool)> {
+    let outside = run.outside.as_ref().context("a box or mac check needs --runner")?;
+    let no_box_env = BoxEnv::new();
+    let (box_env, tools): (&BoxEnv, &[PathBuf]) = match check.executor.map(|e| e.kind) {
+        Some(ExecutorKind::Box) => (&outside.box_env, &[]),
+        _ => (&no_box_env, &outside.tools),
+    };
+    let outcome: OutsideOutcome = run
+        .runner
+        .run_outside(
+            check,
+            &outside.dir,
+            manifest,
+            |h| ix.file(s.graph(), h).map(<[u8]>::to_vec),
+            &run.known,
+            inputs,
+            box_env,
+            tools,
+        )
+        .map_err(|e| anyhow::Error::new(e).context(format!("check {}: nothing was recorded for it", p.name)))?;
+    let mut lines = outcome.run_lines();
+    // The whole output's hash, which for a log cut to its last LOG_CAP bytes is still the output's.
+    let log_hash = outcome.output_hash;
+    let mut log_id = None;
+    // A log cut to its last LOG_CAP bytes isn't the output: withheld, as its size and hash (findings
+    // 2e9d57852ec7, 0fb11da198a5).
+    if !outcome.whole() {
+        lines.push(format!(
+            "log withheld: {} bytes, {log_hash}, over the {} bytes an artifact may hold",
+            outcome.output_bytes,
+            bracken_tree::check::LOG_CAP
+        ));
+    } else if let RecordedTail::Withheld { size, rule, .. } = recorded_tail(&outcome.log, &run.known) {
+        lines.push(format!("log withheld: {size} bytes, {log_hash}, as it matched {rule}"));
+    } else {
+        let artifact = Body::Artifact {
+            name: format!("{} output on {hash}", p.name),
+            media_type: LOG_MEDIA_TYPE.to_owned(),
+            content: outcome.log.clone(),
+        };
+        let id = contribute(s, who, artifact)
+            .with_context(|| format!("check {} ran ({}), but its output wasn't recorded", p.name, outcome.exit))?;
+        lines.push(format!("log {id} {log_hash}"));
+        log_id = Some(id);
+    }
+    let tail_start = outcome.log.len().saturating_sub(run.runner.tail_bytes);
+    let tail = recorded_tail(&outcome.log[tail_start..], &run.known);
+    let passed = outcome.passed();
+    let body = Body::Evidence {
+        target,
+        verdict: if passed { Verdict::Pass } else { Verdict::Fail },
+        method: outcome.method.clone(),
+        details: results::details_with_run(hash, p.attempt, &outcome.argv, &outcome.exit, &lines, &tail),
+    };
+    let id = contribute(s, who, body)
+        .with_context(|| format!("check {} ran ({}), but its result wasn't recorded", p.name, outcome.exit))?;
+    if !json {
+        let verdict = if passed { "pass" } else { "fail" };
+        println!("evidence {id} ({verdict}: {}, {})", p.name, outcome.exit);
+    }
+    Ok((
+        json!({"evidence": id, "check": p.name, "method": outcome.method, "attempt": p.attempt,
+               "argv": outcome.argv, "passed": passed, "exit": outcome.exit.to_string(),
+               "commit": outcome.commit, "tree": outcome.tree, "bundle_sha256": outcome.bundle_sha256,
+               "box": outcome.box_id, "cost": outcome.cost, "log": log_id, "log_hash": log_hash.to_string()}),
+        passed,
+    ))
+}
+
+/// The output of each of `who`'s latest passing results on `manifest` for the policy's box checks, by
+/// check name: what a mac check compares its tests with. A result whose output was withheld, or whose
+/// artifact doesn't hash as its details say, gives nothing.
+fn box_logs(s: &Store, results: &Checks, who: &Identity, policy: &Line, manifest: &ContentHash) -> Result<Inputs> {
+    let mut inputs = Inputs::new();
+    for (name, executor) in &policy.executors {
+        if executor.kind != ExecutorKind::Box {
+            continue;
+        }
+        let method = policy.check_method(name).expect("an executor's check is one of the policy's");
+        let [latest] = results.latest(&who.agent_id(), manifest, &method) else { continue };
+        let Some(result) = results.result(latest) else { continue };
+        if !result.passed {
+            continue;
+        }
+        let Some(Body::Evidence { details, .. }) = s.graph().get(latest).map(|c| c.body().clone()) else { continue };
+        // Only the run's own lines, before the blank line and the tail, which the tree's output fills; a
+        // withheld log is none (finding ee89e79fbcc1).
+        let run_lines = details.split("\n\n").next().unwrap_or_default();
+        let Some(log) = run_lines.lines().find_map(|l| l.strip_prefix("log ")) else { continue };
+        let mut words = log.split(' ');
+        let (Some(id), Some(want)) = (words.next(), words.next().and_then(|w| w.parse::<ContentHash>().ok())) else {
+            continue;
+        };
+        let Ok(id) = id.parse::<ContributionId>() else { continue };
+        let Some(Body::Artifact { content, .. }) = s.graph().get(&id).map(|c| c.body().clone()) else { continue };
+        if ContentHash::of(&content) == want {
+            inputs.push((format!("{name}.log"), content));
+        }
+    }
+    Ok(inputs)
 }

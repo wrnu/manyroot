@@ -55,6 +55,9 @@ use crate::hash::ContentHash;
 use crate::materialize::MaterializeError;
 use crate::secrets::{self, KnownKeys, SecretRule};
 
+mod outside;
+pub use outside::{BoxEnv, Inputs, LOG_CAP, OutsideOutcome, script_hash};
+
 /// macOS's `sandbox-exec`.
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
@@ -125,6 +128,13 @@ pub struct Runner {
     pub tail_bytes: usize,
     /// Where each run's fresh directory is made: the system's temporary directory by default.
     pub base: PathBuf,
+    /// A box or mac check's timeout ([`Runner::run_outside`]): an hour by default, past boat's own
+    /// 2400 s for the box and its setup.
+    pub outside_timeout: Duration,
+    /// How long a box or mac check's process group has, after a SIGTERM at its timeout or when its run
+    /// is abandoned, to clean up (the box script deletes its box) before it is killed (finding
+    /// 8292b1a11a07).
+    pub outside_grace: Duration,
     sandbox_exec: PathBuf,
 }
 
@@ -192,6 +202,16 @@ pub enum CheckError {
     Outside(String),
     #[error("materializing the manifest: {0}")]
     Materialize(#[from] MaterializeError),
+    /// The runner script of a check with an executor can't be used as the policy pins it.
+    #[error("the check's runner script: {0}")]
+    Script(String),
+    /// The run can't be tied to the manifest: nothing of it is recorded.
+    #[error("the run can't be tied to the manifest, so nothing is recorded: {0}")]
+    Proof(String),
+    /// This process got SIGINT, SIGTERM or SIGHUP while the check ran: the check was stopped as at its
+    /// timeout, and nothing of it is recorded (finding 02ab829d2caf).
+    #[error("interrupted by signal {0}: the check was stopped as at its timeout, and nothing of it is recorded")]
+    Interrupted(i32),
     #[error("{what}: {source}")]
     Io {
         what: String,
@@ -214,6 +234,8 @@ impl Runner {
             timeout: Duration::from_secs(30 * 60),
             tail_bytes: 64 * 1024,
             base: std::env::temp_dir(),
+            outside_timeout: Duration::from_secs(60 * 60),
+            outside_grace: Duration::from_secs(60),
             sandbox_exec: PathBuf::from(SANDBOX_EXEC),
         }
     }
@@ -259,6 +281,12 @@ impl Runner {
         files: impl Fn(&ContentHash) -> Option<Vec<u8>>,
     ) -> Result<Outcome, CheckError> {
         let Some(first) = check.argv.first() else { return Err(CheckError::EmptyArgv(check.name.to_owned())) };
+        if check.executor.is_some() {
+            return Err(CheckError::Script(format!(
+                "check {} has an executor, so it runs only through Runner::run_outside",
+                check.name
+            )));
+        }
         // Removed when dropped, however this returns or unwinds.
         let fresh = Fresh::make(&self.base)?;
         self.run_in(&fresh, check, first, manifest, files)
@@ -307,7 +335,7 @@ impl Runner {
         }
         let mut command = profile.command(&self.sandbox_exec, &program);
         command.args(&check.argv[1..]).current_dir(&tree).env_clear().envs(env);
-        let (exit, tail, output_bytes) = run::run(command, self.timeout, self.tail_bytes)?;
+        let (exit, tail, output_bytes, _) = run::run(command, self.timeout, None, self.tail_bytes)?;
         Ok(Outcome { method: check.method(), argv: check.argv.to_vec(), program, exit, tail, output_bytes })
     }
 
@@ -507,30 +535,111 @@ fn writable_under(parent: &std::os::fd::OwnedFd, depth: usize) {
 mod run {
     use std::io::Read;
     use std::process::{Child, Command, ExitStatus, Stdio};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
     use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
     use super::{CheckError, Exit, io};
+    use crate::ContentHash;
 
     /// How long the output may stay open after the check's processes are killed.
     const OUTPUT_GRACE: Duration = Duration::from_secs(2);
 
-    /// The last `cap` bytes written, and how many there were.
+    /// The last `cap` bytes written, how many there were, and the hash of them all.
     #[derive(Default)]
     struct Tail {
         bytes: std::collections::VecDeque<u8>,
         total: u64,
+        hasher: blake3::Hasher,
+    }
+
+    /// The signals a run catches, so that a Ctrl-C, a SIGTERM or a closed terminal stops the check as
+    /// its timeout does, with its grace, rather than ending this process and leaving the check's group
+    /// running, which has no terminal of its own (finding 02ab829d2caf). A SIGKILL can't be caught: a
+    /// runner script must clean up when its output pipe breaks.
+    const CAUGHT: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+
+    /// The last caught signal's number while a run catches them, else 0.
+    static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
+
+    /// What the caught signals did before, put back when the last run catching them ends; runs on
+    /// other threads share the handlers.
+    static CATCHING: Mutex<(usize, Vec<(libc::c_int, libc::sigaction)>)> = Mutex::new((0, Vec::new()));
+
+    /// The handler: one atomic store, which is async-signal-safe.
+    extern "C" fn on_signal(signal: libc::c_int) {
+        INTERRUPTED.store(signal, Ordering::SeqCst);
+    }
+
+    /// Sets `signal`'s action to `new`, or only reads it with `None`, and returns the one it had.
+    fn sigaction(signal: libc::c_int, new: Option<&libc::sigaction>) -> std::io::Result<libc::sigaction> {
+        // SAFETY: libc::sigaction is plain data, for which all-zero bytes are a valid value, and
+        // sigaction(2) only reads `new` (null, or a valid struct) and writes `old`, both live for the call.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            let new = new.map_or(std::ptr::null(), |n| n as *const libc::sigaction);
+            if libc::sigaction(signal, new, &mut old) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(old)
+        }
+    }
+
+    /// While one lives, [`CAUGHT`] signals set [`INTERRUPTED`] instead of their default; one the
+    /// process ignores stays ignored.
+    struct Catching;
+
+    impl Catching {
+        fn start() -> Result<Catching, CheckError> {
+            let mut catching = CATCHING.lock().expect("the handlers' lock isn't poisoned: nothing panics holding it");
+            catching.0 += 1;
+            // Put back by Drop, as far as it got, if this fails.
+            let started = Catching;
+            if catching.0 == 1 {
+                INTERRUPTED.store(0, Ordering::SeqCst);
+                for signal in CAUGHT {
+                    let old = sigaction(signal, None).map_err(io("reading a signal's handling"))?;
+                    if old.sa_sigaction == libc::SIG_IGN {
+                        continue;
+                    }
+                    let mut new = old;
+                    new.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+                    new.sa_flags = libc::SA_RESTART;
+                    sigaction(signal, Some(&new)).map_err(io("catching a signal"))?;
+                    catching.1.push((signal, old));
+                }
+            }
+            Ok(started)
+        }
+
+        /// The caught signal, if one came.
+        fn caught() -> Option<i32> {
+            Some(INTERRUPTED.load(Ordering::SeqCst)).filter(|s| *s != 0)
+        }
+    }
+
+    impl Drop for Catching {
+        fn drop(&mut self) {
+            let mut catching = CATCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            catching.0 -= 1;
+            if catching.0 == 0 {
+                for (signal, old) in std::mem::take(&mut catching.1) {
+                    let _ = sigaction(signal, Some(&old));
+                }
+            }
+        }
     }
 
     /// A started check, leading its own process group. Whatever path leaves [`run`], an error
     /// included, dropping this kills the group before the check is reaped, so the group's id can't
-    /// have been given to another process yet.
+    /// have been given to another process yet. With a grace, the group gets a SIGTERM first, and that
+    /// long to end.
     struct Group {
         child: Child,
         reaped: bool,
+        grace: Option<Duration>,
     }
 
     impl Group {
@@ -546,6 +655,17 @@ mod run {
                 .map_err(|e| io("waiting for the check")(e.into()))
         }
 
+        /// With a grace: a SIGTERM to the group, then waits until the check has exited or the grace
+        /// is over.
+        fn terminate(&self) {
+            let Some(grace) = self.grace else { return };
+            let _ = rustix::process::kill_process_group(self.pid(), Signal::TERM);
+            let end = Instant::now() + grace;
+            while Instant::now() < end && !self.exited().unwrap_or(true) {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+
         /// Kills the group and every descendant found by parent pid, then reaps the check. Returns
         /// its status and the processes that had left the group.
         fn finish(&mut self) -> Result<(ExitStatus, Vec<i32>), CheckError> {
@@ -559,6 +679,7 @@ mod run {
     impl Drop for Group {
         fn drop(&mut self) {
             if !self.reaped {
+                self.terminate();
                 let _ = sweep(self.pid());
                 let _ = self.child.kill();
                 let _ = self.child.wait();
@@ -634,12 +755,23 @@ mod run {
         result.map(|()| left)
     }
 
-    pub(super) fn run(mut command: Command, timeout: Duration, cap: usize) -> Result<(Exit, Vec<u8>, u64), CheckError> {
+    /// Runs `command` in a process group of its own for at most `timeout`, keeping the last `cap`
+    /// bytes of its output; returns how it ended, those bytes, how many there were and the hash of
+    /// them all. With `grace`, a timeout sends the group SIGTERM first, and that long to end. A
+    /// SIGINT, SIGTERM or SIGHUP to this process meanwhile stops it the same way, and is the error.
+    pub(super) fn run(
+        mut command: Command,
+        timeout: Duration,
+        grace: Option<Duration>,
+        cap: usize,
+    ) -> Result<(Exit, Vec<u8>, u64, ContentHash), CheckError> {
+        // Before the check starts, so no signal finds it running uncaught; dropped after it's reaped.
+        let _catching = Catching::start()?;
         let (reader, writer) = std::io::pipe().map_err(io("making the output pipe"))?;
         let writer2 = writer.try_clone().map_err(io("making the output pipe"))?;
         command.stdin(Stdio::null()).stdout(writer).stderr(writer2);
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
-        let mut group = Group { child: command.spawn().map_err(io("starting the check"))?, reaped: false };
+        let mut group = Group { child: command.spawn().map_err(io("starting the check"))?, reaped: false, grace };
         // Our copies of the write end go with the command, so the reader sees end-of-file once the
         // check's processes are gone.
         drop(command);
@@ -669,13 +801,20 @@ mod run {
         let _stop_reader = StopOnDrop(Arc::clone(&stop));
 
         let deadline = Instant::now() + timeout;
-        let mut timed_out = false;
+        let (mut timed_out, mut interrupted) = (false, None);
         while !group.exited()? {
             if Instant::now() >= deadline {
                 timed_out = true;
                 break;
             }
+            interrupted = Catching::caught();
+            if interrupted.is_some() {
+                break;
+            }
             std::thread::sleep(Duration::from_millis(20));
+        }
+        if timed_out || interrupted.is_some() {
+            group.terminate();
         }
         // Whether it ended or timed out, nothing it started that the sweep can find outlives it (an orphan
         // can, weave.md section 3).
@@ -685,6 +824,9 @@ mod run {
         let held = done_rx.recv_timeout(OUTPUT_GRACE).is_err();
         stop.store(true, Ordering::Relaxed);
         let _ = reading.join();
+        if let Some(signal) = interrupted {
+            return Err(CheckError::Interrupted(signal));
+        }
         let exit = if !left.is_empty() {
             Exit::LeftGroup(left)
         } else if held {
@@ -695,7 +837,8 @@ mod run {
             exit_of(status)
         };
         let t = tail.lock().expect("the tail's lock isn't poisoned: nothing panics holding it");
-        Ok((exit, t.bytes.iter().copied().collect(), t.total))
+        let hash = ContentHash(*t.hasher.finalize().as_bytes());
+        Ok((exit, t.bytes.iter().copied().collect(), t.total, hash))
     }
 
     /// Reads `reader` (non-blocking) into `tail`, keeping its last `cap` bytes, until end-of-file, an
@@ -716,6 +859,7 @@ mod run {
             };
             let mut t = tail.lock().expect("the tail's lock isn't poisoned: nothing panics holding it");
             t.total += n as u64;
+            t.hasher.update(&buf[..n]);
             t.bytes.extend(&buf[..n]);
             let excess = t.bytes.len().saturating_sub(cap);
             t.bytes.drain(..excess);
@@ -772,7 +916,12 @@ mod run {
 
     use super::{CheckError, Exit};
 
-    pub(super) fn run(_command: Command, _timeout: Duration, _cap: usize) -> Result<(Exit, Vec<u8>, u64), CheckError> {
+    pub(super) fn run(
+        _command: Command,
+        _timeout: Duration,
+        _grace: Option<Duration>,
+        _cap: usize,
+    ) -> Result<(Exit, Vec<u8>, u64, crate::ContentHash), CheckError> {
         Err(CheckError::NoSandbox("checks run only on macOS".to_owned()))
     }
 }

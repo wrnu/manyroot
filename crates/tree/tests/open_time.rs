@@ -71,6 +71,7 @@ fn a_fifty_megabyte_ground_opens_and_its_views_hold() {
         validators: vec![],
         goal_setters: vec![who.agent_id()],
         checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
         owner_decision: None,
     };

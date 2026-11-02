@@ -57,7 +57,8 @@ impl Setup {
     fn run(&self, argv: &[&str], files: &[(&str, Mode, &[u8])]) -> Result<bracken_tree::check::Outcome, CheckError> {
         let argv: Vec<String> = argv.iter().map(|s| (*s).to_owned()).collect();
         let (manifest, blobs) = tree(files);
-        self.runner.run(&CheckDefinition { name: "test", argv: &argv }, &manifest, |h| blobs.get(h).cloned())
+        self.runner
+            .run(&CheckDefinition { name: "test", argv: &argv, executor: None }, &manifest, |h| blobs.get(h).cloned())
     }
 
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -73,7 +74,8 @@ impl Setup {
         let script = format!("touch {}", marker.display());
         let argv: Vec<String> = ["sh", "-c", &script].iter().map(|a| (*a).to_owned()).collect();
         let (manifest, blobs) = tree(&[("README", Mode::File, b"r\n")]);
-        let result = runner.run(&CheckDefinition { name: "test", argv: &argv }, &manifest, |h| blobs.get(h).cloned());
+        let result = runner
+            .run(&CheckDefinition { name: "test", argv: &argv, executor: None }, &manifest, |h| blobs.get(h).cloned());
         assert!(matches!(result, Err(CheckError::NoSandbox(_))), "{result:?}");
         assert!(!marker.exists(), "the check ran");
         self.assert_cleaned_up();
@@ -110,7 +112,7 @@ mod macos_only {
         let pass = s.run(&["test", "-f", "src/a.txt"], files).expect("runs");
         assert_eq!(pass.exit, Exit::Code(0));
         assert!(pass.exit.passed());
-        assert_eq!(pass.method, CheckDefinition { name: "test", argv: &pass.argv }.method());
+        assert_eq!(pass.method, CheckDefinition { name: "test", argv: &pass.argv, executor: None }.method());
         let fail = s.run(&["sh", "-c", "echo failing; exit 3"], files).expect("runs");
         assert_eq!(fail.exit, Exit::Code(3));
         assert_eq!(fail.tail, b"failing\n");
@@ -527,7 +529,9 @@ mod macos_only {
         let (manifest, _) = tree(&[("README", Mode::File, b"r\n")]);
         let runner = s.runner.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            runner.run(&CheckDefinition { name: "test", argv: &argv }, &manifest, |_| panic!("the file source failed"))
+            runner.run(&CheckDefinition { name: "test", argv: &argv, executor: None }, &manifest, |_| {
+                panic!("the file source failed")
+            })
         }));
         assert!(result.is_err(), "the panic didn't reach the caller");
         s.assert_cleaned_up();
@@ -734,6 +738,110 @@ mod macos_only {
         for sandbox_exec in [Path::new("/nonexistent/sandbox-exec"), Path::new("/usr/bin/false"), open.as_path()] {
             s.assert_refused(&s.runner.clone().with_sandbox_exec(sandbox_exec));
         }
+    }
+
+    /// A check run outside the sandbox (plan cc496dcee0e3, section 2), with `script` as its pinned runner
+    /// script, in a runner directory inside the base.
+    fn outside(
+        s: &Setup,
+        script: &str,
+        files: &[(&str, Mode, &[u8])],
+    ) -> Result<bracken_tree::check::OutsideOutcome, CheckError> {
+        use bracken_tree::format::{Executor, ExecutorKind};
+        use std::os::unix::fs::PermissionsExt;
+        let runner = s.path().join("runner");
+        std::fs::create_dir_all(&runner).expect("mkdir runner");
+        std::fs::write(runner.join("run.sh"), script).expect("write the script");
+        std::fs::set_permissions(runner.join("run.sh"), std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let executor = Executor {
+            kind: ExecutorKind::Mac,
+            script: "run.sh".to_owned(),
+            script_hash: ContentHash::of(script.as_bytes()),
+        };
+        let argv = vec!["mac".to_owned()];
+        let check = CheckDefinition { name: "mac", argv: &argv, executor: Some(&executor) };
+        let (manifest, blobs) = tree(files);
+        s.runner.run_outside(
+            &check,
+            &runner,
+            &manifest,
+            |h| blobs.get(h).cloned(),
+            &KnownKeys::new(),
+            &vec![],
+            &vec![],
+            &[],
+        )
+    }
+
+    // The commit made from the manifest stands for it only if it imports as exactly it: an attribute that
+    // makes git store a file other than as the manifest has it is refused before the script runs.
+    #[test]
+    fn a_manifest_git_would_store_otherwise_is_refused_before_its_script_runs() {
+        let s = Setup::new();
+        let marker = s.path().join("ran");
+        let script = format!(
+            "#!/bin/sh\ntouch {}\nprintf 'head %s\\ntree %s\\n' \"$WEAVE_COMMIT\" \"$WEAVE_TREE\" >>\"$WEAVE_FACTS\"\n",
+            marker.display()
+        );
+        let crlf: &[(&str, Mode, &[u8])] =
+            &[(".gitattributes", Mode::File, b"*.txt text eol=lf\n"), ("a.txt", Mode::File, b"one\r\n")];
+        let err = outside(&s, &script, crlf).expect_err("refused");
+        assert!(matches!(err, CheckError::Proof(_)), "{err}");
+        assert!(!marker.exists(), "the script ran");
+
+        // The same tree without the attribute runs, and its commit and tree are given.
+        let plain: &[(&str, Mode, &[u8])] = &[("a.txt", Mode::File, b"one\r\n")];
+        let out = outside(&s, &script, plain).expect("it runs");
+        assert!(out.passed(), "{:?}", out.exit);
+        assert!(marker.exists());
+        assert_eq!(out.commit.len(), 40);
+        assert!(out.run_lines().contains(&format!("tree {}", out.tree)));
+
+        // A script that isn't the one pinned doesn't run: the hash is of another text.
+        std::fs::remove_file(&marker).expect("rm marker");
+        std::fs::write(s.path().join("runner/run.sh"), "#!/bin/sh\ntouch /dev/null\n").expect("rewrite");
+        let argv = vec!["mac".to_owned()];
+        let executor = bracken_tree::format::Executor {
+            kind: bracken_tree::format::ExecutorKind::Mac,
+            script: "run.sh".to_owned(),
+            script_hash: ContentHash::of(script.as_bytes()),
+        };
+        let check = CheckDefinition { name: "mac", argv: &argv, executor: Some(&executor) };
+        let (manifest, blobs) = tree(plain);
+        let err = s
+            .runner
+            .run_outside(
+                &check,
+                &s.path().join("runner"),
+                &manifest,
+                |h| blobs.get(h).cloned(),
+                &KnownKeys::new(),
+                &vec![],
+                &vec![],
+                &[],
+            )
+            .expect_err("refused");
+        assert!(matches!(err, CheckError::Script(_)), "{err}");
+        assert!(!marker.exists(), "the script ran");
+        // And the sandboxed runner refuses a check with an executor.
+        let err = s.runner.run(&check, &manifest, |h| blobs.get(h).cloned()).expect_err("refused");
+        assert!(matches!(err, CheckError::Script(_)), "{err}");
+    }
+
+    // Finding 8292b1a11a07: at its timeout a box or mac check's group gets a SIGTERM and a grace before the
+    // kill, so the box script's trap deletes its box.
+    #[test]
+    fn an_outside_check_gets_a_sigterm_and_a_grace_at_its_timeout() {
+        let mut s = Setup::new();
+        s.runner.outside_timeout = Duration::from_secs(1);
+        s.runner.outside_grace = Duration::from_secs(10);
+        let marker = s.path().join("cleaned");
+        let script = format!("#!/bin/bash\ntrap 'touch {}; exit 143' TERM\nsleep 30 &\nwait\n", marker.display());
+        let started = Instant::now();
+        let out = outside(&s, &script, &[("a.txt", Mode::File, b"one\n")]).expect("it ran");
+        assert_eq!(out.exit, Exit::TimedOut);
+        assert!(marker.exists(), "the script's TERM trap didn't run");
+        assert!(started.elapsed() < Duration::from_secs(9), "it waited out the grace: {:?}", started.elapsed());
     }
 }
 

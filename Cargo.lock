@@ -243,6 +243,7 @@ dependencies = [
  "hex",
  "icu_casemap",
  "imara-diff",
+ "libc",
  "manyroot",
  "rustix",
  "serde",

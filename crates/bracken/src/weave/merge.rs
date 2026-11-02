@@ -27,7 +27,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result, bail, ensure};
 use bracken_tree::format::Record;
 use bracken_tree::format::{
-    Change, Decision, FileValue, Guardrails, Line, Manifest, Mode, Proposal, Resolution, VERSION,
+    Change, Decision, Executor, ExecutorKind, FileValue, Guardrails, Line, Manifest, Mode, Proposal, Resolution,
+    VERSION,
 };
 use bracken_tree::ground::{Index, kind_of};
 use bracken_tree::import::{self, Source};
@@ -123,6 +124,14 @@ pub(crate) struct PolicyArgs {
     /// several; a name given again replaces its argv.
     #[arg(long = "check", value_name = "NAME=ARGV")]
     checks: Vec<String>,
+    /// Run a check outside the sandboxed runner, as NAME=KIND:SCRIPT: KIND is box (a remote box) or mac
+    /// (this Mac, unsandboxed), and SCRIPT the runner script, a path inside --runner, whose content hash
+    /// the policy pins. Repeat for several; a name given again replaces its executor.
+    #[arg(long = "executor", value_name = "NAME=KIND:SCRIPT", requires = "runner")]
+    executors: Vec<String>,
+    /// The directory --executor's scripts are in: the main checkout, which scripts/weave gives.
+    #[arg(long, value_name = "DIR")]
+    runner: Option<PathBuf>,
     /// Guardrail: how many known breakages a decision may carry.
     #[arg(long, value_name = "N")]
     max_known: Option<u64>,
@@ -144,7 +153,9 @@ pub(crate) enum Field {
     Integrators,
     Validators,
     GoalSetters,
+    /// Every check, and so every executor too.
     Checks,
+    Executors,
     Protected,
 }
 
@@ -260,6 +271,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
                 validators: vec![],
                 goal_setters: vec![],
                 checks: BTreeMap::new(),
+                executors: BTreeMap::new(),
                 guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
                 owner_decision: None,
             };
@@ -288,6 +300,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
                 require_marker(&ix)?;
             }
             let lines = super::lines_for(s, &ix, &[Some(&line)]);
+            super::refuse_unreadable(&lines, "weave line policy")?;
             let first = resolve_line(s, &lines, Some(&line), "the line")?;
             let who = signer(s, agent)?;
             let author = lines.line(&first).expect("resolved").author;
@@ -341,7 +354,11 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
                     Field::Integrators => next.integrators.clear(),
                     Field::Validators => next.validators.clear(),
                     Field::GoalSetters => next.goal_setters.clear(),
-                    Field::Checks => next.checks.clear(),
+                    Field::Checks => {
+                        next.checks.clear();
+                        next.executors.clear();
+                    }
+                    Field::Executors => next.executors.clear(),
                     Field::Protected => next.guardrails.protected.clear(),
                 }
             }
@@ -377,6 +394,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
                 require_marker(&ix)?;
             }
             let lines = super::lines_for(s, &ix, &[Some(&into), Some(&from), base.as_deref()]);
+            super::refuse_unreadable(&lines, "weave line merge")?;
             let target = lines_target(s, &lines, &ix, &into, &from, base.as_deref())?;
             write_merge(s, agent, &ix, &lines, target, note, dry_run, None, None, &Default::default(), out)
         }
@@ -406,7 +424,7 @@ fn print_policy_dry_run(line: &Line, supersedes: &[ContributionId], names: &Name
         let ids = |list: &[AgentId]| -> Vec<String> { list.iter().map(ToString::to_string).collect() };
         print_json(&json!({"line": Value::Null, "name": line.name, "integrators": ids(&line.integrators),
                            "validators": ids(&line.validators), "goal_setters": ids(&line.goal_setters),
-                           "checks": line.checks, "guardrails": {"max_known": line.guardrails.max_known,
+                           "checks": line.checks, "executors": line.executors, "guardrails": {"max_known": line.guardrails.max_known,
                            "max_age": line.guardrails.max_age, "protected": line.guardrails.protected},
                            "owner_decision": line.owner_decision, "supersedes": supersedes}));
         return;
@@ -418,6 +436,9 @@ fn print_policy_dry_run(line: &Line, supersedes: &[ContributionId], names: &Name
     println!("  goal setters: {}", printable(&agents(&line.goal_setters).join(", ")));
     for (name, argv) in &line.checks {
         println!("  check {}: {}", printable(name), printable(&argv.join(" ")));
+    }
+    for (name, e) in &line.executors {
+        println!("  executor {}: {} {} {}", printable(name), e.kind.as_str(), printable(&e.script), e.script_hash);
     }
     let g = &line.guardrails;
     println!(
@@ -453,6 +474,10 @@ fn apply(line: &mut Line, given: &PolicyArgs, names: &Names) -> Result<()> {
         let argv: Vec<String> = argv.split_whitespace().map(str::to_owned).collect();
         line.checks.insert(name.trim().to_owned(), argv);
     }
+    for given_executor in &given.executors {
+        let (name, executor) = parse_executor(given_executor, given.runner.as_deref())?;
+        line.executors.insert(name, executor);
+    }
     if let Some(n) = given.max_known {
         line.guardrails.max_known = n;
     }
@@ -471,6 +496,21 @@ fn apply(line: &mut Line, given: &PolicyArgs, names: &Names) -> Result<()> {
     );
     line.owner_decision = Some(given.owner_decision.clone());
     Ok(())
+}
+
+/// `--executor NAME=KIND:SCRIPT`, with SCRIPT's content hash read from inside `runner`.
+fn parse_executor(given: &str, runner: Option<&Path>) -> Result<(String, Executor)> {
+    let what = || format!("--executor {given:?}");
+    let (name, rest) = given.split_once('=').with_context(|| format!("{}: give NAME=KIND:SCRIPT", what()))?;
+    let (kind, script) = rest.split_once(':').with_context(|| format!("{}: give NAME=KIND:SCRIPT", what()))?;
+    let kind = match kind {
+        "box" => ExecutorKind::Box,
+        "mac" => ExecutorKind::Mac,
+        other => bail!("{}: the kind is box or mac, not {other:?}", what()),
+    };
+    let script_hash =
+        super::checks::runner_script_hash(runner.context("--executor needs --runner")?, script).with_context(what)?;
+    Ok((name.trim().to_owned(), Executor { kind, script: script.to_owned(), script_hash }))
 }
 
 pub(crate) fn propose(s: &mut Store, agent: Option<&str>, args: ProposeArgs) -> Result<ExitCode> {
@@ -598,6 +638,7 @@ pub(crate) fn integrate_proposals(
     require_marker(&ix)?;
     let named: Vec<Option<&str>> = proposals.iter().map(|p| Some(p.as_str())).chain([line]).collect();
     let lines = super::lines_for(s, &ix, &named);
+    super::refuse_unreadable(&lines, "integrate")?;
     let target = proposals_target(s, &lines, &ix, line, proposals)?;
     let mirror = match mirrors {
         None => None,

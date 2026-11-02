@@ -90,6 +90,7 @@ fn policy(w: &World, goal_setters: Vec<manyroot::AgentId>, guardrails: Guardrail
         validators: vec![w.bob.agent_id(), w.carol.agent_id()],
         goal_setters,
         checks: BTreeMap::from([("test".to_owned(), ARGV.iter().map(|a| a.to_string()).collect())]),
+        executors: BTreeMap::new(),
         guardrails,
         owner_decision: Some("decision 0123456789ab".into()),
     }
@@ -206,7 +207,7 @@ impl World {
     /// A result for `test` on a manifest artifact by `who`.
     fn result(&mut self, who: &Identity, manifest: (ContentHash, ContributionId), passed: bool) -> ContributionId {
         let argv: Vec<String> = ARGV.iter().map(|a| a.to_string()).collect();
-        let method = CheckDefinition { name: "test", argv: &argv }.method();
+        let method = CheckDefinition { name: "test", argv: &argv, executor: None }.method();
         let exit = Exit::Code(if passed { 0 } else { 1 });
         let details = details(&manifest.0, 1, &argv, &exit, &RecordedTail::Text("out".into()));
         let verdict = if passed { Verdict::Pass } else { Verdict::Fail };

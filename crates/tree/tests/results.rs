@@ -40,6 +40,7 @@ fn policy(w: &World, argv: &[&str]) -> Line {
         validators: vec![w.alice.agent_id(), w.bob.agent_id(), w.carol.agent_id()],
         goal_setters: vec![w.alice.agent_id()],
         checks: BTreeMap::from([("test".to_owned(), argv.iter().map(|a| a.to_string()).collect())]),
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
         owner_decision: Some("decision 0123456789ab".into()),
     }
@@ -153,7 +154,7 @@ impl World {
         after: Option<Vec<ContributionId>>,
     ) -> ContributionId {
         let argv: Vec<String> = argv.iter().map(|a| a.to_string()).collect();
-        let method = CheckDefinition { name: "test", argv: &argv }.method();
+        let method = CheckDefinition { name: "test", argv: &argv, executor: None }.method();
         let exit = Exit::Code(if passed { 0 } else { 1 });
         let details = details(&manifest.0, attempt, &argv, &exit, &RecordedTail::Text("ok".into()));
         let verdict = if passed { Verdict::Pass } else { Verdict::Fail };
@@ -531,7 +532,8 @@ fn a_forged_highest_attempt_saturates() {
     w.result(&bob, m, ARGV, false, u64::MAX, None);
     let (_, _, checks) = w.checks();
     let method =
-        CheckDefinition { name: "test", argv: &ARGV.iter().map(|a| a.to_string()).collect::<Vec<_>>() }.method();
+        CheckDefinition { name: "test", argv: &ARGV.iter().map(|a| a.to_string()).collect::<Vec<_>>(), executor: None }
+            .method();
     assert_eq!(checks.next_attempt(&bob.agent_id(), &m.0, &method), u64::MAX);
 }
 

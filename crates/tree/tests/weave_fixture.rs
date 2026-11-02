@@ -112,6 +112,7 @@ fn policy(validators: &[&Identity], max_known: u64) -> Line {
         validators: validators.iter().map(|v| v.agent_id()).collect(),
         goal_setters: vec![alice],
         checks: checks(),
+        executors: BTreeMap::new(),
         guardrails: Guardrails { max_known, max_age: 3, protected: vec!["docs".into()] },
         owner_decision: Some("0123456789abcdef".into()),
     }

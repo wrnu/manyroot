@@ -61,6 +61,8 @@ pub enum FormatError {
     Blank(&'static str),
     #[error("check {0:?} has an empty argv")]
     EmptyArgv(String),
+    #[error("executor for {0:?}, which isn't one of the line's checks")]
+    ExecutorWithoutCheck(String),
     #[error("{0} are not strictly ascending")]
     Order(&'static str),
     #[error("the decision refers to {0} contributions, over the limit of {MAX_REFERENCES}")]
@@ -330,6 +332,12 @@ pub struct Line {
     pub goal_setters: Vec<AgentId>,
     /// A check's name, never blank, to the argv that runs it.
     pub checks: BTreeMap<String, Vec<String>>,
+    /// A check that runs outside the sandboxed runner, by its name (one of `checks`), to how it runs
+    /// (plan cc496dcee0e3, section 2). Absent from the payload when empty, so a line without one encodes
+    /// as before; an older build, which doesn't know the field, refuses a line that has one, since it
+    /// wouldn't re-encode the same.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub executors: BTreeMap<String, Executor>,
     pub guardrails: Guardrails,
     /// The id, as text, of the owner's decision claim in the coordination Ground
     /// that allows this version. Required by `scripts/weave` before stage 2.
@@ -340,7 +348,18 @@ impl Line {
     /// The method a result for the named check carries under this policy, if the
     /// policy has that check.
     pub fn check_method(&self, name: &str) -> Option<String> {
-        self.checks.get(name).map(|argv| CheckDefinition { name, argv }.method())
+        self.definition(name).map(|d| d.method())
+    }
+
+    /// The named check's definition under this policy: its argv and, if it has one, its executor.
+    pub fn definition<'a>(&'a self, name: &'a str) -> Option<CheckDefinition<'a>> {
+        let argv = self.checks.get(name)?;
+        Some(CheckDefinition { name, argv, executor: self.executors.get(name) })
+    }
+
+    /// Every check's definition, in name order.
+    pub fn definitions(&self) -> impl Iterator<Item = CheckDefinition<'_>> {
+        self.checks.iter().map(|(name, argv)| CheckDefinition { name, argv, executor: self.executors.get(name) })
     }
 }
 
@@ -358,6 +377,12 @@ impl Record for Line {
             if argv.is_empty() {
                 return Err(FormatError::EmptyArgv(name.clone()));
             }
+        }
+        for (name, executor) in &self.executors {
+            if !self.checks.contains_key(name) {
+                return Err(FormatError::ExecutorWithoutCheck(name.clone()));
+            }
+            valid_path(&executor.script)?;
         }
         for prefix in &self.guardrails.protected {
             valid_path(prefix)?;
@@ -595,17 +620,52 @@ impl Change {
     }
 }
 
-/// A named check and the argv a policy gives it.
+/// Where a check runs, when not in the sandboxed runner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutorKind {
+    /// In a remote box, from a bundle of the manifest's commit.
+    Box,
+    /// On the validator's Mac, unsandboxed, in a checkout of the manifest's commit.
+    Mac,
+}
+
+impl ExecutorKind {
+    /// The name the payload and the CLI use: `box` or `mac`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutorKind::Box => "box",
+            ExecutorKind::Mac => "mac",
+        }
+    }
+}
+
+/// How a check runs outside the sandboxed runner: the runner script that runs it, a path inside the
+/// validator's runner directory (the main checkout), pinned by its content hash, so the script that
+/// judges the run is the one the policy names, never the tree's own copy.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Executor {
+    pub kind: ExecutorKind,
+    pub script: String,
+    pub script_hash: ContentHash,
+}
+
+/// A named check, the argv a policy gives it and, if it runs outside the sandbox, its executor.
 #[derive(Clone, Copy, Debug)]
 pub struct CheckDefinition<'a> {
     pub name: &'a str,
     pub argv: &'a [String],
+    pub executor: Option<&'a Executor>,
 }
 
 impl CheckDefinition<'_> {
-    /// The content hash of the canonical CBOR of `[name, argv]`.
+    /// The content hash of the canonical CBOR of `[name, argv]`, or of `[name, argv, executor]` for a
+    /// check with an executor: the kind, the script and its hash are part of what a result is for.
     pub fn hash(&self) -> ContentHash {
-        ContentHash::of(&to_cbor(&(self.name, self.argv)))
+        match self.executor {
+            None => ContentHash::of(&to_cbor(&(self.name, self.argv))),
+            Some(e) => ContentHash::of(&to_cbor(&(self.name, self.argv, e))),
+        }
     }
 
     /// The method every result for this check carries: `<name> blake3:<definition hash>`.
