@@ -196,43 +196,75 @@ mod macos_only {
     }
 
     /// Agent code reads nothing of the hidden set, imported or run as a command (note 9891289fb39c (1)): not
-    /// the store, nor the host's copy of the tests, while it can read its own tree.
+    /// the store, nor the host's copy of the tests, while it can read its own tree. Each check is a group of its own,
+    /// with a host and a wall time of its own (task 22514c4f1d33): in one group, the dozen command containers
+    /// outran the one host's wall time on a loaded machine, and a check that never ran proves nothing. So each group
+    /// must end with its one test passed, none cut short.
     #[test]
     fn agent_code_reads_no_hidden_test_imported_or_as_a_command() {
         let Some(python) = python() else { return };
-        const PEEK: &str = "import os, subprocess, sys, tempfile, unittest\nimport tiny.peek as peek\n\
-            STORE = '{ROOT}/store/tiny@1/tests/test_peek.py'\n\nclass T(unittest.TestCase):\n\
-            \x20   def test_own_tree(self):\n        self.assertIs(peek.own(), True)\n\
-            \x20   def test_import(self):\n        self.assertIs(peek.can_read(STORE), False)\n\
-            \x20       self.assertIs(peek.can_read(os.path.abspath(__file__)), False)\n\
-            \x20   def test_command(self):\n        for path in (STORE, os.path.abspath(__file__)):\n\
-            \x20           out = subprocess.run([sys.executable, '-m', 'tiny.peek', path], capture_output=True, text=True)\n\
-            \x20           self.assertEqual(out.stdout, 'no\\n', out.stderr)\n\
-            \x20   def test_relative(self):\n\
-            \x20       for path in ('tests/test_peek.py', '../tests/test_peek.py', 'test_peek.py'):\n\
-            \x20           out = subprocess.run([sys.executable, '-m', 'tiny.peek', path], capture_output=True, text=True)\n\
-            \x20           self.assertEqual(out.stdout, 'no\\n', out.stderr)\n\
-            \x20   def test_an_empty_directory(self):\n\
-            \x20       out = subprocess.run([sys.executable, '-m', 'tiny.ls'], capture_output=True, text=True)\n\
-            \x20       self.assertEqual(out.stdout, '[]\\n', out.stderr)\n\
-            \x20   def test_files_given_back_stay_in_its_directory(self):\n\
-            \x20       d = tempfile.mkdtemp()\n\
-            \x20       subprocess.run([sys.executable, '-m', 'tiny.write', 'test_peek.py'], cwd=d, capture_output=True)\n\
-            \x20       self.assertEqual(open(os.path.join(d, 'test_peek.py')).read(), 'written')\n\
-            \x20       self.assertIn('STORE =', open(os.path.abspath(__file__)).read())\n\
-            \x20   def test_not_where_the_tests_are(self):\n\
-            \x20       for d in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):\n\
-            \x20           out = subprocess.run([sys.executable, '-m', 'tiny.ls'], cwd=d, capture_output=True, text=True)\n\
-            \x20           self.assertEqual(out.stdout, '[]\\n', out.stderr)\n\
-            \x20           subprocess.run([sys.executable, '-m', 'tiny.write', 'test_peek.py'], cwd=d, capture_output=True)\n\
-            \x20       self.assertIn('STORE =', open(os.path.abspath(__file__)).read())\n\
-            \x20   def test_no_hidden_file_by_its_absolute_path(self):\n\
-            \x20       for path in (os.path.abspath(__file__), os.path.dirname(os.path.abspath(__file__))):\n\
-            \x20           out = subprocess.run([sys.executable, '-m', 'tiny.peek', path], capture_output=True, text=True)\n\
-            \x20           self.assertEqual(out.stdout, 'no\\n', out.stderr)\n";
-        let groups = json!([{"item": "mean-empty", "file": "tests/test_peek.py", "applies": "always"}]);
-        let s = setup(groups, &[("test_peek.py", PEEK)]);
-        let store_file = s.root.join("store/tiny@1/tests/test_peek.py");
+        // Each file's name and its path in the store: the host's copy of a test file is the file itself. Only the
+        // checks that call the package import it, so only their groups start a server.
+        const HEAD: &str = "import os, subprocess, sys, tempfile, unittest\n\
+            NAME = os.path.basename(__file__)\nSTORE = '{ROOT}/store/tiny@1/tests/' + NAME\n\n\
+            class T(unittest.TestCase):\n";
+        const CHECKS: [(&str, &str); 8] = [
+            ("own_tree", "        import tiny.peek as peek\n        self.assertIs(peek.own(), True)\n"),
+            (
+                "import",
+                "        import tiny.peek as peek\n        self.assertIs(peek.can_read(STORE), False)\n\
+                 \x20       self.assertIs(peek.can_read(os.path.abspath(__file__)), False)\n",
+            ),
+            (
+                "command",
+                "        for path in (STORE, os.path.abspath(__file__)):\n\
+                 \x20           out = subprocess.run([sys.executable, '-m', 'tiny.peek', path], capture_output=True, text=True)\n\
+                 \x20           self.assertEqual(out.stdout, 'no\\n', out.stderr)\n",
+            ),
+            (
+                "relative",
+                "        for path in ('tests/' + NAME, '../tests/' + NAME, NAME):\n\
+                 \x20           out = subprocess.run([sys.executable, '-m', 'tiny.peek', path], capture_output=True, text=True)\n\
+                 \x20           self.assertEqual(out.stdout, 'no\\n', out.stderr)\n",
+            ),
+            (
+                "an_empty_directory",
+                "        out = subprocess.run([sys.executable, '-m', 'tiny.ls'], capture_output=True, text=True)\n\
+                 \x20       self.assertEqual(out.stdout, '[]\\n', out.stderr)\n",
+            ),
+            (
+                "files_given_back_stay_in_its_directory",
+                "        d = tempfile.mkdtemp()\n\
+                 \x20       subprocess.run([sys.executable, '-m', 'tiny.write', NAME], cwd=d, capture_output=True)\n\
+                 \x20       self.assertEqual(open(os.path.join(d, NAME)).read(), 'written')\n\
+                 \x20       self.assertIn('STORE =', open(os.path.abspath(__file__)).read())\n",
+            ),
+            (
+                "not_where_the_tests_are",
+                "        for d in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):\n\
+                 \x20           out = subprocess.run([sys.executable, '-m', 'tiny.ls'], cwd=d, capture_output=True, text=True)\n\
+                 \x20           self.assertEqual(out.stdout, '[]\\n', out.stderr)\n\
+                 \x20           subprocess.run([sys.executable, '-m', 'tiny.write', NAME], cwd=d, capture_output=True)\n\
+                 \x20       self.assertIn('STORE =', open(os.path.abspath(__file__)).read())\n",
+            ),
+            (
+                "no_hidden_file_by_its_absolute_path",
+                "        for path in (os.path.abspath(__file__), os.path.dirname(os.path.abspath(__file__))):\n\
+                 \x20           out = subprocess.run([sys.executable, '-m', 'tiny.peek', path], capture_output=True, text=True)\n\
+                 \x20           self.assertEqual(out.stdout, 'no\\n', out.stderr)\n",
+            ),
+        ];
+        let files: Vec<(String, String)> = CHECKS
+            .iter()
+            .map(|(name, body)| (format!("test_{name}.py"), format!("{HEAD}    def test_{name}(self):\n{body}")))
+            .collect();
+        let groups: Vec<Value> = files
+            .iter()
+            .map(|(file, _)| json!({"item": "mean-empty", "file": format!("tests/{file}"), "applies": "always"}))
+            .collect();
+        let tests: Vec<(&str, &str)> = files.iter().map(|(f, t)| (f.as_str(), t.as_str())).collect();
+        let s = setup(Value::Array(groups), &tests);
+        let store_file = s.root.join("store/tiny@1/tests/test_import.py");
         assert!(std::fs::File::open(&store_file).is_ok(), "the store is readable outside the sandbox");
         let tree = s.root.join("tree");
         write(&tree.join("tiny/__init__.py"), "");
@@ -245,7 +277,11 @@ mod macos_only {
         write(&tree.join("tiny/ls.py"), "import json, os\nprint(json.dumps(sorted(os.listdir('.'))))\n");
         write(&tree.join("tiny/write.py"), "import sys\nopen(sys.argv[1], 'w').write('written')\n");
         let g = grade(&python, &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
-        assert_eq!(g.groups[0].counts, Counts { pass: 8, ..Counts::default() }, "{g:#?}");
+        assert_eq!(indexes(&g), (0..CHECKS.len()).collect::<Vec<_>>(), "{g:#?}");
+        for group in &g.groups {
+            let one = (None, Counts { pass: 1, ..Counts::default() });
+            assert_eq!((group.unfinished.as_deref(), group.counts), one, "{}: {group:#?}", CHECKS[group.index].0);
+        }
     }
 
     /// Hidden tests shaped as a project's own often are (task `6a80d88373a5`): the package `tests`, with helpers
