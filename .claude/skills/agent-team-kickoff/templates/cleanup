@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # cleanup: frees the disk the team's checkouts and scratch fill (owner process 11f1ac552f26).
 #
-#   cleanup [--apply]
+#   cleanup [--apply] [--target-idle <hours>]
 #
 # A dry run by default: it lists what it would do and why, and changes nothing. --apply acts. It runs
 # unattended (the manager's daily T3 task, and scripts/merge after each merge): no prompts, exit 0 when
@@ -22,6 +22,18 @@
 #       its patch, so only the tip it pushed and claimed can be judged by it). The remote-tracking ref's
 #       reflog can't say: git fetch --prune deletes it with the ref;
 #   - the entries of $TMPDIR/bracken-scratch (the team's scratch root, one entry per task), removed.
+# A builder's worktree it keeps for any other reason than being in use or out of bounds (dirty, unmerged,
+# young, on no branch...) still loses its target/ when no process has a file open in the worktree and
+# nothing in target/ changed for the target idle time: 3 hours, or --target-idle <hours>, or
+# CLEANUP_TARGET_IDLE_HOURS (task cb478ca0bd41). With sccache, rebuilding it is cheap. Only where lsof
+# runs: just before each removal it looks again, renames the target dir aside, looks once more, and only
+# then deletes it (finding 176efeffc76f). So does a cargo
+# target dir (one holding cargo's CACHEDIR.TAG, as CARGO_TARGET_DIR makes) inside a scratch entry it keeps,
+# when no process has anything in that entry open, unless it's in a pg-* directory or another
+# repository's checkout at any level (finding 2b3fe543e130). Only target/ goes, removed directly, never
+# sources.
+# Its summary also says how much of Docker's build cache could be reclaimed, but it never prunes it:
+# Docker is shared with the owner's other projects.
 # Each action needs what it acts on to be clean (no uncommitted files and no commits only it holds),
 # unused (no process has a file open in it: lsof) and idle for 2 hours. A branch's changes are all in
 # origin/main when it has commits of its own, and merging it into origin/main changes nothing, or, as
@@ -37,14 +49,19 @@
 # places) are for the manager's weekly look.
 set -uo pipefail
 
-usage() { echo "usage: cleanup [--apply]" >&2; exit 2; }
+usage() { echo "usage: cleanup [--apply] [--target-idle <hours>]" >&2; exit 2; }
 apply=false
-case "${1:-}" in
-  --apply) apply=true ;;
-  "") ;;
-  *) usage ;;
-esac
-[ $# -le 1 ] || usage
+target_hours=${CLEANUP_TARGET_IDLE_HOURS:-3}
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) apply=true ;;
+    --target-idle) [ $# -ge 2 ] || usage; target_hours=$2; shift ;;
+    *) usage ;;
+  esac
+  shift
+done
+[[ $target_hours =~ ^[1-9][0-9]{0,3}$ ]] ||
+  { echo "cleanup: the target idle time must be 1 to 9999 hours, not '$target_hours'" >&2; exit 2; }
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # On its own line: a failing rev-parse inside dirname's argument would leave main as "." (finding
@@ -57,6 +74,7 @@ cd "$main" || exit 1
 # git status mustn't refresh a worktree's index: that would make every worktree look just used.
 export GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0
 min_age=120 # minutes
+target_age=$((target_hours * 60)) # minutes
 now=$(date +%s)
 # T3 names its worktrees folder after the main checkout's: ~/.t3/worktrees/bracken here.
 t3_root=$(real "$HOME/.t3/worktrees/$(basename "$main")") || t3_root=""
@@ -65,6 +83,8 @@ runs=$(real "$HOME/bracken-runs") || runs=""
 scratch="${TMPDIR:-/tmp}/bracken-scratch"
 
 acted=0 kept=0 untouched=0 failed=0 freed=0
+# What this run removes or would remove whole: a target dir inside one is already counted.
+gone=()
 
 # $1 is $2 or inside it.
 inside() { [ -n "$2" ] && { [ "$1" = "$2" ] || [[ $1 == "$2"/* ]]; }; }
@@ -86,17 +106,24 @@ mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 # directory counts. Without lsof, Linux's /proc says the same. Nothing is in use only if one of them
 # answered: each lists at least its own process. lsof prints a backslash in a name as \\ and other
 # unprintable bytes as escapes, so names are compared in its form (finding 786ebd4a2970).
-escaped=false
-if command -v lsof >/dev/null; then
-  escaped=true
-  open=$(lsof -n -P -w -Fpn 2>/dev/null | awk '/^p/ { p = substr($0, 2) } /^n\// { print p " " substr($0, 2) }')
-elif [ -d /proc/self/fd ]; then
-  open=$(find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%p %l\n' 2>/dev/null |
-    sed -E 's|^/proc/([0-9]+)/[^ ]* |\1 |')
-else
-  open=""
-fi
+escaped=false have_lsof=false
+command -v lsof >/dev/null && have_lsof=true
+# Sets $open from a new look at what's open.
+snapshot() {
+  if $have_lsof; then
+    escaped=true
+    open=$(lsof -n -P -w -Fpn 2>/dev/null | awk '/^p/ { p = substr($0, 2) } /^n\// { print p " " substr($0, 2) }')
+  elif [ -d /proc/self/fd ]; then
+    open=$(find /proc/[0-9]*/cwd /proc/[0-9]*/fd -maxdepth 1 -type l -printf '%p %l\n' 2>/dev/null |
+      sed -E 's|^/proc/([0-9]+)/[^ ]* |\1 |')
+  else
+    open=""
+  fi
+}
+snapshot
 plain() { local LC_ALL=C; [[ $1 != *[![:print:]]* ]]; }
+# in_use on a new look, not the run's first one, which may be minutes old by now (finding 176efeffc76f).
+in_use_now() { snapshot; in_use "$1"; }
 in_use() {
   local pid d=$1
   [ -n "$open" ] || { echo "unknown (lsof gave nothing)"; return 0; }
@@ -201,29 +228,30 @@ worktree() {
   if forbidden "$p"; then untouched "$p" "holds or is inside the main checkout, .bracken/ or ~/bracken-runs"; return; fi
   if other_project "$p"; then untouched "$p" "named pg-*, another project's"; return; fi
   if [ "$locked" = true ]; then untouched "$p" "locked"; return; fi
-  $fetched || { keep "$p" "not checked: git fetch failed"; return; }
+  $fetched || { stays keep "$p" "not checked: git fetch failed"; return; }
   # A deleted branch leaves HEAD naming no commit, and every file looks staged.
   if ! git -C "$p" rev-parse -q --verify 'HEAD^{commit}' >/dev/null; then
-    untouched "$p" "its branch is gone: HEAD names no commit (for the manager)"
+    stays untouched "$p" "its branch is gone: HEAD names no commit (for the manager)"
     return
   fi
   if ! n=$(git -C "$p" status --porcelain 2>/dev/null | wc -l); then untouched "$p" "git status failed"; return; fi
-  if [ "$n" -gt 0 ]; then untouched "$p" "dirty: $((n)) uncommitted files (for the manager)"; return; fi
+  if [ "$n" -gt 0 ]; then stays untouched "$p" "dirty: $((n)) uncommitted files (for the manager)"; return; fi
   n=$(git -C "$p" log --oneline HEAD --not --branches --remotes 2>/dev/null | wc -l)
-  if [ "$n" -gt 0 ]; then untouched "$p" "$((n)) commits on no branch or remote (for the manager)"; return; fi
+  if [ "$n" -gt 0 ]; then stays untouched "$p" "$((n)) commits on no branch or remote (for the manager)"; return; fi
   if [ -n "$(git -C "$p" status --porcelain --ignored -- .bracken 2>/dev/null)" ]; then
-    untouched "$p" "ignored files under .bracken/, perhaps an identity's key (for the manager)"
+    stays untouched "$p" "ignored files under .bracken/, perhaps an identity's key (for the manager)"
     return
   fi
   if user=$(in_use "$p"); then keep "$p" "in use by $user"; return; fi
   n=$(idle "$p")
-  if [ "$n" -lt "$min_age" ]; then keep "$p" "used $n min ago"; return; fi
+  if [ "$n" -lt "$min_age" ]; then stays keep "$p" "used $n min ago"; return; fi
 
   if [ "$kind" != builder ]; then
     why="clean, unused, idle $((n / 60)) h"
     [ "$kind" = child ] && why="T3 worktree, $why" || why="scratch checkout, $why"
     size=$(kb "$p")
     say remove "$p" "$why ($(gb "$size"))"
+    gone+=("$p")
     acted=$((acted + 1))
     $apply || { freed=$((freed + size)); return; }
     if git worktree remove "$p" </dev/null 2>&1 | sed 's/^/  /'; then
@@ -234,8 +262,8 @@ worktree() {
     fi
     return
   fi
-  if [ -z "$branch" ]; then keep "$p" "builder's worktree on no branch"; return; fi
-  if ! merged "$branch"; then keep "$p" "branch $branch isn't merged into origin/main"; return; fi
+  if [ -z "$branch" ]; then stays keep "$p" "builder's worktree on no branch"; return; fi
+  if ! merged "$branch"; then stays keep "$p" "branch $branch isn't merged into origin/main"; return; fi
   # The worktree's own target/, removed directly: cargo clean follows CARGO_TARGET_DIR, build.target-dir
   # and build.build-dir, any of which may be shared (findings 1fac2c0f426c, a3cb4a1ac00d).
   if [ -L "$p/target" ]; then untouched "$p" "target/ is a symlink; not followed"; return; fi
@@ -246,26 +274,27 @@ worktree() {
     local ignored heads tip
     tip=$(git rev-parse "refs/heads/$branch")
     if ! claimed_heads "$branch"; then
-      keep "$p" "branch $branch is merged by content, but the Ground's pr claims couldn't be read (jq, scripts/bk)"
+      stays keep "$p" "branch $branch is merged by content, but the Ground's pr claims couldn't be read (jq, scripts/bk)"
       return
     fi
     heads=$claimed
     if [ -z "$heads" ]; then
-      keep "$p" "branch $branch is merged by content, but no current pr claim names it: never pushed and claimed"
+      stays keep "$p" "branch $branch is merged by content, but no current pr claim names it: never pushed and claimed"
       return
     fi
     if ! grep -qxF "$tip" <<<"$heads"; then
-      keep "$p" "branch $branch is at ${tip:0:8}, not its pr claim's head $(head -c 8 <<<"$heads"): it moved since"
+      stays keep "$p" "branch $branch is at ${tip:0:8}, not its pr claim's head $(head -c 8 <<<"$heads"): it moved since"
       return
     fi
     ignored=$(git -C "$p" status --porcelain --ignored 2>/dev/null | grep -vx '!! target/' | head -1)
     if [ -n "$ignored" ]; then
-      untouched "$p" "merged, but holds ignored files besides target/: ${ignored#!! } (for the manager)"
+      stays untouched "$p" "merged, but holds ignored files besides target/: ${ignored#!! } (for the manager)"
       return
     fi
     size=$(kb "$p")
     why="its changes are all in origin/main ($landed), origin has no $branch, nothing running"
     say remove "$p" "worktree and branch $branch: $why, idle $((n / 60)) h ($(gb "$size"))"
+    gone+=("$p")
     acted=$((acted + 1))
     $apply || { freed=$((freed + size)); return; }
     if ! git worktree remove "$p" </dev/null 2>&1 | sed 's/^/  /' || [ -e "$p" ]; then
@@ -285,17 +314,68 @@ worktree() {
   if [ ! -d "$p/target" ]; then keep "$p" "branch $branch is merged; no target/ to clean"; return; fi
   if [ "$(real "$p/target")" != "$p/target" ]; then untouched "$p" "target/ resolves outside it"; return; fi
   if [ ! -f "$p/Cargo.toml" ]; then untouched "$p" "has target/ but no Cargo.toml"; return; fi
-  size=$(kb "$p/target")
-  say "clean" "$p" "remove target/: branch $branch is merged into origin/main, nothing running, idle $((n / 60)) h ($(gb "$size"))"
+  free_target "$p/target" "$p" "branch $branch is merged into origin/main, nothing running, idle $((n / 60)) h"
+}
+
+# Whether target dir $1 can go: a directory of its own, not a symlink, not resolving elsewhere, with
+# nothing in it changed for the target idle time. find fails on what it can't read: then it stays.
+idle_target() {
+  local recent
+  [ -d "$1" ] && [ ! -L "$1" ] && [ "$(real "$1")" = "$1" ] || return 1
+  recent=$(find "$1" -mmin -"$target_age" -print 2>/dev/null | head -1) || return 1
+  [ -z "$recent" ]
+}
+# Removes target dir $1 directly (cargo clean follows CARGO_TARGET_DIR, build.target-dir and
+# build.build-dir, any of which may be shared: findings 1fac2c0f426c, a3cb4a1ac00d), saying why ($3) on
+# $2's line.
+# Only with lsof: the /proc fallback sees a process's cwd and open files but not the program it runs, so a
+# test binary run from a target dir could look unused there. Then no target dir goes.
+#
+# With --apply, just before removing it (finding 176efeffc76f): $2 is looked at again, the target dir is
+# renamed aside in its own directory (one rename, so a build starting now can't find half of it), $2 is
+# looked at once more, and only then is the renamed copy deleted. A process found at either look keeps it,
+# renamed back.
+free_target() {
+  local size user aside=$1.cleanup-$$ rel=${1#"$2"/}
+  if ! $have_lsof; then keep "$2" "$3; but $rel/ stays: no lsof to check nothing uses it"; return; fi
+  size=$(kb "$1")
+  if $apply; then
+    if user=$(in_use_now "$2"); then keep "$2" "$3; but $rel/ stays: now in use by $user"; return; fi
+    if [ -e "$aside" ] || [ -L "$aside" ] || ! mv -- "$1" "$aside" 2>/dev/null; then
+      failed=$((failed + 1))
+      say failed "$2" "couldn't rename $rel/ aside to remove it"
+      return
+    fi
+    if user=$(in_use_now "$2"); then
+      if [ ! -e "$1" ] && [ ! -L "$1" ] && mv -- "$aside" "$1" 2>/dev/null; then
+        keep "$2" "$3; but $rel/ stays: in use by $user once renamed aside, so put back"
+      else
+        failed=$((failed + 1))
+        say failed "$2" "$rel/ came into use by $user once renamed aside, and couldn't be put back: it's ${aside##*/}"
+      fi
+      return
+    fi
+  fi
+  say "clean" "$2" "remove $rel/: $3 ($(gb "$size"))"
   acted=$((acted + 1))
   $apply || { freed=$((freed + size)); return; }
-  if rm -rf -- "$p/target"; then
+  if rm -rf -- "$aside"; then
     freed=$((freed + size))
   else
     failed=$((failed + 1))
-    freed=$((freed + size - $(kb "$p/target")))
-    say failed "$p" "couldn't remove all of target/"
+    freed=$((freed + size - $(kb "$aside")))
+    say failed "$2" "couldn't remove all of $rel/ (renamed ${aside##*/})"
   fi
+}
+# A builder's worktree $2 that stays, for reason $3, with verdict $1 (keep or untouched): its target/
+# still goes if nothing has the worktree open and target/ is idle. Any other kind just gets the verdict.
+stays() {
+  local verdict=$1 p=$2 why=$3
+  if [ "$kind" = builder ] && [ -f "$p/Cargo.toml" ] && ! in_use "$p" >/dev/null && idle_target "$p/target"; then
+    free_target "$p/target" "$p" "$why; nothing running there, target/ unchanged for $target_hours h"
+    return
+  fi
+  "$verdict" "$p" "$why"
 }
 
 # git worktree list --porcelain: a block per worktree, "worktree <path>" first, then "branch refs/heads/<b>"
@@ -313,8 +393,49 @@ done 3< <(git worktree list --porcelain)
 [ -z "$wt" ] || worktree "$wt" "$branch" "$locked"
 ! $apply || git worktree prune
 
+# The cargo target dirs in scratch entry $1, which stays (not in use): those idle go. A cargo target dir
+# holds cargo's CACHEDIR.TAG; one inside a .git, inside another, or inside what this run removes whole
+# is left.
+scratch_targets() {
+  local e=$1 tag d g found=()
+  while IFS= read -r -d '' tag; do
+    grep -q 'created by cargo' "$tag" 2>/dev/null || continue
+    d=$(dirname "$tag")
+    [[ $d != */.git/* ]] || continue
+    for g in "${gone[@]}" "${found[@]}"; do inside "$d" "$g" && continue 2; done
+    found+=("$d")
+    ours_below "$e" "$d" || continue
+    if idle_target "$d"; then
+      free_target "$d" "$e" "a cargo target dir, nothing in this entry running, unchanged for $target_hours h"
+    fi
+  done < <(find "$e" -maxdepth 5 \( -name 'pg-*' -prune \) -o -name CACHEDIR.TAG -type f -print0 2>/dev/null |
+    LC_ALL=C sort -z)
+}
+# Whether nothing between scratch entry $1 and target dir $2 (both included) is another project's (pg-*),
+# forbidden, or a checkout of another repository: one whose git dir isn't this repo's, nor has this
+# repo's origin (finding 2b3fe543e130). find prunes pg-*; this checks every level again.
+ours_below() {
+  local e=$1 d=$2
+  while :; do
+    if other_project "$d" || forbidden "$d"; then return 1; fi
+    if [ -e "$d/.git" ] && ! this_repo "$d"; then return 1; fi
+    [ "$d" != "$e" ] || return 0
+    d=$(dirname "$d")
+    inside "$d" "$e" || return 1
+  done
+}
+origin_url=$(git config --get remote.origin.url 2>/dev/null || true)
+this_repo() {
+  local c u
+  c=$(git -C "$1" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || return 1
+  [ "$(real "$c")" = "$(real "$common")" ] && return 0
+  u=$(git -C "$1" config --get remote.origin.url 2>/dev/null) || return 1
+  [ -n "$origin_url" ] && [ "$u" = "$origin_url" ]
+}
+
 # The scratch root's entries. A checkout of this repo there was handled above; any other git checkout
-# is left alone, since only git worktree remove (or its owner) should take it.
+# is left alone, since only git worktree remove (or its owner) should take it, but its idle cargo target
+# dirs go.
 if [ -L "$scratch" ]; then
   untouched "$scratch" "a symlink; the scratch root must be a directory"
 elif [ -d "$scratch" ]; then
@@ -323,13 +444,15 @@ elif [ -d "$scratch" ]; then
     [ -e "$e" ] || [ -L "$e" ] || continue
     if forbidden "$e"; then untouched "$e" "holds .bracken/ or ~/bracken-runs"; continue; fi
     if other_project "$e"; then untouched "$e" "named pg-*, another project's"; continue; fi
+    if user=$(in_use "$e"); then keep "$e" "in use by $user"; continue; fi
     if [ -n "$(find "$e" -name .git -print 2>/dev/null | head -1)" ]; then
       untouched "$e" "holds a git checkout; remove it with git worktree remove (for the manager)"
+      scratch_targets "$e"
       continue
     fi
-    if user=$(in_use "$e"); then keep "$e" "in use by $user"; continue; fi
     if [ -n "$(find "$e" -mmin -"$min_age" -print 2>/dev/null | head -1)" ]; then
       keep "$e" "changed in the last $((min_age / 60)) h"
+      scratch_targets "$e"
       continue
     fi
     size=$(kb "$e")
@@ -345,6 +468,27 @@ elif [ -d "$scratch" ]; then
   done
 fi
 
+# How much of Docker's build cache could be reclaimed, from docker system df, given 20 s: reported only,
+# never pruned, since Docker is shared with the owner's other projects. Nothing without docker.
+docker_cache() {
+  local out pid i=0
+  command -v docker >/dev/null || return 0
+  out=$(mktemp) || return 0
+  docker system df --format '{{.Type}}|{{.Reclaimable}}' >"$out" 2>/dev/null </dev/null &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.2; i=$((i + 1)); done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+    echo "; Docker build cache: unknown (docker didn't answer in 20 s)"
+  elif wait "$pid" && i=$(awk -F'|' '$1 == "Build Cache" { print $2; exit }' "$out") && [ -n "$i" ]; then
+    echo "; Docker build cache: $i reclaimable (not pruned: Docker is shared)"
+  else
+    echo "; Docker build cache: unknown (docker system df failed)"
+  fi
+  rm -f -- "$out"
+}
+
 free=$(df -Pk "$main" | awk 'NR == 2 { print $4 }')
 if [ "$acted" = 0 ]; then
   summary="nothing to do"
@@ -354,5 +498,5 @@ else
   summary="$acted to do with --apply, freeing about $(gb "$freed")"
 fi
 [ "$failed" = 0 ] || summary="$summary; $failed failed"
-echo "cleanup: $summary; $kept kept, $untouched won't touch; $(gb "${free:-0}") free"
+echo "cleanup: $summary; $kept kept, $untouched won't touch; $(gb "${free:-0}") free$(docker_cache)"
 [ "$failed" = 0 ]

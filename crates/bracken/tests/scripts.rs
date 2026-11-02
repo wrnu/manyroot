@@ -3003,7 +3003,7 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         assert!(stdout.trim_end().ends_with("test-table: counted run mode: light: the scope"), "{scripts}: {stdout}");
         let inner = read("args");
         for line in [
-            "setup $sudo apt-get install -y -qq git b3sum curl jq",
+            "setup $sudo apt-get install -y -qq git b3sum curl jq lsof",
             "setup cargo fetch --locked --target \"$(rustc -vV | sed -n \"s/^host: //p\")\"",
             "cargo build --locked -q -p bracken --bin bracken",
             "BRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table --light -p demo -p agent",
@@ -3689,6 +3689,8 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         let stubs = t.join("stubs");
         std::fs::create_dir_all(&stubs).unwrap();
         write_executable(&stubs.join("cargo"), "#!/bin/sh\necho \"$PWD|$*\" >>\"$LOG\"\n");
+        // Never the machine's Docker.
+        write_executable(&stubs.join("docker"), "#!/bin/sh\nexit 1\n");
         let log = t.join("cargo.log");
         let jq = String::from_utf8(run(&dir, "sh", &["-c", "command -v jq"]).stdout).unwrap();
         let jq_log = t.join("jq.log");
@@ -3707,6 +3709,8 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
                 .env("TMPDIR", &tmpdir)
                 .env("PATH", &path)
                 .env("LOG", &log)
+                // The idle targets of worktrees it keeps are another test's (task cb478ca0bd41).
+                .env("CLEANUP_TARGET_IDLE_HOURS", "24")
                 .output()
                 .unwrap();
             let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -6890,6 +6894,264 @@ fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
     assert!(copy.exists(), "the symlink's target is kept");
     let out = run_backup(&["--verify", &s(&b.join(&new))]);
     assert!(String::from_utf8_lossy(&out.stdout).contains(": 4 contributions, 1 heads, 1 identities"));
+}
+
+/// Task cb478ca0bd41: cleanup frees the target/ of a builder's worktree it keeps, whatever its branch's
+/// state (unmerged, dirty, on no branch), when nothing has the worktree open and nothing in target/ changed
+/// for the target idle time (3 h, CLEANUP_TARGET_IDLE_HOURS, --target-idle). Its sources stay. A busy
+/// worktree, a target/ changed since, and a symlinked one stay. In the scratch root, a cargo target dir
+/// (cargo's CACHEDIR.TAG) in an entry it keeps goes on the same rule, beside a checkout or newer files; a
+/// directory with another program's CACHEDIR.TAG stays, as do target dirs in a pg-* directory or in another
+/// repository's checkout at any depth (finding 2b3fe543e130). Just before each removal it looks again: a
+/// process that starts using a worktree after the run's first look (here, while cleanup sizes its target/)
+/// keeps it (finding 176efeffc76f). The summary reports Docker's reclaimable build cache, and cleanup never
+/// asks Docker to prune.
+#[test]
+fn cleanup_frees_idle_targets_of_worktrees_it_keeps_and_reports_dockers_build_cache() {
+    for scripts in SCRIPTS {
+        let cleanup = repo_root().join(scripts).join("cleanup");
+        let (tmp, dir) = repo(&[("scripts/cleanup", &cleanup)], ".bracken/\n/target\n", |dir| {
+            std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        });
+        let t = tmp.path();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = run(dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let origin = t.join("origin.git");
+        git(t, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "-u", "origin", "main"]);
+        let (home, tmpdir) = (t.join("home"), t.join("tmpdir"));
+        let (t3, scratch) = (home.join(".t3/worktrees/repo"), tmpdir.join("bracken-scratch"));
+        let build = |target: &Path| {
+            std::fs::create_dir_all(target.join("debug")).unwrap();
+            std::fs::write(target.join("debug/big"), "build").unwrap();
+        };
+        let cargo_tag =
+            "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n";
+
+        // Builders' worktrees, none merged: one on a branch with a commit of its own, a dirty one, a busy
+        // one, one whose target/ changes later, one with a symlinked target/, one on no branch, and one a
+        // process starts using after cleanup's first look.
+        for name in ["idle", "dirty", "busy", "fresh", "linked", "detached", "late"] {
+            let path = t3.join(name);
+            std::fs::create_dir_all(&t3).unwrap();
+            if name == "detached" {
+                git(&dir, &["worktree", "add", "-q", "--detach", path.to_str().unwrap()]);
+            } else {
+                git(&dir, &["worktree", "add", "-q", "-b", name, path.to_str().unwrap()]);
+                std::fs::write(path.join(name), name).unwrap();
+                git(&path, &["add", name]);
+                git(&path, &["commit", "-qm", name]);
+            }
+            if name != "linked" {
+                build(&path.join("target"));
+            }
+        }
+        std::fs::write(t3.join("dirty/wip"), "work").unwrap();
+        let shared = t.join("shared-target");
+        build(&shared);
+        std::os::unix::fs::symlink(&shared, t3.join("linked/target")).unwrap();
+        // Scratch: a dirty checkout with a cargo target dir beside it, and an entry holding a cargo target
+        // dir and another program's cache dir beside a file that changes later.
+        std::fs::create_dir_all(scratch.join("task")).unwrap();
+        git(&dir, &["worktree", "add", "-q", "--detach", scratch.join("task/tree").to_str().unwrap()]);
+        // Dirty, so the checkout itself stays.
+        std::fs::write(scratch.join("task/tree/wip"), "work").unwrap();
+        let other_tag = "Signature: 8a477f597d28d172789f06886806bc55\n# made by another tool\n";
+        // "deep" holds target dirs under a pg-* directory and in another repository's checkout, which stay,
+        // and one in plain directories, which goes.
+        std::fs::create_dir_all(scratch.join("deep/a")).unwrap();
+        git(t, &["init", "-q", scratch.join("deep/a/clone").to_str().unwrap()]);
+        git(&scratch.join("deep/a/clone"), &["remote", "add", "origin", "https://example.invalid/other.git"]);
+        for (dir, tag) in [
+            ("task/tgt", cargo_tag),
+            ("notes/tgt", cargo_tag),
+            ("notes/other", other_tag),
+            ("deep/pg-x/b/tgt", cargo_tag),
+            ("deep/a/clone/target", cargo_tag),
+            ("deep/a/plain/tgt", cargo_tag),
+        ] {
+            build(&scratch.join(dir));
+            std::fs::write(scratch.join(dir).join("CACHEDIR.TAG"), tag).unwrap();
+        }
+        set_mtimes(t, std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 3600));
+        std::fs::write(t3.join("fresh/target/debug/new"), "just built").unwrap();
+        std::fs::write(scratch.join("notes/today"), "new").unwrap();
+
+        let stubs = t.join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        let docker_log = t.join("docker.log");
+        let docker = format!(
+            "#!/bin/sh\necho \"$*\" >>'{}'\nprintf 'Images|1GB (10%%)\\nBuild Cache|2.5GB (40%%)\\n'\n",
+            docker_log.display()
+        );
+        write_executable(&stubs.join("docker"), &docker);
+        // A du that, sizing late/target with LATE set, first starts a process with its working directory in
+        // that worktree: it starts after cleanup's first look, and before its removal.
+        let du = String::from_utf8(run(&dir, "sh", &["-c", "command -v du"]).stdout).unwrap();
+        let late_pid = t.join("late.pid");
+        let stub = format!(
+            "#!/bin/sh\ncase \"$*\" in *\"/late/target\"*) if [ -n \"$LATE\" ] && [ ! -e '{pid}' ]; then \
+             (cd \"$LATE\" && exec sleep 120) >/dev/null 2>&1 </dev/null & echo $! >'{pid}'; sleep 1; fi ;; esac\n\
+             exec '{du}' \"$@\"\n",
+            pid = late_pid.display(),
+            du = du.trim()
+        );
+        write_executable(&stubs.join("du"), &stub);
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        // Killed below, after the --apply run: it must outlast every run before it, however loaded the machine
+        // (a 467 s run outlived a 120 s sleep, and busy/target/ went).
+        let mut sleeper = Command::new("sleep").arg("3600").current_dir(t3.join("busy")).spawn().unwrap();
+        let cleanup = |args: &[&str], hours: Option<&str>| {
+            let mut command = command(&dir, "scripts/cleanup", args);
+            command.env("HOME", &home).env("TMPDIR", &tmpdir).env("PATH", &path).env_remove("LATE");
+            if args.contains(&"--apply") {
+                command.env("LATE", t3.join("late"));
+            }
+            match hours {
+                Some(h) => command.env("CLEANUP_TARGET_IDLE_HOURS", h),
+                None => command.env_remove("CLEANUP_TARGET_IDLE_HOURS"),
+            };
+            let out = command.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            (out.status.code(), stdout + &String::from_utf8_lossy(&out.stderr))
+        };
+        let line = |out: &str, verb: &str, path: &str| {
+            out.lines().find(|l| l.starts_with(verb) && l.contains(&format!("{path}:"))).map(str::to_owned)
+        };
+
+        let (code, dry) = cleanup(&[], None);
+        assert_eq!(code, Some(0), "{scripts}: {dry}");
+        for (path, why) in [
+            ("/idle", "isn't merged"),
+            ("/dirty", "dirty"),
+            ("/detached", "on no branch"),
+            ("/late", "isn't merged"),
+            ("/task", "a cargo target dir"),
+            ("/notes", "a cargo target dir"),
+            ("/deep", "a cargo target dir"),
+        ] {
+            let l = line(&dry, "clean", path).unwrap_or_else(|| panic!("{scripts}: {path} isn't cleaned: {dry}"));
+            assert!(l.contains(why) && l.contains(" GB)"), "{scripts}: {l}");
+        }
+        assert!(line(&dry, "clean", "/idle").unwrap().contains("remove target/: "), "{scripts}: {dry}");
+        assert!(line(&dry, "clean", "/task").unwrap().contains("remove tgt/: "), "{scripts}: {dry}");
+        assert!(line(&dry, "keep", "/busy").is_some_and(|l| l.contains("in use by pid")), "{scripts}: {dry}");
+        assert!(line(&dry, "keep", "/fresh").is_some(), "{scripts}: {dry}");
+        assert!(line(&dry, "keep", "/linked").is_some(), "{scripts}: {dry}");
+        assert!(!dry.contains("remove other/"), "{scripts}: {dry}");
+        assert!(line(&dry, "clean", "/deep").unwrap().contains("remove a/plain/tgt/: "), "{scripts}: {dry}");
+        assert!(!dry.contains("pg-x/b/tgt") && !dry.contains("clone/target"), "{scripts}: {dry}");
+        let last = dry.lines().last().unwrap();
+        assert!(last.contains("7 to do") && last.contains("Docker build cache: 2.5GB (40%) reclaimable"), "{last}");
+        assert!(t3.join("idle/target/debug/big").exists(), "{scripts}: the dry run removed something");
+
+        // A longer idle time, from the environment or the flag, keeps them all; a bad one is refused.
+        let (_, longer) = cleanup(&[], Some("5"));
+        assert!(longer.lines().last().unwrap().contains("nothing to do"), "{scripts}: {longer}");
+        let (_, flagged) = cleanup(&["--target-idle", "5"], None);
+        assert!(flagged.lines().last().unwrap().contains("nothing to do"), "{scripts}: {flagged}");
+        let (code, refused) = cleanup(&["--target-idle", "0"], None);
+        assert!(code == Some(2) && refused.contains("1 to 9999 hours"), "{scripts}: {refused}");
+
+        let (code, applied) = cleanup(&["--apply"], None);
+        sleeper.kill().unwrap();
+        sleeper.wait().unwrap();
+        let late = std::fs::read_to_string(&late_pid).unwrap_or_default();
+        let _ = Command::new("kill").arg(late.trim()).status();
+        let _ = std::fs::remove_file(&late_pid);
+        assert_eq!(code, Some(0), "{scripts}: {applied}");
+        assert!(applied.lines().last().unwrap().contains("6 done"), "{scripts}: {applied}");
+        // The late process kept late/target/, found by the look just before removing it.
+        let l = line(&applied, "keep", "/late").unwrap_or_else(|| panic!("{scripts}: {applied}"));
+        assert!(l.contains("now in use by pid"), "{scripts}: {l}");
+        assert!(t3.join("late/target/debug/big").exists(), "{scripts}: {applied}");
+        assert!(!applied.contains(".cleanup-"), "{scripts}: a renamed copy was left: {applied}");
+        assert!(!scratch.join("deep/a/plain/tgt").exists(), "{scripts}: {applied}");
+        for stays in ["deep/pg-x/b/tgt/debug/big", "deep/a/clone/target/debug/big"] {
+            assert!(scratch.join(stays).exists(), "{scripts}: {stays} went: {applied}");
+        }
+        for gone in ["idle/target", "dirty/target", "detached/target"] {
+            assert!(!t3.join(gone).exists(), "{scripts}: {gone} is still there: {applied}");
+        }
+        assert!(!scratch.join("task/tgt").exists() && !scratch.join("notes/tgt").exists(), "{scripts}: {applied}");
+        for stays in ["idle/idle", "dirty/wip", "busy/target/debug/big", "fresh/target/debug/big"] {
+            assert!(t3.join(stays).exists(), "{scripts}: {stays} went: {applied}");
+        }
+        assert!(shared.join("debug/big").exists() && t3.join("linked").exists(), "{scripts}: {applied}");
+        assert!(scratch.join("task/tree/Cargo.toml").exists() && scratch.join("notes/today").exists());
+        assert!(scratch.join("notes/other/debug/big").exists(), "{scripts}: another program's cache dir went");
+        let asked = std::fs::read_to_string(&docker_log).unwrap();
+        assert!(asked.lines().all(|l| l.starts_with("system df")), "{scripts}: docker was asked {asked}");
+    }
+}
+
+/// Finding 176efeffc76f: without lsof, cleanup removes no target dir, rather than judge use from the /proc
+/// fallback (which misses a program run from a target dir) or from nothing (macOS has no /proc). An
+/// unmerged worktree's idle target/ stays, saying why.
+#[test]
+fn cleanup_without_lsof_removes_no_target_dir() {
+    for scripts in SCRIPTS {
+        let cleanup = repo_root().join(scripts).join("cleanup");
+        let (tmp, dir) = repo(&[("scripts/cleanup", &cleanup)], ".bracken/\n/target\n", |dir| {
+            std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        });
+        let t = tmp.path();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = run(dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let origin = t.join("origin.git");
+        git(t, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "-u", "origin", "main"]);
+        let (home, tmpdir) = (t.join("home"), t.join("tmpdir"));
+        let wt = home.join(".t3/worktrees/repo/idle");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(&dir, &["worktree", "add", "-q", "-b", "idle", wt.to_str().unwrap()]);
+        std::fs::write(wt.join("f"), "f").unwrap();
+        git(&wt, &["add", "f"]);
+        git(&wt, &["commit", "-qm", "f"]);
+        std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+        std::fs::write(wt.join("target/debug/big"), "build").unwrap();
+        set_mtimes(t, std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 3600));
+        // PATH without lsof, and with a docker that isn't the machine's. Each directory holding lsof is
+        // replaced by a copy of links to everything else in it: on Linux lsof is in /usr/bin, beside git.
+        let stubs = t.join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(&stubs.join("docker"), "#!/bin/sh\nexit 1\n");
+        let mut dirs = vec![stubs.clone()];
+        for (i, d) in std::env::split_paths(&std::env::var_os("PATH").unwrap()).enumerate() {
+            if !d.join("lsof").exists() {
+                dirs.push(d);
+                continue;
+            }
+            let shadow = t.join(format!("path{i}"));
+            std::fs::create_dir_all(&shadow).unwrap();
+            for entry in std::fs::read_dir(&d).unwrap().flatten() {
+                if entry.file_name() != "lsof" {
+                    let _ = std::os::unix::fs::symlink(entry.path(), shadow.join(entry.file_name()));
+                }
+            }
+            dirs.push(shadow);
+        }
+        let path = std::env::join_paths(dirs).unwrap();
+        let found = Command::new("sh").args(["-c", "command -v lsof"]).env("PATH", &path).output().unwrap();
+        assert!(!found.status.success(), "{scripts}: lsof is still on the test's PATH");
+        let out = command(&dir, "scripts/cleanup", &["--apply"])
+            .env("HOME", &home)
+            .env("TMPDIR", &tmpdir)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(0), "{scripts}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+        assert!(wt.join("target/debug/big").exists(), "{scripts}: target/ went without lsof: {stdout}");
+        let l = stdout.lines().find(|l| l.contains("/idle:")).unwrap_or_else(|| panic!("{scripts}: {stdout}"));
+        assert!(l.starts_with("keep") && l.contains("lsof"), "{scripts}: {l}");
+    }
 }
 
 /// Task 23e73664dc45 (owner decision 8ac9b0239d90): scripts/rustc-wrapper, cargo's rustc wrapper. Without
