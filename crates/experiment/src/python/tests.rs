@@ -310,22 +310,34 @@ pub(crate) mod macos_only {
     }
 
     /// A runner killed while its container runs leaves it behind, and the next runner's sweep removes it. The runner
-    /// is this test binary, running the ignored test below, killed with SIGKILL. Another test run's sweep at the same
-    /// time may remove it first, which is the same sweep: so it's checked as there only while its runner lives.
+    /// is this test binary, running the ignored test below, killed with SIGKILL. Its container's label names an
+    /// owner, a process of this test's, in place of the runner, so no sweep removes the container until the owner
+    /// ends too: that's how it's seen left behind once the runner is dead, though other test runs sweep at the same
+    /// time (finding 9cb20aa5f956).
     #[test]
     fn a_killed_runners_container_is_swept_by_the_next() {
         if python().is_none() {
             return;
         }
+        /// Ends its process when dropped, so a failing test leaves its container to the next sweep.
+        struct Owner(std::process::Child);
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let owner = Owner(Command::new("sleep").arg("600").spawn().expect("an owner"));
+        let pid = owner.0.id();
         let exe = std::env::current_exe().expect("the test binary");
         let inner = "python::tests::macos_only::holds_a_container_until_killed";
         let mut runner = Command::new(exe)
             .args(["--exact", "--ignored", "--nocapture", "--test-threads", "1", inner])
+            .env(TEST_OWNER, pid.to_string())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .expect("started");
-        let pid = runner.id();
         let mut lines = std::io::BufReader::new(runner.stdout.take().expect("piped")).lines();
         assert!(
             lines.by_ref().map_while(Result::ok).any(|l| l.ends_with("running")),
@@ -335,11 +347,17 @@ pub(crate) mod macos_only {
             let out = docker(&["ps", "-aq", "--filter", &format!("label={LABEL}={pid}")]).expect("docker ps");
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
-        // Seen while its runner is alive, which no sweep removes.
         assert_ne!(theirs(), "", "there while its runner runs");
         let _ = runner.kill();
         let _ = runner.wait();
-        // Once its runner is dead, any process's first container sweeps it: another test run's, at the same time,
+        // Its runner's end doesn't take it: still there a while after, its owner keeping it from every sweep.
+        let after = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < after {
+            assert_ne!(theirs(), "", "still there once its runner was killed");
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        drop(owner);
+        // Once its owner is dead, any process's first container sweeps it: another test run's, at the same time,
         // may already have, or be part way through removing it, so this one's own removal fails and it is still
         // listed for a moment (task b7b88eed51c5). So it sweeps until it's gone, for a while on a loaded machine.
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -348,7 +366,7 @@ pub(crate) mod macos_only {
             if theirs().is_empty() {
                 break;
             }
-            assert!(Instant::now() < deadline, "still there a minute after its runner was killed: {}", theirs());
+            assert!(Instant::now() < deadline, "still there a minute after its owner ended: {}", theirs());
             std::thread::sleep(Duration::from_secs(1));
         }
     }
