@@ -260,7 +260,10 @@ runner stay on `sandbox-exec` for now.
   larger) and open files (256) as rlimits. The rlimit is each process's, and
   the code may fork, so the container's CPU time in all, as the supervisor
   says it every 0.1 s, has the same limit: past it the runner kills the run,
-  which ends as `SIGXCPU` too. Memory is the container's cgroup
+  which ends as `SIGXCPU` too. It's counted from the supervisor's first
+  report, made as the code starts, so the supervisor's own start and the
+  inputs' copy aren't the code's; what the supervisor uses after, relaying
+  the output, is, a little. Memory is the container's cgroup
   limit, with no swap: the run's `memory_mb`, **plus its `scratch_mb`**,
   since the scratch directory is a `tmpfs` held in memory and its pages
   count against the container's limit, plus 16 MiB for the container's init

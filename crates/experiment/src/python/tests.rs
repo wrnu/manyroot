@@ -141,13 +141,14 @@ pub(crate) mod macos_only {
         assert_eq!((o.exit.clone(), stdout(&o).trim()), (Exit::Code(0), "ok"), "{}", stderr(&o));
 
         // Exit::Output is reported whenever the output filled its buffer, whichever limit then ended the
-        // run (finding 2e8cdbfcea20), so the wall time is 60 s here: the code's own time ending short of it shows
+        // run (finding 2e8cdbfcea20), so the wall time is 60 s here, and the CPU time 600 s, which writing would
+        // reach first otherwise (finding a6b8193f3044): the code's own time ending short of the wall time shows
         // the output limit ended it. Its own, not the test's: a loaded machine's slow container start made the
         // test's clock read 38.8 s (task 1346b7694f40).
         let o = contained(
             &p,
             "import sys\nwhile True: sys.stdout.write('x' * 4096)",
-            &Limits { wall_seconds: 60, ..quick },
+            &Limits { wall_seconds: 60, cpu_seconds: 600, ..quick },
         );
         assert_eq!(o.exit, Exit::Output);
         assert_eq!(o.stdout.len(), 64 << 10, "kept up to the limit");
@@ -363,6 +364,38 @@ pub(crate) mod macos_only {
         assert_eq!(line.as_deref(), Some("running"));
         println!("running");
         std::thread::sleep(Duration::from_secs(120));
+    }
+
+    /// The CPU time is the code's: the supervisor's own start and the inputs' copy, before the code starts, aren't
+    /// (finding 0179ec8bd23a). Code that only sleeps has used next to none, as a tree of 2000 files is copied in.
+    #[test]
+    fn the_cpu_time_is_the_codes_own() {
+        let Some(p) = python() else { return };
+        let scratch = Scratch::new().expect("a scratch directory");
+        for i in 0..2000 {
+            std::fs::write(scratch.dir.join(format!("f{i}.txt")), "x").expect("written");
+        }
+        let code = "import time\nprint('up', flush=True)\ntime.sleep(60)";
+        let running = p.start(&scratch, &["-c".into(), code.into()], &limits()).expect("started");
+        assert_eq!(running.next(Instant::now() + Duration::from_secs(120)).as_deref(), Some("up"));
+        std::thread::sleep(Duration::from_millis(500));
+        let cpu = running.cpu().unwrap_or_default();
+        assert!(cpu < Duration::from_millis(150), "{cpu:?}");
+    }
+
+    /// A run's time is its code's, to the supervisor's last word: not the container's teardown after it (finding
+    /// e801ed31ff6b), which takes a few tenths of a second here. The supervisor lingers 5 s after its word, as a
+    /// slow teardown would, so the time is short of that only if it ends at the word.
+    #[test]
+    fn a_runs_time_ends_at_the_supervisors_last_word() {
+        let Some(p) = python() else { return };
+        LINGER.set(5);
+        let start = Instant::now();
+        let o = contained(&p, "pass", &limits());
+        LINGER.set(0);
+        assert_eq!(o.exit, Exit::Code(0), "{}", stderr(&o));
+        assert!(start.elapsed() >= Duration::from_secs(5), "it lingered: {:?}", start.elapsed());
+        assert!(o.ran < Duration::from_secs(5), "{:?}", o.ran);
     }
 
     /// A started child's CPU time is the supervisor's word, a tenth of a second behind at most.
