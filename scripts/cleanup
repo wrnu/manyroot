@@ -27,11 +27,13 @@
 # nothing in target/ changed for the target idle time: 3 hours, or --target-idle <hours>, or
 # CLEANUP_TARGET_IDLE_HOURS (task cb478ca0bd41). With sccache, rebuilding it is cheap. Only where lsof
 # runs: just before each removal it looks again, renames the target dir aside, looks once more, and only
-# then deletes it (finding 176efeffc76f). So does a cargo
-# target dir (one holding cargo's CACHEDIR.TAG, as CARGO_TARGET_DIR makes) inside a scratch entry it keeps,
-# when no process has anything in that entry open, unless it's in a pg-* directory or another
-# repository's checkout at any level (finding 2b3fe543e130). Only target/ goes, removed directly, never
-# sources.
+# then deletes it (finding 176efeffc76f). A copy renamed aside that a run couldn't finish with
+# (target.cleanup-<pid>: the put-back failed, rm failed, or the run was killed) goes on the same rule in
+# any worktree once no process with its pid runs, and doesn't make the worktree dirty (finding
+# 88fc809d6a05). So does a cargo target dir (one holding cargo's CACHEDIR.TAG, as CARGO_TARGET_DIR
+# makes) inside a scratch entry it keeps, when no process has anything in that entry open, unless it's
+# in a pg-* directory or another repository's checkout at any level (finding 2b3fe543e130). Only target/
+# goes, removed directly, never sources.
 # Its summary also says how much of Docker's build cache could be reclaimed, but it never prunes it:
 # Docker is shared with the owner's other projects.
 # Each action needs what it acts on to be clean (no uncommitted files and no commits only it holds),
@@ -44,7 +46,8 @@
 # branches are current; the dry run fetches nothing and judges by the refs as they stand.
 #
 # It never touches the main checkout, .bracken/, ~/bracken-runs, a worktree holding ignored files under
-# .bracken/ (an identity's key), anything named pg-* (PineGrove's), other repos, or anything outside those
+# .bracken/ (an identity's key) other than bracken's own .bracken/cache/ (task 9fa138208dac), anything
+# named pg-* (PineGrove's), other repos, or anything outside those
 # places. Each line it prints says what it does or why not; "won't touch" lines (dirty, outside its
 # places) are for the manager's weekly look.
 set -uo pipefail
@@ -228,17 +231,31 @@ worktree() {
   if forbidden "$p"; then untouched "$p" "holds or is inside the main checkout, .bracken/ or ~/bracken-runs"; return; fi
   if other_project "$p"; then untouched "$p" "named pg-*, another project's"; return; fi
   if [ "$locked" = true ]; then untouched "$p" "locked"; return; fi
+  leftovers "$p"
   $fetched || { stays keep "$p" "not checked: git fetch failed"; return; }
   # A deleted branch leaves HEAD naming no commit, and every file looks staged.
   if ! git -C "$p" rev-parse -q --verify 'HEAD^{commit}' >/dev/null; then
     stays untouched "$p" "its branch is gone: HEAD names no commit (for the manager)"
     return
   fi
-  if ! n=$(git -C "$p" status --porcelain 2>/dev/null | wc -l); then untouched "$p" "git status failed"; return; fi
+  if ! n=$(git -C "$p" status --porcelain 2>/dev/null | without_left | wc -l); then
+    untouched "$p" "git status failed"
+    return
+  fi
   if [ "$n" -gt 0 ]; then stays untouched "$p" "dirty: $((n)) uncommitted files (for the manager)"; return; fi
   n=$(git -C "$p" log --oneline HEAD --not --branches --remotes 2>/dev/null | wc -l)
   if [ "$n" -gt 0 ]; then stays untouched "$p" "$((n)) commits on no branch or remote (for the manager)"; return; fi
-  if [ -n "$(git -C "$p" status --porcelain --ignored -- .bracken 2>/dev/null)" ]; then
+  # bracken's .bracken/cache/ (its verified snapshot) is the one ignored entry there that holds no key.
+  # =matching names each ignored path by the pattern it matches: .bracken/cache/ and .bracken/identities/
+  # apart, though .bracken/ itself is untracked; a repo that ignores all of .bracken/ gets .bracken/, kept.
+  # A git status that fails keeps it too, as might a key (finding 6dc71b5c4733): no pipe, so neither git's
+  # failure nor an early grep exit is lost.
+  local under
+  if ! under=$(git -C "$p" status --porcelain --ignored=matching -- .bracken 2>/dev/null); then
+    stays untouched "$p" "git status --ignored failed, so a key under .bracken/ can't be ruled out (for the manager)"
+    return
+  fi
+  if [ -n "$under" ] && grep -qvx '!! .bracken/cache/' <<<"$under"; then
     stays untouched "$p" "ignored files under .bracken/, perhaps an identity's key (for the manager)"
     return
   fi
@@ -269,9 +286,9 @@ worktree() {
   if [ -L "$p/target" ]; then untouched "$p" "target/ is a symlink; not followed"; return; fi
   if ! on_origin "$branch"; then
     # Merged and gone from origin: the whole worktree and its branch go, if its tip is the head it last
-    # pushed and claimed, and only target/ is ignored in it, since git worktree remove would take any other
-    # ignored file with it.
-    local ignored heads tip
+    # pushed and claimed, and only target/ and .bracken/cache/ are ignored in it, since git worktree remove
+    # would take any other ignored file with it.
+    local ignored heads tip all
     tip=$(git rev-parse "refs/heads/$branch")
     if ! claimed_heads "$branch"; then
       stays keep "$p" "branch $branch is merged by content, but the Ground's pr claims couldn't be read (jq, scripts/bk)"
@@ -286,7 +303,11 @@ worktree() {
       stays keep "$p" "branch $branch is at ${tip:0:8}, not its pr claim's head $(head -c 8 <<<"$heads"): it moved since"
       return
     fi
-    ignored=$(git -C "$p" status --porcelain --ignored 2>/dev/null | grep -vx '!! target/' | head -1)
+    if ! all=$(git -C "$p" status --porcelain --ignored=matching 2>/dev/null); then
+      stays untouched "$p" "merged, but git status --ignored failed: what else is ignored is unknown (for the manager)"
+      return
+    fi
+    ignored=$(without_left <<<"$all" | grep -vx -e '!! target/' -e '!! .bracken/cache/' | head -1)
     if [ -n "$ignored" ]; then
       stays untouched "$p" "merged, but holds ignored files besides target/: ${ignored#!! } (for the manager)"
       return
@@ -337,14 +358,14 @@ idle_target() {
 # renamed back.
 free_target() {
   local size user aside=$1.cleanup-$$ rel=${1#"$2"/}
-  if ! $have_lsof; then keep "$2" "$3; but $rel/ stays: no lsof to check nothing uses it"; return; fi
+  if ! $have_lsof; then keep "$2" "$3; but $rel/ stays: no lsof to check nothing uses it"; return 1; fi
   size=$(kb "$1")
   if $apply; then
-    if user=$(in_use_now "$2"); then keep "$2" "$3; but $rel/ stays: now in use by $user"; return; fi
+    if user=$(in_use_now "$2"); then keep "$2" "$3; but $rel/ stays: now in use by $user"; return 1; fi
     if [ -e "$aside" ] || [ -L "$aside" ] || ! mv -- "$1" "$aside" 2>/dev/null; then
       failed=$((failed + 1))
       say failed "$2" "couldn't rename $rel/ aside to remove it"
-      return
+      return 1
     fi
     if user=$(in_use_now "$2"); then
       if [ ! -e "$1" ] && [ ! -L "$1" ] && mv -- "$aside" "$1" 2>/dev/null; then
@@ -353,7 +374,7 @@ free_target() {
         failed=$((failed + 1))
         say failed "$2" "$rel/ came into use by $user once renamed aside, and couldn't be put back: it's ${aside##*/}"
       fi
-      return
+      return 1
     fi
   fi
   say "clean" "$2" "remove $rel/: $3 ($(gb "$size"))"
@@ -365,7 +386,33 @@ free_target() {
     failed=$((failed + 1))
     freed=$((freed + size - $(kb "$aside")))
     say failed "$2" "couldn't remove all of $rel/ (renamed ${aside##*/})"
+    return 1
   fi
+}
+# The copies of target/ that an earlier run renamed aside in worktree $1 and couldn't finish with
+# (finding 88fc809d6a05): target.cleanup-<pid>, or such a copy renamed again, none of whose pids is
+# running. Each goes as an idle target/ would: with lsof, nothing in the worktree open, nothing in the copy
+# changed for the target idle time. Sets $left to the names of those that go (or would, in a dry run).
+left=()
+leftovers() {
+  local p=$1 c name pid why
+  left=()
+  [ -f "$p/Cargo.toml" ] || return 0
+  for c in "$p"/target.cleanup-*; do
+    name=${c##*/}
+    [[ $name =~ ^target(\.cleanup-[1-9][0-9]*)+$ ]] && [ -d "$c" ] && [ ! -L "$c" ] || continue
+    for pid in ${name//[!0-9]/ }; do
+      ! ps -p "$pid" >/dev/null 2>&1 || continue 2
+    done
+    if in_use "$p" >/dev/null || ! idle_target "$c"; then continue; fi
+    why="a copy of target/ an earlier cleanup renamed aside and didn't finish with; that run is over"
+    free_target "$c" "$p" "$why, nothing running there, unchanged for $target_hours h" && left+=("$name")
+  done
+}
+# git status --porcelain lines, less those of the copies in $left: a dry run leaves them there.
+without_left() {
+  L="${left[*]}" awk 'BEGIN { n = split(ENVIRON["L"], l, " "); for (i = 1; i <= n; i++) s[l[i] "/"] = 1 }
+    !(substr($0, 4) in s)'
 }
 # A builder's worktree $2 that stays, for reason $3, with verdict $1 (keep or untouched): its target/
 # still goes if nothing has the worktree open and target/ is idle. Any other kind just gets the verdict.
