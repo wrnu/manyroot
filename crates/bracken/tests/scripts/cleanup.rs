@@ -591,7 +591,11 @@ fn cleanup_without_lsof_removes_no_target_dir() {
 ///   it, found by the look after sizing (finding 075b4a4dbcfd).
 /// - Put back, or kept, because of what happened while cleanup sized them, by commands that had exited by
 ///   its next look (finding 497ffa3fdcdc): an entry whose .keep was touched, one that was written to, one that
-///   gained a git checkout, and a scratch worktree that gained a commit.
+///   gained a git checkout, a scratch worktree that gained a commit, and a cargo target dir in an entry whose
+///   .keep was touched (finding 1efc75ddf0cb).
+/// - A .keep that stat can't date counts as fresh (finding df3b4dc4966f), with a stat stub: an entry whose
+///   day-old .keep can't be dated is kept whole, by the check before sizing; and a cargo target dir is put
+///   back when its entry's day-old .keep can't be dated once it's sized, by the check after the rename.
 /// - Entries left renamed aside as <entry>.cleanup-<pid> (finding 910ae8ed0fe3): put back when that run is
 ///   over and the name is free, and not cleared in the same run; kept when the name exists again, or while
 ///   the run still runs.
@@ -619,22 +623,26 @@ fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
         let mut gone = Command::new("true").spawn().unwrap();
         gone.wait().unwrap();
         let (dead, alive) = (gone.id(), std::process::id());
-        let entries =
-            ["idle", "stale", "future", "linkkeep", "dirkeep", "late", "moved", "read", "dup", "kp", "wr", "gt"];
+        let entries = [
+            "idle", "stale", "future", "linkkeep", "dirkeep", "late", "moved", "read", "dup", "kp", "wr", "gt", "kt",
+            "kn", "ks",
+        ];
         let leftovers =
             [format!("orphan.cleanup-{dead}"), format!("dup.cleanup-{dead}"), format!("busy.cleanup-{alive}")];
         for name in entries.iter().map(|s| s.to_string()).chain(leftovers.iter().cloned()) {
             std::fs::create_dir_all(scratch.join(&name).join("notes")).unwrap();
             std::fs::write(scratch.join(&name).join("notes/log"), &name).unwrap();
         }
-        // An idle cargo target dir in the entry kept by its .keep.
-        std::fs::create_dir_all(scratch.join("read/tgt/debug")).unwrap();
-        std::fs::write(scratch.join("read/tgt/debug/big"), "build").unwrap();
-        std::fs::write(
-            scratch.join("read/tgt/CACHEDIR.TAG"),
-            "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
-        )
-        .unwrap();
+        // Idle cargo target dirs: in the entry kept by its .keep, and in one kept as changed just now.
+        for entry in ["read", "kt", "ks"] {
+            std::fs::create_dir_all(scratch.join(entry).join("tgt/debug")).unwrap();
+            std::fs::write(scratch.join(entry).join("tgt/debug/big"), "build").unwrap();
+            std::fs::write(
+                scratch.join(entry).join("tgt/CACHEDIR.TAG"),
+                "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
+            )
+            .unwrap();
+        }
         // Clean scratch checkouts of this repo: one in an entry its builder only reads, one in use soon.
         for wt in ["task/wt", "sized/wt", "commit/wt"] {
             let wt = scratch.join(wt);
@@ -649,7 +657,7 @@ fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
                 now + std::time::Duration::from_secs((-h) as u64 * 3600)
             }
         };
-        for (entry, h) in [("read", 3), ("task", 3), ("stale", 30), ("future", -48)] {
+        for (entry, h) in [("read", 3), ("task", 3), ("stale", 30), ("future", -48), ("kn", 30), ("ks", 30)] {
             std::fs::write(scratch.join(entry).join(".keep"), "").unwrap();
             set_mtimes(&scratch.join(entry).join(".keep"), hours(h));
         }
@@ -657,7 +665,16 @@ fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
         std::fs::write(t.join("fresh"), "").unwrap();
         std::os::unix::fs::symlink(t.join("fresh"), scratch.join("linkkeep/.keep")).unwrap();
         std::fs::create_dir(scratch.join("dirkeep/.keep")).unwrap();
-        let skip = ["read/.keep", "task/.keep", "stale/.keep", "future/.keep", "dirkeep/.keep", "linkkeep/.keep"];
+        let skip = [
+            "read/.keep",
+            "task/.keep",
+            "stale/.keep",
+            "future/.keep",
+            "dirkeep/.keep",
+            "linkkeep/.keep",
+            "kn/.keep",
+            "ks/.keep",
+        ];
         for entry in std::fs::read_dir(t).unwrap().flatten() {
             if entry.file_name() != "fresh" {
                 set_mtimes_but(&entry.path(), hours(4), &skip.map(|s| scratch.join(s)));
@@ -666,6 +683,8 @@ fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
         set_mtimes(&scratch.join("dirkeep/.keep"), hours(3));
         // dup is in use again, changed just now, beside its old copy.
         set_mtimes(&scratch.join("dup/notes/log"), now);
+        set_mtimes(&scratch.join("kt/notes/log"), now);
+        set_mtimes(&scratch.join("ks/notes/log"), now);
         let old = Command::new("touch").args(["-h", "-t", "202001010000"]).arg(scratch.join("linkkeep/.keep")).status();
         assert!(old.unwrap().success(), "touch -h");
 
@@ -677,16 +696,28 @@ fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
         write_executable(&stubs.join("docker"), "#!/bin/sh\nexit 1\n");
         let which = |p: &str| String::from_utf8(run(&dir, "sh", &["-c", &format!("command -v {p}")]).stdout).unwrap();
         let pids = t.join("pids");
-        let (du, mv) = (which("du"), which("mv"));
+        let (du, mv, stat) = (which("du"), which("mv"), which("stat"));
+        // A stat that never dates kn's .keep, nor ks's once du has sized ks/tgt (finding df3b4dc4966f).
+        let sized = t.join("ks-sized");
+        write_executable(
+            &stubs.join("stat"),
+            &format!(
+                "#!/bin/sh\nfor a; do f=$a; done\ncase \"$f\" in */kn/.keep) exit 1 ;;\n\
+                 */ks/.keep) [ ! -e '{sized}' ] || exit 1 ;; esac\nexec '{stat}' \"$@\"\n",
+                sized = sized.display(),
+                stat = stat.trim()
+            ),
+        );
         write_executable(
             &stubs.join("du"),
             &format!(
                 "#!/bin/sh\ncase \"$*\" in *\"/late\" | *\"/sized/wt\") (cd \"$2\" && exec sleep 600) >/dev/null 2>&1 \
                  </dev/null & echo $! >>'{pids}'; sleep 1 ;;\n\
-                 *\"/kp\") touch \"$2/.keep\" ;;\n*\"/wr\") echo new >\"$2/notes/new\" ;;\n\
+                 *\"/kp\") touch \"$2/.keep\" ;;\n*\"/kt/tgt\") touch \"${{2%/tgt}}/.keep\" ;;\n*\"/ks/tgt\") : >'{sized}' ;;\n*\"/wr\") echo new >\"$2/notes/new\" ;;\n\
                  *\"/gt\") mkdir \"$2/sub\" && : >\"$2/sub/.git\" ;;\n\
                  *\"/commit/wt\") git -C \"$2\" commit -q --allow-empty -m during ;;\nesac\nexec '{du}' \"$@\"\n",
                 pids = pids.display(),
+                sized = sized.display(),
                 du = du.trim()
             ),
         );
@@ -742,6 +773,22 @@ fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
             let l = line(kept);
             assert!(l.starts_with("keep") && l.contains(why), "{scripts}: {kept}: {l}");
         }
+        // kt's tgt/, sized as kt's .keep is touched (finding 1efc75ddf0cb).
+        let kt = stdout.lines().any(|l| {
+            l.starts_with("keep")
+                && l.contains("/kt:")
+                && l.contains("tgt/ stays: a .keep was touched while it was sized")
+        });
+        assert!(kt, "{scripts}: kt's tgt/ wasn't put back: {stdout}");
+        // A .keep that can't be dated: kn kept whole before sizing, ks's tgt/ put back after the rename.
+        let l = line("kn");
+        assert!(l.starts_with("keep") && l.contains("holds a .keep"), "{scripts}: kn: {l}");
+        let ks = stdout.lines().any(|l| {
+            l.starts_with("keep")
+                && l.contains("/ks:")
+                && l.contains("tgt/ stays: a .keep was touched while it was sized")
+        });
+        assert!(ks, "{scripts}: ks's tgt/ wasn't put back: {stdout}");
         let l = line(&format!("dup.cleanup-{dead}"));
         assert!(l.starts_with("won't touch") && l.contains("while dup existed"), "{scripts}: {l}");
         let l = stdout.lines().find(|l| l.starts_with("put back")).unwrap_or_else(|| panic!("{scripts}: {stdout}"));
@@ -761,6 +808,9 @@ fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
             "wr/notes/new",
             "gt/sub/.git",
             "commit/wt",
+            "kt/tgt/debug/big",
+            "kn/notes/log",
+            "ks/tgt/debug/big",
         ] {
             assert!(scratch.join(kept).exists(), "{scripts}: {kept} went: {stdout}");
         }

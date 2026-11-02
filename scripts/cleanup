@@ -32,7 +32,8 @@
 # slow step (du, lsof, the merge check, the Ground read) it checks again after the last look, just before
 # the removal: a worktree whose HEAD, branch, files (git status, ignored ones too), scratch .keep or last use
 # changed stays; a renamed-aside scratch entry holding a fresh .keep, a git checkout or a change in the last
-# 2 hours, or a target dir changed in the time it had to be idle, is put back (finding 497ffa3fdcdc).
+# 2 hours, or a target dir changed in the time it had to be idle, is put back (finding 497ffa3fdcdc), as is
+# a target dir whose scratch entry has come to hold a fresh .keep (finding 1efc75ddf0cb).
 # A builder's worktree it keeps for any other reason than being in use or out of bounds (dirty, unmerged,
 # young, on no branch...) still loses its target/ when no process has a file open in the worktree and
 # nothing in target/ changed for the target idle time: 3 hours, or --target-idle <hours>, or
@@ -138,16 +139,17 @@ snapshot() {
 }
 snapshot
 # Whether $1 is, or is inside, an entry of the scratch root holding a .keep file (not a symlink) touched in
-# the last 24 hours (task 02acb1d6e7e0).
+# the last 24 hours (task 02acb1d6e7e0), or one it can't date: a failed stat keeps the entry (finding
+# df3b4dc4966f).
 kept_by_file() {
-  local rel e
+  local rel e t now_s
   inside "$1" "$scratch_root" && [ "$1" != "$scratch_root" ] || return 1
   rel=${1#"$scratch_root"/}
   e=$scratch_root/${rel%%/*}
+  [ -f "$e/.keep" ] && [ ! -L "$e/.keep" ] || return 1
+  t=$(mtime "$e/.keep") && [[ $t =~ ^[0-9]+$ ]] && now_s=$(date +%s) && [[ $now_s =~ ^[0-9]+$ ]] || return 0
   # A .keep dated later than now doesn't count, so a mis-touched one can't hold an entry for years.
-  local t now_s
-  [ -f "$e/.keep" ] && [ ! -L "$e/.keep" ] && t=$(mtime "$e/.keep") && now_s=$(date +%s) &&
-    [ "${t:-0}" -le "$now_s" ] && [ $((now_s - t)) -lt 86400 ]
+  [ "$t" -le "$now_s" ] && [ $((now_s - t)) -lt 86400 ]
 }
 plain() { local LC_ALL=C; [[ $1 != *[![:print:]]* ]]; }
 # in_use on a new look, not the run's first one, which may be minutes old by now (finding 176efeffc76f).
@@ -411,7 +413,8 @@ idle_target() {
 # renamed aside in its own directory (one rename, so a build starting now can't find half of it), $2 is
 # looked at once more, and only then is the renamed copy deleted. A process found at either look keeps it,
 # renamed back, as does a change in the copy within the target idle time, or $4 minutes if given: one made
-# while it was sized (finding 497ffa3fdcdc).
+# while it was sized (finding 497ffa3fdcdc). So does a .keep touched meanwhile in the scratch entry $2 is, or
+# is in (finding 1efc75ddf0cb).
 free_target() {
   local size user aside=$1.cleanup-$$ rel=${1#"$2"/}
   if ! $have_lsof; then keep "$2" "$3; but $rel/ stays: no lsof to check nothing uses it"; return 1; fi
@@ -423,11 +426,14 @@ free_target() {
       say failed "$2" "couldn't rename $rel/ aside to remove it"
       return 1
     fi
-    # In use, or changed while it was sized (finding 497ffa3fdcdc): put back.
+    # In use, changed while it was sized (finding 497ffa3fdcdc), or kept by a .keep touched meanwhile (finding
+    # 1efc75ddf0cb): put back.
     if user=$(in_use_now "$2"); then
       user="in use by $user once renamed aside"
     elif ! idle_target "$aside" "${4:-}"; then
       user="it changed while it was sized"
+    elif kept_by_file "$2"; then
+      user="a .keep was touched while it was sized"
     else
       user=""
     fi
