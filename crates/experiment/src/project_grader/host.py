@@ -3,9 +3,10 @@ directory holds the hidden tests and nothing of the code under test. The code un
 run here:
 
 - importing the package gives a proxy module. Each attribute, call, iteration and so on goes to the grader,
-  which relays it to the server, a sandboxed child with the tree. Plain values come back as data and are
-  compared here; other objects come back as proxies, which equal only themselves, and whose `in` is answered
-  here from their items. Only the package and its submodules ever become proxy modules, and only when this
+  which relays it to the server, a sandboxed child with the tree. Values of exactly the plain types come back as
+  data and are compared here; other objects, a plain type's subclass too, come back as proxies, which are never
+  compared, hashed or ordered, not even with themselves (decision d1fc04a4f896), and whose `in` is answered here
+  from their items. Only the package and its submodules ever become proxy modules, and only when this
   process imports them (finding 734e5389e188).
 - an io.StringIO given to the code, or standard output or error redirected to one around a call, is given
   as a stream of the server's holding the same text, and holds what the code wrote to it there once the call
@@ -267,8 +268,8 @@ NAMING = {"__name__", "__qualname__", "__annotations__"}
 
 
 class Proxy:
-    """An object of the code under test, by its server's generation and its number there. It equals only
-    itself. One got as an attribute of a module of the package remembers which, so a server started after its
+    """An object of the code under test, by its server's generation and its number there. It is never compared,
+    hashed or ordered (decision d1fc04a4f896). One got as an attribute of a module of the package remembers which, so a server started after its
     own has ended finds it again by name (finding 5f5c3b4b25a9)."""
 
     __slots__ = ("_handle", "_origin")
@@ -342,10 +343,10 @@ class Proxy:
 
 # The code's own operators never answer a test's check of a value (finding c823af485f19). An operator's result on
 # the code's objects stays one of the code's, a proxy, even when it is a number there: so `x - 1.5` that the code
-# says is 0.0 is never 0.0 here, and assertAlmostEqual's round of it raises. Ordering a proxy against a plain
-# value raises rather than let the code's __lt__ say; two of the code's own objects are ordered by the code, as
-# its own behaviour is, a bool. And float(), int(), round() and math's functions on a proxy raise: a test
-# compares plain values the code returns, such as an attribute's or a method's.
+# says is 0.0 is never 0.0 here, and assertAlmostEqual's round of it raises. Ordering a proxy raises, against
+# anything, one of the code's own objects too, rather than let the code's __lt__ say (decision d1fc04a4f896). And
+# float(), int(), round() and math's functions on a proxy raise: a test compares plain values the code returns,
+# such as an attribute's or a method's.
 ORDERING = {"lt", "le", "gt", "ge"}
 
 
