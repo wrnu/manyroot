@@ -28,6 +28,7 @@ not (
         | test(=bracken_mode::tests::concurrent_work_across_pages_is_listed_once)
         | test(=metrics::tests::every_contract_case_is_judged_by_the_agents_working_copy_in_every_mode)
         | test(=python::tests::macos_only::the_parent_never_acts_on_a_path_the_code_can_swap)
+        | test(=project_grader::tests::macos_only::agent_code_reads_no_hidden_test_imported_or_as_a_command)
     ))
     | (binary_id(=bracken-experiment::report) & (
         test(=scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode)
