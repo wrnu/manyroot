@@ -30,11 +30,18 @@ const HOST_TIMES: u32 = 4;
 
 /// The most tests a group's file may hold, as its host says: more are counted as this many.
 const MAX_TESTS: u32 = 100_000;
+
+/// The most errors and failures of a group kept for `--diagnose` (finding 9c10a74d8c2a), and the most bytes of
+/// each description.
+const MAX_DIAGNOSES: usize = 50;
+const MAX_DIAGNOSIS_BYTES: usize = 64 << 10;
 /// What the host may print (its own test runner's output, discarded) and use.
 const HOST_OUTPUT: u64 = 16 << 20;
 const HOST_MEMORY_MB: u32 = 1024;
 /// The most bytes of working files a command may be given or give back.
 const MAX_WORK_BYTES: usize = 32 << 20;
+/// The most directories a command may be given to make, one for each path in its arguments.
+const MAX_DIRS: usize = 256;
 
 /// The tree a grade judges.
 pub enum Tree<'a> {
@@ -84,6 +91,15 @@ pub struct GroupGrade {
     pub outcomes: Vec<Outcome>,
     /// Why its tests didn't all run, if they didn't: how the host ended.
     pub unfinished: Option<String>,
+    /// Each error outside any test, and each test's error or failure with its index (`test`), as the host
+    /// described it: the exception's class, its message and its frames, file:line (task `6a80d88373a5`). At
+    /// most [`MAX_DIAGNOSES`]. Never serialized, so never in a grade, a grades file or any output: only
+    /// `--diagnose` writes it, to a file of the manager's.
+    #[serde(skip)]
+    pub diagnosis: Vec<serde_json::Value>,
+    /// How many errors and failures the host described in all, those beyond the first few too.
+    #[serde(skip)]
+    pub described: usize,
 }
 
 /// A test's outcome, worst last.
@@ -139,8 +155,9 @@ pub fn grade(python: &Python, project: &Project, set: &HiddenSet, tree: Tree, sh
             continue;
         }
         let file = group.file.strip_prefix("tests/").expect("checked to be under tests/");
-        let (counts, outcomes, unfinished) = run_group(python, project, set, &tree, file)?;
-        groups.push(GroupGrade { index, item: group.item.clone(), counts, outcomes, unfinished });
+        let GroupRun { counts, outcomes, unfinished, diagnosis, described } =
+            run_group(python, project, set, &tree, file)?;
+        groups.push(GroupGrade { index, item: group.item.clone(), counts, outcomes, unfinished, diagnosis, described });
     }
     let items = project
         .items
@@ -210,14 +227,18 @@ fn write_files<'a>(to: &Path, entries: impl Iterator<Item = (&'a str, Option<&'a
     Ok(())
 }
 
+/// What one group's host reported: its counts, each test's outcome, how it ended if early, and its errors and
+/// failures, described.
+struct GroupRun {
+    counts: Counts,
+    outcomes: Vec<Outcome>,
+    unfinished: Option<String>,
+    diagnosis: Vec<serde_json::Value>,
+    described: usize,
+}
+
 /// Runs one group's test file in its own host, serving its requests, and counts its outcomes.
-fn run_group(
-    python: &Python,
-    project: &Project,
-    set: &HiddenSet,
-    tree: &Tree,
-    file: &str,
-) -> Result<(Counts, Vec<Outcome>, Option<String>), String> {
+fn run_group(python: &Python, project: &Project, set: &HiddenSet, tree: &Tree, file: &str) -> Result<GroupRun, String> {
     let scratch = Scratch::new()?;
     let tests = scratch.dir.join("tests");
     let (dirs, files) = set.under("tests");
@@ -256,6 +277,7 @@ fn run_group(
     // Each test's outcome by index, the worst it reported; the test running; and the worst outcome reported
     // outside any test, such as a class fixture's error (finding bcecc7c3f6e3).
     let (mut outcomes, mut current, mut outside) = (Vec::<Option<Outcome>>::new(), None::<usize>, None::<Outcome>);
+    let (mut diagnosis, mut described) = (Vec::new(), 0usize);
     while let Some(line) = running.next(deadline) {
         // The host's wall time stands still while it waits on another container, and doesn't count the time that
         // container took to start: a second or more on a loaded machine, and not the host's.
@@ -268,6 +290,17 @@ fn run_group(
                 running.resume(Duration::ZERO);
                 total = n.parse::<u32>().unwrap_or(0).min(MAX_TESTS);
                 outcomes = vec![None; total as usize];
+                continue;
+            }
+            Some(("X", text)) => {
+                // Bounded in number and size: the host's own description of an error or a failure.
+                described += 1;
+                if diagnosis.len() < MAX_DIAGNOSES
+                    && text.len() <= MAX_DIAGNOSIS_BYTES
+                    && let Ok(v) = serde_json::from_str::<serde_json::Value>(text)
+                {
+                    diagnosis.push(v);
+                }
                 continue;
             }
             Some(("B", i)) => {
@@ -327,9 +360,15 @@ fn run_group(
         outcomes.extend(outside);
     }
     Ok(match counts {
-        Some(counts) => (counts, outcomes, None),
+        Some(counts) => GroupRun { counts, outcomes, unfinished: None, diagnosis, described },
         // The tests that hadn't ended when the host did count as failures.
-        None => (Counts { fail: so_far.fail + total.saturating_sub(done), ..so_far }, outcomes, Some(describe(&exit))),
+        None => GroupRun {
+            counts: Counts { fail: so_far.fail + total.saturating_sub(done), ..so_far },
+            outcomes,
+            unfinished: Some(describe(&exit)),
+            diagnosis,
+            described,
+        },
     })
 }
 
@@ -467,6 +506,9 @@ struct CommandRequest {
     argv: Vec<String>,
     /// Each working file's path and its bytes in hex.
     files: Vec<(String, String)>,
+    /// Directories to make in the working directory, such as one for a file the command is to write.
+    #[serde(default)]
+    dirs: Vec<String>,
     stdin: String,
 }
 
@@ -499,7 +541,13 @@ fn command(
     if given.iter().map(|(_, b)| b.len()).sum::<usize>() > MAX_WORK_BYTES {
         return Ok(serde_json::json!({"gone": "too many working files"}).to_string());
     }
-    write_files(&work, given.iter().map(|(rel, b)| (*rel, Some(b.as_slice()))))?;
+    if r.dirs.len() > MAX_DIRS {
+        return Ok(serde_json::json!({"gone": "too many working directories"}).to_string());
+    }
+    write_files(
+        &work,
+        r.dirs.iter().map(|d| (d.as_str(), None)).chain(given.iter().map(|(rel, b)| (*rel, Some(b.as_slice())))),
+    )?;
     let cli = scratch.dir.join("cli.py");
     std::fs::write(&cli, CLI).map_err(|e| format!("writing the command runner: {e}"))?;
     let mut args: Vec<OsString> =

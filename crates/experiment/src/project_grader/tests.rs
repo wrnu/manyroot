@@ -222,8 +222,14 @@ mod macos_only {
             \x20       self.assertIn('STORE =', open(os.path.abspath(__file__)).read())\n\
             \x20   def test_not_where_the_tests_are(self):\n\
             \x20       for d in (os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.dirname(os.path.abspath(__file__)))):\n\
-            \x20           with self.assertRaises(PermissionError):\n\
-            \x20               subprocess.run([sys.executable, '-m', 'tiny.ls'], cwd=d, capture_output=True)\n";
+            \x20           out = subprocess.run([sys.executable, '-m', 'tiny.ls'], cwd=d, capture_output=True, text=True)\n\
+            \x20           self.assertEqual(out.stdout, '[]\\n', out.stderr)\n\
+            \x20           subprocess.run([sys.executable, '-m', 'tiny.write', 'test_peek.py'], cwd=d, capture_output=True)\n\
+            \x20       self.assertIn('STORE =', open(os.path.abspath(__file__)).read())\n\
+            \x20   def test_no_hidden_file_by_its_absolute_path(self):\n\
+            \x20       for path in (os.path.abspath(__file__), os.path.dirname(os.path.abspath(__file__))):\n\
+            \x20           out = subprocess.run([sys.executable, '-m', 'tiny.peek', path], capture_output=True, text=True)\n\
+            \x20           self.assertEqual(out.stdout, 'no\\n', out.stderr)\n";
         let groups = json!([{"item": "mean-empty", "file": "tests/test_peek.py", "applies": "always"}]);
         let s = setup(groups, &[("test_peek.py", PEEK)]);
         let store_file = s.root.join("store/tiny@1/tests/test_peek.py");
@@ -239,7 +245,705 @@ mod macos_only {
         write(&tree.join("tiny/ls.py"), "import json, os\nprint(json.dumps(sorted(os.listdir('.'))))\n");
         write(&tree.join("tiny/write.py"), "import sys\nopen(sys.argv[1], 'w').write('written')\n");
         let g = grade(&python, &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
-        assert_eq!(g.groups[0].counts, Counts { pass: 7, ..Counts::default() }, "{g:#?}");
+        assert_eq!(g.groups[0].counts, Counts { pass: 8, ..Counts::default() }, "{g:#?}");
+    }
+
+    /// Hidden tests shaped as a project's own often are (task `6a80d88373a5`): the package `tests`, with helpers
+    /// beside them imported by name, from `tests.` and relatively; the package imported at a helper's top and a
+    /// test's; a command run through `subprocess` from the project's root, as a helper finds it from
+    /// `__file__`, on a temporary file, writing another; and decimals compared here.
+    #[test]
+    fn tests_shaped_as_a_projects_own_are_graded() {
+        let Some(python) = python() else { return };
+        const SUPPORT: &str = "import os, subprocess, sys, tempfile\nimport tiny\nfrom tiny.stats import sum_of\n\
+            ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\n\n\
+            def total(text):\n    with tempfile.TemporaryDirectory() as d:\n\
+            \x20       given, made = os.path.join(d, 'in.txt'), os.path.join(d, 'out.txt')\n\
+            \x20       open(given, 'w').write(text)\n\
+            \x20       out = subprocess.run([sys.executable, '-m', 'tiny.io', given, made], cwd=ROOT,\n\
+            \x20                            capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=ROOT))\n\
+            \x20       written = open(made).read() if os.path.exists(made) else None\n\
+            \x20       return out.returncode, out.stdout.replace(given, 'IN'), out.stderr, written\n\n\
+            def missing():\n    with tempfile.TemporaryDirectory() as d:\n        path = os.path.join(d, 'none.txt')\n\
+            \x20       out = subprocess.run([sys.executable, '-m', 'tiny.io', path, path], capture_output=True, text=True)\n\
+            \x20       return out.returncode, out.stderr.replace(path, 'NONE')\n";
+        const COMMON: &str = "import decimal\nfrom tiny import stats\nHALF = decimal.Decimal('0.5')\n";
+        // A helper that finds the project from the package's file at its top, and runs the command from there.
+        const FROM_FILE: &str = "import os, subprocess, sys, tempfile\nfrom pathlib import Path\nimport tiny\n\
+            import tiny.stats\nPACKAGE = Path(tiny.__file__).resolve().parent\nROOT = PACKAGE.parent\n\
+            STATS = tiny.stats.__file__\nPATH = list(tiny.__path__)\n\n\
+            def total(text):\n    with tempfile.TemporaryDirectory() as d:\n\
+            \x20       given, made = os.path.join(d, 'in.txt'), os.path.join(d, 'out.txt')\n\
+            \x20       open(given, 'w').write(text)\n\
+            \x20       out = subprocess.run([sys.executable, '-m', 'tiny.io', given, made], cwd=ROOT,\n\
+            \x20                            capture_output=True, text=True, env=dict(os.environ, PYTHONPATH=str(ROOT)))\n\
+            \x20       return out.returncode, open(made).read() if os.path.exists(made) else out.stderr\n";
+        const TEST_FROM_FILE: &str = "import os, unittest\nimport from_file\n\n\
+            class T(unittest.TestCase):\n\
+            \x20   def test_the_package_has_a_place(self):\n\
+            \x20       self.assertEqual(from_file.PACKAGE.name, 'tiny')\n\
+            \x20       self.assertEqual(os.path.basename(from_file.STATS), 'stats.py')\n\
+            \x20       self.assertEqual(os.path.dirname(from_file.STATS), str(from_file.PACKAGE))\n\
+            \x20       self.assertEqual(from_file.PATH, [str(from_file.PACKAGE)])\n\
+            \x20       self.assertTrue(from_file.PACKAGE.is_dir())\n\
+            \x20       self.assertEqual(os.listdir(from_file.PACKAGE), [], 'no file of the tree')\n\
+            \x20   def test_not_the_tests_nor_the_tree(self):\n\
+            \x20       tests = os.path.dirname(os.path.abspath(__file__))\n\
+            \x20       root = str(from_file.ROOT)\n\
+            \x20       self.assertFalse(root.startswith(tests) or tests.startswith(root + os.sep), root)\n\
+            \x20       self.assertNotIn('{ROOT}/tree', root)\n\
+            \x20   def test_a_command_from_there(self):\n\
+            \x20       self.assertEqual(from_file.total('1 2.5'), (0, '3.5'))\n";
+        const TEST: &str = "import decimal, unittest\nimport tiny\nfrom tiny.stats import sum_of\n\
+            from support import total\nfrom tests.support import missing\nfrom .common import HALF\n\n\
+            class T(unittest.TestCase):\n\
+            \x20   def test_a_command_on_temporary_files(self):\n\
+            \x20       self.assertEqual(total('1.5 2'), (0, 'read IN\\n', '', '3.5'))\n\
+            \x20   def test_its_error_names_the_path_given(self):\n\
+            \x20       self.assertEqual(missing(), (2, 'no file NONE\\n'))\n\
+            \x20   def test_decimals(self):\n\
+            \x20       self.assertEqual(sum_of(['1.5', '2']), decimal.Decimal('3.5'))\n\
+            \x20       self.assertIsInstance(sum_of([HALF]), decimal.Decimal)\n\
+            \x20       self.assertEqual(sum_of([HALF, HALF]), 1)\n\
+            \x20       self.assertEqual(tiny.stats.sum_of([]) + HALF, HALF)\n";
+        let groups = json!([
+            {"item": "decimals", "file": "tests/sub/test_shapes.py", "applies": "always"},
+            {"item": "decimals", "file": "tests/test_from_file.py", "applies": "always"},
+        ]);
+        let s = setup(
+            groups,
+            &[
+                ("__init__.py", ""),
+                ("support.py", SUPPORT),
+                ("sub/common.py", COMMON),
+                ("sub/test_shapes.py", TEST),
+                ("from_file.py", FROM_FILE),
+                ("test_from_file.py", TEST_FROM_FILE),
+            ],
+        );
+        let tree = s.root.join("tree");
+        write(&tree.join("tiny/__init__.py"), "");
+        write(&tree.join("tiny/stats.py"), &format!("{ERRORS}{AFTER}"));
+        write(
+            &tree.join("tiny/io.py"),
+            "import sys\nfrom tiny.stats import sum_of\ngiven, made = sys.argv[1:3]\ntry:\n    text = open(given).read()\n\
+             except OSError:\n    print('no file', given, file=sys.stderr)\n    sys.exit(2)\n\
+             print('read', given)\nopen(made, 'w').write(str(sum_of(text.split())))\n",
+        );
+        let g = grade(&python, &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
+        assert_eq!(g.groups[0].counts, Counts { pass: 3, ..Counts::default() }, "{g:#?}");
+        assert_eq!(g.groups[1].counts, Counts { pass: 3, ..Counts::default() }, "{g:#?}");
+        assert!(g.groups.iter().all(|g| g.diagnosis.is_empty()), "{g:#?}");
+    }
+
+    /// A test's error or failure is described for `--diagnose` too, with its index, its message cut to 300
+    /// characters (task `6a80d88373a5`); a subtest's under its test's index.
+    #[test]
+    fn a_tests_error_or_failure_is_described_with_its_index() {
+        let Some(python) = python() else { return };
+        let test = "import unittest\nimport tiny.stats as stats\n\nclass T(unittest.TestCase):\n\
+                    \x20   def test_a_pass(self):\n        self.assertEqual(stats.f(), 1)\n\
+                    \x20   def test_b_fail(self):\n        self.fail('x' * 500)\n\
+                    \x20   def test_c_error(self):\n        stats.g()\n\
+                    \x20   def test_d_subtest(self):\n        with self.subTest(i=1):\n            self.assertTrue(False)\n";
+        let g = graded(&python, "def f():\n    return 1\n", test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        assert_eq!(g.counts, Counts { pass: 1, fail: 2, error: 1, ..Counts::default() }, "{g:#?}");
+        let by: Vec<(Value, Value)> = g.diagnosis.iter().map(|d| (d["test"].clone(), d["class"].clone())).collect();
+        assert_eq!(
+            by,
+            [
+                (json!(1), json!("builtins.AssertionError")),
+                (json!(2), json!("builtins.AttributeError")),
+                (json!(3), json!("builtins.AssertionError")),
+            ],
+            "{g:#?}"
+        );
+        assert!(g.diagnosis[0]["message"].as_str().is_some_and(|m| m.chars().count() == 300), "{g:#?}");
+        let last = g.diagnosis[1]["frames"].as_array().and_then(|f| f.iter().rev().find(|f| f[0] == "tests/test_x.py"));
+        assert_eq!(last.map(|f| &f[1]), Some(&json!(10)), "{g:#?}");
+    }
+
+    /// A text stream given to the code, or standard output redirected to one, holds what the code wrote there
+    /// once the call returns or raises; and an exception keeps its attributes of plain data (task
+    /// `6a80d88373a5`): as a command line's in-process `main(argv, out=io.StringIO())` is tested.
+    #[test]
+    fn a_text_stream_given_to_the_code_holds_what_it_wrote() {
+        let Some(python) = python() else { return };
+        let stats = "import json, sys\n\nclass ParseError(ValueError):\n    def __init__(self, message, line):\n\
+                     \x20       super().__init__(message)\n        self.line = line\n\n\
+                     def main(argv, out=None, err=None):\n    out = out or sys.stdout\n    err = err or sys.stderr\n\
+                     \x20   if argv == ['bad']:\n        print('no such command', file=err)\n        return 2\n\
+                     \x20   if argv == ['raise']:\n        out.write('partial')\n        raise ParseError('bad line', 7)\n\
+                     \x20   print(json.dumps({'total': '3.50', 'argv': argv}), file=out)\n    return 0\n";
+        let test = "import contextlib, io, json, unittest\nfrom tiny.stats import main, ParseError\n\n\
+                    class T(unittest.TestCase):\n\
+                    \x20   def test_out_and_err(self):\n        out, err = io.StringIO(), io.StringIO()\n\
+                    \x20       self.assertEqual(main(['balance'], out=out, err=err), 0)\n\
+                    \x20       self.assertEqual(json.loads(out.getvalue()), {'total': '3.50', 'argv': ['balance']})\n\
+                    \x20       self.assertEqual(err.getvalue(), '')\n\
+                    \x20   def test_err(self):\n        out, err = io.StringIO(), io.StringIO()\n\
+                    \x20       self.assertEqual(main(['bad'], out=out, err=err), 2)\n\
+                    \x20       self.assertEqual((out.getvalue(), err.getvalue()), ('', 'no such command\\n'))\n\
+                    \x20   def test_appends(self):\n        out = io.StringIO()\n        out.write('before ')\n\
+                    \x20       main(['x'], out=out, err=out)\n        self.assertTrue(out.getvalue().startswith('before {'))\n\
+                    \x20   def test_redirected(self):\n        out = io.StringIO()\n\
+                    \x20       with contextlib.redirect_stdout(out):\n            self.assertEqual(main(['r']), 0)\n\
+                    \x20       self.assertEqual(json.loads(out.getvalue())['argv'], ['r'])\n\
+                    \x20   def test_raised_keeps_what_was_written_and_its_line(self):\n        out = io.StringIO()\n\
+                    \x20       with self.assertRaises(ParseError) as cm:\n            main(['raise'], out=out)\n\
+                    \x20       self.assertEqual((out.getvalue(), cm.exception.line, str(cm.exception)), ('partial', 7, 'bad line'))\n";
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        assert_eq!(g.counts, Counts { pass: 5, ..Counts::default() }, "{g:#?}");
+    }
+
+    /// A path in a call's arguments, such as a temporary file's in a command line's argv, is given as the
+    /// server's own, and what the code wrote there comes back; an error naming it names the test's (task
+    /// `6a80d88373a5`). Never a hidden test's, nor a path outside the host's own directory.
+    #[test]
+    fn a_path_given_to_the_code_is_its_own() {
+        let Some(python) = python() else { return };
+        let stats = "import os\n\ndef main(argv, out):\n    path, made = argv[1], argv[2]\n    try:\n\
+                     \x20       text = open(path).read()\n    except OSError:\n        raise ValueError('cannot read ' + path)\n\
+                     \x20   open(made, 'w').write(text.upper())\n    out.write(path + ': ' + text)\n    return 0\n\n\
+                     def read(path):\n    return open(os.fspath(path)).read()\n\n\
+                     def same(s):\n    return s\n";
+        let test = "import io, os, pathlib, tempfile, unittest\nfrom tiny.stats import main, read, same\n\n\
+                    class T(unittest.TestCase):\n\
+                    \x20   def test_a_temporary_file(self):\n        with tempfile.TemporaryDirectory() as d:\n\
+                    \x20           path, made = os.path.join(d, 'books.journal'), os.path.join(d, 'out.txt')\n\
+                    \x20           open(path, 'w').write('books')\n            out = io.StringIO()\n\
+                    \x20           self.assertEqual(main(['-f', path, made], out=out), 0)\n\
+                    \x20           self.assertEqual(out.getvalue(), path + ': books')\n\
+                    \x20           self.assertEqual(open(made).read(), 'BOOKS')\n\
+                    \x20           self.assertEqual(read(pathlib.Path(path)), 'books')\n\
+                    \x20           self.assertEqual(sorted(os.listdir(d)), ['books.journal', 'out.txt'])\n\
+                    \x20   def test_an_error_names_the_tests_path(self):\n        with tempfile.TemporaryDirectory() as d:\n\
+                    \x20           none = os.path.join(d, 'none')\n\
+                    \x20           with self.assertRaises(ValueError) as cm:\n                main(['-f', none, none], out=io.StringIO())\n\
+                    \x20           self.assertEqual(str(cm.exception), 'cannot read ' + none)\n\
+                    \x20   def test_not_a_hidden_file_nor_one_outside(self):\n\
+                    \x20       for path in (os.path.abspath(__file__), '{ROOT}/store/tiny@1/tests/test_x.py'):\n\
+                    \x20           with self.assertRaises(Exception):\n                read(path)\n\
+                    \x20       self.assertEqual(same('/'), '/')\n        self.assertEqual(same(['/etc']), ['/etc'])\n";
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        assert_eq!(g.counts, Counts { pass: 3, ..Counts::default() }, "{g:#?}");
+    }
+
+    /// What ledger's own hidden tests need of the grader (task `6a80d88373a5`), each by its test:
+    /// a command with interpreter flags before `-m`, a working directory it was given files in, an environment,
+    /// input, a timeout; operators on the code's objects, reflected and unary too, with equality and hashing by
+    /// class and fields, never by the code's own `__eq__`; a function's module and name, a module's names, and
+    /// `find_spec` as the tree has its modules; and an exception's fields, defaulted by its class or declared as a
+    /// dataclass's.
+    #[test]
+    fn ledgers_shapes_of_command_operator_introspection_and_error() {
+        let Some(python) = python() else { return };
+        const STATS: &str = r#"import dataclasses, decimal, sys
+
+@dataclasses.dataclass(frozen=True)
+class Money:
+    amount: decimal.Decimal
+    unit: str = 'USD'
+
+    def __add__(self, other):
+        if isinstance(other, Money):
+            return Money(self.amount + other.amount, self.unit)
+        return Money(self.amount + decimal.Decimal(other), self.unit)
+
+    __radd__ = __add__
+
+    def __sub__(self, other):
+        return Money(self.amount - other.amount, self.unit)
+
+    def __mul__(self, n):
+        return Money(self.amount * n, self.unit)
+
+    def __neg__(self):
+        return Money(-self.amount, self.unit)
+
+    def __abs__(self):
+        return Money(abs(self.amount), self.unit)
+
+    def __lt__(self, other):
+        return self.amount < other.amount
+
+    def __float__(self):
+        return float(self.amount)
+
+class Liar:
+    def __init__(self, n):
+        self.n = n
+
+    def __eq__(self, other):
+        return True
+
+    __hash__ = object.__hash__
+
+def total(xs):
+    """The total of xs."""
+    return sum(xs, Money(decimal.Decimal(0)))
+
+class LedgerError(Exception):
+    filename = '<string>'
+
+@dataclasses.dataclass
+class ParseError(LedgerError):
+    message: str
+    line: int = 0
+    column: int = 1
+
+    def __str__(self):
+        return '%s:%d: %s' % (self.filename, self.line, self.message)
+
+def parse(text):
+    raise ParseError('bad posting', line=3)
+"#;
+        const CLI: &str = "import os, sys\ntext = open('books.journal').read()\nextra = sys.stdin.read()\n\
+            open('out.txt', 'w').write(text.upper() + extra)\nprint(len(text), sorted(os.listdir('.')))\n\
+            print(sys.flags.dont_write_bytecode == 1 or True)\n";
+        const TEST: &str = r#"import decimal, importlib.util, os, subprocess, sys, tempfile, unittest
+import tiny
+import tiny.stats as stats
+from tiny.stats import Money, Liar, total, parse, ParseError
+
+D = decimal.Decimal
+
+class Command(unittest.TestCase):
+    def test_flags_cwd_env_input_timeout(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, 'books.journal'), 'w') as f:
+                f.write('books')
+            env = {'PYTHONPATH': '/elsewhere', 'PYTHONDONTWRITEBYTECODE': '1', 'PATH': os.environ.get('PATH', '')}
+            out = subprocess.run([sys.executable, '-B', '-I', '-m', 'tiny.cli', 'x'], cwd=d, env=env, input='!',
+                                 capture_output=True, text=True, timeout=60)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertEqual(out.stdout.splitlines()[0], "5 ['books.journal', 'out.txt']")
+            self.assertEqual(open(os.path.join(d, 'out.txt')).read(), 'BOOKS!')
+
+    def test_other_flags_are_still_refused(self):
+        for argv in ([sys.executable, '-c', 'print(1)'], [sys.executable, '-B', 'x.py'],
+                     [sys.executable, '-X', 'dev', '-m', 'tiny.cli']):
+            with self.assertRaises(PermissionError):
+                subprocess.run(argv, capture_output=True)
+
+class Operators(unittest.TestCase):
+    def test_arithmetic(self):
+        a, b = Money(D('1.50')), Money(D('2'))
+        self.assertEqual((a + b).amount, D('3.50'))
+        self.assertEqual((b - a).amount, D('0.50'))
+        self.assertEqual((a * 2).amount, D('3.00'))
+        self.assertEqual((1 + a).amount, D('2.50'), 'reflected')
+        self.assertEqual((-a).amount, D('-1.50'))
+        self.assertEqual(abs(-a).amount, a.amount)
+        with self.assertRaises(TypeError):
+            float(a)
+        self.assertEqual(total([a, b]).amount, D('3.50'))
+        self.assertEqual((a + b).unit, 'USD')
+
+    def test_order_equality_and_hash_raise(self):
+        a, b = Money(D('1.50')), Money(D('2'))
+        for f in (lambda: a < b, lambda: sorted([b, a]), lambda: a == b, lambda: a != Money(D('1.50'), 'EUR'),
+                  lambda: {a, b}, lambda: Money(D('2')) in [a, b]):
+            with self.assertRaises(TypeError):
+                f()
+        self.assertLess(a.amount, b.amount)
+
+    def test_the_codes_own_eq_never_answers(self):
+        for a, b in ((Liar(1), Liar(2)), (Liar(1), Liar(1)), (total, parse), (total, stats.total), (total, total)):
+            with self.assertRaises(TypeError):
+                a == b
+        f = total
+        self.assertIs(f, f)
+
+class Introspection(unittest.TestCase):
+    def test_a_functions_module_and_name(self):
+        self.assertEqual(total.__module__, 'tiny.stats')
+        self.assertEqual((total.__name__, total.__qualname__), ('total', 'total'))
+        self.assertEqual(total.__doc__, 'The total of xs.')
+        self.assertEqual(Money.__module__, 'tiny.stats')
+
+    def test_a_modules_names(self):
+        self.assertTrue({'Money', 'total', 'parse', 'ParseError'} <= set(dir(stats)), dir(stats))
+        self.assertIn('stats', dir(tiny))
+
+    def test_find_spec_as_the_tree_has_it(self):
+        self.assertIsNone(importlib.util.find_spec('tiny.absent'))
+        self.assertIsNotNone(importlib.util.find_spec('tiny.stats'))
+        with self.assertRaises(ImportError):
+            import tiny.absent
+
+class Errors(unittest.TestCase):
+    def test_fields_and_class_defaults(self):
+        with self.assertRaises(ParseError) as cm:
+            parse('x')
+        e = cm.exception
+        self.assertEqual((e.message, e.line, e.column, e.filename), ('bad posting', 3, 1, '<string>'))
+        self.assertEqual(str(e), '<string>:3: bad posting')
+"#;
+        let groups = json!([{"item": "decimals", "file": "tests/test_ledgers.py", "applies": "always"}]);
+        let s = setup(groups, &[("test_ledgers.py", TEST)]);
+        let tree = s.root.join("tree");
+        write(&tree.join("tiny/__init__.py"), "");
+        write(&tree.join("tiny/stats.py"), STATS);
+        write(&tree.join("tiny/cli.py"), CLI);
+        let g = grade(&python, &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
+        assert_eq!(g.groups[0].counts, Counts { pass: 9, ..Counts::default() }, "{:#?}", g.groups[0].diagnosis);
+    }
+
+    /// An exception a test makes of the code's class is made by its own `__init__` on the server; and a package
+    /// attribute that shadows its submodule's name is the package's, as Python has it (task `6a80d88373a5`).
+    #[test]
+    fn a_made_exception_and_a_shadowed_submodule_are_the_codes() {
+        let Some(python) = python() else { return };
+        const ERRORS: &str = "class LedgerError(Exception):\n    pass\n\n\
+            class SomeError(LedgerError):\n    def __init__(self, message, filename, line):\n\
+            \x20       super().__init__(f'{filename}:{line}: {message}')\n\
+            \x20       self.message, self.filename, self.line = message, filename, line\n\n\
+            def fail():\n    raise SomeError('bad', 'y.journal', 2)\n";
+        const TEST: &str = "import importlib, unittest\nimport tiny.errors as errors\n\
+            import tiny.reports.balance\nimport tiny.reports.accounts\nfrom tiny.reports import stats\n\n\
+            class T(unittest.TestCase):\n\
+            \x20   def test_made_by_its_init(self):\n        e = errors.SomeError('msg', 'x.journal', 7)\n\
+            \x20       self.assertEqual((e.message, e.filename, e.line), ('msg', 'x.journal', 7))\n\
+            \x20       self.assertEqual(str(e), 'x.journal:7: msg')\n\
+            \x20       self.assertIsInstance(e, errors.LedgerError)\n\
+            \x20       with self.assertRaises(errors.SomeError) as cm:\n            raise e\n\
+            \x20       self.assertIs(cm.exception, e)\n\
+            \x20   def test_raised_still_told(self):\n        with self.assertRaises(errors.SomeError) as cm:\n\
+            \x20           errors.fail()\n\
+            \x20       self.assertEqual((cm.exception.filename, str(cm.exception)), ('y.journal', 'y.journal:2: bad'))\n\
+            \x20   def test_the_packages_attribute_not_its_submodule(self):\n\
+            \x20       reports = importlib.import_module('tiny.reports')\n\
+            \x20       for name in ('balance', 'accounts'):\n\
+            \x20           f = getattr(reports, name)\n\
+            \x20           self.assertEqual((f.__module__, f.__name__), ('tiny.reports.' + name, name))\n\
+            \x20       self.assertEqual(reports.balance(), 'balance')\n\
+            \x20       self.assertEqual(stats(), 'stats')\n\
+            \x20       self.assertEqual(stats.__module__, 'tiny.reports.accounts')\n\
+            \x20       from tiny.reports.balance import balance\n        self.assertEqual(balance(), 'balance')\n";
+        let groups = json!([{"item": "decimals", "file": "tests/test_made.py", "applies": "always"}]);
+        let s = setup(groups, &[("test_made.py", TEST)]);
+        let tree = s.root.join("tree");
+        write(&tree.join("tiny/__init__.py"), "");
+        write(&tree.join("tiny/errors.py"), ERRORS);
+        write(
+            &tree.join("tiny/reports/__init__.py"),
+            "from .balance import balance\nfrom .accounts import accounts, stats\n",
+        );
+        write(&tree.join("tiny/reports/balance.py"), "def balance():\n    return 'balance'\n");
+        write(
+            &tree.join("tiny/reports/accounts.py"),
+            "def accounts():\n    return 'accounts'\n\ndef stats():\n    return 'stats'\n",
+        );
+        let g = grade(&python, &s.project, &s.set, Tree::Dir(&tree), 1.0).expect("graded");
+        assert_eq!(g.groups[0].counts, Counts { pass: 3, ..Counts::default() }, "{:#?}", g.groups[0].diagnosis);
+    }
+
+    /// The code's own operators never answer a test's check of a value (finding c823af485f19): an object whose
+    /// `__sub__` says 0.0, whose `__gt__` and `__lt__` both say yes, whose `__abs__` and `__round__` say 0, whose
+    /// `__float__` says 1.5 and whose `__bool__` says yes passes none of the asserts they would forge; an
+    /// operator's result stays the code's; and two of the code's objects are still ordered and added by it.
+    #[test]
+    fn the_codes_operators_never_forge_a_pass() {
+        let Some(python) = python() else { return };
+        let stats = "class Forger:\n    def __sub__(self, other):\n        return 0.0\n    __rsub__ = __sub__\n\
+                     \x20   def __gt__(self, other):\n        return True\n    __lt__ = __ge__ = __le__ = __gt__\n\
+                     \x20   def __abs__(self):\n        return 0\n    def __round__(self, n=None):\n        return 0\n\
+                     \x20   def __float__(self):\n        return 1.5\n    def __int__(self):\n        return 1\n\
+                     \x20   def __bool__(self):\n        return True\n    def __len__(self):\n        return 0\n\n\
+                     class Plain:\n    pass\n\n\
+                     class Box:\n    def __init__(self, n):\n        self.n = n\n\
+                     \x20   def __add__(self, other):\n        return Box(self.n + other.n)\n\
+                     \x20   def __lt__(self, other):\n        return self.n < other.n\n\n\
+                     def forger():\n    return Forger()\n";
+        let test = "import math, unittest\nfrom tiny.stats import forger, Plain, Box\n\n\
+                    class T(unittest.TestCase):\n\
+                    \x20   def test_almost_equal(self):\n        with self.assertRaises((AssertionError, TypeError)):\n\
+                    \x20           self.assertAlmostEqual(forger(), 1.5)\n\
+                    \x20   def test_greater_and_less(self):\n        with self.assertRaises(TypeError):\n\
+                    \x20           self.assertGreater(forger(), 10)\n        with self.assertRaises(TypeError):\n\
+                    \x20           self.assertLess(forger(), 0)\n        with self.assertRaises(TypeError):\n\
+                    \x20           self.assertLess(0, forger())\n\
+                    \x20   def test_a_result_stays_the_codes(self):\n        x = forger()\n\
+                    \x20       with self.assertRaises(TypeError):\n            x - 1.5 == 0.0\n\
+                    \x20       with self.assertRaises(TypeError):\n            abs(x) == 0\n\
+                    \x20       with self.assertRaises(TypeError):\n            round(x - 1.5, 7)\n\
+                    \x20   def test_round_float_int(self):\n        x = forger()\n\
+                    \x20       for f in (round, float, int, math.floor, lambda v: math.isclose(v, 1.5)):\n\
+                    \x20           with self.assertRaises(TypeError):\n                f(x)\n\
+                    \x20   def test_truth(self):\n        with self.assertRaises(TypeError):\n\
+                    \x20           self.assertTrue(forger())\n        with self.assertRaises(TypeError):\n\
+                    \x20           self.assertFalse(forger())\n        self.assertTrue(Plain())\n\
+                    \x20   def test_the_codes_own_objects(self):\n        a, b = Box(1), Box(2)\n\
+                    \x20       with self.assertRaises(TypeError):\n            a < b\n\
+                    \x20       self.assertEqual((a + b).n, 3)\n        self.assertLess(a.n, b.n)\n\
+                    \x20       with self.assertRaises(TypeError):\n            a + b == Box(3)\n";
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        assert_eq!(g.counts, Counts { pass: 6, ..Counts::default() }, "{:#?}", g.diagnosis);
+    }
+
+    /// What the code writes to a test's temporary file comes back, made by `mkstemp` or `NamedTemporaryFile`, in
+    /// a call or through a command (finding 8221427759ca); the host's temporary directory holds no test.
+    #[test]
+    fn writes_to_a_tests_temporary_files_come_back() {
+        let Some(python) = python() else { return };
+        let stats = "import sys\n\ndef save(path, text):\n    with open(path, 'w') as f:\n        f.write(text)\n\
+                     \x20   return 0\n\nif __name__ == '__main__':\n    save(sys.argv[1], sys.argv[2])\n";
+        let test = "import os, subprocess, sys, tempfile, unittest\nfrom tiny.stats import save\n\n\
+                    class T(unittest.TestCase):\n\
+                    \x20   def test_mkstemp(self):\n        fd, path = tempfile.mkstemp(suffix='.journal')\n        os.close(fd)\n\
+                    \x20       self.assertEqual(save(path, 'made'), 0)\n        self.assertEqual(open(path).read(), 'made')\n\
+                    \x20   def test_named_temporary_file(self):\n\
+                    \x20       with tempfile.NamedTemporaryFile('w', suffix='.journal', delete=False) as f:\n\
+                    \x20           f.write('old')\n        save(f.name, 'new')\n        self.assertEqual(open(f.name).read(), 'new')\n\
+                    \x20   def test_a_command(self):\n        fd, path = tempfile.mkstemp()\n        os.close(fd)\n\
+                    \x20       out = subprocess.run([sys.executable, '-m', 'tiny.stats', path, 'cmd'], capture_output=True)\n\
+                    \x20       self.assertEqual(out.returncode, 0, out.stderr)\n        self.assertEqual(open(path).read(), 'cmd')\n\
+                    \x20   def test_no_test_where_temporary_files_are(self):\n\
+                    \x20       tests = os.path.dirname(os.path.abspath(__file__))\n\
+                    \x20       self.assertFalse(tests.startswith(tempfile.gettempdir() + os.sep))\n\
+                    \x20       self.assertFalse(tempfile.gettempdir().startswith(tests + os.sep))\n\
+                    \x20       self.assertNotIn(os.path.basename(tests), os.listdir(tempfile.gettempdir()))\n";
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        assert_eq!(g.counts, Counts { pass: 4, ..Counts::default() }, "{:#?}", g.diagnosis);
+    }
+
+    /// The code's objects are never compared (decision d1fc04a4f896): every probe of rounds 2 to 4 raises, against
+    /// one of its own, itself, a plain value, inside a plain container, ordered or hashed; and a value of a plain
+    /// type's subclass is the code's too. What the code gives as plain values, an attribute's, a method's, str()'s,
+    /// comes as data and is compared here, Fraction and complex too.
+    #[test]
+    fn no_object_of_the_codes_is_ever_compared() {
+        let Some(python) = python() else { return };
+        let stats = r#"import collections, dataclasses, datetime, decimal, fractions, functools, sys, typing
+
+class Liar:
+    def __init__(self, n):
+        self.n = n
+    def __eq__(self, other):
+        return True
+    def __lt__(self, other):
+        return True
+    __gt__ = __le__ = __ge__ = __lt__
+    __hash__ = object.__hash__
+
+class Entry:
+    def __init__(self, n):
+        self._n = n
+
+class Money:
+    __slots__ = ('currency', '__cents')
+    def __init__(self, cents, currency='USD'):
+        self.currency = currency
+        self.__cents = cents
+
+class Row(tuple):
+    def __new__(cls, n):
+        o = super().__new__(cls, (n,))
+        o.kind = 'row'
+        return o
+
+class Day(datetime.date):
+    def __init__(self, *a):
+        self.label = 'day'
+
+@dataclasses.dataclass
+class Sub:
+    amount: int = 0
+    kind: str = 'sub'
+
+P = collections.namedtuple('P', 'x y')
+
+class FakeDC:
+    __dataclass_fields__ = {}
+    def __init__(self, n):
+        self.n = n
+
+class PHid(tuple):
+    _fields = ()
+    __dict__ = property(lambda self: (_ for _ in ()).throw(AttributeError('no')))
+    def __new__(cls, n):
+        o = tuple.__new__(cls, ())
+        o.n = n
+        return o
+
+@dataclasses.dataclass(eq=False)
+class DayDC(datetime.date):
+    label: str = ''
+    def __new__(cls, y, m, d, label=''):
+        return datetime.date.__new__(cls, y, m, d)
+    def __init__(self, y, m, d, label=''):
+        self.label = label
+
+class Amount(decimal.Decimal):
+    pass
+
+class Name(str):
+    def __eq__(self, other):
+        return True
+    __hash__ = str.__hash__
+
+class Wordy:
+    def __str__(self):
+        return Name('wordy')
+
+def amount():
+    return Amount('1.50')
+
+def name():
+    return Name('x')
+
+def counts():
+    return collections.Counter('aab')
+
+def holding():
+    return [Liar(1)]
+
+def plain():
+    return {'n': 3, 'xs': [1, (2, 3)], 'when': datetime.date(2024, 2, 29), 'q': fractions.Fraction(1, 3),
+            'z': complex(1, -2), 'd': decimal.Decimal('0.10'), 'set': {1, 2}, 'b': b'x', 'none': None}
+"#;
+        let test = r#"import datetime, decimal, fractions, unittest
+from tiny.stats import (Liar, Entry, Money, Row, Day, Sub, P, FakeDC, PHid, DayDC, Wordy, amount, name, counts,
+                        holding, plain)
+
+def made():
+    return [Liar(1), Entry(5), Money(5), Row(5), Day(2020, 1, 1), Sub(5), P(1, 2), FakeDC(5), PHid(5),
+            DayDC(2020, 1, 1, 'x')]
+
+class Never(unittest.TestCase):
+    def test_against_one_of_its_own(self):
+        for a, b in zip(made(), made()):
+            with self.subTest(a=type(a).__name__):
+                with self.assertRaises(TypeError):
+                    a == b
+                with self.assertRaises(TypeError):
+                    a != b
+                with self.assertRaises(TypeError):
+                    self.assertEqual(a, b)
+
+    def test_against_itself_or_a_plain_value(self):
+        for a in made():
+            with self.subTest(a=type(a).__name__):
+                with self.assertRaises(TypeError):
+                    a == a
+                for v in (5, 'x', None, (1, 2), datetime.date(2020, 1, 1)):
+                    with self.assertRaises(TypeError):
+                        a == v
+                    with self.assertRaises(TypeError):
+                        v == a
+
+    def test_ordered_or_hashed(self):
+        for a, b in zip(made(), made()):
+            with self.subTest(a=type(a).__name__):
+                for f in (lambda: a < b, lambda: a > 5, lambda: 5 <= a, lambda: hash(a), lambda: {a},
+                          lambda: sorted([a, b])):
+                    with self.assertRaises(TypeError):
+                        f()
+
+    def test_inside_a_plain_container(self):
+        with self.assertRaises(TypeError):
+            [Liar(1)] == [Liar(2)]
+        with self.assertRaises(TypeError):
+            self.assertEqual(holding(), [5])
+        with self.assertRaises(TypeError):
+            self.assertIn(Sub(5), [Sub(5)])
+
+    def test_a_plain_types_subclass_is_the_codes(self):
+        for f, v in ((amount, decimal.Decimal('1.50')), (name, 'y'), (counts, {'a': 2, 'b': 1})):
+            with self.subTest(f=f.__name__):
+                with self.assertRaises(TypeError):
+                    self.assertEqual(f(), v)
+
+class Plain(unittest.TestCase):
+    def test_attributes_and_returns(self):
+        self.assertEqual(Sub(5).amount, 5)
+        self.assertNotEqual(Sub(999).amount, Sub(5).amount)
+        self.assertEqual((P(1, 2).x, P(1, 2).y), (1, 2))
+        self.assertEqual(Money(5).currency, 'USD')
+        self.assertEqual(DayDC(2020, 1, 1, 'x').label, 'x')
+        self.assertEqual(str(Day(2020, 1, 1)), '2020-01-01')
+        self.assertNotEqual(str(Day(2021, 2, 2)), str(Day(2020, 1, 1)))
+        self.assertEqual(str(Wordy()), 'wordy')
+        self.assertIs(type(str(Wordy())), str)
+        self.assertLess(Sub(1).amount, Sub(2).amount)
+
+    def test_plain_values_come_as_data(self):
+        v = plain()
+        self.assertEqual(v, {'n': 3, 'xs': [1, (2, 3)], 'when': datetime.date(2024, 2, 29),
+                             'q': fractions.Fraction(1, 3), 'z': complex(1, -2), 'd': decimal.Decimal('0.10'),
+                             'set': {1, 2}, 'b': b'x', 'none': None})
+        self.assertIs(type(v['q']), fractions.Fraction)
+        self.assertIs(type(v['z']), complex)
+        self.assertEqual(len({v['when'], v['when']}), 1)
+"#;
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 60}));
+        assert_eq!(g.counts, Counts { pass: 7, ..Counts::default() }, "{:#?}", g.diagnosis);
+    }
+
+    /// No module the code wrote is ever imported here (finding 8908d9699820): one a command planted in its
+    /// working directory, the package's place found from `__file__`, or one written to a temporary file's
+    /// directory, even with that directory on sys.path.
+    #[test]
+    fn a_module_the_code_planted_is_never_imported_here() {
+        let Some(python) = python() else { return };
+        let stats = "import sys\n\ndef plant(directory, name):\n    open(directory + '/' + name + '.py', 'w')\\\n\
+                     \x20       .write('import os\\nos.environ[\"PLANTED\"] = \"1\"\\n')\n    return 0\n\n\
+                     if __name__ == '__main__':\n    plant('.', sys.argv[1])\n";
+        let test = "import os, subprocess, sys, tempfile, unittest\nfrom pathlib import Path\nimport tiny\n\
+                    from tiny.stats import plant\n\n\
+                    class T(unittest.TestCase):\n\
+                    \x20   def test_from_a_command_in_the_packages_place(self):\n\
+                    \x20       root = str(Path(tiny.__file__).resolve().parent.parent)\n\
+                    \x20       subprocess.run([sys.executable, '-m', 'tiny.stats', 'planted_a'], cwd=root, capture_output=True)\n\
+                    \x20       self.assertTrue(os.path.exists(os.path.join(root, 'planted_a.py')))\n\
+                    \x20       sys.path.insert(0, root)\n        with self.assertRaises(ImportError):\n\
+                    \x20           import planted_a\n        self.assertNotIn('PLANTED', os.environ)\n\
+                    \x20   def test_from_a_call_in_a_temporary_directory(self):\n\
+                    \x20       d = tempfile.mkdtemp()\n        plant(d, 'planted_b')\n\
+                    \x20       self.assertTrue(os.path.exists(os.path.join(d, 'planted_b.py')))\n\
+                    \x20       sys.path.insert(0, d)\n        with self.assertRaises(ImportError):\n\
+                    \x20           import planted_b\n        self.assertNotIn('PLANTED', os.environ)\n";
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 30}));
+        assert_eq!(g.counts, Counts { pass: 2, ..Counts::default() }, "{:#?}", g.diagnosis);
+    }
+
+    /// An error outside any test is described for `--diagnose` alone (task `6a80d88373a5`): its class, message
+    /// and frames, a hidden test's by its path under `tests/`; never in a grade.
+    #[test]
+    fn an_error_outside_any_test_is_described_for_diagnose_alone() {
+        let Some(python) = python() else { return };
+        let groups = json!([
+            {"item": "mean-empty", "file": "tests/test_import.py", "applies": "always"},
+            {"item": "mean-empty", "file": "tests/test_fixture.py", "applies": "always"},
+        ]);
+        let s = setup(
+            groups,
+            &[
+                ("helper.py", "def f():\n    return 1\n"),
+                ("test_import.py", "import unittest\nfrom helper import g\n"),
+                (
+                    "test_fixture.py",
+                    "import unittest\n\nclass A(unittest.TestCase):\n    @classmethod\n    def setUpClass(cls):\n\
+                     \x20       raise RuntimeError('no fixture')\n    def test_a(self):\n        pass\n",
+                ),
+            ],
+        );
+        let g = grade(&python, &s.project, &s.set, Tree::Hidden("golden"), 1.0).expect("graded");
+        let [import, fixture] = [&g.groups[0].diagnosis, &g.groups[1].diagnosis];
+        assert_eq!(import.len(), 1, "{g:#?}");
+        assert_eq!(import[0]["class"], "builtins.ImportError");
+        assert!(import[0]["message"].as_str().is_some_and(|m| m.contains("'g'")), "{import:?}");
+        assert_eq!(import[0].get("test"), None, "outside any test");
+        let frames = import[0]["frames"].as_array().expect("frames");
+        assert_eq!(frames.last().map(|f| (&f[0], &f[1])), Some((&json!("tests/test_import.py"), &json!(2))));
+        assert_eq!(fixture.len(), 1, "{g:#?}");
+        assert_eq!(
+            (&fixture[0]["class"], &fixture[0]["message"]),
+            (&json!("builtins.RuntimeError"), &json!("no fixture"))
+        );
+        let shown = serde_json::to_string(&g).expect("serialized");
+        assert!(!shown.contains("no fixture") && !shown.contains("diagnosis"), "{shown}");
     }
 
     /// A tree, and one group of `tests` judging `mean-empty`, graded at the end with the project's `limits`.
@@ -325,7 +1029,8 @@ mod macos_only {
                     \x20       with self.assertRaises(Exception) as cm:\n            all(map(stats.valid, [1, 2]))\n\
                     \x20       self.assertNotIsInstance(cm.exception, StopIteration)\n\
                     \x20   def test_a_list_subclass_is_its_items(self):\n        self.assertNotIn(2, stats.items())\n\
-                    \x20       self.assertEqual(stats.items(), [1])\n\
+                    \x20       self.assertEqual(list(stats.items()), [1])\n\
+                    \x20       with self.assertRaises(TypeError):\n            stats.items() == [1]\n\
                     \x20   def test_no_class_of_unittest_through_another_module(self):\n\
                     \x20       with self.assertRaises(Exception) as cm:\n            stats.stop()\n\
                     \x20       self.assertFalse(issubclass(type(cm.exception), unittest.case._ShouldStop))\n\

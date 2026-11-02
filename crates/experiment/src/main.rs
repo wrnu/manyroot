@@ -206,6 +206,10 @@ enum Cmd {
         /// The bracken binary that checks trees out of the run's hub; defaults to the one next to this executable.
         #[arg(long)]
         bracken: Option<PathBuf>,
+        /// The manager's alone: a new file for each error outside any test and each test's error or failure, its
+        /// class, message and frames, never written anywhere else.
+        #[arg(long)]
+        diagnose: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -317,10 +321,12 @@ fn main() {
         Cmd::Project(ProjectCmd::Check { dir, hidden, json }) => project_check(&dir, hidden.as_deref(), json),
         Cmd::Project(cmd @ ProjectCmd::Grade { .. }) => project_grade(cmd),
         Cmd::RunTests { project, tree, python, json } => run_tests(&project, tree.as_deref(), &python, json),
-        Cmd::GradeRun { dir, hidden, grades, bracken, json } => std::env::current_exe()
+        Cmd::GradeRun { dir, hidden, grades, bracken, diagnose, json } => std::env::current_exe()
             .map_err(|e| e.to_string())
             .map(|me| bracken.unwrap_or_else(|| me.with_file_name("bracken")))
-            .and_then(|bracken| bracken_experiment::grade_run::grade_run(&dir, &hidden, &grades, &bracken))
+            .and_then(|bracken| {
+                bracken_experiment::grade_run::grade_run(&dir, &hidden, &grades, &bracken, diagnose.as_deref())
+            })
             .map(|s| {
                 if json {
                     println!("{}", serde_json::to_string(&s).expect("a summary is plain JSON"));
@@ -697,16 +703,21 @@ enum ProjectCmd {
         /// The share of the run's agent-turns used: the groups that apply then. The end by default.
         #[arg(long, default_value_t = 1.0)]
         share: f64,
+        /// The manager's alone: a new file for each error outside any test and each test's error or failure, its
+        /// class, message and frames, never written anywhere else.
+        #[arg(long)]
+        diagnose: Option<PathBuf>,
         #[arg(long)]
         json: bool,
     },
 }
 
 fn project_grade(cmd: ProjectCmd) -> Result<(), String> {
+    use bracken_experiment::grade_run::Diagnosis;
     use bracken_experiment::project::{HiddenSet, Project};
     use bracken_experiment::project_grader::{Grade, Tree, golden_check, grade};
     use bracken_experiment::python::Python;
-    let ProjectCmd::Grade { dir, hidden, python, tree, golden, share, json } = cmd else {
+    let ProjectCmd::Grade { dir, hidden, python, tree, golden, share, diagnose, json } = cmd else {
         unreachable!("only Grade is passed here")
     };
     if !(0.0..=1.0).contains(&share) {
@@ -715,6 +726,11 @@ fn project_grade(cmd: ProjectCmd) -> Result<(), String> {
     let project = Project::load(&dir)?;
     let set = HiddenSet::open(&project, &hidden)?;
     let python = Python::pin(&python, &project.python)?;
+    let mut inside = vec![("the project", project.dir.as_path()), ("the private store", hidden.as_path())];
+    if let Some(tree) = &tree {
+        inside.push(("the tree", tree.as_path()));
+    }
+    let mut diagnosis = diagnose.as_deref().map(|d| Diagnosis::create(d, &inside)).transpose()?;
     let lines = |name: &str, g: &Grade| {
         println!("{name} at share {}: {}", g.share, if g.all_pass() { "all pass" } else { "not all pass" });
         for i in &g.items {
@@ -726,6 +742,12 @@ fn project_grade(cmd: ProjectCmd) -> Result<(), String> {
     };
     if golden {
         let check = golden_check(&python, &project, &set)?;
+        if let Some(d) = diagnosis.as_mut() {
+            d.write(&serde_json::json!("golden"), &check.after)?;
+            if let Some(before) = &check.before {
+                d.write(&serde_json::json!("golden-before"), before)?;
+            }
+        }
         if json {
             println!("{}", serde_json::json!({"passed": check.passed(), "check": check, "python": python.plan_pin()}));
         } else {
@@ -739,6 +761,9 @@ fn project_grade(cmd: ProjectCmd) -> Result<(), String> {
     }
     let tree = tree.expect("the parser requires --tree without --golden");
     let g = grade(&python, &project, &set, Tree::Dir(&tree), share)?;
+    if let Some(d) = diagnosis.as_mut() {
+        d.write(&serde_json::json!("tree"), &g)?;
+    }
     if json {
         println!("{}", serde_json::json!({"grade": g, "python": python.plan_pin()}));
     } else {

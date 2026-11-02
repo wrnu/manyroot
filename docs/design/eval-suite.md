@@ -297,6 +297,12 @@ output. It is feedback for the agent, not a grade: the tests share the
 container with the code under test. `bracken-experiment run-tests --project
 <dir> [--tree <dir>] --python <image>` runs it, on the seed by default.
 
+**Not defended (finding `a1e72cb9c89d`, deferred to task `6202d01435a9`):**
+the grader's server is the code's own process, so the code can reach the
+server's sealed names through frames or `gc`, or replace builtins it uses;
+since no object of the code is compared (decision `d1fc04a4f896`), that can
+forge only a plain value the server reports, as any of its answers could.
+
 A run's plan records the image, by digest, and its Python's version
 (`python`), and every run of agent code pins it from there again, refused
 if the image isn't here by that digest or its version has changed
@@ -363,17 +369,101 @@ message. The tests and the code under test never share a process:
   do checks of the class's name (answer `c473d137f5b7`, finding
   `621c185d3e6f`). Never as themselves: `StopIteration`,
   `StopAsyncIteration` and anything of `unittest`, which would stop the
-  host's iterator or skip a test (finding `d077f100ac33`).
+  host's iterator or skip a test (finding `d077f100ac33`). The exception
+  keeps its own attributes that are plain data or the package's objects,
+  such as a parse error's line (task `6a80d88373a5`).
+- **Operators and equality:** the code's own operators never answer a
+  test's check of a value (finding `c823af485f19`). Arithmetic, reflected
+  and unary operators on the code's objects are done by the code, and their
+  result stays the code's, a proxy, even when it is a number there: so
+  `assertAlmostEqual`, whose `round` of a proxy raises, can't be forged by a
+  `__sub__` that says 0. Ordering a proxy raises, against anything.
+  `float()`, `int()`, `round()` and `math`'s functions on
+  a proxy raise, and its truth is Python's own (true) unless its class
+  defines `__bool__` or `__len__`, when asking it raises: a test checks the
+  plain values the code returns, such as an attribute's or a method's.
+  **Only plain values are compared** (decision `d1fc04a4f896`, superseding
+  `4990ee876e00`'s dataclass and named-tuple rule; findings `70e0656020fd`,
+  `4df9d8089543`, `56250a88505b`). Every fact about one of the code's
+  objects comes from the code's own process, so every structural rule could
+  be lied to: the host compares only values of exactly the plain types, int,
+  float, complex, bool, None, str, bytes, `Decimal`, `Fraction`, date, time,
+  datetime and timedelta, and list, tuple, dict, set and frozenset of those,
+  each type checked by identity (a subclass, of int or str too, is never
+  plain). Such a value the code gives back, an attribute's, a method's,
+  `str()`'s or `repr()`'s, comes to the host as data, and is compared there.
+  Anything else stays the code's, a proxy, and equality, ordering or
+  hashing with one raises in the test, never answering: against another of
+  the code's objects, itself, or a plain value, or inside a plain
+  container. A builtin type is known by identity alone, among Python's own
+  types taken before any of the code is imported, never by `in`, a hash or
+  `==`, nor by a class's `__module__` (findings `98fb18bf3e9c`,
+  `a2c5943deae7`). The server's functions run over a copy of its names, and
+  of Python's builtins, taken then too, so code that rebinds one, such as
+  `state` or `type`, changes nothing (finding `0b5b233009ef`).
+  **The rule for a project's hidden tests:** compare attributes, return
+  values or `str()`, never the code's objects: `assertEqual(entry.amount,
+  Decimal("5"))`, not `assertEqual(entry, Entry(5))`. A hidden test that
+  compares objects errors, even for a correct solution: the cost the owner
+  accepted.
+- **Introspection:** an object's `__module__`, `__name__`, `__qualname__`
+  and `__doc__`, and `dir()` of it or of a module of the package, are the
+  code's; `importlib.util.find_spec` finds a module of the package only if
+  the tree has it. A mirrored exception's `str()` is the code's, and its
+  fields come with it: its own, a slot's, a dataclass field's and those its
+  classes declare or default (task `6a80d88373a5`). An exception a test
+  makes of the code's class is made by the class's own `__init__` on the
+  server and takes its arguments, attributes and `str()` from there. A
+  submodule imported in the test is never bound on its package here, so a
+  package attribute of the same name, such as a function its `__init__`
+  imported from it, is the package's own, as in Python.
+- **A text stream:** an `io.StringIO` given to the code, or standard output
+  or error redirected to one around a call, is given as one of the
+  server's holding the same text, and holds what the code wrote there once
+  the call returns or raises; so a command line's in-process
+  `main(argv, out=io.StringIO())` is tested as it would be run (task
+  `6a80d88373a5`).
+- **A path in a call:** a string or path-like argument that is an absolute
+  path inside the host's own directory or its temporary one (in the
+  profile, the same scratch directory), such as a temporary file's in an
+  argv list, and not the tests' or one holding them, is given as one in a
+  fresh directory of the server's, as a command's are; what the code wrote
+  there goes back after the call, and the reply names the test's own path
+  wherever it names the server's (task `6a80d88373a5`). Any other path,
+  such as the store's, goes as a plain string, which the server's sandbox
+  can't read. The host's temporary directory is one of its own, holding no
+  test, so what the code writes to a test's `mkstemp` or
+  `NamedTemporaryFile` comes back (finding `8221427759ca`). And the host
+  never imports a module from its own directory, where everything the code
+  can write lands, so no module the code planted runs there, whatever a
+  test puts on `sys.path` (finding `8908d9699820`).
 - **A command:** a test's `subprocess` runs only `python -m <package> ...`
-  (`sys.executable` or a `python`), and not in the host. The grader runs it in
+  (`sys.executable` or a `python`, with harmless interpreter flags such as
+  `-B`, `-I` or `-E` before `-m`; its environment is ignored, so nothing
+  such as `PYTHONPATH` changes what runs), and not in the host. The grader runs it in
   a fresh child under the profile, with the tree, the working directory's
   files (at most 32 MiB) and the input, and gives back its exit code, its
   output and the working directory's files after it. A command's working
-  directory is the host's empty one unless the test gives another, never
-  the tests' directory or one holding it, and the files it gives back are
-  written only inside it, through no symlink (findings `7f3dc66a8589`,
-  `f13d1ff05b5f`). So agent code never runs in the host's process and never
-  sees a hidden file (note `9891289fb39c`).
+  directory is the host's empty one unless the test gives another, and the
+  files it gives back are written only inside it, through no symlink
+  (findings `7f3dc66a8589`, `f13d1ff05b5f`). One that is the tests'
+  directory or holds it, as a helper's project root from `__file__` does,
+  is given as an empty one, and nothing written there is kept. An argument
+  that is an absolute path outside the tests, such as a temporary file's,
+  is given inside the command's directory (a file's bytes, or a
+  directory's files) and named so there; what the command writes there
+  goes back to that path's directory, and the output says the test's own
+  path again (task `6a80d88373a5`). So agent code never runs in the host's
+  process and never sees a hidden file (note `9891289fb39c`).
+- **The tests' own imports:** the hidden tests' directory is on the host's
+  path, and is the package `tests` too: a group's file is the module
+  `tests.<its path>`, so helpers beside the tests import by name, as
+  `tests.<helper>` or relatively (task `6a80d88373a5`). A module of the
+  package has a `__file__`, and a package its `__path__`: their places in
+  the tree, as the server says them relative to it, in the host's own copy
+  of the tree's layout, which holds its directories and no file. So a
+  helper that finds the project from `ledger.__file__` gets a directory of
+  its own, never the tree's real one or one holding the tests.
 - **Limits:** the server and each command have the project's. The host has
   four times its CPU and wall time, 1 GiB and 16 MiB of output: it runs a
   whole file, waiting on each call. The host reports the number of tests,
@@ -395,9 +485,23 @@ must pass (answer `c473d137f5b7`). Both must, before a project's hidden set is
 approved.
 
 `bracken-experiment project grade <dir> --hidden <store> --python <image>
-(--tree <dir> [--share <s>] | --golden)
-[--json]` grades a tree, or runs the approval check. It prints counts per
-item only.
+(--tree <dir> [--share <s>] | --golden) [--diagnose <file>] [--json]`
+grades a tree, or runs the approval check. It prints counts per item only.
+`--diagnose`, the manager's alone, writes to a new file, outside the
+project, the store, any Ground and any checkout, one line per group with an
+error outside any test (one that kept its tests from running, such as an
+import's or a class fixture's) or a test that erred or failed: the
+exception's class, message and frames, file:line, a hidden test's by its
+path under `tests/`, and a test's index. It is agents' text, so its first
+line says so, and each message is cut to 300 characters, a class to 100, a
+frame's file and function to 200, with every character of Unicode's
+categories Cc, Cf, Co, Cs, Cn, Zl and Zp (the tag characters included), and
+the invisible ones of other categories (variation selectors, the combining
+grapheme joiner, the Hangul and Braille blanks, and any whose name says
+BLANK or FILLER), shown as an escape by the host's tables (findings
+`052914fb0445`, `7df26ede5a8b`), and at most 50 errors of a group with the
+count of all (finding `9c10a74d8c2a`). Nothing else ever holds it: not the
+output, nor a grade (task `6a80d88373a5`).
 
 ## Running a project
 
@@ -467,8 +571,8 @@ the same way, runs a project's agents through **Weave mode**
   (finding `01e0ce2648ad`); so do snapshots and the final `integrated`
   event.
 - **Grading:** `bracken-experiment grade-run --dir <run> --hidden <store>
-  --grades <file> [--bracken <path>] [--json]` grades each checkpoint's
-  tree, and the line at the end as `end`, with the hidden set
+  --grades <file> [--bracken <path>] [--diagnose <file>] [--json]` grades
+  each checkpoint's tree, and the line at the end as `end`, with the hidden set
   (`src/grade_run.rs`), checking each out of the run's hub by the manifest
   id its event names (on a forked line, the first head's, and the grade says
   it was forked). It takes the project and the image from the plan,

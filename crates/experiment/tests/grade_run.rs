@@ -303,7 +303,28 @@ mod macos_only {
             .collect();
         std::fs::write(&events, lines.join("\n") + "\n").expect("the events");
         let bad = root.join("grades/bad.jsonl");
-        let summary = bracken_experiment::grade_run::grade_run(&cfg.root, &store, &bad, &bracken()).expect("graded");
+        let inside = cfg.root.join("diagnosis.jsonl");
+        let refused = bracken_experiment::grade_run::grade_run(&cfg.root, &store, &bad, &bracken(), Some(&inside));
+        assert!(refused.is_err_and(|e| e.contains("--diagnose") && e.contains("inside the run")));
+        assert!(!inside.exists() && !bad.exists());
+        let diagnosis = root.join("diagnosis.jsonl");
+        let summary = bracken_experiment::grade_run::grade_run(&cfg.root, &store, &bad, &bracken(), Some(&diagnosis))
+            .expect("graded");
+        // The mock's trees fail some tests: each is described with its index, by the point it was graded at,
+        // and no error was outside any test. The grades file says nothing of it.
+        let described: Vec<Value> = std::fs::read_to_string(&diagnosis)
+            .expect("the diagnosis")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("JSON"))
+            .collect();
+        assert!(described[0]["note"].as_str().is_some_and(|n| n.contains("untrusted")), "{}", described[0]);
+        for d in &described[1..] {
+            assert!(d["at"]["manifest"].is_string() && d["group"].is_u64(), "{d}");
+            let errors = d["errors"].as_array().expect("errors");
+            assert!(!errors.is_empty() && errors.iter().all(|e| e["test"].is_u64() && e["class"].is_string()), "{d}");
+        }
+        let grades_text = std::fs::read_to_string(&bad).expect("the grades");
+        assert!(!grades_text.contains("frames") && !grades_text.contains("AssertionError"), "{grades_text}");
         assert_eq!((summary.points, summary.errors), (4, 1), "{summary:?}");
         let lines: Vec<Value> = std::fs::read_to_string(&bad)
             .expect("the grades")
@@ -340,7 +361,8 @@ mod macos_only {
         assert!(plan["prompts"].get("item-decimals").is_none(), "{plan}");
 
         let grades = root.join("held.jsonl");
-        let summary = bracken_experiment::grade_run::grade_run(&cfg.root, &store, &grades, &bracken()).expect("graded");
+        let summary =
+            bracken_experiment::grade_run::grade_run(&cfg.root, &store, &grades, &bracken(), None).expect("graded");
         assert_eq!(summary.points, 3);
         let text = std::fs::read_to_string(&grades).expect("the grades");
         for l in text.lines() {
