@@ -1104,6 +1104,205 @@ class Restart(unittest.TestCase):
         assert_eq!(g.outcomes, [Outcome::Error, Outcome::Pass, Outcome::Pass, Outcome::Pass], "{:#?}", g.diagnosis);
     }
 
+    /// Two classes one function made, under one module and qualname, carry across a restart by the attributes the
+    /// test file bound them by (finding 9ed85ad61c06), not by which the server sends first after it (finding
+    /// 30eb693032b7): after the crash B comes first, and is still B, and A is still A. Before it, each catches only
+    /// its own.
+    #[test]
+    fn classes_under_one_name_carry_by_the_attributes_they_are_bound_to() {
+        let Some(python) = python() else { return };
+        let stats = r#"import os
+
+def _make():
+    class Local(Exception):
+        pass
+    return Local
+
+A = _make()
+B = _make()
+
+def crash():
+    os.abort()
+
+def raise_a():
+    raise A('a')
+
+def raise_b():
+    raise B('b')
+"#;
+        let test = r#"import unittest
+from tiny.stats import A, B, crash, raise_a, raise_b
+
+class Restart(unittest.TestCase):
+    def test_a_each_catches_its_own(self):
+        self.assertIsNot(A, B)
+        with self.assertRaises(A):
+            raise_a()
+        with self.assertRaises(B):
+            raise_b()
+
+    def test_b_a_crash(self):
+        crash()
+
+    def test_c_b_after_it(self):
+        try:
+            raise_b()
+        except A:
+            self.fail('B caught as A')
+        except B:
+            pass
+
+    def test_d_a_after_it(self):
+        try:
+            raise_a()
+        except B:
+            self.fail('A caught as B')
+        except A:
+            pass
+"#;
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 60}));
+        assert_eq!(g.outcomes, [Outcome::Pass, Outcome::Error, Outcome::Pass, Outcome::Pass], "{:#?}", g.diagnosis);
+    }
+
+    /// A class bound again by a module imported later still carries across a restart (finding b8aa42f090fd): sent
+    /// first, before `tiny.api` is imported, it is bound only as `tiny.stats.E`; after the crash the server first
+    /// reaches it through `tiny.api`, bound in both, and the host finds it again by the name it already knows. One
+    /// made in a function and one made by a factory in another module.
+    #[test]
+    fn a_class_bound_again_by_a_module_imported_later_carries_across_a_restart() {
+        let Some(python) = python() else { return };
+        let stats = r#"import os
+from tiny import factory
+
+def _make():
+    class E(Exception):
+        pass
+    return E
+
+E = _make()
+Made = factory.make('Made')
+
+def crash():
+    os.abort()
+"#;
+        let api = "from tiny.stats import E, Made\n\ndef raise_e():\n    raise E('e')\n\n\
+                   def raise_made():\n    raise Made('made')\n";
+        let factory = "def make(name):\n    return type(name, (Exception,), {})\n";
+        let test = r#"import unittest
+from tiny.stats import E, Made, crash
+from tiny.api import raise_e, raise_made
+
+class Later(unittest.TestCase):
+    def test_a_before_it(self):
+        with self.assertRaises(E):
+            raise_e()
+        with self.assertRaises(Made):
+            raise_made()
+
+    def test_b_a_crash(self):
+        crash()
+
+    def test_c_after_it(self):
+        with self.assertRaises(E):
+            raise_e()
+        with self.assertRaises(Made):
+            raise_made()
+"#;
+        let files = [("tiny/stats.py", stats), ("tiny/api.py", api), ("tiny/factory.py", factory)];
+        let g = graded_with(&python, &files, test, &json!({"cpu_seconds": 5, "wall_seconds": 60}), 0);
+        assert_eq!(g.outcomes, [Outcome::Pass, Outcome::Error, Outcome::Pass], "{:#?}", g.diagnosis);
+    }
+
+    /// An attribute rebound at run time from one class to another never gives one the other's class after a restart
+    /// (findings 64056ff2e17d, d2521ba519d5): `Default` is `Loose` when first sent, `Strict` after `use_strict()`;
+    /// `Active` is `A`, then `B` after `use_b()`. A carried name's class is taken only for a class of its module and
+    /// qualname, so each still catches its own, as on main.
+    #[test]
+    fn a_rebound_attribute_never_gives_one_class_anothers() {
+        let Some(python) = python() else { return };
+        let stats = r#"import os
+
+def _loose():
+    class Loose(Exception):
+        pass
+    return Loose
+
+def _strict():
+    class Strict(Exception):
+        pass
+    return Strict
+
+def _make_a():
+    class E(Exception):
+        pass
+    return E
+
+def _make_b():
+    class E(Exception):
+        pass
+    return E
+
+Loose = _loose()
+Strict = _strict()
+Default = Loose
+A = _make_a()
+B = _make_b()
+Active = A
+
+def use_strict():
+    global Default
+    Default = Strict
+
+def use_b():
+    global Active
+    Active = B
+
+def fail():
+    raise Default('x')
+
+def raise_a():
+    raise A('a')
+
+def raise_b():
+    raise B('b')
+
+def crash():
+    os.abort()
+"#;
+        let test = r#"import unittest
+from tiny.stats import A, B, Loose, Strict, crash, fail, raise_a, raise_b, use_b, use_strict
+
+class Rebound(unittest.TestCase):
+    def test_a_before_it(self):
+        with self.assertRaises(Loose):
+            fail()
+        with self.assertRaises(A):
+            raise_a()
+        with self.assertRaises(B):
+            raise_b()
+
+    def test_b_a_crash(self):
+        crash()
+
+    def test_c_strict_after_it(self):
+        use_strict()
+        with self.assertRaises(Strict):
+            fail()
+
+    def test_d_b_after_it(self):
+        use_b()
+        with self.assertRaises(B):
+            raise_b()
+
+    def test_e_a_after_it(self):
+        with self.assertRaises(A):
+            raise_a()
+"#;
+        let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 60}));
+        use Outcome::*;
+        assert_eq!(g.outcomes, [Pass, Error, Pass, Pass, Pass], "{:#?}", g.diagnosis);
+    }
+
     /// No module the code wrote is ever imported here (finding 8908d9699820): one a command planted in its
     /// working directory, the package's place found from `__file__`, or one written to a temporary file's
     /// directory, even with that directory on sys.path.

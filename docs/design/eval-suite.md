@@ -372,22 +372,30 @@ message. The tests and the code under test never share a process:
   its module and name give in the server, and the first sent under that
   name; any other gets a class of its own, never Python's of that name nor
   another of the code's (decision `0f7f0b4b048b`): one class for the
-  server's life, however often it comes, and the first such under its module
-  and name carries across a restart by them, as a named class does (finding
-  `90ae40b8ad52`). A class of Python's own, builtin or of the standard
-  library, is raised as itself, but strictly: only from a module the host
-  has already loaded, the name walked through classes only, and only a class
-  whose own module and name are the ones claimed (finding `d1f7d7880644`).
-  One whose constructor takes other arguments, such as
-  `json.JSONDecodeError`, is made with the message as its arguments (finding
-  `ed723694b473`). So `assertRaises` with the package's class or one of its
-  bases, a builtin or a standard library class works, and so do checks of
-  the class's name (answer `c473d137f5b7`, finding `621c185d3e6f`). Never as
-  themselves: `StopIteration`, `StopAsyncIteration` and anything of
-  `unittest`, which would stop the host's iterator or skip a test (finding
-  `d077f100ac33`). The exception keeps its own attributes that are plain
-  data or the package's objects, such as a parse error's line (task
-  `6a80d88373a5`).
+  server's life, however often it comes, and it carries names across a
+  restart, as a named class does its own (findings `90ae40b8ad52`,
+  `9ed85ad61c06`, `b8aa42f090fd`). They are taken when the server first
+  sends it, and fixed for that server's life: each attribute of the
+  package's modules, of exactly the module type, bound to it then, such as
+  `tiny.stats.A`, except one another object was sent under first; and its
+  module and name, if it is the first such class sent under them. The host
+  keeps its class under all of them, and after a restart gives it the class
+  of the first of the names it then carries that the host already knows for
+  a class of the same module and name, unless another class of the new
+  server already has that class (findings `d2521ba519d5`, `64056ff2e17d`). A
+  class of Python's own, builtin or of the standard library, is raised as
+  itself, but strictly: only from a module the host has already loaded, the
+  name walked through classes only, and only a class whose own module and
+  name are the ones claimed (finding `d1f7d7880644`). One whose constructor
+  takes other arguments, such as `json.JSONDecodeError`, is made with the
+  message as its arguments (finding `ed723694b473`). So `assertRaises` with
+  the package's class or one of its bases, a builtin or a standard library
+  class works, and so do checks of the class's name (answer `c473d137f5b7`,
+  finding `621c185d3e6f`). Never as themselves: `StopIteration`,
+  `StopAsyncIteration` and anything of `unittest`, which would stop the
+  host's iterator or skip a test (finding `d077f100ac33`). The exception
+  keeps its own attributes that are plain data or the package's objects,
+  such as a parse error's line (task `6a80d88373a5`).
 - **Operators and equality:** the code's own operators never answer a
   test's check of a value (finding `c823af485f19`). Arithmetic, reflected
   and unary operators on the code's objects are done by the code, and their
@@ -431,25 +439,48 @@ message. The tests and the code under test never share a process:
   server, with two residuals. A name carries across a server's restart, as a
   test file binds the code's classes when it imports them, so code that ends
   its own server between two fetches can have two objects, one in each
-  generation, match as one. Of several classes under one module and
-  qualified name, such as two a function made by being called twice, only
-  the first sent in a generation carries: after a restart the first of them
-  sent then is that class, whichever object it is, so a test's class of one
-  may catch another, or not catch its own (finding `30eb693032b7`). Nothing
-  can carry them better: a new server can't tell which of its objects an
-  earlier one sent, nor sends them in the same order, which follows the
-  test's calls. A correct solution meets this only when it makes two classes
-  under one name and a test crosses a crash with them. And the server is the
-  code's own process: code that rewrites the server's state, such as its
-  record of names (`__main__`'s), can send any object under any name, as it
-  could forge any plain value the server reports (finding `899e1616f407`;
-  "Not defended" above). A builtin type is known by identity alone, among
-  Python's own types taken before any of the code is imported, never by
-  `in`, a hash or `==`, nor by a class's `__module__` (findings
-  `98fb18bf3e9c`, `a2c5943deae7`). The server's functions run over a copy of
-  its names, and of Python's builtins, taken then too, so code that rebinds
-  one, such as `is_builtin` or `type`, changes nothing (finding
-  `0b5b233009ef`).
+  generation, match as one. So a class its name doesn't give keeps its class
+  across a restart when, of the names it carries after it, taken in order
+  (its attributes in order, then its module and name), the first the host
+  knows for a class of its module and qualified name that no other class of
+  the new server has taken is one its own class was kept under before. When
+  there is none, it gets a new class. When that first is another's, such as
+  an attribute moved to it from another class of its module and qualified
+  name, it gets that one's class, though a later name of its is its own. For
+  example, of two classes under one module and qualified name, such as two a
+  function made by being called twice, that no module attribute held when
+  they were first sent, only the first sent before the restart carried that
+  name, and whichever is sent first after it takes that class, so a test's
+  class of one may catch another, or not catch its own (finding
+  `30eb693032b7`). Carrying them by the order first sent wouldn't help: a
+  new server sends them in the order the test's calls reach them. A correct
+  solution meets this only when two of its classes share a module and
+  qualified name, such as two one function made, and a test crosses a crash
+  with them: a class with a module and qualified name of its own is the
+  first sent under them in every server, so it always carries them, and only
+  a class of the same ones can take its class. In that case this can do
+  worse than keeping such classes by module and qualified name alone, as the
+  grader did before (findings `0982c542c2ae`, `5ad67192f117`; note
+  `fef96243f1aa`). With `X = _make()`, `Y = _make()` and `Current = Y`, a
+  test that binds both, crosses a crash, then calls `use_x()`, which sets
+  `Current = X`, and raises `X`, gets `Y`'s class for `X`, since
+  `tiny.stats.Current` comes before `tiny.stats.X`, and its
+  `assertRaises(X)` fails. Keeping by module and qualified name alone, `X`,
+  the first sent under them on both sides of the restart, would have kept
+  its own. It does better than that rule only when such classes are bound to
+  module attributes, as finding `30eb693032b7`'s `A` and `B` were, where
+  keeping by module and qualified name gives one class the other's. In the
+  example above, of classes no module attribute held, it does just what that
+  rule does. And the server is the code's own process: code that rewrites
+  the server's state, such as its record of names (`__main__`'s), can send
+  any object under any name, as it could forge any plain value the server
+  reports (finding `899e1616f407`; "Not defended" above). A builtin type is
+  known by identity alone, among Python's own types taken before any of the
+  code is imported, never by `in`, a hash or `==`, nor by a class's
+  `__module__` (findings `98fb18bf3e9c`, `a2c5943deae7`). The server's
+  functions run over a copy of its names, and of Python's builtins, taken
+  then too, so code that rebinds one, such as `is_builtin` or `type`,
+  changes nothing (finding `0b5b233009ef`).
   **The rule for a project's hidden tests:** compare attributes, return
   values or `str()`, never the code's objects: `assertEqual(entry.amount,
   Decimal("5"))`, not `assertEqual(entry, Entry(5))`. A hidden test that

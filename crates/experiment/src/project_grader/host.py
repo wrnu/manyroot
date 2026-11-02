@@ -140,6 +140,10 @@ NEVER = (StopIteration, StopAsyncIteration, unittest.SkipTest)
 # Modules whose classes are never taken for real ones, though of the standard library.
 NOT_REAL = {"unittest", "__main__", "importlib", "sys"}
 classes = {}
+# Which of the code's classes, by its server's generation and handle, each class here stands for in that
+# generation, by the class's id: one only, so two of one server's classes never meet in one here by the names they
+# carried across a restart.
+claimed = {}
 
 
 def real_class(module, qualname):
@@ -174,11 +178,13 @@ def exception_class(described, depth=0):
     """The class standing here for the code's class `described`, [module, qualname, [bases described], own]: one
     for each name, with the mirrors of its bases as its own. A class the server sent with `own`, its generation
     and handle, isn't the object its name gives there, or another was sent under that name first: it gets a class
-    of its own, never Python's of that name nor another of the code's (decision 0f7f0b4b048b). The first such class
-    the server sent under its module and qualname is kept by them, apart from the named ones, so a test's class of
-    it still catches it after a restart (finding 90ae40b8ad52); any later one by its generation and handle. Of
-    several under one module and qualname, the first sent after a restart takes that class, whichever it is
-    (finding 30eb693032b7, eval-suite.md's restart residual)."""
+    of its own, never Python's of that name nor another of the code's (decision 0f7f0b4b048b), kept by its
+    generation and handle and by each name the server says it carries across a restart, apart from the named
+    ones: the attributes of the package's modules bound to it, and its module and qualname if it was the first such
+    sent under them. After a restart one is found again by the first of its names already known here for a class
+    of its module and qualname that no other of the new server's classes has, so a test's class of it still
+    catches it (findings 90ae40b8ad52, 9ed85ad61c06, b8aa42f090fd, 64056ff2e17d); eval-suite.md's restart residual
+    says when that fails (finding 30eb693032b7)."""
     if depth > 64:
         raise GraderError("a class nested too deeply")
     module, qualname, bases = str(described[0]), str(described[1]), described[2]
@@ -188,10 +194,19 @@ def exception_class(described, depth=0):
         if real is not None:
             return real
         key = (module, qualname)
-    elif len(own) > 2 and own[2] is True:
-        key = ("unnamed", module, qualname)
     else:
         key = ("own", int(own[0]), int(own[1]))
+        carried = own[2] if len(own) > 2 and type(own[2]) is list else []
+        names = [("unnamed",) + tuple(str(part) for part in n) for n in carried if type(n) is list]
+        if key not in classes:
+            for n in names:
+                # Only a class of the same module and qualname: a name rebound from one class to another between
+                # restarts never gives one the other's (findings d2521ba519d5, 64056ff2e17d).
+                found = classes.get(n)
+                if (found is not None and (found.__module__, found.__qualname__) == (module, qualname)
+                        and claimed.get((key[1], id(found)), key[2]) == key[2]):
+                    classes[key] = found
+                    break
     if key not in classes:
         mirrored = []
         for base in bases:
@@ -208,6 +223,10 @@ def exception_class(described, depth=0):
             classes[key] = type(name, tuple(mirrored) or (Exception,), namespace)
         except TypeError:
             classes[key] = type(name, (mirrored[0],), namespace)
+    if own is not None:
+        for n in names:
+            classes.setdefault(n, classes[key])
+        claimed.setdefault((key[1], id(classes[key])), key[2])
     return classes[key]
 
 
