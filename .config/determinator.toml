@@ -28,7 +28,7 @@ mark-changed = []
 globs = ["scripts/code-scope", ".claude/skills/**/code-scope"]
 mark-changed = ["bracken", "bracken-scope"]
 
-# The scripts and skills: their tests are in crates/bracken/tests/scripts.rs.
+# The scripts and skills: their tests are in crates/bracken/tests/scripts/, a module per script.
 [[path-rule]]
 globs = ["scripts/**", ".claude/skills/**"]
 mark-changed = ["bracken"]
