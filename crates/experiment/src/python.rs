@@ -57,6 +57,12 @@ const START_GRACE: Duration = Duration::from_secs(60);
 pub const SCRATCH: &str = "/scratch";
 /// The label each container is given: the pid of the process that started it, for [`sweep`].
 const LABEL: &str = "bracken.python-runner";
+#[cfg(test)]
+thread_local! {
+    /// In tests, the seconds the supervisor waits after its last word before it ends, as a slow container teardown
+    /// would take: for runs started on this thread.
+    static LINGER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 /// The most bytes of one frame from the supervisor: a collected file is the longest.
 const MAX_FRAME: usize = 64 << 20;
 /// The runner [`run_tests`] starts, as it is in this binary.
@@ -433,8 +439,11 @@ struct Shared {
     extra: AtomicU64,
     /// Since when its wall time has stood still, if it has ([`Running::pause`]).
     paused: Mutex<Option<Instant>>,
-    /// The container's CPU time, in microseconds.
+    /// The code's CPU time, in microseconds: the container's, less what its first report said, which is the
+    /// supervisor's start and the inputs' copy (finding 0179ec8bd23a).
     cpu: AtomicU64,
+    /// The container's CPU time in its first report, in microseconds.
+    cpu_base: std::sync::OnceLock<u64>,
     stdout: Mutex<Vec<u8>>,
     stderr: Mutex<Vec<u8>>,
     files: Mutex<Vec<(String, Vec<u8>)>>,
@@ -443,8 +452,8 @@ struct Shared {
     ended: Mutex<Option<Instant>>,
 }
 
-/// The limit a container has passed, if it has passed one: its output; its CPU time in all, as the supervisor
-/// says it, which bounds what forked children use together, as their rlimits bound each alone (finding
+/// The limit a container has passed, if it has passed one: its output; its code's CPU time in all, as the
+/// supervisor says it, which bounds what forked children use together, as their rlimits bound each alone (finding
 /// ee32bfe90b5c), and counts as the CPU limit's `SIGXCPU`; or its wall time from when the code started (or, until
 /// it has, from when the container was asked for, with [`START_GRACE`] more).
 fn over(shared: &Shared, limits: &Limits, spawned: Instant) -> Option<Exit> {
@@ -491,7 +500,13 @@ impl Container {
             .iter()
             .map(|a| a.to_str().ok_or_else(|| format!("an argument that isn't UTF-8: {a:?}")))
             .collect::<Result<_, _>>()?;
-        let spec = serde_json::json!({"argv": argv, "cwd": SCRATCH, "collect": collect}).to_string();
+        #[cfg_attr(not(test), expect(unused_mut, reason = "only tests add to it"))]
+        let mut spec = serde_json::json!({"argv": argv, "cwd": SCRATCH, "collect": collect});
+        #[cfg(test)]
+        {
+            spec["linger"] = LINGER.get().into();
+        }
+        let spec = spec.to_string();
         let source =
             scratch.dir.to_str().filter(|s| !s.contains(',')).ok_or("a scratch directory docker can't mount")?;
         let seed = format!("{:?}{}{}", Instant::now(), std::process::id(), source);
@@ -645,7 +660,8 @@ fn read_frames(from: impl Read, shared: &Shared, cap: usize, lines: Option<std::
             (b'e', _) => keep(&shared.stderr, &payload, cap, &shared.full),
             (b'c', _) => {
                 let usec = std::str::from_utf8(&payload).ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                shared.cpu.store(usec, Ordering::SeqCst);
+                let base = *shared.cpu_base.get_or_init(|| usec);
+                shared.cpu.store(usec.saturating_sub(base), Ordering::SeqCst);
             }
             (b'f', _) => {
                 if let Some(at) = payload.iter().position(|&b| b == 0) {

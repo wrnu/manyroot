@@ -161,6 +161,8 @@ def main():
         collect(os.fsencode(os.path.join(SCRATCH, spec["collect"])))
     frame(b"c", cpu())
     frame(b"x", json.dumps({"status": child.returncode, "scratch": was_full}).encode())
+    # Only tests set it, to stand for a slow teardown after the last word.
+    time.sleep(spec.get("linger", 0))
 
 
 main()
