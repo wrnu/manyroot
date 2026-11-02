@@ -341,12 +341,13 @@ message. The tests and the code under test never share a process:
   when the host imports them, and the host refuses a package whose name
   something else there already answers to (finding `734e5389e188`).
 - **The server** answers them: the code under test, in the same profile, in
-  another scratch directory with the tree. Plain values (numbers, strings,
-  bytes, decimals, dates and times, and lists, tuples, sets and dicts of them)
-  come back as data, decoded and compared by the host; so do subclasses of
-  them but tuple's, as the plain type. Anything else comes back as a handle
-  that equals only itself, and whose `in` the host answers from its items,
-  so the code's own `__eq__` or `__contains__` never answers for a test. A
+  another scratch directory with the tree. Values of exactly the plain
+  types (see "Only plain values are compared" below) come back as data,
+  decoded and compared by the host. Anything else, a subclass of a plain
+  type too, comes back as a handle, a proxy that is never compared, nor
+  hashed, nor ordered, not even with itself: each raises in the test
+  (decision `d1fc04a4f896`). Its `in` the host answers from its items, so
+  the code's own `__eq__` or `__contains__` never answers for a test. A
   server that dies is started again for the next call. Each start is a new
   generation, whose number tags its handles. A handle got as an attribute of
   a module of the package, such as a test file's `from pkg.mod import f`, is
@@ -400,7 +401,7 @@ message. The tests and the code under test never share a process:
   `==`, nor by a class's `__module__` (findings `98fb18bf3e9c`,
   `a2c5943deae7`). The server's functions run over a copy of its names, and
   of Python's builtins, taken then too, so code that rebinds one, such as
-  `state` or `type`, changes nothing (finding `0b5b233009ef`).
+  `is_builtin` or `type`, changes nothing (finding `0b5b233009ef`).
   **The rule for a project's hidden tests:** compare attributes, return
   values or `str()`, never the code's objects: `assertEqual(entry.amount,
   Decimal("5"))`, not `assertEqual(entry, Entry(5))`. A hidden test that

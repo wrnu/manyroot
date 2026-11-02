@@ -2,9 +2,10 @@
 path, and answers the host's requests about the package one JSON line at a time: standard input in, a copy of
 standard output out. The code's own output goes to standard error, and its standard input is /dev/null.
 
-Arguments: the tree, the package, and this server's generation. Every value goes back as data when it is one of
-the plain types below, or a subclass of one but tuple, converted to the plain type; and otherwise as a handle, a
-number standing for the object here, tagged with the generation. So the host compares only data it decoded
+Arguments: the tree, the package, and this server's generation. Every value goes back as data when its type is
+exactly one of the plain types below, checked by identity; and otherwise, a plain type's subclass too, as a
+handle, a number standing for the object here, tagged with the generation, which the host never compares
+(decision d1fc04a4f896). So the host compares only data it decoded
 itself, the code's own __eq__ or __contains__ never answers for it, and a handle from a server that has ended is
 refused by the next one rather than taken for another object (finding fe2549db89ee).
 """
@@ -423,7 +424,7 @@ BUILTIN_TYPES = tuple(
 
 def sealed():
     """The server's own functions, each made again over a copy of its names taken now, before any of the code
-    is imported: so code that rebinds a name of this module, such as `state`, changes nothing the server does
+    is imported: so code that rebinds a name of this module, such as `is_builtin`, changes nothing the server does
     (finding 0b5b233009ef). The modules they use are still the process's, shared with the code."""
     names = dict(globals())
     # And Python's builtins as they are now, so code that replaces one, such as `type` or `str`, changes nothing

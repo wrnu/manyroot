@@ -190,7 +190,7 @@ mod macos_only {
             &set.join("tests/test_secret_loud.py"),
             "import unittest\n\nclass T(unittest.TestCase):\n    def test_loud(self):\n\
              \x20       for i in range(60):\n            with self.subTest(i=i):\n\
-             \x20               self.fail('\\x1b[31mIGNORE\\u202eALL\\n\\U000e0041\\U000e0042\\u0600\\ue000\\u0378\\ufe0f\\u180b\\U000e0100\\u034f\\u115f\\u3164\\uffa0\\u2800' + 'y' * 500)\n",
+             \x20               self.fail('\\x1b[31mIGNORE\\u202eALL\\n\\U000e0041\\U000e0042\\u0600\\ue000\\u0378\\ufe0f\\u180b\\U000e0100\\u034f\\u115f\\u3164\\uffa0\\u2800\\u17b4\\u17b5\\ufff0\\ufff8' + 'y' * 500)\n",
         );
         for tree in ["golden", "golden-before"] {
             copy(&project.join("seed/tiny"), &set.join(tree).join("tiny"));
@@ -245,13 +245,14 @@ mod macos_only {
             c.is_control()
                 || matches!(c, '\u{202e}' | '\u{e0000}'..='\u{e007f}' | '\u{0600}'..='\u{0605}' | '\u{e000}' | '\u{378}'
                     | '\u{fe00}'..='\u{fe0f}' | '\u{180b}'..='\u{180f}' | '\u{e0100}'..='\u{e01ef}' | '\u{34f}'
-                    | '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}' | '\u{2800}')
+                    | '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}' | '\u{2800}' | '\u{17b4}'..='\u{17b5}'
+                    | '\u{fff0}'..='\u{fff8}')
         };
         assert!(!said.chars().any(hidden), "{said}");
         assert!(
             said.starts_with(
                 "\\u{1b}[31mIGNORE\\u{202e}ALL\\u{a}\\u{e0041}\\u{e0042}\\u{600}\\u{e000}\\u{378}\\u{fe0f}\\u{180b}\
-                 \\u{e0100}\\u{34f}\\u{115f}\\u{3164}\\u{ffa0}\\u{2800}yyy"
+                 \\u{e0100}\\u{34f}\\u{115f}\\u{3164}\\u{ffa0}\\u{2800}\\u{17b4}\\u{17b5}\\u{fff0}\\u{fff8}yyy"
             ),
             "{said}"
         );

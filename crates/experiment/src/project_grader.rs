@@ -7,8 +7,8 @@
 //! here as a line, which goes on to the **server**: another container under the same profile, with the tree. A
 //! `python -m <package>` a test starts comes here too, and runs in a fresh container with the tree and the test's
 //! working files, which come back once it has ended. So agent code runs only in the profile, with no way to the hidden
-//! tests (note 9891289fb39c), and its values come back as data the host compares, or as handles that equal
-//! only themselves.
+//! tests (note 9891289fb39c), and its values come back as data the host compares, values of exactly the plain
+//! types, or as handles that are never compared (decision d1fc04a4f896).
 //!
 //! What it reports is counts per item and per group, by index: no test's name, source, expected value or
 //! message, and nothing the host printed.
