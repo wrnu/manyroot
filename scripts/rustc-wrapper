@@ -12,7 +12,13 @@
 #
 # When sccache can't reach or start its server (a sandbox that denies the socket, a server that won't
 # start), it exits 2 before the compiler runs; the wrapper then runs the compiler itself, so the build goes
-# on uncached (finding 20a5ceea1005). rustc exits 0, 1 or 101, never 2.
+# on uncached (finding 20a5ceea1005). sccache 0.19 also exits 2 when a compile it ran itself was killed by a
+# signal (a crash, the OOM killer), and says so last on stdout: "sccache: Compile terminated by signal <n>".
+# That one is passed on, never rerun (finding ec492ce1a7d1); one the server ran ends 254, passed on too.
+# Its errors can't be sorted reliably into before and after the compile (one context, "failed to execute
+# compile", covers both, and the compiler's stderr is in the same stream: findings 5e48b5f2a88e,
+# 38094ff61ec4), so any other exit 2 is rerun as before, a compile that had already run included. So is
+# every exit 2 when the copy of stdout can't be made (finding 2bc99ca95dc3).
 #
 # sccache's client sends its environment to the server, which runs the compiler with it. So sccache gets
 # only what a compile needs: the names cargo sets for a compile (CARGO_PKG_*, CARGO_BIN_EXE_*,
@@ -68,12 +74,24 @@ while IFS= read -r -d '' entry; do
   kept+=("$entry")
 done < <(/usr/bin/env -0)
 
-rc=0
+# sccache's stdout goes on through tee, with a copy in the private socket directory for its last line.
+# stderr isn't touched (rustc's diagnostics and artifact notices go there, as they come), and nor is any
+# other file descriptor: cargo's jobserver is on inherited ones (CARGO_MAKEFLAGS --jobserver-auth=3,5,
+# finding c3665d850bc9).
+out=$(mktemp "$socket_dir/stdout.XXXXXX" 2>/dev/null) || out=""
+trap '[[ -z $out ]] || rm -f -- "$out"' EXIT
+set +e
 /usr/bin/env -i "${kept[@]}" \
   SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-15G}" \
   SCCACHE_IGNORE_SERVER_IO_ERROR="${SCCACHE_IGNORE_SERVER_IO_ERROR:-1}" \
   SCCACHE_SERVER_UDS="$socket_dir/server.sock" \
-  "$sccache" "$@" || rc=$?
-# 2 is sccache's own failure, before the compiler ran: compile without it.
-[[ $rc -ne 2 ]] || exec "$@"
-exit "$rc"
+  "$sccache" "$@" | tee -- "${out:-/dev/null}"
+rc=${PIPESTATUS[0]}
+set -e
+[[ $rc -eq 2 ]] || exit "$rc"
+# A compile sccache ran and a signal killed: passed on. Any other 2: compile without sccache.
+if [[ -n $out ]] && tail -n 1 -- "$out" | grep -Eqx 'sccache: Compile terminated by signal [0-9]+'; then
+  exit 2
+fi
+[[ -z $out ]] || rm -f -- "$out"
+exec "$@"

@@ -6909,8 +6909,12 @@ fn rustc_wrapper_uses_sccache_when_installed_and_gives_it_no_secrets() {
     // A compiler, a clippy and an sccache that each record how they were run, and with what variables. In
     // bash, not sh: Linux's dash drops a name that isn't a shell identifier (CARGO_BIN_EXE_a-b) before its
     // child runs, so the record would miss what the wrapper passed.
-    let record =
-        |who: &str| format!("#!/bin/bash\n{{ echo {who} \"$@\"; /usr/bin/env | sort; }} >\"{}\"\n", seen.display());
+    let record = |who: &str| {
+        format!(
+            "#!/bin/bash\n{{ echo {who} \"$@\"; IFS= read -r j 2>/dev/null <&3; echo \"fd3=$j\"; /usr/bin/env | sort; }} >\"{}\"\n",
+            seen.display()
+        )
+    };
     write_executable(&bin.join("rustc"), &record("rustc"));
     write_executable(&bin.join("clippy-driver"), &record("clippy-driver"));
     write_executable(&stubs.join("sccache"), &record("sccache"));
@@ -7014,26 +7018,75 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
     assert!(has(&s, "ANTHROPIC_AUTH_TOKEN=s1"), "{s}");
 
     // sccache failing to reach or start its server exits 2 before the compiler runs: the wrapper runs the
-    // compiler itself (finding 20a5ceea1005). Any other exit, the compile's own, is passed on as it is.
+    // compiler itself (finding 20a5ceea1005), as it does for any exit 2 (findings 5e48b5f2a88e, 38094ff61ec4)
+    // but one. sccache also exits 2 when a compile it ran was killed by a signal, its note last on stdout:
+    // that's passed on, not rerun (finding ec492ce1a7d1), whatever the compiler printed on stderr. Without the
+    // copy of stdout (here a mktemp that fails), every exit 2 is rerun (finding 2bc99ca95dc3). Any other exit,
+    // the compile's own, is passed on. sccache's output passes on, and an open fd 3, as cargo's jobserver is,
+    // reaches sccache and the compiler (finding c3665d850bc9).
     let failing = stubs.parent().unwrap().join("failing");
+    let nocopy = stubs.parent().unwrap().join("nocopy");
     std::fs::create_dir_all(&failing).unwrap();
-    for (code, ran) in [(2, "rustc"), (1, "sccache"), (101, "sccache")] {
+    std::fs::create_dir_all(&nocopy).unwrap();
+    write_executable(&nocopy.join("mktemp"), "#!/bin/bash\nexit 1\n");
+    let jobserver = stubs.parent().unwrap().join("jobserver");
+    // A line for each stub that reads it: sccache's, then the compiler's.
+    std::fs::write(&jobserver, "jobserver\n".repeat(4)).unwrap();
+    let startup = "echo 'sccache: error: Server startup failed: No such file or directory (os error 2)' >&2\n\
+                   echo 'Run with SCCACHE_LOG=debug SCCACHE_NO_DAEMON=1 to get more information' >&2";
+    let denied = "echo 'sccache: error: Operation not permitted (os error 1)' >&2";
+    let dropped = "echo 'sccache: error: failed to execute compile' >&2\n\
+                   echo 'sccache: caused by: Failed to send data to or receive data from server' >&2";
+    let killed = "echo 'sccache: Compile terminated by signal 11'";
+    let decoy_killed = "echo 'sccache: error: Operation not permitted (os error 1)' >&2\n\
+                        echo 'sccache: Compile terminated by signal 11'";
+    let not_last = "echo 'sccache: Compile terminated by signal 11'\necho 'later'";
+    for (code, says, copy, ran) in [
+        (2, startup, true, "rustc"),
+        (2, denied, true, "rustc"),
+        (2, dropped, true, "rustc"),
+        (2, "", true, "rustc"),
+        (2, not_last, true, "rustc"),
+        (2, killed, true, "sccache"),
+        (2, decoy_killed, true, "sccache"),
+        (2, denied, false, "rustc"),
+        (2, killed, false, "rustc"),
+        (1, "", true, "sccache"),
+        (101, "", true, "sccache"),
+    ] {
         write_executable(
             &failing.join("sccache"),
-            &format!("#!/bin/bash\necho sccache \"$@\" >\"{}\"\nexit {code}\n", seen.display()),
+            &format!(
+                "#!/bin/bash\n{{ echo sccache \"$@\"; IFS= read -r j 2>/dev/null <&3; echo \"fd3=$j\"; }} >\"{}\"\n{says}\nexit {code}\n",
+                seen.display()
+            ),
         );
+        let path = if copy {
+            format!("{}:{base}", failing.display())
+        } else {
+            format!("{}:{}:{base}", nocopy.display(), failing.display())
+        };
         let mut command = Command::new(bash);
         command
+            .args(["-c", "exec 3<\"$0\"; exec \"$@\"", jobserver.to_str().unwrap(), bash.to_str().unwrap()])
             .arg(wrapper)
             .arg(bin.join("rustc"))
             .args(["--crate-name", "x"])
             .env_clear()
-            .env("PATH", format!("{}:{base}", failing.display()))
+            .env("PATH", path)
             .env("HOME", home);
         let out = command.output().unwrap();
+        let case = format!("{bash:?}: sccache exit {code}, {says:?}, copy {copy}");
         let s = std::fs::read_to_string(seen).unwrap();
-        assert!(s.starts_with(&format!("{ran} ")), "{bash:?}: sccache exit {code}: {s}");
-        let want = if code == 2 { 0 } else { code };
-        assert_eq!(out.status.code(), Some(want), "{bash:?}: sccache exit {code}");
+        assert!(s.starts_with(&format!("{ran} ")), "{case}: {s}");
+        assert!(s.lines().any(|l| l == "fd3=jobserver"), "{case}: fd 3 didn't reach {ran}: {s}");
+        let want = if ran == "rustc" { 0 } else { code };
+        assert_eq!(out.status.code(), Some(want), "{case}");
+        let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let shown = format!("{stdout}{stderr}");
+        for line in says.lines().filter_map(|l| l.split('\'').nth(1)) {
+            assert!(shown.contains(line), "{case}: sccache's {line:?} didn't pass on: {shown}");
+        }
+        assert!(stdout.contains("signal") == says.contains("signal"), "{case}: stdout stays stdout: {shown}");
     }
 }
