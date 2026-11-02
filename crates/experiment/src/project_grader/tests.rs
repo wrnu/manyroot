@@ -746,7 +746,9 @@ class Errors(unittest.TestCase):
 
     /// The code's objects are never compared (decision d1fc04a4f896): every probe of rounds 2 to 4 raises, against
     /// one of its own, itself, a plain value, inside a plain container, ordered or hashed; and a value of a plain
-    /// type's subclass is the code's too. What the code gives as plain values, an attribute's, a method's, str()'s,
+    /// type's subclass is the code's too. Inside a container, one and the same proxy object matches itself by
+    /// Python's identity check, which the host can't step into; two got from the same object don't (finding
+    /// c9626960bb86). What the code gives as plain values, an attribute's, a method's, str()'s,
     /// comes as data and is compared here, Fraction and complex too.
     #[test]
     fn no_object_of_the_codes_is_ever_compared() {
@@ -835,6 +837,8 @@ def counts():
 def holding():
     return [Liar(1)]
 
+ONE = Liar(1)
+
 def plain():
     return {'n': 3, 'xs': [1, (2, 3)], 'when': datetime.date(2024, 2, 29), 'q': fractions.Fraction(1, 3),
             'z': complex(1, -2), 'd': decimal.Decimal('0.10'), 'set': {1, 2}, 'b': b'x', 'none': None}
@@ -885,6 +889,17 @@ class Never(unittest.TestCase):
         with self.assertRaises(TypeError):
             self.assertIn(Sub(5), [Sub(5)])
 
+    def test_inside_a_container_by_identity_alone(self):
+        import tiny.stats as stats
+        p = stats.ONE
+        self.assertTrue([p] == [p])
+        self.assertTrue((p,) == (p,))
+        self.assertIn(p, [p])
+        with self.assertRaises(TypeError):
+            [stats.ONE] == [stats.ONE]
+        with self.assertRaises(TypeError):
+            stats.ONE in [stats.ONE]
+
     def test_a_plain_types_subclass_is_the_codes(self):
         for f, v in ((amount, decimal.Decimal('1.50')), (name, 'y'), (counts, {'a': 2, 'b': 1})):
             with self.subTest(f=f.__name__):
@@ -914,7 +929,7 @@ class Plain(unittest.TestCase):
         self.assertEqual(len({v['when'], v['when']}), 1)
 "#;
         let g = graded(&python, stats, test, &json!({"cpu_seconds": 5, "wall_seconds": 60}));
-        assert_eq!(g.counts, Counts { pass: 7, ..Counts::default() }, "{:#?}", g.diagnosis);
+        assert_eq!(g.counts, Counts { pass: 8, ..Counts::default() }, "{:#?}", g.diagnosis);
     }
 
     /// No module the code wrote is ever imported here (finding 8908d9699820): one a command planted in its

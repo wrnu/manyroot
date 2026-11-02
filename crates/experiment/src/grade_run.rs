@@ -381,3 +381,6 @@ pub fn check_grades_path(grades: &Path, inside: &[(&str, &Path)]) -> Result<Path
     bracken_demo::safety::refuse_git_checkout(&parent, false, &advice).map_err(|e| e.to_string())?;
     Ok(real)
 }
+
+#[cfg(test)]
+mod tests;

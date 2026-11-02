@@ -349,8 +349,9 @@ message. The tests and the code under test never share a process:
   decoded and compared by the host. Anything else, a subclass of a plain
   type too, comes back as a handle, a proxy that is never compared, nor
   hashed, nor ordered, not even with itself: each raises in the test
-  (decision `d1fc04a4f896`). Its `in` the host answers from its items, so
-  the code's own `__eq__` or `__contains__` never answers for a test. A
+  (decision `d1fc04a4f896`), but for one case of Python's own, below. Its
+  `in` the host answers from its items, so the code's own `__eq__` or
+  `__contains__` never answers for a test. A
   server that dies is started again for the next call. Each start is a new
   generation, whose number tags its handles. A handle got as an attribute of
   a module of the package, such as a test file's `from pkg.mod import f`, is
@@ -399,7 +400,13 @@ message. The tests and the code under test never share a process:
   Anything else stays the code's, a proxy, and equality, ordering or
   hashing with one raises in the test, never answering: against another of
   the code's objects, itself, or a plain value, or inside a plain
-  container. A builtin type is known by identity alone, among Python's own
+  container. The one exception is Python's own (finding `c9626960bb86`): a
+  list's or a tuple's comparison and `in` check identity before `__eq__`,
+  so one and the same proxy object, held twice by a test, matches itself
+  there: `[p] == [p]`, `(p,) == (p,)` and `p in [p]` are true. Every value
+  got from the code is a new proxy, so two never match, not even two got
+  from the same object, and the code can't make a test pass this way. A
+  builtin type is known by identity alone, among Python's own
   types taken before any of the code is imported, never by `in`, a hash or
   `==`, nor by a class's `__module__` (findings `98fb18bf3e9c`,
   `a2c5943deae7`). The server's functions run over a copy of its names, and
