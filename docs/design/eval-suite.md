@@ -431,16 +431,25 @@ message. The tests and the code under test never share a process:
   server, with two residuals. A name carries across a server's restart, as a
   test file binds the code's classes when it imports them, so code that ends
   its own server between two fetches can have two objects, one in each
-  generation, match as one. And the server is the code's own process: code
-  that rewrites the server's state, such as its record of names
-  (`__main__`'s), can send any object under any name, as it could forge any
-  plain value the server reports (finding `899e1616f407`; "Not defended"
-  above). A builtin type is known by identity alone, among Python's own
-  types taken before any of the code is imported, never by `in`, a hash or
-  `==`, nor by a class's `__module__` (findings `98fb18bf3e9c`,
-  `a2c5943deae7`). The server's functions run over a copy of its names, and
-  of Python's builtins, taken then too, so code that rebinds one, such as
-  `is_builtin` or `type`, changes nothing (finding `0b5b233009ef`).
+  generation, match as one. Of several classes under one module and
+  qualified name, such as two a function made by being called twice, only
+  the first sent in a generation carries: after a restart the first of them
+  sent then is that class, whichever object it is, so a test's class of one
+  may catch another, or not catch its own (finding `30eb693032b7`). Nothing
+  can carry them better: a new server can't tell which of its objects an
+  earlier one sent, nor sends them in the same order, which follows the
+  test's calls. A correct solution meets this only when it makes two classes
+  under one name and a test crosses a crash with them. And the server is the
+  code's own process: code that rewrites the server's state, such as its
+  record of names (`__main__`'s), can send any object under any name, as it
+  could forge any plain value the server reports (finding `899e1616f407`;
+  "Not defended" above). A builtin type is known by identity alone, among
+  Python's own types taken before any of the code is imported, never by
+  `in`, a hash or `==`, nor by a class's `__module__` (findings
+  `98fb18bf3e9c`, `a2c5943deae7`). The server's functions run over a copy of
+  its names, and of Python's builtins, taken then too, so code that rebinds
+  one, such as `is_builtin` or `type`, changes nothing (finding
+  `0b5b233009ef`).
   **The rule for a project's hidden tests:** compare attributes, return
   values or `str()`, never the code's objects: `assertEqual(entry.amount,
   Decimal("5"))`, not `assertEqual(entry, Entry(5))`. A hidden test that
