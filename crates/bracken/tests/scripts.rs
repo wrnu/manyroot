@@ -3562,6 +3562,28 @@ fn set_mtimes(path: &Path, when: std::time::SystemTime) {
     std::fs::File::open(path).unwrap().set_modified(when).unwrap();
 }
 
+/// A `sleep 3600` with its working directory in `dir`, so lsof shows a process using it. It outlasts any test
+/// however loaded the machine (a 467 s run outlived a `sleep 120`: evidence 16972bc5b1d9), and is killed and
+/// waited for when dropped, so a failing assert never leaves it running (finding 1cc1ba335e87).
+struct Sleeper(std::process::Child);
+
+impl Sleeper {
+    fn in_dir(dir: &Path) -> Self {
+        Sleeper(Command::new("sleep").arg("3600").current_dir(dir).spawn().unwrap())
+    }
+
+    fn id(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for Sleeper {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// cleanup (owner process 11f1ac552f26) on stubbed worktrees, with HOME and TMPDIR throwaway directories
 /// and a stub cargo that logs any call. Of this repo's worktrees, it removes only the clean, unused ones
 /// idle 2 hours under T3's root (t3-<id>) or TMPDIR. A builder's worktree whose branch is squash-merged
@@ -3699,8 +3721,8 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         let reads = || std::fs::read_to_string(&jq_log).unwrap_or_default().lines().count();
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
         let busy = t3.join("t3-busy");
-        let mut sleeper = Command::new("sleep").arg("120").current_dir(&busy).spawn().unwrap();
-        let mut slashed = Command::new("sleep").arg("120").current_dir(tmpdir.join("b\\s")).spawn().unwrap();
+        let sleeper = Sleeper::in_dir(&busy);
+        let slashed = Sleeper::in_dir(&tmpdir.join("b\\s"));
         let refs = || String::from_utf8(run(&dir, "git", &["for-each-ref"]).stdout).unwrap();
         let refs_before = refs();
         let cleanup = |args: &[&str]| {
@@ -3778,10 +3800,7 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
 
         let applied = cleanup(&["--apply"]);
         assert_eq!(reads(), 2, "{scripts}: --apply read the pr claims more than once: {applied}");
-        for s in [&mut sleeper, &mut slashed] {
-            s.kill().unwrap();
-            s.wait().unwrap();
-        }
+        drop((sleeper, slashed));
         assert!(refs().contains("refs/remotes/origin/extra"), "{scripts}: --apply didn't fetch");
         assert!(applied.lines().last().unwrap().contains("6 done"), "{scripts}: {applied}");
         let after = worktrees();
@@ -7001,9 +7020,7 @@ fn cleanup_frees_idle_targets_of_worktrees_it_keeps_and_reports_dockers_build_ca
         );
         write_executable(&stubs.join("du"), &stub);
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
-        // Killed below, after the --apply run: it must outlast every run before it, however loaded the machine
-        // (a 467 s run outlived a 120 s sleep, and busy/target/ went).
-        let mut sleeper = Command::new("sleep").arg("3600").current_dir(t3.join("busy")).spawn().unwrap();
+        let sleeper = Sleeper::in_dir(&t3.join("busy"));
         let cleanup = |args: &[&str], hours: Option<&str>| {
             let mut command = command(&dir, "scripts/cleanup", args);
             command.env("HOME", &home).env("TMPDIR", &tmpdir).env("PATH", &path).env_remove("LATE");
@@ -7057,8 +7074,7 @@ fn cleanup_frees_idle_targets_of_worktrees_it_keeps_and_reports_dockers_build_ca
         assert!(code == Some(2) && refused.contains("1 to 9999 hours"), "{scripts}: {refused}");
 
         let (code, applied) = cleanup(&["--apply"], None);
-        sleeper.kill().unwrap();
-        sleeper.wait().unwrap();
+        drop(sleeper);
         let late = std::fs::read_to_string(&late_pid).unwrap_or_default();
         let _ = Command::new("kill").arg(late.trim()).status();
         let _ = std::fs::remove_file(&late_pid);
@@ -7151,6 +7167,110 @@ fn cleanup_without_lsof_removes_no_target_dir() {
         assert!(wt.join("target/debug/big").exists(), "{scripts}: target/ went without lsof: {stdout}");
         let l = stdout.lines().find(|l| l.contains("/idle:")).unwrap_or_else(|| panic!("{scripts}: {stdout}"));
         assert!(l.starts_with("keep") && l.contains("lsof"), "{scripts}: {l}");
+    }
+}
+
+/// Task 9fa138208dac: bracken's .bracken/cache/ (its verified snapshot, since #204) is the one ignored entry
+/// under .bracken/ that doesn't keep a worktree whole. A builder's worktree merged into origin/main, gone from
+/// origin and at its claimed head goes with its branch though it holds .bracken/cache/; one that also holds
+/// .bracken/identities/ (a key) stays, saying why. The repo ignores those two as this one does, not all of
+/// .bracken/. A git status --ignored=matching that fails keeps both, at either check (finding 6dc71b5c4733):
+/// a git wrapper fails it for the .bracken/ check and the whole-worktree one, then for the latter only.
+#[test]
+fn cleanup_removes_a_merged_worktree_holding_brackens_cache_but_not_one_holding_a_key() {
+    for scripts in SCRIPTS {
+        let cleanup = repo_root().join(scripts).join("cleanup");
+        let ignore = ".bracken/identities/\n.bracken/cache/\n/target\n";
+        let (tmp, dir) = repo(&[("scripts/cleanup", &cleanup)], ignore, |dir| {
+            std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        });
+        let t = tmp.path();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = run(dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let origin = t.join("origin.git");
+        git(t, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "-u", "origin", "main"]);
+        let (home, tmpdir) = (t.join("home"), t.join("tmpdir"));
+        let t3 = home.join(".t3/worktrees/repo");
+        std::fs::create_dir_all(&t3).unwrap();
+        // Each a commit of its own, squash-merged into main, never on origin, its head claimed.
+        bk(&dir, &["init", "--name", "cleanup"]);
+        bk(&dir, &["id", "new", "builder"]);
+        for (n, name) in ["cached", "keyed"].iter().enumerate() {
+            let wt = t3.join(name);
+            git(&dir, &["worktree", "add", "-q", "-b", name, wt.to_str().unwrap()]);
+            std::fs::write(wt.join(name), name).unwrap();
+            git(&wt, &["add", name]);
+            git(&wt, &["commit", "-qm", name]);
+            git(&dir, &["merge", "-q", "--squash", name]);
+            git(&dir, &["commit", "-qm", &format!("{name} (#{n})")]);
+            let head = String::from_utf8(run(&dir, "git", &["rev-parse", name]).stdout).unwrap();
+            bk(
+                &dir,
+                &["claim", &format!("PR #{n} {name} @ {}: {name}", head.trim()), "--tag", "pr", "--as", "builder"],
+            );
+            std::fs::create_dir_all(wt.join(".bracken/cache")).unwrap();
+            std::fs::write(wt.join(".bracken/cache/snapshot"), "verified").unwrap();
+        }
+        git(&dir, &["push", "-q", "origin", "main"]);
+        std::fs::create_dir_all(t3.join("keyed/.bracken/identities")).unwrap();
+        std::fs::write(t3.join("keyed/.bracken/identities/k"), "key").unwrap();
+        set_mtimes(t, std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 3600));
+        let stubs = t.join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(&stubs.join("docker"), "#!/bin/sh\nexit 1\n");
+        let real_git = String::from_utf8(run(&dir, "sh", &["-c", "command -v git"]).stdout).unwrap();
+        write_executable(
+            &stubs.join("git"),
+            &format!(
+                "#!/bin/bash\ncase \" $* \" in\n\
+                 *' --ignored=matching -- .bracken '*) [ \"$FAIL_GIT\" != all ] || exit 128 ;;\n\
+                 *' --ignored=matching '*) [ -z \"$FAIL_GIT\" ] || exit 128 ;;\nesac\nexec '{}' \"$@\"\n",
+                real_git.trim()
+            ),
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let cleanup = |args: &[&str], fail: &str| {
+            let out = command(&dir, "scripts/cleanup", args)
+                .env("HOME", &home)
+                .env("TMPDIR", &tmpdir)
+                .env("PATH", &path)
+                .env("FAIL_GIT", fail)
+                .output()
+                .unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let line_in = |out: &str, name: &str| -> String {
+            out.lines()
+                .find(|l| l.contains(&format!("/{name}:")))
+                .unwrap_or_else(|| panic!("{scripts}: {out}"))
+                .to_owned()
+        };
+        for (fail, cached, keyed) in [
+            ("all", "a key under .bracken/ can't be ruled out", "a key under .bracken/ can't be ruled out"),
+            ("whole", "what else is ignored is unknown", "perhaps an identity's key"),
+        ] {
+            let (code, dry) = cleanup(&[], fail);
+            assert_eq!(code, Some(0), "{scripts}: {dry}");
+            for (name, why) in [("cached", cached), ("keyed", keyed)] {
+                let l = line_in(&dry, name);
+                assert!(l.starts_with("won't touch") && l.contains(why), "{scripts}: git failing {fail}: {l}");
+            }
+        }
+        let (code, stdout) = cleanup(&["--apply"], "");
+        let out_code = code;
+        assert_eq!(out_code, Some(0), "{scripts}: {stdout}");
+        let line = |name: &str| line_in(&stdout, name);
+        assert!(line("cached").starts_with("remove"), "{scripts}: {stdout}");
+        assert!(!t3.join("cached").exists(), "{scripts}: {stdout}");
+        let branches = String::from_utf8(run(&dir, "git", &["branch", "--list", "cached"]).stdout).unwrap();
+        assert!(branches.trim().is_empty(), "{scripts}: branch cached stayed: {stdout}");
+        let keyed = line("keyed");
+        assert!(keyed.starts_with("won't touch") && keyed.contains("perhaps an identity's key"), "{scripts}: {keyed}");
+        assert!(t3.join("keyed/.bracken/identities/k").exists(), "{scripts}: {stdout}");
     }
 }
 
@@ -7353,5 +7473,146 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
             assert!(shown.contains(line), "{case}: sccache's {line:?} didn't pass on: {shown}");
         }
         assert!(stdout.contains("signal") == says.contains("signal"), "{case}: stdout stays stdout: {shown}");
+    }
+}
+
+/// Finding 88fc809d6a05: cleanup's second look, after it renames a target/ aside. A process that starts
+/// using the worktree between the rename and that look keeps target/, put back. When a build has meanwhile
+/// made a new target/, the put-back fails and the copy stays as target.cleanup-<pid>. A later run, once that
+/// pid is gone and nothing uses the worktree, frees the copy, and the copy doesn't make the worktree dirty,
+/// in the dry run either. A copy whose pid still runs stays. The repo's .gitignore here, like an old
+/// branch's, doesn't cover the copies.
+#[test]
+fn cleanup_puts_back_a_target_dir_used_once_renamed_aside_and_later_frees_a_copy_left_behind() {
+    for scripts in SCRIPTS {
+        let cleanup = repo_root().join(scripts).join("cleanup");
+        let (tmp, dir) = repo(&[("scripts/cleanup", &cleanup)], ".bracken/\n/target\n", |dir| {
+            std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        });
+        let t = tmp.path();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = run(dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let origin = t.join("origin.git");
+        git(t, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "-u", "origin", "main"]);
+        let (home, tmpdir) = (t.join("home"), t.join("tmpdir"));
+        let t3 = home.join(".t3/worktrees/repo");
+        std::fs::create_dir_all(&t3).unwrap();
+        // Unmerged builders' worktrees with an idle target/; "live" also holds a copy whose pid runs.
+        let live = Sleeper::in_dir(t);
+        let live_copy = format!("target.cleanup-{}", live.id());
+        for name in ["back", "stuck", "live"] {
+            let wt = t3.join(name);
+            git(&dir, &["worktree", "add", "-q", "-b", name, wt.to_str().unwrap()]);
+            std::fs::write(wt.join("f"), name).unwrap();
+            git(&wt, &["add", "f"]);
+            git(&wt, &["commit", "-qm", name]);
+            std::fs::create_dir_all(wt.join("target/debug")).unwrap();
+            std::fs::write(wt.join("target/debug/big"), "build").unwrap();
+        }
+        std::fs::create_dir_all(t3.join("live").join(&live_copy).join("debug")).unwrap();
+        std::fs::write(t3.join("live").join(&live_copy).join("debug/big"), "build").unwrap();
+        set_mtimes(t, std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 3600));
+
+        // An mv that, the first time it renames back/target or stuck/target aside, starts a process in that
+        // worktree before returning: so the look after the rename finds it. In stuck, a build has also made a
+        // new target/ by then.
+        let stubs = t.join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(&stubs.join("docker"), "#!/bin/sh\nexit 1\n");
+        let mv = String::from_utf8(run(&dir, "sh", &["-c", "command -v mv"]).stdout).unwrap();
+        let state = t.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let stub = format!(
+            "#!/bin/sh\n'{mv}' \"$@\" || exit\nfor a; do to=$a; done\n\
+             case \"$to\" in */back/target.cleanup-* | */stuck/target.cleanup-*)\n\
+             w=${{to%/target.cleanup-*}}; n=${{w##*/}}\n\
+             [ ! -e '{state}'/$n ] || exit 0; : >'{state}'/$n\n\
+             [ $n != stuck ] || mkdir \"$w/target\"\n\
+             (cd \"$w\" && exec sleep 120) >/dev/null 2>&1 </dev/null & echo $! >>'{state}/pids'; sleep 1 ;;\n\
+             esac\n",
+            mv = mv.trim(),
+            state = state.display()
+        );
+        write_executable(&stubs.join("mv"), &stub);
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let cleanup = |args: &[&str]| {
+            let out = command(&dir, "scripts/cleanup", args)
+                .env("HOME", &home)
+                .env("TMPDIR", &tmpdir)
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            (out.status.code(), format!("{stdout}{}", String::from_utf8_lossy(&out.stderr)))
+        };
+        let lines = |out: &str, wt: &str| -> Vec<String> {
+            out.lines().filter(|l| l.contains(&format!("/{wt}:"))).map(str::to_owned).collect()
+        };
+        let copies = |wt: &str| -> Vec<String> {
+            std::fs::read_dir(t3.join(wt))
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("target.cleanup-"))
+                .collect()
+        };
+
+        let (code, first) = cleanup(&["--apply"]);
+        let pids = std::fs::read_to_string(state.join("pids")).unwrap_or_default();
+        for pid in pids.split_whitespace() {
+            let _ = Command::new("kill").arg(pid).status();
+            // Gone before the next run looks.
+            for _ in 0..50 {
+                if !Command::new("kill")
+                    .args(["-0", pid])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        assert_eq!(code, Some(1), "{scripts}: the stuck copy is a failure: {first}");
+        let back = lines(&first, "back").join("\n");
+        assert!(back.starts_with("keep") && back.contains("once renamed aside, so put back"), "{scripts}: {back}");
+        assert!(t3.join("back/target/debug/big").exists(), "{scripts}: {first}");
+        assert!(copies("back").is_empty(), "{scripts}: {:?}", copies("back"));
+        let stuck = lines(&first, "stuck").join("\n");
+        assert!(stuck.starts_with("failed") && stuck.contains("couldn't be put back"), "{scripts}: {stuck}");
+        let left = copies("stuck");
+        assert_eq!(left.len(), 1, "{scripts}: {first}");
+        assert!(stuck.contains(&left[0]), "{scripts}: the line names the copy: {stuck}");
+        assert!(t3.join("stuck").join(&left[0]).join("debug/big").exists(), "{scripts}: {first}");
+
+        // Hours later: the copy's run is over and nothing uses stuck. The dry run would free it, and judges
+        // stuck as if it had: kept, as a build just made its target/, not dirty.
+        set_mtimes(
+            &t3.join("stuck").join(&left[0]),
+            std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 3600),
+        );
+        let (code, dry) = cleanup(&[]);
+        assert_eq!(code, Some(0), "{scripts}: {dry}");
+        let stuck = lines(&dry, "stuck");
+        assert!(stuck.iter().any(|l| l.starts_with("clean") && l.contains(&format!("remove {}/", left[0]))), "{dry}");
+        assert!(stuck.iter().all(|l| !l.contains("dirty")), "{scripts}: the copy made it dirty: {dry}");
+        assert!(stuck.iter().any(|l| l.starts_with("keep")), "{scripts}: judged as clean: {dry}");
+        let live_lines = lines(&dry, "live").join("\n");
+        assert!(!live_lines.contains(&live_copy) && live_lines.contains("dirty"), "{scripts}: {live_lines}");
+
+        let (code, applied) = cleanup(&["--apply"]);
+        assert_eq!(code, Some(0), "{scripts}: {applied}");
+        assert!(copies("stuck").is_empty(), "{scripts}: {applied}");
+        // The new target/ is a build's, made just now: it stays.
+        assert!(t3.join("stuck/target").exists(), "{scripts}: {applied}");
+        assert_eq!(copies("live"), std::slice::from_ref(&live_copy), "{scripts}: {applied}");
+        assert!(lines(&applied, "live").join("\n").contains("dirty"), "{scripts}: {applied}");
+        drop(live);
     }
 }

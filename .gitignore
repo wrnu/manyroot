@@ -1,4 +1,6 @@
 /target
+# What scripts/cleanup renames target/ to while it removes it, left if a run couldn't finish
+/target.cleanup-*
 
 # Private agent keys never leave the machine. The rest of .bracken/ is the
 # Ground itself and is committed: contribution files are immutable and named
