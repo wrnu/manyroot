@@ -6,8 +6,10 @@ run here:
   which relays it to the server, a sandboxed child with the tree. Values of exactly the plain types come back as
   data and are compared here; other objects, a plain type's subclass too, come back as proxies, which are never
   compared, hashed or ordered, not even with themselves (decision d1fc04a4f896), and whose `in` is answered here
-  from their items. Only the package and its submodules ever become proxy modules, and only when this
-  process imports them (finding 734e5389e188).
+  from their items. One exception, Python's own: a list, a tuple or `in` checks identity before `__eq__`, so one
+  and the same proxy object, held twice by a test, matches itself there; every value got from the code is a new
+  proxy, so two never do (finding c9626960bb86). Only the package and its submodules ever become proxy modules,
+  and only when this process imports them (finding 734e5389e188).
 - an io.StringIO given to the code, or standard output or error redirected to one around a call, is given
   as a stream of the server's holding the same text, and holds what the code wrote to it there once the call
   returns or raises (task 6a80d88373a5).
@@ -269,8 +271,8 @@ NAMING = {"__name__", "__qualname__", "__annotations__"}
 
 class Proxy:
     """An object of the code under test, by its server's generation and its number there. It is never compared,
-    hashed or ordered (decision d1fc04a4f896). One got as an attribute of a module of the package remembers which, so a server started after its
-    own has ended finds it again by name (finding 5f5c3b4b25a9)."""
+    hashed or ordered (decision d1fc04a4f896). One got as an attribute of a module of the package remembers which,
+    so a server started after its own has ended finds it again by name (finding 5f5c3b4b25a9)."""
 
     __slots__ = ("_handle", "_origin")
 
