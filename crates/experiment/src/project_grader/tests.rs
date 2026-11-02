@@ -932,6 +932,178 @@ class Plain(unittest.TestCase):
         assert_eq!(g.counts, Counts { pass: 8, ..Counts::default() }, "{:#?}", g.diagnosis);
     }
 
+    /// One name stands for one of the code's objects (decision 0f7f0b4b048b, finding 9acc5305790f): its exception
+    /// classes and the package's modules are the host's own, one for each name, compared by identity, so one goes by
+    /// its name only if it is the object the name gives in the server and the first sent under it. Two classes made
+    /// with one name are two here, and a class claiming to be Python's ValueError isn't it; a module made under the
+    /// package's module's name, or swapped into sys.modules under it, is a proxy; and a module of the package the
+    /// code sent first under a name isn't then imported under it (finding 4d05772e8e19). The class its name gives is
+    /// one class however often it comes, and catches what the code raises of it or of a subclass of it; so is a class
+    /// its name doesn't give, such as one made in a function (finding deeada376fa8); and the package's module given
+    /// back is the one imported.
+    #[test]
+    fn one_name_stands_for_one_of_the_codes_objects() {
+        let Some(python) = python() else { return };
+        let stats = r#"import sys, types
+
+class Bad(Exception):
+    pass
+
+def made():
+    return type('Bad', (Exception,), {})
+
+def builtin():
+    return type('ValueError', (Exception,), {'__module__': 'builtins'})
+
+def raise_bad():
+    raise Bad('bad')
+
+def raise_made():
+    raise type('Worse', (Bad,), {})('worse')
+
+def _make():
+    class Local(Exception):
+        pass
+    return Local
+
+Local = _make()
+
+def raise_local():
+    raise Local('local')
+
+def plant():
+    m = types.ModuleType('tiny.other')
+    sys.modules['tiny.other'] = m
+    return m
+
+def unplant():
+    del sys.modules['tiny.other']
+
+def me():
+    return sys.modules[__name__]
+
+def forged():
+    return types.ModuleType(__name__)
+
+def swapped():
+    real = sys.modules[__name__]
+    m = types.ModuleType(__name__)
+    def restore():
+        sys.modules[__name__] = real
+    m.restore = restore
+    sys.modules[__name__] = m
+    return m
+"#;
+        let test = r#"import unittest
+import tiny.stats as stats
+
+class Names(unittest.TestCase):
+    def test_two_classes_made_with_one_name_are_two(self):
+        self.assertIsNot(stats.made(), stats.made())
+        self.assertIsNot(stats.made(), stats.Bad)
+        self.assertNotEqual(stats.made(), stats.Bad)
+
+    def test_a_class_claiming_pythons_name_isnt_pythons(self):
+        self.assertIsNot(stats.builtin(), ValueError)
+
+    def test_the_class_its_name_gives_is_one_class(self):
+        self.assertIs(stats.Bad, stats.Bad)
+        with self.assertRaises(stats.Bad):
+            stats.raise_bad()
+        with self.assertRaises(stats.Bad):
+            stats.raise_made()
+
+    def test_a_class_its_name_doesnt_give_is_one_class(self):
+        self.assertIs(stats.Local, stats.Local)
+        with self.assertRaises(stats.Local):
+            stats.raise_local()
+
+    def test_a_module_sent_first_under_a_name_keeps_it(self):
+        stats.plant()
+        stats.unplant()
+        with self.assertRaises(ImportError):
+            import tiny.other
+
+    def test_the_packages_module_is_the_one_imported(self):
+        self.assertIs(stats.me(), stats)
+
+    def test_a_module_made_under_its_name_is_a_proxy(self):
+        self.assertIsNot(stats.forged(), stats)
+        with self.assertRaises(TypeError):
+            stats.forged() == stats
+
+    def test_a_module_swapped_in_under_its_name_is_a_proxy(self):
+        m = stats.swapped()
+        try:
+            self.assertIsNot(m, stats)
+            with self.assertRaises(TypeError):
+                m == stats
+        finally:
+            m.restore()
+"#;
+        let files = [("tiny/stats.py", stats), ("tiny/other.py", "who = 'real'\n")];
+        let g = graded_with(&python, &files, test, &json!({"cpu_seconds": 5, "wall_seconds": 60}), 0);
+        assert_eq!(g.counts, Counts { pass: 8, ..Counts::default() }, "{:#?}", g.diagnosis);
+    }
+
+    /// A class its name doesn't give still catches what the code raises of it after the server's restart
+    /// (finding 90ae40b8ad52), as main's did: the first such class sent under its module and qualname is kept by
+    /// them across a restart, as a named class is. One made in a function, and one a factory in another module
+    /// made; the test file binds them as it imports, before the crash.
+    #[test]
+    fn a_class_its_name_doesnt_give_carries_across_a_restart() {
+        let Some(python) = python() else { return };
+        let stats = r#"import os
+from tiny import factory
+
+class Bad(Exception):
+    pass
+
+def _make():
+    class Local(Exception):
+        pass
+    return Local
+
+Local = _make()
+Made = factory.make('Made')
+
+def crash():
+    os.abort()
+
+def raise_bad():
+    raise Bad('bad')
+
+def raise_local():
+    raise Local('local')
+
+def raise_made():
+    raise Made('made')
+"#;
+        let factory = "def make(name):\n    return type(name, (Exception,), {})\n";
+        let test = r#"import unittest
+from tiny.stats import Bad, Local, Made, crash, raise_bad, raise_local, raise_made
+
+class Restart(unittest.TestCase):
+    def test_a_crash(self):
+        crash()
+
+    def test_b_a_named_class(self):
+        with self.assertRaises(Bad):
+            raise_bad()
+
+    def test_c_a_class_made_in_a_function(self):
+        with self.assertRaises(Local):
+            raise_local()
+
+    def test_d_a_class_a_factory_made(self):
+        with self.assertRaises(Made):
+            raise_made()
+"#;
+        let files = [("tiny/stats.py", stats), ("tiny/factory.py", factory)];
+        let g = graded_with(&python, &files, test, &json!({"cpu_seconds": 5, "wall_seconds": 60}), 0);
+        assert_eq!(g.outcomes, [Outcome::Error, Outcome::Pass, Outcome::Pass, Outcome::Pass], "{:#?}", g.diagnosis);
+    }
+
     /// No module the code wrote is ever imported here (finding 8908d9699820): one a command planted in its
     /// working directory, the package's place found from `__file__`, or one written to a temporary file's
     /// directory, even with that directory on sys.path.
@@ -1005,11 +1177,18 @@ class Plain(unittest.TestCase):
     /// [`graded`], with `pad` small files more in the tree: each server start copies them in, about 7 ms a file on
     /// Docker Desktop, so they make every start slow, and none of that time is the code's.
     fn graded_padded(python: &Python, stats: &str, test: &str, limits: &Value, pad: usize) -> GroupGrade {
+        graded_with(python, &[("tiny/stats.py", stats)], test, limits, pad)
+    }
+
+    /// [`graded_padded`], with the tree's `files` by their path in it, beside an empty `tiny/__init__.py`.
+    fn graded_with(python: &Python, files: &[(&str, &str)], test: &str, limits: &Value, pad: usize) -> GroupGrade {
         let groups = json!([{"item": "mean-empty", "file": "tests/test_x.py", "applies": "always"}]);
         let s = setup_with(groups, &[("test_x.py", test)], limits);
         let tree = s.root.join("tree");
         write(&tree.join("tiny/__init__.py"), "");
-        write(&tree.join("tiny/stats.py"), stats);
+        for (rel, text) in files {
+            write(&tree.join(rel), text);
+        }
         for i in 0..pad {
             write(&tree.join(format!("pad/f{i}.txt")), "x");
         }

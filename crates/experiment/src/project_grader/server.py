@@ -92,16 +92,81 @@ def handle(obj):
     return len(handles) - 1
 
 
+# The object first reported under each name for this server's life (decision 0f7f0b4b048b): ("m", name) for a
+# module, ("e", module, qualname) for a class. A module or a class goes to the host by its name only if it is the
+# object the name gives and the first reported under it, so two of the code's modules or classes, which the host
+# keeps one of for each name, match there only when they are one object here.
+named = {}
+
+
+def first(key, obj):
+    """Whether `obj` is the object first reported under `key`, as it now is if none was."""
+    return named.setdefault(key, obj) is obj
+
+
+# Each class that doesn't go by its name, by identity: its one handle for this server's life, so it is one class in
+# the host however often it comes, and only another object is another class (finding deeada376fa8). The handles
+# hold the classes, so no id here is ever another's.
+owned = {}
+
+
+def own_handle(cls):
+    """The one handle of class `cls`, which doesn't go by its name."""
+    h = owned.get(id(cls))
+    if h is None:
+        h = owned[id(cls)] = handle(cls)
+    return h
+
+
+def module_named(m):
+    """The name module `m` goes by, if it is the module sys.modules holds under it and the first reported there;
+    else None."""
+    try:
+        name = object.__getattribute__(m, "__dict__").get("__name__")
+    except BaseException:
+        return None
+    if type(name) is str and sys.modules.get(name) is m and first(("m", name), m):
+        return name
+    return None
+
+
+def class_named(cls, module, qualname):
+    """Whether class `cls` goes by its module and qualname: the object they give, walked through each object's own
+    `__dict__`, never by getattr, and the first reported under them."""
+    if type(module) is not str or type(qualname) is not str:
+        return False
+    found = sys.modules.get(module)
+    try:
+        for part in qualname.split("."):
+            found = object.__getattribute__(found, "__dict__").get(part)
+    except BaseException:
+        return False
+    return found is cls and first(("e", module, qualname), cls)
+
+
 def described(cls, depth=0):
-    """A class as [module, qualname, [its bases, described]], as strings whatever the class says."""
+    """A class as [module, qualname, [its bases, described], own], as strings whatever the class says: `own` is
+    None for a class that goes by its name, and otherwise its generation, its one handle and whether it is the first
+    such class sent under its module and qualname. The host keeps a class of its own for each, matching no other,
+    and a first one's carries across a restart by its module and qualname, as a named class's does (finding
+    90ae40b8ad52)."""
     if depth > DEPTH:
         raise ValueError("a class nested too deeply to send")
     try:
-        module = str(type.__getattribute__(cls, "__module__"))
+        module = type.__getattribute__(cls, "__module__")
+    except BaseException:
+        module = None
+    qualname = type.__getattribute__(cls, "__qualname__")
+    mine = None
+    if not class_named(cls, module, qualname):
+        carried = type(module) is str and type(qualname) is str and first(("u", module, qualname), cls)
+        mine = [generation, own_handle(cls), carried]
+    try:
+        module = str(module) if module is not None else "?"
     except BaseException:
         module = "?"
     bases = type.__getattribute__(cls, "__bases__")
-    return [module, str(type.__getattribute__(cls, "__qualname__")), [described(b, depth + 1) for b in bases]]
+    return [module, str(qualname), [described(b, depth + 1) for b in bases], mine]
 
 
 # Only a value of exactly one of the plain types goes back as data (decision d1fc04a4f896): checked by identity,
@@ -144,7 +209,8 @@ def enc(v, depth=0):
     if t is complex:
         return ["c", repr(v.real), repr(v.imag)]
     if t is types.ModuleType:
-        return ["m", str(v.__name__)]
+        name = module_named(v)
+        return ["m", name] if name is not None else ["h", generation, handle(v)]
     if isinstance(v, type) and issubclass(v, BaseException):
         return ["e", generation, handle(v), described(v)]
     return ["h", generation, handle(v)]
@@ -289,7 +355,12 @@ def plain_type(v):
 def answer(r):
     op = r["op"]
     if op == "import":
-        return ["s", place(module(r["name"]))]
+        # What the host imports is what the name gives from now on, before the code can report another under it;
+        # and if the code already sent another under it, the import is refused (finding 4d05772e8e19).
+        m = module(r["name"])
+        if not first(("m", str(r["name"])), m):
+            raise ImportError("another module was sent under the name " + str(r["name"]))
+        return ["s", place(m)]
     if op == "exists":
         # Whether the package has the module, as the host's import machinery asks.
         name = str(r["name"])
