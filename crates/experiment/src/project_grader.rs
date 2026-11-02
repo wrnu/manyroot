@@ -28,6 +28,34 @@ const CLI: &str = include_str!("project_grader/cli.py");
 /// The host's CPU and wall time are the project's times this: it runs a whole file, waiting on every call.
 const HOST_TIMES: u32 = 4;
 
+/// In tests, how the last group run on this thread spent its host's wall time.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, Default)]
+struct HostTime {
+    /// The group's first server start, which moved the deadline without drawing on the allowance.
+    aside: Duration,
+    /// What moved the deadline from the allowance: the other containers' starts and the time around calls.
+    drawn: Duration,
+    /// How far the host's deadline moved in all (finding b5600996ed42).
+    moved: Duration,
+    /// How far the host's own wall limit, the one its container is killed at, moved in all: whole milliseconds,
+    /// one rounding down for each move (finding e4c03aa4e4e9).
+    skipped: Duration,
+    /// How many times the deadline and the wall limit moved.
+    moves: u32,
+    /// The most a call's deadline was given for its server's start ([`call_deadline`]).
+    given: Duration,
+    /// The host's own: its wall time, less every move of its deadline.
+    own: Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+    static HOST_TIME: std::cell::Cell<HostTime> = std::cell::Cell::new(HostTime::default());
+    /// What [`call_deadline`] was last given for a server's start, at most, since the group began.
+    static GIVEN: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::ZERO) };
+}
+
 /// The most tests a group's file may hold, as its host says: more are counted as this many.
 const MAX_TESTS: u32 = 100_000;
 
@@ -259,6 +287,10 @@ fn run_group(python: &Python, project: &Project, set: &HiddenSet, tree: &Tree, f
     ];
     let mut running = python.start(&scratch, &args, &host_limits)?;
     let mut deadline = running.started() + Duration::from_secs(host_limits.wall_seconds.into());
+    #[cfg(test)]
+    let (mut spent, first_deadline) = (HostTime::default(), deadline);
+    #[cfg(test)]
+    GIVEN.set(Duration::ZERO);
     let mut may_move = Allowance(Duration::from_secs(host_limits.wall_seconds.into()));
     let mut server = Server {
         python,
@@ -337,12 +369,30 @@ fn run_group(python: &Python, project: &Project, set: &HiddenSet, tree: &Tree, f
         // drawing on the allowance: only what the code can cause, restarts and commands, does.
         let uncounted = waiting.elapsed().saturating_sub(std::mem::take(&mut server.counted));
         let first = std::mem::take(&mut server.first).min(uncounted);
-        let lost = first + may_move.take(uncounted - first);
+        let drawn = may_move.take(uncounted - first);
+        let lost = first + drawn;
+        #[cfg(test)]
+        let skipped = running.skipped();
         running.resume(lost);
         deadline += lost;
+        #[cfg(test)]
+        {
+            spent.aside += first;
+            spent.drawn += drawn;
+            spent.skipped += running.skipped().saturating_sub(skipped);
+            spent.moves += 1;
+        }
         if running.send(&reply).is_err() {
             break;
         }
+    }
+    #[cfg(test)]
+    {
+        let budget = Duration::from_secs(host_limits.wall_seconds.into());
+        spent.own = budget.saturating_sub(deadline.saturating_duration_since(Instant::now()));
+        spent.moved = deadline.saturating_duration_since(first_deadline);
+        spent.given = GIVEN.get();
+        HOST_TIME.set(spent);
     }
     server.end();
     let exit = running.finish();
@@ -376,6 +426,14 @@ fn run_group(python: &Python, project: &Project, set: &HiddenSet, tree: &Tree, f
 /// server start aside: one more of its wall time in all (finding 9391e821d0da), so a server crashed on every call
 /// can't stretch a group without end.
 struct Allowance(Duration);
+
+/// A call's deadline: the host's, moved by its server's start if that has just been, since that isn't the host's
+/// time, and never past the call's `own` wall time.
+fn call_deadline(host: Instant, starting: Duration, own: Instant) -> Instant {
+    #[cfg(test)]
+    GIVEN.set(GIVEN.get().max(starting));
+    (host + starting).min(own)
+}
 
 impl Allowance {
     /// How much of `lost` the deadline moves by: what's left of the allowance at most.
@@ -464,8 +522,8 @@ impl Server<'_> {
         // From when the server started, if it has just been: its container's start isn't the call's, nor the
         // host's, whose deadline moves by it once this call is answered.
         let (_, running) = self.running.as_ref().expect("started");
-        let call = (deadline + self.starting)
-            .min(running.started().max(Instant::now()) + Duration::from_secs(limits.wall_seconds.into()));
+        let own = running.started().max(Instant::now()) + Duration::from_secs(limits.wall_seconds.into());
+        let call = call_deadline(deadline, self.starting, own);
         let budget = Duration::from_secs(limits.cpu_seconds.into());
         let (_, running) = self.running.as_mut().expect("started");
         let start = running.cpu().unwrap_or_default();

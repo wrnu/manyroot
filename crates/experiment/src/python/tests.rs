@@ -437,17 +437,20 @@ pub(crate) mod macos_only {
         assert!(running.cpu().unwrap_or_default() >= Duration::from_millis(500), "{:?}", running.cpu());
     }
 
-    /// A started child's CPU time is the supervisor's word, a tenth of a second behind at most.
+    /// A started child's CPU time is the supervisor's word, a tenth of a second behind at most. Every wait here is
+    /// long, as is the code's wall time: what's checked is the CPU time reported, and half a second of it can take
+    /// tens of seconds to get on a loaded machine (task 494343db20c9).
     #[test]
     fn a_started_childs_cpu_time_is_reported() {
         let Some(p) = python() else { return };
         let scratch = Scratch::new().expect("a scratch directory");
         let code = "import sys, time\nfor line in sys.stdin:\n    end = time.process_time() + 0.5\n\
                     \x20   while time.process_time() < end: pass\n    print('spun', flush=True)";
-        let mut running = p.start(&scratch, &["-c".into(), code.into()], &limits()).expect("started");
+        let roomy = Limits { wall_seconds: 600, ..limits() };
+        let mut running = p.start(&scratch, &["-c".into(), code.into()], &roomy).expect("started");
         running.send("spin").expect("sent");
-        assert_eq!(running.next(Instant::now() + Duration::from_secs(30)).as_deref(), Some("spun"));
-        let deadline = Instant::now() + Duration::from_secs(5);
+        assert_eq!(running.next(Instant::now() + Duration::from_secs(600)).as_deref(), Some("spun"));
+        let deadline = Instant::now() + Duration::from_secs(60);
         while running.cpu().unwrap_or_default() < Duration::from_millis(500) && Instant::now() < deadline {
             std::thread::sleep(POLL);
         }

@@ -781,6 +781,13 @@ impl Running {
         }
     }
 
+    /// In tests, how far [`Running::resume`] has moved its wall limit in all.
+    #[cfg(test)]
+    pub fn skipped(&self) -> Duration {
+        let ms = self.container.as_ref().map_or(0, |c| c.shared.extra.load(Ordering::SeqCst));
+        Duration::from_millis(ms)
+    }
+
     /// The CPU time the container has used so far, as the supervisor last said it: every 0.1 s.
     pub fn cpu(&self) -> Option<Duration> {
         let container = self.container.as_ref()?;
