@@ -22,6 +22,17 @@
 #       its patch, so only the tip it pushed and claimed can be judged by it). The remote-tracking ref's
 #       reflog can't say: git fetch --prune deletes it with the ref;
 #   - the entries of $TMPDIR/bracken-scratch (the team's scratch root, one entry per task), removed.
+# An entry of the scratch root holding a .keep file touched in the last 24 hours (not later than now) stays
+# whole, its cargo target dirs and any worktree inside it included: a builder that only reads its scratch
+# for a while touches .keep (task 02acb1d6e7e0). With --apply, it looks again (lsof) just before each
+# removal, worktree or scratch entry, after sizing it; a scratch entry is also renamed aside first and
+# looked at once more, as a target dir is, and goes only where lsof runs. An entry left renamed aside as
+# <entry>.cleanup-<pid> by a run that was stopped is put back under its name, never cleared (finding
+# 910ae8ed0fe3); a run stopped by INT, TERM or HUP puts back the one it has aside. What it judged before a
+# slow step (du, lsof, the merge check, the Ground read) it checks again after the last look, just before
+# the removal: a worktree whose HEAD, branch, files (git status, ignored ones too), scratch .keep or last use
+# changed stays; a renamed-aside scratch entry holding a fresh .keep, a git checkout or a change in the last
+# 2 hours, or a target dir changed in the time it had to be idle, is put back (finding 497ffa3fdcdc).
 # A builder's worktree it keeps for any other reason than being in use or out of bounds (dirty, unmerged,
 # young, on no branch...) still loses its target/ when no process has a file open in the worktree and
 # nothing in target/ changed for the target idle time: 3 hours, or --target-idle <hours>, or
@@ -84,6 +95,8 @@ t3_root=$(real "$HOME/.t3/worktrees/$(basename "$main")") || t3_root=""
 tmp_root=$(real "${TMPDIR:-/tmp}") || tmp_root=""
 runs=$(real "$HOME/bracken-runs") || runs=""
 scratch="${TMPDIR:-/tmp}/bracken-scratch"
+scratch_root=""
+[ -L "$scratch" ] || scratch_root=$(real "$scratch") || scratch_root=""
 
 acted=0 kept=0 untouched=0 failed=0 freed=0
 # What this run removes or would remove whole: a target dir inside one is already counted.
@@ -124,6 +137,18 @@ snapshot() {
   fi
 }
 snapshot
+# Whether $1 is, or is inside, an entry of the scratch root holding a .keep file (not a symlink) touched in
+# the last 24 hours (task 02acb1d6e7e0).
+kept_by_file() {
+  local rel e
+  inside "$1" "$scratch_root" && [ "$1" != "$scratch_root" ] || return 1
+  rel=${1#"$scratch_root"/}
+  e=$scratch_root/${rel%%/*}
+  # A .keep dated later than now doesn't count, so a mis-touched one can't hold an entry for years.
+  local t now_s
+  [ -f "$e/.keep" ] && [ ! -L "$e/.keep" ] && t=$(mtime "$e/.keep") && now_s=$(date +%s) &&
+    [ "${t:-0}" -le "$now_s" ] && [ $((now_s - t)) -lt 86400 ]
+}
 plain() { local LC_ALL=C; [[ $1 != *[![:print:]]* ]]; }
 # in_use on a new look, not the run's first one, which may be minutes old by now (finding 176efeffc76f).
 in_use_now() { snapshot; in_use "$1"; }
@@ -141,7 +166,9 @@ in_use() {
 }
 
 # Minutes since a worktree was last used: its directory, target/, and its HEAD, index and reflog.
-idle() {
+idle() { echo $(((now - $(last_used "$1")) / 60)); }
+# When worktree $1 was last used, in seconds since the epoch.
+last_used() {
   local gitdir newest=0 t f
   gitdir=$(git -C "$1" rev-parse --absolute-git-dir 2>/dev/null)
   for f in "$1" "$1/target" "$gitdir/HEAD" "$gitdir/index" "$gitdir/logs/HEAD"; do
@@ -150,7 +177,18 @@ idle() {
     t=$(mtime "$f") || continue
     [ "${t:-0}" -le "$newest" ] || newest=$t
   done
-  echo $(((now - newest) / 60))
+  echo "$newest"
+}
+# What can change about worktree $1 (branch $2, if any) with no process left in it to see (finding
+# 497ffa3fdcdc): its HEAD and branch tip, its files as git status sees them, ignored ones included, a fresh
+# .keep in its scratch entry, and when it was last used. Taken once it's judged clean, compared just before
+# its removal. A failed git call never compares equal.
+wt_state() {
+  git -C "$1" rev-parse -q --verify HEAD 2>/dev/null || echo "no HEAD $BASHPID $RANDOM"
+  [ -z "$2" ] || git rev-parse -q --verify "refs/heads/$2" 2>/dev/null || echo "no branch $BASHPID $RANDOM"
+  git -C "$1" status --porcelain --ignored=matching 2>/dev/null || echo "status failed $BASHPID $RANDOM"
+  ! kept_by_file "$1" || echo "fresh .keep"
+  last_used "$1"
 }
 
 # The branch's changes are all in origin/main (see the header). Sets landed to how: "merged", or "in <main
@@ -218,7 +256,7 @@ elif ! git fetch --prune --quiet origin </dev/null >/dev/null 2>&1; then
 fi
 
 worktree() {
-  local wt=$1 branch=$2 locked=$3 p name kind n user why size
+  local wt=$1 branch=$2 locked=$3 p name kind n user why size before
   p=$(real "$wt") || { say prune "$wt" "its directory is gone; git worktree prune drops it"; return; }
   [ "$p" != "$main" ] || return 0
   kind=""
@@ -245,6 +283,8 @@ worktree() {
   if [ "$n" -gt 0 ]; then stays untouched "$p" "dirty: $((n)) uncommitted files (for the manager)"; return; fi
   n=$(git -C "$p" log --oneline HEAD --not --branches --remotes 2>/dev/null | wc -l)
   if [ "$n" -gt 0 ]; then stays untouched "$p" "$((n)) commits on no branch or remote (for the manager)"; return; fi
+  # Clean, with nothing only it holds: compared again just before any removal.
+  before=$(wt_state "$p" "$branch")
   # bracken's .bracken/cache/ (its verified snapshot) is the one ignored entry there that holds no key.
   # =matching names each ignored path by the pattern it matches: .bracken/cache/ and .bracken/identities/
   # apart, though .bracken/ itself is untracked; a repo that ignores all of .bracken/ gets .bracken/, kept.
@@ -260,13 +300,21 @@ worktree() {
     return
   fi
   if user=$(in_use "$p"); then keep "$p" "in use by $user"; return; fi
+  if kept_by_file "$p"; then keep "$p" "its scratch entry holds a .keep touched in the last 24 h"; return; fi
   n=$(idle "$p")
   if [ "$n" -lt "$min_age" ]; then stays keep "$p" "used $n min ago"; return; fi
 
   if [ "$kind" != builder ]; then
     why="clean, unused, idle $((n / 60)) h"
     [ "$kind" = child ] && why="T3 worktree, $why" || why="scratch checkout, $why"
+    # Sized first: du on a big checkout takes a while, and the last look must come just before the removal
+    # (finding 075b4a4dbcfd).
     size=$(kb "$p")
+    if $apply && user=$(in_use_now "$p"); then keep "$p" "$why; but now in use by $user"; return; fi
+    if $apply && [ "$(wt_state "$p" "$branch")" != "$before" ]; then
+      keep "$p" "$why; but it changed while it was judged"
+      return
+    fi
     say remove "$p" "$why ($(gb "$size"))"
     gone+=("$p")
     acted=$((acted + 1))
@@ -313,6 +361,11 @@ worktree() {
       return
     fi
     size=$(kb "$p")
+    if $apply && user=$(in_use_now "$p"); then keep "$p" "branch $branch is merged, but now in use by $user"; return; fi
+    if $apply && [ "$(wt_state "$p" "$branch")" != "$before" ]; then
+      keep "$p" "branch $branch is merged, but the worktree changed while it was judged"
+      return
+    fi
     why="its changes are all in origin/main ($landed), origin has no $branch, nothing running"
     say remove "$p" "worktree and branch $branch: $why, idle $((n / 60)) h ($(gb "$size"))"
     gone+=("$p")
@@ -335,15 +388,17 @@ worktree() {
   if [ ! -d "$p/target" ]; then keep "$p" "branch $branch is merged; no target/ to clean"; return; fi
   if [ "$(real "$p/target")" != "$p/target" ]; then untouched "$p" "target/ resolves outside it"; return; fi
   if [ ! -f "$p/Cargo.toml" ]; then untouched "$p" "has target/ but no Cargo.toml"; return; fi
-  free_target "$p/target" "$p" "branch $branch is merged into origin/main, nothing running, idle $((n / 60)) h"
+  free_target "$p/target" "$p" "branch $branch is merged into origin/main, nothing running, idle $((n / 60)) h" \
+    "$min_age"
 }
 
 # Whether target dir $1 can go: a directory of its own, not a symlink, not resolving elsewhere, with
-# nothing in it changed for the target idle time. find fails on what it can't read: then it stays.
+# nothing in it changed for the target idle time, or for $2 minutes if given. find fails on what it can't
+# read: then it stays.
 idle_target() {
   local recent
   [ -d "$1" ] && [ ! -L "$1" ] && [ "$(real "$1")" = "$1" ] || return 1
-  recent=$(find "$1" -mmin -"$target_age" -print 2>/dev/null | head -1) || return 1
+  recent=$(find "$1" -mmin -"${2:-$target_age}" -print 2>/dev/null | head -1) || return 1
   [ -z "$recent" ]
 }
 # Removes target dir $1 directly (cargo clean follows CARGO_TARGET_DIR, build.target-dir and
@@ -355,7 +410,8 @@ idle_target() {
 # With --apply, just before removing it (finding 176efeffc76f): $2 is looked at again, the target dir is
 # renamed aside in its own directory (one rename, so a build starting now can't find half of it), $2 is
 # looked at once more, and only then is the renamed copy deleted. A process found at either look keeps it,
-# renamed back.
+# renamed back, as does a change in the copy within the target idle time, or $4 minutes if given: one made
+# while it was sized (finding 497ffa3fdcdc).
 free_target() {
   local size user aside=$1.cleanup-$$ rel=${1#"$2"/}
   if ! $have_lsof; then keep "$2" "$3; but $rel/ stays: no lsof to check nothing uses it"; return 1; fi
@@ -367,12 +423,20 @@ free_target() {
       say failed "$2" "couldn't rename $rel/ aside to remove it"
       return 1
     fi
+    # In use, or changed while it was sized (finding 497ffa3fdcdc): put back.
     if user=$(in_use_now "$2"); then
+      user="in use by $user once renamed aside"
+    elif ! idle_target "$aside" "${4:-}"; then
+      user="it changed while it was sized"
+    else
+      user=""
+    fi
+    if [ -n "$user" ]; then
       if [ ! -e "$1" ] && [ ! -L "$1" ] && mv -- "$aside" "$1" 2>/dev/null; then
-        keep "$2" "$3; but $rel/ stays: in use by $user once renamed aside, so put back"
+        keep "$2" "$3; but $rel/ stays: $user, so put back"
       else
         failed=$((failed + 1))
-        say failed "$2" "$rel/ came into use by $user once renamed aside, and couldn't be put back: it's ${aside##*/}"
+        say failed "$2" "$rel/: $user, and couldn't be put back: it's ${aside##*/}"
       fi
       return 1
     fi
@@ -424,6 +488,37 @@ stays() {
   fi
   "$verdict" "$p" "$why"
 }
+
+# Whether scratch entry $1 is one a run renamed aside, <entry>.cleanup-<pid>: sets lorig to the entry's
+# path and lpid to the run's pid (finding 910ae8ed0fe3).
+lorig="" lpid=""
+leftover() {
+  [ -d "$1" ] && [ ! -L "$1" ] && [[ ${1##*/} =~ ^(.+)\.cleanup-([1-9][0-9]*)$ ]] || return 1
+  lorig=${1%/*}/${BASH_REMATCH[1]} lpid=${BASH_REMATCH[2]}
+}
+# Before any worktree is judged (one inside such an entry would look gone, and be pruned): an entry a run
+# that's over left renamed aside goes back under its name if that's free. It isn't judged again this run.
+restored=()
+was_restored() {
+  local r
+  for r in "${restored[@]}"; do [ "$r" != "$1" ] || return 0; done
+  return 1
+}
+if [ -n "$scratch_root" ]; then
+  for e in "$scratch_root"/*.cleanup-* "$scratch_root"/.*.cleanup-*; do
+    leftover "$e" || continue
+    ! ps -p "$lpid" >/dev/null 2>&1 || continue
+    [ ! -e "$lorig" ] && [ ! -L "$lorig" ] || continue
+    say "put back" "$lorig" "${e##*/}: renamed aside by a cleanup run that was stopped; back under its name"
+    acted=$((acted + 1))
+    restored+=("$lorig")
+    $apply || continue
+    if ! mv -- "$e" "$lorig" 2>/dev/null; then
+      failed=$((failed + 1))
+      say failed "$e" "couldn't put it back as ${lorig##*/}"
+    fi
+  done
+fi
 
 # git worktree list --porcelain: a block per worktree, "worktree <path>" first, then "branch refs/heads/<b>"
 # or "detached", and "locked" or "prunable" when they apply.
@@ -480,38 +575,100 @@ this_repo() {
   [ -n "$origin_url" ] && [ "$u" = "$origin_url" ]
 }
 
+# Removes scratch entry $1, saying why ($2). Only with lsof, as for a target dir. With --apply, just before
+# (task 02acb1d6e7e0, finding 176efeffc76f's rule): it looks again, renames the entry aside in the scratch
+# root, looks at the renamed copy once more, and only then deletes it. A process found at either look keeps
+# it, renamed back.
+inflight_from="" inflight_to=""
+trap 'if [ -n "$inflight_to" ] && [ -e "$inflight_to" ] && [ ! -e "$inflight_from" ] && [ ! -L "$inflight_from" ]; then
+  mv -- "$inflight_to" "$inflight_from" 2>/dev/null; fi; exit 130' INT TERM HUP
+free_entry() {
+  local e=$1 why=$2 size user aside=$1.cleanup-$$
+  if ! $have_lsof; then keep "$e" "$why; but it stays: no lsof to check nothing uses it"; return; fi
+  size=$(kb "$e")
+  if $apply; then
+    if user=$(in_use_now "$e"); then keep "$e" "$why; but now in use by $user"; return; fi
+    # Set before the mv: a signal during it runs the trap as soon as mv returns.
+    [ -e "$aside" ] || [ -L "$aside" ] || inflight_from=$e inflight_to=$aside
+    if [ -z "$inflight_to" ] || ! mv -- "$e" "$aside" 2>/dev/null; then
+      inflight_from="" inflight_to=""
+      failed=$((failed + 1))
+      say failed "$e" "couldn't rename it aside to remove it"
+      return
+    fi
+    # In use, or what kept an entry came about while it was sized (finding 497ffa3fdcdc): put back.
+    if user=$(in_use_now "$aside"); then
+      user="in use by $user once renamed aside"
+    elif kept_by_file "$aside"; then
+      user="a .keep was touched while it was sized"
+    elif [ -n "$(find "$aside" -name .git -print 2>/dev/null | head -1)" ]; then
+      user="a git checkout appeared in it while it was sized"
+    elif [ -n "$(find "$aside" -mmin -"$min_age" ! -mmin -0 -print 2>/dev/null | head -1)" ]; then
+      user="it changed while it was sized"
+    else
+      user=""
+    fi
+    if [ -n "$user" ]; then
+      if [ ! -e "$e" ] && [ ! -L "$e" ] && mv -- "$aside" "$e" 2>/dev/null; then
+        keep "$e" "$why; but $user, so put back"
+      else
+        failed=$((failed + 1))
+        say failed "$e" "$user, and couldn't be put back: it's ${aside##*/}"
+      fi
+      inflight_from="" inflight_to=""
+      return
+    fi
+  fi
+  say clear "$e" "$why ($(gb "${size:-0}"))"
+  acted=$((acted + 1))
+  $apply || { freed=$((freed + ${size:-0})); return; }
+  if rm -rf -- "$aside"; then
+    freed=$((freed + ${size:-0}))
+  else
+    failed=$((failed + 1))
+    freed=$((freed + ${size:-0} - $(kb "$aside")))
+    say failed "$e" "couldn't remove all of it (renamed ${aside##*/})"
+  fi
+  inflight_from="" inflight_to=""
+}
+
 # The scratch root's entries. A checkout of this repo there was handled above; any other git checkout
 # is left alone, since only git worktree remove (or its owner) should take it, but its idle cargo target
 # dirs go.
 if [ -L "$scratch" ]; then
   untouched "$scratch" "a symlink; the scratch root must be a directory"
 elif [ -d "$scratch" ]; then
-  root=$(real "$scratch")
+  root=$scratch_root
   for e in "$root"/* "$root"/.[!.]* "$root"/..?*; do
     [ -e "$e" ] || [ -L "$e" ] || continue
     if forbidden "$e"; then untouched "$e" "holds .bracken/ or ~/bracken-runs"; continue; fi
     if other_project "$e"; then untouched "$e" "named pg-*, another project's"; continue; fi
     if user=$(in_use "$e"); then keep "$e" "in use by $user"; continue; fi
+    if was_restored "$e"; then keep "$e" "put back this run; judged again next time"; continue; fi
+    if leftover "$e"; then
+      if ps -p "$lpid" >/dev/null 2>&1; then
+        keep "$e" "renamed aside by cleanup run $lpid, still running"
+      elif ! was_restored "$lorig"; then
+        untouched "$e" "left renamed aside by a stopped cleanup run while ${lorig##*/} existed (for the manager)"
+      fi
+      continue
+    fi
+    if kept_by_file "$e"; then
+      keep "$e" "holds a .keep touched in the last 24 h: kept whole, target dirs included"
+      continue
+    fi
     if [ -n "$(find "$e" -name .git -print 2>/dev/null | head -1)" ]; then
       untouched "$e" "holds a git checkout; remove it with git worktree remove (for the manager)"
       scratch_targets "$e"
       continue
     fi
-    if [ -n "$(find "$e" -mmin -"$min_age" -print 2>/dev/null | head -1)" ]; then
+    # ! -mmin -0 leaves out what's dated in the future, which would otherwise hold the entry for good.
+    if [ -n "$(find "$e" -mmin -"$min_age" ! -mmin -0 -print 2>/dev/null | head -1)" ]; then
       keep "$e" "changed in the last $((min_age / 60)) h"
       scratch_targets "$e"
       continue
     fi
-    size=$(kb "$e")
-    say clear "$e" "scratch, unused, unchanged for $((min_age / 60)) h ($(gb "${size:-0}"))"
-    acted=$((acted + 1))
-    $apply || { freed=$((freed + ${size:-0})); continue; }
-    if rm -rf -- "$e"; then
-      freed=$((freed + ${size:-0}))
-    else
-      failed=$((failed + 1))
-      say failed "$e" "couldn't remove all of it"
-    fi
+    free_entry "$e" "scratch, unused, unchanged for $((min_age / 60)) h"
   done
 fi
 

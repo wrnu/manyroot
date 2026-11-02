@@ -7212,7 +7212,7 @@ fn cleanup_frees_idle_targets_of_worktrees_it_keeps_and_reports_dockers_build_ca
 
 /// Finding 176efeffc76f: without lsof, cleanup removes no target dir, rather than judge use from the /proc
 /// fallback (which misses a program run from a target dir) or from nothing (macOS has no /proc). An
-/// unmerged worktree's idle target/ stays, saying why.
+/// unmerged worktree's idle target/ stays, saying why, as does an idle scratch entry (task 02acb1d6e7e0).
 #[test]
 fn cleanup_without_lsof_removes_no_target_dir() {
     for scripts in SCRIPTS {
@@ -7238,6 +7238,8 @@ fn cleanup_without_lsof_removes_no_target_dir() {
         git(&wt, &["commit", "-qm", "f"]);
         std::fs::create_dir_all(wt.join("target/debug")).unwrap();
         std::fs::write(wt.join("target/debug/big"), "build").unwrap();
+        std::fs::create_dir_all(tmpdir.join("bracken-scratch/old")).unwrap();
+        std::fs::write(tmpdir.join("bracken-scratch/old/notes"), "notes").unwrap();
         set_mtimes(t, std::time::SystemTime::now() - std::time::Duration::from_secs(4 * 3600));
         // PATH without lsof, and with a docker that isn't the machine's. Each directory holding lsof is
         // replaced by a copy of links to everything else in it: on Linux lsof is in /usr/bin, beside git.
@@ -7273,7 +7275,232 @@ fn cleanup_without_lsof_removes_no_target_dir() {
         assert!(wt.join("target/debug/big").exists(), "{scripts}: target/ went without lsof: {stdout}");
         let l = stdout.lines().find(|l| l.contains("/idle:")).unwrap_or_else(|| panic!("{scripts}: {stdout}"));
         assert!(l.starts_with("keep") && l.contains("lsof"), "{scripts}: {l}");
+        let l = stdout.lines().find(|l| l.contains("/old:")).unwrap_or_else(|| panic!("{scripts}: {stdout}"));
+        // Without lsof, macOS's first look gives nothing and Linux's /proc look can't clear it: kept either way.
+        assert!(l.starts_with("keep") && l.contains("lsof"), "{scripts}: {l}");
+        assert!(tmpdir.join("bracken-scratch/old/notes").exists(), "{scripts}: {stdout}");
     }
+}
+
+/// Task 02acb1d6e7e0 and PR #224's review: cleanup keeps a scratch entry a builder is still using.
+/// - Cleared: an idle entry, and those whose .keep is a day old, dated in the future, a symlink or a
+///   directory (finding f53cfe828590).
+/// - Kept: one a process starts using after the run's first look (while cleanup sizes it), found by the look
+///   just before its removal; one a process starts using once it's renamed aside, put back; one only read
+///   for a while whose .keep was touched in the last 24 hours, whole, its idle cargo target dir included; a
+///   worktree inside such an entry; and a clean scratch worktree a process starts using while cleanup sizes
+///   it, found by the look after sizing (finding 075b4a4dbcfd).
+/// - Put back, or kept, because of what happened while cleanup sized them, by commands that had exited by
+///   its next look (finding 497ffa3fdcdc): an entry whose .keep was touched, one that was written to, one that
+///   gained a git checkout, and a scratch worktree that gained a commit.
+/// - Entries left renamed aside as <entry>.cleanup-<pid> (finding 910ae8ed0fe3): put back when that run is
+///   over and the name is free, and not cleared in the same run; kept when the name exists again, or while
+///   the run still runs.
+/// - A run stopped by TERM while it has an entry aside puts it back.
+#[test]
+fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
+    for scripts in SCRIPTS {
+        let cleanup = repo_root().join(scripts).join("cleanup");
+        let (tmp, dir) = repo(&[("scripts/cleanup", &cleanup)], ".bracken/\n/target\n", |dir| {
+            std::fs::write(dir.join("Cargo.toml"), "[workspace]\n").unwrap();
+        });
+        let t = tmp.path();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = run(dir, "git", args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let origin = t.join("origin.git");
+        git(t, &["init", "-q", "--bare", "-b", "main", origin.to_str().unwrap()]);
+        git(&dir, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&dir, &["push", "-q", "-u", "origin", "main"]);
+        let (home, tmpdir) = (t.join("home"), t.join("tmpdir"));
+        std::fs::create_dir_all(&home).unwrap();
+        let scratch = tmpdir.join("bracken-scratch");
+        // A pid no process has: a child that has been waited for.
+        let mut gone = Command::new("true").spawn().unwrap();
+        gone.wait().unwrap();
+        let (dead, alive) = (gone.id(), std::process::id());
+        let entries =
+            ["idle", "stale", "future", "linkkeep", "dirkeep", "late", "moved", "read", "dup", "kp", "wr", "gt"];
+        let leftovers =
+            [format!("orphan.cleanup-{dead}"), format!("dup.cleanup-{dead}"), format!("busy.cleanup-{alive}")];
+        for name in entries.iter().map(|s| s.to_string()).chain(leftovers.iter().cloned()) {
+            std::fs::create_dir_all(scratch.join(&name).join("notes")).unwrap();
+            std::fs::write(scratch.join(&name).join("notes/log"), &name).unwrap();
+        }
+        // An idle cargo target dir in the entry kept by its .keep.
+        std::fs::create_dir_all(scratch.join("read/tgt/debug")).unwrap();
+        std::fs::write(scratch.join("read/tgt/debug/big"), "build").unwrap();
+        std::fs::write(
+            scratch.join("read/tgt/CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
+        // Clean scratch checkouts of this repo: one in an entry its builder only reads, one in use soon.
+        for wt in ["task/wt", "sized/wt", "commit/wt"] {
+            let wt = scratch.join(wt);
+            std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+            git(&dir, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+        }
+        let now = std::time::SystemTime::now();
+        let hours = |h: i64| {
+            if h >= 0 {
+                now - std::time::Duration::from_secs(h as u64 * 3600)
+            } else {
+                now + std::time::Duration::from_secs((-h) as u64 * 3600)
+            }
+        };
+        for (entry, h) in [("read", 3), ("task", 3), ("stale", 30), ("future", -48)] {
+            std::fs::write(scratch.join(entry).join(".keep"), "").unwrap();
+            set_mtimes(&scratch.join(entry).join(".keep"), hours(h));
+        }
+        // A fresh file outside, linked as linkkeep's .keep; a directory .keep, touched 3 h ago.
+        std::fs::write(t.join("fresh"), "").unwrap();
+        std::os::unix::fs::symlink(t.join("fresh"), scratch.join("linkkeep/.keep")).unwrap();
+        std::fs::create_dir(scratch.join("dirkeep/.keep")).unwrap();
+        let skip = ["read/.keep", "task/.keep", "stale/.keep", "future/.keep", "dirkeep/.keep", "linkkeep/.keep"];
+        for entry in std::fs::read_dir(t).unwrap().flatten() {
+            if entry.file_name() != "fresh" {
+                set_mtimes_but(&entry.path(), hours(4), &skip.map(|s| scratch.join(s)));
+            }
+        }
+        set_mtimes(&scratch.join("dirkeep/.keep"), hours(3));
+        // dup is in use again, changed just now, beside its old copy.
+        set_mtimes(&scratch.join("dup/notes/log"), now);
+        let old = Command::new("touch").args(["-h", "-t", "202001010000"]).arg(scratch.join("linkkeep/.keep")).status();
+        assert!(old.unwrap().success(), "touch -h");
+
+        // A du that, sizing late or sized/wt, and an mv that, renaming moved or trapped aside, each first
+        // start a process with its working directory there, so only the looks after can find them. Renaming
+        // trapped aside, mv also sends cleanup TERM.
+        let stubs = t.join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(&stubs.join("docker"), "#!/bin/sh\nexit 1\n");
+        let which = |p: &str| String::from_utf8(run(&dir, "sh", &["-c", &format!("command -v {p}")]).stdout).unwrap();
+        let pids = t.join("pids");
+        let (du, mv) = (which("du"), which("mv"));
+        write_executable(
+            &stubs.join("du"),
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in *\"/late\" | *\"/sized/wt\") (cd \"$2\" && exec sleep 600) >/dev/null 2>&1 \
+                 </dev/null & echo $! >>'{pids}'; sleep 1 ;;\n\
+                 *\"/kp\") touch \"$2/.keep\" ;;\n*\"/wr\") echo new >\"$2/notes/new\" ;;\n\
+                 *\"/gt\") mkdir \"$2/sub\" && : >\"$2/sub/.git\" ;;\n\
+                 *\"/commit/wt\") git -C \"$2\" commit -q --allow-empty -m during ;;\nesac\nexec '{du}' \"$@\"\n",
+                pids = pids.display(),
+                du = du.trim()
+            ),
+        );
+        write_executable(
+            &stubs.join("mv"),
+            &format!(
+                "#!/bin/sh\n'{mv}' \"$@\" || exit\nfor a; do to=$a; done\ncase \"$to\" in */moved.cleanup-*) \
+                 (cd \"$to\" && exec sleep 600) >/dev/null 2>&1 </dev/null & echo $! >>'{pids}'; sleep 1 ;;\n\
+                 */trapped.cleanup-*) kill -TERM $PPID ;; esac\n",
+                pids = pids.display(),
+                mv = mv.trim()
+            ),
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let cleanup = || {
+            let out = command(&dir, "scripts/cleanup", &["--apply"])
+                .env("HOME", &home)
+                .env("TMPDIR", &tmpdir)
+                .env("PATH", &path)
+                .output()
+                .unwrap();
+            for pid in std::fs::read_to_string(&pids).unwrap_or_default().split_whitespace() {
+                let _ = Command::new("kill").arg(pid).status();
+            }
+            let _ = std::fs::remove_file(&pids);
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let (code, stdout) = cleanup();
+        assert_eq!(code, Some(0), "{scripts}: {stdout}");
+        let line = |name: &str| {
+            stdout
+                .lines()
+                .find(|l| l.contains(&format!("/{name}:")))
+                .unwrap_or_else(|| panic!("{scripts}: no line for {name}: {stdout}"))
+                .to_owned()
+        };
+        for gone in ["idle", "stale", "future", "linkkeep", "dirkeep"] {
+            assert!(line(gone).starts_with("clear"), "{scripts}: {gone}: {stdout}");
+            assert!(!scratch.join(gone).exists(), "{scripts}: {gone} stayed: {stdout}");
+        }
+        for (kept, why) in [
+            ("late", "now in use by pid"),
+            ("moved", "once renamed aside, so put back"),
+            ("read", "kept whole, target dirs included"),
+            ("task/wt", "its scratch entry holds a .keep"),
+            ("sized/wt", "but now in use by pid"),
+            ("kp", "a .keep was touched while it was sized, so put back"),
+            ("wr", "it changed while it was sized, so put back"),
+            ("gt", "a git checkout appeared in it while it was sized, so put back"),
+            ("commit/wt", "but it changed while it was judged"),
+            (&format!("busy.cleanup-{alive}"), "still running"),
+        ] {
+            let l = line(kept);
+            assert!(l.starts_with("keep") && l.contains(why), "{scripts}: {kept}: {l}");
+        }
+        let l = line(&format!("dup.cleanup-{dead}"));
+        assert!(l.starts_with("won't touch") && l.contains("while dup existed"), "{scripts}: {l}");
+        let l = stdout.lines().find(|l| l.starts_with("put back")).unwrap_or_else(|| panic!("{scripts}: {stdout}"));
+        assert!(l.contains("/orphan:"), "{scripts}: {l}");
+        let again = stdout.lines().any(|l| l.starts_with("keep") && l.contains("/orphan: put back this run"));
+        assert!(again, "{scripts}: orphan was judged again: {stdout}");
+        for kept in [
+            "late",
+            "moved",
+            "read",
+            "read/tgt/debug/big",
+            "task/wt",
+            "sized/wt",
+            "orphan/notes/log",
+            "dup",
+            "kp/.keep",
+            "wr/notes/new",
+            "gt/sub/.git",
+            "commit/wt",
+        ] {
+            assert!(scratch.join(kept).exists(), "{scripts}: {kept} went: {stdout}");
+        }
+        for kept in [format!("dup.cleanup-{dead}"), format!("busy.cleanup-{alive}")] {
+            assert!(scratch.join(&kept).exists(), "{scripts}: {kept} went: {stdout}");
+        }
+        assert!(!scratch.join(format!("orphan.cleanup-{dead}")).exists(), "{scripts}: {stdout}");
+        assert!(scratch.join("moved/notes/log").exists(), "{scripts}: moved wasn't put back whole: {stdout}");
+        assert!(stdout.lines().last().unwrap().contains("6 done"), "{scripts}: {stdout}");
+
+        // A run stopped while it has trapped aside puts it back, and leaves no copy.
+        std::fs::create_dir_all(scratch.join("trapped/notes")).unwrap();
+        set_mtimes(&scratch.join("trapped"), hours(4));
+        let (code, stdout) = cleanup();
+        assert_eq!(code, Some(130), "{scripts}: {stdout}");
+        assert!(scratch.join("trapped/notes").exists(), "{scripts}: trapped wasn't put back: {stdout}");
+        let left: Vec<_> = std::fs::read_dir(&scratch).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert!(
+            left.iter().all(|n| !n.to_string_lossy().starts_with("trapped.cleanup-")),
+            "{scripts}: a copy was left: {left:?}"
+        );
+    }
+}
+
+/// [`set_mtimes`], but leaving the paths in `skip` (and what's under them) as they are.
+fn set_mtimes_but(path: &Path, when: std::time::SystemTime, skip: &[PathBuf]) {
+    if skip.iter().any(|s| s == path) {
+        return;
+    }
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    if meta.is_symlink() {
+        return;
+    }
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path).unwrap() {
+            set_mtimes_but(&entry.unwrap().path(), when, skip);
+        }
+    }
+    std::fs::File::open(path).unwrap().set_modified(when).unwrap();
 }
 
 /// Task 9fa138208dac: bracken's .bracken/cache/ (its verified snapshot, since #204) is the one ignored entry
@@ -7282,6 +7509,9 @@ fn cleanup_without_lsof_removes_no_target_dir() {
 /// .bracken/identities/ (a key) stays, saying why. The repo ignores those two as this one does, not all of
 /// .bracken/. A git status --ignored=matching that fails keeps both, at either check (finding 6dc71b5c4733):
 /// a git wrapper fails it for the .bracken/ check and the whole-worktree one, then for the latter only.
+/// PR #224's review: two more such worktrees stay, with their branches, found by the checks just before the
+/// removal (findings 075b4a4dbcfd, 497ffa3fdcdc): one a process starts using while cleanup sizes it, and one
+/// that gains a commit then, by a command that has exited by the next look.
 #[test]
 fn cleanup_removes_a_merged_worktree_holding_brackens_cache_but_not_one_holding_a_key() {
     for scripts in SCRIPTS {
@@ -7305,7 +7535,7 @@ fn cleanup_removes_a_merged_worktree_holding_brackens_cache_but_not_one_holding_
         // Each a commit of its own, squash-merged into main, never on origin, its head claimed.
         bk(&dir, &["init", "--name", "cleanup"]);
         bk(&dir, &["id", "new", "builder"]);
-        for (n, name) in ["cached", "keyed"].iter().enumerate() {
+        for (n, name) in ["cached", "keyed", "busy", "moving"].iter().enumerate() {
             let wt = t3.join(name);
             git(&dir, &["worktree", "add", "-q", "-b", name, wt.to_str().unwrap()]);
             std::fs::write(wt.join(name), name).unwrap();
@@ -7328,6 +7558,25 @@ fn cleanup_removes_a_merged_worktree_holding_brackens_cache_but_not_one_holding_
         let stubs = t.join("stubs");
         std::fs::create_dir_all(&stubs).unwrap();
         write_executable(&stubs.join("docker"), "#!/bin/sh\nexit 1\n");
+        // With --apply, a du that, sizing busy, starts a process there, and sizing moving, commits there.
+        let pids = t.join("pids");
+        let du = String::from_utf8(run(&dir, "sh", &["-c", "command -v du"]).stdout).unwrap();
+        write_executable(
+            &stubs.join("du"),
+            &format!(
+                "#!/bin/sh
+[ -z \"$DU_ACTS\" ] || case \"$*\" in
+\
+                 *\"/busy\") (cd \"$2\" && exec sleep 600) >/dev/null 2>&1 </dev/null & echo $! >>'{pids}'; sleep 1 ;;
+\
+                 *\"/moving\") git -C \"$2\" commit -q --allow-empty -m during ;;
+esac
+exec '{du}' \"$@\"
+",
+                pids = pids.display(),
+                du = du.trim()
+            ),
+        );
         let real_git = String::from_utf8(run(&dir, "sh", &["-c", "command -v git"]).stdout).unwrap();
         write_executable(
             &stubs.join("git"),
@@ -7345,8 +7594,13 @@ fn cleanup_removes_a_merged_worktree_holding_brackens_cache_but_not_one_holding_
                 .env("TMPDIR", &tmpdir)
                 .env("PATH", &path)
                 .env("FAIL_GIT", fail)
+                .env("DU_ACTS", if args.is_empty() { "" } else { "1" })
                 .output()
                 .unwrap();
+            for pid in std::fs::read_to_string(&pids).unwrap_or_default().split_whitespace() {
+                let _ = Command::new("kill").arg(pid).status();
+            }
+            let _ = std::fs::remove_file(&pids);
             (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
         };
         let line_in = |out: &str, name: &str| -> String {
@@ -7377,6 +7631,16 @@ fn cleanup_removes_a_merged_worktree_holding_brackens_cache_but_not_one_holding_
         let keyed = line("keyed");
         assert!(keyed.starts_with("won't touch") && keyed.contains("perhaps an identity's key"), "{scripts}: {keyed}");
         assert!(t3.join("keyed/.bracken/identities/k").exists(), "{scripts}: {stdout}");
+        for (name, why) in [
+            ("busy", "branch busy is merged, but now in use by pid"),
+            ("moving", "branch moving is merged, but the worktree changed while it was judged"),
+        ] {
+            let l = line(name);
+            assert!(l.starts_with("keep") && l.contains(why), "{scripts}: {name}: {l}");
+            assert!(t3.join(name).join(".bracken/cache/snapshot").exists(), "{scripts}: {name} went: {stdout}");
+            let branches = String::from_utf8(run(&dir, "git", &["branch", "--list", name]).stdout).unwrap();
+            assert!(!branches.trim().is_empty(), "{scripts}: branch {name} went: {stdout}");
+        }
     }
 }
 
@@ -7587,7 +7851,8 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
 /// made a new target/, the put-back fails and the copy stays as target.cleanup-<pid>. A later run, once that
 /// pid is gone and nothing uses the worktree, frees the copy, and the copy doesn't make the worktree dirty,
 /// in the dry run either. A copy whose pid still runs stays. The repo's .gitignore here, like an old
-/// branch's, doesn't cover the copies.
+/// branch's, doesn't cover the copies. A target/ a build writes to while cleanup sizes it, and that has
+/// exited by the next look, is put back too (finding 497ffa3fdcdc).
 #[test]
 fn cleanup_puts_back_a_target_dir_used_once_renamed_aside_and_later_frees_a_copy_left_behind() {
     for scripts in SCRIPTS {
@@ -7610,7 +7875,7 @@ fn cleanup_puts_back_a_target_dir_used_once_renamed_aside_and_later_frees_a_copy
         // Unmerged builders' worktrees with an idle target/; "live" also holds a copy whose pid runs.
         let live = Sleeper::in_dir(t);
         let live_copy = format!("target.cleanup-{}", live.id());
-        for name in ["back", "stuck", "live"] {
+        for name in ["back", "stuck", "live", "built"] {
             let wt = t3.join(name);
             git(&dir, &["worktree", "add", "-q", "-b", name, wt.to_str().unwrap()]);
             std::fs::write(wt.join("f"), name).unwrap();
@@ -7644,6 +7909,16 @@ fn cleanup_puts_back_a_target_dir_used_once_renamed_aside_and_later_frees_a_copy
             state = state.display()
         );
         write_executable(&stubs.join("mv"), &stub);
+        // A du that, the first time it sizes built/target, writes there, as a build would.
+        let du = String::from_utf8(run(&dir, "sh", &["-c", "command -v du"]).stdout).unwrap();
+        let stub = format!(
+            "#!/bin/sh
+case \"$*\" in *\"/built/target\") [ -e '{state}'/built ] || \
+             {{ : >'{state}'/built; echo new >\"$2/debug/new\"; }} ;; esac\nexec '{du}' \"$@\"\n",
+            du = du.trim(),
+            state = state.display()
+        );
+        write_executable(&stubs.join("du"), &stub);
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
         let cleanup = |args: &[&str]| {
             let out = command(&dir, "scripts/cleanup", args)
@@ -7690,6 +7965,13 @@ fn cleanup_puts_back_a_target_dir_used_once_renamed_aside_and_later_frees_a_copy
         assert!(back.starts_with("keep") && back.contains("once renamed aside, so put back"), "{scripts}: {back}");
         assert!(t3.join("back/target/debug/big").exists(), "{scripts}: {first}");
         assert!(copies("back").is_empty(), "{scripts}: {:?}", copies("back"));
+        let built = lines(&first, "built").join("\n");
+        assert!(
+            built.starts_with("keep") && built.contains("it changed while it was sized, so put back"),
+            "{scripts}: {built}"
+        );
+        assert!(t3.join("built/target/debug/new").exists(), "{scripts}: {first}");
+        assert!(copies("built").is_empty(), "{scripts}: {:?}", copies("built"));
         let stuck = lines(&first, "stuck").join("\n");
         assert!(stuck.starts_with("failed") && stuck.contains("couldn't be put back"), "{scripts}: {stuck}");
         let left = copies("stuck");
