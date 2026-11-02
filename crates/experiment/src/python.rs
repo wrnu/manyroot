@@ -62,6 +62,9 @@ thread_local! {
     /// In tests, the seconds the supervisor waits after its last word before it ends, as a slow container teardown
     /// would take: for runs started on this thread.
     static LINGER: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// In tests, the seconds the supervisor waits after starting the code before its loop first runs, as a
+    /// supervisor the scheduler holds back would: for runs started on this thread.
+    static LATE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 /// The most bytes of one frame from the supervisor: a collected file is the longest.
 const MAX_FRAME: usize = 64 << 20;
@@ -439,8 +442,9 @@ struct Shared {
     extra: AtomicU64,
     /// Since when its wall time has stood still, if it has ([`Running::pause`]).
     paused: Mutex<Option<Instant>>,
-    /// The code's CPU time, in microseconds: the container's, less what its first report said, which is the
-    /// supervisor's start and the inputs' copy (finding 0179ec8bd23a).
+    /// The code's CPU time, in microseconds: the container's, less what its first report said, which the
+    /// supervisor sends just before it starts the code: its own start and the inputs' copy (finding 0179ec8bd23a),
+    /// and none of the code's (task 0e4b7ddda386).
     cpu: AtomicU64,
     /// The container's CPU time in its first report, in microseconds.
     cpu_base: std::sync::OnceLock<u64>,
@@ -505,6 +509,7 @@ impl Container {
         #[cfg(test)]
         {
             spec["linger"] = LINGER.get().into();
+            spec["late"] = LATE.get().into();
         }
         let spec = spec.to_string();
         let source =

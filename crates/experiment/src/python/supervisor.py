@@ -7,14 +7,16 @@ much CPU time the container has used; and once the code has ended, it says how t
 scratch directory was full. It only classifies: every limit is the kernel's or the runner's, never its own.
 
 Frames, on standard output: a tag byte, a four-byte big-endian length, then the payload. `o` and `e` are the
-code's standard output and error; `c` the container's CPU time in microseconds, in decimal; `f` a collected file,
+code's standard output and error; `c` the container's CPU time in microseconds, in decimal, the first just before
+the code starts, and then as it runs; `f` a collected file,
 its path relative to the collected directory, a NUL, then its bytes; and `x`, last, a JSON object: `status`, the
 code's exit status (negative for a signal, as subprocess has it), and `scratch`, whether the scratch directory was
 full at any check. Its own errors go to standard error.
 
 Argument: a JSON object with `argv`, the code's arguments after the interpreter's own flags; `cwd`, its working
 directory; and `collect`, a directory under the scratch directory whose regular files go back once the code has
-ended, or null.
+ended, or null. Tests only may add `late`, the seconds to wait after starting the code before it first reads the
+code's output, and `linger`, the seconds to wait after the last frame before it ends.
 """
 
 import ctypes
@@ -118,6 +120,9 @@ def main():
         sys.stderr.buffer.write(b"copying the inputs: " + copy_err[-2000:])
         frame(b"x", json.dumps({"status": None, "scratch": full()}).encode())
         return
+    # Before the code starts: the runner counts the code's CPU time from this report, so none of it can come
+    # before, whenever the loop below first runs (task 0e4b7ddda386).
+    frame(b"c", cpu())
     argv = [sys.executable, "-I", "-S", "-B", "-X", "utf8", *spec["argv"]]
     child = as_code(argv, cwd=spec["cwd"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     os.setgroups([])
@@ -126,6 +131,8 @@ def main():
     sel = selectors.DefaultSelector()
     sel.register(child.stdout, selectors.EVENT_READ, b"o")
     sel.register(child.stderr, selectors.EVENT_READ, b"e")
+    # Only tests set it, to stand for a supervisor the scheduler holds back after the code has started.
+    time.sleep(spec.get("late", 0))
     was_full, next_poll = False, 0.0
     while child.poll() is None:
         if time.monotonic() >= next_poll:

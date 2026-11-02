@@ -398,6 +398,27 @@ pub(crate) mod macos_only {
         assert!(o.ran < Duration::from_secs(5), "{:?}", o.ran);
     }
 
+    /// The code's CPU time counts from before it starts, however late the supervisor runs after (task
+    /// 0e4b7ddda386): here it starts reading 2 s after the code has started, by when the code has spun half a
+    /// second, all of which counts.
+    #[test]
+    fn the_codes_cpu_time_counts_from_before_it_starts() {
+        let Some(p) = python() else { return };
+        let scratch = Scratch::new().expect("a scratch directory");
+        let code = "import time\nend = time.process_time() + 0.5\nwhile time.process_time() < end: pass\n\
+                    print('spun', flush=True)\ntime.sleep(60)";
+        LATE.set(2);
+        let running = p.start(&scratch, &["-c".into(), code.into()], &limits());
+        LATE.set(0);
+        let running = running.expect("started");
+        assert_eq!(running.next(Instant::now() + Duration::from_secs(60)).as_deref(), Some("spun"));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while running.cpu().unwrap_or_default() < Duration::from_millis(500) && Instant::now() < deadline {
+            std::thread::sleep(POLL);
+        }
+        assert!(running.cpu().unwrap_or_default() >= Duration::from_millis(500), "{:?}", running.cpu());
+    }
+
     /// A started child's CPU time is the supervisor's word, a tenth of a second behind at most.
     #[test]
     fn a_started_childs_cpu_time_is_reported() {
