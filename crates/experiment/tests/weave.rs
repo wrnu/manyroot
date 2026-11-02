@@ -399,7 +399,7 @@ mod macos_only {
             worker_bin: bin(),
             bracken: bracken(),
             git: git_binary().expect("git"),
-            trace: false,
+            trace: true,
             calls_per_turn: CALLS_PER_TURN,
             turn_limit: TURN_LIMIT,
             plan: PlanInputs {
@@ -415,8 +415,9 @@ mod macos_only {
         let log = events(&cfg.root.join("events.jsonl"));
         assert!(
             log.iter().all(|e| e["event"] != "turn_error"),
-            "no turn erred: {:?}",
-            log.iter().filter(|e| e["event"] == "turn_error").collect::<Vec<_>>()
+            "no turn erred: {:?}\n{}",
+            log.iter().filter(|e| e["event"] == "turn_error").collect::<Vec<_>>(),
+            std::fs::read_to_string(cfg.root.join("turn-errors.txt")).unwrap_or_default()
         );
         let failed: Vec<&Value> = log
             .iter()

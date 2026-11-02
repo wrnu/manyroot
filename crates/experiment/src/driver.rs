@@ -64,7 +64,8 @@ pub struct RunConfig {
     pub sandbox: bool,
     /// The real `git` binary, by absolute path (see [`git_binary`]).
     pub git: PathBuf,
-    /// Tests only: workers record every command git starts.
+    /// Tests only: workers record every command git starts, and each turn error's text is kept in
+    /// `turn-errors.txt` in the run's root, which the events never hold.
     pub trace: bool,
     /// Tool calls an agent may make per turn: [`CALLS_PER_TURN`] in a real run.
     pub calls_per_turn: u32,
@@ -454,6 +455,15 @@ pub fn core_tools() -> Vec<ToolSpec> {
 }
 
 impl Run<'_> {
+    /// A turn error's text, for a test to show ([`RunConfig::trace`]): a line in `turn-errors.txt`, written whole
+    /// in one append, so two agents erring at once don't interleave theirs (finding 1f2556c8abfb).
+    fn keep_turn_error(&self, name: &str, turn: u32, step: &str, error: &str) {
+        let path = self.cfg.root.join("turn-errors.txt");
+        let line = format!("{name} turn {turn} {step}: {error:?}\n");
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(path);
+        let _ = file.and_then(|mut f| f.write_all(line.as_bytes()));
+    }
+
     fn hub(&self) -> std::sync::MutexGuard<'_, Worker> {
         self.hub.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -491,6 +501,9 @@ impl Run<'_> {
                         data["socket"] = json!(named);
                     }
                     self.events.log(Some(name), "turn_error", data);
+                    if self.cfg.trace {
+                        self.keep_turn_error(name, turn, step, &e);
+                    }
                 }
             }
             self.events.log(Some(name), "turn_end", json!({"turn": turn}));
