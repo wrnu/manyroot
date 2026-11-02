@@ -52,7 +52,6 @@ Everything below is importable from the `ledger` package itself, such as `from l
 
 - `Amount(quantity, commodity="")`: an immutable value.
   - `quantity` is a `decimal.Decimal`, and `commodity` is a str.
-  - Amounts compare equal when both fields are equal.
   - `+` and `-` work on two amounts of the same commodity, and unary `-` negates. Adding or subtracting amounts of different commodities raises `LedgerError`.
 - `Posting`: `account` (str), `amount` (Amount) and `line` (int, counting from 1).
 - `Transaction`: `date` (`datetime.date`), `description` (str), `postings` (a list of Posting, in the order written) and `line` (the header's line).

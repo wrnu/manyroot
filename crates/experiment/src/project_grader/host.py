@@ -7,6 +7,9 @@ run here:
   compared here; other objects come back as proxies, which equal only themselves, and whose `in` is answered
   here from their items. Only the package and its submodules ever become proxy modules, and only when this
   process imports them (finding 734e5389e188).
+- an io.StringIO given to the code, or standard output or error redirected to one around a call, is given
+  as a stream of the server's holding the same text, and holds what the code wrote to it there once the call
+  returns or raises (task 6a80d88373a5).
 - an exception the code raises comes back as its class, described with its bases. It is raised here as one
   class per class of the code's, of the same name and module, whose bases are the mirrors of its bases, so
   issubclass holds along the code's own hierarchy (finding 621c185d3e6f). A class of Python's own, builtins or
@@ -17,32 +20,53 @@ run here:
   and gives back its output, its exit code and the working directory's files. This process's own directory is
   an empty one of its own, never the hidden tests' or one holding them, so a command is never given a hidden
   file, and the files it gives back are written only inside its working directory (findings 7f3dc66a8589,
-  f13d1ff05b5f).
+  f13d1ff05b5f). A working directory that holds the hidden tests, as a test's helper gets from `__file__`,
+  is given as an empty one, and what the command writes there is dropped. An argument that is an absolute
+  path, such as a temporary file's, is given as a path in the command's own directory: a file's bytes, or a
+  directory's files, and what the command writes there goes back to it, never to one holding the hidden tests
+  (task 6a80d88373a5).
+- a module of the package has a `__file__`, and a package its `__path__`: their places in the tree, but in
+  the host's own copy of the tree's layout under its directory, which holds the tree's directories and no file.
+  So a helper that finds the project from the package's file, as `Path(ledger.__file__).parents[1]`, gets a
+  directory of its own: never the tree's real one, nor one holding the hidden tests (task 6a80d88373a5).
+- the hidden tests are importable as the package `tests`, as a project's own tests often are, and their
+  helpers by their own names: a group's file is the module `tests.<its path>`, so `from tests.support import
+  x` and `from .support import x` work as well as `from support import x`.
 
 Arguments: the hidden tests' directory, the group's test file relative to it, the package, and an empty
 directory to work in. Standard output carries only the lines to the grader: the requests, the number of tests,
-each outcome and each test's end as they happen (finding e7d128464936), and last the counts; the replies come
-on standard input.
+each test's start, each outcome and each test's end as they happen (finding e7d128464936), a description of
+each error outside any test (X: its class, message and frames, which the grader keeps for --diagnose alone,
+task 6a80d88373a5), and last the counts; the replies come on standard input.
 """
 
 import base64
 import builtins
 import datetime
 import decimal
+import fractions
 import importlib.abc
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
+import traceback
 import types
+import unicodedata
 import unittest
 
 tests, group, package, home = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 TESTS = os.path.realpath(tests)
 os.chdir(home)
+# The host's own temporary directory, holding no test, so what the code writes to a test's temporary file comes
+# back (finding 8221427759ca); in the directory the host may give paths in.
+os.makedirs(os.path.join(home, "tmp"), exist_ok=True)
+tempfile.tempdir = os.path.realpath(os.path.join(home, "tmp"))
 to_grader = os.fdopen(os.dup(1), "w", encoding="utf-8")
 from_grader = os.fdopen(os.dup(0), "r", encoding="utf-8")
 null = os.open("/dev/null", os.O_RDONLY)
@@ -72,8 +96,31 @@ def ask(kind, request):
     return reply
 
 
+# The text streams given in the request being made, by number.
+sent = []
+
+
 def server(request):
-    reply = ask("S", request)
+    try:
+        if request.get("op") == "call":
+            for name in ("stdout", "stderr"):
+                if type(getattr(sys, name)) is io.StringIO:
+                    request[name] = enc(getattr(sys, name))
+        if given.by:
+            request.update(files=given.files(), dirs=given.roots(), paths=given.names)
+        reply = ask("S", request)
+        if given.by:
+            given.back(given_back(reply.get("files", [])))
+        for i, text, pos in reply.get("streams", []):
+            if type(i) is int and 0 <= i < len(sent):
+                s = sent[i]
+                s.seek(0)
+                s.truncate()
+                s.write(str(text))
+                s.seek(min(int(pos), len(str(text))))
+    finally:
+        sent.clear()
+        given.clear()
     if "raise" in reply:
         raise raised(reply)
     if "ok" not in reply:
@@ -135,7 +182,8 @@ def exception_class(described, depth=0):
             if cls not in mirrored:
                 mirrored.append(cls)
         name = qualname.rsplit(".", 1)[-1]
-        namespace = {"__module__": module, "__qualname__": qualname}
+        namespace = {"__module__": module, "__qualname__": qualname, "__str__": mirrored_str,
+                     "__init__": mirrored_init, "_grader_mirror": True}
         try:
             classes[key] = type(name, tuple(mirrored) or (Exception,), namespace)
         except TypeError:
@@ -143,9 +191,53 @@ def exception_class(described, depth=0):
     return classes[key]
 
 
+def mirrored_str(e):
+    """A mirrored exception says what the code's said (task 6a80d88373a5)."""
+    told = e.__dict__.get("_told")
+    return told if type(told) is str else BaseException.__str__(e)
+
+
+def mirrored_init(e, *args, **kwargs):
+    """A test's own instance of a mirrored class: made by the code's own __init__ on the server, and given its
+    arguments, attributes and str() from there (task 6a80d88373a5). A class known only as a base, never got
+    from the package, is made here."""
+    cls = type(e)
+    ref = cls.__dict__.get("_grader_ref")
+    if ref is None:
+        BaseException.__init__(e, *args)
+        return
+    origin = cls.__dict__.get("_grader_origin")
+    made = server({"op": "make", "obj": ref + [origin] if origin else ref, "args": [enc(a) for a in args],
+                   "kwargs": {k: enc(v) for k, v in kwargs.items()}})
+    told(e, made)
+
+
+def told(e, reply):
+    """Gives exception `e` what the code's said: its arguments, its message as its str(), its attributes."""
+    message = str(reply["message"])
+    try:
+        args = dec(reply["args"])
+        e.args = args if type(args) is tuple else (message,)
+    except Exception:
+        e.args = (message,)
+    if type(e).__str__ is mirrored_str:
+        e._told = message
+    for name, value in reply.get("attrs", []):
+        if type(name) is str and not name.startswith("_") and name != "args":
+            try:
+                setattr(e, name, dec(value))
+            except Exception:
+                pass
+
+
 def raised(reply):
     cls = exception_class(reply["raise"][3])
     message = str(reply["message"])
+    if cls.__dict__.get("_grader_mirror"):
+        # Never made again by the code: told what the raised one was.
+        e = cls.__new__(cls)
+        told(e, reply)
+        return e
     try:
         args = dec(reply["args"])
         e = cls(*args) if type(args) is tuple else cls(message)
@@ -157,7 +249,21 @@ def raised(reply):
             # ed723694b473): made without it, with the message as its arguments.
             e = cls.__new__(cls)
             e.args = (message,)
+    if type(e).__str__ is mirrored_str:
+        e._told = message
+    for name, value in reply.get("attrs", []):
+        if type(name) is str and not name.startswith("_") and name != "args":
+            try:
+                setattr(e, name, dec(value))
+            except Exception:
+                pass
     return e
+
+
+UNCOMPARED = ("the code's objects are never compared (decision d1fc04a4f896): compare plain values it "
+              "gives, an attribute's, a method's or str()'s")
+# The dunder names a proxy asks the code for, as the object's own.
+NAMING = {"__name__", "__qualname__", "__annotations__"}
 
 
 class Proxy:
@@ -176,9 +282,21 @@ class Proxy:
         return ref + [self._origin] if self._origin else ref
 
     def __getattr__(self, name):
-        if name.startswith("__") and name.endswith("__"):
+        if name.startswith("__") and name.endswith("__") and name not in NAMING:
             raise AttributeError(name)
         return server({"op": "getattr", "obj": self._ref(), "name": name})
+
+    # What the object says of itself, never this class's own (task 6a80d88373a5).
+    @property
+    def __module__(self):
+        return server({"op": "getattr", "obj": self._ref(), "name": "__module__"})
+
+    @property
+    def __doc__(self):
+        return server({"op": "getattr", "obj": self._ref(), "name": "__doc__"})
+
+    def __dir__(self):
+        return server({"op": "dir", "obj": self._ref()})
 
     def __setattr__(self, name, value):
         raise AttributeError("objects of the code under test can't be changed from a test")
@@ -209,18 +327,71 @@ class Proxy:
     def __getitem__(self, key):
         return server({"op": "getitem", "obj": self._ref(), "key": enc(key)})
 
+    # The code's objects are never compared, nor hashed (decision d1fc04a4f896): against each other, itself, or
+    # a plain value, each raises in the test, never answering. A test compares plain values the code gives, an
+    # attribute's, a method's or str()'s, which come here as data.
     def __eq__(self, other):
-        return isinstance(other, Proxy) and other._handle == self._handle
+        raise TypeError(UNCOMPARED)
 
     def __ne__(self, other):
-        return not self.__eq__(other)
+        raise TypeError(UNCOMPARED)
 
     def __hash__(self):
-        return hash(("proxy", self._handle))
+        raise TypeError(UNCOMPARED)
+
+
+# The code's own operators never answer a test's check of a value (finding c823af485f19). An operator's result on
+# the code's objects stays one of the code's, a proxy, even when it is a number there: so `x - 1.5` that the code
+# says is 0.0 is never 0.0 here, and assertAlmostEqual's round of it raises. Ordering a proxy against a plain
+# value raises rather than let the code's __lt__ say; two of the code's own objects are ordered by the code, as
+# its own behaviour is, a bool. And float(), int(), round() and math's functions on a proxy raise: a test
+# compares plain values the code returns, such as an attribute's or a method's.
+ORDERING = {"lt", "le", "gt", "ge"}
+
+
+def binary(name, reflected=False):
+    """The operator `name` on a proxy, done by the code: with `other` on the left when reflected."""
+
+    def op(self, other):
+        if name in ORDERING:
+            raise TypeError(UNCOMPARED)
+        try:
+            mine, theirs = self._ref(), enc(other)
+        except (TypeError, ValueError):
+            return NotImplemented
+        a, b = (theirs, mine) if reflected else (mine, theirs)
+        out = server({"op": "binop", "name": name, "a": a, "b": b})
+        if type(out) is not Proxy:
+            raise GraderError("an operator's result that isn't the code's")
+        return out
+
+    return op
+
+
+def unary(name):
+    def op(self):
+        out = server({"op": "unop", "name": name, "obj": self._ref()})
+        if type(out) is not Proxy:
+            raise GraderError("an operator's result that isn't the code's")
+        return out
+
+    return op
+
+
+for name in ("add", "sub", "mul", "truediv", "floordiv", "mod", "pow"):
+    setattr(Proxy, "__%s__" % name, binary(name))
+    setattr(Proxy, "__r%s__" % name, binary(name, reflected=True))
+for name in ORDERING:
+    setattr(Proxy, "__%s__" % name, binary(name))
+for name in ("neg", "pos", "abs"):
+    setattr(Proxy, "__%s__" % name, unary(name))
 
 
 class Module(types.ModuleType):
     """A module of the package under test, reached through the server."""
+
+    def __dir__(self):
+        return sorted(set(super().__dir__()) | set(server({"op": "dir", "obj": ["m", self.__name__]})))
 
     def __getattr__(self, name):
         if name.startswith("__") and name.endswith("__"):
@@ -228,7 +399,16 @@ class Module(types.ModuleType):
         found = server({"op": "getattr", "obj": ["m", self.__name__], "name": name})
         if type(found) is Proxy:
             object.__setattr__(found, "_origin", [self.__name__, name])
+        elif isinstance(found, type) and found.__dict__.get("_grader_mirror"):
+            type.__setattr__(found, "_grader_origin", [self.__name__, name])
         return found
+
+    def __setattr__(self, name, value):
+        # Not a submodule bound here as it's imported: the package's own attribute of that name, such as a
+        # function its __init__ imported from it, is the server's to say (task 6a80d88373a5).
+        if type(value) is Module and value.__name__ == self.__name__ + "." + name:
+            return
+        super().__setattr__(name, value)
 
 
 def module(name):
@@ -240,14 +420,37 @@ def module(name):
     return known if isinstance(known, Module) else Module(name)
 
 
+# The host's own copy of the tree's layout: its directories, as the modules imported name them, and no file.
+TREE = os.path.join(os.path.realpath(home), "tree")
+
+
+def mirrored(place):
+    """A module's place in the tree, `place` as the server said it, in the host's copy: None for none, or one
+    that isn't a plain relative path to a `.py` file."""
+    parts = place.split("/") if type(place) is str and place.endswith(".py") else []
+    if not parts or any(p in ("", ".", "..") or "\\" in p or "\0" in p for p in parts):
+        return None
+    path = os.path.join(TREE, *parts)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    return path
+
+
 class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
     def find_spec(self, name, path=None, target=None):
         if name == package or name.startswith(package + "."):
+            # Only a module the tree has: as `importlib.util.find_spec` would say of it there.
+            if not server({"op": "exists", "name": name}):
+                return None
             return importlib.machinery.ModuleSpec(name, self, is_package=True)
         return None
 
     def create_module(self, spec):
-        server({"op": "import", "name": spec.name})
+        place = server({"op": "import", "name": spec.name})
+        where = mirrored(place)
+        if where is not None:
+            spec.origin, spec.has_location = where, True
+            if os.path.basename(where) == "__init__.py":
+                spec.submodule_search_locations = [os.path.dirname(where)]
         return Module(spec.name)
 
     def exec_module(self, m):
@@ -259,6 +462,24 @@ class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
 if importlib.util.find_spec(package.split(".")[0]) is not None:
     print("the package's name is already importable here", file=sys.stderr)
     sys.exit(3)
+class Planted(importlib.abc.MetaPathFinder):
+    """Refuses to import any module from the host's own directory (finding 8908d9699820). Everything the code
+    can write here is there, the copy of the tree's layout, a command's working directory and the temporary
+    files included, so no module the code planted is ever run here, wherever a test points sys.path."""
+
+    def find_spec(self, name, path=None, target=None):
+        spec = importlib.machinery.PathFinder.find_spec(name, path, target)
+        if spec is None:
+            return None
+        places = [spec.origin] if spec.origin else []
+        places += list(spec.submodule_search_locations or [])
+        if any(os.path.realpath(p).startswith(HOME + os.sep) for p in places if isinstance(p, str)):
+            raise ImportError("a module the code under test could have written is never imported here", name=name)
+        return None
+
+
+HOME = os.path.realpath(home)
+sys.meta_path.insert(0, Planted())
 sys.meta_path.insert(0, Finder())
 
 
@@ -275,11 +496,17 @@ def enc(v, depth=0):
     if t is float:
         return ["f", repr(v)]
     if t is str:
-        return ["s", v]
+        # A path such as a temporary file's: given, as the server's own (task 6a80d88373a5).
+        shown = given.map(v) if v.startswith("/") else None
+        return ["p", shown] if shown else ["s", v]
     if t is bytes:
         return ["y", base64.b64encode(v).decode()]
     if t is decimal.Decimal:
         return ["D", str(v)]
+    if t is fractions.Fraction:
+        return ["Q", str(v.numerator), str(v.denominator)]
+    if t is complex:
+        return ["c", repr(v.real), repr(v.imag)]
     if t is datetime.date:
         return ["date", v.isoformat()]
     if t is datetime.datetime and (v.tzinfo is None or type(v.tzinfo) is datetime.timezone):
@@ -293,10 +520,19 @@ def enc(v, depth=0):
         return [tag, [enc(x, depth + 1) for x in v]]
     if t is dict:
         return ["d", [[enc(k, depth + 1), enc(x, depth + 1)] for k, x in v.items()]]
+    if isinstance(v, os.PathLike) and type(os.fspath(v)) is str:
+        shown = given.map(os.fspath(v))
+        return ["p", shown] if shown else ["s", os.fspath(v)]
     if t is Proxy:
         return v._ref()
     if t is Module:
         return ["m", v.__name__]
+    if t is io.StringIO:
+        for i, s in enumerate(sent):
+            if s is v:
+                return ["sio", i, v.getvalue(), v.tell()]
+        sent.append(v)
+        return ["sio", len(sent) - 1, v.getvalue(), v.tell()]
     raise TypeError("only plain data and the package's own objects can be given to the code under test")
 
 
@@ -318,6 +554,10 @@ def dec(v, depth=0):
         return base64.b64decode(v[1])
     if tag == "D":
         return decimal.Decimal(v[1])
+    if tag == "Q":
+        return fractions.Fraction(int(v[1]), int(v[2]))
+    if tag == "c":
+        return complex(float(v[1]), float(v[2]))
     if tag == "date":
         return datetime.date.fromisoformat(v[1])
     if tag == "datetime":
@@ -334,7 +574,13 @@ def dec(v, depth=0):
     if tag == "h":
         return Proxy((int(v[1]), int(v[2])))
     if tag == "e":
-        return exception_class(v[3])
+        cls = exception_class(v[3])
+        if cls.__dict__.get("_grader_mirror"):
+            # The code's class, by its handle, so a test's instance of it is made there.
+            type.__setattr__(cls, "_grader_ref", ["h", int(v[1]), int(v[2])])
+        return cls
+    if tag == "made":
+        return v[1]
     if tag == "m":
         return module(str(v[1]))
     raise GraderError("an unknown value")
@@ -367,6 +613,88 @@ def files_of(root):
     return out
 
 
+class Mounts:
+    """The directories that absolute paths name, each given as PATHS<n>: to a command in its own directory, to a
+    call in the server's. A directory's files, or of a file's directory only the files named, and what was
+    written there goes back. Only a path inside the temporary directory or this host's own, never one that is,
+    holds or is inside the hidden tests' (task 6a80d88373a5)."""
+
+    def __init__(self):
+        self.clear()
+
+    def clear(self):
+        # (directory, whole) -> [its name as given, the names of its files given]; each path, as given and as is.
+        self.by, self.names = {}, []
+
+    def map(self, arg):
+        """`arg`'s name as given, or None for one that isn't such a path."""
+        if not os.path.isabs(arg) or "\0" in arg or holds_tests(arg):
+            return None
+        real = os.path.realpath(arg)
+        if not any(real.startswith(r + os.sep) for r in ROOTS):
+            return None
+        whole = os.path.isdir(arg)
+        if not whole and not os.path.isdir(os.path.dirname(arg)):
+            return None
+        mount = os.path.realpath(arg if whole else os.path.dirname(arg))
+        key = (mount, whole)
+        if key not in self.by:
+            self.by[key] = ["%s%d" % (PATHS, len(self.by)), set()]
+        root, names = self.by[key]
+        shown = root if whole else root + "/" + os.path.basename(arg)
+        if not whole:
+            names.add(os.path.basename(arg))
+        self.names.append((shown, arg))
+        return shown
+
+    def roots(self):
+        return sorted(root for root, _ in self.by.values())
+
+    def files(self):
+        files = []
+        for (mount, whole), (root, names) in self.by.items():
+            if whole:
+                files += [[root + "/" + rel, data] for rel, data in files_of(mount)]
+                continue
+            for name in sorted(names):
+                path = os.path.join(mount, name)
+                if os.path.isfile(path) and not os.path.islink(path):
+                    with open(path, "rb") as f:
+                        files.append([root + "/" + name, f.read(MAX_FILES + 1).hex()])
+        if sum(len(f[1]) for f in files) > 2 * MAX_FILES:
+            raise GraderError("the paths given hold too much")
+        return files
+
+    def back(self, back):
+        """Writes back what was under each mount in `back` (relative path -> bytes); the rest is returned."""
+        roots = set(self.roots())
+        for (mount, whole), (root, _) in self.by.items():
+            theirs = {rel[len(root) + 1:]: b for rel, b in back.items() if rel.startswith(root + "/")}
+            if holds_tests(mount):
+                # A file beside the hidden tests, such as the project's own: given, and nothing kept.
+                continue
+            # A file's directory: only what was made or changed, never its other files removed.
+            write_back(mount, theirs, files_of(mount) if whole else [])
+        return {rel: b for rel, b in back.items() if rel.split("/")[0] not in roots}
+
+    def shown_again(self, data):
+        """`data`, bytes, with each path as given saying the test's own again, the longest first."""
+        for shown, arg in sorted(self.names, key=lambda n: -len(n[0])):
+            data = data.replace(shown.encode(), os.fsencode(arg))
+        return data
+
+
+def given_back(files):
+    """Files given back, by plain relative path."""
+    back = {}
+    for rel, b in files:
+        parts = str(rel).split("/")
+        if any(p in ("", ".", "..") for p in parts):
+            raise GraderError("a file given back outside its directory")
+        back["/".join(parts)] = bytes.fromhex(b)
+    return back
+
+
 class Command:
     """Stands for subprocess.Popen. Runs only `python -m <package> ...`, through the grader."""
 
@@ -374,14 +702,21 @@ class Command:
                  env=None, text=None, universal_newlines=None, encoding=None, errors=None, shell=False, **_):
         argv = [os.fsdecode(a) for a in args] if isinstance(args, (list, tuple)) else None
         python = bool(argv) and (argv[0] == sys.executable or os.path.basename(argv[0]).startswith("python"))
-        if shell or not python or len(argv) < 3 or argv[1] != "-m" or not (
-                argv[2] == package or argv[2].startswith(package + ".")):
+        # Harmless interpreter flags before -m, such as -B: the command runs as the profile runs any.
+        at = 1
+        while python and at < len(argv) and FLAGS.match(argv[at]):
+            at += 1
+        if shell or not python or len(argv) < at + 2 or argv[at] != "-m" or not (
+                argv[at + 1] == package or argv[at + 1].startswith(package + ".")):
             raise PermissionError("in a hidden test, only `python -m %s ...` runs as a command" % package)
         self.args = args
-        self._module, self._argv = argv[2], argv[3:]
+        self._module = argv[at + 1]
+        argv = argv[:1] + argv[at:]
         self._cwd = os.fspath(cwd) if cwd is not None else os.getcwd()
-        if holds_tests(self._cwd):
-            raise PermissionError("a command can't run where the hidden tests are")
+        # Where the hidden tests are, the command gets an empty directory instead, and keeps nothing it writes.
+        self._given_cwd = not holds_tests(self._cwd)
+        self._mounts = Mounts()
+        self._argv = [self._mounts.map(a) or a for a in argv[3:]]
         self._text = bool(text or universal_newlines or encoding or errors)
         self._encoding, self._errors = encoding or "utf-8", errors or "strict"
         self._out, self._err = stdout, stderr
@@ -391,33 +726,26 @@ class Command:
         self.pid = 0
         self._result = (b"", b"")
 
+    def _files(self):
+        roots = set(self._mounts.roots())
+        files = files_of(self._cwd) if self._given_cwd else []
+        return [f for f in files if f[0].split("/")[0] not in roots] + self._mounts.files()
+
     def _run(self, given):
         data = given if given is not None else self._input
         if isinstance(data, str):
             data = data.encode(self._encoding, self._errors)
-        reply = ask("C", {"module": self._module, "argv": self._argv, "files": files_of(self._cwd),
-                          "stdin": (data or b"").hex()})
-        back = {}
-        for rel, b in reply["files"]:
-            parts = str(rel).split("/")
-            if any(p in ("", ".", "..") for p in parts):
-                raise GraderError("the command gave back a file outside its directory")
-            back["/".join(parts)] = bytes.fromhex(b)
-        for rel, _ in files_of(self._cwd):
-            if rel not in back:
-                os.remove(os.path.join(self._cwd, rel))
-        root = os.path.realpath(self._cwd)
-        for rel, data in back.items():
-            path = os.path.join(root, rel)
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            # Only inside the working directory, and through no symlink.
-            if not os.path.realpath(os.path.dirname(path)).startswith(root + os.sep) and \
-                    os.path.realpath(os.path.dirname(path)) != root:
-                raise GraderError("the command gave back a file outside its directory")
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
-        out, err = bytes.fromhex(reply["stdout"]), bytes.fromhex(reply["stderr"])
+        reply = ask("C", {"module": self._module, "argv": self._argv, "files": self._files(),
+                          "dirs": self._mounts.roots(), "stdin": (data or b"").hex()})
+        back = given_back(reply["files"])
+        roots = set(self._mounts.roots())
+        if self._given_cwd:
+            write_back(self._cwd, {rel: b for rel, b in back.items() if rel.split("/")[0] not in roots},
+                       files_of(self._cwd))
+        # Then the paths it was given, so what it wrote to one is kept over the working directory's copy of it.
+        self._mounts.back(back)
+        out = self._mounts.shown_again(bytes.fromhex(reply["stdout"]))
+        err = self._mounts.shown_again(bytes.fromhex(reply["stderr"]))
         if self._err == subprocess.STDOUT:
             out, err = out + err, b""
         self._result = (out, err)
@@ -460,6 +788,35 @@ class Command:
             self.wait()
 
 
+def write_back(directory, back, before):
+    """Makes `directory`'s files those of `back`, by path relative to it: those in `before` and not in `back`
+    removed. Only inside it, through no symlink, and never into the hidden tests."""
+    root = os.path.realpath(directory)
+    if holds_tests(root):
+        raise GraderError("the command gave back a file where the hidden tests are")
+    for rel, _ in before:
+        if rel not in back:
+            os.remove(os.path.join(root, rel))
+    for rel, data in back.items():
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not os.path.realpath(os.path.dirname(path)).startswith(root + os.sep) and \
+                os.path.realpath(os.path.dirname(path)) != root:
+            raise GraderError("the command gave back a file outside its directory")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+
+
+# Interpreter flags a command may give before -m: its environment is never given, so none changes what runs.
+FLAGS = re.compile(r"-[BIEsSuOqdbv]+$")
+# The name in a command's directory, or the server's for a call, under which it's given the paths it's given.
+PATHS = ".grader-path-"
+# Where a path must be to be given: inside the temporary directory, or this host's own.
+ROOTS = [os.path.realpath(tempfile.gettempdir()), os.path.realpath(home)]
+# The paths given in the request being made.
+given = Mounts()
+
 subprocess.Popen = Command
 
 counts = {"pass": 0, "fail": 0, "error": 0, "skip": 0}
@@ -468,6 +825,65 @@ counts = {"pass": 0, "fail": 0, "error": 0, "skip": 0}
 def outcome(kind):
     counts[kind] += 1
     tell("O", kind)
+
+
+def where(path):
+    """A frame's file as a diagnosis names it: a hidden test's relative to the tests' directory, this host's
+    by its own name, anything else in full."""
+    real = os.path.realpath(path)
+    if real.startswith(TESTS + os.sep):
+        return "tests/" + os.path.relpath(real, TESTS)
+    if real == os.path.realpath(__file__):
+        return "host.py"
+    return path
+
+
+UNITTEST = os.path.realpath(os.path.dirname(unittest.__file__)) + os.sep
+
+
+# The categories of characters a diagnosis shows as an escape (finding 052914fb0445): controls, formats (the tag
+# characters, direction marks and overrides), private use, surrogates, unassigned, line and paragraph separators.
+HIDDEN = {"Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp"}
+
+
+# And these, invisible though of other categories (finding 7df26ede5a8b): the variation selectors, the
+# combining grapheme joiner, the Hangul fillers and the Braille blank; and any whose name says BLANK or FILLER.
+INVISIBLE = [(0xFE00, 0xFE0F), (0x180B, 0x180F), (0xE0100, 0xE01EF), (0x034F, 0x034F), (0x115F, 0x1160),
+             (0x3164, 0x3164), (0xFFA0, 0xFFA0), (0x2800, 0x2800), (0x17B4, 0x17B5)]
+
+
+def hidden(c):
+    if unicodedata.category(c) in HIDDEN:
+        return True
+    o = ord(c)
+    if any(lo <= o <= hi for lo, hi in INVISIBLE):
+        return True
+    name = unicodedata.name(c, "")
+    return "BLANK" in name or "FILLER" in name
+
+
+def shown(text):
+    """`text` with each character of HIDDEN, or invisible, shown as \\u{...}, as the grader shows one."""
+    return "".join("\\u{%x}" % ord(c) if hidden(c) else c for c in text)
+
+
+def diagnose(err, test=None):
+    """Tells the grader what an error outside any test was, or why test `test` (its index) erred or failed: the
+    exception's class, its message (a test's cut to 200 characters) and its frames, file:line."""
+    cls, value, tb = err
+    # Not unittest's own frames, which every test's start with.
+    frames = [[where(f.filename), f.lineno, f.name] for f in traceback.extract_tb(tb)
+              if not os.path.realpath(f.filename).startswith(UNITTEST)][-40:]
+    try:
+        message = str(value)[:300]
+    except Exception:
+        message = "?"
+    name = "%s.%s" % (getattr(cls, "__module__", "?"), getattr(cls, "__qualname__", "?"))
+    described = {"class": shown(name[:100]), "message": shown(message),
+                 "frames": [[shown(str(f)[:200]), line, shown(str(fn)[:200])] for f, line, fn in frames]}
+    if test is not None:
+        described["test"] = test
+    tell("X", described)
 
 
 # Each test's index in the suite's order: an outcome is told after its test's B, so one outside any test (a
@@ -496,9 +912,15 @@ class Result(unittest.TestResult):
         outcome("pass")
 
     def addFailure(self, test, err):
+        diagnose(err, index.get(id(test), -1))
         outcome("fail")
 
     def addError(self, test, err):
+        # A class's or module's fixture: an error outside any test.
+        if isinstance(test, unittest.suite._ErrorHolder):
+            diagnose(err)
+        else:
+            diagnose(err, index.get(id(test), -1))
         outcome("error")
 
     def addSkip(self, test, reason):
@@ -512,12 +934,30 @@ class Result(unittest.TestResult):
 
     def addSubTest(self, test, subtest, err):
         if err is not None:
+            diagnose(err, index.get(id(test), -1))
             outcome("fail" if issubclass(err[0], test.failureException) else "error")
 
 
-name = "hidden_" + group[:-3].replace("/", "_")
+def tests_package():
+    """The hidden tests' directory as the package `tests`: its `__init__.py` if it has one, else a namespace."""
+    init = os.path.join(tests, "__init__.py")
+    if os.path.isfile(init):
+        spec = importlib.util.spec_from_file_location("tests", init, submodule_search_locations=[tests])
+    else:
+        spec = importlib.machinery.ModuleSpec("tests", None, is_package=True)
+        spec.submodule_search_locations = [tests]
+    made = importlib.util.module_from_spec(spec)
+    sys.modules["tests"] = made
+    if spec.loader is not None:
+        spec.loader.exec_module(made)
+
+
+name = "tests." + group[:-3].replace("/", ".")
 spec = importlib.util.spec_from_file_location(name, os.path.join(tests, group))
 try:
+    tests_package()
+    if name.count(".") > 1:
+        importlib.import_module(name.rsplit(".", 1)[0])
     loaded = importlib.util.module_from_spec(spec)
     sys.modules[name] = loaded
     spec.loader.exec_module(loaded)
@@ -527,5 +967,6 @@ try:
     tell("N", len(tests_in_order))
     suite.run(Result())
 except Exception:
+    diagnose(sys.exc_info())
     outcome("error")
 tell("R", counts)

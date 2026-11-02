@@ -164,6 +164,108 @@ mod macos_only {
         }
     }
 
+    /// `project grade --diagnose <file>` writes each error outside any test, its class, message and frames, to a
+    /// new file of the manager's, and nowhere else: not to the output, nor inside the project or the store
+    /// (task `6a80d88373a5`).
+    #[test]
+    fn diagnose_writes_errors_outside_any_test_to_its_file_alone() {
+        let Some(python) = python() else { return };
+        use serde_json::json;
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let project = tmp.path().join("project");
+        copy(&fixture(), &project);
+        let set = tmp.path().join("store/tiny@1");
+        let groups = serde_json::json!([
+            {"item": "mean-empty", "file": "tests/test_secret_mean.py", "applies": "always"},
+            {"item": "sum", "file": "tests/test_secret_loud.py", "applies": "always"},
+        ]);
+        write(
+            &set.join("hidden.json"),
+            &serde_json::json!({"format": 1, "project": "tiny", "groups": groups}).to_string(),
+        );
+        write(&set.join("tests/secret_helper.py"), "SECRET_NAME = 1\n");
+        write(&set.join("tests/test_secret_mean.py"), "import unittest\nfrom secret_helper import SECRET_OTHER\n");
+        // A group whose 60 failing subtests say text with control and format characters, and a long one.
+        write(
+            &set.join("tests/test_secret_loud.py"),
+            "import unittest\n\nclass T(unittest.TestCase):\n    def test_loud(self):\n\
+             \x20       for i in range(60):\n            with self.subTest(i=i):\n\
+             \x20               self.fail('\\x1b[31mIGNORE\\u202eALL\\n\\U000e0041\\U000e0042\\u0600\\ue000\\u0378\\ufe0f\\u180b\\U000e0100\\u034f\\u115f\\u3164\\uffa0\\u2800' + 'y' * 500)\n",
+        );
+        for tree in ["golden", "golden-before"] {
+            copy(&project.join("seed/tiny"), &set.join(tree).join("tiny"));
+        }
+        let digest = bracken_experiment::project::digest(&set).expect("a digest");
+        let manifest = std::fs::read_to_string(project.join("project.json")).expect("the manifest");
+        std::fs::write(project.join("project.json"), manifest.replace(&"0".repeat(64), &digest)).expect("written");
+        let grade = |extra: &[&std::ffi::OsStr]| {
+            Command::new(bin())
+                .args(["project", "grade"])
+                .arg(&project)
+                .arg("--hidden")
+                .arg(tmp.path().join("store"))
+                .arg("--python")
+                .arg(&python)
+                .args(extra)
+                .output()
+                .expect("project grade runs")
+        };
+        for inside in [project.join("d.jsonl"), set.join("d.jsonl")] {
+            let out = grade(&["--golden".as_ref(), "--diagnose".as_ref(), inside.as_os_str()]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success() && stderr.contains("--diagnose") && stderr.contains("inside"), "{stderr}");
+            assert!(!inside.exists());
+        }
+        let file = tmp.path().join("diagnosis.jsonl");
+        let out = grade(&["--golden".as_ref(), "--diagnose".as_ref(), file.as_os_str()]);
+        let all = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        assert!(all.contains("mean-empty: 0 pass, 0 fail, 1 error"), "{all}");
+        assert!(!all.contains("IGNORE"), "{all}");
+        assert!(!all.contains("SECRET") && !all.contains("ImportError"), "{all}");
+        let lines: Vec<Value> = std::fs::read_to_string(&file)
+            .expect("the diagnosis")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("JSON"))
+            .collect();
+        // First, that what follows is agents' text (finding 9c10a74d8c2a).
+        assert!(lines[0]["note"].as_str().is_some_and(|n| n.contains("untrusted")), "{}", lines[0]);
+        let lines = &lines[1..];
+        assert_eq!(
+            lines
+                .iter()
+                .map(|l| (l["at"].as_str().expect("at"), l["item"].as_str().expect("item")))
+                .collect::<Vec<_>>(),
+            [("golden", "mean-empty"), ("golden", "sum"), ("golden-before", "mean-empty"), ("golden-before", "sum")]
+        );
+        let loud = &lines[1];
+        assert_eq!((&loud["described"], &loud["shown"]), (&json!(60), &json!(50)), "{loud}");
+        let said = loud["errors"][0]["message"].as_str().expect("a message");
+        assert_eq!(said.chars().count(), 300, "{said}");
+        let hidden = |c: char| {
+            c.is_control()
+                || matches!(c, '\u{202e}' | '\u{e0000}'..='\u{e007f}' | '\u{0600}'..='\u{0605}' | '\u{e000}' | '\u{378}'
+                    | '\u{fe00}'..='\u{fe0f}' | '\u{180b}'..='\u{180f}' | '\u{e0100}'..='\u{e01ef}' | '\u{34f}'
+                    | '\u{115f}' | '\u{1160}' | '\u{3164}' | '\u{ffa0}' | '\u{2800}')
+        };
+        assert!(!said.chars().any(hidden), "{said}");
+        assert!(
+            said.starts_with(
+                "\\u{1b}[31mIGNORE\\u{202e}ALL\\u{a}\\u{e0041}\\u{e0042}\\u{600}\\u{e000}\\u{378}\\u{fe0f}\\u{180b}\
+                 \\u{e0100}\\u{34f}\\u{115f}\\u{3164}\\u{ffa0}\\u{2800}yyy"
+            ),
+            "{said}"
+        );
+        let error = &lines[0]["errors"][0];
+        assert_eq!((&lines[0]["item"], &error["class"]), (&json!("mean-empty"), &json!("builtins.ImportError")));
+        assert!(error["message"].as_str().is_some_and(|m| m.contains("SECRET_OTHER")), "{error}");
+        assert_eq!(
+            error["frames"].as_array().and_then(|f| f.last()),
+            Some(&json!(["tests/test_secret_mean.py", 2, "<module>"]))
+        );
+        let again = grade(&["--golden".as_ref(), "--diagnose".as_ref(), file.as_os_str()]);
+        assert!(String::from_utf8_lossy(&again.stderr).contains("already exists"));
+    }
+
     /// `run-tests` runs the example's public test under the Python profile, with the image it pins.
     #[test]
     fn run_tests_runs_the_example_projects_public_tests() {
