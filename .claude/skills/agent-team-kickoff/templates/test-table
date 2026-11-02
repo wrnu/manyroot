@@ -178,8 +178,12 @@ remote() {
   git bundle create -q "$tmp/push/tree.bundle" HEAD refs/remotes/origin/main
   # In the box: the tools it lacks, HEAD checked out with origin/main beside it, then this script.
   # It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
-  # programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both.
-  # The git-core PPA has the current git. Their output shows only if they fail. Then every crate the
+  # programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both and
+  # need 2.46 (MIN_GIT in crates/experiment/src/git_mode.rs). The git-core PPA has the current git.
+  # Launchpad times out or drops the connection now and then (task 95302a01f49a), so adding the PPA is
+  # tried four times, each for at most 2 minutes, 10, 30 and 90 s apart. If it still fails, the image's
+  # own git does only if it's 2.46 or later; otherwise setup fails, saying so. Whichever git it ends
+  # with is checked against 2.46. Their output shows only if they fail. Then every crate the
   # host's whole package graph needs, dev-dependencies of packages the -p list leaves out included:
   # bracken-scope's cargo metadata --offline reads them all, and a build fetches only what it builds
   # (task 53efd11c6e4a: unicode-properties, manyroot's dev-dependency, without -p manyroot).
@@ -190,8 +194,41 @@ setup() {
   log=$(mktemp)
   "$@" >"$log" 2>&1 || { rc=$?; echo "test-table: box setup failed (exit $rc): $*" >&2; cat "$log" >&2; exit "$rc"; }
 }
-setup $sudo add-apt-repository -y ppa:git-core/ppa
-setup $sudo apt-get install -y -qq git b3sum curl jq lsof
+need_git=2.46
+git_ok() {
+  read -r major minor < <(git --version 2>/dev/null | sed -n "s/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p") ||
+    return 1
+  [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 46 ]; }
+}
+git_said() { git --version 2>&1 | head -n 1; }
+: "${ppa_waits:=10 30 90}"
+ppa=no tries=0
+for wait in $ppa_waits ""; do
+  tries=$((tries + 1)) log=$(mktemp)
+  if timeout 120 $sudo add-apt-repository -y ppa:git-core/ppa >"$log" 2>&1; then
+    ppa=yes
+    break
+  else
+    rc=$?
+  fi
+  echo "test-table: box setup: adding ppa:git-core/ppa failed (exit $rc)${wait:+; trying again in ${wait}s}" >&2
+  tail -n 5 "$log" >&2
+  [ -z "$wait" ] || sleep "$wait"
+done
+if [ $ppa = yes ]; then
+  setup $sudo apt-get install -y -qq -o Acquire::Retries=3 git b3sum curl jq lsof
+elif git_ok; then
+  echo "test-table: box setup: Launchpad unreachable after $tries tries; using the image'"'"'s $(git_said), which is $need_git or later" >&2
+  setup $sudo apt-get update -qq
+  setup $sudo apt-get install -y -qq -o Acquire::Retries=3 b3sum curl jq lsof
+else
+  echo "test-table: box setup failed: couldn'"'"'t add ppa:git-core/ppa after $tries tries (Launchpad unreachable?), and the image'"'"'s $(git_said) is older than the $need_git the experiment'"'"'s git-mode tests need" >&2
+  exit 1
+fi
+git_ok || {
+  echo "test-table: box setup failed: $(git_said) is older than the $need_git the experiment'"'"'s git-mode tests need" >&2
+  exit 1
+}
 nextest_tar=cargo-nextest-$nextest_version-x86_64-unknown-linux-gnu.tar.gz
 nextest_dir=$(mktemp -d)
 setup curl -fsSL -o "$nextest_dir/$nextest_tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$nextest_version/$nextest_tar"
