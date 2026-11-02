@@ -176,7 +176,9 @@ def exception_class(described, depth=0):
     and handle, isn't the object its name gives there, or another was sent under that name first: it gets a class
     of its own, never Python's of that name nor another of the code's (decision 0f7f0b4b048b). The first such class
     the server sent under its module and qualname is kept by them, apart from the named ones, so a test's class of
-    it still catches it after a restart (finding 90ae40b8ad52); any later one by its generation and handle."""
+    it still catches it after a restart (finding 90ae40b8ad52); any later one by its generation and handle. Of
+    several under one module and qualname, the first sent after a restart takes that class, whichever it is
+    (finding 30eb693032b7, eval-suite.md's restart residual)."""
     if depth > 64:
         raise GraderError("a class nested too deeply")
     module, qualname, bases = str(described[0]), str(described[1]), described[2]
