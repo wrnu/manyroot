@@ -118,6 +118,41 @@ def own_handle(cls):
     return h
 
 
+# The names each class that doesn't go by its name carries across a restart by, taken at its first send and
+# fixed for this server's life (findings 9ed85ad61c06, b8aa42f090fd): ["b", "module.attribute"] for each
+# attribute of the package's modules bound to it then, in order, except one another object was sent under first;
+# and ["u", module, qualname] if it is the first such class sent under them. The host keeps its class under all
+# of them, so after a restart it is found again by any it still has.
+carries = {}
+
+
+def bound(cls):
+    """Where class `cls` is bound among the package's modules, of exactly the module type: "module.attribute" for
+    each, in order. By identity, reading each module's own `__dict__`."""
+    found = []
+    for name, m in list(sys.modules.items()):
+        if type(name) is not str or (name != package and not name.startswith(package + ".")):
+            continue
+        if type(m) is not types.ModuleType:
+            continue
+        try:
+            names = list(object.__getattribute__(m, "__dict__").items())
+        except BaseException:
+            continue
+        found.extend(name + "." + k for k, v in names if v is cls and type(k) is str)
+    return sorted(found)
+
+
+def carry(cls, module, qualname):
+    """The names class `cls`, which doesn't go by its name, carries across a restart by: see `carries`."""
+    if id(cls) not in carries:
+        names = [["b", where] for where in bound(cls) if first(("b", where), cls)]
+        if type(module) is str and type(qualname) is str and first(("u", module, qualname), cls):
+            names.append(["u", module, qualname])
+        carries[id(cls)] = names
+    return carries[id(cls)]
+
+
 def module_named(m):
     """The name module `m` goes by, if it is the module sys.modules holds under it and the first reported there;
     else None."""
@@ -146,10 +181,10 @@ def class_named(cls, module, qualname):
 
 def described(cls, depth=0):
     """A class as [module, qualname, [its bases, described], own], as strings whatever the class says: `own` is
-    None for a class that goes by its name, and otherwise its generation, its one handle and whether it is the first
-    such class sent under its module and qualname. The host keeps a class of its own for each, matching no other,
-    and a first one's carries across a restart by its module and qualname, as a named class's does (finding
-    90ae40b8ad52)."""
+    None for a class that goes by its name, and otherwise its generation, its one handle and what it carries across
+    a restart by (`carries`). The host keeps a class of its own for each, matching no other, and one that carries
+    something keeps its class across a restart by it, as a named class does by its name (findings 90ae40b8ad52,
+    9ed85ad61c06)."""
     if depth > DEPTH:
         raise ValueError("a class nested too deeply to send")
     try:
@@ -159,8 +194,7 @@ def described(cls, depth=0):
     qualname = type.__getattribute__(cls, "__qualname__")
     mine = None
     if not class_named(cls, module, qualname):
-        carried = type(module) is str and type(qualname) is str and first(("u", module, qualname), cls)
-        mine = [generation, own_handle(cls), carried]
+        mine = [generation, own_handle(cls), carry(cls, module, qualname)]
     try:
         module = str(module) if module is not None else "?"
     except BaseException:
