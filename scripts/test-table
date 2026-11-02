@@ -183,7 +183,8 @@ remote() {
   # Launchpad times out or drops the connection now and then (task 95302a01f49a), so adding the PPA is
   # tried four times, each for at most 2 minutes, 10, 30 and 90 s apart. If it still fails, the image's
   # own git does only if it's 2.46 or later; otherwise setup fails, saying so. Whichever git it ends
-  # with is checked against 2.46. Their output shows only if they fail. Then every crate the
+  # with is checked against 2.46. need_git holds that number, which a test keeps equal to MIN_GIT.
+  # Their output shows only if they fail. Then every crate the
   # host's whole package graph needs, dev-dependencies of packages the -p list leaves out included:
   # bracken-scope's cargo metadata --offline reads them all, and a build fetches only what it builds
   # (task 53efd11c6e4a: unicode-properties, manyroot's dev-dependency, without -p manyroot).
@@ -198,7 +199,7 @@ need_git=2.46
 git_ok() {
   read -r major minor < <(git --version 2>/dev/null | sed -n "s/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p") ||
     return 1
-  [ "$major" -gt 2 ] || { [ "$major" -eq 2 ] && [ "$minor" -ge 46 ]; }
+  [ "$major" -gt "${need_git%.*}" ] || { [ "$major" -eq "${need_git%.*}" ] && [ "$minor" -ge "${need_git#*.}" ]; }
 }
 git_said() { git --version 2>&1 | head -n 1; }
 : "${ppa_waits:=10 30 90}"

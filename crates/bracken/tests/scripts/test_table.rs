@@ -431,10 +431,11 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
         std::fs::create_dir_all(&tools).unwrap();
         for (name, body) in [
             ("sudo", "exec \"$@\""),
-            ("timeout", "[ \"$1\" = 120 ] || exit 9\nshift; exec \"$@\""),
+            ("timeout", "[ \"$1\" = 120 ] || exit 9\nshift; UNDER_TIMEOUT=120 exec \"$@\""),
             (
                 "add-apt-repository",
-                "n=$(cat \"$T/tries\" 2>/dev/null || echo 0); echo $((n + 1)) >\"$T/tries\"\n\
+                "[ \"$UNDER_TIMEOUT\" = 120 ] || { echo 'not run under timeout 120'; exit 7; }\n\
+                 n=$(cat \"$T/tries\" 2>/dev/null || echo 0); echo $((n + 1)) >\"$T/tries\"\n\
                  [ \"$n\" -ge \"$PPA_FAILS\" ] || { echo 'TimeoutError: [Errno 110] Connection timed out'; exit 1; }",
             ),
             ("apt-get", "echo \"apt-get $*\" >>\"$T/ran\"\ncase \"$*\" in *' git '*) touch \"$T/ppa-git\" ;; esac"),
@@ -507,6 +508,26 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
         assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
         assert!(stderr.contains("box setup failed: git version 2.45.2 is older than the 2.46"), "{scripts}: {stderr}");
         assert!(!ran.contains("tar"), "{scripts}: went on: {ran}");
+    }
+}
+
+/// Finding b8b6193329db: the git version test-table's box needs is the experiment's MIN_GIT, the one
+/// number in crates/experiment/src/git_mode.rs, and the box script's comparison reads only `need_git`.
+#[test]
+fn test_table_box_needs_the_experiments_min_git() {
+    let source = std::fs::read_to_string(repo_root().join("crates/experiment/src/git_mode.rs")).unwrap();
+    let line = source.lines().find(|l| l.starts_with("pub const MIN_GIT: (u32, u32) = (")).expect("MIN_GIT");
+    let pair = line.trim_start_matches("pub const MIN_GIT: (u32, u32) = (").trim_end_matches(");");
+    let (major, minor) = pair.split_once(", ").expect("two numbers");
+    let (major, minor): (u32, u32) = (major.parse().unwrap(), minor.parse().unwrap());
+    for scripts in SCRIPTS {
+        let table = std::fs::read_to_string(repo_root().join(scripts).join("test-table")).unwrap();
+        let set: Vec<&str> = table.lines().filter(|l| l.starts_with("need_git=")).collect();
+        assert_eq!(set, [format!("need_git={major}.{minor}")], "{scripts}: test-table's need_git is MIN_GIT");
+        assert!(
+            table.contains(r#"[ "$minor" -ge "${need_git#*.}" ]"#) && !table.contains(&format!("-ge {minor} ]")),
+            "{scripts}: the comparison reads need_git, not a number of its own"
+        );
     }
 }
 
