@@ -126,11 +126,24 @@ fn an_agent_cap_above_the_runs_cap_of_its_kind_is_refused() {
     let err = pilot.clone().with_agent_caps(None, Some(1_666_667)).expect_err("above the run's output");
     assert!(err.contains("--agent-output-cap 1666667") && err.contains("1666666"), "{err}");
     // The run's token cap is the mode's, so a raised mode cap lets a higher agent cap through, and a
-    // lowered one refuses the pilot's own.
+    // lowered one refuses a given agent cap above it.
     let raised = Caps::for_mode("weave", &[cap("weave=24000000")]).expect("caps");
     assert_eq!(raised.with_agent_caps(Some(8_000_000), Some(500_000)).expect("caps").agent_tokens, 8_000_000);
     let lowered = Caps::for_mode("git", &[cap("git=2000000")]).expect("caps");
-    assert!(lowered.with_agent_caps(None, None).is_err(), "the pilot's 3M agent cap above a 2M run");
+    assert!(lowered.clone().with_agent_caps(Some(2_000_001), None).is_err(), "a given agent cap above a 2M run");
+}
+
+/// A mode cap under the pilot's 3M agent cap, given alone, is taken as on main (finding `2c9bdb920d6b`): only
+/// a given agent cap is checked, so the pilot's 3M stays and the 2M run cap binds first.
+#[test]
+fn a_mode_cap_under_the_pilots_agent_cap_alone_is_taken() {
+    let lowered = Caps::for_mode("git", &[cap("git=2000000")]).expect("caps");
+    let caps = lowered.clone().with_agent_caps(None, None).expect("a 2M mode cap alone");
+    assert_eq!(caps.plan_value(), lowered.plan_value(), "nothing moves");
+    assert_eq!((caps.agent_tokens, caps.run_tokens), (3_000_000, 2_000_000));
+    // So the output cap's own pilot value is never checked either, and a given one equal to the run's is taken.
+    let output = lowered.with_agent_caps(Some(2_000_000), Some(1_666_666)).expect("caps");
+    assert_eq!((output.agent_tokens, output.agent_output), (2_000_000, 1_666_666));
 }
 
 #[test]
@@ -160,7 +173,10 @@ fn run_refuses_a_zero_malformed_or_too_large_agent_cap() {
             &["--agent-token-cap", "8000000", "--mode-token-cap", "bracken=5000000"],
             "above the run's token cap, 5000000",
         ),
-        (&["--mode-token-cap", "bracken=2000000"], "--agent-token-cap 3000000 is above the run's token cap, 2000000"),
+        (
+            &["--agent-token-cap", "3000000", "--mode-token-cap", "bracken=2000000"],
+            "--agent-token-cap 3000000 is above",
+        ),
     ];
     for (args, says) in cases {
         let dir = tempfile::tempdir().expect("a temp dir");
@@ -184,6 +200,26 @@ fn run_refuses_a_zero_malformed_or_too_large_agent_cap() {
         assert!(String::from_utf8_lossy(&out.stderr).contains(says), "{args:?}: {out:?}");
         assert!(!dir.path().join("run").exists());
     }
+}
+
+/// The command line takes a 2M mode cap alone, as main did (finding `2c9bdb920d6b`): it gets past the caps,
+/// says the run's token cap, and stops only at the missing Claude Code, naming no agent cap.
+#[test]
+fn run_takes_a_mode_cap_under_the_pilots_agent_cap_alone() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_bracken-experiment"));
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let out = Command::new(bin)
+        .args(["run", "--dir"])
+        .arg(dir.path().join("run"))
+        .args(["--mode", "bracken", "--claude", "/nonexistent", "--claude-version", "0", "--settings", "/nonexistent"])
+        .args(["--mode-token-cap", "bracken=2000000"])
+        .output()
+        .expect("the binary runs");
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "past the caps, it stops at the missing Claude Code: {out:?}");
+    assert!(stdout.contains("token cap is 2000000 (--mode-token-cap)"), "{stdout}");
+    assert!(stderr.contains("/nonexistent") && !stderr.contains("agent-token-cap"), "{stderr}");
+    assert!(!dir.path().join("run").exists());
 }
 
 /// The command line refuses a malformed value, or one above the replicate's total, before anything runs.

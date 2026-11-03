@@ -149,21 +149,22 @@ impl Caps {
     }
 
     /// These caps with one agent's token and output caps in place of the pilot's, where given (`run
-    /// --agent-token-cap`, `--agent-output-cap`, task `ba049eeaff56`). Neither may pass the run's cap of the
-    /// same kind, [`Caps::run_tokens`] and [`Caps::run_output`]: one agent can't use more than the whole run.
+    /// --agent-token-cap`, `--agent-output-cap`, task `ba049eeaff56`). A given one may not pass the run's cap of
+    /// the same kind, [`Caps::run_tokens`] and [`Caps::run_output`]: one agent can't use more than the whole run.
+    /// The pilot's own are never checked (finding `2c9bdb920d6b`): under a lower run cap, that one binds first.
     pub fn with_agent_caps(self, tokens: Option<u64>, output: Option<u64>) -> Result<Caps, String> {
         let caps = Caps {
             agent_tokens: tokens.unwrap_or(self.agent_tokens),
             agent_output: output.unwrap_or(self.agent_output),
             ..self
         };
-        if caps.agent_tokens > caps.run_tokens {
+        if tokens.is_some() && caps.agent_tokens > caps.run_tokens {
             return Err(format!(
                 "--agent-token-cap {} is above the run's token cap, {}: raise that with --mode-token-cap",
                 caps.agent_tokens, caps.run_tokens
             ));
         }
-        if caps.agent_output > caps.run_output {
+        if output.is_some() && caps.agent_output > caps.run_output {
             return Err(format!(
                 "--agent-output-cap {} is above the run's output cap, {}",
                 caps.agent_output, caps.run_output
