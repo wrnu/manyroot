@@ -721,8 +721,14 @@ weave_mac() {
   # The tree that runs is the commit's, unchanged (finding 79114ae0b4ab).
   [ "$(git rev-parse 'HEAD^{tree}')" = "$WEAVE_TREE" ] || fail "this checkout's tree isn't the manifest's tree $WEAVE_TREE"
   local changed
-  changed=$(git status --porcelain) || fail "git status failed in this checkout"
+  # Ignored files count too, and no index entry may be marked to skip the comparison (assume-unchanged,
+  # a lowercase tag, or skip-worktree, S), so every file differing from the commit shows (finding
+  # 35815ad2763b).
+  changed=$(git status --porcelain --ignored --untracked-files=all) || fail "git status failed in this checkout"
   [ -z "$changed" ] || fail "this checkout isn't clean against the manifest's commit: $(head -n 3 <<<"$changed" | tr '\n' ' ')"
+  changed=$(git ls-files -v) || fail "git ls-files failed in this checkout"
+  changed=$(grep -E '^([a-z]|S) ' <<<"$changed") || true
+  [ -z "$changed" ] || fail "this checkout isn't clean: entries skip the comparison: $(head -n 3 <<<"$changed" | tr '\n' ' ')"
   printf 'head %s\ntree %s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" >>"$WEAVE_FACTS"
   box_log="$WEAVE_INPUTS/$box_check.log"
   [ -f "$box_log" ] ||
