@@ -390,6 +390,9 @@ impl WeaveStore {
     fn checkout(&mut self, manifest: &str, message: &str) -> Result<(), String> {
         let dir = self.config.dir.clone();
         let fresh = dir.join("tree.new");
+        // Nothing below is cleared while it holds the only copy of the agent's files or repository. After this,
+        // a missing tree means none was ever placed (the copy's setup), so tree.new holds nothing of the agent's.
+        self.recover_tree()?;
         if fresh.exists() {
             std::fs::remove_dir_all(&fresh).map_err(|e| format!("clearing {}: {e}", fresh.display()))?;
         }
@@ -418,7 +421,7 @@ impl WeaveStore {
         } else {
             Ok(())
         }
-        .and_then(|()| std::fs::rename(&fresh, &tree).map_err(|e| format!("placing the tree: {e}")));
+        .and_then(|()| self.place(&fresh, &tree));
         // A swap that fails puts the old tree and git's repository back, so the tree is still one, and git can
         // restore its files: else every later git call there fails as not a repository (task 898fff65aaef).
         if let Err(e) = swapped {
@@ -433,6 +436,62 @@ impl WeaveStore {
         // What can't be removed now, the next checkout tries again.
         let _ = std::fs::remove_dir_all(&old);
         if tree.join(".git").exists() { self.git_commit_all(message) } else { self.git_start(message) }
+    }
+
+    /// Renames the checked-out `fresh` to be the tree. A debug build fails it while the store's directory holds
+    /// a file `fail-placing-the-tree`, so a test can reach the put-back after it (task 43ca0a00d4b9): nothing
+    /// else makes this one rename fail, a root user's included. A release build never reads that file.
+    fn place(&self, fresh: &Path, tree: &Path) -> Result<(), String> {
+        if cfg!(debug_assertions) && self.config.dir.join("fail-placing-the-tree").exists() {
+            return Err("placing the tree: failed for a test (fail-placing-the-tree)".into());
+        }
+        std::fs::rename(fresh, tree).map_err(|e| format!("placing the tree: {e}"))
+    }
+
+    /// Puts back what a checkout whose swap and put-back both failed left elsewhere (task 43ca0a00d4b9):
+    /// the agent's files in the one tree.old.<n> while the tree is missing, and git's repository in tree.new
+    /// while the tree has none. Where that isn't one clear move, it refuses, naming what it found, and removes
+    /// nothing: no later clear of tree.new or tree.old.* may take the only copy.
+    fn recover_tree(&self) -> Result<(), String> {
+        let dir = &self.config.dir;
+        let (tree, fresh) = (self.tree(), dir.join("tree.new"));
+        if !tree.exists() {
+            let mut old: Vec<PathBuf> = std::fs::read_dir(dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().starts_with("tree.old."))
+                .map(|e| e.path())
+                .collect();
+            old.sort();
+            match old.as_slice() {
+                [] => {}
+                [one] => std::fs::rename(one, &tree)
+                    .map_err(|e| format!("the tree is missing and {} holds it: putting it back: {e}", one.display()))?,
+                many => {
+                    let names: Vec<String> = many.iter().map(|p| p.display().to_string()).collect();
+                    return Err(format!(
+                        "the tree is missing, and {} old trees are left ({}): which was the tree is unclear, so \
+                         none is moved or removed",
+                        many.len(),
+                        names.join(", ")
+                    ));
+                }
+            }
+        }
+        if fresh.join(".git").exists() {
+            if tree.join(".git").exists() {
+                return Err(format!(
+                    "both {} and {} hold a git repository, left by a failed checkout: neither is removed",
+                    tree.join(".git").display(),
+                    fresh.join(".git").display()
+                ));
+            }
+            std::fs::create_dir_all(&tree)
+                .and_then(|()| std::fs::rename(fresh.join(".git"), tree.join(".git")))
+                .map_err(|e| format!("{} holds git's repository: putting it back: {e}", fresh.display()))?;
+        }
+        Ok(())
     }
 
     /// A path in the working tree, checked: plain, and with no symlink on the way.
@@ -1092,6 +1151,9 @@ impl Store for WeaveStore {
     }
 
     fn tool(&mut self, name: &str, args: &Value) -> Result<Value, String> {
+        // What a failed checkout left aside goes back first, so the tool sees the tree and its repository, not
+        // a tree that isn't one (task 43ca0a00d4b9).
+        self.recover_tree()?;
         match name {
             "task" => {
                 Args::new(args, &[])?;
