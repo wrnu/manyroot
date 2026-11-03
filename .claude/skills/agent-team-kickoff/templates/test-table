@@ -6,6 +6,8 @@
 #   test-table --split [-p <package>]...
 #   test-table --light -p <package>...       (in --split -p's box)
 #   test-table --lists [-p <package>]...     (in --split's box)
+#   test-table --weave-box [-p <package>]...           (as weave validate's box check)
+#   test-table --weave-mac <box check> [-p <package>]... (as weave validate's mac check)
 #
 # Runs, from the top of the checkout it lives in, stopping at the first that fails:
 #   cargo fmt --check
@@ -81,13 +83,58 @@
 # With TEST_TABLE_MODE set (verify-seq sets it: the mode, light or full, and why), a run that passes, or
 # fails through a check here, ends with 'test-table: counted run mode: <it>', so the evidence's details
 # hold it.
+#
+# --weave-box and --weave-mac are Weave stage 2b's box and mac checks (plan cc496dcee0e3; weave.md
+# section 3, Checks outside the sandbox): weave validate runs this script, the copy in the main checkout
+# whose hash line main's policy pins, in the checkout it made of a manifest's commit, which is where
+# they work, not this script's own checkout. It gives WEAVE_COMMIT and WEAVE_TREE, the commit and its
+# tree id, and WEAVE_FACTS, a file of '<key> <value>' lines this script writes and the tree's code
+# never sees, which validate checks before it records anything.
+#   --weave-box runs what --split's box runs, for the commit in WEAVE_BUNDLE (whose sha256 is
+#   WEAVE_BUNDLE_SHA256): the whole table, or for -p the light table, then the box's test lists. The
+#   box gets the bundle and this script, nothing else, and runs this copy (--in-tree), not the tree's.
+#   The box script sends its standard error to its standard output first, so everything it prints
+#   keeps its order. Before any of the tree's code runs, it prints 'WEAVE bundle|head|tree <value>' (the
+#   bundle's sha256 as received, the commit checked out, its tree id), then 'WEAVE start'; after the
+#   table passed and the lists are printed, 'WEAVE end'. The facts get the first of each proof before
+#   'WEAVE start', and none if there's no start line, so nothing the tree prints later counts; the box's
+#   id (from boat's own 'bx_… ready'); boat's cost line, only as the output's last line, which boat
+#   prints after the box has ended; and 'end seen' only if a 'test-table: … passed' line and a later
+#   'WEAVE end' follow 'WEAVE start' (plan cc496dcee0e3 2(c), finding ad1bd61cad43), without which the
+#   check fails here and in weave validate. The Ground guards don't run: Weave holds no .bracken/, and
+#   scripts/merge runs them itself. The box is deleted on every way out, weave validate's end included
+#   (its output pipe breaking), and once boat names it, its lifetime is set to 2700 s as a backstop.
+#   --weave-mac <box check> runs --split's part here, the macOS-only tests and this Mac's lists, in
+#   the commit's checkout, then compares the lists with the box's, read from WEAVE_INPUTS/<box check>.log,
+#   the output of this validator's latest passing result of that box check on the manifest. The facts
+#   get the commit and tree first, before any of the tree's code runs.
+#   --in-tree <mode...> is the box's own call: the mode, in the current directory.
+# The Weave modes are self-contained (finding fa1611bbec29): the policy pins this one file, so they and
+# --in-tree call no other script, of this checkout or the tree's, and only this copy runs in the box.
 set -euo pipefail
 # The tests decide for themselves whether a read goes through the verified snapshot: a full check
 # asked for by whoever runs the table mustn't reach them (finding 607273d1d193).
 unset BRACKEN_FULL_CHECK
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-cd "$(git -C "$here" rev-parse --show-toplevel)"
+in_tree=false
+case "${1:-}" in
+  # Nothing of the tree's runs on this Mac for a box check (finding 42ac5a6e8aee): weave validate runs it
+  # in the tree's checkout with the caller's own PATH and HOME, so before anything is looked up it leaves
+  # that directory, and PATH keeps only absolute entries, which no file in the tree can stand in for.
+  --weave-box)
+    kept=''
+    IFS=: read -ra entries <<<"$PATH"
+    for entry in ${entries[@]+"${entries[@]}"}; do
+      [[ $entry != /* ]] || kept+=${kept:+:}$entry
+    done
+    PATH=$kept
+    cd /
+    ;;
+  --weave-mac) ;;
+  --in-tree) in_tree=true; shift ;;
+  *) cd "$(git -C "$here" rev-parse --show-toplevel)" ;;
+esac
 # The counted run's mode and why, for the evidence's details: verify-seq sets TEST_TABLE_MODE.
 mode_line() { [ -z "${TEST_TABLE_MODE:-}" ] || echo "test-table: counted run mode: $TEST_TABLE_MODE"; }
 fail() { echo "test-table: $*" >&2; mode_line >&2; exit 1; }
@@ -154,42 +201,21 @@ scope_args() {
   if [ ${#packages[@]} -gt 0 ]; then printf -- '-p\n%s\n' "${packages[@]}"; else echo --workspace; fi
 }
 
-# The table in one boat box, for HEAD, or only the tests of $packages; $1, if given, runs in the box
-# after it.
-remote() {
-  local rc line
-  command -v boat >/dev/null || fail "--remote needs boat (reference ea41264b3c38)"
-  [ -z "$(git status --porcelain)" ] || fail "--remote tests HEAD: commit or set aside the changes first"
-  git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
-  # tmp, out and box are globals: the EXIT trap runs after this function has returned.
-  tmp=$(mktemp -d)
-  out="$tmp/box.out"
-  # Every way out deletes the box if boat left one, and the bundle.
-  # shellcheck disable=SC2329 # run by the EXIT trap
-  cleanup() {
-    local box
-    box=$(box_in "$out")
-    [ -z "$box" ] || delete_box "$box"
-    rm -rf -- "$tmp"
-  }
-  trap cleanup EXIT
-  trap 'exit 130' INT TERM
-  mkdir "$tmp/push"
-  git bundle create -q "$tmp/push/tree.bundle" HEAD refs/remotes/origin/main
-  # In the box: the tools it lacks, HEAD checked out with origin/main beside it, then this script.
-  # It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
-  # programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both and
-  # need 2.46 (MIN_GIT in crates/experiment/src/git_mode.rs). The git-core PPA has the current git.
-  # Launchpad times out or drops the connection now and then (task 95302a01f49a), so adding the PPA is
-  # tried four times, each for at most 2 minutes, 10, 30 and 90 s apart. If it still fails, the image's
-  # own git does only if it's 2.46 or later; otherwise setup fails, saying so. Whichever git it ends
-  # with is checked against 2.46. need_git holds that number, which a test keeps equal to MIN_GIT.
-  # Their output shows only if they fail. Then every crate the
-  # host's whole package graph needs, dev-dependencies of packages the -p list leaves out included:
-  # bracken-scope's cargo metadata --offline reads them all, and a build fetches only what it builds
-  # (task 53efd11c6e4a: unicode-properties, manyroot's dev-dependency, without -p manyroot).
-  # shellcheck disable=SC2016 # expanded in the box
-  local inner='set -eu
+# The box's setup, before anything of the tree: the tools it lacks.
+# It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
+# programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both and
+# need 2.46 (MIN_GIT in crates/experiment/src/git_mode.rs). The git-core PPA has the current git.
+# Launchpad times out or drops the connection now and then (task 95302a01f49a), so adding the PPA is
+# tried four times, each for at most 2 minutes, 10, 30 and 90 s apart. If it still fails, the image's
+# own git does only if it's 2.46 or later; otherwise setup fails, saying so. Whichever git it ends
+# with is checked against 2.46. need_git holds that number, which a test keeps equal to MIN_GIT.
+# Their output shows only if they fail. Then cargo-nextest, as pinned. After its checkout, --remote
+# also fetches every crate the host's whole package graph needs, dev-dependencies of packages the -p
+# list leaves out included: bracken-scope's cargo metadata --offline reads them all, and a build fetches
+# only what it builds (task 53efd11c6e4a: unicode-properties, manyroot's dev-dependency, without -p
+# manyroot).
+# shellcheck disable=SC2016 # expanded in the box
+box_setup='set -eu
 sudo=; [ "$(id -u)" -eq 0 ] || sudo=sudo
 setup() {
   log=$(mktemp)
@@ -236,7 +262,34 @@ setup curl -fsSL -o "$nextest_dir/$nextest_tar" "https://github.com/nextest-rs/n
 echo "$nextest_sha256  $nextest_dir/$nextest_tar" | sha256sum -c --quiet - >/dev/null 2>&1 ||
   { echo "test-table: $nextest_tar does not match its pinned sha256; not running it" >&2; exit 1; }
 setup tar -xzf "$nextest_dir/$nextest_tar" -C "$nextest_dir" cargo-nextest
-export PATH="$nextest_dir:$PATH"
+export PATH="$nextest_dir:$PATH"'
+
+# The table in one boat box, for HEAD, or only the tests of $packages; $1, if given, runs in the box
+# after it.
+remote() {
+  local rc line
+  command -v boat >/dev/null || fail "--remote needs boat (reference ea41264b3c38)"
+  [ -z "$(git status --porcelain)" ] || fail "--remote tests HEAD: commit or set aside the changes first"
+  git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
+  # tmp, out and box are globals: the EXIT trap runs after this function has returned.
+  tmp=$(mktemp -d)
+  out="$tmp/box.out"
+  # Every way out deletes the box if boat left one, and the bundle.
+  # shellcheck disable=SC2329 # run by the EXIT trap
+  cleanup() {
+    local box
+    box=$(box_in "$out")
+    [ -z "$box" ] || delete_box "$box"
+    rm -rf -- "$tmp"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT TERM
+  mkdir "$tmp/push"
+  git bundle create -q "$tmp/push/tree.bundle" HEAD refs/remotes/origin/main
+  # In the box: the tools it lacks (box_setup), HEAD checked out with origin/main beside it, then this
+  # script.
+  # shellcheck disable=SC2016 # expanded in the box
+  local inner="$box_setup"'
 git init -q tree
 cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
@@ -487,19 +540,31 @@ split() {
   fi
   wait "$box_job" || rc=$?
   box_job=''
-  local which
+  echo "== the box, last lines"
+  grep -v '^LIST ' "$split_tmp/box" | tail -n 15
+  echo "== here, last lines"
+  grep -E '^ *Summary \[|^test-table: ' "$split_tmp/here" | tail -n 8 || true
+  [ "$rc" -eq 0 ] || { echo "test-table: the box's table exited $rc" >&2; exit "$rc"; }
+  compare_lists
+  if $light_split; then
+    echo "test-table: light run passed at $(git rev-parse HEAD):$(printf ' -p %s' "${packages[@]}"), in a box, and their macOS-only tests here; not the whole table"
+  else
+    echo "test-table: all passed at $(git rev-parse HEAD): the whole table in a box, and the macOS-only tests here"
+  fi
+  mode_line
+}
+
+# The box's lists, from its output in $split_tmp/box, against this Mac's (here_part's): each list must
+# have come back whole, by its cksum, and every test that runs here but is missing on Linux, or is
+# ignored there and not here, must be one of the macOS-only tests run here.
+compare_lists() {
+  local which sum got
   for which in all ignored; do
     {
       sed -n "s/^LIST $which nextest //p" "$split_tmp/box" | nextest_listed
       sed -n "s/^LIST $which doc //p" "$split_tmp/box" | tests_listed
     } | LC_ALL=C sort -u >"$split_tmp/linux-$which"
   done
-  echo "== the box, last lines"
-  grep -v '^LIST ' "$split_tmp/box" | tail -n 15
-  echo "== here, last lines"
-  grep -E '^ *Summary \[|^test-table: ' "$split_tmp/here" | tail -n 8 || true
-  [ "$rc" -eq 0 ] || { echo "test-table: the box's table exited $rc" >&2; exit "$rc"; }
-  local sum got
   for which in all ignored; do
     sum=$(sed -n "s/^LIST end $which //p" "$split_tmp/box" | tail -n 1)
     [ -n "$sum" ] || fail "the box's test lists didn't finish, so which tests need macOS is unknown"
@@ -518,12 +583,157 @@ split() {
   } | grep -v '^[^|]*|.*macos_only::' || true)
   [ -z "$escaped" ] ||
     fail "these run on this Mac but not on Linux, and aren't in a macos_only module, so neither part runs them: $(tr '\n' ' ' <<<"$escaped")"
-  if $light_split; then
-    echo "test-table: light run passed at $(git rev-parse HEAD):$(printf ' -p %s' "${packages[@]}"), in a box, and their macOS-only tests here; not the whole table"
+}
+
+# Fails unless weave validate gave each of the variables $@.
+weave_needs() {
+  local v
+  for v in "$@"; do
+    [ -n "${!v:-}" ] || fail "$weave_mode runs only as weave validate's check, which gives $v"
+  done
+}
+
+# --weave-box: what --split's box runs, on the bundled commit, with the proofs (above).
+weave_box() {
+  local rc line box packages_args=''
+  weave_mode=--weave-box
+  weave_needs WEAVE_BUNDLE WEAVE_BUNDLE_SHA256 WEAVE_COMMIT WEAVE_TREE WEAVE_FACTS
+  command -v boat >/dev/null || fail "--weave-box needs boat (reference ea41264b3c38)"
+  [ ${#packages[@]} -eq 0 ] || packages_args=$(printf ' -p %s' "${packages[@]}")
+  # tmp, out and ttl_job are globals: the EXIT trap runs after this function has returned.
+  tmp=$(mktemp -d)
+  out="$tmp/box.out"
+  ttl_job=''
+  # Every way out deletes the box, weave validate's own end included (finding 34f8b1a9991f): when it
+  # dies, even by SIGKILL, this script's output pipe has no reader, and the next write here raises
+  # SIGPIPE, which ends it through this trap, not around it. The cleanup's own writes to that pipe may
+  # fail, so none of them stops it.
+  # shellcheck disable=SC2329 # run by the EXIT trap
+  cleanup() {
+    local box
+    set +e
+    trap '' PIPE
+    [ -z "$ttl_job" ] || kill "$ttl_job" 2>/dev/null
+    box=$(box_in "$out")
+    [ -z "$box" ] || delete_box "$box"
+    rm -rf -- "$tmp"
+  }
+  trap cleanup EXIT
+  trap 'exit 130' INT TERM HUP
+  # Ignored first: bash's own message about the failed write would raise SIGPIPE again on the way out,
+  # and skip the EXIT trap.
+  trap 'trap "" PIPE; exit 130' PIPE
+  mkdir -p "$tmp/push/runner"
+  cp -- "$WEAVE_BUNDLE" "$tmp/push/tree.bundle"
+  cp -- "$here/${BASH_SOURCE[0]##*/}" "$tmp/push/runner/test-table"
+  # In the box: its setup, the bundle's commit checked out as origin/main too (so the table's own
+  # comparisons with main find nothing to compare), the proofs, then this copy of the script.
+  # shellcheck disable=SC2016 # expanded in the box
+  local inner="exec 2>&1
+nextest_version=$nextest_version nextest_sha256=$nextest_sha256
+$box_setup"'
+git init -q tree
+cd tree
+git fetch -q ../tree.bundle +weave:refs/heads/tested
+# The commit as committed: attributes come from the empty tree, so the .gitattributes of the commit
+# itself can not filter the checkout (finding 42ac5a6e8aee; git 2.40 or later, box_setup gives 2.46).
+git --attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904 checkout -q tested
+git update-ref refs/remotes/origin/main HEAD
+echo "WEAVE bundle $(sha256sum ../tree.bundle | cut -d" " -f1)"
+echo "WEAVE head $(git rev-parse HEAD)"
+echo "WEAVE tree $(git rev-parse "HEAD^{tree}")"
+echo "WEAVE start"'
+  if [ -n "$packages_args" ]; then
+    inner+="
+bash ../runner/test-table --in-tree --light$packages_args"
   else
-    echo "test-table: all passed at $(git rev-parse HEAD): the whole table in a box, and the macOS-only tests here"
+    inner+="
+bash ../runner/test-table --in-tree"
   fi
-  mode_line
+  inner+="
+bash ../runner/test-table --in-tree --lists$packages_args
+echo 'WEAVE end'"
+  # A backstop for a way out no trap sees: once boat names the box, its lifetime is set to end 300 s
+  # after boat's own timeout would end the command (boat run has no lifetime of its own to set).
+  (
+    for _ in $(seq 120); do
+      b=$(box_in "$out")
+      if [ -n "$b" ]; then
+        boat extend "$b" --ttl 2700 || true
+        exit 0
+      fi
+      sleep 1
+    done
+  ) </dev/null >/dev/null 2>&1 &
+  ttl_job=$!
+  set +e
+  # tee -i: a Ctrl-C must not stop the copy before boat has printed the box it's deleting.
+  boat run --no-env --push "$tmp/push" --type default --timeout 2400 -- bash -c "$inner" 2>&1 | tee -i "$out"
+  rc=${PIPESTATUS[0]}
+  set -e
+  # The proofs: the first of each before 'WEAVE start', printed only on reaching it, so none without it.
+  awk '
+    $1 == "WEAVE" && ($2 == "bundle" || $2 == "head" || $2 == "tree") && !($2 in v) { v[$2] = $3 }
+    $0 == "WEAVE start" {
+      if ("bundle" in v) print "bundle", v["bundle"]
+      if ("head" in v) print "head", v["head"]
+      if ("tree" in v) print "tree", v["tree"]
+      exit
+    }' "$out" >>"$WEAVE_FACTS"
+  # The box as boat announced it, and boat's cost line: the output's last line, never the tree's.
+  box=$(box_in "$out")
+  [ -z "$box" ] || echo "box $box" >>"$WEAVE_FACTS"
+  line=$(awk 'NF { l = $0 } END { print l }' "$out" | grep -E '^exit [0-9]+ · ' || true)
+  [ -z "$line" ] || echo "cost $line" >>"$WEAVE_FACTS"
+  # The end: the table's success line, then 'WEAVE end', both after 'WEAVE start'.
+  local ended=false
+  if awk '
+    $0 == "WEAVE start" { s = 1; next }
+    s && /^test-table: .*passed/ { p = 1; next }
+    s && p && $0 == "WEAVE end" { e = 1 }
+    END { exit !e }' "$out"; then
+    ended=true
+    echo "end seen" >>"$WEAVE_FACTS"
+  fi
+  echo "test-table: box: ${line:-no cost line from boat}"
+  if [ "$rc" -ne 0 ]; then
+    echo "test-table: the box exited $rc" >&2
+    exit "$rc"
+  fi
+  $ended || fail "the box exited 0, but its output has no 'WEAVE end' after the table's success line, so the table may not have run to its end"
+  echo "test-table: weave box passed at $WEAVE_COMMIT${packages_args:+:$packages_args}, in box ${box:-unknown}"
+}
+
+# --weave-mac <box check>: --split's part here, in the commit's checkout, against the box's lists.
+weave_mac() {
+  local box_check=$1 box_log here_rc=0
+  weave_mode=--weave-mac
+  weave_needs WEAVE_COMMIT WEAVE_TREE WEAVE_FACTS WEAVE_INPUTS
+  [ "$(git rev-parse HEAD)" = "$WEAVE_COMMIT" ] || fail "this checkout's HEAD isn't the manifest's commit $WEAVE_COMMIT"
+  printf 'head %s\ntree %s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" >>"$WEAVE_FACTS"
+  box_log="$WEAVE_INPUTS/$box_check.log"
+  [ -f "$box_log" ] ||
+    fail "no output of box check $box_check on this manifest: it runs first, and its latest result must pass"
+  need_nextest
+  if [ ${#packages[@]} -gt 0 ]; then
+    light_split=true
+    scope_libs
+  else
+    libs=(--workspace)
+  fi
+  split_tmp=$(mktemp -d)
+  here_limit=1800
+  # shellcheck disable=SC2329 # run by the EXIT trap
+  done_mac() { rm -rf -- "$split_tmp"; }
+  trap done_mac EXIT
+  (here_part) || here_rc=$?
+  if [ "$here_rc" -ne 0 ]; then
+    echo "test-table: the macOS-only tests here failed (exit $here_rc)" >&2
+    exit "$here_rc"
+  fi
+  cp -- "$box_log" "$split_tmp/box"
+  compare_lists
+  echo "test-table: weave mac passed at $WEAVE_COMMIT: the macOS-only tests here, and the box's lists of $box_check leave none out"
 }
 
 # Parses -p <package>... from $@ into packages, failing with usage $1 on anything else.
@@ -571,7 +781,22 @@ case "${1:-}" in
     # A docs-only head runs the local docs-only table below: nothing for a box to do.
     "$here/code-scope" docs-only origin/main HEAD >/dev/null 2>&1 || { split; exit 0; }
     ;;
-  *) fail "usage: test-table [--remote [-p <package>]... | --split [-p <package>]... | --light -p <package>... | --lists [-p <package>]...]" ;;
+  --weave-box)
+    shift
+    take_packages "test-table --weave-box [-p <package>]..." "$@"
+    weave_box
+    exit 0
+    ;;
+  --weave-mac)
+    shift
+    [[ ${1:-} =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || fail "usage: test-table --weave-mac <box check> [-p <package>]..."
+    check=$1
+    shift
+    take_packages "test-table --weave-mac <box check> [-p <package>]..." "$@"
+    weave_mac "$check"
+    exit 0
+    ;;
+  *) fail "usage: test-table [--remote [-p <package>]... | --split [-p <package>]... | --light -p <package>... | --lists [-p <package>]... | --weave-box [-p <package>]... | --weave-mac <box check> [-p <package>]...]" ;;
 esac
 
 step() {
@@ -579,6 +804,11 @@ step() {
   "$@" || fail "failed: $*"
 }
 guards() {
+  # In a Weave box: no .bracken/ to guard, and scripts/merge runs them; never the tree's own script.
+  if $in_tree; then
+    echo "test-table: in Weave's box: skipped the Ground guards (scripts/merge runs them)"
+    return 0
+  fi
   if [ "$(git rev-parse HEAD)" = "$(git rev-parse --verify -q 'origin/main^{commit}' || true)" ]; then
     echo "test-table: HEAD is origin/main: skipped the Ground guards (nothing to compare it with)"
   else
@@ -606,7 +836,7 @@ if $light; then
   mode_line
   exit 0
 fi
-if scope=$("$here/code-scope" docs-only origin/main HEAD 2>&1); then
+if ! $in_tree && scope=$("$here/code-scope" docs-only origin/main HEAD 2>&1); then
   echo "test-table: $scope"
   step cargo fmt --check
   echo "test-table: docs-only: skipped clippy and cargo test"

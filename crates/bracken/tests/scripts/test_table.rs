@@ -1033,3 +1033,326 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
         );
     }
 }
+
+/// A manifest's checkout as weave validate makes it (plan cc496dcee0e3): a repository whose one commit is
+/// on branch weave, a bundle of it, and the WEAVE_* variables validate gives, with an empty facts file.
+/// The test-table copy runs from `scripts`, outside it, as the main checkout's pinned copy does.
+struct WeaveCheckout {
+    tmp: tempfile::TempDir,
+    tree: PathBuf,
+    commit: String,
+    tree_id: String,
+}
+
+impl WeaveCheckout {
+    fn new(scripts: &str) -> WeaveCheckout {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = tmp.path().join("tree");
+        std::fs::create_dir_all(tmp.path().join("runner")).unwrap();
+        copy_executable(&repo_root().join(scripts).join("test-table"), &tmp.path().join("runner/test-table"));
+        std::fs::create_dir_all(&tree).unwrap();
+        put(&tree, "a.txt", "one\n");
+        // An attribute a checkout would apply: id.txt's $Id$ expands unless attributes are off.
+        put(&tree, ".gitattributes", "id.txt ident\n");
+        put(&tree, "id.txt", "$Id$\n");
+        for args in [
+            &["init", "-q", "-b", "weave"][..],
+            &["config", "user.name", "t"],
+            &["config", "user.email", "t@example.invalid"],
+            &["add", "-A"],
+            &["commit", "-qm", "weave manifest"],
+        ] {
+            assert!(run(&tree, "git", args).status.success(), "git {args:?} failed");
+        }
+        let rev = |r: &str| String::from_utf8(run(&tree, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
+        let (commit, tree_id) = (rev("HEAD"), rev("HEAD^{tree}"));
+        let bundle = tmp.path().join("tree.bundle");
+        assert!(run(&tree, "git", &["bundle", "create", "-q", bundle.to_str().unwrap(), "weave"]).status.success());
+        std::fs::write(tmp.path().join("facts"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("inputs")).unwrap();
+        WeaveCheckout { tmp, tree, commit, tree_id }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.tmp.path().join(name)
+    }
+
+    fn sha256(&self) -> String {
+        let out = Command::new("shasum").args(["-a", "256"]).arg(self.path("tree.bundle")).output().unwrap();
+        String::from_utf8(out.stdout).unwrap().split_whitespace().next().unwrap().to_owned()
+    }
+
+    /// The runner copy of test-table with `args`, in the checkout, with validate's variables.
+    fn table(&self, args: &[&str]) -> Command {
+        let mut c = Command::new(self.path("runner/test-table"));
+        c.args(args)
+            .current_dir(&self.tree)
+            .env("WEAVE_BUNDLE", self.path("tree.bundle"))
+            .env("WEAVE_BUNDLE_SHA256", self.sha256())
+            .env("WEAVE_COMMIT", &self.commit)
+            .env("WEAVE_TREE", &self.tree_id)
+            .env("WEAVE_FACTS", self.path("facts"))
+            .env("WEAVE_INPUTS", self.path("inputs"))
+            .env("T", self.tmp.path());
+        c
+    }
+
+    fn facts(&self) -> String {
+        std::fs::read_to_string(self.path("facts")).unwrap()
+    }
+}
+
+/// `test-table --weave-box`, weave validate's box check (plan cc496dcee0e3; weave.md section 3, Checks
+/// outside the sandbox), with a stub boat that plays the box: the box gets the bundle and this copy of the
+/// script and nothing else, prints the proofs before any of the tree's code, and the facts get the first
+/// of each, the box boat announced and its cost line, never what the tree prints after 'WEAVE start'. The
+/// box's own commands, from the bundle to 'WEAVE start', print the bundle's sha256, the commit and tree.
+#[test]
+fn test_table_weave_box_pushes_the_bundle_and_this_script_and_records_the_boxs_proofs() {
+    for scripts in SCRIPTS {
+        let w = WeaveCheckout::new(scripts);
+        let stubs = w.path("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        // boat run: records its arguments and what was pushed, keeps the push, and plays the box from $T/box.
+        write_executable(
+            &stubs.join("boat"),
+            "#!/bin/bash\n\
+             case \"$1\" in\n\
+             run) printf '%s\\n' \"$@\" >\"$T/args\"\n\
+               while [ $# -gt 0 ]; do [ \"$1\" = --push ] && push=$2; shift; done\n\
+               (cd \"$push\" && find . -type f | sort) >\"$T/pushed\"; cp -R \"$push\" \"$T/push-copy\"\n\
+               echo 'bx_stub01 ready in 1.0s'; cat \"$T/box\"\n\
+               echo \"exit $EXIT · 1m 00s · default · \\$0.0010 · bx_stub01 deleted\"; exit \"$EXIT\" ;;\n\
+             list) echo '{\"sandboxes\":[]}' ;;\n\
+             delete) echo \"$*\" >>\"$T/deleted\" ;;\n\
+             esac\n",
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let sha = w.sha256();
+        std::fs::write(
+            w.path("box"),
+            format!(
+                "WEAVE bundle {sha}\nWEAVE head {}\nWEAVE tree {}\nWEAVE start\nWEAVE tree 0000 printed by the tree\n\
+                 exit 0 · printed by the tree\ntest-table: all passed\nWEAVE end\n",
+                w.commit, w.tree_id
+            ),
+        )
+        .unwrap();
+        let out = w.table(&["--weave-box"]).env("PATH", &path).env("EXIT", "0").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{scripts}: {}{stdout}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            w.facts(),
+            format!(
+                "bundle {sha}\nhead {}\ntree {}\nbox bx_stub01\ncost exit 0 · 1m 00s · default · $0.0010 · bx_stub01 deleted\n\
+                 end seen\n",
+                w.commit, w.tree_id
+            ),
+            "{scripts}"
+        );
+        let args = std::fs::read_to_string(w.path("args")).unwrap();
+        assert!(args.lines().any(|a| a == "--no-env"), "{scripts}: {args}");
+        assert_eq!(
+            std::fs::read_to_string(w.path("pushed")).unwrap(),
+            "./runner/test-table\n./tree.bundle\n",
+            "{scripts}"
+        );
+        assert_eq!(
+            std::fs::read(w.path("push-copy/runner/test-table")).unwrap(),
+            std::fs::read(w.path("runner/test-table")).unwrap(),
+            "{scripts}: the box runs this copy"
+        );
+        // The box's script: the proofs come before the tree's code, which runs this copy, never the tree's.
+        // boat run ... -- bash -c <inner>: the box script is the last argument, after -c.
+        let inner = args.split("\n-c\n").nth(1).expect("bash -c <script>").to_owned();
+        // One stream from the first line, so the proofs keep their place (finding 694f565ee5cd).
+        assert!(inner.starts_with("exec 2>&1\n"), "{scripts}: {inner}");
+        let start = inner.find("echo \"WEAVE start\"").expect("the start line");
+        let table = inner.find("bash ../runner/test-table --in-tree").expect("this copy, in the tree");
+        assert!(start < table, "{scripts}: {inner}");
+        let lists = inner.find("bash ../runner/test-table --in-tree --lists").expect("the lists");
+        assert!(inner[lists..].trim_end().ends_with("echo 'WEAVE end'"), "{scripts}: {inner}");
+        assert!(!inner.contains("scripts/test-table"), "{scripts}: the tree's own copy runs: {inner}");
+        // Those commands themselves, from the checkout to the start line, on the pushed bundle (sha256sum
+        // as the box has it).
+        let from = inner.find("git init -q tree").expect("the checkout");
+        let prove = &inner[from..start + "echo \"WEAVE start\"".len()];
+        let box_dir = w.path("box-run");
+        std::fs::create_dir_all(&box_dir).unwrap();
+        std::fs::copy(w.path("tree.bundle"), box_dir.join("tree.bundle")).unwrap();
+        write_executable(&stubs.join("sha256sum"), "#!/bin/sh\nexec shasum -a 256 \"$@\"\n");
+        let ran = Command::new("bash")
+            .args(["-c", &format!("set -eu\n{prove}")])
+            .current_dir(&box_dir)
+            .env("PATH", &path)
+            .output()
+            .unwrap();
+        assert!(ran.status.success(), "{scripts}: {}", String::from_utf8_lossy(&ran.stderr));
+        // The checkout is the commit's bytes: its own .gitattributes changed none (finding 42ac5a6e8aee).
+        assert_eq!(std::fs::read_to_string(box_dir.join("tree/id.txt")).unwrap(), "$Id$\n", "{scripts}");
+        assert_eq!(
+            String::from_utf8_lossy(&ran.stdout),
+            format!("WEAVE bundle {sha}\nWEAVE head {}\nWEAVE tree {}\nWEAVE start\n", w.commit, w.tree_id),
+            "{scripts}"
+        );
+
+        // Nothing of the tree's runs on this Mac (finding 42ac5a6e8aee): a boat in the tree, found first
+        // through a relative PATH entry, never runs.
+        write_executable(&w.tree.join("boat"), "#!/bin/sh\ntouch \"$T/tree-boat-ran\"\nexit 7\n");
+        std::fs::write(w.path("facts"), "").unwrap();
+        let relative = format!(".:{path}");
+        let out = w.table(&["--weave-box"]).env("PATH", &relative).env("EXIT", "0").output().unwrap();
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(!w.path("tree-boat-ran").exists(), "{scripts}: the tree's boat ran");
+        std::fs::remove_file(w.tree.join("boat")).unwrap();
+
+        // -p: the light table and the lists of those packages.
+        std::fs::write(w.path("facts"), "").unwrap();
+        let out = w.table(&["--weave-box", "-p", "demo"]).env("PATH", &path).env("EXIT", "0").output().unwrap();
+        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
+        let args = std::fs::read_to_string(w.path("args")).unwrap();
+        assert!(args.contains("bash ../runner/test-table --in-tree --light -p demo\n"), "{scripts}: {args}");
+        assert!(args.contains("bash ../runner/test-table --in-tree --lists -p demo"), "{scripts}: {args}");
+
+        // The box failed: so does the check, with the proofs still written.
+        std::fs::write(w.path("facts"), "").unwrap();
+        let out = w.table(&["--weave-box"]).env("PATH", &path).env("EXIT", "4").output().unwrap();
+        assert_eq!(out.status.code(), Some(4), "{scripts}");
+        assert!(w.facts().contains("box bx_stub01\n"), "{scripts}");
+
+        // No start line: no proofs. No end line after the table's success: the check fails, with no end.
+        std::fs::write(w.path("facts"), "").unwrap();
+        std::fs::write(w.path("box"), format!("WEAVE head {}\ntest-table: all passed\nWEAVE end\n", w.commit)).unwrap();
+        let out = w.table(&["--weave-box"]).env("PATH", &path).env("EXIT", "0").output().unwrap();
+        assert!(!out.status.success(), "{scripts}");
+        let facts = w.facts();
+        assert!(!facts.contains("head ") && !facts.contains("end seen"), "{scripts}: {facts}");
+        std::fs::write(w.path("facts"), "").unwrap();
+        std::fs::write(w.path("box"), "WEAVE start\nWEAVE end\ntest-table: all passed\n").unwrap();
+        let out = w.table(&["--weave-box"]).env("PATH", &path).env("EXIT", "0").output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no 'WEAVE end'"), "{scripts}");
+        assert!(!w.facts().contains("end seen"), "{scripts}");
+
+        // weave validate gone, even by SIGKILL: the output pipe loses its reader, and the box is still
+        // deleted, by the EXIT trap (finding 34f8b1a9991f); boat was also told the box's lifetime.
+        write_executable(
+            &stubs.join("boat"),
+            "#!/bin/bash\n\
+             case \"$1\" in\n\
+             run) echo 'bx_stub02 ready in 1.0s'; for i in $(seq 100); do echo \"line $i\"; sleep 0.1; done ;;\n\
+             list) if [ -e \"$T/deleted\" ]; then echo '{\"sandboxes\":[]}'; \
+                   else echo '{\"sandboxes\":[{\"id\": \"bx_stub02\"}]}'; fi ;;\n\
+             delete) echo \"$*\" >>\"$T/deleted\" ;;\n\
+             extend) echo \"$*\" >>\"$T/extended\" ;;\n\
+             esac\n",
+        );
+        let _ = std::fs::remove_file(w.path("deleted"));
+        let (mut reader, writer) = std::io::pipe().unwrap();
+        let mut child = w
+            .table(&["--weave-box"])
+            .env("PATH", &path)
+            .stdout(writer.try_clone().unwrap())
+            .stderr(writer)
+            .spawn()
+            .unwrap();
+        let mut first = [0u8; 64];
+        std::io::Read::read_exact(&mut reader, &mut first).unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        drop(reader);
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "{scripts}");
+        let deleted = std::fs::read_to_string(w.path("deleted")).unwrap_or_default();
+        assert!(deleted.contains("delete --yes bx_stub02"), "{scripts}: no delete: {deleted:?}");
+        let extended = std::fs::read_to_string(w.path("extended")).unwrap_or_default();
+        assert_eq!(extended, "extend bx_stub02 --ttl 2700\n", "{scripts}");
+
+        // Not as validate's check: refused, and no box.
+        std::fs::remove_file(w.path("args")).unwrap();
+        let out = w.table(&["--weave-box"]).env("PATH", &path).env_remove("WEAVE_BUNDLE").output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("which gives WEAVE_BUNDLE"), "{scripts}");
+        assert!(!w.path("args").exists(), "{scripts}: a box ran");
+    }
+}
+
+/// `test-table --weave-mac <box check>`, weave validate's mac check (plan cc496dcee0e3): in the manifest's
+/// checkout it writes the commit and tree first, runs the macOS-only tests, and compares this Mac's lists
+/// with the box's, read from the box check's output. A test that runs here and on neither side's list
+/// fails it, as in --split; so do a missing box output and a checkout that isn't the manifest's commit.
+#[test]
+fn test_table_weave_mac_runs_the_macos_tests_and_compares_with_the_boxs_lists() {
+    for scripts in SCRIPTS {
+        let w = WeaveCheckout::new(scripts);
+        let stubs = w.path("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        // cargo: nextest is there; this Mac's lists from $T/mac-all (the ignored ones and doctests empty);
+        // the macOS-only run passes, and logs that it ran.
+        write_executable(
+            &stubs.join("cargo"),
+            "#!/bin/bash\n[ \"$*\" != 'nextest --version' ] || exit 0\n\
+             case \"$*\" in\n\
+             *'nextest list'*'--run-ignored only'*) ;;\n\
+             *'nextest list'*) cat \"$T/mac-all\" ;;\n\
+             *--list*) ;;\n\
+             *macos_only::*) echo ran >\"$T/ran-here\"; echo '     Summary [   1.000s] 1 test run: 1 passed, 0 skipped' ;;\n\
+             esac\n",
+        );
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let cksum = |text: &str| {
+            let mut c = Command::new("cksum")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            std::io::Write::write_all(c.stdin.as_mut().unwrap(), text.as_bytes()).unwrap();
+            String::from_utf8(c.wait_with_output().unwrap().stdout).unwrap().trim().to_owned()
+        };
+        // The box's output: its lists, as test-table --lists prints them.
+        let box_log = |tests: &str| {
+            let lines: String = tests.lines().map(|t| format!("LIST all nextest {t}\n")).collect();
+            format!("the box's table\n{lines}LIST end all {}\nLIST end ignored {}\n", cksum(tests), cksum(""))
+        };
+        std::fs::write(w.path("inputs/table.log"), box_log("demo::t a\n")).unwrap();
+        std::fs::write(w.path("mac-all"), "demo::t a\ndemo::t macos_only::b\n").unwrap();
+        let mac = || w.table(&["--weave-mac", "table"]).env("PATH", &path).output().unwrap();
+
+        let out = mac();
+        assert!(
+            out.status.success(),
+            "{scripts}: {}{}",
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+        );
+        assert_eq!(w.facts(), format!("head {}\ntree {}\n", w.commit, w.tree_id), "{scripts}");
+        assert!(w.path("ran-here").exists(), "{scripts}: the macOS-only tests didn't run");
+
+        // A test here that the box doesn't list, and not macOS-only: neither side runs it.
+        std::fs::write(w.path("mac-all"), "demo::t a\ndemo::t c\n").unwrap();
+        let out = mac();
+        assert!(!out.status.success(), "{scripts}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("demo::t|c"),
+            "{scripts}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // The box's list came back damaged.
+        std::fs::write(w.path("mac-all"), "demo::t a\n").unwrap();
+        std::fs::write(w.path("inputs/table.log"), box_log("demo::t a\n").replace("t a", "t z")).unwrap();
+        let out = mac();
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("damaged"),
+            "{scripts}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // No output of the box check: refused.
+        std::fs::remove_file(w.path("inputs/table.log")).unwrap();
+        let out = mac();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no output of box check table"), "{scripts}");
+
+        // Not the manifest's commit.
+        let out =
+            w.table(&["--weave-mac", "table"]).env("PATH", &path).env("WEAVE_COMMIT", "0".repeat(40)).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("isn't the manifest's commit"), "{scripts}");
+    }
+}

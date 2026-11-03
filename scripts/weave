@@ -27,7 +27,9 @@
 #   - artifact with a Weave media type, in any case, and relate with supersedes anywhere in its arguments,
 #     after '--' too: Weave records are written only by bracken weave, which checks them, and a hand-made
 #     line version or supersedes relation would go round that check (answer 12000ab70ae5, finding
-#     56dadb600ba2).
+#     56dadb600ba2);
+#   - --runner, and a '--', on weave validate and a line write: it gives them --runner <the main checkout>
+#     itself, the directory a box or mac check's pinned runner script is in (plan cc496dcee0e3).
 # Creating the Weave Ground (weave init) waits for the owner's go.
 set -euo pipefail
 
@@ -80,6 +82,17 @@ if [ "$cmd" = relate ]; then
       fail "relate ... supersedes is refused: weave line policy writes a line's new version and its supersedes relations"
   done
 fi
+# weave validate and a line write get --runner from this script alone (below).
+gets_runner=false
+if [ "$sub" = validate ] || { [ "$sub" = line ] && [[ $subsub == create || $subsub == policy ]]; }; then
+  gets_runner=true
+  for arg in "$@"; do
+    case "$arg" in
+      --) fail "weave $sub takes no '--' here" ;;
+      --runner | --runner=*) fail "--runner is refused: scripts/weave gives the main checkout, $main" ;;
+    esac
+  done
+fi
 [ "$who" != weave-runner ] || [ "$sub" = validate ] || fail "--as weave-runner is only for weave validate"
 if [ "$sub" = integrate ] || { [ "$sub" = line ] && [ "$subsub" = merge ]; }; then
   [ "$who" = weave-integrator ] ||
@@ -129,6 +142,11 @@ if [ -f "$ground/ground.json" ] && [ -f "$main/.bracken/ground.json" ]; then
 fi
 
 export BRACKEN_DIR="$ground"
+# A box or mac check's runner script is the main checkout's, the copy line main's policy pins (plan
+# cc496dcee0e3; weave.md section 3, Checks outside the sandbox): weave validate and a line write get
+# --runner "$main" from here, never one of the caller's.
+runner=()
+! $gets_runner || runner=(--runner "$main")
 if [ "$sub" = validate ]; then
   # The binary refuses a signer that isn't a validator too; this reads the line's validators first, so
   # that nothing runs for anyone else even under a binary that didn't (weave.md section 3).
@@ -140,8 +158,8 @@ if [ "$sub" = validate ]; then
       *) plan+=("$arg") ;;
     esac
   done
-  shown=$("$bin" "${plan[@]}" --dry-run --json) || fail "weave validate refused, so no check ran"
+  shown=$("$bin" "${plan[@]}" "${runner[@]}" --dry-run --json) || fail "weave validate refused, so no check ran"
   jq -e '.signer as $s | (.validators | index($s)) != null' <<<"$shown" >/dev/null 2>&1 ||
     fail "the signer isn't one of the line's validators, so weave validate runs nothing for it"
 fi
-exec "$bin" "$@"
+exec "$bin" "$@" ${runner[@]+"${runner[@]}"}
