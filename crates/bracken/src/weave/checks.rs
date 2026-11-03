@@ -153,16 +153,16 @@ impl Run {
     /// Lets box and mac checks run, with their scripts from `dir`. A box script gets the caller's PATH,
     /// HOME, USER and LOGNAME, for boat; a mac check's PATH gets the directories of the caller's
     /// cargo-nextest, timeout (or gtimeout) and jq, which the test table needs, after the toolchain's.
+    /// Of the caller's PATH, both take only the absolute entries (finding 367a51649450).
     fn with_outside(mut self, dir: PathBuf) -> Result<Run> {
         let dir = dir.canonicalize().with_context(|| format!("resolving --runner {}", dir.display()))?;
-        let box_env: BoxEnv = ["PATH", "HOME", "USER", "LOGNAME"]
-            .into_iter()
-            .filter_map(|k| std::env::var_os(k).map(|v| (k.into(), v)))
+        let path = absolute_entries(&std::env::var_os("PATH").unwrap_or_default());
+        let box_env: BoxEnv = std::iter::once(("PATH".into(), std::env::join_paths(&path)?))
+            .chain(["HOME", "USER", "LOGNAME"].into_iter().filter_map(|k| std::env::var_os(k).map(|v| (k.into(), v))))
             .collect();
-        let path = std::env::var_os("PATH").unwrap_or_default();
         let mut tools: Vec<PathBuf> = Vec::new();
         for name in ["cargo-nextest", "timeout", "gtimeout", "jq"] {
-            if let Some(found) = std::env::split_paths(&path).map(|d| d.join(name)).find(|p| p.is_file())
+            if let Some(found) = path.iter().map(|d| d.join(name)).find(|p| p.is_file())
                 && let Some(parent) = found.parent()
                 && !tools.iter().any(|t| t == parent)
             {
@@ -172,6 +172,12 @@ impl Run {
         self.outside = Some(Outside { dir, box_env, tools });
         Ok(self)
     }
+}
+
+/// The absolute entries of a PATH, in order: an empty or relative one names a directory relative to
+/// wherever a lookup happens, which may be a tree's checkout.
+fn absolute_entries(path: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(path).filter(|d| d.is_absolute()).collect()
 }
 
 /// The owner's default rustup toolchain, found without running anything (finding 899bfab10dec): the
@@ -611,4 +617,18 @@ fn box_logs(s: &Store, results: &Checks, who: &Identity, policy: &Line, manifest
         }
     }
     Ok(inputs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Finding 367a51649450: a relative or empty PATH entry would be looked up from wherever the script is.
+    #[test]
+    fn only_absolute_path_entries_are_kept() {
+        let path = std::ffi::OsString::from(".::bin:/usr/local/bin:./x:/usr/bin:../y:/bin");
+        let kept: Vec<PathBuf> = ["/usr/local/bin", "/usr/bin", "/bin"].map(PathBuf::from).to_vec();
+        assert_eq!(absolute_entries(&path), kept);
+        assert!(absolute_entries(std::ffi::OsStr::new("")).is_empty());
+    }
 }

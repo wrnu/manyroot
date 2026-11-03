@@ -561,7 +561,10 @@ mod run {
     /// runner script must clean up when its output pipe breaks.
     const CAUGHT: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
 
-    /// The last caught signal's number while a run catches them, else 0.
+    /// The last caught signal's number while a run catches them, else 0. Only the last run to stop
+    /// catching resets it, after the handlers are back, so no caught signal goes unread (finding
+    /// 11e32fff3656): one before that is read by every run still catching, one after it is handled as
+    /// before.
     static INTERRUPTED: AtomicI32 = AtomicI32::new(0);
 
     /// What the caught signals did before, put back when the last run catching them ends; runs on
@@ -588,47 +591,67 @@ mod run {
     }
 
     /// While one lives, [`CAUGHT`] signals set [`INTERRUPTED`] instead of their default; one the
-    /// process ignores stays ignored.
+    /// process ignores stays ignored. [`Catching::end`] says whether one came; dropped, it only stops.
     struct Catching;
 
     impl Catching {
         fn start() -> Result<Catching, CheckError> {
             let mut catching = CATCHING.lock().expect("the handlers' lock isn't poisoned: nothing panics holding it");
             catching.0 += 1;
-            // Put back by Drop, as far as it got, if this fails.
             let started = Catching;
-            if catching.0 == 1 {
-                INTERRUPTED.store(0, Ordering::SeqCst);
-                for signal in CAUGHT {
-                    let old = sigaction(signal, None).map_err(io("reading a signal's handling"))?;
-                    if old.sa_sigaction == libc::SIG_IGN {
-                        continue;
-                    }
-                    let mut new = old;
-                    new.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
-                    new.sa_flags = libc::SA_RESTART;
-                    sigaction(signal, Some(&new)).map_err(io("catching a signal"))?;
-                    catching.1.push((signal, old));
-                }
-            }
-            Ok(started)
+            let caught = if catching.0 == 1 { catch(&mut catching.1) } else { Ok(()) };
+            // The lock first: on an error, started's Drop takes it to put back what was caught (findings
+            // f54ce5322328, 9d3d8ebe4319).
+            drop(catching);
+            caught.map(|()| started)
         }
 
         /// The caught signal, if one came.
         fn caught() -> Option<i32> {
             Some(INTERRUPTED.load(Ordering::SeqCst)).filter(|s| *s != 0)
         }
+
+        /// Stops catching, and gives the signal caught meanwhile, if any: read after the handlers are
+        /// back when this is the last run catching them, so none comes between.
+        fn end(self) -> Option<i32> {
+            std::mem::forget(self);
+            stop_catching()
+        }
+    }
+
+    /// Catches each of [`CAUGHT`] that isn't ignored, keeping its old action in `old`, as far as it gets.
+    fn catch(old: &mut Vec<(libc::c_int, libc::sigaction)>) -> Result<(), CheckError> {
+        for signal in CAUGHT {
+            let was = sigaction(signal, None).map_err(io("reading a signal's handling"))?;
+            if was.sa_sigaction == libc::SIG_IGN {
+                continue;
+            }
+            let mut new = was;
+            new.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            new.sa_flags = libc::SA_RESTART;
+            sigaction(signal, Some(&new)).map_err(io("catching a signal"))?;
+            old.push((signal, was));
+        }
+        Ok(())
+    }
+
+    /// One run stops catching. The last puts the old actions back, then takes [`INTERRUPTED`]; the
+    /// others read it.
+    fn stop_catching() -> Option<i32> {
+        let mut catching = CATCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        catching.0 -= 1;
+        if catching.0 > 0 {
+            return Catching::caught();
+        }
+        for (signal, old) in std::mem::take(&mut catching.1) {
+            let _ = sigaction(signal, Some(&old));
+        }
+        Some(INTERRUPTED.swap(0, Ordering::SeqCst)).filter(|s| *s != 0)
     }
 
     impl Drop for Catching {
         fn drop(&mut self) {
-            let mut catching = CATCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            catching.0 -= 1;
-            if catching.0 == 0 {
-                for (signal, old) in std::mem::take(&mut catching.1) {
-                    let _ = sigaction(signal, Some(&old));
-                }
-            }
+            stop_catching();
         }
     }
 
@@ -765,8 +788,8 @@ mod run {
         grace: Option<Duration>,
         cap: usize,
     ) -> Result<(Exit, Vec<u8>, u64, ContentHash), CheckError> {
-        // Before the check starts, so no signal finds it running uncaught; dropped after it's reaped.
-        let _catching = Catching::start()?;
+        // Before the check starts, so no signal finds it running uncaught; ended after it's reaped.
+        let catching = Catching::start()?;
         let (reader, writer) = std::io::pipe().map_err(io("making the output pipe"))?;
         let writer2 = writer.try_clone().map_err(io("making the output pipe"))?;
         command.stdin(Stdio::null()).stdout(writer).stderr(writer2);
@@ -824,7 +847,10 @@ mod run {
         let held = done_rx.recv_timeout(OUTPUT_GRACE).is_err();
         stop.store(true, Ordering::Relaxed);
         let _ = reading.join();
-        if let Some(signal) = interrupted {
+        // A signal after the check exited, or after the loop's last look, stops validate all the same
+        // (findings 11e32fff3656, 9d3d8ebe4319).
+        let late = catching.end();
+        if let Some(signal) = interrupted.or(late) {
             return Err(CheckError::Interrupted(signal));
         }
         let exit = if !left.is_empty() {

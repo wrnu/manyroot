@@ -1079,10 +1079,18 @@ id and a facts file in its environment. The script must be
 self-contained: anything else it runs from the runner directory is not
 pinned. The facts file is out of the tree's reach only for a box check,
 whose tree runs in the box; a mac check's tree runs here as the same user
-and could write it, so a mac check's facts prove nothing and aren't
-required.
+and could write it, so a mac check's facts are a consistency check, not a
+proof: a passing mac check must give the commit and tree, a failing one
+may give neither, and any it gives must be these, or the run is refused
+and nothing is recorded (finding `79114ae0b4ab`). The test table's mac mode
+also requires its checkout's tree to be the tree id and its working tree
+to be clean before any of the tree's code runs.
 - **box**: it also gets a bundle of the commit and the bundle's sha256, and
-  the caller's `PATH`, `HOME`, `USER` and `LOGNAME`, for boat. In the box,
+  the caller's `PATH`, `HOME`, `USER` and `LOGNAME`, for boat. It starts
+  in the runner script's own directory, not the checkout, and the `PATH`
+  keeps only its absolute entries, so no file of the tree can stand in for
+  a program the script, or `env` on its first line, looks up (finding
+  `367a51649450`). In the box,
   before any of the tree's code runs, the runner's inner script prints the
   bundle's sha256, the commit and the checked-out tree id; the script
   writes those, the box's id as boat announced it, boat's cost line and,
@@ -1114,7 +1122,9 @@ SIGTERM or SIGHUP (a Ctrl-C, a kill, a closed terminal), its process group
 gets a SIGTERM and 60 seconds to end, so the box script's trap deletes its
 box, before it is killed. The group has no terminal of its own, so only
 `validate` can pass a Ctrl-C on. An interrupted check records nothing, and
-`validate` fails (finding `02ab829d2caf`). Nothing catches a SIGKILL of
+`validate` fails (finding `02ab829d2caf`), also when the signal comes after
+the check's process ended but before its run was over (finding
+`11e32fff3656`). Nothing catches a SIGKILL of
 `validate`: then the script's output pipe breaks, and the script must
 clean up on that too, as test-table's Weave modes do.
 

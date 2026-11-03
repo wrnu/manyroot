@@ -63,5 +63,34 @@ mod macos_only {
         assert!(matches!(err, CheckError::Interrupted(2)), "{err}");
         assert!(marker.exists(), "the script's TERM trap didn't run");
         assert!(started.elapsed() < Duration::from_secs(30), "it waited out the check: {:?}", started.elapsed());
+
+        // Findings 11e32fff3656 and 9d3d8ebe4319: a signal the check's own exit may beat to the poll is
+        // still read once it's reaped, and the run is interrupted, not recorded.
+        let facts = "printf 'head %s\\ntree %s\\n' \"$WEAVE_COMMIT\" \"$WEAVE_TREE\" >>\"$WEAVE_FACTS\"\n";
+        let run = |script: &str| {
+            std::fs::write(dir.join("run.sh"), script).expect("write the script");
+            let executor = Executor {
+                kind: ExecutorKind::Mac,
+                script: "run.sh".to_owned(),
+                script_hash: ContentHash::of(script.as_bytes()),
+            };
+            let check = CheckDefinition { name: "mac", argv: &argv, executor: Some(&executor) };
+            runner.run_outside(
+                &check,
+                &dir,
+                &manifest,
+                |h| blobs.get(h).cloned(),
+                &KnownKeys::new(),
+                &vec![],
+                &vec![],
+                &[],
+            )
+        };
+        let err = run(&format!("#!/bin/bash\nkill -INT $PPID\n{facts}exit 0\n")).expect_err("interrupted");
+        assert!(matches!(err, CheckError::Interrupted(2)), "{err}");
+
+        // And the next run starts with nothing caught: it passes.
+        let out = run(&format!("#!/bin/bash\n{facts}")).expect("it runs");
+        assert!(out.passed(), "{:?}", out.exit);
     }
 }

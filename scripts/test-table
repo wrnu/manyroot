@@ -106,8 +106,9 @@
 #   (its output pipe breaking), and once boat names it, its lifetime is set to 2700 s as a backstop.
 #   --weave-mac <box check> runs --split's part here, the macOS-only tests and this Mac's lists, in
 #   the commit's checkout, then compares the lists with the box's, read from WEAVE_INPUTS/<box check>.log,
-#   the output of this validator's latest passing result of that box check on the manifest. The facts
-#   get the commit and tree first, before any of the tree's code runs.
+#   the output of this validator's latest passing result of that box check on the manifest. Before any
+#   of the tree's code runs, it fails unless HEAD and its tree are WEAVE_COMMIT and WEAVE_TREE and the
+#   working tree is clean, then the facts get the commit and tree, which weave validate checks.
 #   --in-tree <mode...> is the box's own call: the mode, in the current directory.
 # The Weave modes are self-contained (finding fa1611bbec29): the policy pins this one file, so they and
 # --in-tree call no other script, of this checkout or the tree's, and only this copy runs in the box.
@@ -116,12 +117,19 @@ set -euo pipefail
 # asked for by whoever runs the table mustn't reach them (finding 607273d1d193).
 unset BRACKEN_FULL_CHECK
 
-here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# This script's directory, with builtins only: the box check starts with the caller's PATH, so an external
+# dirname here would be looked up before the --weave-box filter below (finding 367a51649450).
+case ${BASH_SOURCE[0]} in
+  */*) here=${BASH_SOURCE[0]%/*} ;;
+  *) here=. ;;
+esac
+here=$(cd -- "${here:-/}" && pwd)
 in_tree=false
 case "${1:-}" in
-  # Nothing of the tree's runs on this Mac for a box check (finding 42ac5a6e8aee): weave validate runs it
-  # in the tree's checkout with the caller's own PATH and HOME, so before anything is looked up it leaves
-  # that directory, and PATH keeps only absolute entries, which no file in the tree can stand in for.
+  # Nothing of the tree's runs on this Mac for a box check (finding 42ac5a6e8aee): it has the caller's own
+  # HOME, so before anything is looked up it leaves the directory it started in, and PATH keeps only
+  # absolute entries, which no file in the tree can stand in for. weave validate starts it outside the
+  # tree with those entries alone already (finding 367a51649450); this holds for a caller that doesn't.
   --weave-box)
     kept=''
     IFS=: read -ra entries <<<"$PATH"
@@ -710,6 +718,11 @@ weave_mac() {
   weave_mode=--weave-mac
   weave_needs WEAVE_COMMIT WEAVE_TREE WEAVE_FACTS WEAVE_INPUTS
   [ "$(git rev-parse HEAD)" = "$WEAVE_COMMIT" ] || fail "this checkout's HEAD isn't the manifest's commit $WEAVE_COMMIT"
+  # The tree that runs is the commit's, unchanged (finding 79114ae0b4ab).
+  [ "$(git rev-parse 'HEAD^{tree}')" = "$WEAVE_TREE" ] || fail "this checkout's tree isn't the manifest's tree $WEAVE_TREE"
+  local changed
+  changed=$(git status --porcelain) || fail "git status failed in this checkout"
+  [ -z "$changed" ] || fail "this checkout isn't clean against the manifest's commit: $(head -n 3 <<<"$changed" | tr '\n' ' ')"
   printf 'head %s\ntree %s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" >>"$WEAVE_FACTS"
   box_log="$WEAVE_INPUTS/$box_check.log"
   [ -f "$box_log" ] ||
