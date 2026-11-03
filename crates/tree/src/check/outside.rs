@@ -257,15 +257,21 @@ impl Runner {
                 }
             }
         }
+        // A mac check works in the tree's checkout. A box script starts in its own directory, so nothing
+        // it looks up through a relative PATH entry is the tree's (finding 367a51649450).
+        let start = if bundle_sha256.is_some() { &runner } else { &tree };
         let mut command = Command::new(&program);
-        command.args(check.argv).current_dir(&tree).env_clear().envs(env);
+        command.args(check.argv).current_dir(start).env_clear().envs(env);
         let (exit, log, output_bytes, output_hash) =
             super::run::run(command, self.outside_timeout, Some(self.outside_grace), LOG_CAP)?;
         let (mut box_id, mut cost, mut ended) = (None, None, false);
+        // A box run must name the commit and tree; so must a passing mac run, whose facts are read as
+        // the box's (finding 79114ae0b4ab). Any that a failing mac run names must be these too.
+        let facts = Facts::read(&facts)?;
+        let needed = bundle_sha256.is_some() || exit.passed();
+        facts.check("head", &commit, needed)?;
+        facts.check("tree", &tree_id, needed)?;
         if let Some(sha) = &bundle_sha256 {
-            let facts = Facts::read(&facts)?;
-            facts.require("head", &commit)?;
-            facts.require("tree", &tree_id)?;
             facts.require("bundle", sha)?;
             ended = facts.get("end").is_some();
             let id = facts.get("box").ok_or_else(|| CheckError::Proof("the run named no box".to_owned()))?;
@@ -319,7 +325,13 @@ impl Facts {
     }
 
     fn require(&self, key: &str, want: &str) -> Result<(), CheckError> {
+        self.check(key, want, true)
+    }
+
+    /// Fails if `key` is given as anything but `want`, or, when `needed`, isn't given.
+    fn check(&self, key: &str, want: &str, needed: bool) -> Result<(), CheckError> {
         match self.get(key) {
+            None if !needed => Ok(()),
             Some(v) if v == want => Ok(()),
             Some(v) => Err(CheckError::Proof(format!("the run's {key} was {v:?}, not {want}"))),
             None => Err(CheckError::Proof(format!("the run gave no {key}, so it can't be tied to the manifest"))),

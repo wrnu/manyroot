@@ -747,17 +747,24 @@ mod macos_only {
         script: &str,
         files: &[(&str, Mode, &[u8])],
     ) -> Result<bracken_tree::check::OutsideOutcome, CheckError> {
-        use bracken_tree::format::{Executor, ExecutorKind};
+        outside_as(s, bracken_tree::format::ExecutorKind::Mac, &vec![], script, files)
+    }
+
+    /// [`outside`] as a check of `kind`, a box check getting `box_env`.
+    fn outside_as(
+        s: &Setup,
+        kind: bracken_tree::format::ExecutorKind,
+        box_env: &bracken_tree::check::BoxEnv,
+        script: &str,
+        files: &[(&str, Mode, &[u8])],
+    ) -> Result<bracken_tree::check::OutsideOutcome, CheckError> {
+        use bracken_tree::format::Executor;
         use std::os::unix::fs::PermissionsExt;
         let runner = s.path().join("runner");
         std::fs::create_dir_all(&runner).expect("mkdir runner");
         std::fs::write(runner.join("run.sh"), script).expect("write the script");
         std::fs::set_permissions(runner.join("run.sh"), std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        let executor = Executor {
-            kind: ExecutorKind::Mac,
-            script: "run.sh".to_owned(),
-            script_hash: ContentHash::of(script.as_bytes()),
-        };
+        let executor = Executor { kind, script: "run.sh".to_owned(), script_hash: ContentHash::of(script.as_bytes()) };
         let argv = vec!["mac".to_owned()];
         let check = CheckDefinition { name: "mac", argv: &argv, executor: Some(&executor) };
         let (manifest, blobs) = tree(files);
@@ -768,9 +775,64 @@ mod macos_only {
             |h| blobs.get(h).cloned(),
             &KnownKeys::new(),
             &vec![],
-            &vec![],
+            box_env,
             &[],
         )
+    }
+
+    // Finding 367a51649450: a box script starts in its own directory, not the tree's checkout, so a
+    // relative PATH entry finds none of the tree's files: not bash, which env on its first line looks up,
+    // and not dirname, which it runs. Its facts must still give the commit and tree.
+    #[test]
+    fn a_box_script_starts_outside_the_tree() {
+        let s = Setup::new();
+        let planted = |name: &str| {
+            format!("#!/bin/sh\ntouch {}\nexit 7\n", s.path().join(format!("{name}-ran")).display()).into_bytes()
+        };
+        let (bash, dirname) = (planted("bash"), planted("dirname"));
+        let files: &[(&str, Mode, &[u8])] = &[
+            ("a.txt", Mode::File, b"one\n"),
+            ("bash", Mode::Executable, &bash),
+            ("dirname", Mode::Executable, &dirname),
+        ];
+        let script = format!(
+            "#!/usr/bin/env bash\nset -eu\npwd -P >{}\ndirname /a/b >/dev/null\n\
+             printf 'bundle %s\\nhead %s\\ntree %s\\nbox bx_t\\nend seen\\n' \"$WEAVE_BUNDLE_SHA256\" \"$WEAVE_COMMIT\" \
+             \"$WEAVE_TREE\" >>\"$WEAVE_FACTS\"
+",
+            s.path().join("pwd").display()
+        );
+        let box_env = vec![("PATH".into(), ".:/usr/bin:/bin".into())];
+        let out = outside_as(&s, bracken_tree::format::ExecutorKind::Box, &box_env, &script, files).expect("it ran");
+        assert!(out.passed(), "{:?}: {}", out.exit, String::from_utf8_lossy(&out.log));
+        for name in ["bash", "dirname"] {
+            assert!(!s.path().join(format!("{name}-ran")).exists(), "the tree's {name} ran");
+        }
+        let pwd = std::fs::read_to_string(s.path().join("pwd")).expect("the script wrote its directory");
+        assert!(pwd.trim_end().ends_with("/w/runner"), "it started in {pwd}");
+    }
+
+    // Finding 79114ae0b4ab: validate reads a mac check's facts too. A pass must give the commit and tree;
+    // a failure may give neither; any given must be these.
+    #[test]
+    fn a_mac_checks_facts_are_read() {
+        let s = Setup::new();
+        let files: &[(&str, Mode, &[u8])] = &[("a.txt", Mode::File, b"one\n")];
+        let facts =
+            |head: &str, tree: &str| format!("printf 'head %s\\ntree %s\\n' {head} {tree} >>\"$WEAVE_FACTS\"\n");
+        let right = facts("\"$WEAVE_COMMIT\"", "\"$WEAVE_TREE\"");
+        let wrong_tree = facts("\"$WEAVE_COMMIT\"", &"0".repeat(40));
+
+        let out = outside(&s, &format!("#!/bin/sh\n{right}"), files).expect("it ran");
+        assert!(out.passed(), "{:?}", out.exit);
+        let err = outside(&s, "#!/bin/sh\nexit 0\n", files).expect_err("a pass without facts");
+        assert!(matches!(err, CheckError::Proof(_)), "{err}");
+        let err = outside(&s, &format!("#!/bin/sh\n{wrong_tree}"), files).expect_err("another tree");
+        assert!(matches!(err, CheckError::Proof(_)), "{err}");
+        let err = outside(&s, &format!("#!/bin/sh\n{wrong_tree}exit 1\n"), files).expect_err("another tree, failing");
+        assert!(matches!(err, CheckError::Proof(_)), "{err}");
+        let out = outside(&s, "#!/bin/sh\nexit 1\n", files).expect("a failure without facts is recorded");
+        assert_eq!(out.exit, Exit::Code(1));
     }
 
     // The commit made from the manifest stands for it only if it imports as exactly it: an attribute that

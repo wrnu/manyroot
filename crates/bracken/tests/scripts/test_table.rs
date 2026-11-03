@@ -1196,15 +1196,20 @@ fn test_table_weave_box_pushes_the_bundle_and_this_script_and_records_the_boxs_p
             "{scripts}"
         );
 
-        // Nothing of the tree's runs on this Mac (finding 42ac5a6e8aee): a boat in the tree, found first
-        // through a relative PATH entry, never runs.
-        write_executable(&w.tree.join("boat"), "#!/bin/sh\ntouch \"$T/tree-boat-ran\"\nexit 7\n");
+        // Nothing of the tree's runs on this Mac (findings 42ac5a6e8aee, 367a51649450): a boat or a dirname
+        // in the tree, found first through a relative PATH entry, never runs. (A bash there would, through
+        // env on the script's first line: weave validate's PATH and start directory keep that out.)
+        for name in ["boat", "dirname"] {
+            write_executable(&w.tree.join(name), &format!("#!/bin/sh\ntouch \"$T/tree-{name}-ran\"\nexit 7\n"));
+        }
         std::fs::write(w.path("facts"), "").unwrap();
         let relative = format!(".:{path}");
         let out = w.table(&["--weave-box"]).env("PATH", &relative).env("EXIT", "0").output().unwrap();
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
-        assert!(!w.path("tree-boat-ran").exists(), "{scripts}: the tree's boat ran");
-        std::fs::remove_file(w.tree.join("boat")).unwrap();
+        for name in ["boat", "dirname"] {
+            assert!(!w.path(&format!("tree-{name}-ran")).exists(), "{scripts}: the tree's {name} ran");
+            std::fs::remove_file(w.tree.join(name)).unwrap();
+        }
 
         // -p: the light table and the lists of those packages.
         std::fs::write(w.path("facts"), "").unwrap();
@@ -1351,8 +1356,35 @@ fn test_table_weave_mac_runs_the_macos_tests_and_compares_with_the_boxs_lists() 
         assert!(String::from_utf8_lossy(&out.stderr).contains("no output of box check table"), "{scripts}");
 
         // Not the manifest's commit.
+        std::fs::write(w.path("facts"), "").unwrap();
         let out =
             w.table(&["--weave-mac", "table"]).env("PATH", &path).env("WEAVE_COMMIT", "0".repeat(40)).output().unwrap();
         assert!(String::from_utf8_lossy(&out.stderr).contains("isn't the manifest's commit"), "{scripts}");
+
+        // Not the manifest's tree, or not clean (finding 79114ae0b4ab): refused before any test runs or
+        // any fact is written.
+        std::fs::write(w.path("inputs/table.log"), box_log("demo::t a\n")).unwrap();
+        std::fs::remove_file(w.path("ran-here")).unwrap();
+        let out =
+            w.table(&["--weave-mac", "table"]).env("PATH", &path).env("WEAVE_TREE", "0".repeat(40)).output().unwrap();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("isn't the manifest's tree"), "{scripts}");
+        for (name, change) in [("a.txt", "changed\n"), ("new.txt", "new\n")] {
+            let before = std::fs::read(w.tree.join(name)).ok();
+            std::fs::write(w.tree.join(name), change).unwrap();
+            let out = mac();
+            assert!(!out.status.success(), "{scripts}: {name}");
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("isn't clean"),
+                "{scripts}: {name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            match before {
+                Some(bytes) => std::fs::write(w.tree.join(name), bytes).unwrap(),
+                None => std::fs::remove_file(w.tree.join(name)).unwrap(),
+            }
+        }
+        assert_eq!(w.facts(), "", "{scripts}");
+        assert!(!w.path("ran-here").exists(), "{scripts}: the macOS-only tests ran");
+        assert!(mac().status.success(), "{scripts}: clean again");
     }
 }
