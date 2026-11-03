@@ -1383,6 +1383,26 @@ fn test_table_weave_mac_runs_the_macos_tests_and_compares_with_the_boxs_lists() 
                 None => std::fs::remove_file(w.tree.join(name)).unwrap(),
             }
         }
+        // An ignored file, and a change git is told not to look at (finding 35815ad2763b).
+        std::fs::write(w.tree.join(".git/info/exclude"), "ign\n").unwrap();
+        std::fs::write(w.tree.join("ign"), "ignored\n").unwrap();
+        let out = mac();
+        assert!(String::from_utf8_lossy(&out.stderr).contains("isn't clean"), "{scripts}: ignored");
+        std::fs::remove_file(w.tree.join("ign")).unwrap();
+        for flag in ["--assume-unchanged", "--skip-worktree"] {
+            let mark = |on: bool| {
+                let flag = if on { flag.to_owned() } else { flag.replacen("--", "--no-", 1) };
+                assert!(run(&w.tree, "git", &["update-index", flag.as_str(), "a.txt"]).status.success(), "{flag}");
+            };
+            mark(true);
+            let out = mac();
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("skip the comparison"),
+                "{scripts}: {flag}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            mark(false);
+        }
         assert_eq!(w.facts(), "", "{scripts}");
         assert!(!w.path("ran-here").exists(), "{scripts}: the macOS-only tests ran");
         assert!(mac().status.success(), "{scripts}: clean again");
