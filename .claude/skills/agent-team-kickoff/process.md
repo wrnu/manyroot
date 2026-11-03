@@ -137,6 +137,11 @@ Risky classes for this project: `<risky classes>`. Low-risk changes by a builder
 
 - **delegate** a child on the review model; if that model wrote the PR, use another. It runs as `reviewer` and writes only `finding` claims and evidence. Run it for risky classes, and for **every PR the manager authored** (section 4.2); then the brief also asks it to re-run the done-when checks in a fresh worktree.
 - Brief it with the PR number, the `pr` claim id, the class, what must not break and the diff. **Don't give it your conclusions**, and don't point it at your own notes about the PR.
+- **Every review brief opens with context, in three layers:**
+  - **PROJECT:** the project's goal, one paragraph from the vision (this repo's is in its development doc);
+  - **ARC:** the current epic, its goal, and what this PR must give it;
+  - **TASK:** the PR's purpose, what must hold, and what's out of scope.
+- **Then calibration.** A finding names the project, arc or task property it threatens and how. Anything else goes in the verdict's details as a note, and the verdict says how many notes it kept out of findings. Prefer findings shown by a run, a test or a mutation. A clean pass is a good outcome, and excluded scope isn't re-litigated. A note that's a real gap becomes a follow-up task at the manager's call, not a blocker.
 - Each round is a new child. Its brief carries the original brief, the earlier finding ids and how each was handled (the manager's evidence on them), and open disagreements.
 - Each finding is its own `finding` claim with file:line, a severity, **the requirement it breaks** (from the brief, the PR description or the project's rules) and **a concrete counterexample**, ideally a failing test. It's labelled **confirmed** (shown to fail) or **possible risk**. The round ends with a verdict as evidence on the `pr` claim.
 - AI reviewers often reject correct code and invent requirements, and asking for fixes makes this worse. So the manager **triages findings before passing them to the builder**. It rejects (fail evidence, with the reason) findings outside the task's scope or with no requirement behind them. It asks for a counterexample when one is missing. It checks confirmed findings by running the test, then records a pass.
@@ -145,7 +150,7 @@ Risky classes for this project: `<risky classes>`. Low-risk changes by a builder
 
 ### 5.2 Security review (every proposal, every PR)
 
-A child on a strong model, running as `security`, checks:
+A child on a strong model, running as `security`, its brief opening with the same context and calibration as section 5.1's, checks the list below. The calibration never narrows this checklist: it applies in full whatever the TASK excludes. A real risk under it is always a finding, never only a note, even one a run can't show (labelled possible risk), and the manager's triage never rejects it as outside the task's scope. It blocks unless the manager defers it as section 5.1 allows, recording why.
 
 - **Credentials:** nothing that grants access ships in a client bundle; secrets live server-side in a secret manager. Every proposal says where its credentials live and what a leak would expose.
 - **Data flows:** what leaves the device or backend, where it goes, whether users would expect it.
