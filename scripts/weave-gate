@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# weave-gate: line main's Weave results on a PR's merged tree, counted by scripts/merge in place of the
+# manager's counted run (plan cc496dcee0e3 step 1b, design note 4f98bbf64314, decision bbbf898cbcfe).
+# One definition of the switch and the fallbacks, for verify-seq --weave (record) and scripts/merge
+# (check).
+#
+#   weave-gate state
+#   [ON=<main rev>] weave-gate record <pr claim>:<sha>
+#   weave-gate check <pr claim> <sha> <main sha> <key> <manifest> <pointer evidence> <main's tip>
+#
+# state: the switch. It's on only if exactly one current claim tagged weave-gate, written by the manager,
+# exists, and its statement's first line is exactly 'Weave gate: on', nothing after it: 'Weave gate: on
+# hold' and 'on-hold' are off (findings 307d5bd13ec5, 840e29c4202c). Reasons go on later lines. With
+# none, an 'off' one, or several, it's off: so it
+# stays off until the manager writes 'Weave gate: on', and one claim superseding it turns it off again at
+# the next merge (plan section 6's stop conditions, without asking). Prints 'on <claim>' and exits 0, or
+# 'off: <why>' and exits 1.
+#
+# record (verify-seq --weave, as manager): with the switch on, it computes M, git's merge of main (ON, by
+# default origin/main) with the head, as scripts/merge does (scripts/code-scope chain). It imports M into
+# the Weave Ground as manifest H (weave-integrator), checks weave verify --git M --manifest H says equal,
+# and has weave-runner validate H for the checks with no result yet. If line main's current policy has
+# fmt, clippy, table and mac and weave green --manifest H says each is green, it records one manager
+# evidence on the pr claim, the pointer:
+#   'scripts/test-table --weave @ <sha> on <main sha> tree <key> manifest <H>'
+# with details naming H, M, the policy version and each check's counted result ids. Otherwise it names
+# why and says to run git's counted run, recording nothing. It falls back the same way, before anything
+# runs, when:
+#   - the head doesn't merge cleanly onto main;
+#   - the pr claim names no 'Weave proposal <64 hex>' that the Weave Ground holds (weave-shadow --proposal
+#     needs it after the merge: it checks Weave's own merge against git's);
+#   - the head changes scripts/test-table, its template copy, or Cargo.lock: the policy pins main's
+#     test-table, so the head's own copy would be untested, and the vendor directory is main's.
+#
+# check (scripts/merge, for each pointer on the claim): exits 0 only if, each read afresh and none taken
+# from the pointer, the switch is on; the pointer is a current manager pass on the claim with that method;
+# <main sha> is main's tip, or an ancestor of it that holds the head's merge base with the tip (finding
+# 76c500f0c75d: a merge with a commit off main would test another tree; scripts/merge also requires main
+# to have moved since only in .bracken/ and docs the head doesn't touch, its check-5 rule);
+# the head is none of the fallbacks above against <main sha>; git's merge of <main sha> with the head has
+# key <key>; weave verify --git <that merge> --manifest <manifest> says equal; and weave green --manifest
+# gives fmt, clippy, table and mac green under line main's current policy, with exactly the result ids the
+# pointer's details name (a later re-run or fail makes the pointer stale). Otherwise it prints why on one
+# line and exits 1.
+#
+# Results are read only through weave green --manifest, by scripts/weave (decision bbbf898cbcfe).
+set -euo pipefail
+
+here=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+weave="$here/weave"
+# The checks a pointer needs, in the order validate runs them: mac reads table's passing log.
+required=(fmt clippy table mac)
+# Paths whose change by the head means git's counted run: the policy pins main's test-table, and the
+# vendor directory follows main's Cargo.lock.
+runner_paths=(scripts/test-table .claude/skills/agent-team-kickoff/templates/test-table Cargo.lock)
+
+fail() { echo "weave-gate: $*" >&2; exit 2; }
+usage() {
+  echo "usage: weave-gate state | [ON=<main>] weave-gate record <pr claim>:<sha> | weave-gate check <pr claim> <sha> <main sha> <key> <manifest> <evidence> <tip>" >&2
+  exit 2
+}
+command -v jq >/dev/null || fail "needs jq"
+# The gate's Ground reads pull first and are full checks, as scripts/merge's are.
+bk() { BK_PULL=required BRACKEN_FULL_CHECK=1 BRACKEN_AGENT=manager "$here/bk" "$@"; }
+
+# The current manager claims tagged weave-gate, as a JSON array.
+gate_claims() {
+  bk log --tag weave-gate --current --json | jq '[.[] | select(.kind == "claim" and .retracted == false
+    and .author_name == "manager" and (.superseded_by_others | length) == 0)]'
+}
+
+# switch: sets why; returns 0 if on.
+switch() {
+  local claims n
+  claims=$(gate_claims) || { why="off: couldn't read the weave-gate claims"; return 1; }
+  n=$(jq length <<<"$claims")
+  case "$n" in
+    0) why="off: no current manager claim tagged weave-gate"; return 1 ;;
+    1) ;;
+    *) why="off: $n current weave-gate claims, and only one may decide"; return 1 ;;
+  esac
+  if jq -e '.[0].body.statement | split("\n")[0] == "Weave gate: on"' <<<"$claims" >/dev/null; then
+    why="on $(jq -r '.[0].id[:12]' <<<"$claims")"
+    return 0
+  fi
+  why="off: the current weave-gate claim, $(jq -r '.[0].id[:12]' <<<"$claims"), doesn't have 'Weave gate: on' as its whole first line"
+  return 1
+}
+
+# fallback <base> <sha> <statement>: sets why and returns 0 if the head must take git's counted run.
+fallback() {
+  local changed p proposal
+  changed=$(git -C "$main" diff --no-renames --name-only "$1" "$2") || { why="git diff $1 $2 failed"; return 0; }
+  for p in "${runner_paths[@]}"; do
+    if grep -qxF -- "$p" <<<"$changed"; then
+      why="the head changes $p, which Weave's run doesn't test from the head"
+      return 0
+    fi
+  done
+  [[ $3 =~ Weave\ proposal\ ([0-9a-f]{64}) ]] || { why="the pr claim names no 'Weave proposal <64 hex>'"; return 0; }
+  proposal=${BASH_REMATCH[1]}
+  "$weave" show "$proposal" --json >/dev/null 2>&1 || { why="the Weave Ground holds no proposal ${proposal:0:12}"; return 0; }
+  return 1
+}
+
+# merged <main> <sha>: prints '<commit> <key>' of git's merge, or returns 1 on a conflict.
+merged() {
+  local line
+  line=$(cd "$main" && "$here/code-scope" chain "$1" "$2" 2>/dev/null | tail -n 1) || return 1
+  [[ $line =~ ^1\ ([0-9a-f]{40})\ ([0-9a-f]{40,64})$ ]] || return 1
+  echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+}
+
+# green_of <manifest>: weave green --manifest's JSON, checked for shape; if it fails or isn't, prints why
+# instead and returns 1.
+green_of() {
+  local green
+  green=$("$weave" weave green --line main --manifest "$1" --json 2>&1) ||
+    { echo "weave green --manifest $1 failed: $(tail -n 1 <<<"$green")"; return 1; }
+  jq -e '(.checks | type) == "array" and (.version | type) == "string"
+    and all(.checks[]; (.check | type) == "string" and (.green | type) == "boolean"
+      and (.passes | type) == "array" and (.fails | type) == "array")' <<<"$green" >/dev/null 2>&1 ||
+    { echo "weave green --manifest $1 isn't in the shape this reads"; return 1; }
+  printf '%s\n' "$green"
+}
+
+# results <manifest>: 'version <id>', then line main's counted passes on it as '<check> <result>' lines,
+# sorted. Unless every required check is in the policy and every check is green, it prints why instead
+# and returns 1 (run in a command substitution, so it can't set why itself).
+results() {
+  local green c
+  green=$(green_of "$1") || { echo "$green"; return 1; }
+  for c in "${required[@]}"; do
+    jq -e --arg c "$c" 'any(.checks[]; .check == $c)' <<<"$green" >/dev/null ||
+      { echo "line main's policy has no check $c"; return 1; }
+    jq -e --arg c "$c" 'any(.checks[]; .check == $c and .green == true and (.passes | length) > 0)' <<<"$green" >/dev/null ||
+      { echo "check $c isn't green on $1"; return 1; }
+  done
+  jq -e '.green == true' <<<"$green" >/dev/null || { echo "not every check of line main's policy is green on $1"; return 1; }
+  jq -r '"version \(.version)", ([.checks[] | .check as $c | .passes[] | "\($c) \(.result)"] | sort | .[])' <<<"$green"
+}
+
+# pending <manifest>: the required checks with no counted result on it at all, in order; or why not, and 1.
+pending() {
+  local green c
+  green=$(green_of "$1") || { echo "$green"; return 1; }
+  for c in "${required[@]}"; do
+    jq -e --arg c "$c" 'any(.checks[]; .check == $c and ((.passes + .fails) | length) > 0)' <<<"$green" >/dev/null ||
+      echo "$c"
+  done
+}
+
+case "${1:-}" in
+  state)
+    [ $# -eq 1 ] || usage
+    if switch; then echo "$why"; else echo "$why"; exit 1; fi
+    ;;
+
+  record)
+    [ $# -eq 2 ] && [[ $2 =~ ^([0-9a-f]{12,64}):([0-9a-f]{40})$ ]] || usage
+    claim=${BASH_REMATCH[1]} sha=${BASH_REMATCH[2]}
+    switch || { echo "weave-gate: the Weave gate is $why; run git's counted run" >&2; exit 1; }
+    shown=$(bk show "$claim" --json) || fail "no contribution $claim in the Ground"
+    full=$(jq -r .id <<<"$shown")
+    statement=$(jq -r '.body.statement // empty' <<<"$shown")
+    [[ $statement =~ ^PR\ \#([0-9]+)\ [^\ ]+\ @\ ([0-9a-f]{40}): ]] && [ "${BASH_REMATCH[2]}" = "$sha" ] ||
+      fail "$claim isn't a pr claim for $sha"
+    pr=${BASH_REMATCH[1]}
+    git -C "$main" fetch -q origin main "refs/pull/$pr/head" 2>/dev/null || true
+    tip=$(git -C "$main" rev-parse --verify -q "${ON:-origin/main}^{commit}") || fail "no commit ${ON:-origin/main}"
+    git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null || fail "$sha isn't in the main checkout (fetch PR #$pr)"
+    base=$(git -C "$main" merge-base "$tip" "$sha") || fail "$sha and main $tip share no history"
+    if fallback "$base" "$sha" "$statement"; then
+      echo "weave-gate: PR #$pr @ ${sha:0:12}: $why; run git's counted run" >&2
+      exit 1
+    fi
+    m=$(merged "$tip" "$sha") ||
+      { echo "weave-gate: PR #$pr @ ${sha:0:12} doesn't merge cleanly onto main $tip; run git's counted run" >&2; exit 1; }
+    commit=${m% *} key=${m#* }
+    imported=$("$weave" weave import --repo "$main" --from-git "$commit" --as weave-integrator --json) ||
+      fail "weave import of the merge $commit failed"
+    manifest=$(jq -r '.manifest // empty' <<<"$imported")
+    [[ $manifest =~ ^blake3:[0-9a-f]{64}$ ]] || fail "weave import gave no manifest"
+    "$weave" weave verify --repo "$main" --git "$commit" --manifest "$manifest" >/dev/null ||
+      { echo "weave-gate: $manifest doesn't verify equal to git's merge $commit; run git's counted run" >&2; exit 1; }
+    echo "weave-gate: PR #$pr @ ${sha:0:12} merged with main ${tip:0:12} is $commit (key $key), manifest $manifest"
+    todo=$(pending "$manifest") || fail "$todo"
+    if [ -n "$todo" ]; then
+      args=()
+      while IFS= read -r c; do args+=(--check "$c"); done <<<"$todo"
+      echo "weave-gate: weave-runner validates $(tr '\n' ' ' <<<"$todo")on $manifest"
+      "$weave" --as weave-runner weave validate --line main --manifest "$manifest" "${args[@]}" ||
+        echo "weave-gate: weave validate failed or was refused; reading what it recorded" >&2
+    fi
+    if ! counted=$(results "$manifest"); then
+      echo "weave-gate: PR #$pr @ ${sha:0:12}: $counted; run git's counted run" >&2
+      exit 1
+    fi
+    details=$(mktemp)
+    trap 'rm -f "$details"' EXIT
+    {
+      echo "manifest $manifest"
+      echo "merged $commit tree $key on main $tip"
+      sed -n 's/^version /policy /p' <<<"$counted"
+      sed -n '/^version /!s/^/result /p' <<<"$counted"
+    } >"$details"
+    method="scripts/test-table --weave @ $sha on $tip tree $key manifest $manifest"
+    written=$(bk evidence "$full" pass --method "$method" --details-file "$details" --as manager) ||
+      fail "couldn't record the pointer on $claim"
+    echo "weave-gate: recorded ${written%%$'\n'*}: $method"
+    echo "weave-gate: scripts/merge reads afresh the switch, git's merge of main ${tip:0:12} with ${sha:0:12} (key $key), weave verify of it against $manifest, and weave green --manifest $manifest:"
+    sed 's/^/  /' "$details"
+    ;;
+
+  check)
+    [ $# -eq 8 ] || usage
+    claim=$2 sha=$3 on=$4 key=$5 manifest=$6 pointer=$7 tip=$8
+    switch || { echo "the Weave gate is $why"; exit 1; }
+    git -C "$main" merge-base --is-ancestor "$on" "$tip" 2>/dev/null ||
+      { echo "the pointer's main ${on:0:12} isn't main's tip ${tip:0:12} or an ancestor of it"; exit 1; }
+    if ! { tip_base=$(git -C "$main" merge-base "$tip" "$sha") && git -C "$main" merge-base --is-ancestor "$tip_base" "$on"; }; then
+      echo "the pointer's main ${on:0:12} doesn't hold the head's merge base with main's tip"
+      exit 1
+    fi
+    about=$(bk show "$pointer" --json 2>/dev/null) || { echo "no pointer $pointer in the Ground"; exit 1; }
+    want="scripts/test-table --weave @ $sha on $on tree $key manifest $manifest"
+    jq -e --arg c "$claim" --arg m "$want" '.kind == "evidence" and .retracted == false and .author_name == "manager"
+      and .body.verdict == "pass" and .body.target == $c and .body.method == $m' <<<"$about" >/dev/null ||
+      { echo "pointer ${pointer:0:12} isn't a current manager pass '$want' on this claim"; exit 1; }
+    statement=$(bk show "$claim" --json | jq -r '.body.statement // empty') || { echo "can't read the pr claim"; exit 1; }
+    base=$(git -C "$main" merge-base "$on" "$sha") || { echo "main $on and $sha share no history"; exit 1; }
+    if fallback "$base" "$sha" "$statement"; then echo "$why"; exit 1; fi
+    m=$(merged "$on" "$sha") || { echo "$sha doesn't merge cleanly onto main $on"; exit 1; }
+    commit=${m% *}
+    [ "${m#* }" = "$key" ] ||
+      { echo "git's merge of main ${on:0:12} with ${sha:0:12} has key ${m#* }, not the pointer's $key"; exit 1; }
+    "$weave" weave verify --repo "$main" --git "$commit" --manifest "$manifest" >/dev/null 2>&1 ||
+      { echo "$manifest doesn't verify equal to git's merge of main ${on:0:12} with ${sha:0:12}"; exit 1; }
+    counted=$(results "$manifest") || { echo "$counted"; exit 1; }
+    named=$(jq -r '.body.details // ""' <<<"$about" | sed -n 's/^result //p' | sort)
+    [ "$named" = "$(sed '/^version /d' <<<"$counted")" ] ||
+      { echo "the pointer's results aren't the ones counted on $manifest now (stale, or not these): verify again"; exit 1; }
+    echo "line main's Weave results on $manifest, git's merge of main ${on:0:12} with this head, all green ($(sed '/^version /d; s/ .*//' <<<"$counted" | tr '\n' ' ' | sed 's/ $//'))"
+    ;;
+
+  *) usage ;;
+esac

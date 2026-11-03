@@ -162,6 +162,56 @@ fn green_shows_every_attempt() {
     assert!(text.contains("attempt 2") && text.contains("fails a later attempt replaced"), "{text}");
 }
 
+/// `weave green --manifest`: the counted results on any manifest the replica holds, not only a head's, as
+/// scripts/merge reads a candidate's before git merges (plan cc496dcee0e3 step 1b). A validator's latest
+/// counts, a fail it replaced is listed, the integrator's own result is left out, and a manifest the
+/// replica doesn't hold is refused.
+#[test]
+fn green_on_a_manifest_counts_its_results_as_for_a_head() {
+    let w = Weave::new();
+    w.integrate(&[]);
+    let method = w.method();
+    // A candidate: imported, never integrated.
+    w.commit("b.txt", b"two\n");
+    let imported = w.json(&["weave", "import", "--as", AS, "--json"]);
+    let hash = imported["manifest"].as_str().unwrap_or_else(|| panic!("a manifest in {imported}")).to_owned();
+    let artifact = imported["manifest_id"].as_str().unwrap_or_else(|| panic!("its id in {imported}")).to_owned();
+    let on = |w: &Weave| w.json(&["weave", "green", "--manifest", &hash, "--json"]);
+
+    let none = on(&w);
+    assert_eq!(none["green"], false, "{none}");
+    assert_eq!(none["manifest"], hash.as_str());
+    assert_eq!(none["checks"][0]["check"], "test");
+    assert_eq!(none["checks"][0]["passes"], serde_json::json!([]));
+
+    // The integrator's own pass doesn't count.
+    let details = details(
+        &hash.parse().expect("a hash"),
+        1,
+        &["true".to_owned()],
+        &Exit::Code(0),
+        &RecordedTail::Text("out".into()),
+    );
+    w.ok(&["evidence", &artifact, "pass", "--method", &method, "--details", &details, "--as", AS]);
+    assert_eq!(on(&w)["green"], false);
+
+    let fail = w.result(&method, (&hash, &artifact), false, 1);
+    assert_eq!(on(&w)["checks"][0]["fails"][0]["result"], fail.as_str());
+    let pass = w.result(&method, (&hash, &artifact), true, 2);
+    let green = on(&w);
+    assert_eq!(green["green"], true, "{green}");
+    assert_eq!(green["checks"][0]["passes"][0]["result"], pass.as_str());
+    assert_eq!(green["checks"][0]["replaced"][0]["result"], fail.as_str());
+    assert!(green["version"].as_str().is_some_and(|v| v.len() == 64), "{green}");
+    let text = w.ok(&["weave", "green", "--manifest", &hash]);
+    assert!(text.starts_with(&format!("manifest {hash} under line ")) && text.contains(": green\n"), "{text}");
+
+    // A manifest this replica doesn't hold.
+    let missing = format!("blake3:{}", "0".repeat(64));
+    let err = w.fails(&["weave", "green", "--manifest", &missing]);
+    assert!(err.contains("manifest"), "{err}");
+}
+
 /// An evidence-backed objection to the head is open, with the dispositions its basis allows; integrate
 /// refuses an answer its basis doesn't allow, naming rule 5, and accepts an allowed one.
 #[test]

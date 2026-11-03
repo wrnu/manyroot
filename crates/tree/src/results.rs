@@ -305,7 +305,21 @@ impl Checks {
         let d = lines.decision(decision)?;
         let [version] = lines.current_versions(&d.decision.line)[..] else { return None };
         let policy = &lines.version(&version)?.policy;
-        Some(self.counted_now(g, &version, policy, &d.author, &d.decision.manifest))
+        Some(self.counted_now(g, &version, policy, std::slice::from_ref(&d.author), &d.decision.manifest))
+    }
+
+    /// The counted results for each check of `policy`, current version `version`, on any manifest: what
+    /// green would read for a decision with that manifest, by any of the policy's integrators, whose own
+    /// results are left out as a decision's integrator's are (`weave green --manifest`, plan cc496dcee0e3
+    /// step 1b: scripts/merge reads a candidate's results through it before git merges).
+    pub fn counted_on_manifest(
+        &self,
+        g: &Graph,
+        version: &ContributionId,
+        policy: &Line,
+        manifest: &ContentHash,
+    ) -> Vec<Counted> {
+        self.counted_now(g, version, policy, &policy.integrators, manifest)
     }
 
     /// [`Checks::counted`], given the current version.
@@ -314,11 +328,11 @@ impl Checks {
         g: &Graph,
         version: &ContributionId,
         policy: &Line,
-        author: &AgentId,
+        excluded: &[AgentId],
         manifest: &ContentHash,
     ) -> Vec<Counted> {
         let in_epoch = |r: &ContributionId| answer(&self.epochs, &self.epoch_misses, g, version, r);
-        let validators: BTreeSet<&AgentId> = policy.validators.iter().filter(|v| *v != author).collect();
+        let validators: BTreeSet<&AgentId> = policy.validators.iter().filter(|v| !excluded.contains(v)).collect();
         policy
             .definitions()
             .map(|definition| {
@@ -507,7 +521,13 @@ impl Checks {
                 let record = lines.decision(d).expect("a decision on the line");
                 record.decision.breakage.is_empty()
                     && self
-                        .counted_now(g, version, policy, &record.author, &record.decision.manifest)
+                        .counted_now(
+                            g,
+                            version,
+                            policy,
+                            std::slice::from_ref(&record.author),
+                            &record.decision.manifest,
+                        )
                         .iter()
                         .all(Counted::green)
             })

@@ -108,6 +108,11 @@ pub(crate) struct GreenArgs {
     /// A line's id or name. Defaults to the default line.
     #[arg(long, value_name = "LINE")]
     line: Option<String>,
+    /// Instead of the heads, any manifest this replica holds, blake3:<hex>: each check's counted results
+    /// on it under the line's current policy, as green would count them for a decision with it, by any
+    /// of the line's integrators, whose own results are left out.
+    #[arg(long, value_name = "HASH")]
+    manifest: Option<String>,
     #[command(flatten)]
     out: Output,
 }
@@ -171,6 +176,9 @@ pub(crate) fn green(s: &Store, args: GreenArgs) -> Result<ExitCode> {
     let line = resolve_line(s, &lines, args.line.as_deref(), "--line")?;
     let checks = Checks::build(g, &ix, &lines);
     let names = Names::load(s)?;
+    if let Some(manifest) = &args.manifest {
+        return green_on_manifest(s, &ix, &lines, &line, &checks, &names, manifest, &args.out);
+    }
     let green = checks.green(g, &lines, &line);
     let (state, decisions): (&str, Vec<ContributionId>) = match &green {
         Green::Undefined(versions) => ("undefined", versions.clone()),
@@ -215,6 +223,41 @@ pub(crate) fn green(s: &Store, args: GreenArgs) -> Result<ExitCode> {
         for c in counted.iter().flatten() {
             println!("{}", counted_text(c, &checks, &names));
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `weave green --manifest`: each check of the line's current policy, counted on the manifest.
+#[allow(clippy::too_many_arguments)]
+fn green_on_manifest(
+    s: &Store,
+    ix: &Index,
+    lines: &Lines,
+    line: &ContributionId,
+    checks: &Checks,
+    names: &Names,
+    manifest: &str,
+    out: &Output,
+) -> Result<ExitCode> {
+    let (version, policy) = super::checks::current_policy(lines, line)?;
+    let hash = super::manifest_hash(s, ix, manifest, "--manifest")?;
+    ix.manifest(&hash).with_context(|| format!("--manifest {hash}: this replica holds no such manifest"))?;
+    let counted = checks.counted_on_manifest(s.graph(), &version, policy, &hash);
+    let green = !counted.is_empty() && counted.iter().all(Counted::green);
+    if out.json {
+        let per_check: Vec<Value> = counted.iter().map(|c| counted_json(c, checks, names)).collect();
+        print_json(&json!({"line": line, "version": version, "manifest": hash.to_string(), "green": green,
+                           "checks": per_check}));
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!(
+        "manifest {hash} under line {}'s policy {}: {}",
+        line.short(),
+        version.short(),
+        if green { "green" } else { "not green" }
+    );
+    for c in &counted {
+        println!("{}", counted_text(c, checks, names));
     }
     Ok(ExitCode::SUCCESS)
 }

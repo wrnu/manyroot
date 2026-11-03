@@ -921,7 +921,7 @@ never write outside the target directory, and never follow a symlink
 | `weave validate --manifest H [--line L] [--check <name>]... [--again] [--timeout SECONDS] [--runner DIR] [--dry-run]` | Validator: runs the named checks of line `L`'s policy (default: the default line, and all of its checks) on manifest `H` through the check runner, and records each result. Refuses a check it already has a latest result for on `H` unless `--again`. `--timeout` bounds each check (default 1,800 seconds), after which its process group is killed. A box or mac check (*Checks outside the sandbox*, below) needs `--runner`, the directory its pinned runner script is in; mac checks run after the others. `--dry-run` shows the line, its validators and what would run, and runs and writes nothing. |
 | `weave review [--line L] [--proposal P]` | The reviews of the line's heads, the open objections the next move must answer, each with its basis and the dispositions it allows, and the reviews of each open proposal on the line (one whose change no decision on it lists), carried over by change, with what a decision using it unchanged would have to answer. With `--proposal`, that proposal alone. |
 | `weave head [--line L]` | The head, or the fork's heads, with the manifest hash. |
-| `weave green [--line L]` | Green under the line's current policy: the green decision, none, the ambiguous set, or a diverged chain's versions; and per head, each check's counted passes and fails, with the fails a later attempt replaced, each with its validator and attempt. |
+| `weave green [--line L] [--manifest H]` | Green under the line's current policy: the green decision, none, the ambiguous set, or a diverged chain's versions; and per head, each check's counted passes and fails, with the fails a later attempt replaced, each with its validator and attempt. With `--manifest`, the same counted results on any manifest the replica holds instead of the heads, leaving out the line's integrators' own results, as for a decision they would write, and whether every check is green; `scripts/merge` reads a candidate's results through it (section 7). |
 | `weave log [--line L] [--limit N] [--since D]` | Decisions on a line, newest first in causal order, with their checks and breakage. At most 20 unless `--limit` says otherwise; never prints payloads. |
 | `weave slice [--at D] <path or prefix>...` | Those paths' contents at a decision or manifest, for an agent that needs a part, not the whole. |
 | `weave checkout [--at D] <dir>` | Materializes a manifest into an empty directory, or updates a directory that is clean against it. If writing fails part way, it removes what it wrote, or names what it couldn't remove. |
@@ -1598,8 +1598,36 @@ each need their own decision.
   - Symlinks whose target needs `..`, and paths that collide when folded.
   - Git attributes and hooks.
 - **Releases and tags**, which are already the owner's go.
-- **CI and the test table.** In stage 2 they run as Weave checks too, but
-  git's run is still the one that gates.
+- **CI and the test table.** In stage 2 they run as Weave checks too. From
+  stage 2b step 1b (plan `cc496dcee0e3`, owner approval `e8fd45c83ba6`,
+  decision `bbbf898cbcfe`), line main's results can gate a merge in place
+  of git's counted run, but only while the Weave gate is on. The gate is on
+  only while exactly one current manager claim tagged `weave-gate` has
+  `Weave gate: on` as its whole first line; with none, any other, or
+  several, it's off, and git's
+  run gates as before.
+  - `scripts/verify-seq --weave` takes git's merge M of main with the head,
+    as `scripts/merge` computes it, and imports it as manifest H. It
+    checks that `weave verify --git M --manifest H` says equal. weave-runner
+    validates the checks H has no result for. If `weave green --manifest H`
+    shows fmt, clippy, table and mac all green, it records one manager
+    evidence on the pr claim, citing H and the result ids.
+  - `scripts/merge` counts that as a run of the whole table on main merged
+    with the head only if `scripts/weave-gate check` agrees, reading
+    everything afresh: the switch, git's merge and its key, `weave verify`,
+    and `weave green --manifest`, whose result ids must be the ones cited.
+  - Git's run is still needed for:
+    - a head that doesn't merge cleanly;
+    - a pr claim that names no Weave proposal (`weave-shadow --proposal`
+      checks Weave's own merge against git's after the merge);
+    - a head that changes `scripts/test-table`, its template copy, or
+      `Cargo.lock` (the policy pins main's test-table, and the vendor
+      directory follows main's lock);
+    - a check that isn't green;
+    - batches.
+  - Results are read only through `weave green --manifest`: each check's
+    counted results on any manifest the replica holds, under the line's
+    current policy, leaving out its integrators' own.
 
 ## 8. Later
 
