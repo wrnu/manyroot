@@ -104,3 +104,37 @@ fn decisions_are_ordered_after_their_parents() {
     }
     assert!(ancestry_order(&log, &ids(&["nope"])).is_err());
 }
+
+/// The sweep of earlier checkouts' old trees runs only while the tree is a working checkout, its
+/// repository's files exactly (task af9ef395181b): with no repository, or with files the repository doesn't
+/// hold, an old tree may be the only copy of the agent's work, and stays. Every tool that checks out needs a
+/// clean tree first, so this reaches the sweep directly.
+#[test]
+fn old_trees_are_swept_only_from_a_working_checkout() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let config = StoreConfig {
+        dir: tmp.path().to_path_buf(),
+        bracken: PathBuf::from("/nonexistent/bracken"),
+        git: crate::driver::git_binary().expect("git"),
+        identity: "agent-0".into(),
+        trace: false,
+        task: Task::Phase1,
+        accept_rule: Default::default(),
+    };
+    let mut store = WeaveStore { config, runs: 0 };
+    let (tree, old) = (store.tree(), tmp.path().join("tree.old.0"));
+    std::fs::create_dir_all(old.join("tiny")).expect("an old tree");
+    std::fs::write(old.join("tiny/zero.py"), "NAME = 'zero'\n").expect("its file");
+    std::fs::create_dir(&tree).expect("the tree");
+    std::fs::write(tree.join("seed.py"), "SEED = 1\n").expect("a file");
+
+    store.sweep_old_trees();
+    assert!(old.exists(), "a tree with no repository: the old tree stays");
+    store.git_start("seed").expect("the tree's repository");
+    std::fs::write(tree.join("stray.py"), "STRAY = 1\n").expect("a file git doesn't hold");
+    store.sweep_old_trees();
+    assert!(old.exists(), "a tree with files its repository doesn't hold: the old tree stays");
+    std::fs::remove_file(tree.join("stray.py")).expect("the stray file");
+    store.sweep_old_trees();
+    assert!(!old.exists(), "a working checkout: the old tree goes");
+}

@@ -398,11 +398,7 @@ impl WeaveStore {
         }
         // Earlier checkouts' old trees, those that couldn't be removed then: each has a name of its own, so one
         // that still can't be is no hindrance.
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            if entry.file_name().to_string_lossy().starts_with("tree.old.") {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
+        self.sweep_old_trees();
         let old = (0u32..).map(|k| dir.join(format!("tree.old.{k}"))).find(|p| !p.exists()).expect("a free name");
         // Checkout writes into an empty directory.
         std::fs::create_dir(&fresh).map_err(|e| format!("creating {}: {e}", fresh.display()))?;
@@ -441,9 +437,23 @@ impl WeaveStore {
     /// Renames the checked-out `fresh` to be the tree. A debug build fails it while the store's directory holds
     /// a file `fail-placing-the-tree`, so a test can reach the put-back after it (task 43ca0a00d4b9): nothing
     /// else makes this one rename fail, a root user's included. A release build never reads that file.
+    ///
+    /// A debug build likewise makes a tree directory, with a file in it, before the rename while it holds a file
+    /// `recreate-the-tree`: what an unknown writer may do between the set-aside and the placing (task
+    /// af9ef395181b), and the rename then fails as it would.
+    ///
+    /// These hooks are live in debug builds only, and not behind a cargo feature: a feature only the tests turn
+    /// on needs the crate as its own dev-dependency, which changes Cargo.lock and so makes every head that
+    /// touches this need the full table (decision on task af9ef395181b). Only the harness or an operator can make
+    /// the files, in the store's directory, which no agent's tool reaches.
     fn place(&self, fresh: &Path, tree: &Path) -> Result<(), String> {
         if cfg!(debug_assertions) && self.config.dir.join("fail-placing-the-tree").exists() {
             return Err("placing the tree: failed for a test (fail-placing-the-tree)".into());
+        }
+        if cfg!(debug_assertions) && self.config.dir.join("recreate-the-tree").exists() {
+            std::fs::create_dir_all(tree)
+                .and_then(|()| std::fs::write(tree.join("recreated"), "a writer's"))
+                .map_err(|e| format!("recreating the tree for a test: {e}"))?;
         }
         std::fs::rename(fresh, tree).map_err(|e| format!("placing the tree: {e}"))
     }
@@ -455,15 +465,20 @@ impl WeaveStore {
     fn recover_tree(&self) -> Result<(), String> {
         let dir = &self.config.dir;
         let (tree, fresh) = (self.tree(), dir.join("tree.new"));
+        if tree.exists() && !tree.join(".git").exists() {
+            // Something made the tree again after it was set aside (task af9ef395181b): the repository in an old
+            // tree is the agent's, and which files are its is unclear.
+            if let Some(held) = self.old_trees().into_iter().find(|o| o.join(".git").exists()) {
+                return Err(format!(
+                    "{} has no git repository, while {} holds one, left by a failed checkout: neither is moved or \
+                     removed",
+                    tree.display(),
+                    held.display()
+                ));
+            }
+        }
         if !tree.exists() {
-            let mut old: Vec<PathBuf> = std::fs::read_dir(dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|e| e.file_name().to_string_lossy().starts_with("tree.old."))
-                .map(|e| e.path())
-                .collect();
-            old.sort();
+            let old = self.old_trees();
             match old.as_slice() {
                 [] => {}
                 [one] => std::fs::rename(one, &tree)
@@ -492,6 +507,35 @@ impl WeaveStore {
                 .map_err(|e| format!("{} holds git's repository: putting it back: {e}", fresh.display()))?;
         }
         Ok(())
+    }
+
+    /// Earlier checkouts' old trees, tree.old.<n>, in name order.
+    fn old_trees(&self) -> Vec<PathBuf> {
+        let mut old: Vec<PathBuf> = std::fs::read_dir(&self.config.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("tree.old."))
+            .map(|e| e.path())
+            .collect();
+        old.sort();
+        old
+    }
+
+    /// Removes earlier checkouts' old trees, as far as it can, but only while the tree is a working checkout, its
+    /// repository's files exactly: only then is an old tree surely no copy of the agent's (task af9ef395181b).
+    fn sweep_old_trees(&mut self) {
+        if self.working_checkout() {
+            for old in self.old_trees() {
+                let _ = std::fs::remove_dir_all(old);
+            }
+        }
+    }
+
+    /// Whether the tree is a working checkout: it has its repository, and git status runs there and finds the
+    /// files exactly the repository's, so nothing of the agent's is anywhere else.
+    fn working_checkout(&mut self) -> bool {
+        self.tree().join(".git").is_dir() && self.dirty().is_ok_and(|d| !d)
     }
 
     /// A path in the working tree, checked: plain, and with no symlink on the way.
