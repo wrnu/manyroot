@@ -6,7 +6,8 @@
 #   [ON=origin/main] verify-seq [--split] --batch <pr claim>:<sha> ...
 #   [ON=origin/main] verify-seq --split [-j N] --speculative <pr claim>:<sha> ...
 #   [ON=origin/main] verify-seq --light [--reason <why>] <pr claim>:<sha> ...
-#   --reason <why> goes with any of them
+#   [ON=origin/main] verify-seq --weave <pr claim>:<sha> ...
+#   --reason <why> goes with any of them but --weave
 #
 # For each pair, in a scratch worktree at <sha> (removed afterwards if the run left it clean), this
 # checkout's bk-evidence records a run of scripts/test-table on <claim> as manager, and the last two
@@ -72,6 +73,13 @@
 # main merged with the head is always tested for the scope, whether or not main moved since the
 # builder's run. Batches stay full: --light refuses --batch, --speculative, --split and -j.
 #
+# --weave (plan cc496dcee0e3 step 1b, decision bbbf898cbcfe) runs nothing here: for each head in turn,
+# scripts/weave-gate record has line main's Weave results on main (ON) merged with the head counted in
+# place of the table, and records the pointer scripts/merge re-checks ('scripts/test-table --weave @
+# <sha> on <main> tree <key> manifest <H>'). Only with the Weave gate on (scripts/weave-gate state). A
+# head it can't count (a conflict, no Weave proposal, a change to scripts/test-table or Cargo.lock, a
+# check not green) is named with the reason, and needs git's counted run: verify-seq exits 1.
+#
 # Every run's evidence details end with 'test-table: counted run mode: <light|full>: <why>': for light,
 # the scope and the builder's passes it checked; for full, any path code-scope full names, then
 # --reason, if given, or 'the default'.
@@ -80,7 +88,7 @@
 # it exits 130.
 set -uo pipefail
 
-usage() { echo "usage: [ON=<main>] verify-seq [--split [-j N]] [--batch | --speculative] [--reason <why>] <pr claim>:<sha> ..." >&2; echo "       [ON=<main>] verify-seq --light [--reason <why>] <pr claim>:<sha> ..." >&2; exit 2; }
+usage() { echo "usage: [ON=<main>] verify-seq [--split [-j N]] [--batch | --speculative] [--reason <why>] <pr claim>:<sha> ..." >&2; echo "       [ON=<main>] verify-seq --light [--reason <why>] <pr claim>:<sha> ..." >&2; echo "       [ON=<main>] verify-seq --weave <pr claim>:<sha> ..." >&2; exit 2; }
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 cd "$main" || exit 1
@@ -89,10 +97,12 @@ jobs=''
 batch=false
 speculative=false
 light=false
+weave=false
 reason=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --split) table=(scripts/test-table --split); shift ;;
+    --weave) weave=true; shift ;;
     --light) light=true; shift ;;
     --reason) [ $# -ge 2 ] && [[ $2 =~ [^[:space:]] ]] && [[ $2 != *$'\n'* ]] ||
       { echo "verify-seq: --reason takes one line saying why" >&2; exit 2; }
@@ -106,6 +116,17 @@ while [ $# -gt 0 ]; do
     *) break ;;
   esac
 done
+
+if $weave; then
+  [ ${#table[@]} -eq 1 ] && ! $light && ! $batch && ! $speculative && [ -z "$jobs" ] && [ -z "$reason" ] ||
+    { echo "verify-seq: --weave takes no other mode or option: Weave's runs are line main's checks" >&2; exit 2; }
+  [ $# -ge 1 ] || usage
+  status=0
+  for pair in "$@"; do
+    "$here/weave-gate" record "$pair" || { status=1; echo "verify-seq: $pair: not counted by Weave; run git's counted run" >&2; }
+  done
+  exit "$status"
+fi
 
 # Free space where the runs' worktrees and builds go (process 11f1ac552f26): a warning below 50 GB, and
 # a refusal below 20 GB, since a run that fills the disk fails every agent's build. VERIFY_SEQ_WARN_GB

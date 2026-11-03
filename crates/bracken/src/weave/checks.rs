@@ -242,7 +242,7 @@ pub(super) struct Recorded {
 }
 
 /// The single current policy version of `line`, refused while its chain has diverged.
-fn current_policy<'l>(lines: &'l Lines, line: &ContributionId) -> Result<(ContributionId, &'l Line)> {
+pub(super) fn current_policy<'l>(lines: &'l Lines, line: &ContributionId) -> Result<(ContributionId, &'l Line)> {
     match lines.current_versions(line).as_slice() {
         [one] => Ok((*one, &lines.version(one).expect("a current version").policy)),
         many => {

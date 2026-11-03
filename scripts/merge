@@ -39,7 +39,12 @@
 #      the merge ('scripts/test-table @ <sha> on <main sha>', from bk-evidence --on, with
 #      ' tree <key>' and then ' docs-only' or ' reuses <id>' after it as bk-evidence now
 #      records them) with a main sha that main's tip has moved past only in those same
-#      paths. A light pass counts here too, where the scope check allows it. A pass of
+#      paths. A light pass counts here too, where the scope check allows it, and so does a Weave pass
+#      ('scripts/test-table --weave @ <sha> on <main sha> tree <key> manifest <H>', from verify-seq
+#      --weave: line main's Weave results on that merge, plan cc496dcee0e3 step 1b), but the scope
+#      check fails unless scripts/weave-gate check agrees, reading everything afresh: the Weave gate
+#      on, git's merge with that key, weave verify of it against H, and weave green --manifest H with
+#      exactly the results the pass names. A pass of
 #      any other command with --on doesn't count: part of the table proves too little;
 #   6. scripts/ground-guards passes on the sha against main's tip: no keys or stray
 #      files under .bracken/, the Ground append-only, the Ground opens, and
@@ -293,13 +298,17 @@ tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no o
 
 # The manager's passes of scripts/test-table naming the sha, one '<main sha>\t<key>\t<suffix>' line
 # each; the main and key are empty for a pass without --on, the suffix ' docs-only', ' reuses <id>',
-# ' light -p <package>...' (a light pass, always with --on) or empty.
+# ' light -p <package>...' (a light pass, always with --on), ' weave <manifest> <evidence>' (line main's
+# Weave results on the merge, recorded by verify-seq --weave and re-checked below by scripts/weave-gate
+# check) or empty.
 tables=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
   and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
-  | .body.method
+  | . as $e | .body.method
   | ((capture("^scripts/test-table( --split)? @ (?<h>[0-9a-f]{40})( on (?<m>[0-9a-f]{40})( tree (?<k>[0-9a-f]{40,64}))?)?(?<x> docs-only| reuses [0-9a-f]{64})?$")?)
      // (capture("^scripts/test-table --split(?<p>( -p [A-Za-z0-9][A-Za-z0-9_-]*)+) @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40}) tree (?<k>[0-9a-f]{40,64})$")?
-         | .x = " light" + .p))
+         | .x = " light" + .p)
+     // (capture("^scripts/test-table --weave @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40}) tree (?<k>[0-9a-f]{40,64}) manifest (?<w>blake3:[0-9a-f]{64})$")?
+         | .x = " weave " + .w + " " + $e.id))
   | select(.h == $sha) | [.m // "", .k // "", .x // ""] | @tsv] | unique | .[]' <<<"$shown")
 # The manager's batch passes naming the sha, one '<batch>\t<main>\t<key>\t<run>' line each.
 batch_passes=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
@@ -422,6 +431,17 @@ batch_member_main() {
     check FAIL main "main ($tip, key $t) isn't the batch's prefix $((member - 1)) (key ${keys[member - 1]})${bad:+, differing in $(tr "\n" " " <<<"$bad")}, or merging $sha onto it ($( [ -n "$next" ] && echo "key $(key_of "$next")" || echo "a conflict")) isn't prefix $member (key ${keys[member]}): stop the batch"
   fi
 }
+# weave_main_ok <main sha>: whether a Weave pass's main may stand for main's tip, by check 5's rule: it
+# is the tip, or it holds the branch point and main has moved since only in .bracken/ and docs the head
+# doesn't touch (finding 76c500f0c75d).
+weave_main_ok() {
+  local base ours
+  [ "$1" != "$tip" ] || return 0
+  base=$(git -C "$main" merge-base "$tip" "$sha") || return 1
+  ours=$(git -C "$main" diff --no-renames --name-only "$base" "$sha") || return 1
+  git -C "$main" merge-base --is-ancestor "$base" "$1" 2>/dev/null &&
+    git -C "$main" merge-base --is-ancestor "$1" "$tip" 2>/dev/null && [ -z "$(untested "$1")" ]
+}
 # Whether <id> is a current manager pass of the whole table, with key <key>, on a pr claim of this PR.
 reuses_a_pass() {
   local about target
@@ -439,7 +459,8 @@ else
   if scope=$(cd "$main" && "$here/code-scope" docs-only "$tip" "$sha" 2>&1); then docs_only=true; fi
   scope=${scope#code-scope: }
   wrong=()
-  needs_full='' light_packages='' light_passes=''
+  needs_full='' light_packages='' light_passes='' weave_case=''
+  weave_dropped=() weave_dropped_ids=() weave_ignored=()
   while IFS=$'\t' read -r m k x; do
     case "$x" in
       " docs-only") $docs_only || wrong+=("a docs-only pass${m:+ on main $m} on a head that isn't docs-only ($scope)") ;;
@@ -479,10 +500,49 @@ else
         ;;
       " reuses "*) reuses_a_pass "${x# reuses }" "$k" ||
         wrong+=("a pass reusing ${x# reuses }, which isn't a current manager pass of the whole table on PR #$pr with key ${k:-none}") ;;
+      " weave "*)
+        # Line main's Weave results, counted only if scripts/weave-gate's own reads agree (plan
+        # cc496dcee0e3 step 1b): the switch, main, the fallbacks, git's merge, weave verify and weave
+        # green; and only if main has moved since the pass's main only as check 5 allows (finding
+        # 76c500f0c75d). One that doesn't count is ignored, not a failure, so git's counted run beside
+        # it still counts (finding cfd70a4b5283); but nothing below may rest on it.
+        read -r _ w e <<<"$x"
+        if ! why=$("$here/weave-gate" check "$full" "$sha" "$m" "$k" "$w" "$e" "$tip" 2>&1); then
+          why=$(tail -n 1 <<<"$why")
+        elif ! weave_main_ok "$m"; then
+          why="main ($tip) has moved since its main ${m:0:12} in what can change the tests"
+        else
+          weave_case=$(tail -n 1 <<<"$why")
+          continue
+        fi
+        weave_dropped+=("$m"$'\t'"$k"$'\t'"$x") weave_dropped_ids+=("$e")
+        weave_ignored+=("Weave pass ${e:0:12} on main ${m:0:12} ignored: $why")
+        ;;
     esac
   done <<<"$tables"
+  if [ ${#weave_dropped_ids[@]} -gt 0 ]; then
+    # Check 5 never reads an ignored pointer's main.
+    kept=''
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf '%s\n' "${weave_dropped[@]}" | grep -qxF -- "$line" || kept+="$line"$'\n'
+    done <<<"$tables"
+    tables=${kept%$'\n'}
+    # An ignored pointer carries nothing (finding f6bf883e41d7): a manager pass of the table must remain,
+    # git's counted run or a pointer that counts, and without the ignored ones the gate's passes must
+    # still come from enough distinct authors, counted as the gate counts them.
+    dropped_json=$(printf '%s\n' "${weave_dropped_ids[@]}" | jq -R . | jq -s .)
+    left=$(jq --argjson d "$dropped_json" '.assessment.passes as $p | [.referrers[]
+      | select(.kind == "evidence" and (.id as $i | $p | index($i)) and (.id as $i | $d | index($i) | not))
+      | .author] | unique | length' <<<"$shown")
+    if [ -z "$tables" ] && [ -z "$batch_passes" ]; then
+      wrong+=("$(printf '%s; ' "${weave_ignored[@]}")and no other manager pass of the table is on the claim")
+    elif [ "$left" -lt "$min_passes" ]; then
+      wrong+=("$(printf '%s; ' "${weave_ignored[@]}")without it the gate's passes come from $left of the $min_passes authors it needs")
+    fi
+  fi
   if [ ${#wrong[@]} -eq 0 ]; then
-    check ok scope "$($docs_only && echo "the head is docs-only" || echo "the head changes code"): $scope"
+    check ok scope "$($docs_only && echo "the head is docs-only" || echo "the head changes code"): $scope${weave_case:+; $weave_case}$( [ ${#weave_ignored[@]} -eq 0 ] || printf '; %s' "${weave_ignored[@]}")"
   else
     check FAIL scope "$(printf '%s; ' "${wrong[@]}")run the whole table: bk-evidence --on origin/main -- scripts/test-table"
   fi
