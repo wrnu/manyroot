@@ -1188,6 +1188,93 @@ impl<'a> Transcript<'a> {
 mod tests {
     use super::*;
 
+    /// A harness no turn may start: every turn here must stop at a cap before its process (task
+    /// `88657300b06e`), so launching one is an error the tests can tell from the cap's.
+    struct NoTurn {
+        pin: Pin,
+    }
+
+    const NOT_LAUNCHED: &str = "no turn of this test may launch";
+
+    impl Harness for NoTurn {
+        fn name(&self) -> &str {
+            "no-turn"
+        }
+
+        fn route(&self) -> Route {
+            Route { host: "llm.no-turn.invalid".into(), port: 443, connect: None }
+        }
+
+        fn secret(&self) -> &str {
+            "no-turn-secret-0123456789"
+        }
+
+        fn pin(&self) -> &Pin {
+            &self.pin
+        }
+
+        fn profile(&self) -> Profile {
+            Profile::Agent
+        }
+
+        fn env_names(&self) -> &[&str] {
+            &[]
+        }
+
+        fn config(&self, _name: &str, _socket: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
+            Ok(vec![])
+        }
+
+        fn launch(&self, _turn: &Turn) -> Result<Launch, String> {
+            Err(NOT_LAUNCHED.into())
+        }
+
+        fn event(&self, _line: &str, _first: bool, _turn: &Turn) -> Result<Event, String> {
+            Err(NOT_LAUNCHED.into())
+        }
+    }
+
+    /// A backend under `caps` whose harness never starts a turn, and its directory's guard.
+    fn no_turn_backend(caps: Caps) -> (tempfile::TempDir, HarnessBackend<NoTurn>) {
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+        std::fs::write(root.join("prog"), "the program").expect("a program");
+        let pin = Pin::of(&root.join("prog"), "1").expect("a pin");
+        let cfg = BackendConfig { caps, dir: root.join("backend"), shim: PathBuf::from("/nonexistent/shim"), turns: 4 };
+        let backend = HarnessBackend::start(NoTurn { pin }, cfg).expect("the backend");
+        (tmp, backend)
+    }
+
+    /// The run's caps bind on the run's sum, whoever's tokens make it (task `88657300b06e`): with each
+    /// agent's caps far above, two agents each under the run's cap pass it together. Counting the second's
+    /// tokens says the run must stop (`count`), and the next turn of any agent, a third with none of its own,
+    /// stops the run before it starts (`turn`). On every platform: no turn's process ever starts.
+    #[test]
+    fn the_runs_token_and_output_caps_bind_on_the_sum_of_every_agents_tokens() {
+        let caps = Caps {
+            agent_tokens: 1_000_000,
+            agent_output: 1_000_000,
+            run_tokens: 1_000,
+            run_output: 100,
+            ..Caps::pilot()
+        };
+        let socket = Path::new("/nonexistent/agent.sock");
+        let tokens = |input, output| Tokens { input, output, ..Tokens::default() };
+        for (first, second) in [(tokens(600, 0), tokens(400, 0)), (tokens(0, 60), tokens(0, 40))] {
+            let (_tmp, b) = no_turn_backend(caps.clone());
+            assert_eq!(b.count("agent-0", &first), None, "under every cap: {first:?}");
+            assert_eq!(b.count("agent-1", &second), Some(End::Halt(RUN_TOKEN_CAP.into())), "{second:?}");
+            assert_eq!(b.halted(), None, "counting alone stops nothing: the turn that counted does");
+            assert_eq!(b.turn(2, "agent-2", 1, socket), Err(RUN_TOKEN_CAP.into()), "{second:?}");
+            assert_eq!(b.halted(), Some(RUN_TOKEN_CAP.into()));
+        }
+        // Below the run's caps, a turn isn't stopped by them: it gets as far as launching.
+        let (_tmp, b) = no_turn_backend(caps);
+        assert_eq!(b.count("agent-0", &tokens(900, 99)), None, "999 tokens, 99 of them output");
+        assert_eq!(b.turn(0, "agent-0", 1, socket), Err(NOT_LAUNCHED.into()));
+        assert_eq!(b.halted(), None);
+    }
+
     /// What a harness could do if Pin's fields were its to set (finding ab0192deac8f): the check
     /// refuses either, though each pin's own file and hash still match.
     #[test]
