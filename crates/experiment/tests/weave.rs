@@ -329,6 +329,141 @@ fn a_fork_is_settled_by_a_merge_that_keeps_both_heads() {
     }
 }
 
+/// Two agents' integrations, met at a sync: a forked line, each head with one file of its own.
+fn forked() -> Stores {
+    let mut s = Stores::new(&["agent-0", "agent-1"]);
+    for (i, name) in [(0, "zero"), (1, "one")] {
+        s.ok(i, "write_file", json!({"path": format!("tiny/{name}.py"), "text": format!("NAME = '{name}'\n")}));
+        s.ok(i, "integrate", json!({"note": format!("agent {i}'s tree")}));
+    }
+    for i in [0, 1, 0, 1] {
+        s.sync(i);
+    }
+    assert_eq!(s.ok(0, "head", json!({}))["forked"], true);
+    s
+}
+
+/// What a copy's directory holds beside its tree: tree.new and any tree.old.<n>.
+fn aside(tree: &Path) -> Vec<String> {
+    let dir = tree.parent().expect("the copy's directory");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("the copy's directory")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n == "tree.new" || n.starts_with("tree.old."))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A failed checkout that couldn't put everything back leaves git's repository in tree.new, or also the
+/// agent's files in tree.old.<n> with the tree missing (task 43ca0a00d4b9). The next tool puts each back
+/// before anything is cleared, so neither copy is lost; where it can't tell which is the tree, or both trees
+/// hold a repository, it refuses and removes nothing. Each state is made by hand, as such a failure leaves it.
+#[test]
+fn what_a_failed_checkout_left_aside_is_put_back_or_kept() {
+    let mut s = Stores::new(&["agent-0"]);
+    let tree = s.trees[0].clone();
+    let dir = tree.parent().expect("the copy's directory").to_path_buf();
+    s.ok(0, "write_file", json!({"path": "tiny/zero.py", "text": "NAME = 'zero'\n"}));
+    s.ok(0, "integrate", json!({"note": "zero"}));
+    let whole = |s: &mut Stores| {
+        assert!(tree.join(".git").is_dir() && tree.join("tiny/zero.py").exists(), "the tree and its repository");
+        assert_eq!(s.ok(0, "head", json!({}))["unproposed_edits"], false, "the tree is as it was");
+    };
+
+    // Git's repository alone in tree.new: it goes back, and the checkout after clears tree.new.
+    std::fs::create_dir(dir.join("tree.new")).expect("tree.new");
+    std::fs::rename(tree.join(".git"), dir.join("tree.new/.git")).expect("the repository aside");
+    s.ok(0, "update", json!({}));
+    whole(&mut s);
+    assert_eq!(aside(&tree), Vec::<String>::new());
+
+    // The tree in tree.old.0 and its repository in tree.new: both go back.
+    std::fs::create_dir(dir.join("tree.new")).expect("tree.new");
+    std::fs::rename(tree.join(".git"), dir.join("tree.new/.git")).expect("the repository aside");
+    std::fs::rename(&tree, dir.join("tree.old.0")).expect("the tree aside");
+    s.ok(0, "update", json!({}));
+    whole(&mut s);
+    assert_eq!(aside(&tree), Vec::<String>::new());
+
+    // Two old trees and no tree: which was the tree is unclear, so both stay, and nothing runs.
+    std::fs::rename(&tree, dir.join("tree.old.0")).expect("the tree aside");
+    std::fs::create_dir(dir.join("tree.old.1")).expect("another old tree");
+    let err = s.tool(0, "update", json!({})).expect_err("unclear");
+    assert!(err.contains("the tree is missing, and 2 old trees are left"), "{err}");
+    assert!(dir.join("tree.old.0/.git").is_dir() && dir.join("tree.old.1").is_dir(), "both kept");
+    std::fs::remove_dir(dir.join("tree.old.1")).expect("the empty one");
+    s.ok(0, "update", json!({}));
+    whole(&mut s);
+
+    // A repository in both trees: neither is removed.
+    std::fs::create_dir_all(dir.join("tree.new/.git")).expect("a second repository");
+    let err = s.tool(0, "update", json!({})).expect_err("two repositories");
+    assert!(err.contains("hold a git repository") && err.contains("neither is removed"), "{err}");
+    assert!(dir.join("tree.new/.git").is_dir() && tree.join(".git").is_dir(), "both kept");
+    std::fs::remove_dir_all(dir.join("tree.new")).expect("the second");
+    s.ok(0, "update", json!({}));
+    whole(&mut s);
+}
+
+/// A checkout whose new tree can't be placed puts the old tree back, with its repository and files
+/// (task 43ca0a00d4b9): the merge says what failed, the tree is as it was, and the next merge goes through,
+/// leaving nothing aside. The placing is made to fail by the debug build's `fail-placing-the-tree` file,
+/// since nothing else makes that one rename fail, a root user's included.
+#[test]
+fn a_tree_that_cant_be_placed_is_put_back_and_the_next_merge_goes_through() {
+    let mut s = forked();
+    let tree = s.trees[0].clone();
+    let marker = tree.parent().expect("the copy's directory").join("fail-placing-the-tree");
+    std::fs::write(&marker, "").expect("the marker");
+    let err = s.tool(0, "merge", json!({})).expect_err("placing fails");
+    std::fs::remove_file(&marker).expect("the marker");
+    assert!(err.contains("placing the tree: failed for a test"), "{err}");
+    assert!(!err.contains("putting the tree back") && !err.contains("not a git repository"), "{err}");
+    assert!(tree.join(".git").is_dir() && tree.join("tiny/zero.py").exists(), "the old tree, with its repository");
+    assert!(!tree.join("tiny/one.py").exists(), "not the other head's");
+    // The old tree itself came back, not just its files by the merge's reset: none is left aside, only the
+    // checkout that couldn't be placed.
+    assert_eq!(aside(&tree), ["tree.new"]);
+    assert_eq!(s.ok(0, "head", json!({}))["unproposed_edits"], false, "the tree is as it was");
+
+    let merged = s.ok(0, "merge", json!({}));
+    assert_eq!(merged["conflicts"], json!([]), "{merged}");
+    for name in ["zero", "one"] {
+        assert!(tree.join(format!("tiny/{name}.py")).exists(), "{name}'s file is in the merge");
+    }
+    assert_eq!(aside(&tree), Vec::<String>::new());
+}
+
+/// When the heads' merge fails and so does putting the tree back, the merge's own failure is told first
+/// (task 43ca0a00d4b9, after 898fff65aaef). A lock git finds already held fails both, root or not: the
+/// mirror's commit and the reset each need the index lock, while the status before them doesn't.
+#[test]
+fn a_merge_whose_restore_fails_too_tells_the_merges_failure_first() {
+    let mut s = forked();
+    let lock = s.trees[0].join(".git/index.lock");
+    std::fs::write(&lock, "").expect("a held lock");
+    let err = s.tool(0, "merge", json!({})).expect_err("both fail");
+    std::fs::remove_file(&lock).expect("the lock");
+    let (merge, restore) = err.split_once("; and restoring the tree: ").unwrap_or_else(|| panic!("both: {err}"));
+    // Git's messages are cut short, before the lock's name: each step says it couldn't create it.
+    assert!(merge.starts_with("git add: ") && merge.contains("Unable to create"), "the merge's first: {err}");
+    assert!(restore.starts_with("git reset: ") && restore.contains("Unable to create"), "then the restore's: {err}");
+}
+
+/// Bracken refuses to integrate a proposal on a forked line with "is forked", the words the mock's weave
+/// turn takes as the proposal left open for later (mock.rs, task 61c34b3c2704): this pins them, so a change
+/// to bracken's message fails here, not as a mock run's lost turn.
+#[test]
+fn integrating_a_proposal_on_a_forked_line_is_refused_as_forked() {
+    let mut s = forked();
+    s.ok(0, "write_file", json!({"path": "tiny/late.py", "text": "LATE = True\n"}));
+    let p = s.ok(0, "propose", json!({"summary": "late"}));
+    let err = s.tool(0, "integrate", json!({"proposals": [p["proposal"]], "note": "late"})).expect_err("forked");
+    assert!(err.contains("is forked"), "{err}");
+}
+
 /// A project run is Weave mode's, and needs the Python pin; Weave mode needs a project. Each is refused before
 /// the run directory is made.
 #[test]
