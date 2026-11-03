@@ -11,6 +11,19 @@ fn the_hosts_deadline_moves_a_bounded_amount() {
     assert_eq!(moved, [3, 1, 0].map(Duration::from_secs));
 }
 
+/// A call's deadline is the host's moved by its server's start, which isn't the host's time, unless the call's own
+/// wall time ends first (findings 783ef2c1346d, e4c03aa4e4e9). In a group the call's own nearly always does, so
+/// it's pinned here.
+#[test]
+fn a_calls_deadline_is_the_hosts_moved_by_its_servers_start() {
+    use std::time::{Duration, Instant};
+    let host = Instant::now();
+    let s = Duration::from_secs;
+    assert_eq!(super::call_deadline(host, s(10), host + s(60)), host + s(10));
+    assert_eq!(super::call_deadline(host, s(10), host + s(5)), host + s(5));
+    assert_eq!(super::call_deadline(host, Duration::ZERO, host + s(60)), host);
+}
+
 /// In `macos_only` though they don't need macOS, so the counted run's Mac side runs them: Docker is on this Mac
 /// and not in the test boxes, where they skip (decision ac22cedd8fee, docs/development.md).
 mod macos_only {
@@ -1396,10 +1409,11 @@ class Rebound(unittest.TestCase):
     }
 
     /// A slow first server start doesn't count against the host's wall time (finding 783ef2c1346d, the failure
-    /// of #207's counted run): the tree's 1500 files make it take about 10 s, which would leave the host none of its
-    /// 4 s if it drew on the allowance, so none of its calls would pass. They're quick, and one passing is enough:
-    /// on a machine loaded enough, the host's own start and four calls that each slept half a second outran its
-    /// 4 s (evidence 3c0248f8b699).
+    /// of #207's counted run): the tree's 300 files make it a couple of seconds, all set aside, none of it drawn on
+    /// the allowance, and both the deadline and the wall limit the host's container is killed at move by it and by
+    /// all that was drawn, as does the first call's own deadline (findings b5600996ed42, e4c03aa4e4e9). What the
+    /// allowance gives is only the time around the four quick calls. The host's own time isn't what's checked, so a
+    /// loaded machine can't fail it (task 494343db20c9): its budget is ample.
     #[test]
     fn a_slow_first_server_start_doesnt_cost_the_host() {
         let Some(python) = python() else { return };
@@ -1408,8 +1422,14 @@ class Rebound(unittest.TestCase):
         for i in 0..4 {
             test.push_str(&format!("    def test_n{i}(self):\n        self.assertEqual(stats.one(), 1)\n"));
         }
-        let g = graded_padded(&python, stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": 1}), 1500);
-        assert!(g.counts.pass > 0, "{g:#?}");
+        let g = graded_padded(&python, stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": 30}), 300);
+        let t = HOST_TIME.get();
+        assert_eq!(g.counts.pass, 4, "{g:#?}");
+        assert!(t.aside >= Duration::from_millis(500) && t.drawn < t.aside / 2, "{t:?}");
+        assert!(t.moved >= t.aside + t.drawn, "{t:?}");
+        // The wall limit moves in whole milliseconds, rounded down at each move.
+        assert!(t.skipped + Duration::from_millis(t.moves.into()) >= t.aside + t.drawn, "{t:?}");
+        assert!(t.given >= t.aside, "{t:?}");
     }
 
     /// Other containers' starts, after the group's first server's, do draw on the allowance (finding 783ef2c1346d):
@@ -1526,19 +1546,25 @@ class Rebound(unittest.TestCase):
     }
 
     /// A host killed at its wall time keeps the outcomes it reported, and the tests it didn't finish count as
-    /// failures (finding e7d128464936). Each hanging call ends at one run's wall time, a second here, as an error.
+    /// failures (finding e7d128464936). Each hanging call ends at one run's wall time, as an error, so four of them
+    /// would spend the host's. The wall time is the host's own time for the three quick tests, measured first, a
+    /// second at least: its budget, four times that, holds them and some hanging calls however loaded the machine
+    /// (task 494343db20c9).
     #[test]
     fn an_unfinished_host_keeps_its_outcomes() {
         let Some(python) = python() else { return };
-        let stats = "import time\n\ndef ok():\n    return 1\n\ndef hang():\n    time.sleep(60)\n";
+        let stats = "import time\n\ndef ok():\n    return 1\n\ndef hang():\n    time.sleep(600)\n";
         let mut test = String::from("import unittest\nimport tiny.stats as stats\n\nclass T(unittest.TestCase):\n");
         for i in 0..3 {
             test.push_str(&format!("    def test_a{i}(self):\n        self.assertEqual(stats.ok(), 1)\n"));
         }
+        let quick = graded(&python, stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": 60}));
+        assert_eq!(quick.counts.pass, 3, "{quick:#?}");
+        let wall = HOST_TIME.get().own.as_secs() + 1;
         for i in 0..6 {
             test.push_str(&format!("    def test_h{i}(self):\n        stats.hang()\n"));
         }
-        let g = graded(&python, stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": 1}));
+        let g = graded(&python, stats, &test, &json!({"cpu_seconds": 2, "wall_seconds": wall}));
         assert!(g.unfinished.is_some(), "{g:#?}");
         let c = g.counts;
         assert_eq!((c.pass, c.pass + c.fail + c.error), (3, 9), "{g:#?}");
