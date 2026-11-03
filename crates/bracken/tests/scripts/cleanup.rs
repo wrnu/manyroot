@@ -4,16 +4,7 @@ use crate::support::*;
 
 /// Sets the modification time of `path` and everything under it, not following symlinks.
 fn set_mtimes(path: &Path, when: std::time::SystemTime) {
-    let meta = std::fs::symlink_metadata(path).unwrap();
-    if meta.is_symlink() {
-        return;
-    }
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(path).unwrap() {
-            set_mtimes(&entry.unwrap().path(), when);
-        }
-    }
-    std::fs::File::open(path).unwrap().set_modified(when).unwrap();
+    set_mtimes_but(path, when, &[]);
 }
 
 /// A `sleep 3600` with its working directory in `dir`, so lsof shows a process using it. It outlasts any test
@@ -837,19 +828,37 @@ fn cleanup_keeps_scratch_entries_in_use_or_kept_and_clears_the_idle_ones() {
 
 /// [`set_mtimes`], but leaving the paths in `skip` (and what's under them) as they are.
 fn set_mtimes_but(path: &Path, when: std::time::SystemTime, skip: &[PathBuf]) {
+    mtimes_walk(path, when, skip, false);
+}
+
+/// The walk of [`set_mtimes`] and [`set_mtimes_but`]; `listed` if `read_dir` found `path`. The tree holds live
+/// git repos, so a listed entry git removes before it's visited (a lock or temp file) is skipped: NotFound only,
+/// and never for the path a test passed in, whose absence still panics (task ba4acc922700).
+fn mtimes_walk(path: &Path, when: std::time::SystemTime, skip: &[PathBuf], listed: bool) {
     if skip.iter().any(|s| s == path) {
         return;
     }
-    let meta = std::fs::symlink_metadata(path).unwrap();
+    let gone = |e: &std::io::Error| listed && e.kind() == std::io::ErrorKind::NotFound;
+    let meta = match std::fs::symlink_metadata(path) {
+        Err(e) if gone(&e) => return,
+        meta => meta.unwrap(),
+    };
     if meta.is_symlink() {
         return;
     }
     if meta.is_dir() {
-        for entry in std::fs::read_dir(path).unwrap() {
-            set_mtimes_but(&entry.unwrap().path(), when, skip);
+        let entries = match std::fs::read_dir(path) {
+            Err(e) if gone(&e) => return,
+            entries => entries.unwrap(),
+        };
+        for entry in entries {
+            mtimes_walk(&entry.unwrap().path(), when, skip, true);
         }
     }
-    std::fs::File::open(path).unwrap().set_modified(when).unwrap();
+    match std::fs::File::open(path) {
+        Err(e) if gone(&e) => {}
+        file => file.unwrap().set_modified(when).unwrap(),
+    }
 }
 
 /// Task 9fa138208dac: bracken's .bracken/cache/ (its verified snapshot, since #204) is the one ignored entry
