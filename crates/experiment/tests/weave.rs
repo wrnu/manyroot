@@ -436,6 +436,51 @@ fn a_tree_that_cant_be_placed_is_put_back_and_the_next_merge_goes_through() {
     assert_eq!(aside(&tree), Vec::<String>::new());
 }
 
+/// Something that makes the tree again between the set-aside and the placing (the unknown writer behind
+/// task 61c34b3c2704's flake) fails the placing, and the old tree, holding the agent's files, isn't put back
+/// over it (task af9ef395181b). That old tree stays until the tree is a working checkout again, and goes only
+/// then. The debug build's `recreate-the-tree` file stands in for the writer. Separately, a tree with no
+/// repository while an old tree holds one is refused, and neither is moved or removed.
+#[test]
+fn an_old_tree_stays_while_the_tree_isnt_a_working_checkout() {
+    let mut s = Stores::new(&["agent-0"]);
+    let tree = s.trees[0].clone();
+    let dir = tree.parent().expect("the copy's directory").to_path_buf();
+    s.ok(0, "write_file", json!({"path": "tiny/zero.py", "text": "NAME = 'zero'\n"}));
+    s.ok(0, "integrate", json!({"note": "zero"}));
+
+    let marker = dir.join("recreate-the-tree");
+    std::fs::write(&marker, "").expect("the marker");
+    let err = s.tool(0, "update", json!({})).expect_err("the placing fails");
+    std::fs::remove_file(&marker).expect("the marker");
+    assert!(err.contains("placing the tree"), "{err}");
+    assert!(dir.join("tree.old.0/tiny/zero.py").exists(), "the agent's files are kept aside");
+    assert!(tree.join(".git").is_dir() && tree.join("recreated").exists(), "the writer's tree, given the repository");
+    assert_eq!(s.ok(0, "head", json!({}))["unproposed_edits"], true, "the tree isn't its repository's files");
+    let err = s.tool(0, "update", json!({})).expect_err("not a clean tree");
+    assert!(err.contains("not yet proposed"), "{err}");
+    assert!(dir.join("tree.old.0/tiny/zero.py").exists(), "still kept");
+
+    // Once the tree is its repository's files again, the next checkout sweeps the old tree.
+    std::fs::remove_file(tree.join("recreated")).expect("the writer's file");
+    let git = bracken_experiment::driver::git_binary().expect("git");
+    let out = std::process::Command::new(git).arg("-C").arg(&tree).args(["reset", "-q", "--hard"]).output();
+    assert!(out.expect("git runs").status.success(), "the files back from the repository");
+    s.ok(0, "update", json!({}));
+    assert!(tree.join("tiny/zero.py").exists());
+    assert_eq!(aside(&tree), Vec::<String>::new());
+
+    // A tree with no repository while an old tree holds one: neither is moved or removed.
+    std::fs::create_dir(dir.join("tree.old.0")).expect("an old tree");
+    std::fs::rename(tree.join(".git"), dir.join("tree.old.0/.git")).expect("its repository");
+    let err = s.tool(0, "head", json!({})).expect_err("unclear");
+    assert!(err.contains("has no git repository, while") && err.contains("neither is moved or removed"), "{err}");
+    assert!(dir.join("tree.old.0/.git").is_dir() && tree.join("tiny/zero.py").exists(), "both kept");
+    std::fs::rename(dir.join("tree.old.0/.git"), tree.join(".git")).expect("the repository back");
+    std::fs::remove_dir(dir.join("tree.old.0")).expect("the empty old tree");
+    assert_eq!(s.ok(0, "head", json!({}))["unproposed_edits"], false);
+}
+
 /// When the heads' merge fails and so does putting the tree back, the merge's own failure is told first
 /// (task 43ca0a00d4b9, after 898fff65aaef). A lock git finds already held fails both, root or not: the
 /// mirror's commit and the reset each need the index lock, while the status before them doesn't.
