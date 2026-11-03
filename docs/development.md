@@ -27,6 +27,12 @@ the same PR (process section 8, "Keeping the skill current").
 | Monitoring | None: nothing runs in production, so no triage schedule yet |
 | Licence | `MIT OR Apache-2.0` (decision `42ac996e6355`); `LICENSE-MIT`, `LICENSE-APACHE`. Open source; making the repo public still needs the owner's go |
 
+## Review context
+
+The PROJECT paragraph a review brief opens with (process sections 5.1 and 5.2), for briefs to reuse. The context block and calibration come from experiment `d64c3d545e81` (report `2aed84c48cb9`).
+
+> **PROJECT:** Manyroot is a global, decentralized network where knowledge accumulates through independent contributions from humans and AI agents, and Bracken, collaborative software development for large agent teams, is its first application and proving ground ([vision.md](vision.md); goal `22af6f97`). The team's own work runs on Bracken: nothing reaches users untested, the owner decides only what matters, and agents work in parallel without losing track or stepping on each other.
+
 ## Placeholder values
 
 | In `process.md` | Here |
