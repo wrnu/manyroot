@@ -827,16 +827,30 @@ weave_mac() {
   changed=$(GIT_INDEX_FILE="$clean_tmp/index" "${g[@]}" ls-files --others --directory) ||
     { rm -rf "$clean_tmp"; fail "git ls-files failed in this checkout"; }
   rm -rf "$clean_tmp"
+  local own_git_dir top_git line
+  own_git_dir=$("${g[@]}" rev-parse --absolute-git-dir) || fail "git rev-parse failed in this checkout"
   while IFS= read -r path; do
     [ -n "$path" ] || continue
     # The checkout's own .git under another letter case (a gitdir named .GIT on macOS's disk, which
-    # ignores case): with core.ignorecase off, git lists it. Only the same directory as .git is skipped,
-    # never a symlink to it (finding dbbfd9efd7f7).
-    if [[ ${path%/} =~ ^\.[gG][iI][tT]$ ]] && [ ! -L "${path%/}" ] && [ "${path%/}" -ef .git ]; then continue; fi
+    # ignores case): with core.ignorecase off, git lists it. It's skipped only as the same directory as
+    # .git, or as a gitdir file (a linked worktree's) naming this checkout's own git dir; never as a
+    # symlink (findings dbbfd9efd7f7, task bc54c58729a9).
+    top_git=${path%/}
+    if [[ $top_git =~ ^\.[gG][iI][tT]$ ]] && [ ! -L "$top_git" ] && [ "$top_git" -ef .git ]; then
+      [ ! -d "$top_git" ] || continue
+      if [ -f "$top_git" ] && IFS= read -r line <"$top_git" && [[ $line == "gitdir: "* ]] &&
+        [ "${line#gitdir: }" -ef "$own_git_dir" ]; then
+        continue
+      fi
+    fi
     differs+=("$path (not in the commit)")
   done <<<"$changed"
-  # find doesn't follow symlinks (-P, its default), and prunes the top-level .git only as a real directory.
-  changed=$(find . -ipath ./.git -type d -prune -o -iname .git -print) || fail "find failed in this checkout"
+  # find doesn't follow symlinks (-P, its default). It prunes the top-level .git in any letter case as a
+  # directory or a gitdir file, never a symlink. Of the top-level ones it reports only a symlinked .git
+  # in lowercase, which git never lists (findings 8c68510d09a9, 45087e9b6e21); the listing above has any
+  # other that isn't the checkout's own, so a symlinked .GIT is reported once.
+  changed=$(find . -ipath ./.git ! -type l -prune -o \( -path ./.git -o ! -ipath ./.git \) -iname .git -print) ||
+    fail "find failed in this checkout"
   while IFS= read -r path; do
     [ -z "$path" ] || differs+=("${path#./} (a .git below the top)")
   done <<<"$changed"

@@ -1621,14 +1621,17 @@ fn test_table_weave_mac_runs_the_macos_tests_and_compares_with_the_boxs_lists() 
         assert!(!out.status.success() && stderr.contains("older than 2.45"), "{scripts}: git 2.44: {stderr}");
         // A minor with a leading zero, which bash arithmetic would read as octal, and one too long to
         // read (finding 51c047a8eb0f).
-        for (dir, v) in [("git-2.08", "2.08.0"), ("git-2.long", "2.99999999999999999999.0")] {
+        for (dir, v, says) in [
+            ("git-2.08", "2.08.0", "git version 2.08.0 is older than 2.45"),
+            (
+                "git-2.long",
+                "2.99999999999999999999.0",
+                "can't read git's version from: git version 2.99999999999999999999.0",
+            ),
+        ] {
             let out = stubbed(dir, &version(v));
             let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(!out.status.success() && stderr.contains("git version"), "{scripts}: git {v}: {stderr}");
-            assert!(
-                stderr.contains("older than 2.45") || stderr.contains("can't read git's version"),
-                "{scripts}: git {v}: {stderr}"
-            );
+            assert!(!out.status.success() && stderr.contains(says), "{scripts}: git {v}: {stderr}");
         }
         let out = stubbed("git-2.45", &version("2.45.0"));
         assert!(out.status.success(), "{scripts}: git 2.45: {}", String::from_utf8_lossy(&out.stderr));
@@ -1645,15 +1648,51 @@ fn test_table_weave_mac_runs_the_macos_tests_and_compares_with_the_boxs_lists() 
         std::fs::rename(w.tree.join(".GIT"), w.tree.join(".git")).unwrap();
         // An untracked top-level symlink .GIT -> .git, possible only where the disk keeps case: it's a file
         // the commit doesn't hold, not the checkout's own .git (finding dbbfd9efd7f7).
+        // It's reported once, as a file the commit doesn't hold, not again as a .git below the top.
         match std::os::unix::fs::symlink(".git", w.tree.join(".GIT")) {
             Ok(()) => {
                 let out = mac2();
                 let stderr = String::from_utf8_lossy(&out.stderr);
-                assert!(!out.status.success() && stderr.contains(".GIT"), "{scripts}: a .GIT symlink: {stderr}");
+                assert!(!out.status.success(), "{scripts}: a .GIT symlink passed");
+                assert!(stderr.contains(".GIT (not in the commit)"), "{scripts}: a .GIT symlink: {stderr}");
+                assert_eq!(stderr.matches(".GIT").count(), 1, "{scripts}: a .GIT symlink, reported once: {stderr}");
                 std::fs::remove_file(w.tree.join(".GIT")).unwrap();
             }
-            Err(e) => eprintln!("{scripts}: skipped the .GIT symlink case: the disk ignores case ({e})"),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                eprintln!("{scripts}: skipped the .GIT symlink case: the disk ignores case ({e})")
+            }
+            Err(e) => panic!("{scripts}: a .GIT symlink: {e}"),
         }
+        // A top-level .git that is a symlink to the repository moved elsewhere: git follows it and never
+        // lists it, so find must report it (findings 8c68510d09a9, 45087e9b6e21).
+        let moved = w.path("moved.git");
+        std::fs::rename(w.tree.join(".git"), &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, w.tree.join(".git")).unwrap();
+        refused2("a .git symlink", ".git (a .git below the top)");
+        std::fs::remove_file(w.tree.join(".git")).unwrap();
+        std::fs::rename(&moved, w.tree.join(".git")).unwrap();
+        // The check run from a linked worktree of the checkout, whose top-level .git is a gitdir file
+        // (task bc54c58729a9): it passes, and as .GIT too where the disk ignores case. The worktree is
+        // checked out as the box does, with no attributes, so id.txt's $Id$ stays as committed.
+        let linked = w.path("linked");
+        git(&["worktree", "add", "-q", "--no-checkout", "--detach", linked.to_str().unwrap(), &c2]);
+        let in_linked = |args: &[&str]| assert!(run(&linked, "git", args).status.success(), "git {args:?} failed");
+        in_linked(&["--attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904", "reset", "-q", "--hard", &c2]);
+        assert!(linked.join(".git").is_file(), "{scripts}: a linked worktree's .git is a file");
+        let mac_linked = || {
+            let mut c = w.table(&["--weave-mac", "table"]);
+            c.current_dir(&linked).env("PATH", &path).env("WEAVE_COMMIT", &c2).env("WEAVE_TREE", &t2);
+            c.output().unwrap()
+        };
+        let out = mac_linked();
+        assert!(out.status.success(), "{scripts}: a linked worktree: {}", String::from_utf8_lossy(&out.stderr));
+        std::fs::rename(linked.join(".git"), linked.join(".GIT")).unwrap();
+        if linked.join(".git").exists() {
+            let out = mac_linked();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{scripts}: a linked worktree's .GIT: {stderr}");
+        }
+        std::fs::rename(linked.join(".GIT"), linked.join(".git")).unwrap();
         // A partial clone missing sub's tree: ls-tree must not fetch it lazily, running the checkout's
         // uploadpack.
         let full = w.path("full.git");
