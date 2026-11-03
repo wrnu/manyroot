@@ -107,8 +107,13 @@
 #   --weave-mac <box check> runs --split's part here, the macOS-only tests and this Mac's lists, in
 #   the commit's checkout, then compares the lists with the box's, read from WEAVE_INPUTS/<box check>.log,
 #   the output of this validator's latest passing result of that box check on the manifest. Before any
-#   of the tree's code runs, it fails unless HEAD and its tree are WEAVE_COMMIT and WEAVE_TREE and the
-#   working tree is clean, then the facts get the commit and tree, which weave validate checks.
+#   of the tree's code runs, it fails unless HEAD and its tree are WEAVE_COMMIT and WEAVE_TREE, the
+#   current directory is the work tree, every path the tree holds has the commit's bytes (no filter),
+#   executable bit or symlink target, and no other file is there, ignored files and any .git below the
+#   top, in any letter case, included; the check reads the files itself, so no index, filter, hook or git setting of the
+#   checkout's can vouch for them, and every tree object read must hash to its id. Only the files are
+#   verified: this checkout's .git is not, and the tests still run git against it; nor is a submodule's
+#   directory (the repo has none). Then the facts get the commit and tree, which weave validate checks.
 #   --in-tree <mode...> is the box's own call: the mode, in the current directory.
 # The Weave modes are self-contained (finding fa1611bbec29): the policy pins this one file, so they and
 # --in-tree call no other script, of this checkout or the tree's, and only this copy runs in the box.
@@ -717,19 +722,112 @@ weave_mac() {
   local box_check=$1 box_log here_rc=0
   weave_mode=--weave-mac
   weave_needs WEAVE_COMMIT WEAVE_TREE WEAVE_FACTS WEAVE_INPUTS
-  [ "$(git rev-parse HEAD)" = "$WEAVE_COMMIT" ] || fail "this checkout's HEAD isn't the manifest's commit $WEAVE_COMMIT"
-  # The tree that runs is the commit's, unchanged (finding 79114ae0b4ab).
-  [ "$(git rev-parse 'HEAD^{tree}')" = "$WEAVE_TREE" ] || fail "this checkout's tree isn't the manifest's tree $WEAVE_TREE"
-  local changed
-  # Ignored files count too, and no index entry may be marked to skip the comparison (assume-unchanged,
-  # a lowercase tag, or skip-worktree, S), so every file differing from the commit shows (finding
-  # 35815ad2763b).
-  changed=$(git status --porcelain --ignored --untracked-files=all) || fail "git status failed in this checkout"
-  [ -z "$changed" ] || fail "this checkout isn't clean against the manifest's commit: $(head -n 3 <<<"$changed" | tr '\n' ' ')"
-  changed=$(git ls-files -v) || fail "git ls-files failed in this checkout"
+  # The tree that runs is the commit's, unchanged (findings 79114ae0b4ab, 35815ad2763b, 09fe06b9fb99,
+  # ed638559f5e7, fd2e2a083cb3, eefa1f065b93, 124fe52daa4a, 58f79f117987, 64d2eb46911f, 8cab439fd587,
+  # 46215ffe9ff9, 64f4f9f5d68d, d0828e375d67), whatever state the checkout carries. Git's own comparison
+  # can't say so: git status trusts the index's stat cache, which the checkout's config (core.trustctime,
+  # core.checkStat, core.fileMode) or the index itself (written under core.autocrlf) can make vouch for
+  # a changed file, and it runs the clean filters of .git/info/attributes, the checkout's own code. So
+  # the check reads every path HEAD holds itself: a file's bytes hashed with no filter (git hash-object
+  # --no-filters), its executable bit, a symlink's target, against git ls-tree -r HEAD, each tree object
+  # it read, the root's included, re-hashed against its id, since git doesn't check a tree's hash when it
+  # reads one and the object store is the checkout's (blobs are compared by id); and a fresh index
+  # of HEAD, never the checkout's, lists what else is here, ignored files included. git's walk never
+  # lists an entry named .git, so find looks for one below the top, in any letter case (macOS's disk
+  # ignores case, so a .GIT opens as .git, and git with core.ignorecase skips it too; finding
+  # eb10b06eff21): a gitdir file or a repository there would redirect git run from that directory. A tracked path starting with a double quote is refused,
+  # since --stdin-paths would unquote it. Every git call here, the facts' included, reads only objects,
+  # refs and the work tree, and runs none of the checkout's code: no filter, no hook (core.hooksPath is
+  # /dev/null, so read-tree's post-index-change hook can't run), no fsmonitor, no lazy fetch from a
+  # promisor remote (GIT_NO_LAZY_FETCH, so a missing object fails); and replace refs are ignored, so
+  # the tree compared is the one the commit names. The work tree must be this directory, not another
+  # that core.worktree names. The box checks the commit out as committed, with no attributes, and this
+  # compares the same bytes, so a checkout that applied the commit's own eol or ident attributes is
+  # refused.
+  local -a g=(env GIT_NO_LAZY_FETCH=1 git --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=
+    -c core.untrackedCache=false -c core.ignorecase=false)
+  local top clean_tmp entry meta path mode type id got changed
+  local -a differs=() paths=() wants=() trees=()
+  top=$("${g[@]}" rev-parse --show-toplevel) || fail "git rev-parse failed in this checkout"
+  [ "$top" = "$(pwd -P)" ] || fail "this checkout's work tree is $top, not the current directory $(pwd -P)"
+  [ "$("${g[@]}" rev-parse HEAD)" = "$WEAVE_COMMIT" ] || fail "this checkout's HEAD isn't the manifest's commit $WEAVE_COMMIT"
+  [ "$("${g[@]}" rev-parse 'HEAD^{tree}')" = "$WEAVE_TREE" ] || fail "this checkout's tree isn't the manifest's tree $WEAVE_TREE"
+  clean_tmp=$(mktemp -d) || fail "mktemp failed"
+  "${g[@]}" ls-tree -r -t -z --full-tree HEAD >"$clean_tmp/tree" ||
+    { rm -rf "$clean_tmp"; fail "git ls-tree failed in this checkout"; }
+  while IFS= read -r -d '' entry; do
+    meta=${entry%%$'\t'*} path=${entry#*$'\t'}
+    read -r mode type id <<<"$meta"
+    case "$path" in
+      *$'\n'*)
+        differs+=("a path with a newline")
+        continue
+        ;;
+      '"'*)
+        differs+=("$path (starts with a double quote)")
+        continue
+        ;;
+    esac
+    case "$mode" in
+      100644 | 100755)
+        if [ -L "$path" ] || [ ! -f "$path" ]; then
+          differs+=("$path (not a file)")
+          continue
+        fi
+        if [ -x "$path" ]; then got=100755; else got=100644; fi
+        [ "$got" = "$mode" ] || differs+=("$path (mode $got)")
+        paths+=("$path") wants+=("$id")
+        ;;
+      120000)
+        if [ ! -L "$path" ]; then
+          differs+=("$path (not a symlink)")
+          continue
+        fi
+        # The target byte for byte: a trailing newline counts (finding 83842bff251e). readlink -n adds
+        # none of its own, and the sentinel keeps $(...) from stripping the target's.
+        got=$(readlink -n -- "$path" && echo x) || got=x
+        got=$(printf '%s' "${got%x}" | "${g[@]}" hash-object --no-filters --stdin) || got=''
+        [ "$got" = "$id" ] || differs+=("$path (symlink target)")
+        ;;
+      040000) trees+=("$id") ;;
+      160000) ;; # a submodule's commit: its files aren't this tree's
+      *) differs+=("$path (mode $mode, $type)") ;;
+    esac
+  done <"$clean_tmp/tree"
+  for id in "$WEAVE_TREE" ${trees[@]+"${trees[@]}"}; do
+    got=$("${g[@]}" cat-file tree "$id" | "${g[@]}" hash-object -t tree --stdin) || got=''
+    [ "$got" = "$id" ] || differs+=("tree $id (its object doesn't hash to its id)")
+  done
+  if [ ${#paths[@]} -gt 0 ]; then
+    printf '%s\n' "${paths[@]}" >"$clean_tmp/paths"
+    printf '%s\n' "${wants[@]}" >"$clean_tmp/want"
+    "${g[@]}" hash-object --no-filters --stdin-paths <"$clean_tmp/paths" >"$clean_tmp/got" ||
+      { rm -rf "$clean_tmp"; fail "git hash-object failed in this checkout"; }
+    while IFS= read -r path; do
+      differs+=("$path")
+    done < <(paste -d '\t' "$clean_tmp/want" "$clean_tmp/got" "$clean_tmp/paths" | awk -F '\t' '$1 != $2 { print $3 }')
+  fi
+  GIT_INDEX_FILE="$clean_tmp/index" "${g[@]}" read-tree HEAD ||
+    { rm -rf "$clean_tmp"; fail "git read-tree failed in this checkout"; }
+  changed=$(GIT_INDEX_FILE="$clean_tmp/index" "${g[@]}" ls-files --others --directory) ||
+    { rm -rf "$clean_tmp"; fail "git ls-files failed in this checkout"; }
+  rm -rf "$clean_tmp"
+  while IFS= read -r path; do
+    [ -z "$path" ] || differs+=("$path (not in the commit)")
+  done <<<"$changed"
+  # find doesn't follow symlinks (-P, its default).
+  changed=$(find . -path ./.git -prune -o -iname .git -print) || fail "find failed in this checkout"
+  while IFS= read -r path; do
+    [ -z "$path" ] || differs+=("${path#./} (a .git below the top)")
+  done <<<"$changed"
+  [ ${#differs[@]} -eq 0 ] ||
+    fail "this checkout isn't clean against the manifest's commit: ${differs[*]:0:3}"
+  # No index entry may be marked to skip git's comparison either (assume-unchanged, a lowercase tag, or
+  # skip-worktree, S): the check doesn't rely on one, but such a mark says the checkout was tampered with.
+  changed=$("${g[@]}" ls-files -v) || fail "git ls-files failed in this checkout"
   changed=$(grep -E '^([a-z]|S) ' <<<"$changed") || true
   [ -z "$changed" ] || fail "this checkout isn't clean: entries skip the comparison: $(head -n 3 <<<"$changed" | tr '\n' ' ')"
-  printf 'head %s\ntree %s\n' "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" >>"$WEAVE_FACTS"
+  printf 'head %s\ntree %s\n' "$("${g[@]}" rev-parse HEAD)" "$("${g[@]}" rev-parse 'HEAD^{tree}')" >>"$WEAVE_FACTS"
   box_log="$WEAVE_INPUTS/$box_check.log"
   [ -f "$box_log" ] ||
     fail "no output of box check $box_check on this manifest: it runs first, and its latest result must pass"

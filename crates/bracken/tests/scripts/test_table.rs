@@ -1403,8 +1403,223 @@ fn test_table_weave_mac_runs_the_macos_tests_and_compares_with_the_boxs_lists() 
             );
             mark(false);
         }
+        // The checkout's own .git/config can't hide a change (finding 09fe06b9fb99).
+        let git = |args: &[&str]| assert!(run(&w.tree, "git", args).status.success(), "git {args:?} failed");
+        let refused = |what: &str, says: &str| {
+            let out = mac();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success() && stderr.contains(says), "{scripts}: {what}: {stderr}");
+        };
+        // a.txt's mtime set long before the index is written, so git doesn't treat the entry as racy and
+        // reread the file whatever the cache says.
+        let past = || assert!(run(&w.tree, "touch", &["-t", "202001010000", "a.txt"]).status.success());
+        let hidden = |what: &str| {
+            let status = run(&w.tree, "git", &["status", "--porcelain", "--ignored", "--untracked-files=all"]).stdout;
+            assert!(status.is_empty(), "{scripts}: {what}: git status sees {}", String::from_utf8_lossy(&status));
+        };
+        // An fsmonitor hook that reports nothing changed, after git has recorded its token: a.txt edited.
+        // The check must not run it either: it's the checkout's code.
+        let hook = w.path("fsmonitor-hook");
+        let hook_ran = w.path("fsmonitor-ran");
+        write_executable(&hook, &format!("#!/bin/sh\ntouch '{}'\nprintf 'tok\\0'\n", hook_ran.display()));
+        git(&["config", "core.fsmonitor", hook.to_str().unwrap()]);
+        past();
+        // The first status records the hook's token, the second marks a.txt valid by it.
+        git(&["status", "--porcelain"]);
+        git(&["status", "--porcelain"]);
+        std::fs::write(w.tree.join("a.txt"), "changed by more bytes\n").unwrap();
+        assert!(run(&w.tree, "git", &["status", "--porcelain"]).stdout.is_empty(), "{scripts}: the hook hides a.txt");
+        std::fs::remove_file(&hook_ran).unwrap();
+        refused("core.fsmonitor", "isn't clean");
+        assert!(!hook_ran.exists(), "{scripts}: the check ran the checkout's fsmonitor hook");
+        git(&["config", "--unset", "core.fsmonitor"]);
+        git(&["checkout", "--", "a.txt"]);
+        // An executable bit, with core.fileMode false.
+        git(&["config", "core.fileMode", "false"]);
+        let mode = |m: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(w.tree.join("a.txt"), std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        mode(0o755);
+        refused("core.fileMode false", "isn't clean");
+        mode(0o644);
+        git(&["config", "--unset", "core.fileMode"]);
+        // core.worktree naming a clean copy elsewhere, a file here the commit doesn't hold: git would list
+        // the copy's files, not this directory's. The index is rebuilt so its stat data doesn't mark id.txt
+        // (ident) changed against the copy: git status then sees nothing.
+        let clean = w.path("clean");
+        git(&["worktree", "add", "-q", "--detach", clean.to_str().unwrap(), "HEAD"]);
+        git(&["config", "core.worktree", clean.to_str().unwrap()]);
+        git(&["read-tree", "HEAD"]);
+        std::fs::write(w.tree.join("extra.rs"), "not in the commit\n").unwrap();
+        hidden("core.worktree");
+        refused("core.worktree", "not the current directory");
+        std::fs::remove_file(w.tree.join("extra.rs")).unwrap();
+        git(&["config", "--unset", "core.worktree"]);
+        git(&["read-tree", "HEAD"]);
+        // git status's stat cache and clean filters can't vouch for a file either (findings ed638559f5e7,
+        // fd2e2a083cb3, eefa1f065b93): each case leaves plain git status empty on a changed a.txt.
+        let a = |text: &str| std::fs::write(w.tree.join("a.txt"), text).unwrap();
+        let settle = || {
+            a("one\n");
+            git(&["read-tree", "HEAD"]);
+            git(&["status", "--porcelain"]);
+        };
+        // core.trustctime false and core.checkStat minimal: an edit of the same size, mtime restored.
+        git(&["config", "core.trustctime", "false"]);
+        git(&["config", "core.checkStat", "minimal"]);
+        a("one\n");
+        past();
+        git(&["read-tree", "HEAD"]);
+        git(&["status", "--porcelain"]);
+        a("two\n");
+        past();
+        hidden("core.checkStat minimal");
+        refused("core.checkStat minimal", "isn't clean");
+        git(&["config", "--unset", "core.trustctime"]);
+        git(&["config", "--unset", "core.checkStat"]);
+        settle();
+        // An index written under core.autocrlf, with nothing left in the config: a.txt rewritten with CRLF.
+        git(&["-c", "core.autocrlf=true", "read-tree", "HEAD"]);
+        a("one\r\n");
+        past();
+        git(&["-c", "core.autocrlf=true", "status", "--porcelain"]);
+        hidden("an index written under core.autocrlf");
+        refused("an index written under core.autocrlf", "isn't clean");
+        settle();
+        // A clean filter from .git/info/attributes: it hides the edit, and must not run in the check.
+        let ran = w.path("filter-ran");
+        std::fs::write(w.tree.join(".git/info/attributes"), "a.txt filter=x\n").unwrap();
+        git(&["config", "filter.x.clean", &format!("sh -c 'touch {}; cat >/dev/null; echo one'", ran.display())]);
+        a("ONE\n");
+        hidden("a clean filter");
+        assert!(ran.exists(), "{scripts}: git status ran the filter");
+        std::fs::remove_file(&ran).unwrap();
+        refused("a clean filter", "isn't clean");
+        assert!(!ran.exists(), "{scripts}: the check ran the checkout's clean filter");
+        std::fs::remove_file(w.tree.join(".git/info/attributes")).unwrap();
+        git(&["config", "--unset", "filter.x.clean"]);
+        settle();
         assert_eq!(w.facts(), "", "{scripts}");
         assert!(!w.path("ran-here").exists(), "{scripts}: the macOS-only tests ran");
         assert!(mac().status.success(), "{scripts}: clean again");
+
+        // Round 3 (findings 8cab439fd587, 46215ffe9ff9, 124fe52daa4a, 58f79f117987, 64d2eb46911f), on a
+        // commit with a tracked directory and a symlink.
+        put(&w.tree, "sub/b.txt", "b\n");
+        std::os::unix::fs::symlink("a.txt", w.tree.join("lnk")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "round 3"]);
+        let rev = |r: &str| String::from_utf8(run(&w.tree, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
+        let (c2, t2) = (rev("HEAD"), rev("HEAD^{tree}"));
+        let mac2 = || {
+            let mut c = w.table(&["--weave-mac", "table"]);
+            c.env("PATH", &path).env("WEAVE_COMMIT", &c2).env("WEAVE_TREE", &t2).output().unwrap()
+        };
+        let refused2 = |what: &str, says: &str| {
+            let out = mac2();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success() && stderr.contains(says), "{scripts}: {what}: {stderr}");
+        };
+        assert!(mac2().status.success(), "{scripts}: the round 3 commit, clean");
+        // A .git below the top, which git's walk never lists: a gitdir file in a tracked directory.
+        std::fs::write(w.tree.join("sub/.git"), "gitdir: /nonexistent/evil.git\n").unwrap();
+        hidden("sub/.git");
+        refused2("sub/.git", "sub/.git (a .git below the top)");
+        std::fs::remove_file(w.tree.join("sub/.git")).unwrap();
+        // The same in another letter case, which macOS's disk opens as .git (finding eb10b06eff21): a
+        // gitdir file at sub/.GIT, and a bare repository at sub/.Git.
+        std::fs::write(w.tree.join("sub/.GIT"), "gitdir: /nonexistent/evil.git\n").unwrap();
+        refused2("sub/.GIT", "sub/.GIT (a .git below the top)");
+        std::fs::remove_file(w.tree.join("sub/.GIT")).unwrap();
+        assert!(run(&w.tree, "git", &["init", "-q", "--bare", "sub/.Git"]).status.success());
+        refused2("sub/.Git", "sub/.Git (a .git below the top)");
+        std::fs::remove_dir_all(w.tree.join("sub/.Git")).unwrap();
+        // A symlink whose target has a trailing newline, against the commit's "a.txt" (finding
+        // 83842bff251e).
+        std::fs::remove_file(w.tree.join("lnk")).unwrap();
+        std::os::unix::fs::symlink("a.txt\n", w.tree.join("lnk")).unwrap();
+        refused2("a symlink target with a trailing newline", "lnk (symlink target)");
+        std::fs::remove_file(w.tree.join("lnk")).unwrap();
+        std::os::unix::fs::symlink("a.txt", w.tree.join("lnk")).unwrap();
+        // A tracked path starting with a double quote, which --stdin-paths would read as q.txt: on a
+        // commit of its own, the quoted file then changed.
+        put(&w.tree, "\"q.txt\"", "same\n");
+        put(&w.tree, "q.txt", "same\n");
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "a quoted path"]);
+        let (c3, t3) = (rev("HEAD"), rev("HEAD^{tree}"));
+        std::fs::write(w.tree.join("\"q.txt\""), "DIRTY payload\n").unwrap();
+        let mut quoted = w.table(&["--weave-mac", "table"]);
+        let out = quoted.env("PATH", &path).env("WEAVE_COMMIT", &c3).env("WEAVE_TREE", &t3).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains("starts with a double quote"), "{scripts}: quoted: {stderr}");
+        git(&["reset", "-q", "--hard", &c2]);
+        assert!(mac2().status.success(), "{scripts}: back on the round 3 commit");
+        // A post-index-change hook: read-tree of the fresh index must not run it.
+        let hook_ran = w.path("post-index-change-ran");
+        write_executable(
+            &w.tree.join(".git/hooks/post-index-change"),
+            &format!("#!/bin/sh\ntouch '{}'\n", hook_ran.display()),
+        );
+        let out = mac2();
+        assert!(!hook_ran.exists(), "{scripts}: the check ran the checkout's post-index-change hook");
+        assert!(out.status.success(), "{scripts}: post-index-change: {}", String::from_utf8_lossy(&out.stderr));
+        std::fs::remove_file(w.tree.join(".git/hooks/post-index-change")).unwrap();
+        // A replace ref swapping the commit's tree for one that matches a dirty work tree.
+        put(&w.tree, "a.txt", "EVIL\n");
+        put(&w.tree, "extra.rs", "not in the commit\n");
+        git(&["add", "-A"]);
+        let dirty = String::from_utf8(run(&w.tree, "git", &["write-tree"]).stdout).unwrap().trim().to_owned();
+        git(&["read-tree", "HEAD"]);
+        git(&["replace", &t2, &dirty]);
+        let listed = String::from_utf8(run(&w.tree, "git", &["ls-tree", "-r", "HEAD"]).stdout).unwrap();
+        assert!(listed.contains("extra.rs"), "{scripts}: git reads the replacement: {listed}");
+        refused2("a replace ref", "isn't clean");
+        git(&["replace", "-d", &t2]);
+        std::fs::remove_file(w.tree.join("extra.rs")).unwrap();
+        put(&w.tree, "a.txt", "one\n");
+        git(&["read-tree", "HEAD"]);
+        assert!(mac2().status.success(), "{scripts}: the round 3 commit, clean again");
+        // A subtree's object file rewritten to an edited tree's (finding d0828e375d67): ls-tree then lists
+        // the edited blob, which the work tree matches.
+        let object = |id: &str| w.tree.join(".git/objects").join(&id[..2]).join(&id[2..]);
+        let real_sub = rev("HEAD:sub");
+        let real_bytes = std::fs::read(object(&real_sub)).unwrap();
+        put(&w.tree, "sub/b.txt", "EVIL\n");
+        git(&["add", "sub/b.txt"]);
+        let evil = String::from_utf8(run(&w.tree, "git", &["write-tree"]).stdout).unwrap().trim().to_owned();
+        let evil_sub = rev(&format!("{evil}:sub"));
+        git(&["read-tree", "HEAD"]);
+        std::fs::remove_file(object(&real_sub)).unwrap();
+        std::fs::copy(object(&evil_sub), object(&real_sub)).unwrap();
+        assert_eq!(rev("HEAD:sub/b.txt"), rev(&format!("{evil}:sub/b.txt")), "{scripts}: git reads the edited subtree");
+        refused2("a rewritten subtree object", "doesn't hash to its id");
+        std::fs::remove_file(object(&real_sub)).unwrap();
+        std::fs::write(object(&real_sub), &real_bytes).unwrap();
+        put(&w.tree, "sub/b.txt", "b\n");
+        git(&["read-tree", "HEAD"]);
+        assert!(mac2().status.success(), "{scripts}: the round 3 commit, restored");
+        // A partial clone missing sub's tree: ls-tree must not fetch it lazily, running the checkout's
+        // uploadpack.
+        let full = w.path("full.git");
+        assert!(
+            run(&w.tree, "git", &["clone", "-q", "--bare", "--no-local", ".", full.to_str().unwrap()]).status.success()
+        );
+        let sub_tree = rev("HEAD:sub");
+        std::fs::remove_file(w.tree.join(".git/objects").join(&sub_tree[..2]).join(&sub_tree[2..])).unwrap();
+        let fetched = w.path("lazy-fetched");
+        for (key, value) in [
+            ("core.repositoryformatversion", "1".to_owned()),
+            ("extensions.partialClone", "origin".to_owned()),
+            ("remote.origin.url", full.display().to_string()),
+            ("remote.origin.promisor", "true".to_owned()),
+            ("remote.origin.uploadpack", format!("touch '{}'; git-upload-pack", fetched.display())),
+        ] {
+            git(&["config", key, &value]);
+        }
+        let out = mac2();
+        assert!(!fetched.exists(), "{scripts}: the check fetched lazily, running the checkout's uploadpack");
+        assert!(!out.status.success(), "{scripts}: a missing tree object passed");
     }
 }
