@@ -393,6 +393,24 @@ fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds(scripts: &str) {
         assert!(line.starts_with("FAIL") && line.contains("code.txt"), "{}: {line}", case(what));
     }
 
+    // Task 962bd6b61626: a docs-only or reusing pass recorded without --on, its main and key empty, is
+    // still checked: on a code head it fails the scope check.
+    for (what, suffix, why) in [
+        ("a docs-only pass without --on", " docs-only".to_owned(), "a docs-only pass".to_owned()),
+        ("a reusing pass without --on", format!(" reuses {}", "9".repeat(64)), format!("reusing {}", "9".repeat(64))),
+    ] {
+        let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, |_| {}, code, |_| {}, None);
+        let head = String::from_utf8(run(&dir, "git", &["rev-parse", "pr"]).stdout).unwrap().trim().to_owned();
+        let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+        let claim = prs[0]["id"].as_str().unwrap().to_owned();
+        let method = format!("scripts/test-table @ {head}{suffix}");
+        bk(&dir, &["evidence", &claim, "pass", "--method", &method, "--as", "manager"]);
+        let out = merge.output().unwrap();
+        let line = check_line(&out, "scope");
+        assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
+        assert!(line.starts_with("FAIL") && line.contains(&why), "{}: {line}", case(what));
+    }
+
     // A reused pass, main ahead in code: it counts when it cites the manager's whole-table pass on this
     // PR with the same key; not when the cited pass is someone else's, docs-only, another key's, or
     // on another PR.
