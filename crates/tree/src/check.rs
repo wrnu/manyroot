@@ -128,6 +128,11 @@ pub struct Runner {
     pub tail_bytes: usize,
     /// Where each run's fresh directory is made: the system's temporary directory by default.
     pub base: PathBuf,
+    /// Where a box or mac check's fresh directory is made: `/private/tmp` by default, so that its `TMPDIR`
+    /// is short enough for the Unix sockets the tests and sccache make there. Under macOS's per-user
+    /// temporary directory, a socket a few directories down passes the 104 bytes a socket path may have
+    /// (stage 2b trial run 2, note 20e075f475e0).
+    pub outside_base: PathBuf,
     /// A box or mac check's timeout ([`Runner::run_outside`]): an hour by default, past boat's own
     /// 2400 s for the box and its setup.
     pub outside_timeout: Duration,
@@ -234,6 +239,7 @@ impl Runner {
             timeout: Duration::from_secs(30 * 60),
             tail_bytes: 64 * 1024,
             base: std::env::temp_dir(),
+            outside_base: PathBuf::from("/private/tmp"),
             outside_timeout: Duration::from_secs(60 * 60),
             outside_grace: Duration::from_secs(60),
             sandbox_exec: PathBuf::from(SANDBOX_EXEC),

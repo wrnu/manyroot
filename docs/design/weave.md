@@ -1100,7 +1100,12 @@ to be clean before any of the tree's code runs.
   runner's environment (no `BRACKEN_*` variable or token path, a fresh
   `HOME`, `TMPDIR` and `CARGO_HOME` reading the vendor directory offline),
   the directories of `cargo-nextest`, `timeout` and `jq` on its `PATH`, but
-  no sandbox profile. It's given the output of the validator's latest
+  no sandbox profile. Its `HOME` holds `.cargo`, which is its `CARGO_HOME`,
+  and `.rustup`, a link to the toolchain's rustup home, where the tests that
+  run `validate` look for it. A box or mac check's fresh directory is made
+  in `/private/tmp`, not the per-user temporary directory, so that a Unix
+  socket a few directories under its `TMPDIR` stays within the 104 bytes
+  macOS allows (note `20e075f475e0`). It's given the output of the validator's latest
   passing result on the manifest of each box check, which the test table
   compares its own test list with.
 

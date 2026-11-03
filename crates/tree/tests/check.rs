@@ -890,6 +890,38 @@ mod macos_only {
         assert!(matches!(err, CheckError::Script(_)), "{err}");
     }
 
+    // Stage 2b trial run 2 (note 20e075f475e0): a mac check's TMPDIR is short enough for a Unix socket a
+    // few directories down, as the tests and sccache make there, and its fresh HOME holds .cargo, its
+    // CARGO_HOME, and .rustup, the toolchain's rustup home. Under a long work root, as macOS's per-user
+    // temporary directory gives, the socket can't be bound.
+    #[test]
+    fn a_mac_checks_tmpdir_takes_a_socket_and_its_home_has_cargo_and_rustup() {
+        let mut s = Setup::new();
+        let (_, rustup_home) = with_toolchain(&mut s);
+        let rustup_home = rustup_home.canonicalize().expect("canonical");
+        let script = format!(
+            "#!/bin/bash\nset -eu\n\
+             d=\"$TMPDIR/.tmp0123456789/run/sockets\"\nmkdir -p \"$d\"\n\
+             /usr/bin/perl -MIO::Socket::UNIX -e '$SIG{{__WARN__}} = sub {{ die \"bind: @_\" }}; IO::Socket::UNIX->new(Type => SOCK_STREAM(), Local => $ARGV[0], \
+             Listen => 1) or die \"bind: $!\\n\"' \"$d/a0.sock\"\n\
+             [ \"$CARGO_HOME\" = \"$HOME/.cargo\" ] && [ -d \"$HOME/.cargo\" ] || {{ echo 'no ~/.cargo'; exit 3; }}\n\
+             [ \"$(cd \"$HOME/.rustup\" && pwd -P)\" = '{}' ] || {{ echo 'no ~/.rustup'; exit 4; }}\n\
+             printf 'head %s\\ntree %s\\n' \"$WEAVE_COMMIT\" \"$WEAVE_TREE\" >>\"$WEAVE_FACTS\"\n",
+            rustup_home.display()
+        );
+        let files: &[(&str, Mode, &[u8])] = &[("a.txt", Mode::File, b"one\n")];
+        let out = outside(&s, &script, files).expect("it ran");
+        assert!(out.passed(), "{:?}: {}", out.exit, String::from_utf8_lossy(&out.log));
+
+        // The same check under a long work root fails: the socket can't be bound there.
+        let long = s.path().join("a-long-work-root-as-the-per-user-temporary-directory-gives");
+        std::fs::create_dir(&long).expect("mkdir");
+        s.runner.outside_base = long;
+        let out = outside(&s, &script, files).expect("it ran");
+        let log = String::from_utf8_lossy(&out.log);
+        assert!(!out.passed() && log.contains("bind: "), "{:?}: {log}", out.exit);
+    }
+
     // Finding 8292b1a11a07: at its timeout a box or mac check's group gets a SIGTERM and a grace before the
     // kill, so the box script's trap deletes its box.
     #[test]

@@ -173,13 +173,14 @@ impl Runner {
                 executor.script_hash
             )));
         }
-        let fresh = Fresh::make(&self.base)?;
+        let fresh = Fresh::make(&self.outside_base)?;
         let root = fresh.0.join("w");
         let (tree, home, tmp, cargo, inputs_dir, runner) = (
             root.join("tree"),
             root.join("home"),
             root.join("tmp"),
-            root.join("cargo"),
+            // The cargo home is HOME's own .cargo, where cargo and the tests look for it by default.
+            root.join("home").join(".cargo"),
             root.join("inputs"),
             root.join("runner"),
         );
@@ -252,6 +253,12 @@ impl Runner {
                 env.push(("HOME".into(), home.clone().into_os_string()));
                 env.push(("CARGO_HOME".into(), cargo.clone().into_os_string()));
                 if let Some(t) = &self.toolchain {
+                    // HOME's .rustup is the toolchain's rustup home, which weave validate, run by the
+                    // tests, reads only there (finding 899bfab10dec). The check runs as this user
+                    // without a sandbox, so the link opens nothing it couldn't reach already.
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(&t.rustup_home, home.join(".rustup"))
+                        .map_err(io("linking HOME's .rustup"))?;
                     env.push(("RUSTUP_HOME".into(), t.rustup_home.clone().into_os_string()));
                     env.push(("DEVELOPER_DIR".into(), super::DEVELOPER_DIR.into()));
                 }
