@@ -411,6 +411,25 @@ fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds(scripts: &str) {
         assert!(line.starts_with("FAIL") && line.contains(&why), "{}: {line}", case(what));
     }
 
+    // Task c55bf6355adf: a docs-only pass recorded with --on but no tree key, its key empty, on a code head
+    // with main ahead in code. It fails the scope check, and its main doesn't count as tested in check 5.
+    let what = case("a docs-only pass with --on and no tree");
+    let out = merge_dry_run_on(
+        scripts,
+        |_| {},
+        code,
+        lib,
+        Some(Tested { suffix: " docs-only", ..tested("manager", "main") }),
+    );
+    let line = check_line(&out, "scope");
+    assert_eq!(out.status.code(), Some(1), "{what}: {line}");
+    assert!(
+        line.starts_with("FAIL") && line.contains("a docs-only pass on main") && line.contains("code.txt"),
+        "{what}: {line}"
+    );
+    let line = check_line(&out, "main");
+    assert!(line.starts_with("FAIL") && !line.contains("tested") && line.contains("lib.rs"), "{what}: {line}");
+
     // A reused pass, main ahead in code: it counts when it cites the manager's whole-table pass on this
     // PR with the same key; not when the cited pass is someone else's, docs-only, another key's, or
     // on another PR.
