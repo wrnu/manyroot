@@ -1600,6 +1600,60 @@ fn test_table_weave_mac_runs_the_macos_tests_and_compares_with_the_boxs_lists() 
         put(&w.tree, "sub/b.txt", "b\n");
         git(&["read-tree", "HEAD"]);
         assert!(mac2().status.success(), "{scripts}: the round 3 commit, restored");
+        // Task f5f7b98824ca. A git stub in front of the real one: a git older than 2.45, which ignores
+        // GIT_NO_LAZY_FETCH, is refused before the check, and 2.45 itself runs; a failing cat-file is
+        // named as such, not taken as an object that hashes to the empty tree.
+        let real_git = String::from_utf8(Command::new("sh").args(["-c", "command -v git"]).output().unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let stubbed = |name: &str, body: &str| {
+            let dir = w.path(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            write_executable(&dir.join("git"), &format!("#!/bin/sh\n{body}\nexec '{real_git}' \"$@\"\n"));
+            let mut c = w.table(&["--weave-mac", "table"]);
+            let on_path = format!("{}:{path}", dir.display());
+            c.env("PATH", on_path).env("WEAVE_COMMIT", &c2).env("WEAVE_TREE", &t2).output().unwrap()
+        };
+        let version = |v: &str| format!("[ \"$1\" != --version ] || {{ echo 'git version {v}'; exit 0; }}");
+        let out = stubbed("git-2.44", &version("2.44.2"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains("older than 2.45"), "{scripts}: git 2.44: {stderr}");
+        // A minor with a leading zero, which bash arithmetic would read as octal, and one too long to
+        // read (finding 51c047a8eb0f).
+        for (dir, v) in [("git-2.08", "2.08.0"), ("git-2.long", "2.99999999999999999999.0")] {
+            let out = stubbed(dir, &version(v));
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success() && stderr.contains("git version"), "{scripts}: git {v}: {stderr}");
+            assert!(
+                stderr.contains("older than 2.45") || stderr.contains("can't read git's version"),
+                "{scripts}: git {v}: {stderr}"
+            );
+        }
+        let out = stubbed("git-2.45", &version("2.45.0"));
+        assert!(out.status.success(), "{scripts}: git 2.45: {}", String::from_utf8_lossy(&out.stderr));
+        let out = stubbed("git-cat-file-fails", "for a in \"$@\"; do [ \"$a\" != cat-file ] || exit 1; done");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains("(git cat-file failed)"), "{scripts}: cat-file: {stderr}");
+        // A top-level gitdir named .GIT is the checkout's own .git on a disk that ignores case (macOS's), not
+        // one below the top. Where the disk keeps case, git wouldn't find it, so there's nothing to check.
+        std::fs::rename(w.tree.join(".git"), w.tree.join(".GIT")).unwrap();
+        if w.tree.join(".git").exists() {
+            let out = mac2();
+            assert!(out.status.success(), "{scripts}: a top-level .GIT: {}", String::from_utf8_lossy(&out.stderr));
+        }
+        std::fs::rename(w.tree.join(".GIT"), w.tree.join(".git")).unwrap();
+        // An untracked top-level symlink .GIT -> .git, possible only where the disk keeps case: it's a file
+        // the commit doesn't hold, not the checkout's own .git (finding dbbfd9efd7f7).
+        match std::os::unix::fs::symlink(".git", w.tree.join(".GIT")) {
+            Ok(()) => {
+                let out = mac2();
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                assert!(!out.status.success() && stderr.contains(".GIT"), "{scripts}: a .GIT symlink: {stderr}");
+                std::fs::remove_file(w.tree.join(".GIT")).unwrap();
+            }
+            Err(e) => eprintln!("{scripts}: skipped the .GIT symlink case: the disk ignores case ({e})"),
+        }
         // A partial clone missing sub's tree: ls-tree must not fetch it lazily, running the checkout's
         // uploadpack.
         let full = w.path("full.git");

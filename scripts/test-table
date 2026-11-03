@@ -104,16 +104,17 @@
 #   check fails here and in weave validate. The Ground guards don't run: Weave holds no .bracken/, and
 #   scripts/merge runs them itself. The box is deleted on every way out, weave validate's end included
 #   (its output pipe breaking), and once boat names it, its lifetime is set to 2700 s as a backstop.
-#   --weave-mac <box check> runs --split's part here, the macOS-only tests and this Mac's lists, in
-#   the commit's checkout, then compares the lists with the box's, read from WEAVE_INPUTS/<box check>.log,
-#   the output of this validator's latest passing result of that box check on the manifest. Before any
-#   of the tree's code runs, it fails unless HEAD and its tree are WEAVE_COMMIT and WEAVE_TREE, the
-#   current directory is the work tree, every path the tree holds has the commit's bytes (no filter),
-#   executable bit or symlink target, and no other file is there, ignored files and any .git below the
-#   top, in any letter case, included; the check reads the files itself, so no index, filter, hook or git setting of the
-#   checkout's can vouch for them, and every tree object read must hash to its id. Only the files are
-#   verified: this checkout's .git is not, and the tests still run git against it; nor is a submodule's
-#   directory (the repo has none). Then the facts get the commit and tree, which weave validate checks.
+#   --weave-mac <box check> runs --split's part here, the macOS-only tests and this Mac's lists, in the
+#   commit's checkout, then compares the lists with the box's, read from WEAVE_INPUTS/<box check>.log, the
+#   output of this validator's latest passing result of that box check on the manifest. Before any of the
+#   tree's code runs, it fails unless git is 2.45 or later, and unless HEAD and its tree are WEAVE_COMMIT
+#   and WEAVE_TREE, the current directory is the work tree, every path the tree holds has the commit's bytes
+#   (no filter), executable bit or symlink target, and no other file is there, ignored files and any .git
+#   below the top, in any letter case, included; the check reads the files itself, so no index, filter, hook
+#   or git setting of the checkout's can vouch for them, and every tree object read must hash to its id.
+#   Only the files are verified: this checkout's .git is not, and the tests still run git against it; nor is
+#   a submodule's directory (the repo has none). Then the facts get the commit and tree, which weave
+#   validate checks.
 #   --in-tree <mode...> is the box's own call: the mode, in the current directory.
 # The Weave modes are self-contained (finding fa1611bbec29): the policy pins this one file, so they and
 # --in-tree call no other script, of this checkout or the tree's, and only this copy runs in the box.
@@ -722,27 +723,37 @@ weave_mac() {
   local box_check=$1 box_log here_rc=0
   weave_mode=--weave-mac
   weave_needs WEAVE_COMMIT WEAVE_TREE WEAVE_FACTS WEAVE_INPUTS
+  # Base 10 and at most 4 digits each, so a minor like 08 isn't read as octal and none wraps (finding
+  # 51c047a8eb0f).
+  local git_version
+  git_version=$(git --version) || fail "git --version failed"
+  [[ $git_version =~ ^git\ version\ ([0-9]{1,4})\.([0-9]{1,4})([^0-9]|$) ]] ||
+    fail "can't read git's version from: $git_version"
+  if ((10#${BASH_REMATCH[1]} < 2 || (10#${BASH_REMATCH[1]} == 2 && 10#${BASH_REMATCH[2]} < 45))); then
+    fail "$git_version is older than 2.45, which ignores GIT_NO_LAZY_FETCH: the clean check needs 2.45 or later"
+  fi
   # The tree that runs is the commit's, unchanged (findings 79114ae0b4ab, 35815ad2763b, 09fe06b9fb99,
   # ed638559f5e7, fd2e2a083cb3, eefa1f065b93, 124fe52daa4a, 58f79f117987, 64d2eb46911f, 8cab439fd587,
   # 46215ffe9ff9, 64f4f9f5d68d, d0828e375d67), whatever state the checkout carries. Git's own comparison
   # can't say so: git status trusts the index's stat cache, which the checkout's config (core.trustctime,
-  # core.checkStat, core.fileMode) or the index itself (written under core.autocrlf) can make vouch for
-  # a changed file, and it runs the clean filters of .git/info/attributes, the checkout's own code. So
-  # the check reads every path HEAD holds itself: a file's bytes hashed with no filter (git hash-object
-  # --no-filters), its executable bit, a symlink's target, against git ls-tree -r HEAD, each tree object
-  # it read, the root's included, re-hashed against its id, since git doesn't check a tree's hash when it
-  # reads one and the object store is the checkout's (blobs are compared by id); and a fresh index
-  # of HEAD, never the checkout's, lists what else is here, ignored files included. git's walk never
-  # lists an entry named .git, so find looks for one below the top, in any letter case (macOS's disk
-  # ignores case, so a .GIT opens as .git, and git with core.ignorecase skips it too; finding
-  # eb10b06eff21): a gitdir file or a repository there would redirect git run from that directory. A tracked path starting with a double quote is refused,
-  # since --stdin-paths would unquote it. Every git call here, the facts' included, reads only objects,
-  # refs and the work tree, and runs none of the checkout's code: no filter, no hook (core.hooksPath is
-  # /dev/null, so read-tree's post-index-change hook can't run), no fsmonitor, no lazy fetch from a
-  # promisor remote (GIT_NO_LAZY_FETCH, so a missing object fails); and replace refs are ignored, so
-  # the tree compared is the one the commit names. The work tree must be this directory, not another
-  # that core.worktree names. The box checks the commit out as committed, with no attributes, and this
-  # compares the same bytes, so a checkout that applied the commit's own eol or ident attributes is
+  # core.checkStat, core.fileMode) or the index itself (written under core.autocrlf) can make vouch for a
+  # changed file, and it runs the clean filters of .git/info/attributes, the checkout's own code. So the
+  # check reads every path HEAD holds itself: a file's bytes hashed with no filter (git hash-object
+  # --no-filters), its executable bit, a symlink's target, against git ls-tree -r HEAD, each tree object it
+  # read, the root's included, re-hashed against its id, since git doesn't check a tree's hash when it reads
+  # one and the object store is the checkout's (blobs are compared by id); and a fresh index of HEAD, never
+  # the checkout's, lists what else is here, ignored files included. git's walk never lists an entry named
+  # .git, so find looks for one below the top, in any letter case (macOS's disk ignores case, so a .GIT
+  # opens as .git, and git with core.ignorecase skips it too; finding eb10b06eff21), skipping the top-level
+  # one in any letter case too: a gitdir file or a repository below the top would redirect git run from that
+  # directory. A tracked path starting with a double quote is refused, since --stdin-paths would unquote it.
+  # Every git call here, the facts' included, reads only objects, refs and the work tree, and runs none of
+  # the checkout's code: no filter, no hook (core.hooksPath is /dev/null, so read-tree's post-index-change
+  # hook can't run), no fsmonitor, no lazy fetch from a promisor remote (GIT_NO_LAZY_FETCH, so a missing
+  # object fails; git older than 2.45 ignores it, so the check refuses to run with one); and replace refs
+  # are ignored, so the tree compared is the one the commit names. The work tree must be this directory, not
+  # another that core.worktree names. The box checks the commit out as committed, with no attributes, and
+  # this compares the same bytes, so a checkout that applied the commit's own eol or ident attributes is
   # refused.
   local -a g=(env GIT_NO_LAZY_FETCH=1 git --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=
     -c core.untrackedCache=false -c core.ignorecase=false)
@@ -795,7 +806,11 @@ weave_mac() {
     esac
   done <"$clean_tmp/tree"
   for id in "$WEAVE_TREE" ${trees[@]+"${trees[@]}"}; do
-    got=$("${g[@]}" cat-file tree "$id" | "${g[@]}" hash-object -t tree --stdin) || got=''
+    if ! "${g[@]}" cat-file tree "$id" >"$clean_tmp/object"; then
+      differs+=("tree $id (git cat-file failed)")
+      continue
+    fi
+    got=$("${g[@]}" hash-object -t tree --stdin <"$clean_tmp/object") || got=''
     [ "$got" = "$id" ] || differs+=("tree $id (its object doesn't hash to its id)")
   done
   if [ ${#paths[@]} -gt 0 ]; then
@@ -813,10 +828,15 @@ weave_mac() {
     { rm -rf "$clean_tmp"; fail "git ls-files failed in this checkout"; }
   rm -rf "$clean_tmp"
   while IFS= read -r path; do
-    [ -z "$path" ] || differs+=("$path (not in the commit)")
+    [ -n "$path" ] || continue
+    # The checkout's own .git under another letter case (a gitdir named .GIT on macOS's disk, which
+    # ignores case): with core.ignorecase off, git lists it. Only the same directory as .git is skipped,
+    # never a symlink to it (finding dbbfd9efd7f7).
+    if [[ ${path%/} =~ ^\.[gG][iI][tT]$ ]] && [ ! -L "${path%/}" ] && [ "${path%/}" -ef .git ]; then continue; fi
+    differs+=("$path (not in the commit)")
   done <<<"$changed"
-  # find doesn't follow symlinks (-P, its default).
-  changed=$(find . -path ./.git -prune -o -iname .git -print) || fail "find failed in this checkout"
+  # find doesn't follow symlinks (-P, its default), and prunes the top-level .git only as a real directory.
+  changed=$(find . -ipath ./.git -type d -prune -o -iname .git -print) || fail "find failed in this checkout"
   while IFS= read -r path; do
     [ -z "$path" ] || differs+=("${path#./} (a .git below the top)")
   done <<<"$changed"
