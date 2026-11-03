@@ -42,8 +42,18 @@ fn this_repository_imports_cleanly() {
     let manifest = plan.manifest().expect("nothing refused");
     assert!(manifest.get("Cargo.toml").is_some());
     assert!(manifest.get("crates/tree/src/lib.rs").is_some());
-    // The coordination Ground is tracked, and excluded.
-    assert!(plan.excluded.iter().any(|(p, why)| p.starts_with(".bracken/") && *why == Exclusion::BrackenRoot));
+    // The coordination Ground is excluded where HEAD tracks it, as git's checkout does. weave validate's
+    // box checks out a commit made from a manifest, which has none, so nothing is excluded there (task
+    // dd551b46c167).
+    let ls = std::process::Command::new("git")
+        .args(["ls-tree", "--name-only", "HEAD", ".bracken"])
+        .current_dir(this_repo)
+        .output()
+        .expect("git runs");
+    assert!(ls.status.success(), "git ls-tree: {}", String::from_utf8_lossy(&ls.stderr));
+    let tracked = !ls.stdout.is_empty();
+    let excluded = plan.excluded.iter().any(|(p, why)| p.starts_with(".bracken/") && *why == Exclusion::BrackenRoot);
+    assert_eq!(excluded, tracked, "HEAD tracks .bracken/: {tracked}; excluded: {:?}", plan.excluded);
     assert!(manifest.entries.iter().all(|e| !e.path.starts_with(".bracken")));
 }
 

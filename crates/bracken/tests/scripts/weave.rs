@@ -367,22 +367,44 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("2 lines are named"), "{out:?}");
     refused(&["--init", "--owner-decision", &approval], "already set up");
 
-    // Three successive first-parent commits of this repository, oldest first, in a clone sharing its
-    // objects, whose origin/main is this repository's HEAD: a branch under test isn't on the real origin/main.
+    // Three successive first-parent commits, oldest first, in a clone sharing this repository's objects:
+    // the first has HEAD's whole tree, and each after it one file more, and origin/main is the last. Made,
+    // not read from this repository's history, which weave validate's box checkout doesn't have (task
+    // dd551b46c167); what this measures is the real tree imported and verified three times.
     let clone = tmp.path().join("clone");
     git_out(
         tmp.path(),
         &["clone", "-q", "--shared", "--no-checkout", repo_root().to_str().unwrap(), clone.to_str().unwrap()],
     );
-    let root_head = git_out(&repo_root(), &["rev-parse", "HEAD"]);
-    git_out(&clone, &["update-ref", "refs/remotes/origin/main", &root_head]);
     // A box has no git identity, and commit-tree below needs one.
     git_out(&clone, &["config", "user.name", "t"]);
     git_out(&clone, &["config", "user.email", "t@example.invalid"]);
-    let mut commits: Vec<String> =
-        git_out(&clone, &["rev-list", "--first-parent", "-n", "3", "origin/main"]).lines().map(str::to_owned).collect();
-    commits.reverse();
-    assert_eq!(commits.len(), 3, "this repository has three first-parent commits");
+    let chain_index = tmp.path().join("chain-index");
+    let chain = |args: &[&str]| {
+        let out = command(&clone, "git", args).env("GIT_INDEX_FILE", &chain_index).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    chain(&["read-tree", "HEAD"]);
+    let mut commits: Vec<String> = Vec::new();
+    for i in 0..3 {
+        if i > 0 {
+            let file = tmp.path().join(format!("chain-{i}.txt"));
+            std::fs::write(&file, format!("commit {i} of the chain\n")).unwrap();
+            let blob = chain(&["hash-object", "-w", file.to_str().unwrap()]);
+            chain(&["update-index", "--add", "--cacheinfo", &format!("100644,{blob},chain-{i}.txt")]);
+        }
+        let tree = chain(&["write-tree"]);
+        let message = format!("chain {i}");
+        let parent = commits.last().cloned();
+        let mut args = vec!["commit-tree", tree.as_str(), "-m", message.as_str()];
+        if let Some(parent) = &parent {
+            args.extend(["-p", parent.as_str()]);
+        }
+        let commit = chain(&args);
+        commits.push(commit);
+    }
+    git_out(&clone, &["update-ref", "refs/remotes/origin/main", &commits[2]]);
     let in_clone = |sha: &str| run_with(&["--repo", clone.to_str().unwrap(), sha]);
     let mut decisions = Vec::new();
     for sha in &commits {
@@ -421,8 +443,7 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     // and a commit unrelated to the recorded one (the test's own repository, whose origin/main is its HEAD).
     // The commit not on origin/main, `unmerged`, is a child of commits[2] whose tree is commits[2]'s with
     // one file more, outside .bracken/, which Weave's recorded tree leaves out: made through a scratch
-    // index, so that it differs from commits[2]'s whatever the repository's last commits changed (task
-    // bb59a076515a: two of them may differ only in .bracken/).
+    // index, as the chain is.
     let extra = tmp.path().join("extra.txt");
     std::fs::write(&extra, "in no merged commit\n").unwrap();
     let blob = git_out(&clone, &["hash-object", "-w", extra.to_str().unwrap()]);
