@@ -480,9 +480,14 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
     c.tool("run_tests", json!({}))?;
     let proposed = c.tool("propose", json!({"summary": format!("agent {agent}'s module of turn {turn}")}))?;
     let proposal = proposed["proposal"].as_str().ok_or("propose gave no proposal")?.to_string();
-    // Refused if the line forked or moved on under it: the proposal stays open, for later.
-    if c.tool("integrate", json!({"proposals": [proposal], "note": format!("agent {agent}'s turn {turn}")})).is_ok() {
-        c.tool("update", json!({}))?;
+    // Refused if the line forked under it: the proposal stays open, for later. Any other failure is the turn's,
+    // so it names its real step (task 61c34b3c2704).
+    match c.tool("integrate", json!({"proposals": [proposal], "note": format!("agent {agent}'s turn {turn}")})) {
+        Ok(_) => {
+            c.tool("update", json!({}))?;
+        }
+        Err(e) if e.contains("is forked") => {}
+        Err(e) => return Err(e),
     }
     c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}")}))?;
     c.tool("sync", json!({}))?;

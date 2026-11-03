@@ -388,23 +388,50 @@ impl WeaveStore {
 
     /// Writes the manifest `manifest` as the working tree, keeping its git repository, and commits it.
     fn checkout(&mut self, manifest: &str, message: &str) -> Result<(), String> {
-        let fresh = self.config.dir.join("tree.new");
+        let dir = self.config.dir.clone();
+        let fresh = dir.join("tree.new");
         if fresh.exists() {
             std::fs::remove_dir_all(&fresh).map_err(|e| format!("clearing {}: {e}", fresh.display()))?;
         }
+        // Earlier checkouts' old trees, those that couldn't be removed then: each has a name of its own, so one
+        // that still can't be is no hindrance.
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("tree.old.") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        let old = (0u32..).map(|k| dir.join(format!("tree.old.{k}"))).find(|p| !p.exists()).expect("a free name");
         // Checkout writes into an empty directory.
         std::fs::create_dir(&fresh).map_err(|e| format!("creating {}: {e}", fresh.display()))?;
         let target = fresh.to_string_lossy().into_owned();
         self.bracken(&["weave".into(), "checkout".into(), format!("--manifest={manifest}"), target])?;
         let tree = self.tree();
-        if tree.join(".git").exists() {
+        let kept = tree.join(".git").exists();
+        if kept {
             std::fs::rename(tree.join(".git"), fresh.join(".git"))
                 .map_err(|e| format!("keeping git's repository: {e}"))?;
         }
-        if tree.exists() {
-            std::fs::remove_dir_all(&tree).map_err(|e| format!("clearing the tree: {e}"))?;
+        // The old tree is set aside whole, not cleared in place: something can write into it as it's cleared, and
+        // the clear then fails (os error 66, task 61c34b3c2704). A rename doesn't.
+        let swapped = if tree.exists() {
+            std::fs::rename(&tree, &old).map_err(|e| format!("setting the old tree aside: {e}"))
+        } else {
+            Ok(())
         }
-        std::fs::rename(&fresh, &tree).map_err(|e| format!("placing the tree: {e}"))?;
+        .and_then(|()| std::fs::rename(&fresh, &tree).map_err(|e| format!("placing the tree: {e}")));
+        // A swap that fails puts the old tree and git's repository back, so the tree is still one, and git can
+        // restore its files: else every later git call there fails as not a repository (task 898fff65aaef).
+        if let Err(e) = swapped {
+            let back = (if tree.exists() || !old.exists() { Ok(()) } else { std::fs::rename(&old, &tree) })
+                .and_then(|()| std::fs::create_dir_all(&tree))
+                .and_then(|()| if kept { std::fs::rename(fresh.join(".git"), tree.join(".git")) } else { Ok(()) });
+            if let Err(b) = back {
+                return Err(format!("{e}; and putting the tree back: {b}"));
+            }
+            return Err(e);
+        }
+        // What can't be removed now, the next checkout tries again.
+        let _ = std::fs::remove_dir_all(&old);
         if tree.join(".git").exists() { self.git_commit_all(message) } else { self.git_start(message) }
     }
 
@@ -796,8 +823,15 @@ impl WeaveStore {
         let keep = self.git_line(&["rev-parse", "HEAD"])?;
         // Whatever happens after the mirror, the tree goes back to its own commit (finding e26a1c74e007).
         let merged = self.merge_heads(&decisions, &ids);
-        self.git(&["reset", "-q", "--hard", &keep])?;
-        let (tree, conflicts) = merged?;
+        let restored = self.git(&["reset", "-q", "--hard", &keep]);
+        // The merge's own failure is the one to tell, with the restore's if that failed too: the restore's alone
+        // would hide what went wrong (task 898fff65aaef).
+        let (tree, conflicts) = match (merged, restored) {
+            (Err(e), Err(r)) => return Err(format!("{e}; and restoring the tree: {r}")),
+            (Err(e), Ok(_)) => return Err(e),
+            (Ok(_), Err(r)) => return Err(r),
+            (Ok(merged), Ok(_)) => merged,
+        };
         let count = self
             .git(&["ls-tree", "-r", "--name-only", &tree])?
             .split(|b| *b == b'\n')

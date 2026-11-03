@@ -368,6 +368,47 @@ fn a_project_run_needs_weave_mode_and_the_python_pin() {
 #[cfg(target_os = "macos")]
 mod macos_only {
     use super::*;
+
+    /// A checkout sets the old tree aside whole and removes it after, so one that can't be cleared, as when
+    /// something writes into it while it is (task 61c34b3c2704), neither fails it nor costs the tree its repository
+    /// (task 898fff65aaef). A read-only directory stands for that here, which a root user could clear, so it's
+    /// here. The next checkout removes what's left once it can.
+    #[test]
+    fn a_checkout_sets_the_old_tree_aside_and_keeps_its_repository() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut s = Stores::new(&["agent-0", "agent-1"]);
+        for (i, name) in [(0, "zero"), (1, "one")] {
+            s.ok(i, "write_file", json!({"path": format!("tiny/{name}.py"), "text": format!("NAME = '{name}'\n")}));
+            s.ok(i, "integrate", json!({"note": format!("agent {i}'s tree")}));
+        }
+        for i in [0, 1, 0, 1] {
+            s.sync(i);
+        }
+        assert_eq!(s.ok(0, "head", json!({}))["forked"], true);
+        let mode = |dir: &Path, m| std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m)).expect("a mode");
+        let dir = s.trees[0].parent().expect("the copy's directory").to_path_buf();
+        let aside = || -> Vec<PathBuf> {
+            let entries = std::fs::read_dir(&dir).expect("the copy's directory").flatten();
+            entries.map(|e| e.path()).filter(|p| p.to_string_lossy().contains("/tree.old.")).collect()
+        };
+
+        // The merge's checkouts set the old tree aside, though it can't be cleared, and the merge goes through.
+        mode(&s.trees[0].join("tiny"), 0o555);
+        let merged = s.ok(0, "merge", json!({}));
+        assert_eq!(merged["conflicts"], json!([]), "{merged}");
+        assert!(s.trees[0].join(".git").is_dir(), "the tree keeps its repository");
+        for name in ["zero", "one"] {
+            assert!(s.trees[0].join(format!("tiny/{name}.py")).exists(), "{name}'s file is in the merge");
+        }
+        let left = aside();
+        assert_eq!(left.len(), 1, "the old tree that couldn't be cleared: {left:?}");
+
+        // Once it can be removed, the next checkout does.
+        mode(&left[0].join("tiny"), 0o755);
+        s.ok(0, "integrate", json!({"note": "the merge"}));
+        s.ok(0, "update", json!({}));
+        assert_eq!(aside(), Vec::<PathBuf>::new());
+    }
     use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, run};
     use bracken_experiment::mock::MockBackend;
     use bracken_experiment::plan::{PlanInputs, ProjectPlan};
