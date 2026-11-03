@@ -138,6 +138,14 @@ enum Cmd {
         /// only when MODE is this run's mode; give it once per mode. The plan records the caps in effect.
         #[arg(long, value_name = "MODE=TOKENS")]
         mode_token_cap: Vec<ModeTokenCap>,
+        /// One agent's tokens over the run, in place of the pilot's 3M; at most the run's token cap. The plan
+        /// records the caps in effect.
+        #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
+        agent_token_cap: Option<u64>,
+        /// One agent's output tokens over the run, in place of the pilot's 180k; at most the run's output cap,
+        /// 1666666. The plan records the caps in effect.
+        #[arg(long, value_name = "TOKENS", value_parser = clap::value_parser!(u64).range(1..))]
+        agent_output_cap: Option<u64>,
     },
     /// Run one mode with the mock backend into a new directory.
     MockRun {
@@ -260,10 +268,15 @@ fn main() {
             bracken,
             accept_rule,
             mode_token_cap,
+            agent_token_cap,
+            agent_output_cap,
         } => agent_run(AgentRun {
             project: project_inputs(project.as_deref(), python.as_deref(), hold_change)
                 .unwrap_or_else(|e| refuse_run(&e)),
-            mode_token_cap,
+            // Refused here, before anything runs, like the other options.
+            caps: Caps::for_mode(&mode, &mode_token_cap)
+                .and_then(|c| c.with_agent_caps(agent_token_cap, agent_output_cap))
+                .unwrap_or_else(|e| refuse_run(&e)),
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
             task: task_named(&task),
             dir,
@@ -498,7 +511,8 @@ struct AgentRun {
     model: String,
     bracken: Option<PathBuf>,
     accept_rule: AcceptRule,
-    mode_token_cap: Vec<ModeTokenCap>,
+    /// The run's caps: the pilot's, with `--mode-token-cap`, `--agent-token-cap` and `--agent-output-cap`.
+    caps: Caps,
 }
 
 fn agent_run(a: AgentRun) -> Result<(), String> {
@@ -517,9 +531,16 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
     if a.prompt_file.is_some() {
         println!("the system prompt is from --prompt-file, not the reviewed prompts; the plan hashes it");
     }
-    let (expect, caps) = (Expect::pinned_2_1_311(&a.model), Caps::for_mode(&a.mode, &a.mode_token_cap)?);
-    if caps.run_tokens != Caps::pilot().run_tokens {
+    let (expect, caps) = (Expect::pinned_2_1_311(&a.model), a.caps);
+    let pilot = Caps::pilot();
+    if caps.run_tokens != pilot.run_tokens {
         println!("this {} run's token cap is {} (--mode-token-cap); the plan records it", a.mode, caps.run_tokens);
+    }
+    if caps.agent_tokens != pilot.agent_tokens {
+        println!("each agent's token cap is {} (--agent-token-cap); the plan records it", caps.agent_tokens);
+    }
+    if caps.agent_output != pilot.agent_output {
+        println!("each agent's output cap is {} (--agent-output-cap); the plan records it", caps.agent_output);
     }
     // The backend's own directory, named for its harness.
     let backend_dir = a.dir.join(match a.harness {

@@ -1,6 +1,7 @@
 //! A mode's token cap for a run (`run --mode-token-cap <mode>=<tokens>`, the manager's note `2018c9beceff`, decision `c90a34c1ca38`): without
 //! it every run's caps are the pilot's, exactly; with it only the named mode's token cap changes; and the
-//! plan records the caps in effect, so its hash changes with them.
+//! plan records the caps in effect, so its hash changes with them. Likewise one agent's token and output caps
+//! (`--agent-token-cap`, `--agent-output-cap`, task `ba049eeaff56`), each at most the run's cap of its kind.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -94,6 +95,95 @@ fn the_plan_records_the_caps_in_effect_so_its_hash_changes_with_them() {
     assert_eq!(plan_hash("bracken", &pilot), plan_hash("bracken", &Caps::for_mode("bracken", &[]).expect("caps")));
     // Another mode's run with the same option plans exactly as without it.
     assert_eq!(plan_hash("git", &pilot), plan_hash("git", &Caps::for_mode("git", &given).expect("caps")));
+}
+
+/// One agent's caps (task `ba049eeaff56`): without the options they're the pilot's exactly; each option
+/// changes only its own cap; and neither may pass the run's cap of the same kind.
+#[test]
+fn the_agent_caps_default_to_the_pilots_and_each_option_changes_only_its_own() {
+    for mode in MODES {
+        let caps = Caps::for_mode(mode, &[]).and_then(|c| c.with_agent_caps(None, None)).expect("caps");
+        assert_eq!(caps.plan_value(), PILOT, "{mode}");
+    }
+    let pilot = Caps::pilot();
+    let tokens = pilot.clone().with_agent_caps(Some(8_000_000), None).expect("caps");
+    assert_eq!(tokens.agent_tokens, 8_000_000);
+    assert_eq!(Caps { agent_tokens: pilot.agent_tokens, ..tokens }.plan_value(), PILOT, "nothing else moves");
+    let output = pilot.clone().with_agent_caps(None, Some(500_000)).expect("caps");
+    assert_eq!(output.agent_output, 500_000);
+    assert_eq!(Caps { agent_output: pilot.agent_output, ..output }.plan_value(), PILOT, "nothing else moves");
+    // Lower than the pilot's, and up to the run's cap itself, are taken.
+    let both = pilot.clone().with_agent_caps(Some(1_000_000), Some(1_666_666)).expect("caps");
+    assert_eq!((both.agent_tokens, both.agent_output), (1_000_000, 1_666_666));
+    assert_eq!(pilot.clone().with_agent_caps(Some(25_000_000), None).expect("caps").agent_tokens, 25_000_000);
+}
+
+#[test]
+fn an_agent_cap_above_the_runs_cap_of_its_kind_is_refused() {
+    let pilot = Caps::pilot();
+    let err = pilot.clone().with_agent_caps(Some(25_000_001), None).expect_err("above the run's tokens");
+    assert!(err.contains("--agent-token-cap 25000001") && err.contains("25000000"), "{err}");
+    let err = pilot.clone().with_agent_caps(None, Some(1_666_667)).expect_err("above the run's output");
+    assert!(err.contains("--agent-output-cap 1666667") && err.contains("1666666"), "{err}");
+    // The run's token cap is the mode's, so a raised mode cap lets a higher agent cap through, and a
+    // lowered one refuses the pilot's own.
+    let raised = Caps::for_mode("weave", &[cap("weave=24000000")]).expect("caps");
+    assert_eq!(raised.with_agent_caps(Some(8_000_000), Some(500_000)).expect("caps").agent_tokens, 8_000_000);
+    let lowered = Caps::for_mode("git", &[cap("git=2000000")]).expect("caps");
+    assert!(lowered.with_agent_caps(None, None).is_err(), "the pilot's 3M agent cap above a 2M run");
+}
+
+#[test]
+fn the_plan_records_the_agent_caps_so_its_hash_changes_with_them() {
+    let pilot = Caps::pilot();
+    let tokens = pilot.clone().with_agent_caps(Some(8_000_000), None).expect("caps");
+    let output = pilot.clone().with_agent_caps(None, Some(500_000)).expect("caps");
+    assert!(tokens.plan_value().as_str().expect("a string").contains("agent_tokens: 8000000"));
+    assert!(output.plan_value().as_str().expect("a string").contains("agent_output: 500000"));
+    let hashes = [plan_hash("bracken", &pilot), plan_hash("bracken", &tokens), plan_hash("bracken", &output)];
+    assert!(hashes[0] != hashes[1] && hashes[0] != hashes[2] && hashes[1] != hashes[2], "{hashes:?}");
+    let same = pilot.clone().with_agent_caps(Some(3_000_000), Some(180_000)).expect("caps");
+    assert_eq!(plan_hash("bracken", &pilot), plan_hash("bracken", &same), "the pilot's own values plan as without");
+}
+
+/// The command line refuses an agent cap of 0, a malformed one, or one above the run's cap of its kind,
+/// before anything runs.
+#[test]
+fn run_refuses_a_zero_malformed_or_too_large_agent_cap() {
+    let bin = Path::new(env!("CARGO_BIN_EXE_bracken-experiment"));
+    let cases: [(&[&str], &str); 6] = [
+        (&["--agent-token-cap", "0"], "--agent-token-cap"),
+        (&["--agent-output-cap", "1e6"], "--agent-output-cap"),
+        (&["--agent-token-cap", "25000001"], "above the run's token cap, 25000000"),
+        (&["--agent-output-cap", "1666667"], "above the run's output cap, 1666666"),
+        (
+            &["--agent-token-cap", "8000000", "--mode-token-cap", "bracken=5000000"],
+            "above the run's token cap, 5000000",
+        ),
+        (&["--mode-token-cap", "bracken=2000000"], "--agent-token-cap 3000000 is above the run's token cap, 2000000"),
+    ];
+    for (args, says) in cases {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let out = Command::new(bin)
+            .args(["run", "--dir"])
+            .arg(dir.path().join("run"))
+            .args([
+                "--mode",
+                "bracken",
+                "--claude",
+                "/nonexistent",
+                "--claude-version",
+                "0",
+                "--settings",
+                "/nonexistent",
+            ])
+            .args(args)
+            .output()
+            .expect("the binary runs");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(says), "{args:?}: {out:?}");
+        assert!(!dir.path().join("run").exists());
+    }
 }
 
 /// The command line refuses a malformed value, or one above the replicate's total, before anything runs.

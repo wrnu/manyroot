@@ -89,7 +89,9 @@ pub struct Caps {
     pub turn_output: u64,
     /// `--max-budget-usd`: Claude Code's own stop, on its API-equivalent estimate, which sees output as it grows.
     pub turn_budget_usd: Option<f64>,
+    /// One agent's tokens over the run; past them it takes no more turns (`--agent-token-cap`).
     pub agent_tokens: u64,
+    /// One agent's output tokens over the run; past them it takes no more turns (`--agent-output-cap`).
     pub agent_output: u64,
     pub run_tokens: u64,
     pub run_output: u64,
@@ -142,6 +144,30 @@ impl Caps {
             if c.mode == mode {
                 caps.run_tokens = c.tokens;
             }
+        }
+        Ok(caps)
+    }
+
+    /// These caps with one agent's token and output caps in place of the pilot's, where given (`run
+    /// --agent-token-cap`, `--agent-output-cap`, task `ba049eeaff56`). Neither may pass the run's cap of the
+    /// same kind, [`Caps::run_tokens`] and [`Caps::run_output`]: one agent can't use more than the whole run.
+    pub fn with_agent_caps(self, tokens: Option<u64>, output: Option<u64>) -> Result<Caps, String> {
+        let caps = Caps {
+            agent_tokens: tokens.unwrap_or(self.agent_tokens),
+            agent_output: output.unwrap_or(self.agent_output),
+            ..self
+        };
+        if caps.agent_tokens > caps.run_tokens {
+            return Err(format!(
+                "--agent-token-cap {} is above the run's token cap, {}: raise that with --mode-token-cap",
+                caps.agent_tokens, caps.run_tokens
+            ));
+        }
+        if caps.agent_output > caps.run_output {
+            return Err(format!(
+                "--agent-output-cap {} is above the run's output cap, {}",
+                caps.agent_output, caps.run_output
+            ));
         }
         Ok(caps)
     }

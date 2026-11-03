@@ -1104,6 +1104,13 @@ as well as raise it. The run's plan records the caps in effect, so the
 plan's hash changes with it. Without it, every run's caps are as above. The
 flag refuses a value above 75 million, the whole replicate's tokens.
 
+One agent's caps can change too, for every agent of a run (task
+`ba049eeaff56`): `run --agent-token-cap <tokens>` in place of the 3 million,
+and `run --agent-output-cap <tokens>` in place of the 180,000. The plan
+records them as well. Each is refused above the run's cap of its kind: the
+run's token cap, the mode's when `--mode-token-cap` gives one, and its
+output cap, 1,666,666.
+
 The owner sets a mode's share with the go for a replicate. For Phase 2's
 replicate 1 (approval `1316798b18f9`), Bracken's share is 30 million, and
 git's and crdt's are 25 million each, so the shares add up to more than the
