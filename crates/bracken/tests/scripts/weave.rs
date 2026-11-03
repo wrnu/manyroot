@@ -155,14 +155,27 @@ fn weave_runs_validate_only_for_a_validator() {
     }
     let out = planned(r#"{"signer": "aa", "validators": ["bb", "aa"]}"#, &validate);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    // The plan was asked for without the caller's --json, and the run itself gets the arguments as given.
+    // The plan was asked for without the caller's --json, and the run itself gets the arguments as given,
+    // and --runner <the main checkout>, where a box or mac check's pinned runner script is (plan
+    // cc496dcee0e3).
+    let main = dir.canonicalize().unwrap();
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "RAN --as weave-runner weave validate --manifest blake3:00 --json"
+        format!("RAN --as weave-runner weave validate --manifest blake3:00 --json --runner {}", main.display())
     );
     let out = planned(r#"{"signer": "aa", "validators": ["aa"]}"#, &["weave", "validate", "--", "x"]);
     assert!(String::from_utf8_lossy(&out.stderr).contains("takes no '--'"), "{out:?}");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("RAN"));
+    // The caller's own --runner is refused, on validate and on a line write.
+    for args in [
+        &[&validate[..], &["--runner", "/tmp"]].concat()[..],
+        &["weave", "line", "policy", "main", "--runner=/tmp", "--owner-decision", "0123456789abcdef"],
+    ] {
+        let out = planned(r#"{"signer": "aa", "validators": ["aa"]}"#, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("--runner is refused"), "{args:?}: {stderr}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("RAN"), "{args:?}: it ran");
+    }
 
     // With the real binary: a line whose only validator is val, and a manifest.
     let decision = owner_decision(&dir);
