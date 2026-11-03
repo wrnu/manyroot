@@ -296,8 +296,9 @@ fi
 git -C "$main" fetch -q origin main "refs/pull/$pr/head" || fail "couldn't fetch main and PR #$pr from origin"
 tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no origin/main"
 
-# The manager's passes of scripts/test-table naming the sha, one '<main sha>\t<key>\t<suffix>' line
-# each; the main and key are empty for a pass without --on, the suffix ' docs-only', ' reuses <id>',
+# The manager's passes of scripts/test-table naming the sha, one '<main sha>\x1f<key>\x1f<suffix>' line
+# each, split on the unit separator: a tab is whitespace to read, so an empty main and key would collapse
+# and a suffix land in the wrong field, never checked (task 962bd6b61626); the main and key are empty for a pass without --on, the suffix ' docs-only', ' reuses <id>',
 # ' light -p <package>...' (a light pass, always with --on), ' weave <manifest> <evidence>' (line main's
 # Weave results on the merge, recorded by verify-seq --weave and re-checked below by scripts/weave-gate
 # check) or empty.
@@ -309,7 +310,7 @@ tables=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind
          | .x = " light" + .p)
      // (capture("^scripts/test-table --weave @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40}) tree (?<k>[0-9a-f]{40,64}) manifest (?<w>blake3:[0-9a-f]{64})$")?
          | .x = " weave " + .w + " " + $e.id))
-  | select(.h == $sha) | [.m // "", .k // "", .x // ""] | @tsv] | unique | .[]' <<<"$shown")
+  | select(.h == $sha) | [.m // "", .k // "", .x // ""] | join("\u001f")] | unique | .[]' <<<"$shown")
 # The manager's batch passes naming the sha, one '<batch>\t<main>\t<key>\t<run>' line each.
 batch_passes=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
   and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
@@ -461,7 +462,7 @@ else
   wrong=()
   needs_full='' light_packages='' light_passes='' weave_case=''
   weave_dropped=() weave_dropped_ids=() weave_ignored=()
-  while IFS=$'\t' read -r m k x; do
+  while IFS=$'\x1f' read -r m k x; do
     case "$x" in
       " docs-only") $docs_only || wrong+=("a docs-only pass${m:+ on main $m} on a head that isn't docs-only ($scope)") ;;
       " light -p "*)
@@ -515,7 +516,7 @@ else
           weave_case=$(tail -n 1 <<<"$why")
           continue
         fi
-        weave_dropped+=("$m"$'\t'"$k"$'\t'"$x") weave_dropped_ids+=("$e")
+        weave_dropped+=("$m"$'\x1f'"$k"$'\x1f'"$x") weave_dropped_ids+=("$e")
         weave_ignored+=("Weave pass ${e:0:12} on main ${m:0:12} ignored: $why")
         ;;
     esac
@@ -567,7 +568,7 @@ else
   # The main shas the manager's test-table passes tested this head merged with ('scripts/test-table @
   # <sha> on <main sha>'); a docs-only one only for a docs-only head, and the scope check vets a reused
   # one. Any other command's --on pass is part of the table at most.
-  verified=$(while IFS=$'\t' read -r m _ x; do
+  verified=$(while IFS=$'\x1f' read -r m _ x; do
     [ -n "$m" ] || continue
     [ "$x" != " docs-only" ] || $docs_only || continue
     echo "$m"
