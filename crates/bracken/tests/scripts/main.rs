@@ -10,6 +10,7 @@ mod support;
 
 mod bk;
 mod bk_evidence;
+mod ci_result;
 mod cleanup;
 mod code_scope;
 mod ground_checkpoint;

@@ -1,57 +1,106 @@
-# Tests, lint, formatting and the Ground guards, run only by hand (workflow_dispatch), on the branch it's
-# started from. It deploys nothing. Nothing runs on push or pull_request: this repository is public, so its
-# Actions can't be trusted with secrets, and a PR from anyone would run here. Per owner decision
-# 20a06f9b815e the manager's counted run of the test table on the exact head (scripts/bk-evidence) is the
-# CI, and scripts/merge runs scripts/ground-guards itself. This run is an extra observer: when it disagrees
-# with the Ground, the manager records a ci-disagreement claim (owner decision 8b2454e4cf81; process
-# section 10).
+# CI on GitHub Actions (task 87d7f62409b0, decision d9fa2c08146c): the AGENTS.md test table on Linux, as
+# scripts/test-table runs it in a box, and the macOS-only tests with the host's clippy on a Mac, as
+# scripts/test-table --split's Mac part runs them. It runs on every push and pull request, and by hand
+# (workflow_dispatch). It only reports: it merges nothing, writes nothing to the Ground and deploys
+# nothing. The manager's counted run is still what a merge waits for; scripts/ci-evidence records this
+# run's result on a pr claim, so the two can be compared (decision d9fa2c08146c).
+#
+# Hardened for a public repository: read-only token, no secrets, never pull_request_target or
+# workflow_run (a pull_request run from a fork gets no secrets and a read-only token), third-party
+# actions pinned by full commit sha, no `${{ }}` of event data inside a script, and the cargo cache
+# saved only from main, so a pull request can read it but never write it. Standard runners only: larger
+# ones are billed.
 name: CI
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
 
-# Read-only: the run needs no write access and no secret.
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The toolchain the team builds with; scripts/test-table's box pins nothing else.
+  RUST_VERSION: "1.98.1"
+  # scripts/test-table's pin (decision 4bf44934cb67 (4)): the hashes are those nextest publishes beside
+  # each tarball, which match GitHub's digests of the assets (checked 2026-11-04).
+  NEXTEST_VERSION: "0.9.150"
+  NEXTEST_LINUX_SHA256: b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
+  NEXTEST_MAC_SHA256: 82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a
+  CARGO_TERM_COLOR: never
+
 jobs:
-  check:
+  table:
+    name: Test table (Linux)
     runs-on: ubuntu-latest
-    container:
-      image: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
+    timeout-minutes: 120
     steps:
-      # Plain git, no checkout action and no token: the repository is public.
+      # Full history, for the Ground guards' append-only check and scripts/code-scope against main.
       - name: Check out
-        run: |
-          git init -q .
-          git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
-          # Fetch the ref, then check out the run's own commit: if the branch moved on while the run was
-          # queued, fail instead of testing a newer commit and reporting it against this one.
-          git fetch -q --depth=100 origin "${{ github.ref }}"
-          git checkout -q --detach "${{ github.sha }}" || {
-            echo "${{ github.sha }} is no longer on ${{ github.ref }}; a newer run covers the new commit"
-            exit 1
-          }
-          echo "checked out $(git rev-parse HEAD) from ${{ github.ref }}"
-          # main, for the append-only check below.
-          git fetch -q --depth=100 origin +refs/heads/main:refs/remotes/origin/main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: main, as origin/main
+        run: git fetch -q --no-tags origin +refs/heads/main:refs/remotes/origin/main
       - name: Toolchain
         run: |
-          rustup component add clippy rustfmt
-          # scripts/team-server hashes tokens with b3sum; its test runs it.
-          cargo install --locked b3sum --version 1.8.7
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_VERSION"
           cargo --version
-      - name: Format
-        run: cargo fmt --check
-      - name: Lint
-        run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --locked --workspace
-      # The checks on the committed Ground that the test table doesn't make (no keys or stray files under
-      # .bracken/, append-only since the merge base with main, the Ground opens, docs/vision.md matches), in
-      # the one copy scripts/merge also runs. A run dispatched on main fails this step by design: HEAD is
-      # origin/main, so there's no merge base to compare with, and ground-guards fails rather than check nothing.
-      - name: Ground guards
+      - name: Tools
         run: |
-          cargo build -q --locked -p bracken
-          BRACKEN_BIN=target/debug/bracken scripts/ground-guards origin/main HEAD
+          # b3sum for scripts/team-server's test; the experiment's git-mode tests need git 2.46 or later.
+          sudo apt-get install -y -qq b3sum jq lsof
+          git --version
+          tar=cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz
+          dir=$(mktemp -d)
+          curl -fsSL -o "$dir/$tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/$tar"
+          echo "$NEXTEST_LINUX_SHA256  $dir/$tar" | sha256sum -c --quiet -
+          tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
+          echo "$dir" >>"$GITHUB_PATH"
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # fmt, clippy (this host is x86_64-unknown-linux-gnu, so both of the table's clippies), every test
+      # under nextest, the doctests, and the Ground guards against main: the one copy the manager runs.
+      - name: scripts/test-table
+        run: BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table
+
+  macos:
+    name: macOS-only tests and clippy (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
+          rustup default "$RUST_VERSION"
+          cargo --version
+      - name: Tools
+        run: |
+          tar=cargo-nextest-$NEXTEST_VERSION-universal-apple-darwin.tar.gz
+          dir=$(mktemp -d)
+          curl -fsSL -o "$dir/$tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/$tar"
+          echo "$NEXTEST_MAC_SHA256  $dir/$tar" | shasum -a 256 -c --quiet -
+          tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
+          echo "$dir" >>"$GITHUB_PATH"
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy (macOS host)
+        run: cargo clippy --locked --all-targets -- -D warnings
+      # Every test in a 'mod macos_only', which Linux skips (scripts/test-table --split).
+      - name: macOS-only tests
+        run: cargo nextest run --locked --workspace --no-fail-fast -E 'test(~macos_only::)'

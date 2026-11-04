@@ -39,7 +39,7 @@ Build the **project profile**:
 | Shared resources | Things only one agent may use at a time | **the pinned `bracken` binary**, Ground checkpoint commits |
 | Things that break production | Footguns | "a change to encoding or validity rules can make every existing Ground unreadable" |
 | Remote | Where PRs and CI live | GitHub `owner/repo` (the `scripts/merge` template speaks GitHub's API through `gh`), or `TODO(owner)`: no remote yet |
-| CI role | Observer on every PR (default), manual, or gate | observer: runs on every PR, but merges are gated by the Ground (process section 10). Manual, when the runner's compute is too slow or a public repo's Actions can't be trusted with secrets: the workflow runs only on `workflow_dispatch`, and the manager's counted test-table run on the exact head is the CI |
+| CI role | Observer on every PR (default), manual, or gate | observer: runs on every PR, but merges are gated by the Ground (process section 10). Manual, when the runner's compute is too slow: the workflow runs only on `workflow_dispatch`, and the manager's counted test-table run on the exact head is the CI |
 | Agent harness | How threads, child tasks, messages and schedules work here (see Tool mapping) | T3 Code + Claude Code |
 | Models | Default model, a different-model reviewer, a strong security model, and which quota is largest | default A; reviewer B; security A at high effort |
 | Monitoring | Error monitor, crash reporting, where logs live | none yet |

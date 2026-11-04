@@ -6,7 +6,7 @@ Nothing is released yet. Every merge to `main` runs checks only and deploys noth
 
 | Stage | What it is | Status |
 |---|---|---|
-| `main` | Merged once the Ground's merge gate passed (CI runs only by hand and doesn't gate) | In use |
+| `main` | Merged once the Ground's merge gate passed (GitHub Actions CI observes every push and PR, and doesn't gate) | In use |
 | Tagged pre-release | A `v<version>-pre.<n>` tag on a `main` commit | `TODO(owner)` when there's something to hand out |
 | Published crates | `manyroot` and `bracken` on crates.io, under `MIT OR Apache-2.0` | `TODO(owner)` |
 

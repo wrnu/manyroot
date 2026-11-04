@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# ci-result: a head's GitHub Actions result (.github/workflows/ci.yml), read through gh, as a check that
+# bk-evidence can record on its pr claim (task 87d7f62409b0), so the manager can compare it with the
+# counted run. It records nothing itself and changes nothing on GitHub: only GET requests.
+#
+#   ci-result [--event pull_request|push] [<sha>]
+#   ci-result --record <pr claim> [--as <identity>] [--event pull_request|push]
+#
+# For <sha> (HEAD by default), it finds ci.yml's runs on origin's GitHub repository whose head is that
+# sha, takes the latest of the given event, or by default the latest pull_request run (it tests the head
+# merged with main, as the counted run does) or, with none, the latest push run (the head alone). It
+# prints the run's URL, event, attempt, the PR's base for a pull_request run, and each job's conclusion.
+# It exits 0 only if the run completed, its conclusion is success and so is every job's; 1 if it
+# completed otherwise; 3 if it hasn't completed (run it again later); 2 if there's no such run, or it
+# can't read one.
+#
+# --record runs the main checkout's bk-evidence on <pr claim> with this script as the command, from a
+# clean checkout at the claim's head: the evidence is "scripts/ci-result @ <sha>", with this output and
+# exit code. A run that hasn't completed records a fail, so wait for it to complete first.
+#
+# gh authenticates from its own credential store (gh auth login), with GH_TOKEN, GITHUB_TOKEN, the
+# enterprise token variables and GH_DEBUG unset for it, as in scripts/merge. Needs gh and jq.
+set -euo pipefail
+set +ax
+
+fail() { echo "ci-result: $*" >&2; exit 2; }
+usage() {
+  echo "usage: ci-result [--event pull_request|push] [<sha>]" >&2
+  echo "       ci-result --record <pr claim> [--as <identity>] [--event pull_request|push]" >&2
+  exit 2
+}
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+event='' sha='' record='' as=''
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --event) [ $# -ge 2 ] && [[ $2 =~ ^(pull_request|push)$ ]] || usage; event=$2; shift 2 ;;
+    --record) [ $# -ge 2 ] && [[ $2 =~ ^[0-9a-f]{12,64}$ ]] || usage; record=$2; shift 2 ;;
+    --as) [ $# -ge 2 ] || usage; as=$2; shift 2 ;;
+    -*) usage ;;
+    *) [ -z "$sha" ] || usage; sha=$1; shift ;;
+  esac
+done
+
+if [ -n "$record" ]; then
+  [ -z "$sha" ] || fail "--record takes the sha from the claim's checkout: give no <sha>"
+  main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+  cd "$(git rev-parse --show-toplevel)"
+  args=("$record")
+  [ -z "$as" ] || args+=(--as "$as")
+  exec "$main/scripts/bk-evidence" "${args[@]}" -- scripts/ci-result ${event:+--event "$event"}
+fi
+[ -z "$as" ] || usage
+
+for tool in gh jq; do command -v "$tool" >/dev/null || fail "needs $tool"; done
+[ -n "$sha" ] || sha=$(git rev-parse HEAD)
+[[ $sha =~ ^[0-9a-f]{40}$ ]] || fail "'$sha' isn't a full commit sha"
+
+origin=$(git -C "$here" config --get remote.origin.url) || fail "no origin"
+[[ $origin =~ ^https://([^/@]+)/([^/]+)/([^/]+)$ ]] ||
+  fail "origin's URL isn't https://<host>/<owner>/<repo>, with no user or password in it"
+host=${BASH_REMATCH[1]}
+repo="${BASH_REMATCH[2]}/${BASH_REMATCH[3]%.git}"
+[[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "origin's owner and repository aren't plain names"
+
+gh_() {
+  env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_DEBUG -u DEBUG \
+    -u GH_HOST -u GH_REPO GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh "$@"
+}
+get() { gh_ api --hostname "$host" -X GET -H "Accept: application/vnd.github+json" "repos/$repo/$1"; }
+
+runs=$(get "actions/workflows/ci.yml/runs?head_sha=$sha&per_page=100") ||
+  fail "couldn't read ci.yml's runs for $sha from $host (is gh logged in? gh auth login --hostname $host)"
+# The latest run of the event, by id; with no event given, pull_request first, then push.
+run=$(jq -ce --arg sha "$sha" --arg event "$event" '[.workflow_runs[] | select(.head_sha == $sha)] as $r
+  | (if $event != "" then [$event] else ["pull_request", "push"] end)
+  | map(. as $e | [$r[] | select(.event == $e)] | max_by(.id)) | map(select(. != null)) | first' <<<"$runs") ||
+  fail "no ci.yml run on $repo for $sha${event:+ ($event)}: push the head, or start one with gh workflow run ci.yml --ref <branch>"
+id=$(jq -r .id <<<"$run")
+[[ $id =~ ^[0-9]+$ ]] || fail "a run without a numeric id"
+status=$(jq -r .status <<<"$run")
+conclusion=$(jq -r '.conclusion // "none"' <<<"$run")
+echo "ci-result: $(jq -r .html_url <<<"$run")"
+echo "ci-result: run $id, $(jq -r .event <<<"$run") on $sha, attempt $(jq -r .run_attempt <<<"$run"): $status, $conclusion"
+if [ "$(jq -r .event <<<"$run")" = pull_request ]; then
+  echo "ci-result: pull_request run: the head merged with $(jq -r '.pull_requests[0].base | if . then "\(.ref) at \(.sha)" else "main (base not shown: a fork PR)" end' <<<"$run") as of the run"
+fi
+if [ "$status" != completed ]; then
+  echo "ci-result: run $id hasn't completed; run ci-result again when it has" >&2
+  exit 3
+fi
+jobs=$(get "actions/runs/$id/jobs?per_page=100") || fail "couldn't read run $id's jobs"
+jq -r '.jobs[] | "ci-result: job \(.name): \(.conclusion // .status)"' <<<"$jobs"
+if [ "$conclusion" = success ] &&
+  jq -e '(.jobs | length) > 0 and all(.jobs[]; .conclusion == "success")' <<<"$jobs" >/dev/null; then
+  echo "ci-result: passed at $sha"
+  exit 0
+fi
+echo "ci-result: failed at $sha ($conclusion)" >&2
+exit 1
