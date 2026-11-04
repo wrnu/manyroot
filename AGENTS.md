@@ -62,6 +62,7 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 - Contribute what others would need **as you learn it**, not at the end.
 - A write prints one labelled line per record, the primary first: `claim <id>`, then `relation <id> (supersedes)`. Pass on the id from the line you mean, never just the first word; scripts use `--json` and its `id`.
 - Messages carry ids; the content goes in the Ground. No secrets or personal data: contributions are permanent.
+- **The Ground is public.** `.bracken/` is committed to the public GitHub repository, so every contribution is a publication, readable by anyone and kept forever (decision `473d5df9b1ab`).
 
 | What | How |
 |---|---|

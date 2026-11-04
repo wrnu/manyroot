@@ -95,6 +95,15 @@ jobs:
           echo "$NEXTEST_MAC_SHA256  $dir/$tar" | shasum -a 256 -c --quiet -
           tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
           echo "$dir" >>"$GITHUB_PATH"
+          # Apple's git, as on the team's Mac, ahead of the runner's Homebrew git: the experiment's
+          # sandbox lets a worker run git's binary and exec path but not Homebrew's libraries, so
+          # Homebrew's git fails to load there (dyld). The git-mode tests need git 2.46 or later.
+          git_dir=$(mktemp -d)
+          ln -s /usr/bin/git "$git_dir/git"
+          "$git_dir/git" --version
+          "$git_dir/git" --version | awk '{split($3, v, "."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 46))}' ||
+            { echo "Apple's git is older than 2.46, which the experiment's git-mode tests need"; exit 1; }
+          echo "$git_dir" >>"$GITHUB_PATH"
       - name: Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
