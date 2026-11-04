@@ -92,8 +92,8 @@ impl Mode for WeaveMode {
             ),
             tool(
                 "changes",
-                "Your working tree against the decision it started from (proposed or not): each file changed, and the diff; with `path`, that file's alone. A diff too large for one result lists the files it leaves out",
-                json!({"path": path}),
+                "Your working tree against the decision it started from (proposed or not): each file changed, and the diff; with `path`, that file's alone. A diff too large for one result comes in pages: files says the page each file's diff is on, and `page` (from 1) picks one",
+                json!({"path": path, "page": {"type": "integer", "minimum": 1}}),
                 &[],
             ),
             tool(
@@ -117,8 +117,8 @@ impl Mode for WeaveMode {
             tool("proposals", "The line's open proposals, with their authors", json!({}), &[]),
             tool(
                 "diff",
-                "The per-file difference between two decisions or manifests, with a unified diff of each changed file",
-                json!({"a": id, "b": id}),
+                "The per-file difference between two decisions or manifests, with a unified diff of each changed file. A diff too large for one result comes in pages: files says the page each file's diff is on, and `page` (from 1) picks one",
+                json!({"a": id, "b": id, "page": {"type": "integer", "minimum": 1}}),
                 &["a", "b"],
             ),
             tool(
@@ -220,12 +220,18 @@ pub fn hub_data(project: &Project, integrator: &str, hold: bool) -> Result<Value
 /// How an item's statement ends when it changes other items' requirement.
 const CHANGES: &str = "This changes the requirement of: ";
 
-/// An item as the hub states it, in a claim tagged `item`: its id, kind and title on the first line, then its
-/// issue text, then the items whose requirement it changes, if any. `item` is one of [`hub_data`]'s items.
+/// How an item's first line names the items whose requirement it changes, after its kind.
+const CHANGES_IN_HEAD: &str = "; changes ";
+
+/// An item as the hub states it, in a claim tagged `item`: its id, kind, the items whose requirement it changes,
+/// if any, and title on the first line, then its issue text, then the items it changes again, in words. The index
+/// reads the first line only, which the hub writes whole, so no wording in the issue text can change it (task
+/// `a5253414e178`). `item` is one of [`hub_data`]'s items.
 pub fn item_statement(item: &Value) -> String {
     let revises: Vec<&str> = item["revises"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let changes = if revises.is_empty() { String::new() } else { format!("{CHANGES_IN_HEAD}{}", revises.join(", ")) };
     let mut text = format!(
-        "Item {} ({}): {}\n\n{}",
+        "Item {} ({}{changes}): {}\n\n{}",
         item["id"].as_str().unwrap_or_default(),
         item["kind"].as_str().unwrap_or_default(),
         item["title"].as_str().unwrap_or_default(),
@@ -237,19 +243,20 @@ pub fn item_statement(item: &Value) -> String {
     text
 }
 
-/// An item's entry in the task tool's index, from its statement ([`item_statement`]): its id, kind and title,
-/// and the items whose requirement it changes. A statement of another shape is shown whole, so nothing the
-/// setter stated is lost.
+/// An item's entry in the task tool's index, from its statement's first line ([`item_statement`]): its id,
+/// kind and title, and the items whose requirement it changes. A statement of another shape is shown whole, so
+/// nothing the setter stated is lost.
 fn item_entry(statement: &str) -> Value {
     let first = statement.lines().next().unwrap_or_default();
     let parsed = first
         .strip_prefix("Item ")
         .and_then(|rest| rest.split_once(" ("))
         .and_then(|(id, rest)| rest.split_once("): ").map(|(kind, title)| (id, kind, title)));
-    let Some((id, kind, title)) = parsed else { return json!({"text": statement}) };
+    let Some((id, head, title)) = parsed else { return json!({"text": statement}) };
+    let (kind, changes) = head.split_once(CHANGES_IN_HEAD).map_or((head, None), |(k, c)| (k, Some(c)));
     let mut entry = json!({"id": id, "kind": kind, "title": title});
-    if let Some(list) = statement.lines().last().and_then(|l| l.strip_prefix(CHANGES)) {
-        entry["changes"] = json!(list.trim_end_matches('.').split(", ").collect::<Vec<_>>());
+    if let Some(list) = changes {
+        entry["changes"] = json!(list.split(", ").collect::<Vec<_>>());
     }
     entry
 }
@@ -315,13 +322,21 @@ fn failure(command: &str, stderr: &[u8]) -> String {
 /// under [`crate::driver::MAX_RESULT_BYTES`] with room for the rest of it.
 const LIST_BYTES: usize = crate::driver::MAX_RESULT_BYTES - 2048;
 
+/// The most bytes of a diff page's text, JSON-escaped: [`LIST_BYTES`] less room for its index of files.
+const PAGE_TEXT_BYTES: usize = LIST_BYTES * 3 / 4;
+
+/// `v`'s size as the driver sends it: its JSON text, in bytes.
+fn json_len<T: serde::Serialize + ?Sized>(v: &T) -> usize {
+    serde_json::to_string(v).map_or(usize::MAX / 2, |j| j.len())
+}
+
 /// `parts` from the first, while their JSON text fits `budget` bytes in all, and those left out.
 fn fit<T: serde::Serialize>(mut parts: Vec<T>, budget: usize) -> (Vec<T>, Vec<T>) {
     let mut size = 0;
     let keep = parts
         .iter()
         .take_while(|p| {
-            size += serde_json::to_string(p).map_or(usize::MAX / 2, |j| j.len() + 1);
+            size += json_len(p) + 1;
             size <= budget
         })
         .count();
@@ -329,81 +344,157 @@ fn fit<T: serde::Serialize>(mut parts: Vec<T>, budget: usize) -> (Vec<T>, Vec<T>
     (parts, rest)
 }
 
-/// The changes tool's result: the files changed and as many files' whole diffs as fit, naming the files whose
-/// diff it leaves out, so a large diff never cuts one off in the middle unsaid (task `b58cf9180030`).
-pub fn changes_view(base: String, files: Vec<&str>, diff: &str) -> Value {
-    let (files, files_left) = fit(files, LIST_BYTES / 4);
-    let used = serde_json::to_string(&files).map_or(0, |j| j.len());
-    let mut parts: Vec<&str> = Vec::new();
-    let mut from = 0;
-    for (at, _) in diff.match_indices("diff --git ").filter(|(at, _)| *at == 0 || diff.as_bytes()[at - 1] == b'\n') {
-        if at > from {
-            parts.push(&diff[from..at]);
+/// One changed file of a diff: its path, git's letter for its change, and its unified diff.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FileDiff {
+    pub path: String,
+    pub change: String,
+    pub text: String,
+}
+
+/// `git diff`'s output split per file, its paths and changes from `--name-status`'s, in the same order. A file
+/// of git's patch whose header names no path takes the next name-status line's.
+pub fn split_diff(name_status: &str, patch: &str) -> Vec<FileDiff> {
+    let mut status = name_status.lines().filter(|l| !l.is_empty()).map(|l| match l.split_once('\t') {
+        Some((c, p)) => (c.to_string(), p.rsplit('\t').next().unwrap_or(p).to_string()),
+        None => (String::new(), l.to_string()),
+    });
+    let mut starts: Vec<usize> = patch
+        .match_indices("diff --git ")
+        .map(|(at, _)| at)
+        .filter(|at| *at == 0 || patch.as_bytes()[at - 1] == b'\n')
+        .collect();
+    starts.push(patch.len());
+    starts
+        .windows(2)
+        .map(|w| {
+            let text = &patch[w[0]..w[1]];
+            let (change, listed) = status.next().unwrap_or_default();
+            let path = text.lines().next().and_then(|l| l.rsplit_once(" b/")).map_or(listed, |(_, p)| p.to_string());
+            FileDiff { path, change, text: text.to_string() }
+        })
+        .collect()
+}
+
+/// `text` in pieces of at most `budget` bytes of JSON text each, cut after a line where it can, inside a line
+/// only one that alone is over the budget, and never inside a character.
+fn pieces(text: &str, budget: usize) -> Vec<&str> {
+    let mut out = Vec::new();
+    let (mut from, mut size) = (0, 0);
+    for (at, ch) in text.char_indices() {
+        let n = json_len(&ch.to_string()) - 2;
+        if size + n > budget && at > from {
+            // Back to the last line's end in this piece, if it has one.
+            let cut = text[from..at].rfind('\n').map_or(at, |i| from + i + 1);
+            out.push(&text[from..cut]);
+            size = json_len(&text[cut..at]) - 2;
+            from = cut;
         }
-        from = at;
+        size += n;
     }
-    if from < diff.len() {
-        parts.push(&diff[from..]);
-    }
-    let (shown, left) = fit(parts, LIST_BYTES - used);
-    let mut out = json!({"base": base, "files": files, "diff": shown.concat()});
-    if !files_left.is_empty() {
-        out["files_not_shown"] = json!(files_left.len());
-    }
-    if !left.is_empty() {
-        let paths: Vec<&str> =
-            left.iter().filter_map(|p| p.lines().next()?.rsplit_once(" b/").map(|(_, path)| path)).collect();
-        let (named, unnamed) = fit(paths, LIST_BYTES / 8);
-        out["diff_not_shown"] = json!(named);
-        out["note"] = json!(format!(
-            "The diff is too large for one result: {} files' diffs are left out{}. Call changes with path for each.",
-            left.len(),
-            if unnamed.is_empty() { String::new() } else { format!(", {} of them not named here", unnamed.len()) }
-        ));
+    if from < text.len() {
+        out.push(&text[from..]);
     }
     out
 }
 
-/// The diff tool's result, from `bracken weave diff --json`: every file, or, when they don't all fit one
-/// result, as many as fit, by path and change, with the count of those left out.
-pub fn diff_view(mut v: Value) -> Value {
-    let files = v["files"].as_array().cloned().unwrap_or_default();
-    if serde_json::to_string(&files).map_or(0, |j| j.len()) <= LIST_BYTES {
-        return v;
+/// One page of a diff (task `a5253414e178`, finding `e97ef2cd6d6e`): every file's diff is on some page, a file
+/// too large for one page across as many as it needs, each part saying which, so nothing is out of reach and no
+/// advice loops. Page `page` (from 1) has its text, and an index of the files with the pages each is on: those
+/// of this page first, then the rest in order, as many as fit, with a count of the rest. `extra` holds the
+/// tool's own fields.
+pub fn diff_page(files: &[FileDiff], page: usize, mut extra: Value) -> Result<Value, String> {
+    // Room for a continued part's first line, which names the file.
+    let budget = |f: &FileDiff| PAGE_TEXT_BYTES.saturating_sub(json_len(&f.path) + 64).max(1024);
+    let mut parts: Vec<(usize, String)> = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let split = pieces(&f.text, budget(f));
+        let n = split.len();
+        for (k, p) in split.into_iter().enumerate() {
+            let head = if n > 1 { format!("[{}: part {} of {n}]\n", f.path, k + 1) } else { String::new() };
+            parts.push((i, head + p));
+        }
     }
-    let brief: Vec<Value> = files.iter().map(|f| json!({"path": f["path"], "change": f["change"]})).collect();
-    let (shown, left) = fit(brief, LIST_BYTES);
-    v["files"] = json!(shown);
-    if !left.is_empty() {
-        v["files_not_shown"] = json!(left.len());
+    // Pages in order, a part going on the page before unless it would pass the budget.
+    let mut pages: Vec<Vec<usize>> = Vec::new();
+    let mut size = usize::MAX;
+    for (j, (_, text)) in parts.iter().enumerate() {
+        let n = json_len(text);
+        if size.saturating_add(n) > PAGE_TEXT_BYTES {
+            pages.push(Vec::new());
+            size = 0;
+        }
+        size += n;
+        pages.last_mut().expect("a page").push(j);
     }
-    v["note"] = json!("Too many files for one result: each is shown by path and change only.");
-    v
+    let count = pages.len().max(1);
+    if page == 0 || page > count {
+        return Err(format!("page {page}: the diff has {count} pages, from 1"));
+    }
+    let on: &[usize] = pages.get(page - 1).map_or(&[], Vec::as_slice);
+    let text: String = on.iter().map(|&j| parts[j].1.as_str()).collect();
+    let span = |i: usize| -> (usize, usize) {
+        let mut at = pages.iter().enumerate().filter(|(_, p)| p.iter().any(|&j| parts[j].0 == i)).map(|(k, _)| k + 1);
+        let first = at.next().unwrap_or(1);
+        (first, at.next_back().unwrap_or(first))
+    };
+    let entry = |i: usize| {
+        let (first, last) = span(i);
+        let mut e = json!({"path": files[i].path, "change": files[i].change, "page": first});
+        if last > first {
+            e["last_page"] = json!(last);
+        }
+        e
+    };
+    let here: std::collections::BTreeSet<usize> = on.iter().map(|&j| parts[j].0).collect();
+    let order: Vec<usize> = here.iter().copied().chain((0..files.len()).filter(|i| !here.contains(i))).collect();
+    let (listed, unlisted) = fit(order.into_iter().map(entry).collect(), LIST_BYTES - PAGE_TEXT_BYTES);
+    extra["files"] = json!(listed);
+    if !unlisted.is_empty() {
+        extra["files_not_listed"] = json!(unlisted.len());
+    }
+    extra["diff"] = json!(text);
+    if count > 1 {
+        extra["page"] = json!(page);
+        extra["pages"] = json!(count);
+        extra["note"] = json!(format!(
+            "The diff has {count} pages; this is page {page}. Call again with page set to see another: each file \
+             in files says the page its diff starts on (and last_page, if it goes on)."
+        ));
+    }
+    Ok(extra)
 }
 
 /// The error an integrate that stopped at conflicts gives, from bracken's JSON: each conflict's path, whether
-/// either side deleted it, its conflicting regions and the resolutions offered for it, as many as fit, with the
-/// count of those left out. None if `v` lists no conflict.
+/// either side deleted it, its conflicting regions and the resolutions offered for it. A conflict too large to
+/// show whole keeps its path (task `a5253414e178`); past the bound, the count of those left out. None if `v`
+/// lists no conflict.
 pub fn conflicts_error(v: &Value) -> Option<String> {
     let all = v["conflicts"].as_array().filter(|c| !c.is_empty())?;
     let side = |x: &Value| if x.is_null() { "deleted" } else { "present" };
-    let rows: Vec<Value> = all
-        .iter()
-        .map(|c| {
-            let offered: Vec<&Value> =
-                c["offered"].as_array().into_iter().flatten().map(|o| &o["resolution"]).collect();
-            json!({"path": c["path"], "into": side(&c["into"]), "from": side(&c["from"]),
-                   "regions": c["text_conflicts"], "offered": offered})
-        })
-        .collect();
-    let (shown, left) = fit(rows, LIST_BYTES);
-    let more = if left.is_empty() { String::new() } else { format!(" ({} more not shown)", left.len()) };
+    let mut rows = Vec::new();
+    let (mut size, mut left) = (0, 0);
+    for c in all {
+        let offered: Vec<&Value> = c["offered"].as_array().into_iter().flatten().map(|o| &o["resolution"]).collect();
+        let whole = json!({"path": c["path"], "into": side(&c["into"]), "from": side(&c["from"]),
+                           "regions": c["text_conflicts"], "offered": offered});
+        let brief = json!({"path": c["path"], "into": side(&c["into"]), "from": side(&c["from"]),
+                           "regions": "too many to show", "offered": offered.len()});
+        match [whole, brief].into_iter().find(|r| size + json_len(r) < LIST_BYTES) {
+            Some(r) => {
+                size += json_len(&r) + 1;
+                rows.push(r);
+            }
+            None => left += 1,
+        }
+    }
+    let more = if left == 0 { String::new() } else { format!(" ({left} more not shown)") };
     Some(format!(
         "merging {} stopped at {} conflicts with no resolution, so nothing was written{more}: {}. Settle each with \
          resolve, giving the same proposals, then integrate them again.",
         v["step"].as_str().unwrap_or("the proposals"),
         all.len(),
-        Value::from(shown)
+        Value::from(rows)
     ))
 }
 
@@ -498,6 +589,24 @@ impl WeaveStore {
 
     /// [`WeaveStore::git`]'s process, whatever its exit.
     fn git_output(&mut self, args: &[&str]) -> Result<std::process::Output, String> {
+        self.git_output_with(args, &[])
+    }
+
+    /// [`WeaveStore::git`], with the variables `vars` set too.
+    fn git_with(&mut self, args: &[&str], vars: &[(&str, &std::ffi::OsStr)]) -> Result<Vec<u8>, String> {
+        let out = self.git_output_with(args, vars)?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(format!("git {}: {}", args.first().unwrap_or(&""), short(String::from_utf8_lossy(&out.stderr).trim())))
+        }
+    }
+
+    fn git_output_with(
+        &mut self,
+        args: &[&str],
+        vars: &[(&str, &std::ffi::OsStr)],
+    ) -> Result<std::process::Output, String> {
         self.runs += 1;
         Command::new(&self.config.git)
             .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "user.name=weave"])
@@ -508,6 +617,7 @@ impl WeaveStore {
             .env_clear()
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .envs(vars.iter().copied())
             .stdin(Stdio::null())
             .output()
             .map_err(|e| format!("running git: {e}"))
@@ -937,24 +1047,83 @@ impl WeaveStore {
     }
 
     /// The working tree against its base's commit, so a proposal doesn't hide what it proposed (finding
-    /// `24bae8fdb48a`).
-    /// With `path`, that file's alone. A diff too large for one result keeps each file's diff whole, as many
-    /// as fit, and names the files it leaves out (task `b58cf9180030`).
-    fn changes(&mut self, path: Option<&str>) -> Result<Value, String> {
+    /// `24bae8fdb48a`). With `path`, that file's alone; in pages ([`diff_page`]).
+    fn changes(&mut self, path: Option<&str>, page: usize) -> Result<Value, String> {
         if let Some(p) = path {
             plain_path(p)?;
         }
         let only: Vec<&str> = path.into_iter().collect();
         self.git(&["add", "-A"])?;
-        let files = self
-            .git(&[&["diff", "--cached", "--name-status", "refs/tags/base", "--"][..], &only].concat())
-            .map(|o| String::from_utf8_lossy(&o).into_owned());
-        let diff = self
-            .git(&[&["diff", "--cached", "--no-color", "--no-ext-diff", "refs/tags/base", "--"][..], &only].concat())
-            .map(|o| String::from_utf8_lossy(&o).into_owned());
+        let files = self.file_diffs(&[&["--cached", "refs/tags/base", "--"][..], &only].concat());
         self.git(&["reset", "-q"])?;
-        let (files, diff) = (files?, diff?);
-        Ok(changes_view(self.saved("base.txt")?, files.lines().collect(), &diff))
+        diff_page(&files?, page, json!({"base": self.saved("base.txt")?}))
+    }
+
+    /// `git diff <args>` on the tree's repository, per file, with no renames, so each file is one path.
+    fn file_diffs(&mut self, args: &[&str]) -> Result<Vec<FileDiff>, String> {
+        let run = |s: &mut WeaveStore, how: &[&str]| {
+            let argv = [&["diff", "--no-color", "--no-ext-diff", "--no-renames"][..], how, args].concat();
+            s.git(&argv).map(|o| String::from_utf8_lossy(&o).into_owned())
+        };
+        let (status, patch) = (run(self, &["--name-status"])?, run(self, &[])?);
+        Ok(split_diff(&status, &patch))
+    }
+
+    /// The diff tool (decision `b423e8767735`): the per-file difference between `a` and `b`, decisions or
+    /// manifests, with each file's unified diff, in pages. Each side is checked out apart from the agent's tree
+    /// and written as a git tree, so git diffs them; a side this copy can't check out gives the files alone.
+    fn diff(&mut self, a: &str, b: &str, page: usize) -> Result<Value, String> {
+        let out = self.bracken(&["weave".into(), "diff".into(), "--json".into(), a.into(), b.into()])?;
+        let v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
+        let (ma, mb) =
+            (v["a"].as_str().unwrap_or_default().to_string(), v["b"].as_str().unwrap_or_default().to_string());
+        let extra = json!({"a": ma, "b": mb});
+        let trees = self.manifest_tree(&ma).and_then(|ta| Ok((ta, self.manifest_tree(&mb)?)));
+        match trees {
+            Ok((ta, tb)) => {
+                let files = self.file_diffs(&[ta.as_str(), tb.as_str(), "--"])?;
+                diff_page(&files, page, extra)
+            }
+            Err(e) => {
+                let files: Vec<FileDiff> = v["files"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|f| FileDiff {
+                        path: f["path"].as_str().unwrap_or_default().into(),
+                        change: f["change"].as_str().unwrap_or_default().into(),
+                        text: String::new(),
+                    })
+                    .collect();
+                let mut out = diff_page(&files, page, extra)?;
+                out["note"] = json!(format!("No text: {}. Sync, then try again.", short(&e)));
+                Ok(out)
+            }
+        }
+    }
+
+    /// Manifest `manifest` as a git tree in the tree's repository: checked out into a directory of the store's
+    /// own, outside the agent's tree, and added through an index of its own, so the agent's tree and index are
+    /// never touched. Both are cleared after.
+    fn manifest_tree(&mut self, manifest: &str) -> Result<String, String> {
+        let (dir, index) = (self.config.dir.join("diff.tree"), self.config.dir.join("diff.index"));
+        let clear = |d: &Path, i: &Path| {
+            let _ = std::fs::remove_dir_all(d);
+            let _ = std::fs::remove_file(i);
+        };
+        clear(&dir, &index);
+        std::fs::create_dir(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
+        let target = dir.to_string_lossy().into_owned();
+        let tree = self
+            .bracken(&["weave".into(), "checkout".into(), format!("--manifest={manifest}"), target.clone()])
+            .and_then(|_| {
+                let work = format!("--work-tree={target}");
+                let with = [("GIT_INDEX_FILE", index.as_os_str())];
+                self.git_with(&[&work, "add", "-A", "-f", "--", "."], &with)?;
+                self.git_with(&["write-tree"], &with)
+            });
+        clear(&dir, &index);
+        Ok(String::from_utf8_lossy(&tree?).trim().to_string())
     }
 
     fn head(&mut self) -> Result<Value, String> {
@@ -1418,9 +1587,10 @@ impl Store for WeaveStore {
             "edit_file" => self.edit_file(&Args::new(args, &["path", "old", "new"])?),
             "delete_file" => self.delete_file(Args::new(args, &["path"])?.text("path")?),
             "changes" => {
-                let a = Args::new(args, &["path"])?;
+                let a = Args::new(args, &["path", "page"])?;
                 let path = a.text_opt("path")?;
-                self.changes((!path.is_empty()).then_some(path))
+                let page = a.int_opt("page", 1..=100_000)?.unwrap_or(1) as usize;
+                self.changes((!path.is_empty()).then_some(path), page)
             }
             "head" => {
                 Args::new(args, &[])?;
@@ -1440,11 +1610,10 @@ impl Store for WeaveStore {
                 self.proposals()
             }
             "diff" => {
-                let a = Args::new(args, &["a", "b"])?;
+                let a = Args::new(args, &["a", "b", "page"])?;
                 let (x, y) = (reference(a.text("a")?)?.to_string(), reference(a.text("b")?)?.to_string());
-                let out = self.bracken(&["weave".into(), "diff".into(), "--json".into(), x, y])?;
-                let v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
-                Ok(diff_view(v))
+                let page = a.int_opt("page", 1..=100_000)?.unwrap_or(1) as usize;
+                self.diff(&x, &y, page)
             }
             "integrate" => {
                 let a = Args::new(args, &["proposals", "note"])?;

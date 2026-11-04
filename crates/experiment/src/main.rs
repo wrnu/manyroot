@@ -19,7 +19,7 @@ use bracken_experiment::backend::{Caps, ModeTokenCap, RUN_TIME_CAP, RUN_TOKEN_CA
 use bracken_experiment::bracken_mode::AcceptRule;
 use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routing};
 use bracken_experiment::driver::{
-    CALLS_PER_TURN, RunConfig, TURN_LIMIT, check_socket_room, core_tools, git_binary, run,
+    CALLS_PER_TURN, ResultLimit, RunConfig, TURN_LIMIT, check_socket_room, core_tools, git_binary, run,
 };
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_under};
@@ -58,6 +58,9 @@ enum Cmd {
         /// Bracken mode: which implementation counts for a function.
         #[arg(long, default_value = "one-pass", value_parser = AcceptRule::NAMES)]
         accept_rule: String,
+        /// How the run's backend bounds a tool result, which the mode sizes its pages to.
+        #[arg(long, default_value = "claude-code", value_parser = ["claude-code", "pi"])]
+        result_limit: String,
     },
     /// Relay MCP between standard input and output and the driver's socket.
     Shim {
@@ -235,12 +238,13 @@ enum Cmd {
 
 fn main() {
     let result = match Cli::parse().command {
-        Cmd::Worker { mode, identity, store, bracken, git, task, trace, accept_rule } => {
+        Cmd::Worker { mode, identity, store, bracken, git, task, trace, accept_rule, result_limit } => {
             let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
+            let limit = ResultLimit::named(&result_limit).expect("clap checked the name");
             let task = task_named(&task);
             bracken_experiment::worker::serve(
                 &mode,
-                StoreConfig { dir: store, bracken, git, identity, trace, accept_rule, task },
+                StoreConfig { dir: store, bracken, git, identity, trace, accept_rule, task, limit },
             )
         }
         Cmd::Shim { socket } => bracken_experiment::shim::run(&socket),

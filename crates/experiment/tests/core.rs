@@ -129,6 +129,7 @@ fn each_worker_writes_only_its_own_store() {
         identity: identity.into(),
         trace: false,
         accept_rule: Default::default(),
+        limit: Default::default(),
     };
     let mut hub = Worker::spawn(&bin(), "bracken", &config("hub", "setter")).expect("hub");
     hub.ok(&request("setup")).expect("hub setup");
@@ -436,6 +437,7 @@ fn sync_moves_only_what_is_missing() {
             identity: "setter".into(),
             trace: false,
             accept_rule: Default::default(),
+            limit: Default::default(),
         },
     )
     .expect("hub");
@@ -551,6 +553,7 @@ fn one_agent_spending_its_hub_quota_leaves_anothers_sync_alone() {
         identity: identity.into(),
         trace: false,
         accept_rule: Default::default(),
+        limit: Default::default(),
     };
     let sockets = dir.path().join("s");
     std::fs::create_dir(&sockets).expect("sockets");
@@ -698,6 +701,7 @@ fn git_store(dir: &Path, name: &str) -> StoreConfig {
         identity: name.into(),
         trace: true,
         accept_rule: Default::default(),
+        limit: Default::default(),
     }
 }
 
@@ -819,6 +823,7 @@ fn bracken_records_an_agents_contract_members_after_its_calls_and_its_syncs() {
         identity: identity.into(),
         trace: false,
         accept_rule: Default::default(),
+        limit: Default::default(),
     };
     let sockets = dir.path().join("s");
     std::fs::create_dir(&sockets).expect("sockets");

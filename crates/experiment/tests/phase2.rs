@@ -307,14 +307,14 @@ fn the_top_layer_runs_within_the_step_and_depth_limits() {
     }
 }
 
-/// Reading the task whole fits in one tool result, as every one must (`driver::MAX_RESULT_BYTES`),
+/// Reading the task whole fits in one tool result, as every one must (`driver::MAX_RESULT_CHARS`),
 /// even as `read` numbers its lines, and so does the correct library's largest module.
 #[test]
 fn the_task_and_a_module_fit_in_one_tool_result() {
-    use bracken_experiment::driver::MAX_RESULT_BYTES;
+    use bracken_experiment::driver::MAX_RESULT_CHARS;
     let tasks = T.tasks_md(T.all());
-    let numbered = tasks.len() + 6 * tasks.lines().count();
-    assert!(numbered * 2 < MAX_RESULT_BYTES, "{numbered} bytes numbered");
+    let numbered = tasks.chars().count() + 6 * tasks.lines().count();
+    assert!(numbered * 2 < MAX_RESULT_CHARS, "{numbered} characters numbered");
     let largest = modules(T, &correct_programs(T, Version::ORIGINAL)).into_iter().map(|(_, t)| t.len()).max();
     assert!(largest.is_some_and(|n| n * 4 < bracken_experiment::lang::MAX_MODULE_BYTES), "{largest:?}");
 }

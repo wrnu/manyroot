@@ -43,13 +43,62 @@ pub const BYTES_PER_CONTRIBUTION: u64 = crate::args::MAX_TEXT as u64 + 4096;
 /// Pi cuts the middle out of a longer text, so an agent never sees what was there.
 pub const PI_MCP_OUTPUT_MAX_BYTES: usize = 20 * 1024;
 /// The most bytes of one tool result a Pi agent is shown, in every mode (task `b58cf9180030`): under Pi's cap,
-/// with room for the note [`bounded`] adds, so Pi never cuts a result itself. It is also what each mode sizes
-/// its own pages, indexes and lists to, the tighter of the backends' bounds, so no backend cuts them.
+/// with room for the note [`bounded`] adds, so Pi never cuts a result itself. Weave mode, whose runs are Pi's,
+/// sizes its own pages, indexes and lists to it.
 pub const MAX_RESULT_BYTES: usize = PI_MCP_OUTPUT_MAX_BYTES - 1024;
-/// The most bytes of one tool result a Claude Code agent is shown, in every mode (decision `74d00180c642`):
-/// below Claude Code's own tool-result limit, about 50,000 characters, with room for the note [`bounded`]
-/// adds, so Claude Code never cuts a result itself. Kept as it was, so Claude Code runs reproduce.
-pub const CLAUDE_CODE_RESULT_BYTES: usize = 40_000;
+/// The most characters of one tool result a Claude Code agent is shown, in every mode (decision
+/// `74d00180c642`): below Claude Code's own tool-result limit, about 50,000 characters, with room for the note
+/// [`bounded`] adds, so Claude Code never cuts a result itself.
+pub const MAX_RESULT_CHARS: usize = 40_000;
+
+/// How a backend's agents' tool results are bounded ([`Backend::result_limit`]): by characters under Claude
+/// Code, exactly as before task `b58cf9180030`, so its runs reproduce (finding `868ff1726b88`); by bytes, under
+/// Pi's MCP output cap, under Pi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResultLimit {
+    /// At most [`MAX_RESULT_CHARS`] characters.
+    #[default]
+    ClaudeCode,
+    /// At most [`MAX_RESULT_BYTES`] bytes.
+    Pi,
+}
+
+impl ResultLimit {
+    pub fn name(self) -> &'static str {
+        match self {
+            ResultLimit::ClaudeCode => "claude-code",
+            ResultLimit::Pi => "pi",
+        }
+    }
+
+    pub fn named(name: &str) -> Option<ResultLimit> {
+        [ResultLimit::ClaudeCode, ResultLimit::Pi].into_iter().find(|l| l.name() == name)
+    }
+
+    /// The most of [`ResultLimit::size`] one result may have.
+    pub fn max(self) -> usize {
+        match self {
+            ResultLimit::ClaudeCode => MAX_RESULT_CHARS,
+            ResultLimit::Pi => MAX_RESULT_BYTES,
+        }
+    }
+
+    /// `text`'s size as this limit counts it: characters, or bytes.
+    pub fn size(self, text: &str) -> usize {
+        match self {
+            ResultLimit::ClaudeCode => text.chars().count(),
+            ResultLimit::Pi => text.len(),
+        }
+    }
+
+    /// What [`ResultLimit::size`] counts, in a note.
+    pub fn unit(self) -> &'static str {
+        match self {
+            ResultLimit::ClaudeCode => "characters",
+            ResultLimit::Pi => "bytes",
+        }
+    }
+}
 /// The longest MCP message the driver reads from an agent.
 pub const MAX_MCP_LINE: usize = 256 * 1024;
 /// How long the driver waits for both ends of a sync session to connect.
@@ -123,10 +172,10 @@ pub trait Backend: Sync {
     /// any release it makes due.
     fn turn_counted(&self, _done: u32) {}
 
-    /// The most bytes of one tool result its agents are shown: [`bounded`] cuts a longer one, with a note,
-    /// before the agent's own harness would cut it unsaid.
-    fn result_bytes(&self) -> usize {
-        CLAUDE_CODE_RESULT_BYTES
+    /// How its agents' tool results are bounded: [`bounded`] cuts a longer one, with a note, before the
+    /// agent's own harness would cut it unsaid; and modes size their pages to it.
+    fn result_limit(&self) -> ResultLimit {
+        ResultLimit::ClaudeCode
     }
 }
 
@@ -262,8 +311,8 @@ fn make_dir(path: &Path) -> Result<(), String> {
 
 struct Run<'a> {
     cfg: &'a RunConfig,
-    /// The backend's [`Backend::result_bytes`].
-    result_bytes: usize,
+    /// The backend's [`Backend::result_limit`].
+    limit: ResultLimit,
     mode: &'static dyn Mode,
     events: EventLog,
     hub: Mutex<Worker>,
@@ -344,6 +393,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         trace: cfg.trace,
         task: cfg.plan.task,
         accept_rule: cfg.plan.accept_rule,
+        limit: backend.result_limit(),
     };
 
     let sockets = root.join("sockets");
@@ -394,7 +444,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     tools.extend(core_tools());
     let run = Run {
         cfg,
-        result_bytes: backend.result_bytes(),
+        limit: backend.result_limit(),
         mode,
         events,
         hub: Mutex::new(hub),
@@ -897,11 +947,12 @@ impl Run<'_> {
             Ok(v) => (v.to_string(), false),
             Err(e) => (e.clone(), true),
         };
-        let (text, cut_from) = bounded(text, self.result_bytes);
-        if let Some(bytes) = cut_from {
+        let (text, cut_from) = bounded(text, self.limit);
+        if let Some(size) = cut_from {
             // A result the guard cut, on its own line of the log, so a run's report can tell whether any agent
             // hit the cap, with which tool (task `b58cf9180030`).
-            self.events.log(Some(name), "result_cut", json!({"turn": turn, "tool": shown, "bytes": bytes}));
+            let unit = self.limit.unit();
+            self.events.log(Some(name), "result_cut", json!({"turn": turn, "tool": shown, "size": size, "unit": unit}));
         }
         self.events.log(
             Some(name),
@@ -912,25 +963,44 @@ impl Run<'_> {
     }
 }
 
-/// `text` cut to at most `limit` bytes, the backend's [`Backend::result_bytes`], at a character's boundary, with
-/// a note saying so and how to see more, and the bytes it had if it was cut. The same for every tool in every
-/// mode: no result is cut silently, and none reaches the agent's harness over its own cap.
-pub fn bounded(text: String, limit: usize) -> (String, Option<usize>) {
-    let bytes = text.len();
-    if bytes <= limit {
-        return (text, None);
+/// `text` cut to the backend's `limit`, with a note saying so and how to see more, and the size it had if it was
+/// cut. The same for every tool in every mode: no result is cut silently, and none reaches the agent's harness
+/// over its own cap. Under Claude Code, exactly as before task `b58cf9180030`: the first [`MAX_RESULT_CHARS`]
+/// characters. Under Pi, at most [`MAX_RESULT_BYTES`] bytes, cut at a character's boundary.
+pub fn bounded(text: String, limit: ResultLimit) -> (String, Option<usize>) {
+    match limit {
+        ResultLimit::ClaudeCode => {
+            let chars = text.chars().count();
+            if chars <= MAX_RESULT_CHARS {
+                return (text, None);
+            }
+            let kept: String = text.chars().take(MAX_RESULT_CHARS).collect();
+            let note = format!(
+                "\n[Cut: this result has {chars} characters and only the first {MAX_RESULT_CHARS} are shown. To see \
+                 the rest, narrow the call: one file, function or item, a line range or a smaller count, where the \
+                 tool takes one.]"
+            );
+            (kept + &note, Some(chars))
+        }
+        ResultLimit::Pi => {
+            let bytes = text.len();
+            if bytes <= MAX_RESULT_BYTES {
+                return (text, None);
+            }
+            let mut cut = MAX_RESULT_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let note = format!(
+                "\n[Cut: this result has {bytes} bytes and only the first {cut} are shown. To see the rest, narrow \
+                 the call: one file, item or path, a line range, a page or a smaller count, where the tool takes \
+                 one.]"
+            );
+            let mut kept = text;
+            kept.truncate(cut);
+            (kept + &note, Some(bytes))
+        }
     }
-    let mut cut = limit;
-    while !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    let note = format!(
-        "\n[Cut: this result has {bytes} bytes and only the first {cut} are shown. To see the rest, narrow the \
-         call: one file, item or path, a line range or a smaller count, where the tool takes one.]"
-    );
-    let mut kept = text;
-    kept.truncate(cut);
-    (kept + &note, Some(bytes))
 }
 
 /// Every string in `v`, at any depth.

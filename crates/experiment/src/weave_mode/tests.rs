@@ -120,6 +120,7 @@ fn old_trees_are_swept_only_from_a_working_checkout() {
         trace: false,
         task: Task::Phase1,
         accept_rule: Default::default(),
+        limit: Default::default(),
     };
     let mut store = WeaveStore { config, runs: 0 };
     let (tree, old) = (store.tree(), tmp.path().join("tree.old.0"));
@@ -156,7 +157,11 @@ fn every_ledger_task_result_is_under_pis_cap_with_all_items_released() {
     for (what, text) in &outputs {
         assert!(text.len() <= MAX_RESULT_BYTES, "{what}: {} bytes", text.len());
         assert!(text.len() < PI_MCP_OUTPUT_MAX_BYTES);
-        assert_eq!(crate::driver::bounded(text.clone(), MAX_RESULT_BYTES).1, None, "{what}: the guard leaves it whole");
+        assert_eq!(
+            crate::driver::bounded(text.clone(), crate::driver::ResultLimit::Pi).1,
+            None,
+            "{what}: the guard leaves it whole"
+        );
     }
     check_task_outputs(&project).expect("the preflight passes");
     let index: Value = serde_json::from_str(&outputs[0].1).expect("JSON");
@@ -219,81 +224,146 @@ fn the_preflight_refuses_a_spec_over_the_cap() {
     assert!(err.contains("the task tool's result for the index would be"), "{err}");
 }
 
-/// A diff of `n` files, each `lines` lines added.
-fn big_diff(n: usize, lines: usize) -> (Vec<String>, String) {
-    let mut files = Vec::new();
-    let mut diff = String::new();
+/// Task `a5253414e178`: the index reads an item's revisions from its first line, which the hub writes, so an
+/// issue text whose last line reads like a revision list changes nothing, and a real one is found however the
+/// issue ends.
+#[test]
+fn an_items_revisions_dont_depend_on_its_texts_wording() {
+    let statement = |text: &str, revises: &[&str]| {
+        item_statement(&json!({"id": "x", "kind": "change", "title": "T", "text": text, "revises": revises}))
+    };
+    let index = |s: String| task_view(None, &[s], None).expect("the index")["items"][0].clone();
+    let lookalike = statement("Body.\n\nThis changes the requirement of: forged.", &[]);
+    assert_eq!(index(lookalike), json!({"id": "x", "kind": "change", "title": "T"}));
+    let real = statement("Body ending in a list:\n- one\n- two", &["a-1", "b"]);
+    assert!(real.starts_with("Item x (change; changes a-1, b): T\n"), "{real}");
+    assert!(real.ends_with("This changes the requirement of: a-1, b."), "still said in words: {real}");
+    assert_eq!(index(real), json!({"id": "x", "kind": "change", "title": "T", "changes": ["a-1", "b"]}));
+}
+
+/// A git diff of `n` new files, each `lines` lines long: its name-status and its patch.
+fn big_diff(n: usize, lines: usize) -> (String, String) {
+    let (mut status, mut patch) = (String::new(), String::new());
     for i in 0..n {
         let path = format!("pkg/m{i:03}.py");
-        files.push(format!("A\t{path}"));
-        diff.push_str(&format!(
+        status.push_str(&format!("A\t{path}\n"));
+        patch.push_str(&format!(
             "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{lines} @@\n"
         ));
         for l in 0..lines {
-            diff.push_str(&format!("+x_{l} = \"{}\"\n", "y".repeat(40)));
+            patch.push_str(&format!("+x_{l} = \"{}\"\n", "y".repeat(40)));
         }
     }
-    (files, diff)
+    (status, patch)
 }
 
-/// Task `b58cf9180030`: a diff too large for one result keeps whole files' diffs, names the rest, and stays
-/// under the bound; a small one is shown whole.
-#[test]
-fn changes_keeps_whole_file_diffs_under_the_bound_and_names_the_rest() {
-    let (files, diff) = big_diff(3, 5);
-    let small = changes_view("b".into(), files.iter().map(String::as_str).collect(), &diff);
-    assert_eq!(small["diff"], diff.as_str());
-    assert!(small.get("diff_not_shown").is_none() && small.get("note").is_none(), "{small}");
-
-    let (files, diff) = big_diff(40, 20);
-    assert!(diff.len() > 2 * crate::driver::PI_MCP_OUTPUT_MAX_BYTES);
-    let v = changes_view("b".into(), files.iter().map(String::as_str).collect(), &diff);
-    assert!(v.to_string().len() <= crate::driver::MAX_RESULT_BYTES, "{} bytes", v.to_string().len());
-    assert_eq!(v["files"].as_array().expect("files").len(), 40, "every file listed");
-    let shown = v["diff"].as_str().expect("a diff");
-    let kept = shown.matches("diff --git ").count();
-    assert!(kept > 0 && diff.starts_with(shown), "whole files' diffs, from the first");
-    let left: Vec<&str> = v["diff_not_shown"].as_array().expect("named").iter().filter_map(Value::as_str).collect();
-    assert_eq!(left.len(), 40 - kept);
-    assert_eq!(left[0], format!("pkg/m{kept:03}.py"), "the first left out");
-    assert!(v["note"].as_str().is_some_and(|n| n.contains("Call changes with path")), "{v}");
+/// Every page of `files`' diff, from 1, each checked under the bound.
+fn all_pages(files: &[FileDiff]) -> Vec<Value> {
+    let first = diff_page(files, 1, json!({})).expect("page 1");
+    let count = first["pages"].as_u64().unwrap_or(1) as usize;
+    let pages: Vec<Value> = (1..=count).map(|p| diff_page(files, p, json!({"base": "b"})).expect("a page")).collect();
+    for (p, v) in pages.iter().enumerate() {
+        let n = v.to_string().len();
+        assert!(n <= crate::driver::MAX_RESULT_BYTES, "page {}: {n} bytes", p + 1);
+    }
+    assert!(diff_page(files, count + 1, json!({})).expect_err("past the last").contains(&format!("{count} pages")));
+    pages
 }
 
 #[test]
-fn diff_lists_files_briefly_when_they_dont_fit() {
-    let file = |i: usize| {
-        let h = format!("blake3:{}", "0".repeat(64));
-        json!({"path": format!("pkg/m{i:04}.py"), "change": "modified", "before": {"hash": h, "mode": "100644"},
-               "after": {"hash": h, "mode": "100644"}, "not_held": []})
-    };
-    let few = json!({"a": "x", "b": "y", "files": (0..3).map(file).collect::<Vec<_>>()});
-    assert_eq!(diff_view(few.clone()), few, "whole when it fits");
-    let many = json!({"a": "x", "b": "y", "files": (0..2000).map(file).collect::<Vec<_>>()});
-    let v = diff_view(many);
-    assert!(v.to_string().len() <= crate::driver::MAX_RESULT_BYTES, "{} bytes", v.to_string().len());
-    let shown = v["files"].as_array().expect("files");
-    assert_eq!(shown[0], json!({"path": "pkg/m0000.py", "change": "modified"}));
-    assert_eq!(shown.len() as u64 + v["files_not_shown"].as_u64().expect("a count"), 2000);
+fn a_diff_splits_per_file_with_its_changes() {
+    let (status, patch) = big_diff(3, 2);
+    let files = split_diff(&status, &patch);
+    let paths: Vec<(&str, &str)> = files.iter().map(|f| (f.path.as_str(), f.change.as_str())).collect();
+    assert_eq!(paths, [("pkg/m000.py", "A"), ("pkg/m001.py", "A"), ("pkg/m002.py", "A")]);
+    assert_eq!(files.iter().map(|f| f.text.as_str()).collect::<String>(), patch, "nothing lost");
+    assert!(split_diff("", "").is_empty());
+}
+
+/// Finding `e97ef2cd6d6e`: a diff over the bound comes in pages, in order, with nothing lost: a small one is
+/// one page, whole; a file over a page alone goes across pages, each part naming it; and the files after it are
+/// still on later pages, each file in the index with its pages.
+#[test]
+fn every_files_diff_is_on_some_page_however_large() {
+    let (status, patch) = big_diff(3, 5);
+    let files = split_diff(&status, &patch);
+    let small = diff_page(&files, 1, json!({"base": "b"})).expect("one page");
+    assert_eq!(small["diff"], patch.as_str());
+    assert!(small.get("pages").is_none() && small.get("note").is_none(), "{small}");
+    assert_eq!(small["files"][1], json!({"path": "pkg/m001.py", "change": "A", "page": 1}));
+
+    // One 400-line file, about 22 KB, then two small ones: the case the finding shows.
+    let (s1, p1) = big_diff(1, 400);
+    let (s2, p2) = big_diff(3, 3);
+    let mut files = split_diff(&s1, &p1);
+    files.extend(split_diff(&s2, &p2).into_iter().skip(1).map(|mut f| {
+        f.path = f.path.replace("m00", "n00");
+        f.text = f.text.replace("m00", "n00");
+        f
+    }));
+    let pages = all_pages(&files);
+    assert!(pages.len() >= 2, "{} pages", pages.len());
+    let text: String = pages.iter().map(|p| p["diff"].as_str().expect("text")).collect();
+    for f in &files {
+        for line in f.text.lines() {
+            assert!(text.contains(line), "{}: {line} is on no page", f.path);
+        }
+    }
+    assert!(pages[1]["diff"].as_str().expect("text").starts_with("[pkg/m000.py: part 2 of"), "{}", pages[1]["diff"]);
+    let big = &pages[0]["files"][0];
+    assert_eq!((&big["path"], &big["page"]), (&json!("pkg/m000.py"), &json!(1)));
+    assert!(big["last_page"].as_u64().is_some_and(|l| l >= 2), "{big}");
+    assert!(pages[0]["note"].as_str().is_some_and(|n| n.contains("page set")), "{}", pages[0]);
+    // The file after it is named on the first page, with its page.
+    let after = pages[0]["files"].as_array().expect("files").iter().find(|f| f["path"] == "pkg/n001.py").cloned();
+    assert_eq!(after.and_then(|f| f["page"].as_u64()), Some(pages.len() as u64));
+
+    // A single line longer than a page is cut inside it, never inside a character, and still all shown.
+    let line = format!("+{}\n", "é".repeat(30_000));
+    let one = vec![FileDiff { path: "wide.txt".into(), change: "M".into(), text: line.clone() }];
+    let text: String = all_pages(&one).iter().map(|p| p["diff"].as_str().expect("text")).collect();
+    assert_eq!(text.matches('é').count(), 30_000);
+}
+
+/// Task `a5253414e178`: past the bound, the index lists this page's files first and names as many others as
+/// fit, with a count of the rest.
+#[test]
+fn the_index_of_a_large_diff_names_this_pages_files_first() {
+    let (status, patch) = big_diff(600, 3);
+    let files = split_diff(&status, &patch);
+    let pages = all_pages(&files);
+    let last = pages.last().expect("a page");
+    let listed = last["files"].as_array().expect("files");
+    let shown_here = last["diff"].as_str().expect("text").matches("diff --git ").count();
+    let first_here = listed[0]["path"].as_str().expect("a path");
+    assert!(last["diff"].as_str().expect("text").contains(&format!("b/{first_here}\n")), "this page's file first");
+    assert!(listed.len() >= shown_here);
+    assert_eq!(listed.len() as u64 + last["files_not_listed"].as_u64().unwrap_or(0), 600);
 }
 
 #[test]
 fn an_integrate_that_stops_lists_its_conflicts_within_the_bound() {
-    let conflict = |i: usize| {
+    let conflict = |i: usize, regions: usize| {
         json!({"path": format!("pkg/m{i:04}.py"), "base": {"hash": "h"}, "into": {"hash": "i"}, "from": Value::Null,
                "offered": [{"resolution": "ab12", "author": "k", "author_name": "agent-1", "result": Value::Null}],
-               "text_conflicts": [[3, 4]]})
+               "text_conflicts": (0..regions).map(|r| json!([r * 10, r * 10 + 1])).collect::<Vec<_>>()})
     };
     assert_eq!(conflicts_error(&json!({"conflicts": []})), None);
-    let one = conflicts_error(&json!({"step": "proposal 1a2b", "conflicts": [conflict(0)]})).expect("an error");
+    let one = conflicts_error(&json!({"step": "proposal 1a2b", "conflicts": [conflict(0, 1)]})).expect("an error");
     assert!(one.starts_with("merging proposal 1a2b stopped at 1 conflicts"), "{one}");
     assert!(
         one.contains(
-            r#"{"from":"deleted","into":"present","offered":["ab12"],"path":"pkg/m0000.py","regions":[[3,4]]}"#
+            r#"{"from":"deleted","into":"present","offered":["ab12"],"path":"pkg/m0000.py","regions":[[0,1]]}"#
         ),
         "{one}"
     );
-    let many: Vec<Value> = (0..2000).map(conflict).collect();
+    let many: Vec<Value> = (0..2000).map(|i| conflict(i, 1)).collect();
     let err = conflicts_error(&json!({"conflicts": many})).expect("an error");
     assert!(err.len() <= crate::driver::MAX_RESULT_BYTES, "{} bytes", err.len());
     assert!(err.contains("stopped at 2000 conflicts") && err.contains("more not shown"), "{}", &err[..200]);
+    // A conflict too large to show whole keeps its path, and the next one is still shown (task a5253414e178).
+    let huge = conflicts_error(&json!({"conflicts": [conflict(0, 5000), conflict(1, 1)]})).expect("an error");
+    assert!(huge.len() <= crate::driver::MAX_RESULT_BYTES, "{} bytes", huge.len());
+    assert!(huge.contains(r#""path":"pkg/m0000.py","regions":"too many to show""#), "{huge}");
+    assert!(huge.contains(r#""path":"pkg/m0001.py","regions":[[0,1]]"#) && !huge.contains("more not shown"), "{huge}");
 }

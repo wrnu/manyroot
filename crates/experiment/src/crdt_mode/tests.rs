@@ -20,6 +20,7 @@ fn store(dir: &Path, identity: &str) -> CrdtStore {
             identity: identity.into(),
             trace: false,
             accept_rule: Default::default(),
+            limit: Default::default(),
         },
         doc: None,
     }
