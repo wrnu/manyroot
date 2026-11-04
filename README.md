@@ -141,10 +141,11 @@ after every round of turns. One run each:
   ever saw two of the three missing items, account names with spaces and
   postings with an implied amount, and the third, `check`, fails because of
   the second. Pi cuts the middle out of any tool output over 20 KiB, and the
-  task list the agents read was 26.5 KB, so both items were cut from it (report `b7b35a307aea`). Keeping every tool
-  output under that cap is in progress (task `b58cf9180030`), and the
-  `w3l` and `w4l` scores on those items say nothing about Weave until runs
-  are repeated with the fix.
+  task list the agents read was 26.5 KB, so both items were cut from it
+  (report `b7b35a307aea`). Every tool output now stays under that cap (task
+  `b58cf9180030`, PR #254), but no `ledger` run has been made since, so the
+  `w3l` and `w4l` scores on those items say nothing yet about Weave or the
+  agents.
 
 **What this doesn't show.** It's two tasks, one of them a toy, with at most
 10 agents and three runs per setting, and single runs on `ledger`. Three runs
@@ -167,8 +168,9 @@ Every change gets an independent review, and nothing merges until a counted
 test run passes on `main` merged with the exact commit under review, and no
 review finding is left open. `scripts/merge` checks all of that before it merges.
 Each merge also goes through Weave, as above, and with the Weave gate on,
-Weave's own green checks on the merged tree can count as that test run. The
-process is in [process.md](.claude/skills/agent-team-kickoff/process.md),
+Weave's own green checks on the merged tree can count as that test run.
+GitHub Actions runs the test table on every push and pull request too, as
+an observer that no merge waits on yet. The process is in [process.md](.claude/skills/agent-team-kickoff/process.md),
 with this repository's values in [docs/development.md](docs/development.md).
 
 ## Where it's going
@@ -260,7 +262,7 @@ The protocol is specified in [docs/protocol.md](docs/protocol.md).
 | Directory | What it holds |
 | --- | --- |
 | [`docs/`](docs/README.md) | The vision, the protocol, the CLI reference, the team's process values, and design notes and results under `docs/design/` |
-| [`scripts/`](scripts) | The team's tools: `bk` (the pinned `bracken` on the team's Ground), `bk-evidence` (record a check's real result), `merge` and `verify-seq` (the merge gate and counted runs), `test-table`, `code-scope`, `weave`, `weave-propose`, `weave-shadow` and `weave-gate` (the Weave dogfood), `owner-approve`, and housekeeping |
+| [`scripts/`](scripts) | The team's tools: `bk` (the pinned `bracken` on the team's Ground), `bk-evidence` (record a check's real result), `merge` and `verify-seq` (the merge gate and counted runs), `test-table`, `ci-result` (record a head's Actions result), `code-scope`, `weave`, `weave-propose`, `weave-shadow` and `weave-gate` (the Weave dogfood), `owner-approve`, and housekeeping |
 | [`.bracken/`](.bracken) | This repository's own Ground: every task, decision, finding, test run and report |
 | [`.claude/skills/agent-team-kickoff`](.claude/skills/agent-team-kickoff) | The agent-team process, as a skill that sets it up in a repository |
 
