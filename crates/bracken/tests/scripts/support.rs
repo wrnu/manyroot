@@ -224,8 +224,12 @@ pub(crate) fn weave(dir: &Path, script: &str, home: &Path, bin: Option<&Path>, a
 
 /// A batch (decision db6f7705c0a4), end to end: a repository with the real merge, verify-seq, bk-evidence,
 /// code-scope and ground-guards, a committed stub scripts/test-table that fails when the tree holds a
-/// file named `broken`, and a local forge whose `curl` stub answers GET /pulls/<n> and does POST
-/// /pulls/<n>/merge as a squash merge (git merge-tree onto main). PR #n adds `a<n>.rs`, and `broken` too
+/// file named `broken`, and a local stand-in for GitHub: a bare repository behind origin's URL and a `gh`
+/// stub that answers GET pulls/<n> and does PUT pulls/<n>/merge as a squash merge (git merge-tree onto
+/// main) of the body's sha, answering 409 if that isn't the PR's head, as GitHub does. It answers GET
+/// git/ref/heads/<ref> and DELETE git/refs/heads/<ref>, logging each deleted ref to `$T/deleted`. PR #n's
+/// head is branch `pr<n>` in origin's repository, or a fork's with `$T/fork-<n>`; with `$T/move-<n>`, the
+/// head moves just before the merge call is answered, as a push racing it would. PR #n adds `a<n>.rs`, and `broken` too
 /// if it is in `broken`. With `$T/tamper` holding n, the forge's merge of #n leaves main's tree as it was.
 /// With `$T/flaky`, the table's next run fails, once; with `$T/flaky-tree`, the next run whose a*.rs files
 /// are those it lists (as `a1.rs a2.rs `) does. With `$T/slow`, each run waits 10 minutes before its
@@ -234,8 +238,8 @@ pub(crate) fn weave(dir: &Path, script: &str, home: &Path, bin: Option<&Path>, a
 /// in the job's process group, its pid in `$T/orphan`, for 10 minutes; a SIGINT stops it 3 s later, once
 /// it has made `$T/orphan-stopped`. With
 /// `$T/hook-<n>`, the forge runs it at the
-/// `$T/hook-at-<n>`'th GET of /pulls/<n>. With `$T/post-502-<n>`, the POST of #n merges but answers 502,
-/// as a proxy can while the forge merges anyway.
+/// `$T/hook-at-<n>`'th GET of pulls/<n>. With `$T/post-502-<n>`, the PUT of #n merges but answers 502,
+/// as a proxy can while GitHub merges anyway.
 pub(crate) struct Batch {
     pub(crate) tmp: tempfile::TempDir,
     pub(crate) dir: PathBuf,
@@ -311,14 +315,9 @@ impl Batch {
         let mut push = vec!["push", "-q", forge.to_str().unwrap()];
         push.extend(refs.iter().map(String::as_str));
         git(&push);
-        git(&["config", "remote.origin.url", "https://forge.example/o/r.git"]);
+        git(&["config", "remote.origin.url", "https://github.example/o/r.git"]);
         git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
-        git(&["config", &format!("url.{}.insteadOf", forge.display()), "https://forge.example/o/r.git"]);
-        git(&[
-            "config",
-            "credential.https://forge.example.helper",
-            "!f() { echo username=t; echo password=DUMMY; }; f",
-        ]);
+        git(&["config", &format!("url.{}.insteadOf", forge.display()), "https://github.example/o/r.git"]);
         git(&["fetch", "-q", "origin"]);
         let mut claims = Vec::new();
         for (n, sha) in shas.iter().enumerate() {
@@ -338,25 +337,39 @@ impl Batch {
         }
         std::fs::create_dir_all(tmp.path().join("stubs")).unwrap();
         write_executable(
-            &tmp.path().join("stubs/curl"),
-            "#!/bin/bash\nmethod=GET body=\nwhile [ $# -gt 0 ]; do case \"$1\" in -X) method=$2; shift 2 ;; \
-             --data-binary) body=${2#@}; shift 2 ;; -H) shift 2 ;; *) url=$1; shift ;; esac; done\n\
-             n=$(sed -E 's|.*/pulls/([0-9]+).*|\\1|' <<<\"$url\")\n\
+            &tmp.path().join("stubs/gh"),
+            "#!/bin/bash\n[ \"$1\" = api ] || exit 0\nshift\nmethod=GET body=\nwhile [ $# -gt 0 ]; do case \"$1\" in \
+             -X) method=$2; shift 2 ;; --input) body=$2; shift 2 ;; -H|--hostname) shift 2 ;; --include) shift ;; \
+             *) url=$1; shift ;; esac; done\n\
              g() { git --git-dir=\"$FORGE\" \"$@\"; }\n\
+             case \"$url\" in */git/ref/heads/*|*/git/refs/heads/*)\n\
+               ref=${url#*/heads/}\n\
+               if [ \"$method\" = DELETE ]; then g update-ref -d \"refs/heads/$ref\"; echo \"$ref\" >>\"$T/deleted\"; echo 'HTTP/2.0 204 No Content'; exit 0; fi\n\
+               at=$(g rev-parse --verify -q \"refs/heads/$ref\") || { echo '{\"message\":\"Not Found\"}'; exit 1; }\n\
+               echo \"{\\\"object\\\":{\\\"sha\\\":\\\"$at\\\"}}\"; exit 0 ;;\n\
+             esac\n\
+             n=$(sed -E 's|.*/pulls/([0-9]+).*|\\1|' <<<\"$url\")\n\
              if [ \"$method\" = GET ]; then\n\
                echo x >>\"$T/gets-$n\"\n\
                if [ -x \"$T/hook-$n\" ] && [ \"$(wc -l <\"$T/gets-$n\")\" -eq \"$(cat \"$T/hook-at-$n\")\" ]; then \"$T/hook-$n\"; fi\n\
                head=$(g rev-parse \"refs/pull/$n/head\"); merged=false; [ ! -e \"$T/merged-$n\" ] || merged=true\n\
-               echo \"{\\\"head\\\":{\\\"sha\\\":\\\"$head\\\"},\\\"state\\\":\\\"open\\\",\\\"merged\\\":$merged,\\\"base\\\":{\\\"ref\\\":\\\"main\\\"},\\\"title\\\":\\\"t$n\\\"}\"\n\
+               owner=o; [ ! -e \"$T/fork-$n\" ] || owner=someone\n\
+               echo \"{\\\"head\\\":{\\\"sha\\\":\\\"$head\\\",\\\"ref\\\":\\\"pr$n\\\",\\\"repo\\\":{\\\"full_name\\\":\\\"$owner/r\\\"}},\\\"state\\\":\\\"open\\\",\\\"merged\\\":$merged,\\\"base\\\":{\\\"ref\\\":\\\"main\\\"},\\\"title\\\":\\\"t$n\\\"}\"\n\
                exit 0\n\
              fi\n\
-             sha=$(jq -r .head_commit_id \"$body\")\n\
-             tree=$(g merge-tree --write-tree main \"$sha\") || exit 22\n\
+             [ \"$method\" = PUT ] && [ \"$(jq -r .merge_method \"$body\")\" = squash ] || { echo 'HTTP/2.0 422 Unprocessable Entity'; exit 1; }\n\
+             if [ -e \"$T/move-$n\" ]; then\n\
+               moved=$(g -c user.name=f -c user.email=f@invalid commit-tree \"refs/pull/$n/head^{tree}\" -p \"refs/pull/$n/head\" -m pushed)\n\
+               g update-ref \"refs/pull/$n/head\" \"$moved\"\n\
+             fi\n\
+             sha=$(jq -r .sha \"$body\")\n\
+             [ \"$sha\" = \"$(g rev-parse \"refs/pull/$n/head\")\" ] || { echo 'HTTP/2.0 409 Conflict'; exit 1; }\n\
+             tree=$(g merge-tree --write-tree main \"$sha\") || { echo 'HTTP/2.0 405 Method Not Allowed'; exit 1; }\n\
              [ \"$(cat \"$T/tamper\" 2>/dev/null)\" != \"$n\" ] || tree=$(g rev-parse 'main^{tree}')\n\
-             new=$(g -c user.name=f -c user.email=f@invalid commit-tree \"$tree\" -p main -m \"squash $n\")\n\
+             new=$(g -c user.name=f -c user.email=f@invalid commit-tree \"$tree\" -p main -m \"$(jq -r .commit_title \"$body\")\")\n\
              g update-ref refs/heads/main \"$new\"; touch \"$T/merged-$n\"\n\
-             if [ -e \"$T/post-502-$n\" ]; then echo 502; exit 22; fi\n\
-             echo 200\n",
+             if [ -e \"$T/post-502-$n\" ]; then echo 'HTTP/2.0 502 Bad Gateway'; exit 1; fi\n\
+             echo 'HTTP/2.0 200 OK'\n",
         );
         Batch { tmp, dir, forge, claims, shas }
     }

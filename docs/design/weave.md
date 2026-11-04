@@ -977,7 +977,7 @@ nothing else runs a check on a Weave manifest (security note
     where throwaway Grounds keep keys. So a check can't read any
     `identities/` directory, `~/bracken-weave` outside the vendor
     directory, the main checkout's `.bracken/` or `$main/.bracken-team`,
-    `~/.ssh`, the forge CLI's credentials, git's credential stores, or
+    `~/.ssh`, `gh`'s credentials, git's credential stores, or
     cargo's `credentials*` and `config*` files;
     Metadata (`stat`) stays readable everywhere, as in the experiment's
     profile, since tools resolve their paths through directories they can't
@@ -1586,7 +1586,7 @@ each need their own decision.
 
 ## 7. What stays git's job until Weave proves itself
 
-- **The repository of record.** `main` on the Forge, PRs, reviews and the
+- **The repository of record.** `main` on GitHub, PRs, reviews and the
   merge gate, through `scripts/merge` and the counted test-table run.
 - **History before the dogfood starts**, and blame. Weave starts from an
   imported tree.

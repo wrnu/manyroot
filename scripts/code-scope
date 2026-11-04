@@ -34,7 +34,7 @@
 # both, must still run.
 #
 # chain prints the prefixes of a batch (decision db6f7705c0a4): P_0 = <main>, then P_i = P_(i-1)
-# merged with the i-th head, as git merge-tree computes it, which is the tree the forge's squash merge
+# merged with the i-th head, as git merge-tree computes it, which is the tree GitHub's squash merge
 # of that head onto P_(i-1) produces. One line each, '<i> <commit> <key>', for i = 0..n. The merge
 # commits are made with git commit-tree, nothing else refers to them, and no ref or worktree changes.
 # A head that doesn't merge cleanly onto its prefix stops it: exit 1, naming that head.

@@ -1,27 +1,27 @@
 # Tests, lint, formatting and the Ground guards, run only by hand (workflow_dispatch), on the branch it's
-# started from. It deploys nothing. The forge's compute is too slow for every PR and push, so per owner
-# decision 20a06f9b815e the manager's counted run of the test table on the exact head (scripts/bk-evidence)
-# is the CI, and scripts/merge runs scripts/ground-guards itself. This run is an extra observer: when it
-# disagrees with the Ground, the manager records a ci-disagreement claim (owner decision 8b2454e4cf81;
-# process section 10).
+# started from. It deploys nothing. Nothing runs on push or pull_request: this repository is public, so its
+# Actions can't be trusted with secrets, and a PR from anyone would run here. Per owner decision
+# 20a06f9b815e the manager's counted run of the test table on the exact head (scripts/bk-evidence) is the
+# CI, and scripts/merge runs scripts/ground-guards itself. This run is an extra observer: when it disagrees
+# with the Ground, the manager records a ci-disagreement claim (owner decision 8b2454e4cf81; process
+# section 10).
 name: CI
 
 on:
   workflow_dispatch:
 
+# Read-only: the run needs no write access and no secret.
+permissions:
+  contents: read
+
 jobs:
   check:
-    runs-on: docker
+    runs-on: ubuntu-latest
     container:
       image: rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e
     steps:
-      # The image has no Node, so no JavaScript checkout action. The token reaches git through environment
-      # config, never argv or a remote URL.
+      # Plain git, no checkout action and no token: the repository is public.
       - name: Check out
-        env:
-          GIT_CONFIG_COUNT: "1"
-          GIT_CONFIG_KEY_0: http.extraHeader
-          GIT_CONFIG_VALUE_0: "Authorization: token ${{ secrets.GITHUB_TOKEN }}"
         run: |
           git init -q .
           git remote add origin "${{ github.server_url }}/${{ github.repository }}.git"
@@ -33,7 +33,7 @@ jobs:
             exit 1
           }
           echo "checked out $(git rev-parse HEAD) from ${{ github.ref }}"
-          # main, for the append-only check below. Fetched here so no later step needs the token.
+          # main, for the append-only check below.
           git fetch -q --depth=100 origin +refs/heads/main:refs/remotes/origin/main
       - name: Toolchain
         run: |

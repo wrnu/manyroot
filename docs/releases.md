@@ -8,7 +8,7 @@ Nothing is released yet. Every merge to `main` runs checks only and deploys noth
 |---|---|---|
 | `main` | Merged once the Ground's merge gate passed (CI runs only by hand and doesn't gate) | In use |
 | Tagged pre-release | A `v<version>-pre.<n>` tag on a `main` commit | `TODO(owner)` when there's something to hand out |
-| Published crates | `manyroot` and `bracken` on crates.io or the Forge cargo index, under `MIT OR Apache-2.0` | `TODO(owner)` |
+| Published crates | `manyroot` and `bracken` on crates.io, under `MIT OR Apache-2.0` | `TODO(owner)` |
 
 Each step past `main` needs the owner's go, recorded in the Ground as a claim `--tag approval`.
 
@@ -20,7 +20,7 @@ The classes and the risky ones are defined in [development.md](development.md). 
 |---|---|---|
 | docs, process | security | none |
 | cli, library | security | upgrade the pinned binary afterwards (see below) |
-| merge-gate tooling: all of `scripts/`, `.forgejo/` | security, independent | the change runs its own checks on the PR before it merges |
+| merge-gate tooling: all of `scripts/`, `.github/` | security, independent | the change runs its own checks on the PR before it merges |
 | crypto | security, independent | none |
 | protocol, storage | security, independent | the manager's go, logged as `owner-review`; a migration note below; upgrade the pinned binary afterwards |
 
@@ -28,8 +28,8 @@ The classes and the risky ones are defined in [development.md](development.md). 
 
 The owner delegated everything else to the manager (decision `adcb78b88c6c`), including protocol-class merges and pinned-binary upgrades, which the manager logs as `owner-review` claims. Still the owner's go:
 
-- Publishing crates; making the repository public; licence changes.
-- Granting access to `Autimo/manyroot`; changing branch protection.
+- Publishing crates; changing the repository's visibility; licence changes.
+- Granting access to `wrnu/manyroot`; changing branch protection.
 - Deleting or rewriting history or data: force-push, deleting branches others use, removing Ground files.
 - Creating, exposing or moving credentials and secrets.
 - Spending money; new outside services, infrastructure or schedules; sending data somewhere new.

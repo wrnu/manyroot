@@ -2,37 +2,28 @@
 
 use crate::support::*;
 
-/// merge must not hand the forge token to its children when the caller exports a variable named `token`:
-/// an assignment keeps an inherited export. The fake bracken reports every exported variable holding the
-/// (dummy) token, by name, on every call after merge's first (`heads`, its pull check), which comes
-/// before the token is set.
+/// merge reaches GitHub only through gh's own credential store: it never handles a token, and gh runs
+/// with GH_TOKEN, GITHUB_TOKEN, the enterprise token variables and GH_DEBUG unset, so a token the caller
+/// exports is never used or logged. The `gh` stub records its arguments and every such variable it sees;
+/// it has no login, so merge stops there and says how to log in.
 #[test]
-fn merge_keeps_the_token_out_of_the_environment_when_the_caller_exports_token() {
+fn merge_runs_gh_on_its_own_credential_store_and_never_a_token_from_the_environment() {
     for scripts in SCRIPTS {
         let merge = repo_root().join(scripts).join("merge");
         let (tmp, dir) = repo(&[("scripts/merge", &merge)], ".bracken/\n", |_| {});
-        for args in [
-            &["config", "remote.origin.url", "https://forge.example/o/r.git"][..],
-            &[
-                "config",
-                "credential.https://forge.example.helper",
-                "!f() { echo username=t; echo password=DUMMY-TOKEN-0123; }; f",
-            ],
-        ] {
-            assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
-        }
+        let url = ["config", "remote.origin.url", "https://github.example/o/r.git"];
+        assert!(run(&dir, "git", &url).status.success());
         let probe = tmp.path().join("probe.log");
+        write_executable(&tmp.path().join("bracken"), "#!/usr/bin/env bash\n[ \"$1\" != heads ] || exit 0\nexit 1\n");
+        std::fs::create_dir_all(tmp.path().join("stubs")).unwrap();
         write_executable(
-            &tmp.path().join("bracken"),
-            "#!/usr/bin/env bash\n[ \"$1\" != heads ] || exit 0\necho ran >>\"$PROBE_LOG\"\n\
+            &tmp.path().join("stubs/gh"),
+            "#!/usr/bin/env bash\necho \"gh $*\" >>\"$PROBE_LOG\"\n\
+             for v in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_DEBUG; do\n\
+               [ -z \"${!v+x}\" ] || echo \"set: $v\" >>\"$PROBE_LOG\"\ndone\n\
              for v in $(compgen -e); do [[ ${!v} != *DUMMY-TOKEN* ]] || echo \"exported: $v\"; done >>\"$PROBE_LOG\"\n\
              exit 1\n",
         );
-        // merge only checks that curl and jq exist before the token; nothing reaches them here.
-        std::fs::create_dir_all(tmp.path().join("stubs")).unwrap();
-        for tool in ["curl", "jq"] {
-            write_executable(&tmp.path().join("stubs").join(tool), "#!/bin/sh\nexit 1\n");
-        }
         let path = std::env::var("PATH").unwrap();
         let out = command(
             &dir,
@@ -41,21 +32,25 @@ fn merge_keeps_the_token_out_of_the_environment_when_the_caller_exports_token() 
         )
         .env("PATH", format!("{}:{path}", tmp.path().join("stubs").display()))
         .env("PROBE_LOG", &probe)
-        .env("token", "unrelated")
+        .env("GH_TOKEN", "DUMMY-TOKEN-0123")
+        .env("GITHUB_TOKEN", "DUMMY-TOKEN-0123")
+        .env("GH_DEBUG", "api")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .output()
         .unwrap();
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(!stderr.contains("DUMMY-TOKEN") && !String::from_utf8_lossy(&out.stdout).contains("DUMMY-TOKEN"));
-        let log = std::fs::read_to_string(&probe).unwrap_or_else(|_| panic!("{scripts}: bracken never ran: {stderr}"));
-        assert_eq!(log, "ran\n", "{scripts}: the token reached bracken's environment");
-        let said = "team server: none set up (no .bracken-team); reading the local replica\n";
-        assert!(String::from_utf8_lossy(&out.stdout).starts_with(said), "{scripts}: {:?}", out.stdout);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {said}");
+        assert!(said.contains("gh has no login for github.example"), "{scripts}: {said}");
+        assert!(!said.contains("DUMMY-TOKEN"), "{scripts}: {said}");
+        let log = std::fs::read_to_string(&probe).unwrap_or_else(|_| panic!("{scripts}: gh never ran: {said}"));
+        assert_eq!(log, "gh auth status --hostname github.example\n", "{scripts}: gh saw a token: {log}");
+        let first = "team server: none set up (no .bracken-team); reading the local replica\n";
+        assert!(String::from_utf8_lossy(&out.stdout).starts_with(first), "{scripts}: {:?}", out.stdout);
     }
 }
 
-/// Runs `scripts/merge --dry-run` for PR #1 against a local forge: a bare repository standing in for
-/// origin (through `insteadOf`) and a `curl` stub that answers with the PR. main holds a committed Ground;
+/// Runs `scripts/merge --dry-run` for PR #1 against a local stand-in for GitHub: a bare repository
+/// standing in for origin (through `insteadOf`) and a `gh` stub that answers every call with the PR. main holds a committed Ground;
 /// `on_branch` changes the PR's head and `on_main` what main gains after the branch point, each committed
 /// (`git add -A`, so a caller forces anything ignored in itself). The pr claim is by `builder` and passed
 /// by `val`, so the gate accepts it.
@@ -111,10 +106,9 @@ fn merge_dry_run_command(
     let forge = tmp.path().join("forge.git");
     git(&["init", "-q", "--bare", forge.to_str().unwrap()]);
     git(&["push", "-q", forge.to_str().unwrap(), "main", "pr:refs/pull/1/head"]);
-    git(&["config", "remote.origin.url", "https://forge.example/o/r.git"]);
+    git(&["config", "remote.origin.url", "https://github.example/o/r.git"]);
     git(&["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"]);
-    git(&["config", &format!("url.{}.insteadOf", forge.display()), "https://forge.example/o/r.git"]);
-    git(&["config", "credential.https://forge.example.helper", "!f() { echo username=t; echo password=DUMMY; }; f"]);
+    git(&["config", &format!("url.{}.insteadOf", forge.display()), "https://github.example/o/r.git"]);
     let claim = bk(&dir, &["claim", &format!("PR #1 pr @ {sha}: a change"), "--tag", "pr", "--as", "builder"]);
     bk(&dir, &["evidence", &claim, "pass", "--method", "checked", "--as", "val"]);
     if let Some(t) = tested {
@@ -133,7 +127,7 @@ fn merge_dry_run_command(
     std::fs::create_dir_all(tmp.path().join("stubs")).unwrap();
     let pr =
         format!(r#"{{"head":{{"sha":"{sha}"}},"state":"open","merged":false,"base":{{"ref":"main"}},"title":"t"}}"#);
-    write_executable(&tmp.path().join("stubs/curl"), &format!("#!/bin/sh\necho '{pr}'\n"));
+    write_executable(&tmp.path().join("stubs/gh"), &format!("#!/bin/sh\necho '{pr}'\n"));
     let path = std::env::var("PATH").unwrap();
     let mut merge =
         command(&dir, "scripts/merge", &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"]);
@@ -685,27 +679,28 @@ fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
     }
 }
 
-/// Finding d494f36dee9d: merge records its "merge gate" pass before it asks the forge to merge, and a
-/// live one is what tells `log --open` a PR merged. When the merge call fails, merge asks the forge
+/// Finding d494f36dee9d: merge records its "merge gate" pass before it asks GitHub to merge, and a
+/// live one is what tells `log --open` a PR merged. When the merge call fails, merge asks GitHub
 /// (findings f1fc25380904, 3623855aa0e8). Merged at the head keeps the pass. Open, at any head, retracts
 /// it: at once after a 4xx, and after a 5xx or no reply only if it stays open while merge asks again, so a
 /// slow merge behind a proxy's timeout keeps it. Anything else stops, naming the evidence, and keeps it.
 /// When the pass is retracted, the finding against the claim stays open.
 #[test]
-fn a_failed_merge_call_retracts_the_gate_evidence_only_when_the_forge_shows_the_pr_unmerged() {
-    // The merge call's status and curl's exit code, the forge's answers to each GET after it (the
+fn a_failed_merge_call_retracts_the_gate_evidence_only_when_github_shows_the_pr_unmerged() {
+    // The merge call's HTTP status (000: gh got no reply), GitHub's answers to each GET after it (the
     // last repeated), and what becomes of the pass.
     let cases = [
-        ("refused, still open", "409", 22, &["open"][..], "retracted"),
-        ("refused, the head moved", "409", 22, &["moved"][..], "retracted"),
-        ("refused, merged at another head", "409", 22, &["merged elsewhere"][..], "unclear"),
-        ("reply lost, merged", "502", 22, &["merged"][..], "stands"),
-        ("slow merge behind a proxy", "504", 22, &["open", "merged"][..], "stands"),
-        ("proxy timeout, never merged", "504", 22, &["open"][..], "retracted"),
-        ("dropped, no answer", "000", 52, &["error"][..], "unclear"),
+        ("refused, still open", "409", &["open"][..], "retracted"),
+        ("refused, the head moved", "409", &["moved"][..], "retracted"),
+        ("not mergeable", "405", &["open"][..], "retracted"),
+        ("refused, merged at another head", "409", &["merged elsewhere"][..], "unclear"),
+        ("reply lost, merged", "502", &["merged"][..], "stands"),
+        ("slow merge behind a proxy", "504", &["open", "merged"][..], "stands"),
+        ("proxy timeout, never merged", "504", &["open"][..], "retracted"),
+        ("dropped, no answer", "000", &["error"][..], "unclear"),
     ];
     for scripts in SCRIPTS {
-        for (case, status, exit, answers, expect) in cases {
+        for (case, status, answers, expect) in cases {
             let change = |dir: &Path| std::fs::write(dir.join("code.txt"), "a change\n").unwrap();
             let (tmp, dir, mut dry) = merge_dry_run_command(scripts, |_| {}, change, |_| {}, None);
             let out = dry.output().unwrap();
@@ -715,8 +710,8 @@ fn a_failed_merge_call_retracts_the_gate_evidence_only_when_the_forge_shows_the_
             let finding = bk(&dir, &["claim", "it breaks", "--tag", "finding", "--as", "val"]);
             bk(&dir, &["relate", &finding, "contradicts", &claim, "--as", "val"]);
             bk(&dir, &["evidence", &finding, "fail", "--method", "triage: not a bug", "--as", "manager"]);
-            // The forge answers every GET as before until the merge call, which fails; then as the case says.
-            let stub = tmp.path().join("stubs/curl");
+            // GitHub answers every GET as before until the merge call, which fails; then as the case says.
+            let stub = tmp.path().join("stubs/gh");
             let get = std::fs::read_to_string(&stub).unwrap();
             let get = get.lines().nth(1).unwrap().to_owned();
             let merged = |g: &str| g.replace(r#""state":"open","merged":false"#, r#""state":"closed","merged":true"#);
@@ -730,7 +725,7 @@ fn a_failed_merge_call_retracts_the_gate_evidence_only_when_the_forge_shows_the_
                         "moved" => moved(&get),
                         "merged" => merged(&get),
                         "merged elsewhere" => merged(&moved(&get)),
-                        _ => "exit 22".to_owned(),
+                        _ => "exit 1".to_owned(),
                     };
                     assert!(*answer == "open" || reply != get, "{case}: the stub's {answer} reply didn't change");
                     let arm = if k + 1 == answers.len() { "*".to_owned() } else { (k + 1).to_string() };
@@ -742,7 +737,7 @@ fn a_failed_merge_call_retracts_the_gate_evidence_only_when_the_forge_shows_the_
             write_executable(
                 &stub,
                 &format!(
-                    "#!/bin/sh\ncase \"$*\" in *'-X POST'*) : >'{posted}'; printf {status}; exit {exit} ;; esac\n\
+                    "#!/bin/sh\ncase \"$*\" in *'-X PUT'*) : >'{posted}'; [ {status} = 000 ] || echo 'HTTP/2.0 {status} X'; exit 1 ;; esac\n\
                      if [ -e '{posted}' ]; then\n  n=$(($(cat '{asked}' 2>/dev/null || echo 0) + 1)); echo $n >'{asked}'\n  \
                      case $n in\n{arms}  esac\nfi\n{get}\n"
                 ),
@@ -927,5 +922,66 @@ fn merge_decides_findings_through_the_binary_and_refuses_another_shape() {
             assert!(said.contains("isn't in the shape this check reads"), "{scripts}: {shape}: {said}");
         }
         assert!(b.merged().is_empty(), "{scripts}: a dry run merged");
+    }
+}
+
+/// GitHub merges only the exact head merge checked: merge sends that sha with the squash call, so a push
+/// that lands between the checks and the call is refused (409), nothing merges, and the gate's pass is
+/// retracted.
+#[test]
+fn merge_sends_the_checked_sha_so_github_refuses_a_head_that_moved_before_the_call() {
+    for scripts in SCRIPTS {
+        let b = Batch::new(scripts, 1, &[], false);
+        assert!(b.verify(&[1]).status.success(), "{scripts}");
+        let before = b.forge_main();
+        std::fs::write(b.tmp.path().join("move-1"), "").unwrap();
+        let out = b.merge(&["1", &b.claims[0][..12]]);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {said}");
+        assert!(said.contains("HTTP 409") && said.contains("is retracted"), "{scripts}: {said}");
+        assert!(b.merged().is_empty() && b.forge_main() == before, "{scripts}: merged a moved head: {said}");
+        let gate = b.evidence(1).into_iter().filter(|(_, m)| m.starts_with("merge gate")).count();
+        assert_eq!(gate, 1, "{scripts}");
+        let open: serde_json::Value = serde_json::from_str(&bk(&b.dir, &["show", &b.claims[0], "--json"])).unwrap();
+        let live = open["referrers"].as_array().unwrap().iter().any(|r| {
+            r["body"]["method"].as_str().is_some_and(|m| m.starts_with("merge gate")) && r["retracted"] == false
+        });
+        assert!(!live, "{scripts}: the moved head's gate pass stands");
+    }
+}
+
+/// GitHub's merge call can't delete the head branch, so merge does after the merge: a branch of origin's
+/// repository still at the merged sha. A fork's branch, or one pushed to since, is left alone, and the
+/// merge stands either way.
+#[test]
+fn merge_deletes_the_merged_head_branch_only_in_origins_repository_at_the_merged_sha() {
+    for scripts in SCRIPTS {
+        for case in ["ours", "fork", "moved"] {
+            let b = Batch::new(scripts, 1, &[], false);
+            assert!(b.verify(&[1]).status.success(), "{scripts}");
+            let forge = b.forge.to_str().unwrap().to_owned();
+            assert!(run(&b.dir, "git", &["push", "-q", &forge, "pr1:refs/heads/pr1"]).status.success());
+            match case {
+                "fork" => std::fs::write(b.tmp.path().join("fork-1"), "").unwrap(),
+                "moved" => {
+                    let git = ["--git-dir", &forge, "update-ref", "refs/heads/pr1", "main"];
+                    assert!(run(&b.dir, "git", &git).status.success());
+                }
+                _ => {}
+            }
+            let out = b.merge(&["1", &b.claims[0][..12]]);
+            let said = text(&out);
+            assert!(out.status.success(), "{scripts}, {case}: {said}");
+            assert_eq!(b.merged(), [1], "{scripts}, {case}");
+            let deleted = std::fs::read_to_string(b.tmp.path().join("deleted")).unwrap_or_default();
+            let left = run(&b.dir, "git", &["--git-dir", &forge, "rev-parse", "--verify", "-q", "refs/heads/pr1"]);
+            if case == "ours" {
+                assert!(deleted == "pr1\n" && said.contains("deleted branch pr1"), "{scripts}: {said}");
+                assert!(!left.status.success(), "{scripts}: pr1 is still on origin");
+            } else {
+                assert!(deleted.is_empty() && !said.contains("deleted branch"), "{scripts}, {case}: {said}");
+                assert!(left.status.success(), "{scripts}, {case}: pr1 was deleted");
+            }
+        }
     }
 }

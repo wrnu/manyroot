@@ -14,7 +14,7 @@
 #   3. every finding that contradicts the claim has the manager's evidence, and
 #      every confirmed one (a pass) is deferred by the manager: a current task tagged deferred,
 #      written by the manager, which the manager related depends_on it (process 4.2);
-#   4. the forge PR is open, targets main, and its head is that sha;
+#   4. the GitHub PR is open, targets main, and its head is that sha;
 #   scope: a manager pass of scripts/test-table on the sha that bk-evidence labelled docs-only
 #      counts only if the head is docs-only by scripts/code-scope (everything it changed since main
 #      is *.md outside crates/); one that reuses an earlier pass ('tree <key> reuses <id>') counts
@@ -68,32 +68,32 @@
 # member touches (the same untested() rule as below, and the same key), and that the members merge onto
 # it, in order, into the tested tree. If any member fails, it merges none. Then it merges them in the
 # tested order, each with every check again and check 5 asking that main's tip is the prefix before it,
-# by the same rule, and that the forge's squash tree (git merge-tree) is the next prefix; after each
-# merge, including one the forge made though the call failed (the outcome handling below), it fetches
+# by the same rule, and that the squash merge's tree (git merge-tree) is the next prefix; after each
+# merge, including one GitHub made though the call failed (the outcome handling below), it fetches
 # main and compares again (finding 3199c8e0a8ad). If anything fails part way, it stops, and says which members
 # merged, by their live merge-gate passes: main is then on a prefix nothing tested, and the rest need a
 # new run on it. Which member it checks or merges, and how, is state inside this process: merge reads
 # none from the environment (finding f692f52a1a43).
 #
 # If all pass, it records manager evidence "merge gate @ <sha>" on the claim, then
-# squash-merges through the forge API with head_commit_id set to the sha, so the
-# forge refuses the merge if the branch moved after the check. If the merge fails and
-# the forge shows the PR still open, it retracts that evidence: a live merge-gate pass
-# means the PR merged. If the outcome is unclear, it keeps it and says so. --dry-run runs
-# every check, records nothing, and makes only GET requests.
+# squash-merges through GitHub's API (PUT pulls/<n>/merge) with sha set to the head, so
+# GitHub refuses the merge (409) if the branch moved after the check. If the merge fails and
+# GitHub shows the PR still open, it retracts that evidence: a live merge-gate pass
+# means the PR merged. If the outcome is unclear, it keeps it and says so. After a merge, it
+# deletes the head branch if it is in origin's repository and still at the sha; that is best
+# effort, and the merge stands whatever it does. --dry-run runs every check, records nothing,
+# and makes only GET requests.
 #
-# The forge token comes from git's credential helper for the origin host. It is
-# kept in a shell variable and reaches curl only as a header read from a file
-# descriptor: never argv, a URL, the environment, git -c, or any output.
+# GitHub is reached only through `gh api --hostname <origin's host>`, which authenticates from gh's
+# own credential store (gh auth login). merge never reads, holds or passes a token: gh runs with
+# GH_TOKEN, GITHUB_TOKEN and the enterprise token variables unset, so a token in the caller's
+# environment is never used, and GH_DEBUG unset, so gh logs no HTTP traffic.
 # With the team server set up (scripts/team-server), every read pulls from it first, and the
 # gate refuses if it can't.
-# Needs curl and jq.
+# Needs gh and jq.
 set -euo pipefail
-# Never trace or auto-export (both can be inherited through SHELLOPTS): the token is in a
-# variable from here on, and xtrace would print it, allexport would hand it to every child.
-# A token exported by the caller would keep its export attribute when assigned, so drop it first.
+# Never trace or auto-export (both can be inherited through SHELLOPTS).
 set +ax
-unset token
 
 usage() {
   echo "usage: merge <pr number> <pr claim> --validator <id>... --min-passes N --as manager [--owner-approval] [--dry-run]" >&2
@@ -170,7 +170,7 @@ done
 $dry_run || [ -n "$agent" ] || fail "no identity: pass --as manager or set BRACKEN_AGENT"
 [ "${agent:-manager}" = manager ] ||
   fail "only the manager merges (process 4.2): run with --as manager, not '$agent' (dry runs too)"
-for tool in curl jq; do command -v "$tool" >/dev/null || fail "needs $tool"; done
+for tool in gh jq; do command -v "$tool" >/dev/null || fail "needs $tool"; done
 
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 # With a team server set up, the gate decides only on a replica that has just pulled from it
@@ -191,23 +191,33 @@ origin=$(git -C "$main" config --get remote.origin.url)
   fail "origin's URL isn't https://<host>/<owner>/<repo>, with no user or password in it"
 host=${BASH_REMATCH[1]}
 repo="${BASH_REMATCH[2]}/${BASH_REMATCH[3]%.git}"
-api_base="https://$host/api/v1/repos/$repo"
+[[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail "origin's owner and repository aren't plain names"
 
-token=$(printf 'protocol=https\nhost=%s\n\n' "$host" | GIT_TERMINAL_PROMPT=0 git credential fill 2>/dev/null |
-  sed -n 's/^password=//p') || true
-[ -n "$token" ] || fail "no forge credential for $host from git's credential helper"
+# gh_ <args>: gh with only its own credential store (see the header), never prompting.
+gh_() {
+  env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_DEBUG -u DEBUG \
+    -u GH_HOST -u GH_REPO GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 gh "$@"
+}
+gh_ auth status --hostname "$host" >/dev/null 2>&1 ||
+  fail "gh has no login for $host in its own credential store: run gh auth login --hostname $host"
 
 # api <method> <path> [json body file] [status]: prints the response body, or with "status" only the HTTP
-# status (000 if there was no reply). The token goes in a header read from a file descriptor. In a dry
-# run, anything but GET is refused here, before any request.
+# status (000 if there was no reply), from gh's --include status line; it fails unless the status is 2xx.
+# <path> is under repos/<owner>/<repo>. In a dry run, anything but GET is refused here, before any request.
 api() {
-  local method=$1 path=$2 body=${3:-} status=${4:-}
+  local method=$1 path=$2 body=${3:-} status=${4:-} out code rc=0
   [ "$method" = GET ] || ! $dry_run || fail "dry run: refusing $method $path"
-  local args=(-sS --fail-with-body --proto "=https" --max-redirs 0 -X "$method" -H "Accept: application/json")
-  [ -z "$body" ] || args+=(-H "Content-Type: application/json" --data-binary "@$body")
-  [ -z "$status" ] || args+=(-o /dev/null -w '%{http_code}')
-  # -q first: no curlrc, whose 'verbose' or 'trace' would print or save the header.
-  curl -q "${args[@]}" -H @<(printf 'Authorization: token %s\n' "$token") "$api_base$path"
+  local args=(api --hostname "$host" -X "$method" -H "Accept: application/vnd.github+json"
+    -H "X-GitHub-Api-Version: 2022-11-28")
+  [ -z "$body" ] || args+=(--input "$body")
+  if [ -z "$status" ]; then
+    gh_ "${args[@]}" "repos/$repo$path"
+    return
+  fi
+  out=$(gh_ "${args[@]}" --include "repos/$repo$path" 2>/dev/null) || rc=$?
+  code=$(sed -n '1s|^HTTP/[0-9.]* \([0-9][0-9][0-9]\).*|\1|p' <<<"$out")
+  printf '%s' "${code:-000}"
+  [ "$rc" = 0 ] && [[ ${code:-000} == 2?? ]]
 }
 
 failed=0
@@ -280,16 +290,19 @@ else
   check FAIL findings "untriaged (no $triager evidence): ${untriaged[*]:-none}; confirmed but not deferred (no current task tagged deferred that $triager wrote and related depends_on it): ${undeferred[*]:-none}"
 fi
 
-# 4. The forge PR.
+# 4. The GitHub PR.
 info=$(api GET "/pulls/$pr") || fail "couldn't read PR #$pr from $host"
 f_head=$(jq -r '.head.sha' <<<"$info")
 f_state=$(jq -r 'if .merged then "merged" else .state end' <<<"$info")
 f_base=$(jq -r '.base.ref' <<<"$info")
 title=$(jq -r '.title' <<<"$info")
+# Where the head branch lives, for deleting it after the merge: only a branch of origin's repository.
+f_head_repo=$(jq -r '.head.repo.full_name // empty' <<<"$info")
+f_head_ref=$(jq -r '.head.ref // empty' <<<"$info")
 if [ "$f_state" = open ] && [ "$f_base" = main ] && [ "$f_head" = "$sha" ]; then
-  check ok forge "PR #$pr is open against main, head $f_head"
+  check ok github "PR #$pr is open against main, head $f_head"
 else
-  check FAIL forge "PR #$pr is $f_state against $f_base, head $f_head (the claim says $sha)"
+  check FAIL github "PR #$pr is $f_state against $f_base, head $f_head (the claim says $sha)"
 fi
 
 # 5. main.
@@ -418,8 +431,8 @@ batch_member_main() {
     fi
     return
   fi
-  # The forge's squash merge of this head onto main, as git merge-tree computes it, must be the next
-  # prefix, before the POST; after it, the merged main is compared again.
+  # GitHub's squash merge of this head onto main, as git merge-tree computes it, must be the next
+  # prefix, before the merge call; after it, the merged main is compared again.
   bad=$(untested "${commits[member - 1]}")
   next=$(merged_commit "$tip" "$sha")
   if [ -z "$bad" ] && [ "$t" = "${keys[member - 1]}" ] && [ -n "$next" ] && [ "$(key_of "$next")" = "${keys[member]}" ] &&
@@ -455,7 +468,7 @@ reuses_a_pass() {
 }
 docs_only=false
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
-  check FAIL scope "$sha isn't on the forge"
+  check FAIL scope "$sha isn't on origin"
 else
   if scope=$(cd "$main" && "$here/code-scope" docs-only "$tip" "$sha" 2>&1); then docs_only=true; fi
   scope=${scope#code-scope: }
@@ -549,7 +562,7 @@ else
   fi
 fi
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
-  check FAIL main "$sha isn't on the forge (fetched refs/pull/$pr/head)"
+  check FAIL main "$sha isn't on origin (fetched refs/pull/$pr/head)"
 elif [ -n "$batch_member" ]; then
   batch_member_main
 elif [ -n "$exact" ]; then
@@ -599,7 +612,7 @@ fi
 
 # 6. The Ground guards, on what the head committed.
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
-  check FAIL guards "$sha isn't on the forge"
+  check FAIL guards "$sha isn't on origin"
 # Cleared: a value exported in the caller's shell would let a root .gitattributes change through (note 0e50e7fc03af).
 elif guards=$(cd "$main" && GROUND_GUARDS_ATTRIBUTES_CHECKED='' "$here/ground-guards" "$tip" "$sha" 2>&1); then
   guards_case=$(tail -1 <<<"$guards")
@@ -637,15 +650,14 @@ fi
 body=$(mktemp)
 details=$(mktemp)
 trap 'rm -f "$body" "$details"' EXIT
-jq -n --arg sha "$sha" --arg title "$title (#$pr)" \
-  '{Do: "squash", head_commit_id: $sha, MergeTitleField: $title, delete_branch_after_merge: true}' >"$body"
+jq -n --arg sha "$sha" --arg title "$title (#$pr)" '{merge_method: "squash", sha: $sha, commit_title: $title}' >"$body"
 if $dry_run; then
-  echo "dry run: all checks pass; would record 'merge gate @ $sha' on $claim, then POST /pulls/$pr/merge with:"
+  echo "dry run: all checks pass; would record 'merge gate @ $sha' on $claim, then PUT /pulls/$pr/merge with:"
   cat "$body"
   exit 0
 fi
 
-printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\nforge head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nowner: %s\n' \
+printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\ngithub head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nowner: %s\n' \
   "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$owner_case" >"$details"
 written=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
   fail "couldn't record the merge-gate evidence; not merging"
@@ -654,8 +666,8 @@ id=${written%%$'\n'*}
 id=${id##* }
 echo "recorded merge gate evidence $id"
 # A live merge-gate pass is what says a PR merged (bracken log --open closes findings against it), so a
-# merge the forge refused takes it back (finding d494f36dee9d). But the call also fails when the forge
-# merges anyway: a proxy's 502 or 504, or a dropped connection, while it's still merging. So the forge is
+# merge GitHub refused takes it back (finding d494f36dee9d). But the call also fails when GitHub
+# merges anyway: a proxy's 502 or 504, or a dropped connection, while it's still merging. So GitHub is
 # asked (findings f1fc25380904, 3623855aa0e8). Merged at this head keeps the pass. Open, at any head,
 # retracts it: at once after a 4xx (a 409 if the head moved), and otherwise only if it's still open after
 # asking again for a few seconds. Anything else stops, naming the evidence.
@@ -665,7 +677,7 @@ pr_now() { # merged, merged-elsewhere, open or unknown
   jq -r --arg sha "$sha" 'if .merged == true then (if .head.sha == $sha then "merged" else "merged-elsewhere" end)
     elif .state == "open" then "open" else "unknown" end' <<<"$now" 2>/dev/null || echo unknown
 }
-if ! status=$(api POST "/pulls/$pr/merge" "$body" status); then
+if ! status=$(api PUT "/pulls/$pr/merge" "$body" status); then
   outcome=$(pr_now)
   case "$status" in 4??) asks=0 ;; *) asks=3 ;; esac
   while [ "$outcome" = open ] && [ "$asks" -gt 0 ]; do
@@ -675,14 +687,24 @@ if ! status=$(api POST "/pulls/$pr/merge" "$body" status); then
   done
   case "$outcome" in
     open)
-      bk retract "$id" --reason "the forge didn't merge PR #$pr at $sha (HTTP $status)" --as "$agent" >/dev/null ||
+      bk retract "$id" --reason "GitHub didn't merge PR #$pr at $sha (HTTP $status)" --as "$agent" >/dev/null ||
         fail "the merge failed (HTTP $status; a 409 if the head moved) and PR #$pr is open, and retracting the merge gate evidence $id failed or wasn't confirmed: check with scripts/bk show $id, and if it isn't retracted, run scripts/bk retract $id --as $agent, or log --open counts PR #$pr as merged"
       fail "the merge failed (HTTP $status; a 409 if the head moved) and PR #$pr is open; the merge gate evidence $id is retracted, so it still counts as open" ;;
-    merged) echo "the merge call failed (HTTP $status), but the forge shows PR #$pr merged at $sha; the evidence $id stands" ;;
-    *) fail "the merge's outcome is unclear: the call failed (HTTP $status), and the forge shows PR #$pr neither merged at $sha nor open (${outcome}). The merge gate evidence $id stands; if the PR didn't merge at $sha, run scripts/bk retract $id --as $agent" ;;
+    merged) echo "the merge call failed (HTTP $status), but GitHub shows PR #$pr merged at $sha; the evidence $id stands" ;;
+    *) fail "the merge's outcome is unclear: the call failed (HTTP $status), and GitHub shows PR #$pr neither merged at $sha nor open (${outcome}). The merge gate evidence $id stands; if the PR didn't merge at $sha, run scripts/bk retract $id --as $agent" ;;
   esac
 fi
 echo "merged PR #$pr at $sha"
+# GitHub's merge call has no delete_branch_after_merge, so the head branch goes here: only a branch of
+# origin's repository (never a fork's, never main), only while it is still at the sha, and best effort.
+if [ "$f_head_repo" = "$repo" ] && [ "$f_head_ref" != main ] && [[ $f_head_ref =~ ^[A-Za-z0-9._/-]+$ ]] &&
+  [ "$(api GET "/git/ref/heads/$f_head_ref" 2>/dev/null | jq -r '.object.sha // empty' 2>/dev/null)" = "$sha" ]; then
+  if deleted=$(api DELETE "/git/refs/heads/$f_head_ref" '' status); then
+    echo "deleted branch $f_head_ref"
+  else
+    echo "merge: couldn't delete branch $f_head_ref (HTTP $deleted); the merge stands"
+  fi
+fi
 if [ -n "$expect_after" ]; then
   git -C "$main" fetch -q origin main || fail "merged PR #$pr, but couldn't fetch main to compare it with the batch: stop the batch"
   now=$(key_of origin/main)

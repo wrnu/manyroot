@@ -217,7 +217,7 @@ enum Command {
         /// Only open findings: those `scripts/merge` would block a current head on (process 4.2). Any
         /// contribution, whatever its tags (finding `8c90edd63f5c`), not retracted, with a contradicts
         /// relation to something current and not yet merged (no live pass of the triager's on it whose
-        /// method starts with `merge gate`, which `scripts/merge` takes back if the forge refuses)
+        /// method starts with `merge gate`, which `scripts/merge` takes back if GitHub refuses)
         /// that still counts (live, or retracted by someone other than the finding's author and the triager), that
         /// the triager hasn't triaged (no live evidence of theirs on it) or has confirmed (a live pass of
         /// theirs, whatever else they or anyone gave) and not deferred (a depends_on of theirs from a
@@ -1781,7 +1781,7 @@ fn age(ms: u64) -> String {
 }
 
 /// Whether `id` was merged: the triager's live pass on it with a method starting `merge gate`, which
-/// `scripts/merge` records on the pr claim it merges, and retracts if the forge refuses the merge
+/// `scripts/merge` records on the pr claim it merges, and retracts if GitHub refuses the merge
 /// (finding `d494f36dee9d`). A merged PR's last pr claim stays current, so a finding against it is
 /// closed for `log --open` (task `3217747ec88b`).
 fn merged(g: &Graph, triager: AgentId, id: &ContributionId) -> bool {
