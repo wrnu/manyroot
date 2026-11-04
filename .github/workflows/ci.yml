@@ -73,6 +73,11 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The bracken the Ground guards open the Ground with (BRACKEN_BIN below), as the box builds it before
+      # its light run: a docs-only head's table runs no cargo build, so without this the guards find no
+      # binary and fail (task 8a5e622f0c24, note 54cd03afec67). A head that changes code builds it anyway.
+      - name: Build bracken
+        run: cargo build --locked -q -p bracken --bin bracken
       # fmt, clippy (this host is x86_64-unknown-linux-gnu, so both of the table's clippies), every test
       # under nextest, the doctests, and the Ground guards against main: the one copy the manager runs.
       - name: scripts/test-table
