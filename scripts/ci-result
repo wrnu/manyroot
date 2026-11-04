@@ -10,6 +10,10 @@
 # sha, takes the latest of the given event, or by default the latest pull_request run (it tests the head
 # merged with main, as the counted run does) or, with none, the latest push run (the head alone). It
 # prints the run's URL, event, attempt, the PR's base for a pull_request run, and each job's conclusion.
+# Only origin's own runs count (finding 6ef8d93b7020): a run whose head repository is another (a fork's
+# pull request of the same commit, which anyone can open on a public repository) is never read, and a
+# pull_request run counts only if its PR targets main. It also says what Actions leaves out, which only
+# the counted run checks (finding a5b068929177).
 # It exits 0 only if the run completed, its conclusion is success and so is every job's; 1 if it
 # completed otherwise; 3 if it hasn't completed (run it again later); 2 if there's no such run, or it
 # can't read one.
@@ -71,8 +75,11 @@ get() { gh_ api --hostname "$host" -X GET -H "Accept: application/vnd.github+jso
 
 runs=$(get "actions/workflows/ci.yml/runs?head_sha=$sha&per_page=100") ||
   fail "couldn't read ci.yml's runs for $sha from $host (is gh logged in? gh auth login --hostname $host)"
-# The latest run of the event, by id; with no event given, pull_request first, then push.
-run=$(jq -ce --arg sha "$sha" --arg event "$event" '[.workflow_runs[] | select(.head_sha == $sha)] as $r
+# The latest run of the event, by id, among origin's own runs of the sha (and for pull_request, those
+# whose PR targets main); with no event given, pull_request first, then push.
+run=$(jq -ce --arg sha "$sha" --arg event "$event" --arg repo "$repo" '[.workflow_runs[]
+  | select(.head_sha == $sha and (.head_repository.full_name // "" | ascii_downcase) == ($repo | ascii_downcase)
+      and (.event != "pull_request" or (.pull_requests | length) > 0 and all(.pull_requests[]; .base.ref == "main")))] as $r
   | (if $event != "" then [$event] else ["pull_request", "push"] end)
   | map(. as $e | [$r[] | select(.event == $e)] | max_by(.id)) | map(select(. != null)) | first' <<<"$runs") ||
   fail "no ci.yml run on $repo for $sha${event:+ ($event)}: push the head, or start one with gh workflow run ci.yml --ref <branch>"
@@ -83,8 +90,9 @@ conclusion=$(jq -r '.conclusion // "none"' <<<"$run")
 echo "ci-result: $(jq -r .html_url <<<"$run")"
 echo "ci-result: run $id, $(jq -r .event <<<"$run") on $sha, attempt $(jq -r .run_attempt <<<"$run"): $status, $conclusion"
 if [ "$(jq -r .event <<<"$run")" = pull_request ]; then
-  echo "ci-result: pull_request run: the head merged with $(jq -r '.pull_requests[0].base | if . then "\(.ref) at \(.sha)" else "main (base not shown: a fork PR)" end' <<<"$run") as of the run"
+  echo "ci-result: pull_request run: the head merged with $(jq -r '.pull_requests[0].base | "\(.ref) at \(.sha)"' <<<"$run") as of the run"
 fi
+echo "ci-result: Actions leaves out what only the counted run checks: the Docker-backed macos_only tests (the macOS job has no Docker and lists them as skipped), and --split's check that every test runs on Linux or the Mac"
 if [ "$status" != completed ]; then
   echo "ci-result: run $id hasn't completed; run ci-result again when it has" >&2
   exit 3

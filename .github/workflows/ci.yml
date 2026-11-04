@@ -2,8 +2,13 @@
 # scripts/test-table runs it in a box, and the macOS-only tests with the host's clippy on a Mac, as
 # scripts/test-table --split's Mac part runs them. It runs on every push and pull request, and by hand
 # (workflow_dispatch). It only reports: it merges nothing, writes nothing to the Ground and deploys
-# nothing. The manager's counted run is still what a merge waits for; scripts/ci-evidence records this
+# nothing. The manager's counted run is still what a merge waits for; scripts/ci-result records this
 # run's result on a pr claim, so the two can be compared (decision d9fa2c08146c).
+#
+# What it leaves out, which only the counted run (scripts/test-table --split) checks (finding
+# a5b068929177): the Docker-backed macos_only tests, since GitHub's macOS runners have no Docker (the
+# macOS job lists each one that skipped, in its log and its summary, never as a pass), and --split's
+# cross-check that every test runs on Linux or the Mac.
 #
 # Hardened for a public repository: read-only token, no secrets, never pull_request_target or
 # workflow_run (a pull_request run from a fork gets no secrets and a read-only token), third-party
@@ -110,6 +115,29 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy (macOS host)
         run: cargo clippy --locked --all-targets -- -D warnings
-      # Every test in a 'mod macos_only', which Linux skips (scripts/test-table --split).
+      # Every test in a 'mod macos_only', which Linux skips (scripts/test-table --split). A test that can't
+      # run here returns early after printing 'skipped: <why>' (the Docker-backed ones: these runners have
+      # no Docker), and nextest counts it as passed, so this step lists each one from the captured output
+      # (--success-output final), as a warning and in the job's summary: none of them is a pass.
       - name: macOS-only tests
-        run: cargo nextest run --locked --workspace --no-fail-fast -E 'test(~macos_only::)'
+        run: |
+          log=$RUNNER_TEMP/macos-only.log
+          set +e
+          cargo nextest run --locked --workspace --no-fail-fast --success-output final -E 'test(~macos_only::)' 2>&1 |
+            tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          # A passing test's captured output follows its 'PASS [..] (n/m) <binary> <test>' line.
+          skipped=$(awk '/^ +PASS \[/ { name = $(NF - 1) " " $NF } /^ +skipped: / && name != "" { print name; name = "" }' "$log" | sort -u)
+          count=$(printf '%s' "$skipped" | grep -c . || true)
+          {
+            echo "### macOS-only tests"
+            echo
+            echo "$count of them skipped here, not passed (no Docker on GitHub's macOS runners); the counted run's Mac side runs them:"
+            echo
+            printf '%s\n' "$skipped" | sed '/^$/d; s/^/- /'
+          } >>"$GITHUB_STEP_SUMMARY"
+          [ "$count" = 0 ] || echo "::warning title=macOS-only tests skipped::$count macos_only tests skipped (no Docker); see the job summary"
+          echo "macOS-only tests: $count skipped, not passed:"
+          printf '%s\n' "$skipped"
+          exit "$rc"

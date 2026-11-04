@@ -226,7 +226,8 @@ pub(crate) fn weave(dir: &Path, script: &str, home: &Path, bin: Option<&Path>, a
 /// code-scope and ground-guards, a committed stub scripts/test-table that fails when the tree holds a
 /// file named `broken`, and a local stand-in for GitHub: a bare repository behind origin's URL and a `gh`
 /// stub that answers GET pulls/<n> and does PUT pulls/<n>/merge as a squash merge (git merge-tree onto
-/// main) of the body's sha, answering 409 if that isn't the PR's head, as GitHub does. It answers GET
+/// main) of the body's sha, answering 409 if that isn't the PR's head, as GitHub does; with no sha, it
+/// merges whatever the head is then, as GitHub does too. It answers GET
 /// git/ref/heads/<ref> and DELETE git/refs/heads/<ref>, logging each deleted ref to `$T/deleted`. PR #n's
 /// head is branch `pr<n>` in origin's repository, or a fork's with `$T/fork-<n>`; with `$T/move-<n>`, the
 /// head moves just before the merge call is answered, as a push racing it would. PR #n adds `a<n>.rs`, and `broken` too
@@ -362,8 +363,8 @@ impl Batch {
                moved=$(g -c user.name=f -c user.email=f@invalid commit-tree \"refs/pull/$n/head^{tree}\" -p \"refs/pull/$n/head\" -m pushed)\n\
                g update-ref \"refs/pull/$n/head\" \"$moved\"\n\
              fi\n\
-             sha=$(jq -r .sha \"$body\")\n\
-             [ \"$sha\" = \"$(g rev-parse \"refs/pull/$n/head\")\" ] || { echo 'HTTP/2.0 409 Conflict'; exit 1; }\n\
+             head=$(g rev-parse \"refs/pull/$n/head\"); sha=$(jq -r '.sha // empty' \"$body\"); sha=${sha:-$head}\n\
+             [ \"$sha\" = \"$head\" ] || { echo 'HTTP/2.0 409 Conflict'; exit 1; }\n\
              tree=$(g merge-tree --write-tree main \"$sha\") || { echo 'HTTP/2.0 405 Method Not Allowed'; exit 1; }\n\
              [ \"$(cat \"$T/tamper\" 2>/dev/null)\" != \"$n\" ] || tree=$(g rev-parse 'main^{tree}')\n\
              new=$(g -c user.name=f -c user.email=f@invalid commit-tree \"$tree\" -p main -m \"$(jq -r .commit_title \"$body\")\")\n\

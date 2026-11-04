@@ -985,3 +985,31 @@ fn merge_deletes_the_merged_head_branch_only_in_origins_repository_at_the_merged
         }
     }
 }
+
+/// Check 4 compares GitHub's PR with the claim: a head other than the claim's sha, a PR that isn't open, or
+/// one that doesn't target main fails it, and the dry run with it, whatever else passes.
+#[test]
+fn merge_refuses_a_pr_whose_github_head_state_or_base_isnt_the_claims() {
+    for scripts in SCRIPTS {
+        let change = |dir: &Path| put(dir, "code.txt", "a change\n");
+        let (tmp, _dir, mut merge) = merge_dry_run_command(scripts, |_| {}, change, |_| {}, None);
+        let out = merge.output().unwrap();
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert!(check_line(&out, "github").starts_with("ok"), "{scripts}: {}", check_line(&out, "github"));
+        let stub = tmp.path().join("stubs/gh");
+        let open = std::fs::read_to_string(&stub).unwrap();
+        for (case, from, to) in [
+            ("another head", r#""head":{"sha":""#, r#""head":{"sha":"0"#),
+            ("closed", r#""state":"open""#, r#""state":"closed""#),
+            ("merged", r#""merged":false"#, r#""merged":true"#),
+            ("another base", r#""base":{"ref":"main"}"#, r#""base":{"ref":"release"}"#),
+        ] {
+            assert!(open.contains(from), "{case}: the stub has no {from}");
+            write_executable(&stub, &open.replacen(from, to, 1));
+            let out = merge.output().unwrap();
+            let line = check_line(&out, "github");
+            assert_eq!(out.status.code(), Some(1), "{scripts}, {case}: {}", text(&out));
+            assert!(line.starts_with("FAIL") && line.contains("the claim says"), "{scripts}, {case}: {line}");
+        }
+    }
+}
