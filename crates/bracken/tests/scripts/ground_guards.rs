@@ -187,7 +187,9 @@ fn ground_guards_report_contributions_first_pushed_under_another_credential() {
         };
         let entry = |id: char, ms: u64, credential: &str, author: &str| {
             let id = id.to_string().repeat(64);
-            format!(r#"{{"id":"{id}","first_seen_ms":{ms},"credential":"{credential}","author":"{author}","bytes":10}}"#)
+            format!(
+                r#"{{"id":"{id}","first_seen_ms":{ms},"credential":"{credential}","author":"{author}","bytes":10}}"#
+            )
         };
         let lines = vec![
             entry('a', 1, "val", "VAL"),
@@ -213,7 +215,10 @@ fn ground_guards_report_contributions_first_pushed_under_another_credential() {
 
         let own = ground_guards(scripts, ".", ["main", "pr"], log(vec![entry('a', 1, "val", "VAL")]));
         let stdout = String::from_utf8_lossy(&own.stdout);
-        assert!(own.status.success() && stdout.contains("came first under its author's credential"), "{scripts}: {stdout}");
+        assert!(
+            own.status.success() && stdout.contains("came first under its author's credential"),
+            "{scripts}: {stdout}"
+        );
 
         let none = ground_guards(scripts, ".", ["main", "pr"], |_| {});
         let stdout = String::from_utf8_lossy(&none.stdout);
