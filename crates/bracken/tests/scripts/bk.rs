@@ -185,6 +185,22 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         assert_eq!(out.status.code(), Some(1), "{scripts}: carol wrote without a token");
         let (log, _) = ok(sh(&a, "scripts/bk", &["log"], Some("alice")), "log");
         assert!(!log.contains("from carol"), "{scripts}: {log}");
+        // A relay isn't refused (docs/design/agent-keys.md, part A step 1): carol's contribution, written
+        // in alice's replica past bk, goes to the server with alice's next write, under alice's
+        // credential, and the first-seen log records that for scripts/ground-guards to report.
+        let (relayed, _) = ok(sh(&a, real, &["--dir", ".bracken", "claim", "relayed", "--as", "carol"], None), "carol");
+        let relayed = common::bare_ids(relayed.trim().to_owned());
+        ok(sh(&a, "scripts/bk", &["claim", "relaying", "--as", "alice"], Some("alice")), "alice relays");
+        let (ids, _) = ok(sh(&a, "scripts/bk", &["id", "list", "--json"], None), "id list");
+        let ids: serde_json::Value = serde_json::from_str(&ids).unwrap();
+        let carol = ids.as_array().unwrap().iter().find(|i| i["name"] == "carol").unwrap()["agent"].clone();
+        let seen = std::fs::read_to_string(team.join("first-seen.jsonl")).unwrap();
+        let entry: serde_json::Value = seen
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .find(|e| e["id"] == relayed.trim())
+            .unwrap_or_else(|| panic!("{scripts}: the relayed claim isn't in the first-seen log"));
+        assert!(entry["credential"] == "alice" && entry["author"] == carol, "{scripts}: {entry}");
 
         // A confirm that fails once is retried, and the write confirms.
         std::fs::write(tmp.path().join("fail-once"), "").unwrap();
@@ -251,6 +267,54 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
         assert!(stderr.contains("can't pull from the team server"), "{scripts}: {stderr}");
+    }
+}
+
+/// docs/design/agent-keys.md, part A step 1: with BRACKEN_AGENT set, scripts/bk refuses an --as of its own
+/// that names another identity, in either form and wherever it stands before '--', and runs nothing, for
+/// a write and a read alike. The same identity, no BRACKEN_AGENT, an empty one, and an --as after '--'
+/// (the command's own) all go through.
+#[test]
+fn bk_refuses_an_as_that_differs_from_bracken_agent() {
+    for scripts in SCRIPTS {
+        let bk_copy = repo_root().join(scripts).join("bk");
+        let (_tmp, dir) = repo(&[("scripts/bk", &bk_copy)], ".bracken/\n", |_| {});
+        bk(&dir, &["init", "--name", "team"]);
+        bk(&dir, &["id", "new", "alice"]);
+        bk(&dir, &["id", "new", "bob"]);
+        let as_agent = |agent: Option<&str>, args: &[&str]| {
+            let mut c = command(&dir, "scripts/bk", args);
+            if let Some(agent) = agent {
+                c.env("BRACKEN_AGENT", agent);
+            }
+            c.output().unwrap()
+        };
+        let target = common::bare_ids(bk(&dir, &["claim", "a target", "--as", "alice"]).trim().to_owned());
+        let before = bk(&dir, &["log", "--json"]);
+        for args in [
+            &["claim", "as bob", "--as", "bob"][..],
+            &["claim", "as bob", "--as=bob"],
+            &["--as", "bob", "claim", "as bob"],
+            &["claim", "as bob", "--as", "alice", "--as", "bob"],
+            &["log", "--as", "bob"],
+        ] {
+            let out = as_agent(Some("alice"), args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {args:?}: {stderr}");
+            assert!(stderr.contains("differs from BRACKEN_AGENT (alice)"), "{scripts}: {args:?}: {stderr}");
+            assert!(out.stdout.is_empty(), "{scripts}: {args:?} ran");
+        }
+        assert_eq!(bk(&dir, &["log", "--json"]), before, "{scripts}: a refused --as wrote");
+        for (agent, args) in [
+            (Some("alice"), &["claim", "as alice", "--as", "alice"][..]),
+            (Some("alice"), &["claim", "as alice", "--as=alice"]),
+            (None, &["claim", "as bob", "--as", "bob"]),
+            (Some(""), &["claim", "as bob", "--as", "bob"]),
+            (Some("bob"), &["evidence", &target[..12], "--run", "--as", "bob", "--", "/usr/bin/true", "--as", "alice"]),
+        ] {
+            let out = as_agent(agent, args);
+            assert!(out.status.success(), "{scripts}: {agent:?} {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        }
     }
 }
 
