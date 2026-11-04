@@ -15,75 +15,60 @@ seven findings: the revocation cut (`459f57b58bb5`, `e2663094ef89`),
 delegation by a stolen manager credential (`c20195623de6`), the migration
 window (`263004ff8abd`), what an off-machine root buys (`9328d3a71afd`), the
 threat model's gaps (`d49dc7939051`) and the server's intake of revocations
-(`bd43398b3a0f`). Round 3 (brief `6302190acb02`) answers round 2's five
+(`bd43398b3a0f`). Round 3 (brief `6302190acb02`) answered round 2's five
 (`e52cc9ba888e`, `81d13d29f631`, `0d839e105c44`, `39653d87385e`,
-`35c17799be7a`). Their common cause: whether a record tightens or loosens
-depends on the policy that reads it (a fail rejects a finding and so
-unblocks a PR; a supersession can retire "Weave gate: on" or "Weave gate:
-off"), so no rule that counts some kinds of a revoked key's records and
-ignores others is safe. A revoked key's records outside its cut now **fail
-closed**: every reader that would use one refuses to decide until the root
-rules on it by id (4.4).
+`35c17799be7a`) by making a revoked key's out-of-cut records fail closed.
+Round 3's reviews confirmed four more findings, all in part B. The owner
+then decided "Part A now, B later" (decision `98a0dc81afff`) and approved
+part A's step 2 (approval `1ec8c15fd00f`). Round 4 (brief `f1f0da23180b`)
+records that: **part A is the accepted design; part B is open and not to be
+built** (*Part B is open*, after 4.2).
 
 ## Summary
 
 - **Against an agent that sets out to forge, nothing on this machine makes
   a signature proof.** Any agent with a shell can read every file the
   owner's user can, keys and tokens included, wherever they live, and can
-  edit every verifier on this machine. Even a root key held off the machine
-  only protects verifiers that are also out of agents' reach (section 4.6).
-  The design says so plainly (section 2).
-- **What it can improve is real, though:** accidents (signing as the wrong
-  identity), detection (a forgery leaves a trace that a guard reports),
-  revocation (a distrusted key's later records can't decide anything
-  without the root's ruling), blast radius (a stolen credential signs only
-  what its role may, and can't mint a validator), and the chance of
-  publishing a key through the public repository.
-- **Recommended: option D** (section 3), built in two parts (section 5).
-  **Part A stands alone** and can go ahead whatever becomes of part B:
-  1. **Guard rails, no format change.** `scripts/bk` refuses an `--as` that
-     differs from `BRACKEN_AGENT`; a guard reports contributions first
-     pushed under another identity's credential.
-  2. **The team server signs.** New keys are generated in the server's
-     private directory and never leave it. An agent holds a token, never a
-     key. The server signs only as the key its token is bound to, only what
-     that key's scope allows (from the server's own configuration in part
-     A), and logs every signature. A contribution by a server-held key that
-     isn't in the log was signed by someone who read the key file: the
-     guard reports it.
+  edit every verifier on this machine. The design says so plainly
+  (section 2).
+- **Accepted: part A** (option C in section 3; build steps 1 and 2, section
+  5; decision `98a0dc81afff`). It changes no format and no reader's
+  counting, and needs nothing from part B:
+  1. **Guard rails.** `scripts/bk` refuses an `--as` that differs from
+     `BRACKEN_AGENT`; a guard reports contributions first pushed under
+     another identity's credential.
+  2. **The team server signs for new identities.** Their keys are generated
+     in the server's private directory (0700) and never copied out
+     (approval `1ec8c15fd00f`); existing keys stay where they are. An agent
+     with a new identity holds a token, never a key. The server signs only
+     as the key its token is bound to, only what that key's scope in the
+     server's `scopes.toml` allows, and logs every signature. A contribution
+     by a server-held key that isn't in the log was signed by someone who
+     read the key file: the guard reports it.
 
-  **Part B** makes roles and revocation data in the Ground:
-  3. **Delegation records.** The owner's root key alone grants the roles
-     whose acts a gate counts (`reviewer`, `security`, `owner`,
-     `weave-runner`, `weave-integrator`, and `manager` as triager and Weave
-     gate switch); the manager may grant only builder keys, only server-held
-     ones, and its grants fall with it.
-  4. **Revocation that fails closed.** Only the root revokes, and a key's cut
-     can only shrink. A revoked key's records outside its cut are kept,
-     everywhere, and flagged. Every role-aware reader (merge gate, triage,
-     owner approvals, the Weave gate switch, Weave's views, acceptance)
-     refuses to decide anything such a record touches until the root rules
-     on it by id, `accept` or `dismiss`. The same records and rulings give
-     the same answer on every replica.
-- **No protocol change.** Ids, encoding, the signing context and the
-  validity rules stay as they are; every existing contribution still
-  verifies, and an older binary opens the Ground and sees the new records as
-  artifacts. Protocol-class review is still needed: `manyroot`'s signing API
-  changes shape (`identity.rs`, `contribution.rs`) without changing a byte,
-  and acceptance gains an opt-in policy field and a `held` status (protocol.md,
-  *Acceptance*), whose default changes nothing.
-- **Migration re-signs nothing.** In one root session the owner grants the
-  20 legacy keys their current names with an unrestricted scope and no
-  right to delegate, grants the new server-held keys, and revokes the legacy
-  keys, in that order. Every pre-cut status stays as it is. About 11,700
-  contributions stay exactly as they are. The legacy key files can be
-  deleted, but copies remain in backups, snapshots and transcripts, so they
-  never really leave the machine.
-- **The join should wait for part B**, so Weave's identities in the
-  coordination Ground are server-held and root-granted from their first
-  contribution. **The format freeze needn't wait:** Weave's line policies
-  keep naming keys, and no Weave format changes (section 4.10).
-- **Questions for the owner** are in section 6.
+  What it improves: accidents, detection, blast radius of a stolen token,
+  and no new key under the repository's working tree. What it doesn't:
+  revocation stays as process 9.3 has it (a decision, a new name), and
+  readers still match authors by name.
+- **Open: part B** (option D; sections 4.3 to 4.7 and 4.9's part B, build
+  steps 3 to 5): delegation, revocation, rotation and an owner root key. It
+  is a sketch with four confirmed, unresolved findings, and its
+  prerequisite is a refactor so every role-aware reader resolves roles
+  through one function instead of matching author names (*Part B is open*).
+  It is to be redesigned after that refactor, not built from this text.
+- **No protocol change in part A.** Ids, encoding, the signing context and
+  the validity rules stay as they are, and every existing contribution
+  still verifies. Step 2 still gets protocol-class review and the full
+  table: `manyroot`'s signing API changes shape (`identity.rs`,
+  `contribution.rs`) without changing a byte.
+- **No migration in part A.** Nothing is re-signed, moved or revoked; new
+  identities are simply created on the server.
+- **Weave.** The format freeze doesn't depend on either part. The join
+  needs part A, so Weave's identities in the coordination Ground are born
+  server-held; whether it also waits for part B is the owner's call when the
+  join comes up (section 4.10).
+- **Questions for the owner:** part A's are answered; the rest wait for
+  part B (section 6).
 
 ## 1. Where things are
 
@@ -192,12 +177,11 @@ leaves behind:
   unusual act, not a typo.
 - **Audit** (actors 2 and 3): a forgery leaves evidence that a routine guard
   reports, in a log the forger has to find and alter as well.
-- **Revocation** (all): once a key is distrusted, nothing it signs outside
-  its cut decides anything until the root rules on it, and the cut can't be
-  widened.
+- **Revocation** (all; part B, open): once a key is distrusted, what it
+  signs afterwards stops counting at a point every replica agrees on. Part
+  A doesn't give this: a key is replaced as process 9.3 says.
 - **Blast radius** (2 and 3, after discovery): a stolen token signs only what
-  its role may, so a runner's credential can't approve a merge and a
-  manager's can't mint a validator.
+  its scope allows, so a runner's credential can't approve a merge.
 - **Publication** (4): no private key under the repository's working tree.
   Backups, snapshots and transcripts are still copies (question 3).
 
@@ -224,7 +208,8 @@ Notes on each:
   other agents' unpushed contributions under whichever token runs the next
   `scripts/bk`. Refusing those would strand an ended builder's pending
   writes, so B logs and reports mismatches rather than refusing them.
-- **C** moves the keys, not the trust boundary: the server's directory is
+- **C** is accepted as part A for new identities only: existing keys stay
+  in `.bracken/identities/` (approval `1ec8c15fd00f`). It moves keys, not the trust boundary: the server's directory is
   as readable as `.bracken/identities/`. Its gains are that the normal path
   never touches a key, that it can refuse to sign outside a role's scope, and
   that its signing log makes a forgery with a server-held key detectable.
@@ -240,17 +225,18 @@ Notes on each:
   root records unforgeable, but only verifiers outside this machine's user
   benefit from that: the owner's device, an outside reader pinning the root
   from reviewed history. Section 4.6 says what it takes and what it buys.
-  It needs a device and tooling, so it is the owner's call (question 1).
+  It needs a device and tooling, so it is the owner's call (question 5).
 - **F** was deferred in network-sync.md for this reason: proving possession
   of a key every agent can read proves nothing. It is a protocol change for
   no gain here. Not proposed.
 - **G** is the only option that could make reads of a key file fail for an
   agent's process. Whether Claude Code's deny rules and sandbox hold for
   every tool in the permission mode the team runs in isn't verified, and it
-  is a harness setting, which this task leaves out. Listed as question 6.
+  is a harness setting, which this task leaves out. Listed as question 4.
 
-**Recommended: D**, built in steps so each one pays on its own, with E as
-the owner's choice for the root key.
+**Accepted: C**, as part A (decision `98a0dc81afff`). **D**, with E as the
+owner's choice for the root key, is part B: open, and to be redesigned
+after the refactor *Part B is open* names.
 
 ## 4. The design
 
@@ -259,8 +245,12 @@ the owner's choice for the root key.
 `bracken serve` gains `--keys <dir>`: a directory of identity files, inside
 the team directory (`~/.bracken-team/manyroot/keys/`, 0700), and a binding
 from each credential to exactly one key. Keys are generated there
-(`team-server key <name>`) and never copied out. A new request on the same
-listener:
+(`team-server key <name>`, for a new identity only) and never copied out.
+The same command records the new name and public key in the main
+checkout's `.bracken/agents/` through `bracken` (a public entry only, as
+`id new` writes today, never by hand), so name resolution and the server's
+allowlist, which is built from that directory, work as for any identity. A
+new request on the same listener:
 
 `POST /v1/<ground>/sign`, with the bearer token, and the contribution's
 canonical `content` as the body. The server:
@@ -268,10 +258,8 @@ canonical `content` as the body. The server:
 1. decodes `content` and refuses it unless it re-encodes to the same bytes
    (the same check as protocol.md, *Encoding*), its `ground` is the server's,
    its `protocol` is 1, and its `author` is the key bound to the token;
-2. refuses it unless the body is within the key's scope (from `scopes.toml`
-   in part A, 4.2, and from its grant in part B, 4.3), and, in part B, for a
-   delegation granting a `held: server` key, unless that key is in the
-   server's key directory;
+2. refuses it unless the body is within the identity's scope in
+   `scopes.toml` (4.2);
 3. computes the id, signs `"manyroot/v1/contribution:" || id` (the existing
    context, so nothing new can be signed), appends `{id, credential, time}`
    to `signed.jsonl`, and returns the signature.
@@ -285,9 +273,6 @@ lets it apply a scope.
 reports:
 - a contribution by a server-held key that isn't in `signed.jsonl`: someone
   signed with the key file;
-- a counted grant (4.3) of a key that is neither in the server's key
-  directory though its grant says `held: server` (part B): a key minted
-  outside the server;
 - a contribution first pushed under a credential bound to another key
   (step 1).
 
@@ -307,36 +292,94 @@ already fail to confirm then, and the merge gate already refuses, so what's
 lost is only the unconfirmed local write.
 
 
-### 4.2 Tokens, `--as` and scopes before grants
+### 4.2 Tokens, `--as` and scopes
 
 - `scripts/bk` refuses an `--as` that names a different identity from
   `BRACKEN_AGENT` when both are set. The agent sets its own `BRACKEN_AGENT`,
   so this guards against mistakes only.
-- A token is bound to one key. In part A the binding is the server's
-  configuration; in part B a role's current key is the one its current
-  grant names (4.3), so agents keep writing `--as manager` and `scripts/bk`
-  resolves the role to the key and its token.
-- **Scopes in part A** come from a file in the team directory,
-  `scopes.toml`, mapping each server-held key's name to a scope in the form
-  of 4.3's table. The manager edits it; it is local configuration, as
-  readable and writable by agents as the rest of the team directory, so it
-  caps mistakes and stolen tokens, not a forging agent. In part B the
-  server reads scopes from counted grants instead, and `scopes.toml` goes.
+- A token is bound to one key, by the server's configuration. A new
+  identity on the server is an ordinary identity: its name goes in
+  `.bracken/agents/` as today (`builder-<branch>`, say), so every reader that
+  matches authors by name keeps working unchanged, and `--as <name>` picks
+  its token as now.
+- **Only new identities.** Existing identities keep their key files in
+  `.bracken/identities/` and sign as they do (approval `1ec8c15fd00f`:
+  "existing keys stay where they are"). Nothing is copied into or out of the
+  server's key directory.
+- **Scopes** come from a file in the team directory, `scopes.toml`, mapping
+  each server-held identity's name, or a name pattern (`builder-*`), to a
+  scope: the body kinds it may sign, the relation kinds, and for claims the
+  tags it may or may not carry. A name with no entry gets no scope, and the
+  server signs nothing for it. The first entries follow what each role has
+  written in this Ground (builders: claims without `approval`, `decision`,
+  `task`, `owner-review` or `weave-gate` tags, relations of every kind,
+  evidence and retracts, from 862 `implements`, 396 `refines` and 366
+  `supersedes` among others). Scope limits what the server signs; it never
+  changes protocol.md's author rules. The manager edits the file; it is
+  local configuration, as readable and writable by agents as the rest of
+  the team directory, so it caps mistakes and stolen tokens, not a forging
+  agent.
 - **Retiring a key** is server-side: `team-server retire <name>` stops
   signing for it, drops its token, and the manager notes it in a claim. No
   record in the Ground is needed, so no builder scope has to allow one. A
   retired key's past contributions keep counting. Anything new by it isn't
-  in `signed.jsonl`, so the guard reports it. In part B the root revokes
-  retired keys in its next session (4.4), which turns that into a cut every
-  reader computes.
-- The `owner` token goes away if the root key leaves this machine (4.6).
+  in `signed.jsonl`, so the guard reports it. Retiring doesn't revoke: a
+  key someone copied still verifies, and readers still count what it signed
+  before. For a leak, process 9.3's recovery applies as today.
 
-Part A needs nothing else from this section or the next two: no delegation
-record, no revocation, no change to how any reader counts. Its gains are
+Part A needs nothing else from this document: no delegation record, no
+revocation, no change to how any reader counts, no root key. Its gains are
 the accident guard, the signing log and its guard, scoped signing, and no
 new key under the repository's working tree.
 
-### 4.3 Delegation records (part B)
+### Part B is open
+
+Sections 4.3 to 4.7, 4.9's part B, and build steps 3 to 5 are the round 3
+sketch of part B: delegation, revocation, rotation and an owner root key.
+**It is not accepted and is not to be built** (decision `98a0dc81afff`). It
+stays here as the record of what was tried and why it isn't ready. Four
+confirmed findings against it are unresolved:
+
+- **`3b67f0afb09a` (high): one role, two passes.** Acceptance counts
+  `min_passes` over distinct keys, and the sketch resolves a role to every
+  key with a counted grant. After a rotation a role has two keys, the old
+  one (in its cut) and the new one, so one role can supply two passes:
+  `--validator reviewer --validator security --min-passes 2` accepts with
+  two reviewer passes and no security review. Shown on a throwaway Ground.
+  Counting would have to be over distinct roles.
+- **`050c37b21b36` (medium): the readers aren't all covered.** 4.5's table
+  misses inputs today's readers decide on: `log --open` closing findings by
+  a triager's `merge gate` pass, `scripts/weave-shadow` picking gated heads
+  from the manager's passes, `scripts/weave` taking an owner approval as
+  `--owner-decision`, `scripts/merge`'s batches and its reuse of a pass on
+  another `pr` claim. And "touch" depends on how a reader queries: a reader
+  that reads `--tag approval --current` whole touches every pending
+  approval. Separately, those readers match authors by name
+  (`author_name == "manager"`, `"owner"`), so after a rotation to
+  `manager-k2` none of them would match.
+- **`53dfc3d02e9e` (medium): the revoked keys' quota stops everyone.** The
+  intake refuses an over-quota contribution, the sync then fails, and every
+  later write by every agent builds on the refused head, so none confirms
+  until the quota window rolls, and replicas split again. Shown on a
+  throwaway Ground with the pinned binary.
+- **`da22ec8fa334` (low): rulings can't be withdrawn.** Conflicting rulings
+  leave a record pending for good, and the Weave gate switch's touch set
+  ("any claim tagged `weave-gate`") lets an unrelated pending record turn
+  Weave gating off for good.
+
+**The prerequisite** for redesigning it: a refactor so every role-aware
+reader resolves roles through one function, instead of matching author
+names in its own way. The readers today: `scripts/merge` (its batches and
+its reuse of passes included), `scripts/weave-gate`, `scripts/weave-shadow`,
+`scripts/weave`'s `--owner-decision`, `scripts/weave-backup`,
+`log --open` and `findings`, `scripts/bk show --validator`,
+`scripts/owner-approve`, and the team server's allowlist. With one
+function, each reader's inputs can be pinned, rotation changes one mapping,
+and counting can be over roles rather than keys, which the first two
+findings need. Until then, a role is a name, and process 9.3's recovery
+(a new name and a decision) is how a key is replaced.
+
+### 4.3 Delegation records (part B, open)
 
 A delegation is an `artifact` with media type
 `application/vnd.manyroot.delegation+cbor`, name `delegation`, and a
@@ -425,7 +468,7 @@ scope would refuse in future. **Legacy keys get scope `all`** (4.9), so
 nothing already in the Ground falls outside a scope and every pre-cut status
 is unchanged by construction.
 
-### 4.4 Revocation (part B)
+### 4.4 Revocation (part B, open)
 
 **Revocations and rulings.** Both are root-only artifacts:
 
@@ -486,7 +529,7 @@ reaches the server, blocks its PR's gate (the gate stops on it), and the
 root accepts it by id; it isn't dropped, and no replica sees a different
 answer from the server's for want of it. The intake's quotas bound how many
 a leaked key can add: a revoked key's quota drops to a small number a day
-(question 2), past which its pushes are refused and the guard says so.
+(question 6), past which its pushes are refused and the guard says so.
 
 **The price.** A leaked revoked key can stop any decision it can touch, by
 writing records the root must rule on. That is a denial of service, loud and
@@ -498,7 +541,7 @@ in the same root session. **Revocations ignore retraction**: retracting one
 would undo its cut. A mistaken revocation is answered with a new grant of a
 new key, and rulings that accept the old key's pending records.
 
-### 4.5 Readers, and what touching means (part B)
+### 4.5 Readers, and what touching means (part B, open)
 
 A pending record *touches* a thing a reader decides when the reader would
 read it in deciding that thing: it is the thing, targets it, is a relation
@@ -544,7 +587,7 @@ supersession or retraction by the old key is ruled on by the root like any
 other pending record. A role-level version of the author rules would change
 protocol.md's derived state for everyone and isn't proposed.
 
-### 4.6 The owner's root key
+### 4.6 The owner's root key (part B, open)
 
 The root key signs grants and revocations, a few times a month, in
 sessions. Where it lives decides what its signature means, but **no
@@ -592,14 +635,14 @@ Which device can do all three isn't settled. Hardware keys that sign Ed25519
 generally show nothing about the message, so the likely form is a small
 signing tool on a second computer or phone the owner already has, with the
 bundle and signature carried across as files or QR codes. It needs checking
-before it's chosen (question 1).
+before it's chosen (question 5).
 
 Either way, approvals, which are frequent, can keep an `owner` key on this
 machine, granted by the root with the approvals-only scope. A stolen
 approvals key can then sign approvals, as today, but can't grant a key,
 revoke one or rule on a pending record, and the root can revoke it.
 
-### 4.7 The runner key
+### 4.7 The runner key (part B, open)
 
 `weave-runner` gets its own server-held key, granted by the root with the
 `weave-runner` scope: evidence and its log artifacts, nothing else. Its
@@ -613,7 +656,7 @@ in the log, not a process boundary.
 This applies once Weave writes to a Ground the team server serves, which is
 the join. The dogfood Ground isn't served, and serving it is new
 infrastructure (weave.md section 5), so until the join its runner stays a
-shared key, as documented (question 5).
+shared key, as documented (question 8).
 
 
 ### 4.8 Protocol impact
@@ -622,34 +665,35 @@ shared key, as documented (question 5).
 |---|---|---|
 | A: signing through a trait instead of `Identity` (`identity.rs`, `contribution.rs`) | protocol (review): the files are protocol class, though no byte changes | none; golden vectors unchanged |
 | A: `POST /sign`, `--keys`, credential binding, `scopes.toml`, retirement | cli, merge-gate tooling | none |
-| B: delegation, revocation and ruling payload formats | pinned like Weave's, reviewed as protocol class | new artifacts only; an older binary sees artifacts |
-| B: `revoked` and `held` in acceptance (protocol.md, *Acceptance*) | protocol (review): opt-in derived state, like `follow_changes` | none: default unchanged |
-| B: role resolution and fail-closed readers in `scripts/bk`, `scripts/merge`, `scripts/weave-gate`, the allowlist | merge-gate tooling | none |
+| B (open): delegation, revocation and ruling payload formats | pinned like Weave's, reviewed as protocol class | new artifacts only; an older binary sees artifacts |
+| B (open): `revoked` and `held` in acceptance (protocol.md, *Acceptance*) | protocol (review): opt-in derived state, like `follow_changes` | none: default unchanged |
+| B (open): role resolution and fail-closed readers in `scripts/bk`, `scripts/merge`, `scripts/weave-gate`, the allowlist | merge-gate tooling | none |
 
 No encoding, id, signing context or validity rule changes, so the protocol
 guard's vectors and the fixture Ground stay as they are, and every existing
-Ground opens. A release note in docs/releases.md is still owed for the
-acceptance field and the new formats.
+Ground opens. Part A needs a release note in docs/releases.md only for
+the server's new request and key directory; part B's redesign would owe
+one for any acceptance field or format it adds.
 
 ### 4.9 Migrating this Ground
 
 Nothing is re-signed: re-signing would change every id (`ground` and
 `author` are in the signed content) and break every reference.
 
-**After part A**, nothing about the Ground changes: new identities are
-created in the server's key directory instead of `.bracken/identities/`,
-and the legacy keys keep signing as they do, from their files. Moving a live
-legacy identity onto the server would mean copying its key, which this
-design doesn't do; it rotates instead, in part B.
+**Part A needs no migration.** Nothing about the Ground changes: new
+identities are created in the server's key directory instead of
+`.bracken/identities/`, and existing identities keep signing as they do,
+from their files (approval `1ec8c15fd00f`). Moving an existing identity
+onto the server would mean copying its key, which part A doesn't do.
 
-**Part B**, in order:
+**Part B (open, not to be built)** sketched this order:
 
-1. **Root key.** The owner creates it where question 1 decides, and the
+1. **Root key.** The owner creates it where question 5 decides, and the
    repository's pin names its public key, in a reviewed PR.
 2. **New keys, server-held.** The server generates one key per live role in
    its key directory (`manager-k2`, `reviewer-k2`, …). Nothing grants them
    yet, so no reader counts them. Creating them is the owner's go (decision
-   `adcb78b88c6c`), asked with question 2.
+   `adcb78b88c6c`), asked with question 6.
 3. **Handovers.** At a quiet point, with no PR between review and merge,
    the legacy keys do their last handovers (process 9.4: the manager's
    claims, open tasks the new keys will carry on).
@@ -685,42 +729,49 @@ after the cut get server-held keys from their first contribution.
 
 ### 4.10 Weave, the freeze and the join
 
-- **The freeze doesn't depend on this.** Line policies keep naming keys.
+- **The freeze depends on neither part.** Line policies keep naming keys.
   Rotating the runner or the integrator is a new policy version under the
   owner's decision, as any policy change is. No Weave format changes, so
   step 3 of decision `b4a3456de597` can go ahead in parallel.
-- **Weave's views fail closed** on pending records, as 4.5's table says:
-  `green` refuses for a manifest a pending result or objection touches, and
-  `head` for a line a pending decision or line version touches. That is
-  derived state in `crates/tree` (full table, protocol-class review), with
-  no format change, and it should land before the join.
-- **The join depends on it.** At the join, `weave-integrator` and
-  `weave-runner` begin writing to the coordination Ground. Created there
-  after part B, they are server-held, root-granted and scoped from their
-  first contribution, so Weave's author rules (integrator, validator, line
-  author) become as strong as the rest of the Ground's, and the summary's
-  caveat in weave.md shrinks to section 2's same-user limit. Joined before,
-  they would start as shared keys and need rotating at once. The join
-  doesn't need part B to be finished in every detail, only steps 3 and 4.
-- **`owner_decision`** in a line policy names a coordination claim; after
-  the join, `scripts/weave` checks it as an approval by a key granted
-  `owner`.
+- **The join needs part A.** At the join, `weave-integrator` and
+  `weave-runner` begin writing to the coordination Ground as new
+  identities there. Created after part A, they are server-held and scoped
+  from their first contribution (the runner to evidence and its log
+  artifacts, the integrator to Weave artifacts and their relations, in
+  `scopes.toml`), and no key file of theirs ever sits under the working
+  tree. Created before, they would start as files in
+  `.bracken/identities/`, and part A doesn't move existing keys.
+- **Part B is not a dependency of the join as things stand.** Under part A,
+  Weave's author rules (integrator, validator, line author) hold as far as
+  names, the signing log and scopes make them hold: a stolen runner token
+  can sign only check results, and a result signed with the runner's key
+  file outside the server is reported, but nothing in the Ground revokes a
+  key. Whether the join should also wait for part B's redesign, so a
+  Weave identity can be revoked with a cut every reader computes, is the
+  owner's call when the join comes up (question 7 covers part B's threat
+  model). If it doesn't wait, part B's redesign must cover the Weave
+  readers too (`weave green`, `head`, `scripts/weave-gate`).
+- **`owner_decision`** in a line policy names a coordination claim, which
+  `scripts/weave` checks as an approval signed by `owner`, by name, as now.
 
 ## 5. Build plan
 
-Two parts. **Part A (steps 1 and 2) stands alone**: it needs no delegation,
-revocation or ruling record and changes no reader's counting, so it can go
-ahead even if part B needs more design. **Part B (steps 3 to 5)** builds on
-A. A step that touches `crates/manyroot` or `crates/tree/src/` takes the
-full table (`scripts/code-scope full`).
+**Part A, steps 1 and 2, is accepted and goes ahead** (decision
+`98a0dc81afff`), each step its own task and PR once this design merges. It
+needs no delegation, revocation or ruling record and changes no reader's
+counting. **Part B, steps 3 to 5, is open and not to be built**: the rows
+are kept as the round 3 sketch, and its redesign starts with the
+role-resolution refactor (*Part B is open*). A step that touches
+`crates/manyroot` or `crates/tree/src/` takes the full table
+(`scripts/code-scope full`).
 
 | # | Part | PR | Class | Tests |
 |---|---|---|---|---|
 | 1 | A | `scripts/bk` refuses `--as` ≠ `BRACKEN_AGENT`; `scripts/ground-guards` reports contributions first pushed under another identity's credential (the first-seen log already records both) | merge-gate tooling | mismatch refused; a relayed contribution reported, not refused |
-| 2 | A | Signer trait in `manyroot`; `bracken serve --keys`, credential binding, `POST /sign` with canonical-content, author and scope checks, scopes from `scopes.toml` (4.2); `signed.jsonl`; `team-server key` and `retire`; `scripts/bk` signing through it; new identities created on the server; the guard for contributions by server-held keys missing from the log | protocol (review), cli; **full table** (touches `crates/manyroot`) | golden vectors unchanged; a token can't sign as another key; non-canonical content, a foreign Ground, another author, a body outside `scopes.toml`'s scope refused; a retired key refused; a contribution signed with the key file directly reported |
-| 3 | B | Delegation, revocation and ruling formats with golden vectors; grant counting (root-only gate roles, chains, `held`, scopes, grants voided with their granter); root-only revocations and rulings; the intersection cut; the server reading scopes from grants instead of `scopes.toml`; the delegation check (keys in its directory); the allowlist keeping revoked keys, the intake marking pending records, the revoked keys' quota | protocol (review); full table if the formats live in `crates/manyroot` or `crates/tree/src/` | each counting case; a manager's grant of `reviewer` ignored; a manager's grant of a key outside the key directory refused at signing and reported; a revoked manager's builder grants void; a revocation or ruling by the revoked key or its granter ignored; a second revocation narrowing, never widening, the cut; a revoked key's out-of-cut fail admitted by the server and marked pending (`0d839e105c44`, `39653d87385e`); conflicting rulings leave a record pending |
-| 4 | B | `revoked` and `held` in acceptance; role resolution for `--validator`, `--triager`, `--owner-approval`; every reader of 4.5's table failing closed; Weave's views failing closed | protocol (review); **full table** | each row of 4.5's table; and the round 1 and round 2 counterexamples: a self-revocation leaving out a reviewer's fail ignored (`459f57b58bb5`), a second revocation by the revoked key ignored (`e2663094ef89`), a pending triage fail stops the gate (`e52cc9ba888e` a), a pending fail on a supersessor holds the replaced claim too (`e52cc9ba888e` b), a pending "Weave gate: off" stops the gate (`81d13d29f631`), a real concurrent reviewer fail, accepted by ruling, blocks (`39653d87385e`); an in-cut forged fail dismissed by ruling stops counting |
-| 5 | B | The migration (4.9), run by the manager and the owner, with the owner's go | process | every pre-cut status unchanged (scope `all`, the refines and supersedes of every role included, `35c17799be7a`); the gate's commands by role; no legacy key can grant |
+| 2 | A | Signer trait in `manyroot`; `bracken serve --keys`, credential binding, `POST /sign` with canonical-content, author and scope checks, scopes from `scopes.toml` (4.2); `signed.jsonl`; `team-server key` and `retire`; `scripts/bk` signing through it for server-held identities; new identities created on the server, existing ones untouched; the guard for contributions by server-held keys missing from the log | protocol (review), cli; **full table** (touches `crates/manyroot`) | golden vectors unchanged; a token can't sign as another key; non-canonical content, a foreign Ground, another author, a body outside `scopes.toml`'s scope refused; a retired key refused; a name with no `scopes.toml` entry refused; an existing identity still signs from its file; a contribution signed with a server-held key file directly reported |
+| 3 | B (open) | Delegation, revocation and ruling formats with golden vectors; grant counting (root-only gate roles, chains, `held`, scopes, grants voided with their granter); root-only revocations and rulings; the intersection cut; the server reading scopes from grants instead of `scopes.toml`; the delegation check (keys in its directory); the allowlist keeping revoked keys, the intake marking pending records, the revoked keys' quota | protocol (review); full table if the formats live in `crates/manyroot` or `crates/tree/src/` | each counting case; a manager's grant of `reviewer` ignored; a manager's grant of a key outside the key directory refused at signing and reported; a revoked manager's builder grants void; a revocation or ruling by the revoked key or its granter ignored; a second revocation narrowing, never widening, the cut; a revoked key's out-of-cut fail admitted by the server and marked pending (`0d839e105c44`, `39653d87385e`); conflicting rulings leave a record pending |
+| 4 | B (open) | `revoked` and `held` in acceptance; role resolution for `--validator`, `--triager`, `--owner-approval`; every reader of 4.5's table failing closed; Weave's views failing closed | protocol (review); **full table** | each row of 4.5's table; and the round 1 and round 2 counterexamples: a self-revocation leaving out a reviewer's fail ignored (`459f57b58bb5`), a second revocation by the revoked key ignored (`e2663094ef89`), a pending triage fail stops the gate (`e52cc9ba888e` a), a pending fail on a supersessor holds the replaced claim too (`e52cc9ba888e` b), a pending "Weave gate: off" stops the gate (`81d13d29f631`), a real concurrent reviewer fail, accepted by ruling, blocks (`39653d87385e`); an in-cut forged fail dismissed by ruling stops counting |
+| 5 | B (open) | The migration (4.9), run by the manager and the owner, with the owner's go | process | every pre-cut status unchanged (scope `all`, the refines and supersedes of every role included, `35c17799be7a`); the gate's commands by role; no legacy key can grant |
 
 Docs that change with them: process.md sections 2 and 9.3, development.md
 *Owner approvals* and *Team server*, the README's *Not done yet*,
@@ -729,45 +780,50 @@ network-sync.md section 3, weave.md's summary caveat, and AGENTS.md's
 
 ## 6. Questions for the owner
 
-Part A needs only question 2's first half; part B needs the rest.
+### Part A's, answered
 
-1. **Where does the root key live?** (a) On this machine: root records
-   (grants, revocations, rulings) record your intent with an audit trail,
-   as approvals do today, and an agent could forge them. (b) Off it, on a
-   second computer or phone you already have, running a small signing tool
-   that shows each grant, revocation and ruling before you confirm, and
-   keeps its own check of the Ground. Root records then can't be forged, and
-   a check runs out of agents' reach, but this machine's merge gate can
-   still be pointed at another root by an agent that edits it; the device
-   catches that on its next check, not before. It costs a session by hand a
-   few times a month, plus one whenever a revoked key's records need a
-   ruling. Recommended: (b), if you have a device for it; the design works
-   either way. Should approvals stay on this machine under a root-granted
-   approvals-only key (recommended), or also go off it?
-2. **New keys, and the cut's terms.** (Part A) May the team server generate
-   and hold new agents' keys from now on, in its own directory (your go on
-   credentials, under `adcb78b88c6c`)? (Part B) May the 20 legacy key files
-   be deleted from `.bracken/identities/` after the cut, and do you accept
-   the cut's terms: after it, anything a legacy key signs outside the cut
-   stops every decision it touches until you rule on it by id (accept or
-   dismiss); a leaked legacy key can make you do that work, up to a quota
-   of, say, 20 records a day per revoked key?
+1. **Part A now, part B later?** Yes: "Part A now, B later" (decision
+   `98a0dc81afff`).
+2. **May the team server's private key directory (0700) generate and hold
+   the keys of new identities, never copied out, with existing keys staying
+   where they are?** Yes (approval `1ec8c15fd00f`, signed by the manager on
+   the owner's delegation; the owner said "Yes (Recommended)").
+
+### Open, not blocking part A
+
 3. **Copies of keys.** Time Machine, APFS snapshots and agent transcripts
-   keep copies of every key file, deleted or not. Exclude the server's key
-   directory from Time Machine (a setting on this machine), accepting that
-   losing the machine means re-creating and re-granting those keys?
-4. **The threat model.** Do you accept section 2's statement: on one user,
-   against an agent that sets out to forge, signatures remain intent plus
-   audit, revocation that fails closed, and a capped blast radius, not
-   proof; an off-machine root adds unforgeable root records and a check out
-   of agents' reach, not a trustworthy gate on this machine?
-5. **The dogfood Ground.** Keep its shared keys until the join
-   (recommended), or serve it so its runner signs through a server now
-   (new infrastructure)?
-6. **Harness read rules (G).** Would you like a separate task to test
+   keep copies of every key file, deleted or not, the server's new key
+   directory included. Exclude that directory from Time Machine (a setting
+   on this machine), accepting that losing the machine means re-creating
+   those identities under new names?
+4. **Harness read rules (G).** Would you like a separate task to test
    whether Claude Code's deny rules or sandbox can keep agents' tools from
    reading the server's key directory, in the permission mode the team uses?
    It's a harness setting, outside this task, and unverified.
+
+### Part B's, for its redesign
+
+Asked in round 3 (question `1d039aa82dfd`), not answered, and not to be
+asked again until part B is redesigned; they may change with it.
+
+5. **Where does the root key live?** On this machine (root records record
+   intent and an agent could forge them), or off it on a device you hold
+   that shows each record before you confirm and keeps its own check of the
+   Ground (root records then can't be forged, but this machine's gate can
+   still be repointed by an agent that edits it)? And do approvals stay on
+   this machine under a root-granted approvals-only key?
+6. **Legacy keys and the cut.** May the 20 legacy key files be deleted from
+   `.bracken/identities/` after a cut, and on what terms do a legacy key's
+   records after the cut count (finding `53dfc3d02e9e` showed the round 3
+   quota term doesn't work)?
+7. **The threat model.** Do you accept section 2's statement: on one user,
+   against an agent that sets out to forge, signatures remain intent plus
+   audit and a capped blast radius, not proof; an off-machine root adds
+   unforgeable root records and a check out of agents' reach, not a
+   trustworthy gate on this machine? Does the join wait for part B?
+8. **The dogfood Ground.** Keep its shared keys until the join
+   (recommended), or serve it so its runner signs through a server now
+   (new infrastructure)?
 
 ## 7. Not proposed
 
