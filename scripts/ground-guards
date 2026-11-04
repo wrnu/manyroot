@@ -31,7 +31,11 @@
 #   5. the committed Ground holds a contribution with a Weave media type, retracted or
 #      not: until the join, Weave records go only into the Weave Ground, through
 #      scripts/weave (docs/design/weave.md, A checkpoint tripwire).
-# 3 to 5 run only when <head> has a Ground. Progress goes to stdout; a failure is the
+# Then, never failing, it reports contributions the team server first stored under another identity's
+# credential, from its first-seen log (docs/design/agent-keys.md, part A step 1): one line per
+# credential and author, with a count and the newest id. With no team server set up here (CI), or a
+# log it can't read, it says so and goes on.
+# 3 to 5 and the report run only when <head> has a Ground. Progress goes to stdout; a failure is the
 # last line starting "ground-guards:" on stderr, naming its guard. A guard that can't
 # check says so and fails.
 #
@@ -145,4 +149,32 @@ done < <(g log --kind artifact --json | jq -r '.[] | "\(.id) \(.body.media_type 
   fail "no Weave records: the committed Ground holds contributions with a Weave media type, which go only into the Weave Ground; tell the owner:
 $(printf '%s\n' "${weave[@]}")"
 echo "ground-guards: no Weave records"
+# 6. A report, never a failure: contributions the team server first stored under another identity's
+# credential (docs/design/agent-keys.md, part A step 1). Most are relays, the main checkout's replica
+# pushing another agent's unpushed contribution under whichever token ran the next write, so it only
+# says how many, per credential and author, with the newest of each.
+marker="$main/.bracken-team"
+log=''
+[ ! -f "$marker" ] || log="$(cat "$marker")/first-seen.jsonl"
+if [ -z "$log" ]; then
+  echo "ground-guards: report: no team server here ($marker), so no first-seen log to read"
+elif [ ! -r "$log" ]; then
+  echo "ground-guards: report: can't read the first-seen log $log"
+elif ! report=$(g id list --json | jq -rs '
+    (.[0] | map({(.name): .agent}) | add // {}) as $key
+    | (.[0] | map({(.agent): .name}) | add // {}) as $name
+    | .[1:] | map(select($key[.credential] != .author))
+    | group_by([.credential, .author])
+    | map({c: .[0].credential, a: ($name[.[0].author] // ("key " + .[0].author[0:12])), n: length,
+        last: (max_by(.first_seen_ms).id[0:12])})
+    | sort_by(-.n, .c, .a) | .[]
+    | "ground-guards: report: credential \(.c) first pushed \(.n) of \(.a)'"'"'s, newest \(.last)"
+  ' - "$log"); then
+  echo "ground-guards: report: can't read the first-seen log $log as JSON lines"
+elif [ -z "$report" ]; then
+  echo "ground-guards: report: every contribution in the first-seen log came first under its author's credential"
+else
+  echo "ground-guards: report: contributions first pushed under another identity's credential (a relay, or a signature that isn't the pusher's own), by credential and author:"
+  printf '%s\n' "$report"
+fi
 echo "ground-guards: all guards pass at $head"
