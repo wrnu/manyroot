@@ -134,6 +134,11 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
     // copy of stdout (here a mktemp that fails), every exit 2 is rerun (finding 2bc99ca95dc3). Any other exit,
     // the compile's own, is passed on. sccache's output passes on, and an open fd 3, as cargo's jobserver is,
     // reaches sccache and the compiler (finding c3665d850bc9).
+    //
+    // Exit 254 (task f5849cee0423, gotcha fc6e6835ad88): a server started with a TMPDIR since deleted answers
+    // every compile with its fatal error, as sccache 0.19 does, and the compiler never runs. The wrapper says
+    // so in one line, stops that server, and runs the compiler itself. A compile the server ran and a signal
+    // killed (its note last on stdout) is passed on, never rerun, and so is every 254 without the copy.
     let failing = stubs.parent().unwrap().join("failing");
     let nocopy = stubs.parent().unwrap().join("nocopy");
     std::fs::create_dir_all(&failing).unwrap();
@@ -153,6 +158,15 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
     let not_last = "echo 'sccache: Compile terminated by signal 11'\necho 'later'";
     // The compiler's stdout ended without a newline, so sccache's note ends its last line (finding 19b295a1bb9a).
     let after_partial = "printf 'partial'; echo 'sccache: Compile terminated by signal 11'";
+    // sccache 0.19's answer from a server whose TMPDIR is gone, as the gotcha saw it (and as reproduced by
+    // hand: a server started under a TMPDIR then deleted, then a cacheable compile).
+    let stale = "echo 'sccache: encountered fatal error' >&2\n\
+                 echo 'sccache: error: Failed to create temp dir' >&2\n\
+                 echo 'sccache: caused by: Failed to create temp dir' >&2\n\
+                 echo 'sccache: caused by: No such file or directory (os error 2) at path \"/tmp/w/tmp/sccacheX\"' >&2";
+    let server_killed = "echo 'sccache: Compiler killed by signal 9'";
+    let server_killed_partial = "printf 'partial'; echo 'sccache: Compiler killed by signal 9'";
+    let stops = stubs.parent().unwrap().join("stops");
     for (code, says, copy, ran) in [
         (2, startup, true, "rustc"),
         (2, denied, true, "rustc"),
@@ -164,13 +178,20 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
         (2, after_partial, true, "sccache"),
         (2, denied, false, "rustc"),
         (2, killed, false, "rustc"),
+        (254, stale, true, "rustc"),
+        (254, server_killed, true, "sccache"),
+        (254, server_killed_partial, true, "sccache"),
+        (254, stale, false, "sccache"),
         (1, "", true, "sccache"),
         (101, "", true, "sccache"),
     ] {
+        let _ = std::fs::remove_file(&stops);
         write_executable(
             &failing.join("sccache"),
             &format!(
-                "#!/bin/bash\n{{ echo sccache \"$@\"; IFS= read -r j 2>/dev/null <&3; echo \"fd3=$j\"; }} >\"{}\"\n{says}\nexit {code}\n",
+                "#!/bin/bash\nif [ \"$1\" = --stop-server ]; then echo \"stop $SCCACHE_SERVER_UDS\" >>\"{}\"; exit 0; fi\n\
+                 {{ echo sccache \"$@\"; IFS= read -r j 2>/dev/null <&3; echo \"fd3=$j\"; }} >\"{}\"\n{says}\nexit {code}\n",
+                stops.display(),
                 seen.display()
             ),
         );
@@ -201,5 +222,14 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
             assert!(shown.contains(line), "{case}: sccache's {line:?} didn't pass on: {shown}");
         }
         assert!(stdout.contains("signal") == says.contains("signal"), "{case}: stdout stays stdout: {shown}");
+        // Only sccache's own failure stops its server, through the wrapper's socket, and says so in one line.
+        let fell_back = code == 254 && ran == "rustc";
+        let stopped = std::fs::read_to_string(&stops).unwrap_or_default();
+        let uid = String::from_utf8(Command::new("id").arg("-u").output().unwrap().stdout).unwrap();
+        let socket = format!("/tmp/bracken-sccache-{}/server.sock", uid.trim());
+        assert_eq!(stopped, if fell_back { format!("stop {socket}\n") } else { String::new() }, "{case}");
+        let said: Vec<&str> = stderr.lines().filter(|l| l.starts_with("rustc-wrapper:")).collect();
+        assert_eq!(said.len(), usize::from(fell_back), "{case}: {stderr}");
+        assert!(said.iter().all(|l| l.contains("sccache failed on its own")), "{case}: {stderr}");
     }
 }
