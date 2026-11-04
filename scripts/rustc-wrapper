@@ -15,11 +15,19 @@
 # on uncached (finding 20a5ceea1005). sccache 0.19 also exits 2 when a compile it ran itself was killed by a
 # signal (a crash, the OOM killer), and says so last on stdout: "sccache: Compile terminated by signal <n>",
 # at the end of the last line, which the compiler's own stdout may have begun (finding 19b295a1bb9a).
-# That one is passed on, never rerun (finding ec492ce1a7d1); one the server ran ends 254, passed on too.
-# Its errors can't be sorted reliably into before and after the compile (one context, "failed to execute
-# compile", covers both, and the compiler's stderr is in the same stream: findings 5e48b5f2a88e,
-# 38094ff61ec4), so any other exit 2 is rerun as before, a compile that had already run included. So is
-# every exit 2 when the copy of stdout can't be made (finding 2bc99ca95dc3).
+# That one is passed on, never rerun (finding ec492ce1a7d1). Its errors can't be sorted reliably into before
+# and after the compile (one context, "failed to execute compile", covers both, and the compiler's stderr is
+# in the same stream: findings 5e48b5f2a88e, 38094ff61ec4), so any other exit 2 is rerun as before, a
+# compile that had already run included. So is every exit 2 when the copy of stdout can't be made (finding
+# 2bc99ca95dc3).
+#
+# Exit 254 comes from the server. A compile it ran that a signal killed ends 254, its note last on stdout,
+# "sccache: Compiler killed by signal <n>": passed on, never rerun. Any other 254 is sccache's own fatal
+# error: the server answers "sccache: encountered fatal error" on stderr in place of the compile's output,
+# as when it was started with a TMPDIR since deleted and can't make its temp dir (gotcha fc6e6835ad88,
+# task f5849cee0423). rustc itself never exits 254. Then the wrapper says so in one line on stderr; stops
+# that server, so the next compile starts a fresh one (only compiles already under way see the line too);
+# and runs the compiler itself. With no copy of stdout, every 254 is passed on, as before.
 #
 # sccache's client sends its environment to the server, which runs the compiler with it. So sccache gets
 # only what a compile needs: the names cargo sets for a compile (CARGO_PKG_*, CARGO_BIN_EXE_*,
@@ -33,8 +41,8 @@
 # Clippy (cargo runs `rustc-wrapper clippy-driver rustc <args>` for workspace members) skips sccache,
 # so a lint is never answered from a cache made under other lint flags.
 #
-# It prints nothing of its own, and never logs a command or the environment: it drops sccache's own
-# log settings too.
+# It prints nothing of its own but that one line, and never logs a command or the environment: it drops
+# sccache's own log settings too.
 set -euo pipefail
 
 sccache=$(command -v sccache || true)
@@ -89,10 +97,25 @@ set +e
   "$sccache" "$@" | tee -- "${out:-/dev/null}"
 rc=${PIPESTATUS[0]}
 set -e
-[[ $rc -eq 2 ]] || exit "$rc"
-# A compile sccache ran and a signal killed: passed on. Any other 2: compile without sccache.
-if [[ -n $out ]] && tail -n 1 -- "$out" | grep -Eq 'sccache: Compile terminated by signal [0-9]+$'; then
-  exit 2
-fi
+case $rc in
+  2)
+    # A compile sccache ran and a signal killed: passed on. Any other 2: compile without sccache.
+    if [[ -n $out ]] && tail -n 1 -- "$out" | grep -Eq 'sccache: Compile terminated by signal [0-9]+$'; then
+      exit 2
+    fi
+    ;;
+  254)
+    # One the server ran and a signal killed, or any 254 without the copy: passed on. Any other: sccache's own
+    # fatal error, so its server is stopped, and the compile runs without it.
+    if [[ -z $out ]] || tail -n 1 -- "$out" | grep -Eq 'sccache: Compiler killed by signal [0-9]+$'; then
+      exit 254
+    fi
+    echo "rustc-wrapper: sccache failed on its own (exit 254), not the compile: compiling without it, and" \
+      "stopping its server so the next compile starts a fresh one" >&2
+    /usr/bin/env -i "${kept[@]}" SCCACHE_SERVER_UDS="$socket_dir/server.sock" "$sccache" --stop-server \
+      >/dev/null 2>&1 </dev/null || true
+    ;;
+  *) exit "$rc" ;;
+esac
 [[ -z $out ]] || rm -f -- "$out"
 exec "$@"
