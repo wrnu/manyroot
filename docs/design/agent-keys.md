@@ -22,7 +22,9 @@ Round 3's reviews confirmed four more findings, all in part B. The owner
 then decided "Part A now, B later" (decision `98a0dc81afff`) and approved
 part A's step 2 (approval `1ec8c15fd00f`). Round 4 (brief `f1f0da23180b`)
 records that: **part A is the accepted design; part B is open and not to be
-built** (*Part B is open*, after 4.2).
+built** (*Part B is open*, after 4.2). Part A is built: step 1 in PR #6 (task
+`2f3fc291683f`), step 2 under task `9fdcbbc35806` (docs/cli.md, *Keys a
+server holds*; docs/development.md, *Team server*).
 
 ## Summary
 
