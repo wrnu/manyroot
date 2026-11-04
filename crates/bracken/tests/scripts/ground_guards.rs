@@ -180,7 +180,10 @@ fn ground_guards_report_contributions_first_pushed_under_another_credential() {
                 let team = dir.join("team");
                 std::fs::create_dir_all(&team).unwrap();
                 std::fs::write(dir.join(".bracken-team"), format!("{}\n", team.display())).unwrap();
-                let val = ids[0]["agent"].as_str().unwrap().to_owned();
+                let val = ids.as_array().unwrap().iter().find(|i| i["name"] == "val").unwrap()["agent"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
                 let text: String = lines.iter().map(|l| l.replace("VAL", &val) + "\n").collect();
                 std::fs::write(team.join("first-seen.jsonl"), text).unwrap();
             }
@@ -217,6 +220,25 @@ fn ground_guards_report_contributions_first_pushed_under_another_credential() {
         let stdout = String::from_utf8_lossy(&own.stdout);
         assert!(
             own.status.success() && stdout.contains("came first under its author's credential"),
+            "{scripts}: {stdout}"
+        );
+
+        // An identity made after <head>'s Ground was committed is only in the main checkout's live
+        // directory, which names it: its own pushes aren't reported, a relay of val's by it is
+        // (finding 5af610a0062c).
+        let newer = ground_guards(scripts, ".", ["main", "pr"], |dir: &Path| {
+            bk(dir, &["id", "new", "newer"]);
+            let newer: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join(".bracken/agents/newer.json")).unwrap())
+                    .unwrap();
+            let key = newer["agent"].as_str().unwrap().to_owned();
+            log(vec![entry('a', 1, "newer", &key), entry('b', 2, "newer", &key), entry('c', 3, "newer", "VAL")])(dir);
+        });
+        let stdout = String::from_utf8_lossy(&newer.stdout);
+        let reported: Vec<&str> = stdout.lines().filter(|l| l.contains("report: credential")).collect();
+        assert_eq!(
+            reported,
+            ["ground-guards: report: credential newer first pushed 1 of val's, newest cccccccccccc"],
             "{scripts}: {stdout}"
         );
 

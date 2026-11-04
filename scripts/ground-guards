@@ -156,14 +156,19 @@ echo "ground-guards: no Weave records"
 marker="$main/.bracken-team"
 log=''
 [ ! -f "$marker" ] || log="$(cat "$marker")/first-seen.jsonl"
+# Names come from the main checkout's live directory as well as <head>'s: the log is live, so an identity
+# made since <head>'s last checkpoint is known only there (finding 5af610a0062c). Read only, and its
+# public entries only; with none readable, <head>'s alone.
+live=$(cat "$main"/.bracken/agents/*.json 2>/dev/null | jq -cs 'map({name, agent})' 2>/dev/null) || live='[]'
 if [ -z "$log" ]; then
   echo "ground-guards: report: no team server here ($marker), so no first-seen log to read"
 elif [ ! -r "$log" ]; then
   echo "ground-guards: report: can't read the first-seen log $log"
-elif ! report=$(g id list --json | jq -rs '
-    (.[0] | map({(.name): .agent}) | add // {}) as $key
-    | (.[0] | map({(.agent): .name}) | add // {}) as $name
-    | .[1:] | map(select($key[.credential] != .author))
+elif ! report=$({ printf '%s\n' "$live"; g id list --json; } | jq -rs '
+    (.[0] + .[1]) as $ids
+    | ($ids | map({(.name): .agent}) | add // {}) as $key
+    | ($ids | map({(.agent): .name}) | add // {}) as $name
+    | .[2:] | map(select($key[.credential] != .author))
     | group_by([.credential, .author])
     | map({c: .[0].credential, a: ($name[.[0].author] // ("key " + .[0].author[0:12])), n: length,
         last: (max_by(.first_seen_ms).id[0:12])})
