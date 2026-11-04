@@ -16,6 +16,8 @@
 #   - the Ground holds a contribution with a Weave media type, retracted or not: until
 #     the join, Weave records go only into the Weave Ground (docs/design/weave.md);
 #   - what got staged isn't exactly the new files that were checked;
+#   - the team server holds keys, and its signing log no longer extends the one the last signing-log
+#     claim recorded (someone rewrote it: tell the owner);
 #   - (on main, with an origin remote) origin's main, freshly fetched, has commits
 #     the local main doesn't and they fail scripts/ground-guards from the local
 #     main: no keys or stray files under .bracken/, the Ground append-only, the
@@ -31,6 +33,10 @@
 # Pulling and pushing are separate steps: merge the commit it names as checked
 # (not a fresh `git pull`, which could bring in more), then push. That's the only
 # way to update the main checkout, after a merge too (process 9.3).
+#
+# With a team server that holds keys (docs/design/agent-keys.md, 4.1), it records the signing log's length
+# and BLAKE3 hash, and scopes.toml's hash, in a claim tagged signing-log, as manager, whenever either
+# changed since the last such claim, and says when scopes.toml did; the claim goes into this checkpoint.
 #
 # Normally it runs on main. During the kickoff, `--setup` runs it on the setup
 # branch instead, with every other check, to commit the Ground's first files into
@@ -87,6 +93,37 @@ if [ -n "$checked" ]; then
     --tag note --as manager >/dev/null || stop "couldn't record the note for --attributes-checked; nothing was committed"
 fi
 then_pull() { [ -z "$pull" ] || echo "ground-checkpoint: origin's main passes the Ground guards; pull exactly it with: git merge --no-edit $pull"; }
+
+# The signing log and the scopes, recorded so a rewrite of the log's old entries is caught, and a scopes
+# change seen (verdict 4386857e6cdb).
+if ! $setup && [ -f "$main/.bracken-team" ] && team=$(cat "$main/.bracken-team") && [ -d "$team/keys" ]; then
+  command -v b3sum >/dev/null || stop "needs b3sum to record the team server's signing log; nothing was committed"
+  command -v jq >/dev/null || stop "needs jq to read the last signing-log claim; nothing was committed"
+  log="$team/signed.jsonl"
+  [ -e "$log" ] || log=/dev/null
+  length=$(wc -c <"$log" | tr -d ' ')
+  hash=$(b3sum --no-names <"$log")
+  scopes=absent
+  [ ! -e "$team/scopes.toml" ] || scopes=$(b3sum --no-names <"$team/scopes.toml")
+  records=$("$here/bk" log --tag signing-log --current --json --as manager) ||
+    stop "couldn't read the signing-log claims; nothing was committed"
+  last=$(jq -r '[.[] | select(.author_name == "manager")] | last | select(.) | "\(.id) \(.body.statement)"' <<<"$records")
+  pattern='^([0-9a-f]{64}) .*signed\.jsonl ([0-9]+) bytes, blake3 ([0-9a-f]{64}); scopes\.toml blake3 ([0-9a-f]{64}|absent)'
+  record=true
+  if [ -n "$last" ]; then
+    [[ $last =~ $pattern ]] || stop "the last signing-log claim (${last:0:12}) doesn't say a length and hashes; nothing was committed"
+    was=${BASH_REMATCH[1]:0:12} was_length=${BASH_REMATCH[2]} was_hash=${BASH_REMATCH[3]} was_scopes=${BASH_REMATCH[4]}
+    [ "$length" -ge "$was_length" ] && [ "$(head -c "$was_length" "$log" | b3sum --no-names)" = "$was_hash" ] ||
+      stop "the team server's signing log $log no longer extends the one claim $was recorded ($was_length bytes): its old entries were rewritten. Nothing was committed; tell the owner"
+    [ "$scopes" = "$was_scopes" ] || echo "ground-checkpoint: $team/scopes.toml changed since claim $was"
+    [ "$length $hash $scopes" != "$was_length $was_hash $was_scopes" ] || record=false
+  fi
+  if $record; then
+    "$here/bk" claim "Signing log (ground-checkpoint, $(date -u +%Y-%m-%dT%H:%MZ)): signed.jsonl $length bytes, blake3 $hash; scopes.toml blake3 $scopes" \
+      --tag signing-log --as manager >/dev/null || stop "couldn't record the signing log's claim; nothing was committed"
+    echo "ground-checkpoint: recorded the signing log ($length bytes) and scopes.toml's hash"
+  fi
+fi
 
 tracked_bad=$(git ls-files -- .bracken | grep -E -v "$allowed" || true)
 [ -z "$tracked_bad" ] || stop "tracked files under .bracken/ that aren't Ground files (if any is a key, treat it as leaked and tell the owner):

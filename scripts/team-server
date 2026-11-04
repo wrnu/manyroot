@@ -4,6 +4,8 @@
 #
 #   team-server setup <dir> [port]   once: make <dir> (outside the repo) and a server replica in it
 #   team-server token <identity>     issue, or replace, an identity's token (restarts a running server)
+#   team-server key <identity>       make a new identity whose key the server holds, and issue its token
+#   team-server retire <identity>    stop signing for a server-held identity, and drop its token
 #   team-server start | stop
 #   team-server run                  the server in the foreground, for launchd (scripts/services)
 #   team-server check                wait until the server listens and answers a sync
@@ -20,6 +22,15 @@
 # scripts/bk writes the main checkout's and syncs. A token is written once, to its 0600 file;
 # it's never printed, never in argv, and never in the Ground. Needs b3sum (cargo install --locked b3sum).
 #
+# The server holds new identities' keys and signs for them (docs/design/agent-keys.md, part A step 2;
+# approval 1ec8c15fd00f): key makes the identity with its private key in <dir>/keys/ (0700), never copied
+# out, and its public entry in the main checkout's .bracken/agents/ through bracken, as id new does; held.jsonl
+# lists every such identity's name and public key, for scripts/ground-guards. The server signs only within
+# <dir>/scopes.toml (key writes a first one, which the manager edits; the server reads it on every
+# request), and logs each signature in signed.jsonl. retire moves the key to <dir>/keys/retired/, where the
+# server doesn't read it, and drops its token; note it in a claim. Existing identities keep their key
+# files in .bracken/identities/ and sign as they do.
+#
 # Once scripts/services install has made the server a launchd agent, launchd keeps it running: start
 # and stop refuse (stopping it would only restart it; scripts/services uninstall stops it), and token
 # restarts it through launchd.
@@ -30,7 +41,10 @@ main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-d
 bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
 marker="$main/.bracken-team"
 fail() { echo "team-server: $*" >&2; exit 1; }
-usage() { echo "usage: team-server setup <dir> [port] | token <identity> | start | stop | run | check" >&2; exit 2; }
+usage() {
+  echo "usage: team-server setup <dir> [port] | token <identity> | key <identity> | retire <identity> | start | stop | run | check" >&2
+  exit 2
+}
 # The launchd agent scripts/services installs, and whether it is loaded for this checkout (its working
 # directory is the main checkout; another repository's agent, or a test's, isn't this one).
 label=jx.rs.bracken.team-server
@@ -71,6 +85,53 @@ prepare() {
   # Limits from network-sync.md, "Memory, for choosing step 3's limits".
   serve=("$bin" --dir "$dir/ground" serve --port "${url##*:}" --tokens "$dir/tokens.b3" --allow "$dir/allow"
     --first-seen "$dir/first-seen.jsonl" --batch-bytes 17825792 --id-budget 8388608 --max-sessions 16)
+  [ ! -d "$dir/keys" ] || serve+=(--keys "$dir/keys" --scopes "$dir/scopes.toml" --signed "$dir/signed.jsonl")
+}
+
+# Restarts the server if it runs, so it reads its tokens, allowlist and keys again: a token it doesn't know
+# would let the identity write locally and block everyone's pushes.
+restart() {
+  local old
+  if managed; then
+    echo "team-server: restarting the server through launchd, so it knows $1"
+    old=$(running_pid || true)
+    launchctl kickstart -k "gui/$(id -u)/$label"
+    await_up "$old" || exit 1
+  elif running_pid >/dev/null; then
+    echo "team-server: restarting the server, so it knows $1"
+    stop_server
+    start_server
+  fi
+}
+
+# Issues, or replaces, $name's token.
+issue_token() {
+  local hash
+  command -v b3sum >/dev/null || fail "needs b3sum: cargo install --locked b3sum"
+  # 32 random bytes as hex, straight into the 0600 file.
+  od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"$dir/tokens/$name.new"
+  hash=$(b3sum --no-names <"$dir/tokens/$name.new")
+  mv "$dir/tokens/$name.new" "$dir/tokens/$name"
+  { grep -v "^$name " "$dir/tokens.b3" 2>/dev/null || true; echo "$name $hash"; } >"$dir/tokens.b3.new"
+  mv "$dir/tokens.b3.new" "$dir/tokens.b3"
+  echo "team-server: token for $name in $dir/tokens/$name"
+}
+
+# The first scopes, from what each role has written in this Ground (docs/design/agent-keys.md, 4.2).
+first_scopes() {
+  cat <<'TOML'
+# What the team server signs for each identity whose key it holds (docs/design/agent-keys.md, 4.2). The
+# manager edits this file; the server reads it on every request, and signs nothing while it doesn't parse.
+# An entry is a name, or a name's start followed by '*'; an exact name wins over a pattern, and a longer
+# pattern over a shorter one. A name with no entry gets nothing signed. In an entry, kinds and relations
+# list what may be signed (absent: nothing), tags the only tags a claim may carry (absent: any), and
+# forbidden_tags those it may not.
+
+[scope."builder-*"]
+kinds = ["claim", "relation", "evidence", "retract"]
+relations = ["supports", "contradicts", "depends_on", "refines", "supersedes", "implements", "tests"]
+forbidden_tags = ["approval", "decision", "task", "owner-review", "weave-gate"]
+TOML
 }
 
 # Waits up to 30 seconds for a server other than pid $1 (if given) that is running, listening and has
@@ -143,28 +204,45 @@ case "${1:-}" in
     name=$2
     team_dir
     [[ $name =~ ^[a-z0-9_-]{1,64}$ ]] || fail "'$name' isn't an identity name"
-    command -v b3sum >/dev/null || fail "needs b3sum: cargo install --locked b3sum"
+    [ ! -e "$dir/keys/retired/$name.json" ] || fail "$name is retired: its key is no longer signed with"
     known=$(identities)
     [[ $known == *"\"name\": \"$name\""* ]] || fail "no identity $name in the main checkout's Ground"
-    # 32 random bytes as hex, straight into the 0600 file.
-    od -An -tx1 -N32 /dev/urandom | tr -d ' \n' >"$dir/tokens/$name.new"
-    hash=$(b3sum --no-names <"$dir/tokens/$name.new")
-    mv "$dir/tokens/$name.new" "$dir/tokens/$name"
-    { grep -v "^$name " "$dir/tokens.b3" 2>/dev/null || true; echo "$name $hash"; } >"$dir/tokens.b3.new"
+    issue_token
+    restart "$name"
+    ;;
+  key)
+    [ $# -eq 2 ] || usage
+    name=$2
+    team_dir
+    [[ $name =~ ^[a-z0-9_-]{1,64}$ ]] || fail "'$name' isn't an identity name"
+    command -v b3sum >/dev/null || fail "needs b3sum: cargo install --locked b3sum"
+    known=$(identities)
+    [[ $known != *"\"name\": \"$name\""* ]] || fail "$name is already an identity; key makes new ones only"
+    ! grep -q "\"name\":\"$name\"" "$dir/held.jsonl" 2>/dev/null || fail "$name was held by this server before"
+    mkdir -p "$dir/keys/retired"
+    chmod 700 "$dir/keys" "$dir/keys/retired"
+    [ -e "$dir/scopes.toml" ] || first_scopes >"$dir/scopes.toml"
+    # The private key into the server's directory, the public entry into the main checkout's agents/.
+    agent=$(BRACKEN_DIR="$main/.bracken" "$bin" id new "$name" --key-dir "$dir/keys") ||
+      fail "couldn't make identity $name"
+    [[ $agent =~ ^[0-9a-f]{64}$ ]] || fail "bracken id new printed no key for $name"
+    printf '{"name":"%s","agent":"%s"}\n' "$name" "$agent" >>"$dir/held.jsonl"
+    echo "team-server: made $name ($agent), its key held in $dir/keys"
+    issue_token
+    restart "$name"
+    ;;
+  retire)
+    [ $# -eq 2 ] || usage
+    name=$2
+    team_dir
+    [[ $name =~ ^[a-z0-9_-]{1,64}$ ]] || fail "'$name' isn't an identity name"
+    [ -f "$dir/keys/$name.json" ] || fail "this server holds no key for $name"
+    mv "$dir/keys/$name.json" "$dir/keys/retired/$name.json"
+    rm -f "$dir/tokens/$name"
+    { grep -v "^$name " "$dir/tokens.b3" || true; } >"$dir/tokens.b3.new"
     mv "$dir/tokens.b3.new" "$dir/tokens.b3"
-    echo "team-server: token for $name in $dir/tokens/$name"
-    # The server reads its tokens and allowlist only when it starts, so a running one restarts now:
-    # a token it doesn't know would let the identity write locally and block everyone's pushes.
-    if managed; then
-      echo "team-server: restarting the server through launchd, so it knows $name"
-      old=$(running_pid || true)
-      launchctl kickstart -k "gui/$(id -u)/$label"
-      await_up "$old" || exit 1
-    elif running_pid >/dev/null; then
-      echo "team-server: restarting the server, so it knows $name"
-      stop_server
-      start_server
-    fi
+    echo "team-server: retired $name: the server no longer signs for it, and its token is gone; note it in a claim"
+    if [ -s "$dir/tokens.b3" ]; then restart "$name's retirement"; elif running_pid >/dev/null; then stop_server; fi
     ;;
   start)
     [ $# -eq 1 ] || usage

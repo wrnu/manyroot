@@ -33,8 +33,9 @@
 #      scripts/weave (docs/design/weave.md, A checkpoint tripwire).
 # Then, never failing, it reports contributions the team server first stored under another identity's
 # credential, from its first-seen log (docs/design/agent-keys.md, part A step 1): one line per
-# credential and author, with a count and the newest id. With no team server set up here (CI), or a
-# log it can't read, it says so and goes on.
+# credential and author, with a count and the newest id; and contributions by a key the team server holds
+# that aren't in its signing log, so were signed with the key file outside the server (part A step 2).
+# With no team server set up here (CI), or a log it can't read, it says so and goes on.
 # 3 to 5 and the report run only when <head> has a Ground. Progress goes to stdout; a failure is the
 # last line starting "ground-guards:" on stderr, naming its guard. A guard that can't
 # check says so and fails.
@@ -181,5 +182,30 @@ elif [ -z "$report" ]; then
 else
   echo "ground-guards: report: contributions first pushed under another identity's credential (a relay, or a signature that isn't the pusher's own), by credential and author:"
   printf '%s\n' "$report"
+fi
+# 7. Also a report: contributions by a key the team server holds (its held.jsonl) that aren't in its
+# signing log, so were signed outside it, with the key file (docs/design/agent-keys.md, 4.1). It signs
+# only after logging, so a contribution it signed is always in the log.
+team=${log%/first-seen.jsonl}
+if [ -z "$log" ]; then
+  :
+elif [ ! -f "$team/held.jsonl" ]; then
+  echo "ground-guards: report: the team server holds no keys, so there's no signing log to check"
+elif ! [ -r "$team/held.jsonl" ] || { [ -e "$team/signed.jsonl" ] && ! [ -r "$team/signed.jsonl" ]; }; then
+  echo "ground-guards: report: can't read the team server's held.jsonl or signed.jsonl"
+elif ! unsigned=$(g log --json | jq -r --slurpfile held "$team/held.jsonl" \
+    --slurpfile signed "$([ -e "$team/signed.jsonl" ] && echo "$team/signed.jsonl" || echo /dev/null)" '
+    ($held | map({(.agent): .name}) | add // {}) as $h
+    | ($signed | map({(.id): true}) | add // {}) as $s
+    | map(select($h[.author] != null and ($s[.id] | not)))
+    | group_by(.author) | .[]
+    | "ground-guards: report: \(length) by \($h[.[0].author]), whose key the team server holds, signed outside it (not in its signing log): \(map(.id[0:12]) | .[0:10] | join(" "))\(if length > 10 then " ..." else "" end)"
+  '); then
+  echo "ground-guards: report: can't read the team server's held.jsonl or signed.jsonl as JSON lines"
+elif [ -z "$unsigned" ]; then
+  echo "ground-guards: report: every contribution by a key the team server holds is in its signing log"
+else
+  echo "ground-guards: report: contributions by keys the team server holds that it didn't sign (signed with the key file itself; tell the manager):"
+  printf '%s\n' "$unsigned"
 fi
 echo "ground-guards: all guards pass at $head"

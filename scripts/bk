@@ -22,6 +22,11 @@
 #     If the pinned bracken has watch --feed, bk gives that too: watch then waits on the server's change
 #     feed instead, and syncs only if the server has none.
 #
+# A write signs with the identity's key file in .bracken/identities/ if it has one, as every identity made
+# before keys moved to the team server does; otherwise the team server signs it, for an identity whose key
+# it holds (team-server key), through BRACKEN_SIGN_URL and BRACKEN_SIGN_TOKEN_FILE, which only bk sets
+# (docs/design/agent-keys.md, part A step 2).
+#
 # With BRACKEN_AGENT set, it refuses an --as that names another identity (docs/design/agent-keys.md,
 # part A step 1). It doesn't refuse pushing other identities' unpushed contributions from this replica:
 # relaying is how they reach the server, and scripts/ground-guards reports them from the server's
@@ -40,6 +45,8 @@ common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev
 }
 main=$(dirname "$common")
 export BRACKEN_DIR="$main/.bracken"
+# Signing through the team server is bk's to set up, for writes only.
+unset BRACKEN_SIGN_URL BRACKEN_SIGN_TOKEN_FILE
 
 bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
 if [ ! -x "$bin" ]; then
@@ -135,7 +142,7 @@ sync_team() {
 
 if $write; then
   [ -n "$token" ] || fail "no team token for '${who:-}' (pass --as <identity>), so nothing was written; the manager issues one with scripts/team-server token <identity>"
-  "$bin" "$@" || exit
+  BRACKEN_SIGN_URL=$url BRACKEN_SIGN_TOKEN_FILE=$token "$bin" "$@" || exit
   # One retry, after 0.5 to 2 seconds, in case the server's sessions were all busy.
   sync_team 60 --confirm || {
     delay=$((RANDOM % 1500 + 500))
