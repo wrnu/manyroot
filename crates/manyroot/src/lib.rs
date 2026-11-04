@@ -26,9 +26,9 @@ pub mod store;
 pub mod sync;
 pub mod validation;
 
-pub use contribution::{Body, BodyKind, Contribution, RelationKind, Verdict};
+pub use contribution::{Body, BodyKind, Contribution, ContributionContent, RelationKind, Verdict};
 pub use graph::{Graph, ImportReport, RuleViolation};
 pub use id::{AgentId, ContributionId, GroundId, Signature};
-pub use identity::Identity;
+pub use identity::{Identity, SignError, Signer};
 pub use store::{AgentEntry, GroundInfo, Store, StoreError};
 pub use validation::{Assessment, Conflict, Evaluation, Policy, Status};

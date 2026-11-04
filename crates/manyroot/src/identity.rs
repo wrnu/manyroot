@@ -6,9 +6,10 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
+use crate::contribution::ContributionContent;
 use crate::id::{AgentId, ContributionId, Signature};
 
 /// Domain-separation prefix for contribution signatures.
@@ -29,6 +30,33 @@ pub enum IdentityError {
 pub struct Identity {
     name: String,
     key: SigningKey,
+}
+
+/// What signs a contribution as one author: a local [`Identity`], or something that holds the key
+/// elsewhere, such as a server signing for its credentials. It's handed the content as well as the id,
+/// so a signer that holds the key elsewhere can read what it signs before signing it. Every signer signs
+/// the same message, `"manyroot/v1/contribution:" || id`; nothing about the encoding changes with it.
+pub trait Signer {
+    /// The author key the signatures verify under.
+    fn agent_id(&self) -> AgentId;
+
+    /// The author's signature over `id`, the id of `content`.
+    fn sign_content(&self, content: &ContributionContent, id: &ContributionId) -> Result<Signature, SignError>;
+}
+
+/// A signer that couldn't sign, saying why.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct SignError(pub String);
+
+impl Signer for Identity {
+    fn agent_id(&self) -> AgentId {
+        Identity::agent_id(self)
+    }
+
+    fn sign_content(&self, _: &ContributionContent, id: &ContributionId) -> Result<Signature, SignError> {
+        Ok(self.sign(id))
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -77,6 +105,15 @@ impl Identity {
             return Err(malformed("public key does not match secret key".into()));
         }
         Ok(identity)
+    }
+
+    /// Whether `bytes` holds this identity's private key, as hex in any case or as its raw bytes: the
+    /// likely accidents of a key file attached, or a key pasted into text.
+    pub fn key_is_in(&self, bytes: &[u8]) -> bool {
+        let raw = self.key.to_bytes();
+        let hex = hex::encode(raw);
+        let lower = bytes.to_ascii_lowercase();
+        lower.windows(hex.len()).any(|w| w == hex.as_bytes()) || bytes.windows(raw.len()).any(|w| w == raw)
     }
 
     /// Writes the identity file, refusing to overwrite an existing one.

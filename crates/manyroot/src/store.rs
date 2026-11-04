@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use crate::contribution::{Body, Contribution, DecodeError};
 use crate::graph::{Graph, ImportReport, RuleViolation};
 use crate::id::{AgentId, ContributionId, GroundId};
-use crate::identity::{self, Identity, IdentityError};
+use crate::identity::{self, Identity, IdentityError, SignError, Signer};
 use crate::sync::{Limits, Message, Session, SyncError};
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +60,8 @@ pub enum StoreError {
     DifferentGrounds(GroundId, GroundId),
     #[error("sync: {0}")]
     Sync(#[from] SyncError),
+    #[error("signing: {0}")]
+    Sign(#[from] SignError),
 }
 
 fn io(path: &Path) -> impl FnOnce(std::io::Error) -> StoreError + '_ {
@@ -260,6 +262,16 @@ impl Store {
         Ok(id)
     }
 
+    /// [`Store::contribute`] through any [`Signer`], such as one whose key is held elsewhere.
+    pub fn contribute_with(&mut self, signer: &dyn Signer, body: Body) -> Result<ContributionId, StoreError> {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        let heads: Vec<ContributionId> = self.graph.heads().collect();
+        let c = Contribution::create_with(self.info.ground, signer, heads, now, body)?;
+        let id = c.id();
+        self.add(c)?;
+        Ok(id)
+    }
+
     /// Adds one contribution whose parents are already present.
     pub fn add(&mut self, c: Contribution) -> Result<bool, StoreError> {
         if self.graph.contains(&c.id()) {
@@ -287,13 +299,21 @@ impl Store {
     /// Creates a private key and its public directory entry. Refuses a name
     /// that is already taken, here or in a directory entry from elsewhere.
     pub fn create_identity(&self, name: &str) -> Result<Identity, StoreError> {
+        self.create_identity_in(name, &self.identities_dir())
+    }
+
+    /// [`Store::create_identity`], with the private key in `key_dir` instead of this replica's
+    /// `identities/`: a key held by a signing server, say. The name must be free in both, and in the
+    /// public directory.
+    pub fn create_identity_in(&self, name: &str, key_dir: &Path) -> Result<Identity, StoreError> {
         let identity = Identity::generate(name)?;
-        let key_path = self.identities_dir().join(format!("{name}.json"));
-        let entry_path = self.agents_dir().join(format!("{name}.json"));
-        if key_path.exists() || entry_path.exists() {
+        let file = format!("{name}.json");
+        let key_path = key_dir.join(&file);
+        let entry_path = self.agents_dir().join(&file);
+        if key_path.exists() || entry_path.exists() || self.identities_dir().join(&file).exists() {
             return Err(StoreError::NameTaken(name.to_owned()));
         }
-        for dir in [self.identities_dir(), self.agents_dir()] {
+        for dir in [key_dir.to_owned(), self.agents_dir()] {
             fs::create_dir_all(&dir).map_err(io(&dir))?;
         }
         identity.save(&key_path)?;

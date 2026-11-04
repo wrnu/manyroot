@@ -27,10 +27,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use manyroot::contribution::MAX_CONTRIBUTION_BYTES;
 use manyroot::sync::{Message, Rejected};
 use manyroot::{AgentId, Contribution, ContributionId, Graph, GroundId, ImportReport, Store};
 use serde::{Deserialize, Serialize};
 
+use crate::signing::Signing;
 use crate::wire::{Bounds, Refused, Replica, Side, Timed, run_stream, write_frames};
 
 /// What a server accepts, and how much.
@@ -431,6 +433,8 @@ struct HttpSession {
 struct Server {
     intake: Mutex<Intake>,
     tokens: Tokens,
+    /// The keys it signs with, if it holds any (docs/design/agent-keys.md, 4.1).
+    signing: Option<Signing>,
     ground: GroundId,
     policy: Policy,
     /// Notified after every frame a session handles, so change feeds waiting on `intake` look again.
@@ -454,12 +458,13 @@ impl Drop for Reservation<'_> {
 
 /// Listens on 127.0.0.1:`port` (0 for any free port), prints the URL on stdout, and serves until
 /// the process ends. Each connection carries one request.
-pub fn serve_http(intake: Intake, tokens: Tokens, port: u16) -> Result<()> {
+pub fn serve_http(intake: Intake, tokens: Tokens, signing: Option<Signing>, port: u16) -> Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).context("listening on 127.0.0.1")?;
     let (ground, policy) = (intake.ground(), intake.policy.clone());
     let server = Arc::new(Server {
         intake: Mutex::new(intake),
         tokens,
+        signing,
         ground,
         policy,
         changed: Condvar::new(),
@@ -677,6 +682,9 @@ impl Server {
         if rest == "changes" {
             return self.changes(body);
         }
+        if rest == "sign" {
+            return self.sign(&credential, body);
+        }
         let rest = rest.strip_prefix("sessions").ok_or_else(no_ground)?;
         if rest.is_empty() {
             return self.open(&credential, body);
@@ -684,6 +692,26 @@ impl Server {
         let id =
             rest.strip_prefix('/').and_then(parse_session_id).ok_or_else(|| Refused::new(404, "no such session"))?;
         Reply::frames(&self.round(id, &credential, body)?, None)
+    }
+
+    /// A signature by the key bound to `credential`, over the content in the body ([`Signing::sign`]).
+    fn sign(&self, credential: &str, body: Body) -> Result<Reply, Refused> {
+        let signing = self.signing.as_ref().ok_or_else(|| Refused::new(404, "this server holds no keys"))?;
+        if body.length > MAX_CONTRIBUTION_BYTES as u64 {
+            return Err(Refused::new(413, "the content is over the contribution size limit"));
+        }
+        let mut bytes = Vec::new();
+        let stream = Timed::new(body.stream, Instant::now() + IO_TIMEOUT, None);
+        Cursor::new(body.early)
+            .chain(stream)
+            .take(body.length)
+            .read_to_end(&mut bytes)
+            .map_err(|_| Refused::new(408, "the body didn't arrive in time"))?;
+        if bytes.len() as u64 != body.length {
+            return Err(Refused::new(400, "the body is shorter than its Content-Length"));
+        }
+        let signature = signing.sign(self.ground, credential, &bytes)?;
+        Ok(Reply { body: signature, headers: String::new() })
     }
 
     /// The change feed: what the request's cursor hasn't seen, once something is there or its wait is over.
