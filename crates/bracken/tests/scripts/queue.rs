@@ -251,7 +251,7 @@ fn merge_counts_a_batch_pass_only_under_every_rule() {
             bk(&b.dir, &["retract", &id, "--as", "manager"]);
         }
 
-        // main moves in code between two members' merges: the second is refused before its POST, and
+        // main moves in code between two members' merges: the second is refused before its merge call, and
         // the batch stops with only the first merged.
         let b = Batch::new(scripts, 2, &[], false);
         assert!(b.verify(&[1, 2]).status.success(), "{scripts}");
@@ -264,11 +264,11 @@ fn merge_counts_a_batch_pass_only_under_every_rule() {
             "{scripts}: {said}"
         );
         assert!(said.contains("by the live merge-gate passes: #1."), "{scripts}: {said}");
-        assert_eq!(b.merged(), [1], "{scripts}: #2 was POSTed");
+        assert_eq!(b.merged(), [1], "{scripts}: #2 was merged");
     }
 }
 
-/// Finding 3199c8e0a8ad: a member's POST that fails while the forge merges anyway goes through the
+/// Finding 3199c8e0a8ad: a member's merge call that fails while GitHub merges anyway goes through the
 /// plain form's outcome handling (PR #107), which finds it merged; the batch's key check still runs, and
 /// the batch goes on to the tested tree.
 #[test]
@@ -280,10 +280,7 @@ fn merge_batch_carries_on_when_a_failed_post_merged_anyway_and_checks_the_prefix
         let out = b.merge(&["--batch", &b.batch_claim()[..12]]);
         let said = text(&out);
         assert!(out.status.success(), "{scripts}: {said}");
-        assert!(
-            said.contains("the merge call failed (HTTP 502), but the forge shows PR #2 merged"),
-            "{scripts}: {said}"
-        );
+        assert!(said.contains("the merge call failed (HTTP 502), but GitHub shows PR #2 merged"), "{scripts}: {said}");
         assert!(said.contains("main is the batch's prefix 2"), "{scripts}: the key check didn't run after it: {said}");
         assert_eq!(b.merged(), [1, 2, 3], "{scripts}");
 

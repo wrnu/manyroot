@@ -6,7 +6,7 @@ members = ["crates/manyroot", "crates/bracken", "crates/demo", "crates/experimen
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
-repository = "https://forge.jx.rs/Autimo/manyroot"
+repository = "https://github.com/wrnu/manyroot"
 
 [workspace.dependencies]
 manyroot = { path = "crates/manyroot" }

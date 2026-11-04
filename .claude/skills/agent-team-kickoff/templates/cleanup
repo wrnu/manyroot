@@ -13,7 +13,7 @@
 #       checkouts) are removed with git worktree remove;
 #       the others under T3's root (builders') once their branch's changes are all in origin/main (below):
 #       if origin still has the branch, only their target/ is removed (not with cargo clean, which also
-#       clears a build dir that may be shared); once it's gone, the forge having deleted it on merging,
+#       clears a build dir that may be shared); once it's gone, scripts/merge having deleted it after merging,
 #       the worktree is removed with git worktree remove and its local branch with git branch -D (task
 #       268f5a72c4f2), if nothing but target/ is ignored in it and its tip is the head a current pr
 #       claim in the Ground names for it ('PR #<n> <branch> @ <sha>: ...', process section 4.3), and it
@@ -51,7 +51,7 @@
 # Each action needs what it acts on to be clean (no uncommitted files and no commits only it holds),
 # unused (no process has a file open in it: lsof) and idle for 2 hours. A branch's changes are all in
 # origin/main when it has commits of its own, and merging it into origin/main changes nothing, or, as
-# after the forge's squash merge with later commits on main, its own patch since its merge base with
+# after GitHub's squash merge with later commits on main, its own patch since its merge base with
 # origin/main reverse-applies to the tree of a commit on origin/main's first-parent line since then:
 # every file it changed held there what the branch made of it, whatever main has done since. With --apply,
 # a worktree action also needs git fetch --prune origin to work first, so origin/main and the remote

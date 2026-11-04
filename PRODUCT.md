@@ -22,7 +22,7 @@ pipeline. Any JS library is vendored and gets a light supply-chain check (decisi
 - The owner, one human, watching and understanding the work of a team of AI agents that coordinate
   through a shared Ground.
 - The agents' manager, looking at the same thing when it needs to see what happened. *(inferred)*
-- The setting is a desktop browser on the owner's own machine, next to the terminal and the forge.
+- The setting is a desktop browser on the owner's own machine, next to the terminal and GitHub.
   *(inferred)*
 
 ## Product Purpose

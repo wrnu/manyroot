@@ -434,12 +434,11 @@ process already requires (process step 5). Two standing rules go with this:
   `404c66f318ce`). While CI runs PR code, none may exist. The job token is
   the remaining exposure, finding `b7f6724d61bb`.
 - **The merged commit is the verified commit.** The gate certifies the sha
-  in the current `pr` claim, but the Forge PR's head can move, and a `pr`
-  claim is free text. Before merging, the manager checks that the Forge PR's
-  head is exactly the current `pr` claim's full sha, and merges by that sha:
-  the merge API's expected-head field (`head_commit_id` in Forgejo's merge
-  options; to be verified before use, since `fj pr merge` has no such
-  option), so a head that moved fails the merge. That binds the PR's side
+  in the current `pr` claim, but the PR's head on GitHub can move, and a `pr`
+  claim is free text. Before merging, the manager checks that the PR's head
+  is exactly the current `pr` claim's full sha, and merges by that sha: the
+  merge API's expected-head field (`sha` in GitHub's merge call, which
+  `scripts/merge` sets), so a head that moved fails the merge with a 409. That binds the PR's side
   only: a squash merge lands the verified head combined with main's tip at
   merge time (finding `1b203aeab09b`). So the manager also checks that
   main's current tip is an ancestor of the verified sha (`git merge-base
@@ -574,7 +573,7 @@ signer would need at least:
   makes the whole test binary exit 0), which is one more reason a ci pass is
   never independent.
 - **Binding** (finding `f68a026f861f`): it runs only for a full 40-hex sha
-  that is the Forge PR's current head, records the PR number, and the merge
+  that is the PR's current head on GitHub, records the PR number, and the merge
   uses the expected-head check in section 5.
 - **The key:** readable only by the signer's service user. A leaked key lets
   its holder sign passing evidence on any claim, permanently and backdated,
