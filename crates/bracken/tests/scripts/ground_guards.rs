@@ -165,3 +165,62 @@ fn ground_guards_refuse_each_way_a_head_can_hide_or_break_the_ground() {
         }
     }
 }
+
+/// docs/design/agent-keys.md, part A step 1: ground-guards reports, never failing, the contributions the
+/// team server's first-seen log says came first under another identity's credential, one line per
+/// credential and author with a count and the newest id: a relay, a credential that names no identity
+/// (stdio), and an author the Ground doesn't know. A contribution under its own author's credential isn't
+/// reported. With no team server set up, or a log that isn't JSON lines, it says so and still passes.
+#[test]
+fn ground_guards_report_contributions_first_pushed_under_another_credential() {
+    for scripts in SCRIPTS {
+        let log = |lines: Vec<String>| {
+            move |dir: &Path| {
+                let ids: serde_json::Value = serde_json::from_str(&bk(dir, &["id", "list", "--json"])).unwrap();
+                let team = dir.join("team");
+                std::fs::create_dir_all(&team).unwrap();
+                std::fs::write(dir.join(".bracken-team"), format!("{}\n", team.display())).unwrap();
+                let val = ids[0]["agent"].as_str().unwrap().to_owned();
+                let text: String = lines.iter().map(|l| l.replace("VAL", &val) + "\n").collect();
+                std::fs::write(team.join("first-seen.jsonl"), text).unwrap();
+            }
+        };
+        let entry = |id: char, ms: u64, credential: &str, author: &str| {
+            let id = id.to_string().repeat(64);
+            format!(r#"{{"id":"{id}","first_seen_ms":{ms},"credential":"{credential}","author":"{author}","bytes":10}}"#)
+        };
+        let lines = vec![
+            entry('a', 1, "val", "VAL"),
+            entry('b', 2, "bob", "VAL"),
+            entry('c', 3, "val", &"f".repeat(64)),
+            entry('d', 4, "stdio", "VAL"),
+            entry('e', 5, "stdio", "VAL"),
+        ];
+        let out = ground_guards(scripts, ".", ["main", "pr"], log(lines));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{scripts}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+        let reported: Vec<&str> = stdout.lines().filter(|l| l.contains("report: credential")).collect();
+        assert_eq!(
+            reported,
+            [
+                "ground-guards: report: credential stdio first pushed 2 of val's, newest eeeeeeeeeeee",
+                "ground-guards: report: credential bob first pushed 1 of val's, newest bbbbbbbbbbbb",
+                "ground-guards: report: credential val first pushed 1 of key ffffffffffff's, newest cccccccccccc",
+            ],
+            "{scripts}: {stdout}"
+        );
+        assert!(stdout.contains("all guards pass at"), "{scripts}: {stdout}");
+
+        let own = ground_guards(scripts, ".", ["main", "pr"], log(vec![entry('a', 1, "val", "VAL")]));
+        let stdout = String::from_utf8_lossy(&own.stdout);
+        assert!(own.status.success() && stdout.contains("came first under its author's credential"), "{scripts}: {stdout}");
+
+        let none = ground_guards(scripts, ".", ["main", "pr"], |_| {});
+        let stdout = String::from_utf8_lossy(&none.stdout);
+        assert!(none.status.success() && stdout.contains("report: no team server here"), "{scripts}: {stdout}");
+
+        let bad = ground_guards(scripts, ".", ["main", "pr"], log(vec!["not json".to_owned()]));
+        let stdout = String::from_utf8_lossy(&bad.stdout);
+        assert!(bad.status.success() && stdout.contains("as JSON lines"), "{scripts}: {stdout}");
+    }
+}

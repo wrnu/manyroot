@@ -22,6 +22,11 @@
 #     If the pinned bracken has watch --feed, bk gives that too: watch then waits on the server's change
 #     feed instead, and syncs only if the server has none.
 #
+# With BRACKEN_AGENT set, it refuses an --as that names another identity (docs/design/agent-keys.md,
+# part A step 1). It doesn't refuse pushing other identities' unpushed contributions from this replica:
+# relaying is how they reach the server, and scripts/ground-guards reports them from the server's
+# first-seen log instead.
+#
 # It refuses what would reach another Ground, or bring in work the team server can't confirm: --dir in
 # any form, import, sync with anything but the team server, the weave command, and an artifact with a
 # Weave media type (docs/design/weave.md, Keeping the two scripts apart). The Weave Ground is reached
@@ -48,12 +53,12 @@ weave_media() { [[ $(printf '%s' "$1" | tr '[:upper:]' '[:lower:]') == applicati
 # The command, and whose token: --as before any '--', else BRACKEN_AGENT. What follows '--' is the
 # command's own (evidence --run -- <cmd> ...), so an --as there isn't bk's (note 6b211180ec3a).
 cmd='' who=${BRACKEN_AGENT:-} at=0 help=false follow=false peer=false
-media=()
+media=() as=()
 for ((i = 1; i <= $#; i++)); do
   case "${!i}" in
     --) break ;;
-    --as) j=$((i + 1)); who=${!j:-}; i=$j ;;
-    --as=*) who=${!i#--as=} ;;
+    --as) j=$((i + 1)); who=${!j:-}; as+=("$who"); i=$j ;;
+    --as=*) who=${!i#--as=}; as+=("$who") ;;
     --dir | --dir=*) fail "--dir is refused: bk always uses the team's Ground. Test with your branch's binary and BRACKEN_DIR=\$(mktemp -d)/g instead" ;;
     --media-type) j=$((i + 1)); media+=("${!j:-}"); i=$j ;;
     --media-type=*) media+=("${!i#--media-type=}") ;;
@@ -65,6 +70,14 @@ for ((i = 1; i <= $#; i++)); do
     -*) ;;
     *) [ -n "$cmd" ] || { cmd=${!i}; at=$i; } ;;
   esac
+done
+# An agent signs only as itself (docs/design/agent-keys.md, part A step 1): with BRACKEN_AGENT set, every
+# --as of bk's must name the same identity. A guard against mistakes only: the agent sets its own
+# BRACKEN_AGENT. A script that acts as another identity on purpose sets BRACKEN_AGENT for its bk calls,
+# as owner-approve does.
+for a in ${as[@]+"${as[@]}"}; do
+  [ -z "${BRACKEN_AGENT:-}" ] || [ "$a" = "$BRACKEN_AGENT" ] ||
+    fail "--as $a differs from BRACKEN_AGENT ($BRACKEN_AGENT), so nothing was run: sign only as your own identity (process section 2)"
 done
 [ "$cmd" != weave ] || fail "weave is refused: the Weave Ground is reached only through scripts/weave"
 # watch syncs only with the team server, as sync does (finding 6d623aa585d9): bk gives its --sync itself.
