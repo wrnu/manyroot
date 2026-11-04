@@ -447,6 +447,13 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
     if task["spec"].as_str().is_none_or(str::is_empty) {
         return Err("the task tool showed no spec".into());
     }
+    // Each item's full text comes by its id: the mock reads one, as an agent would (task b58cf9180030).
+    let ids: Vec<&str> = task["items"].as_array().into_iter().flatten().filter_map(|i| i["id"].as_str()).collect();
+    let id = ids.get((agent + turn as usize) % ids.len().max(1)).ok_or("the task tool listed no item")?;
+    let item = c.tool("task", json!({"item": id}))?;
+    if !item["text"].as_str().is_some_and(|t| t.starts_with(&format!("Item {id} ("))) {
+        return Err(format!("the task tool showed item {id} as {item}"));
+    }
     let head = c.tool("head", json!({}))?;
     let heads: Vec<String> = head["heads"]
         .as_array()

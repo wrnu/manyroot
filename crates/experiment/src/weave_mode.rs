@@ -58,7 +58,12 @@ impl Mode for WeaveMode {
         let id =
             json!({"type": "string", "description": "An id, in full or by a unique prefix of at least 8 hex digits"});
         vec![
-            tool("task", "The project's spec and the work items released so far", json!({}), &[]),
+            tool(
+                "task",
+                "The project's spec and an index of the work items released so far (each item's id, kind and title); with `item`, that item's full text",
+                json!({"item": {"type": "string", "description": "An item's id, as the index lists it"}}),
+                &[],
+            ),
             tool("list_files", "Every file in your working tree, with its size in bytes", json!({}), &[]),
             tool(
                 "read_file",
@@ -87,8 +92,8 @@ impl Mode for WeaveMode {
             ),
             tool(
                 "changes",
-                "Your working tree against the decision it started from (proposed or not): each file changed, and the diff",
-                json!({}),
+                "Your working tree against the decision it started from (proposed or not): each file changed, and the diff; with `path`, that file's alone. A diff too large for one result lists the files it leaves out",
+                json!({"path": path}),
                 &[],
             ),
             tool(
@@ -212,6 +217,196 @@ pub fn hub_data(project: &Project, integrator: &str, hold: bool) -> Result<Value
     }))
 }
 
+/// How an item's statement ends when it changes other items' requirement.
+const CHANGES: &str = "This changes the requirement of: ";
+
+/// An item as the hub states it, in a claim tagged `item`: its id, kind and title on the first line, then its
+/// issue text, then the items whose requirement it changes, if any. `item` is one of [`hub_data`]'s items.
+pub fn item_statement(item: &Value) -> String {
+    let revises: Vec<&str> = item["revises"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+    let mut text = format!(
+        "Item {} ({}): {}\n\n{}",
+        item["id"].as_str().unwrap_or_default(),
+        item["kind"].as_str().unwrap_or_default(),
+        item["title"].as_str().unwrap_or_default(),
+        item["text"].as_str().unwrap_or_default()
+    );
+    if !revises.is_empty() {
+        text.push_str(&format!("\n\n{CHANGES}{}.", revises.join(", ")));
+    }
+    text
+}
+
+/// An item's entry in the task tool's index, from its statement ([`item_statement`]): its id, kind and title,
+/// and the items whose requirement it changes. A statement of another shape is shown whole, so nothing the
+/// setter stated is lost.
+fn item_entry(statement: &str) -> Value {
+    let first = statement.lines().next().unwrap_or_default();
+    let parsed = first
+        .strip_prefix("Item ")
+        .and_then(|rest| rest.split_once(" ("))
+        .and_then(|(id, rest)| rest.split_once("): ").map(|(kind, title)| (id, kind, title)));
+    let Some((id, kind, title)) = parsed else { return json!({"text": statement}) };
+    let mut entry = json!({"id": id, "kind": kind, "title": title});
+    if let Some(list) = statement.lines().last().and_then(|l| l.strip_prefix(CHANGES)) {
+        entry["changes"] = json!(list.trim_end_matches('.').split(", ").collect::<Vec<_>>());
+    }
+    entry
+}
+
+/// What the task tool shows, given the spec and the released items' statements (task `b58cf9180030`). With no
+/// `item`: the spec whole and an index of the items, so the result stays under Pi's output cap however many
+/// items are out (report `b7b35a307aea`: a whole list was cut). With `item`, that item's full statement.
+pub fn task_view(spec: Option<&str>, items: &[String], item: Option<&str>) -> Result<Value, String> {
+    let Some(id) = item else {
+        let index: Vec<Value> = items.iter().map(|s| item_entry(s)).collect();
+        return Ok(json!({
+            "spec": spec,
+            "items": index,
+            "item_text": "Each item's full text: call task with item set to its id.",
+        }));
+    };
+    items
+        .iter()
+        .find(|s| item_entry(s)["id"] == id)
+        .map(|s| json!({"item": id, "text": s}))
+        .ok_or_else(|| format!("no released item {}: task with no item lists those released", short(id)))
+}
+
+/// Every result the task tool could give for `project` once all its items are out, as the driver sends it
+/// (JSON text): the index, and each item in full, by what it is.
+pub fn task_outputs(project: &Project) -> Result<Vec<(String, String)>, String> {
+    let data = hub_data(project, ANY_AGENT, false)?;
+    let items: Vec<String> = data["items"].as_array().into_iter().flatten().map(item_statement).collect();
+    let spec = data["spec"].as_str();
+    let mut out = vec![("the index".to_string(), task_view(spec, &items, None)?.to_string())];
+    for item in project.items.iter() {
+        out.push((format!("item {}", item.id), task_view(spec, &items, Some(&item.id))?.to_string()));
+    }
+    Ok(out)
+}
+
+/// The preflight a project's plan and run take (task `b58cf9180030`): refused if any task tool result, with
+/// every item released, would be over what an agent is shown whole ([`crate::driver::MAX_RESULT_BYTES`], under
+/// Pi's cap), so no run starts with a spec or an item an agent can't read.
+pub fn check_task_outputs(project: &Project) -> Result<(), String> {
+    for (what, text) in task_outputs(project)? {
+        if text.len() > crate::driver::MAX_RESULT_BYTES {
+            return Err(format!(
+                "project {}: the task tool's result for {what} would be {} bytes, over the {} an agent is shown \
+                 whole (Pi's MCP output cap is {}): shorten the spec or the item",
+                project.name,
+                text.len(),
+                crate::driver::MAX_RESULT_BYTES,
+                crate::driver::PI_MCP_OUTPUT_MAX_BYTES
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// A failed bracken command, as an agent is told it: its first words only, so no output of any size reaches it
+/// unchecked.
+fn failure(command: &str, stderr: &[u8]) -> String {
+    format!("bracken {command}: {}", short(String::from_utf8_lossy(stderr).trim()))
+}
+
+/// The most bytes of a result's list (diffs, files, conflicts), JSON-escaped, a Weave tool puts in one result:
+/// under [`crate::driver::MAX_RESULT_BYTES`] with room for the rest of it.
+const LIST_BYTES: usize = crate::driver::MAX_RESULT_BYTES - 2048;
+
+/// `parts` from the first, while their JSON text fits `budget` bytes in all, and those left out.
+fn fit<T: serde::Serialize>(mut parts: Vec<T>, budget: usize) -> (Vec<T>, Vec<T>) {
+    let mut size = 0;
+    let keep = parts
+        .iter()
+        .take_while(|p| {
+            size += serde_json::to_string(p).map_or(usize::MAX / 2, |j| j.len() + 1);
+            size <= budget
+        })
+        .count();
+    let rest = parts.split_off(keep);
+    (parts, rest)
+}
+
+/// The changes tool's result: the files changed and as many files' whole diffs as fit, naming the files whose
+/// diff it leaves out, so a large diff never cuts one off in the middle unsaid (task `b58cf9180030`).
+pub fn changes_view(base: String, files: Vec<&str>, diff: &str) -> Value {
+    let (files, files_left) = fit(files, LIST_BYTES / 4);
+    let used = serde_json::to_string(&files).map_or(0, |j| j.len());
+    let mut parts: Vec<&str> = Vec::new();
+    let mut from = 0;
+    for (at, _) in diff.match_indices("diff --git ").filter(|(at, _)| *at == 0 || diff.as_bytes()[at - 1] == b'\n') {
+        if at > from {
+            parts.push(&diff[from..at]);
+        }
+        from = at;
+    }
+    if from < diff.len() {
+        parts.push(&diff[from..]);
+    }
+    let (shown, left) = fit(parts, LIST_BYTES - used);
+    let mut out = json!({"base": base, "files": files, "diff": shown.concat()});
+    if !files_left.is_empty() {
+        out["files_not_shown"] = json!(files_left.len());
+    }
+    if !left.is_empty() {
+        let paths: Vec<&str> =
+            left.iter().filter_map(|p| p.lines().next()?.rsplit_once(" b/").map(|(_, path)| path)).collect();
+        let (named, unnamed) = fit(paths, LIST_BYTES / 8);
+        out["diff_not_shown"] = json!(named);
+        out["note"] = json!(format!(
+            "The diff is too large for one result: {} files' diffs are left out{}. Call changes with path for each.",
+            left.len(),
+            if unnamed.is_empty() { String::new() } else { format!(", {} of them not named here", unnamed.len()) }
+        ));
+    }
+    out
+}
+
+/// The diff tool's result, from `bracken weave diff --json`: every file, or, when they don't all fit one
+/// result, as many as fit, by path and change, with the count of those left out.
+pub fn diff_view(mut v: Value) -> Value {
+    let files = v["files"].as_array().cloned().unwrap_or_default();
+    if serde_json::to_string(&files).map_or(0, |j| j.len()) <= LIST_BYTES {
+        return v;
+    }
+    let brief: Vec<Value> = files.iter().map(|f| json!({"path": f["path"], "change": f["change"]})).collect();
+    let (shown, left) = fit(brief, LIST_BYTES);
+    v["files"] = json!(shown);
+    if !left.is_empty() {
+        v["files_not_shown"] = json!(left.len());
+    }
+    v["note"] = json!("Too many files for one result: each is shown by path and change only.");
+    v
+}
+
+/// The error an integrate that stopped at conflicts gives, from bracken's JSON: each conflict's path, whether
+/// either side deleted it, its conflicting regions and the resolutions offered for it, as many as fit, with the
+/// count of those left out. None if `v` lists no conflict.
+pub fn conflicts_error(v: &Value) -> Option<String> {
+    let all = v["conflicts"].as_array().filter(|c| !c.is_empty())?;
+    let side = |x: &Value| if x.is_null() { "deleted" } else { "present" };
+    let rows: Vec<Value> = all
+        .iter()
+        .map(|c| {
+            let offered: Vec<&Value> =
+                c["offered"].as_array().into_iter().flatten().map(|o| &o["resolution"]).collect();
+            json!({"path": c["path"], "into": side(&c["into"]), "from": side(&c["from"]),
+                   "regions": c["text_conflicts"], "offered": offered})
+        })
+        .collect();
+    let (shown, left) = fit(rows, LIST_BYTES);
+    let more = if left.is_empty() { String::new() } else { format!(" ({} more not shown)", left.len()) };
+    Some(format!(
+        "merging {} stopped at {} conflicts with no resolution, so nothing was written{more}: {}. Settle each with \
+         resolve, giving the same proposals, then integrate them again.",
+        v["step"].as_str().unwrap_or("the proposals"),
+        all.len(),
+        Value::from(shown)
+    ))
+}
+
 /// Whether `path` is one an agent may name: a plain relative path of UTF-8 components, none empty, `.` or
 /// `..`, none starting with `.git` or `.bracken`, at most 255 bytes a component and 1024 in all.
 pub fn plain_path(path: &str) -> Result<(), String> {
@@ -261,9 +456,19 @@ impl WeaveStore {
     /// `bracken --dir <own replica> <argv>` in the store's directory, with only `PATH` set, to the real git's
     /// directory: Weave reads a tree through git.
     fn bracken(&mut self, argv: &[String]) -> Result<Vec<u8>, String> {
+        let out = self.bracken_output(argv)?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(failure(argv.first().map_or("", String::as_str), &out.stderr))
+        }
+    }
+
+    /// [`WeaveStore::bracken`]'s process, whatever its exit.
+    fn bracken_output(&mut self, argv: &[String]) -> Result<std::process::Output, String> {
         self.runs += 1;
         let path = self.config.git.parent().map(Path::to_path_buf).unwrap_or_default();
-        let out = Command::new(&self.config.bracken)
+        Command::new(&self.config.bracken)
             .arg("--dir")
             .arg(self.replica())
             .args(argv)
@@ -272,13 +477,7 @@ impl WeaveStore {
             .current_dir(&self.config.dir)
             .stdin(Stdio::null())
             .output()
-            .map_err(|e| format!("running bracken: {e}"))?;
-        if out.status.success() {
-            Ok(out.stdout)
-        } else {
-            let err = String::from_utf8_lossy(&out.stderr);
-            Err(format!("bracken {}: {}", argv.first().map_or("", String::as_str), short(err.trim())))
-        }
+            .map_err(|e| format!("running bracken: {e}"))
     }
 
     fn bracken_json(&mut self, argv: &[&str]) -> Result<Value, String> {
@@ -628,20 +827,8 @@ impl WeaveStore {
     fn state_items(&mut self, data: &Value, later: bool) -> Result<Vec<String>, String> {
         let mut released = Vec::new();
         for item in data["items"].as_array().into_iter().flatten().filter(|i| i["later"] == later) {
-            let id = item["id"].as_str().unwrap_or_default();
-            let revises: Vec<&str> =
-                item["revises"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-            let mut text = format!(
-                "Item {id} ({}): {}\n\n{}",
-                item["kind"].as_str().unwrap_or_default(),
-                item["title"].as_str().unwrap_or_default(),
-                item["text"].as_str().unwrap_or_default()
-            );
-            if !revises.is_empty() {
-                text.push_str(&format!("\n\nThis changes the requirement of: {}.", revises.join(", ")));
-            }
-            self.claim("item", &text)?;
-            released.push(id.to_string());
+            self.claim("item", &item_statement(item))?;
+            released.push(item["id"].as_str().unwrap_or_default().to_string());
         }
         Ok(released)
     }
@@ -669,9 +856,10 @@ impl WeaveStore {
         Ok(json!({"key": key}))
     }
 
-    /// The spec and the items released so far: only claims the setter's key signed (finding `8c2713b55062`),
-    /// so no claim another author tags `spec` or `item` reaches an agent as its task.
-    fn task(&mut self) -> Result<Value, String> {
+    /// The spec and the index of the items released so far, or with `item`, that item in full ([`task_view`]):
+    /// only claims the setter's key signed (finding `8c2713b55062`), so no claim another author tags `spec` or
+    /// `item` reaches an agent as its task.
+    fn task(&mut self, item: Option<&str>) -> Result<Value, String> {
         let setter = self.saved("setter.txt")?;
         let log = |s: &mut WeaveStore, tag: &str| s.bracken_json(&["log", "--json", &format!("--tag={tag}")]);
         let texts = |v: &Value| -> Vec<String> {
@@ -684,7 +872,7 @@ impl WeaveStore {
         };
         let spec = texts(&log(self, "spec")?);
         let items = texts(&log(self, "item")?);
-        Ok(json!({"spec": spec.first(), "items": items}))
+        task_view(spec.first().map(String::as_str), &items, item)
     }
 
     fn read_file(&mut self, args: &Args) -> Result<Value, String> {
@@ -750,17 +938,23 @@ impl WeaveStore {
 
     /// The working tree against its base's commit, so a proposal doesn't hide what it proposed (finding
     /// `24bae8fdb48a`).
-    fn changes(&mut self) -> Result<Value, String> {
+    /// With `path`, that file's alone. A diff too large for one result keeps each file's diff whole, as many
+    /// as fit, and names the files it leaves out (task `b58cf9180030`).
+    fn changes(&mut self, path: Option<&str>) -> Result<Value, String> {
+        if let Some(p) = path {
+            plain_path(p)?;
+        }
+        let only: Vec<&str> = path.into_iter().collect();
         self.git(&["add", "-A"])?;
         let files = self
-            .git(&["diff", "--cached", "--name-status", "refs/tags/base", "--"])
+            .git(&[&["diff", "--cached", "--name-status", "refs/tags/base", "--"][..], &only].concat())
             .map(|o| String::from_utf8_lossy(&o).into_owned());
         let diff = self
-            .git(&["diff", "--cached", "--no-color", "--no-ext-diff", "refs/tags/base", "--"])
+            .git(&[&["diff", "--cached", "--no-color", "--no-ext-diff", "refs/tags/base", "--"][..], &only].concat())
             .map(|o| String::from_utf8_lossy(&o).into_owned());
         self.git(&["reset", "-q"])?;
         let (files, diff) = (files?, diff?);
-        Ok(json!({"base": self.saved("base.txt")?, "files": files.lines().collect::<Vec<_>>(), "diff": diff}))
+        Ok(changes_view(self.saved("base.txt")?, files.lines().collect(), &diff))
     }
 
     fn head(&mut self) -> Result<Value, String> {
@@ -867,8 +1061,15 @@ impl WeaveStore {
         }
         argv.push("--proposals".into());
         argv.extend(proposals);
-        let out = self.bracken(&argv)?;
-        let v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
+        let out = self.bracken_output(&argv)?;
+        if !out.status.success() {
+            // A merge that stops prints its conflicts on stdout: the agent needs them, not stderr's first words.
+            return Err(serde_json::from_slice::<Value>(&out.stdout)
+                .ok()
+                .and_then(|v| conflicts_error(&v))
+                .unwrap_or_else(|| failure("integrate", &out.stderr)));
+        }
+        let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
         Ok(json!({"decision": v["decision"], "parents": v["parents"], "proposals": v["proposals"]}))
     }
 
@@ -1200,8 +1401,9 @@ impl Store for WeaveStore {
         self.recover_tree()?;
         match name {
             "task" => {
-                Args::new(args, &[])?;
-                self.task()
+                let a = Args::new(args, &["item"])?;
+                let item = a.text_opt("item")?;
+                self.task((!item.is_empty()).then_some(item))
             }
             "list_files" => {
                 Args::new(args, &[])?;
@@ -1216,8 +1418,9 @@ impl Store for WeaveStore {
             "edit_file" => self.edit_file(&Args::new(args, &["path", "old", "new"])?),
             "delete_file" => self.delete_file(Args::new(args, &["path"])?.text("path")?),
             "changes" => {
-                Args::new(args, &[])?;
-                self.changes()
+                let a = Args::new(args, &["path"])?;
+                let path = a.text_opt("path")?;
+                self.changes((!path.is_empty()).then_some(path))
             }
             "head" => {
                 Args::new(args, &[])?;
@@ -1240,7 +1443,8 @@ impl Store for WeaveStore {
                 let a = Args::new(args, &["a", "b"])?;
                 let (x, y) = (reference(a.text("a")?)?.to_string(), reference(a.text("b")?)?.to_string());
                 let out = self.bracken(&["weave".into(), "diff".into(), "--json".into(), x, y])?;
-                serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))
+                let v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
+                Ok(diff_view(v))
             }
             "integrate" => {
                 let a = Args::new(args, &["proposals", "note"])?;

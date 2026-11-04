@@ -138,3 +138,162 @@ fn old_trees_are_swept_only_from_a_working_checkout() {
     store.sweep_old_trees();
     assert!(!old.exists(), "a working checkout: the old tree goes");
 }
+
+/// The ledger project.
+fn ledger() -> Project {
+    Project::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("projects/ledger")).expect("the ledger project")
+}
+
+/// Task `b58cf9180030` (report `b7b35a307aea`): with every ledger item released, each result the task tool can
+/// give, the index and each item in full, is under Pi's MCP output cap as the driver sends it, so an agent
+/// reads the whole spec and every item; and the index names every item, the change's revisions included.
+#[test]
+fn every_ledger_task_result_is_under_pis_cap_with_all_items_released() {
+    use crate::driver::{MAX_RESULT_BYTES, PI_MCP_OUTPUT_MAX_BYTES};
+    let project = ledger();
+    let outputs = task_outputs(&project).expect("the outputs");
+    assert_eq!(outputs.len(), project.items.len() + 1, "the index, and each item");
+    for (what, text) in &outputs {
+        assert!(text.len() <= MAX_RESULT_BYTES, "{what}: {} bytes", text.len());
+        assert!(text.len() < PI_MCP_OUTPUT_MAX_BYTES);
+        assert_eq!(crate::driver::bounded(text.clone(), MAX_RESULT_BYTES).1, None, "{what}: the guard leaves it whole");
+    }
+    check_task_outputs(&project).expect("the preflight passes");
+    let index: Value = serde_json::from_str(&outputs[0].1).expect("JSON");
+    let spec = std::fs::read_to_string(&project.spec).expect("the spec");
+    assert_eq!(index["spec"], spec.as_str(), "the spec, whole");
+    let ids: Vec<&str> = index["items"].as_array().expect("items").iter().filter_map(|i| i["id"].as_str()).collect();
+    let want: Vec<&str> = project.items.iter().map(|i| i.id.as_str()).collect();
+    assert_eq!(ids, want, "every item, in order");
+    for (entry, item) in index["items"].as_array().expect("items").iter().zip(&project.items) {
+        assert_eq!(entry["kind"], item.kind.name(), "{}", item.id);
+        assert_eq!(entry["title"], item.title.as_str(), "{}", item.id);
+        let changes: Vec<&str> = entry["changes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        assert_eq!(changes, item.revises, "{}", item.id);
+    }
+    for (item, (_, text)) in project.items.iter().zip(&outputs[1..]) {
+        let shown: Value = serde_json::from_str(text).expect("JSON");
+        let issue = std::fs::read_to_string(&item.text).expect("the item's text");
+        assert!(shown["text"].as_str().is_some_and(|t| t.contains(issue.trim())), "{} in full", item.id);
+    }
+}
+
+#[test]
+fn task_shows_one_item_by_id_and_refuses_one_not_released() {
+    let item = |id: &str, revises: &[&str]| {
+        item_statement(
+            &json!({"id": id, "kind": "bug", "title": "A (title): with marks", "text": "Body.", "revises": revises}),
+        )
+    };
+    let items = vec![item("a-1", &[]), item("b-2", &["a-1", "c"])];
+    let index = task_view(Some("the spec"), &items, None).expect("the index");
+    assert_eq!(
+        index["items"],
+        json!([
+            {"id": "a-1", "kind": "bug", "title": "A (title): with marks"},
+            {"id": "b-2", "kind": "bug", "title": "A (title): with marks", "changes": ["a-1", "c"]},
+        ])
+    );
+    assert!(index["item_text"].as_str().is_some_and(|t| t.contains("item set to its id")));
+    let one = task_view(Some("the spec"), &items, Some("b-2")).expect("one item");
+    assert_eq!(one, json!({"item": "b-2", "text": items[1]}));
+    assert!(task_view(None, &items, Some("a")).expect_err("a prefix isn't an id").contains("no released item"));
+    // A statement of another shape is shown whole in the index.
+    let odd = vec!["not an item line".to_string()];
+    assert_eq!(task_view(None, &odd, None).expect("the index")["items"], json!([{"text": "not an item line"}]));
+}
+
+/// The preflight refuses a project whose spec would put the task tool's result over the cap.
+#[test]
+fn the_preflight_refuses_a_spec_over_the_cap() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let copy = dir.path().join("ledger");
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("projects/ledger");
+    let status = std::process::Command::new("cp").arg("-R").arg(&src).arg(&copy).status().expect("cp");
+    assert!(status.success());
+    let spec = copy.join("spec.md");
+    let mut text = std::fs::read_to_string(&spec).expect("the spec");
+    text.push_str(&"More words for the spec. ".repeat(crate::driver::PI_MCP_OUTPUT_MAX_BYTES / 20));
+    std::fs::write(&spec, text).expect("written");
+    let err = check_task_outputs(&Project::load(&copy).expect("still a project")).expect_err("over the cap");
+    assert!(err.contains("the task tool's result for the index would be"), "{err}");
+}
+
+/// A diff of `n` files, each `lines` lines added.
+fn big_diff(n: usize, lines: usize) -> (Vec<String>, String) {
+    let mut files = Vec::new();
+    let mut diff = String::new();
+    for i in 0..n {
+        let path = format!("pkg/m{i:03}.py");
+        files.push(format!("A\t{path}"));
+        diff.push_str(&format!(
+            "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{lines} @@\n"
+        ));
+        for l in 0..lines {
+            diff.push_str(&format!("+x_{l} = \"{}\"\n", "y".repeat(40)));
+        }
+    }
+    (files, diff)
+}
+
+/// Task `b58cf9180030`: a diff too large for one result keeps whole files' diffs, names the rest, and stays
+/// under the bound; a small one is shown whole.
+#[test]
+fn changes_keeps_whole_file_diffs_under_the_bound_and_names_the_rest() {
+    let (files, diff) = big_diff(3, 5);
+    let small = changes_view("b".into(), files.iter().map(String::as_str).collect(), &diff);
+    assert_eq!(small["diff"], diff.as_str());
+    assert!(small.get("diff_not_shown").is_none() && small.get("note").is_none(), "{small}");
+
+    let (files, diff) = big_diff(40, 20);
+    assert!(diff.len() > 2 * crate::driver::PI_MCP_OUTPUT_MAX_BYTES);
+    let v = changes_view("b".into(), files.iter().map(String::as_str).collect(), &diff);
+    assert!(v.to_string().len() <= crate::driver::MAX_RESULT_BYTES, "{} bytes", v.to_string().len());
+    assert_eq!(v["files"].as_array().expect("files").len(), 40, "every file listed");
+    let shown = v["diff"].as_str().expect("a diff");
+    let kept = shown.matches("diff --git ").count();
+    assert!(kept > 0 && diff.starts_with(shown), "whole files' diffs, from the first");
+    let left: Vec<&str> = v["diff_not_shown"].as_array().expect("named").iter().filter_map(Value::as_str).collect();
+    assert_eq!(left.len(), 40 - kept);
+    assert_eq!(left[0], format!("pkg/m{kept:03}.py"), "the first left out");
+    assert!(v["note"].as_str().is_some_and(|n| n.contains("Call changes with path")), "{v}");
+}
+
+#[test]
+fn diff_lists_files_briefly_when_they_dont_fit() {
+    let file = |i: usize| {
+        let h = format!("blake3:{}", "0".repeat(64));
+        json!({"path": format!("pkg/m{i:04}.py"), "change": "modified", "before": {"hash": h, "mode": "100644"},
+               "after": {"hash": h, "mode": "100644"}, "not_held": []})
+    };
+    let few = json!({"a": "x", "b": "y", "files": (0..3).map(file).collect::<Vec<_>>()});
+    assert_eq!(diff_view(few.clone()), few, "whole when it fits");
+    let many = json!({"a": "x", "b": "y", "files": (0..2000).map(file).collect::<Vec<_>>()});
+    let v = diff_view(many);
+    assert!(v.to_string().len() <= crate::driver::MAX_RESULT_BYTES, "{} bytes", v.to_string().len());
+    let shown = v["files"].as_array().expect("files");
+    assert_eq!(shown[0], json!({"path": "pkg/m0000.py", "change": "modified"}));
+    assert_eq!(shown.len() as u64 + v["files_not_shown"].as_u64().expect("a count"), 2000);
+}
+
+#[test]
+fn an_integrate_that_stops_lists_its_conflicts_within_the_bound() {
+    let conflict = |i: usize| {
+        json!({"path": format!("pkg/m{i:04}.py"), "base": {"hash": "h"}, "into": {"hash": "i"}, "from": Value::Null,
+               "offered": [{"resolution": "ab12", "author": "k", "author_name": "agent-1", "result": Value::Null}],
+               "text_conflicts": [[3, 4]]})
+    };
+    assert_eq!(conflicts_error(&json!({"conflicts": []})), None);
+    let one = conflicts_error(&json!({"step": "proposal 1a2b", "conflicts": [conflict(0)]})).expect("an error");
+    assert!(one.starts_with("merging proposal 1a2b stopped at 1 conflicts"), "{one}");
+    assert!(
+        one.contains(
+            r#"{"from":"deleted","into":"present","offered":["ab12"],"path":"pkg/m0000.py","regions":[[3,4]]}"#
+        ),
+        "{one}"
+    );
+    let many: Vec<Value> = (0..2000).map(conflict).collect();
+    let err = conflicts_error(&json!({"conflicts": many})).expect("an error");
+    assert!(err.len() <= crate::driver::MAX_RESULT_BYTES, "{} bytes", err.len());
+    assert!(err.contains("stopped at 2000 conflicts") && err.contains("more not shown"), "{}", &err[..200]);
+}

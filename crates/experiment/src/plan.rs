@@ -111,6 +111,7 @@ pub struct ProjectPlan {
 
 impl ProjectPlan {
     pub fn of(project: &crate::project::Project) -> Result<ProjectPlan, String> {
+        crate::weave_mode::check_task_outputs(project)?;
         let dir = std::fs::canonicalize(&project.dir).map_err(|e| format!("resolving the project: {e}"))?;
         let read = |p: &Path| std::fs::read(p).map_err(|e| format!("reading {}: {e}", p.display()));
         let mut texts = BTreeMap::from([("spec".to_string(), hash(&read(&project.spec)?))]);

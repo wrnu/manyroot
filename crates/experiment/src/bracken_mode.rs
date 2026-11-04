@@ -29,10 +29,10 @@ const RELATIONS: [&str; 7] = ["supports", "contradicts", "depends_on", "refines"
 const VERDICTS: [&str; 2] = ["pass", "fail"];
 /// The largest implementation artifact: a module of the most specs any module has, each this size, still fits.
 pub const MAX_ARTIFACT_BYTES: usize = 2000;
-/// The most characters of one `news` page, JSON-escaped as the driver sends it: under
-/// [`crate::driver::MAX_RESULT_CHARS`] with room for the envelope and the closing line, so the
+/// The most bytes of one `news` page, JSON-escaped as the driver sends it: under
+/// [`crate::driver::MAX_RESULT_BYTES`] with room for the envelope and the closing line, so the
 /// result bound never cuts a page whose cursor has already moved past it.
-const NEWS_PAGE_CHARS: usize = 36_000;
+const NEWS_PAGE_BYTES: usize = crate::driver::MAX_RESULT_BYTES - 3_000;
 /// How long one sync session may take, in seconds, on either side.
 const SYNC_DEADLINE: u32 = 60;
 /// Bytes one side of a sync session may receive from the other.
@@ -254,14 +254,14 @@ fn opt(name: &str, value: impl std::fmt::Display) -> String {
 }
 
 /// How many of `lines`, from the first, fit one news page, measured as the driver sends them:
-/// JSON-escaped (a quote is two characters), then a newline's two.
+/// JSON-escaped (a quote is two bytes), then a newline's two.
 fn fits(lines: &[String]) -> usize {
     let mut size = 0;
     lines
         .iter()
         .take_while(|l| {
-            size += serde_json::to_string(l).map_or(usize::MAX / 2, |j| j.chars().count() - 2 + 2);
-            size <= NEWS_PAGE_CHARS
+            size += serde_json::to_string(l).map_or(usize::MAX / 2, |j| j.len() - 2 + 2);
+            size <= NEWS_PAGE_BYTES
         })
         .count()
 }

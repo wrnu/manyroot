@@ -38,10 +38,18 @@ pub const CALLS_PER_TURN: u32 = 50;
 pub const CONTRIBUTIONS_PER_CALL: u64 = 9;
 /// The most bytes one contribution can hold: the largest free text and its envelope.
 pub const BYTES_PER_CONTRIBUTION: u64 = crate::args::MAX_TEXT as u64 + 4096;
-/// The most characters of one tool result an agent is shown, in every mode (decision `74d00180c642`):
-/// below Claude Code's own tool-result limit, about 50,000 characters, with room for the note
-/// [`bounded`] adds, so Claude Code never cuts a result itself.
-pub const MAX_RESULT_CHARS: usize = 40_000;
+/// Pi's cap on one MCP tool result's text: `MCP_OUTPUT_MAX_BYTES`, 20 KiB, in Pi 1.4.0's
+/// `@earendil-works/pi-coding-agent` package, `dist/extensions/mcp/tools.js` line 31 (report `b7b35a307aea`).
+/// Pi cuts the middle out of a longer text, so an agent never sees what was there.
+pub const PI_MCP_OUTPUT_MAX_BYTES: usize = 20 * 1024;
+/// The most bytes of one tool result a Pi agent is shown, in every mode (task `b58cf9180030`): under Pi's cap,
+/// with room for the note [`bounded`] adds, so Pi never cuts a result itself. It is also what each mode sizes
+/// its own pages, indexes and lists to, the tighter of the backends' bounds, so no backend cuts them.
+pub const MAX_RESULT_BYTES: usize = PI_MCP_OUTPUT_MAX_BYTES - 1024;
+/// The most bytes of one tool result a Claude Code agent is shown, in every mode (decision `74d00180c642`):
+/// below Claude Code's own tool-result limit, about 50,000 characters, with room for the note [`bounded`]
+/// adds, so Claude Code never cuts a result itself. Kept as it was, so Claude Code runs reproduce.
+pub const CLAUDE_CODE_RESULT_BYTES: usize = 40_000;
 /// The longest MCP message the driver reads from an agent.
 pub const MAX_MCP_LINE: usize = 256 * 1024;
 /// How long the driver waits for both ends of a sync session to connect.
@@ -114,6 +122,12 @@ pub trait Backend: Sync {
     /// Tests only: called as an agent-turn is counted, `done` agent-turns in all, before its checkpoint and
     /// any release it makes due.
     fn turn_counted(&self, _done: u32) {}
+
+    /// The most bytes of one tool result its agents are shown: [`bounded`] cuts a longer one, with a note,
+    /// before the agent's own harness would cut it unsaid.
+    fn result_bytes(&self) -> usize {
+        CLAUDE_CODE_RESULT_BYTES
+    }
 }
 
 /// The next agent-turn allowed to run in lockstep, and the agents that have stopped playing.
@@ -248,6 +262,8 @@ fn make_dir(path: &Path) -> Result<(), String> {
 
 struct Run<'a> {
     cfg: &'a RunConfig,
+    /// The backend's [`Backend::result_bytes`].
+    result_bytes: usize,
     mode: &'static dyn Mode,
     events: EventLog,
     hub: Mutex<Worker>,
@@ -294,6 +310,7 @@ fn project_run(cfg: &RunConfig, mode: &dyn Mode) -> Result<Option<ProjectRun>, S
     let pin =
         cfg.plan.python.as_ref().ok_or("a project run needs the Python pin (--python), which its plan records")?;
     let project = plan.load()?;
+    crate::weave_mode::check_task_outputs(&project)?;
     let python = crate::python::Python::from_plan(pin, &project.python)?;
     let shares: Vec<f64> = plan.items.iter().map(|(_, s)| *s).collect();
     let change = crate::weave_mode::change_share(&shares)?
@@ -377,6 +394,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     tools.extend(core_tools());
     let run = Run {
         cfg,
+        result_bytes: backend.result_bytes(),
         mode,
         events,
         hub: Mutex::new(hub),
@@ -879,7 +897,12 @@ impl Run<'_> {
             Ok(v) => (v.to_string(), false),
             Err(e) => (e.clone(), true),
         };
-        let (text, cut_from) = bounded(text);
+        let (text, cut_from) = bounded(text, self.result_bytes);
+        if let Some(bytes) = cut_from {
+            // A result the guard cut, on its own line of the log, so a run's report can tell whether any agent
+            // hit the cap, with which tool (task `b58cf9180030`).
+            self.events.log(Some(name), "result_cut", json!({"turn": turn, "tool": shown, "bytes": bytes}));
+        }
         self.events.log(
             Some(name),
             "tool_result",
@@ -889,22 +912,28 @@ impl Run<'_> {
     }
 }
 
-/// Every string in `v`, at any depth.
-/// `text` cut to [`MAX_RESULT_CHARS`] characters, with a note saying so and how to see more, and the
-/// length it had if it was cut. The same for every tool in every mode: no result is cut silently.
-pub fn bounded(text: String) -> (String, Option<usize>) {
-    let chars = text.chars().count();
-    if chars <= MAX_RESULT_CHARS {
+/// `text` cut to at most `limit` bytes, the backend's [`Backend::result_bytes`], at a character's boundary, with
+/// a note saying so and how to see more, and the bytes it had if it was cut. The same for every tool in every
+/// mode: no result is cut silently, and none reaches the agent's harness over its own cap.
+pub fn bounded(text: String, limit: usize) -> (String, Option<usize>) {
+    let bytes = text.len();
+    if bytes <= limit {
         return (text, None);
     }
-    let kept: String = text.chars().take(MAX_RESULT_CHARS).collect();
+    let mut cut = limit;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
     let note = format!(
-        "\n[Cut: this result has {chars} characters and only the first {MAX_RESULT_CHARS} are shown. To see the \
-         rest, narrow the call: one file, function or item, a line range or a smaller count, where the tool takes one.]"
+        "\n[Cut: this result has {bytes} bytes and only the first {cut} are shown. To see the rest, narrow the \
+         call: one file, item or path, a line range or a smaller count, where the tool takes one.]"
     );
-    (kept + &note, Some(chars))
+    let mut kept = text;
+    kept.truncate(cut);
+    (kept + &note, Some(bytes))
 }
 
+/// Every string in `v`, at any depth.
 fn strings(v: &Value) -> Box<dyn Iterator<Item = &str> + '_> {
     match v {
         Value::String(s) => Box::new(std::iter::once(s.as_str())),

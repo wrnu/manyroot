@@ -120,7 +120,13 @@ fn a_copy_works_on_the_tree_through_weave() {
     assert!(task["spec"].as_str().is_some_and(|t| !t.is_empty()), "{task}");
     let items = task["items"].as_array().expect("items");
     assert_eq!(items.len(), 2, "only the items released at the start: {task}");
-    assert!(items.iter().all(|i| !i.as_str().unwrap_or_default().contains("decimals")), "{task}");
+    assert!(items.iter().all(|i| i["id"] != "decimals"), "{task}");
+    // The task shows an index of the items; each one's full text comes by its id (task b58cf9180030).
+    let first = items[0]["id"].as_str().expect("an id").to_string();
+    let one = s.ok(0, "task", json!({"item": first}));
+    assert!(one["text"].as_str().is_some_and(|t| t.starts_with(&format!("Item {first} ("))), "{one}");
+    let err = s.tool(0, "task", json!({"item": "decimals"})).expect_err("not released yet");
+    assert!(err.contains("no released item"), "{err}");
 
     // A spec or item claim any other key signs is never the task (finding 8c2713b55062), even once synced.
     let replica = s.trees[0].parent().expect("the copy's directory").join(".bracken");
@@ -168,6 +174,11 @@ fn a_copy_works_on_the_tree_through_weave() {
     s.ok(0, "write_file", json!({"path": "base", "text": "a file\n"}));
     let changes = s.ok(0, "changes", json!({}));
     assert!(changes["files"].as_array().expect("files").iter().any(|f| f == "A\tbase"), "{changes}");
+    // With a path, that file's changes alone.
+    let one = s.ok(0, "changes", json!({"path": "base"}));
+    assert_eq!(one["files"], json!(["A\tbase"]), "{one}");
+    assert!(one["diff"].as_str().is_some_and(|d| d.contains("+a file") && !d.contains("total")), "{one}");
+    assert!(s.tool(0, "changes", json!({"path": "../x"})).is_err());
     s.ok(0, "delete_file", json!({"path": "base"}));
     let head = s.ok(0, "head", json!({}));
     assert_eq!(head["unproposed_edits"], true, "{head}");
@@ -197,6 +208,8 @@ fn a_copy_works_on_the_tree_through_weave() {
     s.sync(0);
     let items = s.ok(0, "task", json!({}))["items"].as_array().expect("items").len();
     assert_eq!(items, 3);
+    let change = s.ok(0, "task", json!({"item": "decimals"}));
+    assert!(change["text"].as_str().is_some_and(|t| t.starts_with("Item decimals (")), "{change}");
 
     // What the driver runs the public tests on: the working tree, without git's files.
     let tree = s.copies[0].ok(&request("tree", Value::Null)).expect("the tree");
@@ -226,7 +239,10 @@ fn a_conflicting_proposal_waits_for_a_resolution() {
     let first = s.ok(0, "integrate", json!({"proposals": [proposals[0]], "note": "the first"}));
     assert!(first["decision"].is_string());
     let second = s.tool(0, "integrate", json!({"proposals": [proposals[1]], "note": "the second"}));
-    assert!(second.is_err(), "the second edits the same line: {second:?}");
+    let err = second.expect_err("the second edits the same line");
+    // The agent is told each conflict, not bracken's first words (task b58cf9180030).
+    assert!(err.contains("stopped at 1 conflicts") && err.contains(r#""path":"tiny/stats.py""#), "{err}");
+    assert!(err.contains("Settle each with resolve"), "{err}");
     assert_eq!(
         s.ok(0, "head", json!({}))["heads"].as_array().expect("heads").len(),
         1,

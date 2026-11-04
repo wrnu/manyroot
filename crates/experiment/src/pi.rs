@@ -382,6 +382,11 @@ impl Harness for Pi {
         "Pi"
     }
 
+    /// Under Pi's MCP output cap, which cuts the middle out of a longer result (report `b7b35a307aea`).
+    fn result_bytes(&self) -> usize {
+        crate::driver::MAX_RESULT_BYTES
+    }
+
     fn route(&self) -> Route {
         Route { host: self.credential.host.clone(), port: self.credential.port, connect: self.upstream }
     }
@@ -531,6 +536,17 @@ mod tests {
             "usage": {"input": 10, "output": 3, "cacheRead": 40, "cacheWrite": 5, "totalTokens": 58},
         }})
         .to_string()
+    }
+
+    /// Task `b58cf9180030`: a Pi run's results are bounded under Pi's MCP output cap, so Pi never cuts one.
+    #[test]
+    fn a_pi_runs_results_are_bounded_under_pis_cap() {
+        use crate::driver::{CLAUDE_CODE_RESULT_BYTES, MAX_RESULT_BYTES, PI_MCP_OUTPUT_MAX_BYTES, bounded};
+        assert_eq!(pi(None).result_bytes(), MAX_RESULT_BYTES);
+        const { assert!(MAX_RESULT_BYTES < PI_MCP_OUTPUT_MAX_BYTES && MAX_RESULT_BYTES < CLAUDE_CODE_RESULT_BYTES) };
+        let (text, cut) = bounded("x".repeat(3 * PI_MCP_OUTPUT_MAX_BYTES), pi(None).result_bytes());
+        assert_eq!(cut, Some(3 * PI_MCP_OUTPUT_MAX_BYTES));
+        assert!(text.len() <= PI_MCP_OUTPUT_MAX_BYTES, "the note too: {}", text.len());
     }
 
     #[test]

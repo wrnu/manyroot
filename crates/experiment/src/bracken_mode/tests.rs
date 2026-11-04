@@ -793,13 +793,24 @@ fn news_pages_below_the_result_bound_and_loses_nothing() {
         let statement = format!("note {i:03} {}", "x".repeat(180));
         a.tool("claim", &json!({"statement": statement, "tags": ["note"]})).expect("a claim");
     }
-    let page = output(a.tool("news", &json!({})));
-    assert!(page.chars().count() < crate::driver::MAX_RESULT_CHARS, "{} chars", page.chars().count());
-    let (lines, tail) = page.rsplit_once('\n').expect("a tail");
-    assert!(tail.ends_with("more arrived: call news again for them."), "{tail}");
-    let rest = output(a.tool("news", &json!({})));
-    assert!(!rest.contains("more arrived"));
-    let seen: Vec<&str> = lines.lines().chain(rest.lines()).collect();
+    // Every page but the last stops short of the bound and says more arrived; the last says nothing more.
+    let mut pages = Vec::new();
+    loop {
+        let page = output(a.tool("news", &json!({})));
+        assert!(page.len() < crate::driver::MAX_RESULT_BYTES, "{} bytes", page.len());
+        match page.rsplit_once('\n') {
+            Some((lines, tail)) if tail.ends_with("more arrived: call news again for them.") => {
+                pages.push(lines.to_string())
+            }
+            _ => {
+                assert!(!page.contains("more arrived"), "{page}");
+                pages.push(page);
+                break;
+            }
+        }
+    }
+    assert!(pages.len() > 1, "more than one page");
+    let seen: Vec<&str> = pages.iter().flat_map(|p| p.lines()).collect();
     assert_eq!(seen.len(), 320, "every claim once");
     for (i, l) in seen.iter().enumerate() {
         assert!(l.contains(&format!("note {i:03} ")), "in order: {l}");
@@ -851,8 +862,8 @@ fn all_news(s: &mut BrackenStore) -> (Vec<String>, usize) {
     let (mut seen, mut pages) = (Vec::new(), 0);
     loop {
         let result = s.tool("news", &json!({})).expect("news");
-        let sent = result.to_string().chars().count();
-        assert!(sent < crate::driver::MAX_RESULT_CHARS, "a page of {sent} characters as sent would be cut");
+        let sent = result.to_string().len();
+        assert!(sent < crate::driver::MAX_RESULT_BYTES, "a page of {sent} bytes as sent would be cut");
         let page = result["output"].as_str().expect("text").to_string();
         if page.starts_with("Nothing new") {
             return (seen, pages);
@@ -936,7 +947,7 @@ fn status_is_the_agents_queue_and_a_fail_can_name_what_it_needs() {
         text.lines().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle}:\n{text}"))
     };
     assert!(at(&text, "waiting for your pass:") < at(&text, &abs[..8]), "{text}");
-    assert!(text.chars().count() < crate::driver::MAX_RESULT_CHARS);
+    assert!(text.len() < crate::driver::MAX_RESULT_BYTES);
 
     let out = output(b.tool(
         "evidence",
