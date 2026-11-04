@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::args::Args;
+use crate::driver::ResultLimit;
 use crate::lang::{Library, parse_module};
 use crate::mode::{Mode, Session, Store, StoreConfig, ToolSpec, is_within};
 use crate::task::{Task, Version, change_tag};
@@ -29,10 +30,16 @@ const RELATIONS: [&str; 7] = ["supports", "contradicts", "depends_on", "refines"
 const VERDICTS: [&str; 2] = ["pass", "fail"];
 /// The largest implementation artifact: a module of the most specs any module has, each this size, still fits.
 pub const MAX_ARTIFACT_BYTES: usize = 2000;
-/// The most bytes of one `news` page, JSON-escaped as the driver sends it: under
-/// [`crate::driver::MAX_RESULT_BYTES`] with room for the envelope and the closing line, so the
-/// result bound never cuts a page whose cursor has already moved past it.
-const NEWS_PAGE_BYTES: usize = crate::driver::MAX_RESULT_BYTES - 3_000;
+/// The most of one `news` page, JSON-escaped as the driver sends it, by the backend's [`ResultLimit`]: under
+/// its bound with room for the envelope and the closing line, so the result bound never cuts a page whose
+/// cursor has already moved past it. Under Claude Code, 36,000 characters, as before task `b58cf9180030`
+/// (finding `868ff1726b88`); under Pi, 3,000 bytes short of [`crate::driver::MAX_RESULT_BYTES`].
+fn news_page(limit: ResultLimit) -> usize {
+    match limit {
+        ResultLimit::ClaudeCode => 36_000,
+        ResultLimit::Pi => crate::driver::MAX_RESULT_BYTES - 3_000,
+    }
+}
 /// How long one sync session may take, in seconds, on either side.
 const SYNC_DEADLINE: u32 = 60;
 /// Bytes one side of a sync session may receive from the other.
@@ -253,15 +260,15 @@ fn opt(name: &str, value: impl std::fmt::Display) -> String {
     format!("--{name}={value}")
 }
 
-/// How many of `lines`, from the first, fit one news page, measured as the driver sends them:
-/// JSON-escaped (a quote is two bytes), then a newline's two.
-fn fits(lines: &[String]) -> usize {
-    let mut size = 0;
+/// How many of `lines`, from the first, fit one news page under `limit`, measured as the driver sends them:
+/// JSON-escaped (a quote is two), then a newline's two.
+fn fits(lines: &[String], limit: ResultLimit) -> usize {
+    let (mut size, page) = (0, news_page(limit));
     lines
         .iter()
         .take_while(|l| {
-            size += serde_json::to_string(l).map_or(usize::MAX / 2, |j| j.len() - 2 + 2);
-            size <= NEWS_PAGE_BYTES
+            size += serde_json::to_string(l).map_or(usize::MAX / 2, |j| limit.size(&j) - 2 + 2);
+            size <= page
         })
         .count()
 }
@@ -914,7 +921,7 @@ impl BrackenStore {
         // What concerns this agent first (bracken's `log --since --as`), when it all fits on one page.
         let personal = vec!["log".into(), since.clone(), "--compact".into(), opt("as", &self.config.identity)];
         let (lines, next) = self.news_lines(&personal)?;
-        if fits(&lines) == lines.len() {
+        if fits(&lines, self.config.limit) == lines.len() {
             std::fs::write(&file, &next).map_err(|e| format!("writing the news cursor: {e}"))?;
             if lines.is_empty() {
                 return Ok(json!({ "output": "Nothing new since your last news call." }));
@@ -923,7 +930,7 @@ impl BrackenStore {
         }
         // More than a page: oldest first, so that what was shown is what the new cursor covers.
         let (lines, next) = self.news_lines(&["log".into(), since.clone(), "--compact".into()])?;
-        let shown = fits(&lines);
+        let shown = fits(&lines, self.config.limit);
         let (cursor, rest) = if shown == lines.len() {
             (next, String::new())
         } else {

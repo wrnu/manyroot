@@ -487,9 +487,9 @@ pub trait Harness: Sync {
         json!({})
     }
 
-    /// The most bytes of one tool result its agents are shown ([`Backend::result_bytes`]): under its own cap.
-    fn result_bytes(&self) -> usize {
-        crate::driver::CLAUDE_CODE_RESULT_BYTES
+    /// How its agents' tool results are bounded ([`Backend::result_limit`]): under its own cap.
+    fn result_limit(&self) -> crate::driver::ResultLimit {
+        crate::driver::ResultLimit::ClaudeCode
     }
 
     /// The environment entries it may add beyond [`BASE_ENV`], by name, fixed for the run: read once, at
@@ -923,8 +923,8 @@ impl<H: Harness> HarnessBackend<H> {
 }
 
 impl<H: Harness> Backend for HarnessBackend<H> {
-    fn result_bytes(&self) -> usize {
-        self.harness.result_bytes()
+    fn result_limit(&self) -> crate::driver::ResultLimit {
+        self.harness.result_limit()
     }
 
     fn turn(&self, _agent: usize, name: &str, turn: u32, socket: &Path) -> Result<(), String> {

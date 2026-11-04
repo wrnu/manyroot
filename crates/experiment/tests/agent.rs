@@ -16,8 +16,8 @@ use serde_json::{Value, json};
 
 use bracken_experiment::claude::{Caps, ClaudeBackend, ClaudeConfig, Expect, Pin, RUN_TIME_CAP, Routing, Tokens};
 use bracken_experiment::driver::{
-    Backend, CALLS_PER_TURN, CLAUDE_CODE_RESULT_BYTES, MAX_RESULT_BYTES, RunConfig, TURN_LIMIT, core_tools, git_binary,
-    run,
+    Backend, CALLS_PER_TURN, MAX_RESULT_BYTES, MAX_RESULT_CHARS, ResultLimit, RunConfig, TURN_LIMIT, core_tools,
+    git_binary, run,
 };
 use bracken_experiment::mode::mode_named;
 use bracken_experiment::plan::{PlanInputs, report};
@@ -366,9 +366,23 @@ fn the_pilots_run_caps_are_a_third_of_its_go_each() {
 }
 
 #[test]
+fn bounded_cuts_at_the_limit_in_characters_and_says_so() {
+    use bracken_experiment::driver::bounded;
+    let bounded = |t: String| bounded(t, ResultLimit::ClaudeCode);
+    let at = "é".repeat(MAX_RESULT_CHARS);
+    assert_eq!(bounded(at.clone()), (at.clone(), None), "at the limit, untouched");
+    let (text, cut) = bounded(at.clone() + "ab");
+    assert_eq!(cut, Some(MAX_RESULT_CHARS + 2));
+    assert!(text.starts_with(&at), "the first {MAX_RESULT_CHARS} characters, whole");
+    let note = &text[at.len()..];
+    assert!(note.starts_with("\n[Cut: this result has 40002 characters") && note.contains("narrow the call"), "{note}");
+    assert!(note.chars().count() < 300);
+}
+
+#[test]
 fn bounded_cuts_at_the_limit_in_bytes_under_pis_cap_and_says_so() {
     use bracken_experiment::driver::{PI_MCP_OUTPUT_MAX_BYTES, bounded};
-    let bounded = |t: String| bounded(t, MAX_RESULT_BYTES);
+    let bounded = |t: String| bounded(t, ResultLimit::Pi);
     // MAX_RESULT_BYTES is even, so a text of two-byte characters fills it exactly.
     let at = "é".repeat(MAX_RESULT_BYTES / 2);
     assert_eq!(at.len(), MAX_RESULT_BYTES);
@@ -390,7 +404,7 @@ fn bounded_cuts_at_the_limit_in_bytes_under_pis_cap_and_says_so() {
     assert!(text.len() <= PI_MCP_OUTPUT_MAX_BYTES, "{}", text.len());
 }
 
-/// A script that makes one result over [`CLAUDE_CODE_RESULT_BYTES`] in `mode`, then a result event.
+/// A script that makes one result over [`MAX_RESULT_CHARS`] in `mode`, then a result event.
 fn oversized(mode: &str) -> String {
     let big = |n: usize| "x".repeat(n);
     let moves = match mode {
@@ -1104,17 +1118,17 @@ mod macos_only {
             assert!(results[..3].iter().all(|r| r["ok"] == true && r["cut_from"].is_null()), "{mode}: {results:?}");
             let last = results[3];
             let cut = last["cut_from"].as_u64().expect("the read was cut") as usize;
-            // Claude Code's bound, this backend's own (Backend::result_bytes).
-            assert!(cut > CLAUDE_CODE_RESULT_BYTES, "{mode}");
+            assert!(cut > MAX_RESULT_CHARS, "{mode}");
             let shown = last["bytes"].as_u64().expect("bytes") as usize;
-            assert!(shown < CLAUDE_CODE_RESULT_BYTES + 400, "{mode}: {shown} bytes shown");
+            assert!(shown < MAX_RESULT_CHARS + 400, "{mode}: {shown} bytes shown");
             // The cut has its own line in the log, naming the tool and the result's size (task b58cf9180030).
             let cuts: Vec<&Value> = log.iter().filter(|e| e["event"] == "result_cut").map(|e| &e["data"]).collect();
             assert_eq!(cuts.len(), 1, "{mode}: {cuts:?}");
-            assert_eq!((&cuts[0]["tool"], cuts[0]["bytes"].as_u64()), (&last["tool"], Some(cut as u64)), "{mode}");
+            assert_eq!((&cuts[0]["tool"], cuts[0]["size"].as_u64()), (&last["tool"], Some(cut as u64)), "{mode}");
+            assert_eq!(cuts[0]["unit"], "characters", "{mode}");
             let transcript = s.transcript("agent-0", 1).expect("a transcript");
             let note =
-                format!("[Cut: this result has {cut} bytes and only the first {CLAUDE_CODE_RESULT_BYTES} are shown.");
+                format!("[Cut: this result has {cut} characters and only the first {MAX_RESULT_CHARS} are shown.");
             assert!(transcript.contains(&note), "{mode}: the agent is told, and how to narrow the call");
         }
     }

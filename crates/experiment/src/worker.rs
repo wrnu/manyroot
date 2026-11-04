@@ -267,6 +267,7 @@ impl Worker {
             .args(["--task", config.task.name()])
             .args(config.trace.then_some("--trace"))
             .args(["--accept-rule", config.accept_rule.name()])
+            .args(["--result-limit", config.limit.name()])
             .env_clear()
             .current_dir(&config.dir)
             .stdin(Stdio::piped())

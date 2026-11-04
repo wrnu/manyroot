@@ -44,6 +44,8 @@ pub struct StoreConfig {
     pub task: Task,
     /// Bracken mode: which implementation counts for a function.
     pub accept_rule: crate::bracken_mode::AcceptRule,
+    /// How the run's backend bounds a tool result, which a mode sizes its pages to.
+    pub limit: crate::driver::ResultLimit,
 }
 
 /// One agent's working copy, or the mode's hub.

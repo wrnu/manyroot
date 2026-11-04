@@ -54,6 +54,7 @@ impl Stores {
             trace: false,
             task: Task::Phase1,
             accept_rule: Default::default(),
+            limit: Default::default(),
         };
         let sockets = dir.path().join("s");
         std::fs::create_dir(&sockets).expect("sockets");
@@ -173,10 +174,11 @@ fn a_copy_works_on_the_tree_through_weave() {
     // A top-level file named base is a path, never the tag changes diffs against (finding 0fe23b26f83e).
     s.ok(0, "write_file", json!({"path": "base", "text": "a file\n"}));
     let changes = s.ok(0, "changes", json!({}));
-    assert!(changes["files"].as_array().expect("files").iter().any(|f| f == "A\tbase"), "{changes}");
+    assert!(changes["files"].as_array().expect("files").iter().any(|f| f["path"] == "base" && f["change"] == "A"));
     // With a path, that file's changes alone.
     let one = s.ok(0, "changes", json!({"path": "base"}));
-    assert_eq!(one["files"], json!(["A\tbase"]), "{one}");
+    assert_eq!(one["files"], json!([{"path": "base", "change": "A", "page": 1}]), "{one}");
+    assert!(s.tool(0, "changes", json!({"page": 2})).expect_err("one page").contains("1 pages"));
     assert!(one["diff"].as_str().is_some_and(|d| d.contains("+a file") && !d.contains("total")), "{one}");
     assert!(s.tool(0, "changes", json!({"path": "../x"})).is_err());
     s.ok(0, "delete_file", json!({"path": "base"}));
@@ -190,8 +192,22 @@ fn a_copy_works_on_the_tree_through_weave() {
     assert_eq!(s.ok(0, "head", json!({}))["unproposed_edits"], false);
     let open = s.ok(0, "proposals", json!({}));
     assert_eq!(open["proposals"][0]["proposal"], proposal.as_str(), "{open}");
+    let seed = head["base"].as_str().expect("the seed decision").to_string();
     let integrated = s.ok(0, "integrate", json!({"proposals": [&proposal[..12]], "note": "a total"}));
     let decision = integrated["decision"].as_str().expect("a decision").to_string();
+    // diff shows each changed file's text (decision b423e8767735), and leaves the agent's tree alone.
+    let diff = s.ok(0, "diff", json!({"a": &seed[..12], "b": &decision[..12]}));
+    assert_eq!(diff["files"], json!([{"path": "tiny/total.py", "change": "A", "page": 1}]), "{diff}");
+    let text = diff["diff"].as_str().expect("text");
+    assert!(
+        text.starts_with("diff --git a/tiny/total.py b/tiny/total.py\n") && text.contains("+def total(xs):"),
+        "{diff}"
+    );
+    let back = s.ok(0, "diff", json!({"a": &decision[..12], "b": &seed[..12]}));
+    assert!(back["diff"].as_str().is_some_and(|t| t.contains("deleted file mode") && t.contains("-def total(xs):")));
+    assert_eq!(s.ok(0, "head", json!({}))["unproposed_edits"], false, "the tree untouched");
+    let leftovers = ["diff.tree", "diff.index"].map(|f| s.trees[0].parent().expect("the store").join(f).exists());
+    assert_eq!(leftovers, [false, false], "the diff's scratch is cleared");
     let updated = s.ok(0, "update", json!({}));
     assert_eq!(updated["base"], decision.as_str());
 

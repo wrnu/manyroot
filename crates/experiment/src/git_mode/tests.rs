@@ -17,6 +17,7 @@ fn config(dir: &Path, name: &str) -> StoreConfig {
         identity: name.into(),
         trace: true,
         accept_rule: Default::default(),
+        limit: Default::default(),
     }
 }
 
