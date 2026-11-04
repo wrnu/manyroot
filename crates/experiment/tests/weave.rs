@@ -122,6 +122,12 @@ fn a_copy_works_on_the_tree_through_weave() {
     let items = task["items"].as_array().expect("items");
     assert_eq!(items.len(), 2, "only the items released at the start: {task}");
     assert!(items.iter().all(|i| i["id"] != "decimals"), "{task}");
+    // The whole task in one page here: each item in full, on the page the index says (task fb08637d1101).
+    assert_eq!((task["page"].as_u64(), task["pages"].as_u64()), (Some(1), Some(1)), "{task}");
+    let texts = task["texts"].as_array().expect("texts");
+    assert_eq!(texts.len(), 2, "{task}");
+    assert!(items.iter().zip(texts).all(|(i, t)| i["page"] == 1
+        && t.as_str().is_some_and(|t| t.starts_with(&format!("Item {} (", i["id"].as_str().unwrap_or_default())))));
     // The task shows an index of the items; each one's full text comes by its id (task b58cf9180030).
     let first = items[0]["id"].as_str().expect("an id").to_string();
     let one = s.ok(0, "task", json!({"item": first}));

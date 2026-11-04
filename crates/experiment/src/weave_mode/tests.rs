@@ -153,7 +153,7 @@ fn every_ledger_task_result_is_under_pis_cap_with_all_items_released() {
     use crate::driver::{MAX_RESULT_BYTES, PI_MCP_OUTPUT_MAX_BYTES};
     let project = ledger();
     let outputs = task_outputs(&project).expect("the outputs");
-    assert_eq!(outputs.len(), project.items.len() + 1, "the index, and each item");
+    assert_eq!(outputs.len(), project.items.len() + 2, "two pages, and each item");
     for (what, text) in &outputs {
         assert!(text.len() <= MAX_RESULT_BYTES, "{what}: {} bytes", text.len());
         assert!(text.len() < PI_MCP_OUTPUT_MAX_BYTES);
@@ -176,11 +176,68 @@ fn every_ledger_task_result_is_under_pis_cap_with_all_items_released() {
         let changes: Vec<&str> = entry["changes"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         assert_eq!(changes, item.revises, "{}", item.id);
     }
-    for (item, (_, text)) in project.items.iter().zip(&outputs[1..]) {
+    for (item, (_, text)) in project.items.iter().zip(&outputs[2..]) {
         let shown: Value = serde_json::from_str(text).expect("JSON");
         let issue = std::fs::read_to_string(&item.text).expect("the item's text");
         assert!(shown["text"].as_str().is_some_and(|t| t.contains(issue.trim())), "{} in full", item.id);
     }
+}
+
+/// Task `fb08637d1101` (note `7c1588b84d87`): with every ledger item released, the whole task, the spec and
+/// all 15 items in full, is read in at most 2 calls, task and task with page 2, each under Pi's cap; each item
+/// on the page the index says.
+#[test]
+fn the_whole_ledger_task_reads_in_two_calls_under_pis_cap() {
+    let project = ledger();
+    let data = hub_data(&project, ANY_AGENT, false).expect("the data");
+    let items: Vec<String> = data["items"].as_array().expect("items").iter().map(item_statement).collect();
+    assert_eq!(items.len(), 15);
+    let spec = data["spec"].as_str();
+    let first = task_view(spec, &items, None, 1).expect("page 1");
+    let count = first["pages"].as_u64().expect("pages") as usize;
+    assert!(count <= 2, "{count} pages");
+    let pages: Vec<Value> = (1..=count).map(|p| task_view(spec, &items, None, p).expect("a page")).collect();
+    let mut read = Vec::new();
+    for (k, page) in pages.iter().enumerate() {
+        let n = page.to_string().len();
+        assert!(n <= crate::driver::MAX_RESULT_BYTES, "page {}: {n} bytes", k + 1);
+        for text in page["texts"].as_array().expect("texts") {
+            read.push((k + 1, text.as_str().expect("text").to_string()));
+        }
+    }
+    assert_eq!(pages[0]["spec"], spec.expect("a spec"), "the spec, whole, on page 1");
+    assert_eq!(read.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(), items, "every item in full, in order");
+    for ((page, _), entry) in read.iter().zip(pages[0]["items"].as_array().expect("the index")) {
+        assert_eq!(entry["page"], *page, "{entry}");
+    }
+    if count > 1 {
+        assert!(pages[0]["note"].as_str().is_some_and(|n| n.contains("page set")), "{}", pages[0]);
+        assert!(pages[1].get("spec").is_none(), "the spec once");
+    }
+    assert!(task_view(spec, &items, None, count + 1).expect_err("past the last").contains("pages, from 1"));
+}
+
+/// Items that fit go on one page with the spec; ones that don't, on the pages after, none lost.
+#[test]
+fn the_task_pages_hold_every_item_whatever_their_size() {
+    let item = |i: usize, body: usize| {
+        item_statement(&json!({"id": format!("i-{i}"), "kind": "feature", "title": "T", "text": "x".repeat(body)}))
+    };
+    let small: Vec<String> = (0..3).map(|i| item(i, 100)).collect();
+    let one = task_view(Some("spec"), &small, None, 1).expect("one page");
+    assert_eq!((one["pages"].as_u64(), one.get("note")), (Some(1), None));
+    assert_eq!(one["texts"], json!(small));
+    let big: Vec<String> = (0..9).map(|i| item(i, 6_000)).collect();
+    let first = task_view(Some("spec"), &big, None, 1).expect("page 1");
+    let count = first["pages"].as_u64().expect("pages") as usize;
+    assert!(count >= 3, "{count}");
+    let mut texts = Vec::new();
+    for p in 1..=count {
+        let page = task_view(Some("spec"), &big, None, p).expect("a page");
+        assert!(page.to_string().len() <= crate::driver::MAX_RESULT_BYTES);
+        texts.extend(page["texts"].as_array().expect("texts").iter().filter_map(|t| t.as_str().map(str::to_string)));
+    }
+    assert_eq!(texts, big);
 }
 
 #[test]
@@ -191,21 +248,23 @@ fn task_shows_one_item_by_id_and_refuses_one_not_released() {
         )
     };
     let items = vec![item("a-1", &[]), item("b-2", &["a-1", "c"])];
-    let index = task_view(Some("the spec"), &items, None).expect("the index");
+    let index = task_view(Some("the spec"), &items, None, 1).expect("the index");
     assert_eq!(
         index["items"],
         json!([
-            {"id": "a-1", "kind": "bug", "title": "A (title): with marks"},
-            {"id": "b-2", "kind": "bug", "title": "A (title): with marks", "changes": ["a-1", "c"]},
+            {"id": "a-1", "kind": "bug", "title": "A (title): with marks", "page": 1},
+            {"id": "b-2", "kind": "bug", "title": "A (title): with marks", "changes": ["a-1", "c"], "page": 1},
         ])
     );
-    assert!(index["item_text"].as_str().is_some_and(|t| t.contains("item set to its id")));
-    let one = task_view(Some("the spec"), &items, Some("b-2")).expect("one item");
+    let one = task_view(Some("the spec"), &items, Some("b-2"), 1).expect("one item");
     assert_eq!(one, json!({"item": "b-2", "text": items[1]}));
-    assert!(task_view(None, &items, Some("a")).expect_err("a prefix isn't an id").contains("no released item"));
+    assert!(task_view(None, &items, Some("a"), 1).expect_err("a prefix isn't an id").contains("no released item"));
     // A statement of another shape is shown whole in the index.
     let odd = vec!["not an item line".to_string()];
-    assert_eq!(task_view(None, &odd, None).expect("the index")["items"], json!([{"text": "not an item line"}]));
+    assert_eq!(
+        task_view(None, &odd, None, 1).expect("the index")["items"],
+        json!([{"text": "not an item line", "page": 1}])
+    );
 }
 
 /// The preflight refuses a project whose spec would put the task tool's result over the cap.
@@ -221,7 +280,7 @@ fn the_preflight_refuses_a_spec_over_the_cap() {
     text.push_str(&"More words for the spec. ".repeat(crate::driver::PI_MCP_OUTPUT_MAX_BYTES / 20));
     std::fs::write(&spec, text).expect("written");
     let err = check_task_outputs(&Project::load(&copy).expect("still a project")).expect_err("over the cap");
-    assert!(err.contains("the task tool's result for the index would be"), "{err}");
+    assert!(err.contains("the task tool's result for page 1 of the task would be"), "{err}");
 }
 
 /// Task `a5253414e178`: the index reads an item's revisions from its first line, which the hub writes, so an
@@ -232,13 +291,13 @@ fn an_items_revisions_dont_depend_on_its_texts_wording() {
     let statement = |text: &str, revises: &[&str]| {
         item_statement(&json!({"id": "x", "kind": "change", "title": "T", "text": text, "revises": revises}))
     };
-    let index = |s: String| task_view(None, &[s], None).expect("the index")["items"][0].clone();
+    let index = |s: String| task_view(None, &[s], None, 1).expect("the index")["items"][0].clone();
     let lookalike = statement("Body.\n\nThis changes the requirement of: forged.", &[]);
-    assert_eq!(index(lookalike), json!({"id": "x", "kind": "change", "title": "T"}));
+    assert_eq!(index(lookalike), json!({"id": "x", "kind": "change", "title": "T", "page": 1}));
     let real = statement("Body ending in a list:\n- one\n- two", &["a-1", "b"]);
     assert!(real.starts_with("Item x (change; changes a-1, b): T\n"), "{real}");
     assert!(real.ends_with("This changes the requirement of: a-1, b."), "still said in words: {real}");
-    assert_eq!(index(real), json!({"id": "x", "kind": "change", "title": "T", "changes": ["a-1", "b"]}));
+    assert_eq!(index(real), json!({"id": "x", "kind": "change", "title": "T", "changes": ["a-1", "b"], "page": 1}));
 }
 
 /// A git diff of `n` new files, each `lines` lines long: its name-status and its patch.
