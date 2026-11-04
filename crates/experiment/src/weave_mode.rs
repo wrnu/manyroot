@@ -60,8 +60,11 @@ impl Mode for WeaveMode {
         vec![
             tool(
                 "task",
-                "The project's spec and an index of the work items released so far (each item's id, kind and title); with `item`, that item's full text",
-                json!({"item": {"type": "string", "description": "An item's id, as the index lists it"}}),
+                "The whole task: the project's spec, an index of the work items released so far (each item's id, kind, title and page) and every item's full text, in as few pages as fit; `page` (from 1) picks a page. With `item`, that one item's full text",
+                json!({
+                    "page": {"type": "integer", "minimum": 1},
+                    "item": {"type": "string", "description": "An item's id, as the index lists it"},
+                }),
                 &[],
             ),
             tool("list_files", "Every file in your working tree, with its size in bytes", json!({}), &[]),
@@ -261,34 +264,78 @@ fn item_entry(statement: &str) -> Value {
     entry
 }
 
-/// What the task tool shows, given the spec and the released items' statements (task `b58cf9180030`). With no
-/// `item`: the spec whole and an index of the items, so the result stays under Pi's output cap however many
-/// items are out (report `b7b35a307aea`: a whole list was cut). With `item`, that item's full statement.
-pub fn task_view(spec: Option<&str>, items: &[String], item: Option<&str>) -> Result<Value, String> {
-    let Some(id) = item else {
-        let index: Vec<Value> = items.iter().map(|s| item_entry(s)).collect();
-        return Ok(json!({
-            "spec": spec,
-            "items": index,
-            "item_text": "Each item's full text: call task with item set to its id.",
-        }));
-    };
-    items
-        .iter()
-        .find(|s| item_entry(s)["id"] == id)
-        .map(|s| json!({"item": id, "text": s}))
-        .ok_or_else(|| format!("no released item {}: task with no item lists those released", short(id)))
+/// The most bytes of one page of the task, as the driver sends it: under [`crate::driver::MAX_RESULT_BYTES`]
+/// with room to spare.
+const TASK_PAGE_BYTES: usize = crate::driver::MAX_RESULT_BYTES - 512;
+
+/// What the task tool shows, given the spec and the released items' statements (tasks `b58cf9180030`,
+/// `fb08637d1101`). With `item`, that item's full statement. Otherwise page `page` (from 1) of the whole task:
+/// page 1 the spec, an index of the items (each with the page its text is on) and as many items' full text as
+/// fit, the next pages the rest of the items in full, in order, each under Pi's output cap (report
+/// `b7b35a307aea`), so an agent reads the whole task in as few calls as fit (note `7c1588b84d87`: reading items
+/// one at a time used a first turn's calls).
+pub fn task_view(spec: Option<&str>, items: &[String], item: Option<&str>, page: usize) -> Result<Value, String> {
+    if let Some(id) = item {
+        return items
+            .iter()
+            .find(|s| item_entry(s)["id"] == id)
+            .map(|s| json!({"item": id, "text": s}))
+            .ok_or_else(|| format!("no released item {}: task with no item lists those released", short(id)));
+    }
+    let mut index: Vec<Value> = items.iter().map(|s| item_entry(s)).collect();
+    // Each item on the page it fits, in order. Page numbers are sized at their widest, and the index's
+    // `"page":N,` at 16 bytes an item.
+    let first =
+        json_len(&json!({"spec": spec, "items": index, "texts": [], "page": 99_999, "pages": 99_999, "note": NOTE}))
+            + 16 * index.len();
+    let rest = json_len(&json!({"texts": [], "page": 99_999, "pages": 99_999, "note": NOTE}));
+    let (mut pages, mut size): (Vec<Vec<usize>>, usize) = (vec![Vec::new()], first);
+    for (i, text) in items.iter().enumerate() {
+        let n = json_len(text) + 1;
+        if size + n > TASK_PAGE_BYTES && !pages.last().is_some_and(Vec::is_empty) {
+            pages.push(Vec::new());
+            size = rest;
+        }
+        size += n;
+        pages.last_mut().expect("a page").push(i);
+    }
+    let count = pages.len();
+    if page == 0 || page > count {
+        return Err(format!("page {page}: the task has {count} pages, from 1"));
+    }
+    for (k, on) in pages.iter().enumerate() {
+        for &i in on {
+            index[i]["page"] = json!(k + 1);
+        }
+    }
+    let texts: Vec<&str> = pages[page - 1].iter().map(|&i| items[i].as_str()).collect();
+    let mut out = if page == 1 { json!({"spec": spec, "items": index}) } else { json!({}) };
+    out["texts"] = json!(texts);
+    out["page"] = json!(page);
+    out["pages"] = json!(count);
+    if count > 1 {
+        out["note"] = json!(NOTE);
+    }
+    Ok(out)
 }
 
+/// What a page of the task says when there is more than one.
+const NOTE: &str = "The task comes in pages: texts holds the full text of the items on this page, and each item in \
+                    the index says its page. Call task with page set to read each other page.";
+
 /// Every result the task tool could give for `project` once all its items are out, as the driver sends it
-/// (JSON text): the index, and each item in full, by what it is.
+/// (JSON text): each page of the task, and each item in full, by what it is.
 pub fn task_outputs(project: &Project) -> Result<Vec<(String, String)>, String> {
     let data = hub_data(project, ANY_AGENT, false)?;
     let items: Vec<String> = data["items"].as_array().into_iter().flatten().map(item_statement).collect();
     let spec = data["spec"].as_str();
-    let mut out = vec![("the index".to_string(), task_view(spec, &items, None)?.to_string())];
+    let first = task_view(spec, &items, None, 1)?;
+    let mut out = vec![("page 1 of the task".to_string(), first.to_string())];
+    for page in 2..=first["pages"].as_u64().unwrap_or(1) as usize {
+        out.push((format!("page {page} of the task"), task_view(spec, &items, None, page)?.to_string()));
+    }
     for item in project.items.iter() {
-        out.push((format!("item {}", item.id), task_view(spec, &items, Some(&item.id))?.to_string()));
+        out.push((format!("item {}", item.id), task_view(spec, &items, Some(&item.id), 1)?.to_string()));
     }
     Ok(out)
 }
@@ -969,7 +1016,7 @@ impl WeaveStore {
     /// The spec and the index of the items released so far, or with `item`, that item in full ([`task_view`]):
     /// only claims the setter's key signed (finding `8c2713b55062`), so no claim another author tags `spec` or
     /// `item` reaches an agent as its task.
-    fn task(&mut self, item: Option<&str>) -> Result<Value, String> {
+    fn task(&mut self, item: Option<&str>, page: usize) -> Result<Value, String> {
         let setter = self.saved("setter.txt")?;
         let log = |s: &mut WeaveStore, tag: &str| s.bracken_json(&["log", "--json", &format!("--tag={tag}")]);
         let texts = |v: &Value| -> Vec<String> {
@@ -982,7 +1029,7 @@ impl WeaveStore {
         };
         let spec = texts(&log(self, "spec")?);
         let items = texts(&log(self, "item")?);
-        task_view(spec.first().map(String::as_str), &items, item)
+        task_view(spec.first().map(String::as_str), &items, item, page)
     }
 
     fn read_file(&mut self, args: &Args) -> Result<Value, String> {
@@ -1570,9 +1617,10 @@ impl Store for WeaveStore {
         self.recover_tree()?;
         match name {
             "task" => {
-                let a = Args::new(args, &["item"])?;
+                let a = Args::new(args, &["item", "page"])?;
                 let item = a.text_opt("item")?;
-                self.task((!item.is_empty()).then_some(item))
+                let page = a.int_opt("page", 1..=100_000)?.unwrap_or(1) as usize;
+                self.task((!item.is_empty()).then_some(item), page)
             }
             "list_files" => {
                 Args::new(args, &[])?;

@@ -447,8 +447,18 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
     if task["spec"].as_str().is_none_or(str::is_empty) {
         return Err("the task tool showed no spec".into());
     }
-    // Each item's full text comes by its id: the mock reads one, as an agent would (task b58cf9180030).
+    // The whole task, page by page, as the prompt says (task fb08637d1101): every item in the index is in full on
+    // the page it names.
     let ids: Vec<&str> = task["items"].as_array().into_iter().flatten().filter_map(|i| i["id"].as_str()).collect();
+    let mut texts: Vec<String> = Vec::new();
+    for page in 1..=task["pages"].as_u64().unwrap_or(1) {
+        let shown = if page == 1 { task.clone() } else { c.tool("task", json!({"page": page}))? };
+        texts.extend(shown["texts"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)));
+    }
+    if let Some(missing) = ids.iter().find(|id| !texts.iter().any(|t| t.starts_with(&format!("Item {id} (")))) {
+        return Err(format!("the task's pages left out item {missing}"));
+    }
+    // One item again by its id, as an agent may (task b58cf9180030).
     let id = ids.get((agent + turn as usize) % ids.len().max(1)).ok_or("the task tool listed no item")?;
     let item = c.tool("task", json!({"item": id}))?;
     if !item["text"].as_str().is_some_and(|t| t.starts_with(&format!("Item {id} ("))) {
