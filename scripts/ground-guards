@@ -37,7 +37,7 @@
 #
 # Runs the pinned bracken in <main>/.bracken-bin, like scripts/bk, or BRACKEN_BIN.
 # Used by scripts/merge (on a PR's head against main), scripts/ground-checkpoint (on
-# what main gained before it pulls) and the forge workflow's manual run.
+# what main gained before it pulls) and the GitHub workflow's manual run.
 set -euo pipefail
 # Byte-wise matching, whatever the caller's locale: the path checks below mustn't depend on it.
 export LC_ALL=C

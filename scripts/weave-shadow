@@ -35,7 +35,7 @@
 #           differing paths in the note;
 #         - but where Weave's tree is exactly git's with each differing path brought back by a proposal
 #           based on an ancestor of its PR's merge-base (scripts/weave-propose's fallback, when the shadow
-#           hadn't recorded the merge-base: a forge squash), from a commit since undone, and in a batch no
+#           hadn't recorded the merge-base: a squash merge), from a commit since undone, and in a batch no
 #           other proposal changed that path but to bring the same back, it isn't Weave's merge that is
 #           wrong: the commit's tree is imported, noted as from an ancestor base, and counted apart from
 #           mismatches;

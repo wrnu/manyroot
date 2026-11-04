@@ -47,7 +47,7 @@ git -C "$repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail
 fork=$(git -C "$repo" merge-base HEAD refs/remotes/origin/main) || fail "$branch shares no history with origin/main"
 
 # The base: the decision on main mirroring the merge-base or, failing that, its nearest first-parent
-# ancestor the shadow recorded (finding da532127b55f). A merge-base can be a forge squash the shadow never
+# ancestor the shadow recorded (finding da532127b55f). A merge-base can be a squash merge the shadow never
 # records itself, since it records the local merge that brings it in.
 mirrored=$("$weave" weave log --limit 100000 --json |
   jq -r '.decisions[] | select(.source.git != null) | "\(.source.git) \(.decision)"')

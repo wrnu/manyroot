@@ -1,0 +1,143 @@
+# CI on GitHub Actions (task 87d7f62409b0, decision d9fa2c08146c): the AGENTS.md test table on Linux, as
+# scripts/test-table runs it in a box, and the macOS-only tests with the host's clippy on a Mac, as
+# scripts/test-table --split's Mac part runs them. It runs on every push and pull request, and by hand
+# (workflow_dispatch). It only reports: it merges nothing, writes nothing to the Ground and deploys
+# nothing. The manager's counted run is still what a merge waits for; scripts/ci-result records this
+# run's result on a pr claim, so the two can be compared (decision d9fa2c08146c).
+#
+# What it leaves out, which only the counted run (scripts/test-table --split) checks (finding
+# a5b068929177): the Docker-backed macos_only tests, since GitHub's macOS runners have no Docker (the
+# macOS job lists each one that skipped, in its log and its summary, never as a pass), and --split's
+# cross-check that every test runs on Linux or the Mac.
+#
+# Hardened for a public repository: read-only token, no secrets, never pull_request_target or
+# workflow_run (a pull_request run from a fork gets no secrets and a read-only token), third-party
+# actions pinned by full commit sha, no `${{ }}` of event data inside a script, and the cargo cache
+# saved only from main, so a pull request can read it but never write it. Standard runners only: larger
+# ones are billed.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The toolchain the team builds with; scripts/test-table's box pins nothing else.
+  RUST_VERSION: "1.98.1"
+  # scripts/test-table's pin (decision 4bf44934cb67 (4)): the hashes are those nextest publishes beside
+  # each tarball, which match GitHub's digests of the assets (checked 2026-11-04).
+  NEXTEST_VERSION: "0.9.150"
+  NEXTEST_LINUX_SHA256: b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
+  NEXTEST_MAC_SHA256: 82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a
+  CARGO_TERM_COLOR: never
+
+jobs:
+  table:
+    name: Test table (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      # Full history, for the Ground guards' append-only check and scripts/code-scope against main.
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: main, as origin/main
+        run: git fetch -q --no-tags origin +refs/heads/main:refs/remotes/origin/main
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_VERSION"
+          cargo --version
+      - name: Tools
+        run: |
+          # b3sum for scripts/team-server's test; the experiment's git-mode tests need git 2.46 or later.
+          sudo apt-get install -y -qq b3sum jq lsof
+          git --version
+          tar=cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz
+          dir=$(mktemp -d)
+          curl -fsSL -o "$dir/$tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/$tar"
+          echo "$NEXTEST_LINUX_SHA256  $dir/$tar" | sha256sum -c --quiet -
+          tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
+          echo "$dir" >>"$GITHUB_PATH"
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # fmt, clippy (this host is x86_64-unknown-linux-gnu, so both of the table's clippies), every test
+      # under nextest, the doctests, and the Ground guards against main: the one copy the manager runs.
+      - name: scripts/test-table
+        run: BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table
+
+  macos:
+    name: macOS-only tests and clippy (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy
+          rustup default "$RUST_VERSION"
+          cargo --version
+      - name: Tools
+        run: |
+          tar=cargo-nextest-$NEXTEST_VERSION-universal-apple-darwin.tar.gz
+          dir=$(mktemp -d)
+          curl -fsSL -o "$dir/$tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/$tar"
+          echo "$NEXTEST_MAC_SHA256  $dir/$tar" | shasum -a 256 -c --quiet -
+          tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
+          echo "$dir" >>"$GITHUB_PATH"
+          # Apple's git, as on the team's Mac, ahead of the runner's Homebrew git: the experiment's
+          # sandbox lets a worker run git's binary and exec path but not Homebrew's libraries, so
+          # Homebrew's git fails to load there (dyld). The git-mode tests need git 2.46 or later.
+          git_dir=$(mktemp -d)
+          ln -s /usr/bin/git "$git_dir/git"
+          "$git_dir/git" --version
+          "$git_dir/git" --version | awk '{split($3, v, "."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 46))}' ||
+            { echo "Apple's git is older than 2.46, which the experiment's git-mode tests need"; exit 1; }
+          echo "$git_dir" >>"$GITHUB_PATH"
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Clippy (macOS host)
+        run: cargo clippy --locked --all-targets -- -D warnings
+      # Every test in a 'mod macos_only', which Linux skips (scripts/test-table --split). A test that can't
+      # run here returns early after printing 'skipped: <why>' (the Docker-backed ones: these runners have
+      # no Docker), and nextest counts it as passed, so this step lists each one from the captured output
+      # (--success-output final), as a warning and in the job's summary: none of them is a pass.
+      - name: macOS-only tests
+        run: |
+          log=$RUNNER_TEMP/macos-only.log
+          set +e
+          cargo nextest run --locked --workspace --no-fail-fast --success-output final -E 'test(~macos_only::)' 2>&1 |
+            tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          # A passing test's captured output follows its 'PASS [..] (n/m) <binary> <test>' line.
+          skipped=$(awk '/^ +PASS \[/ { name = $(NF - 1) " " $NF } /^ +skipped: / && name != "" { print name; name = "" }' "$log" | sort -u)
+          count=$(printf '%s' "$skipped" | grep -c . || true)
+          {
+            echo "### macOS-only tests"
+            echo
+            echo "$count of them skipped here, not passed (no Docker on GitHub's macOS runners); the counted run's Mac side runs them:"
+            echo
+            printf '%s\n' "$skipped" | sed '/^$/d; s/^/- /'
+          } >>"$GITHUB_STEP_SUMMARY"
+          [ "$count" = 0 ] || echo "::warning title=macOS-only tests skipped::$count macos_only tests skipped (no Docker); see the job summary"
+          echo "macOS-only tests: $count skipped, not passed:"
+          printf '%s\n' "$skipped"
+          exit "$rc"

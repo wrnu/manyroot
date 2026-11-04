@@ -15,11 +15,11 @@
 - Nothing in `manyroot` may assume a contribution is code.
 - Every read command in the CLI keeps a `--json` form; agents depend on it.
 - Commit messages and PRs carry no AI attribution.
-- Forge, not GitHub: `fj --host forge.jx.rs …` for PRs, `fj-ex` for Actions. Commands are in `docs/development.md`, under Forge commands.
+- GitHub, `wrnu/manyroot`: `gh` for PRs and Actions. Commands are in `docs/development.md`, under GitHub commands; the old Forge is the read-only remote `forge` (Remotes there).
 
 ## Tests
 
-This table is the CI: the forge's workflow runs only by hand, and the manager's counted run on the merged tree, main merged with the exact head, is what a merge waits for ([docs/development.md](docs/development.md)). With the Weave gate on (a current manager claim tagged `weave-gate`, `Weave gate: on`; owner approval `e8fd45c83ba6`, decision `bbbf898cbcfe`), line main's Weave results on that merged tree can stand in for the full run: `scripts/verify-seq --weave` records a pointer to them, and `scripts/merge` checks them afresh. A head that changes `scripts/test-table` or `Cargo.lock`, names no Weave proposal, or doesn't merge cleanly still takes git's run. The manager chooses how much of the table it covers, by risk (owner decision `464d3ccca45e`, superseding `20a06f9b815e` for counted runs):
+This table is the CI: GitHub Actions runs it on every push and PR as an observer, less the Docker-backed macOS-only tests and `--split`'s list check (`.github/workflows/ci.yml`; `scripts/ci-result` records its result), and the manager's counted run on the merged tree, main merged with the exact head, is what a merge waits for ([docs/development.md](docs/development.md)). With the Weave gate on (a current manager claim tagged `weave-gate`, `Weave gate: on`; owner approval `e8fd45c83ba6`, decision `bbbf898cbcfe`), line main's Weave results on that merged tree can stand in for the full run: `scripts/verify-seq --weave` records a pointer to them, and `scripts/merge` checks them afresh. A head that changes `scripts/test-table` or `Cargo.lock`, names no Weave proposal, or doesn't merge cleanly still takes git's run. The manager chooses how much of the table it covers, by risk (owner decision `464d3ccca45e`, superseding `20a06f9b815e` for counted runs):
 - **Light:** the tests and doctests of the packages your changed files affect (`scripts/code-scope packages` decides them; the table below documents it), fmt, both clippies and the Ground guards, on the merged tree, in a box plus their macOS-only tests on the Mac (`scripts/test-table --split -p`). It needs your recorded passes on the exact head of `cargo fmt --check`, both clippies, `cargo nextest run -P fast -p <packages>` and `scripts/test-table --remote -p <packages>`, each naming at least those packages. The fast pass may also carry `-j <n>`, `--no-fail-fast` and `--test-threads <n>` among its `-p` arguments, and nothing else (task `b1156a629af9`). They're its precondition only: nothing counted rests on them.
 - **Full:** the whole table, which is also the default. It's always required for a head that touches `crates/manyroot`, the root `Cargo.toml` or `Cargo.lock`, `docs/protocol.md`, anything in `crates/tree/src/`, `crates/tree/Cargo.toml`, the weave-v1 fixtures, `.cargo/`, `rust-toolchain*` or any `build.rs`. `scripts/code-scope full` holds that list, and `scripts/verify-seq --light` and `scripts/merge` both refuse a light run for such a head.
 
@@ -43,7 +43,7 @@ Builders don't run the whole `cargo test --workspace` (decision `ef5b807d3196`):
 | `code-scope`, in `scripts/` or `.claude/skills/` | `-p bracken -p bracken-scope`: bracken-scope's tests run it too |
 | `scripts/`, `.claude/skills/` | `-p bracken` |
 | `.config/determinator.toml` | `-p bracken -p bracken-scope -p bracken-tree` |
-| docs, `.bracken/`, the rest of `.claude/` and `.config/`, `.forgejo/`, and the root files the rules name | `-p bracken -p bracken-tree`: their tests import every tracked file |
+| docs, `.bracken/`, the rest of `.claude/` and `.config/`, `.github/`, and the root files the rules name | `-p bracken -p bracken-tree`: their tests import every tracked file |
 | `rustfmt.toml` | none: the format check alone |
 | anything else, such as a new root file or directory | every package, until a rule in `.config/determinator.toml` names it |
 
@@ -62,6 +62,7 @@ Nothing is published, and no workflow deploys on merge. Publishing crates, makin
 - Contribute what others would need **as you learn it**, not at the end.
 - A write prints one labelled line per record, the primary first: `claim <id>`, then `relation <id> (supersedes)`. Pass on the id from the line you mean, never just the first word; scripts use `--json` and its `id`.
 - Messages carry ids; the content goes in the Ground. No secrets or personal data: contributions are permanent.
+- **The Ground is public.** `.bracken/` is committed to the public GitHub repository, so every contribution is a publication, readable by anyone and kept forever (decision `473d5df9b1ab`).
 
 | What | How |
 |---|---|
@@ -89,4 +90,4 @@ There's no memory folder: what a future agent needs is in the Ground (process se
 
 ## Working with other agents
 
-Roles, the merge gate and everything else about how the team works are in the process, [process.md](.claude/skills/agent-team-kickoff/process.md). This repo's values for it (models, risky classes, Forge commands) are in [docs/development.md](docs/development.md). Builders start with [docs/builder.md](docs/builder.md). "Process section N" means a section of `process.md`.
+Roles, the merge gate and everything else about how the team works are in the process, [process.md](.claude/skills/agent-team-kickoff/process.md). This repo's values for it (models, risky classes, GitHub commands) are in [docs/development.md](docs/development.md). Builders start with [docs/builder.md](docs/builder.md). "Process section N" means a section of `process.md`.

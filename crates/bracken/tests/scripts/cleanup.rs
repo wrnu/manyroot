@@ -110,7 +110,7 @@ fn cleanup_removes_only_clean_unused_idle_checkouts_in_its_places_and_the_dry_ru
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::write(shared.join("other-build"), "build").unwrap();
         std::os::unix::fs::symlink(&shared, t3.join("linked/target")).unwrap();
-        // The forge squash-merges "merged" and "linked": main gets their changes, not their commits.
+        // GitHub squash-merges "merged" and "linked": main gets their changes, not their commits.
         for branch in ["merged", "linked", "later", "pushed", "junk", "unclaimed", "reverted"] {
             git(&dir, &["merge", "-q", "--squash", branch]);
             git(&dir, &["commit", "-qm", &format!("{branch} (#1)")]);

@@ -54,7 +54,7 @@ globs = [
     ".bracken/**",
     ".claude/**",
     ".config/**",
-    ".forgejo/**",
+    ".github/**",
     "AGENTS.md",
     "CLAUDE.md",
     "PRODUCT.md",
