@@ -198,3 +198,54 @@ fn ci_result_reads_only_origins_own_runs_never_a_forks() {
     runs(t, &[run_from(500, &sha, "push", "completed", Some("success"), "O/R", None)]);
     assert_eq!(ci(t, &dir, &[]).status.code(), Some(0), "{}", text(&ci(t, &dir, &[])));
 }
+
+/// Note 3be490258b13: a job GitHub cancelled with no runner and no steps (left in the queue) wasn't run. It's
+/// reported as 'not run' with its own exit code, never a pass, and --record records nothing for it. A
+/// cancelled job that did start, or a failed job beside one not run, is still a fail.
+#[test]
+fn ci_result_reports_a_job_github_never_started_as_not_run() {
+    let (tmp, dir, sha) = ci_repo();
+    let t = tmp.path();
+    let job = |name: &str, conclusion: &str, runner: &str, steps: usize| {
+        let runner = if runner.is_empty() { "null".to_owned() } else { format!("\"{runner}\"") };
+        let steps: Vec<&str> = std::iter::repeat_n(r#"{"name":"s","conclusion":"success"}"#, steps).collect();
+        format!(
+            r#"{{"name":"{name}","status":"completed","conclusion":"{conclusion}","runner_name":{runner},"steps":[{}]}}"#,
+            steps.join(",")
+        )
+    };
+    let set_jobs = |jobs: &[String]| {
+        std::fs::write(t.join("jobs.json"), format!(r#"{{"jobs":[{}]}}"#, jobs.join(","))).unwrap();
+    };
+    runs(t, &[run_json(7, &sha, "pull_request", "completed", Some("cancelled"))]);
+
+    let linux = job("Test table (Linux)", "success", "GitHub Actions 1", 5);
+    set_jobs(&[linux.clone(), job("macOS-only tests and clippy (macOS)", "cancelled", "", 0)]);
+    let out = ci(t, &dir, &[]);
+    let said = text(&out);
+    assert_eq!(out.status.code(), Some(4), "{said}");
+    assert!(said.contains("job macOS-only tests and clippy (macOS): not run"), "{said}");
+    assert!(said.contains(&format!("not run at {sha}")), "{said}");
+    assert!(!said.contains("failed at") && !said.contains("passed at"), "{said}");
+
+    // A job that started and was cancelled ran: a fail. So is a failed job beside one not run.
+    set_jobs(&[linux.clone(), job("macOS-only tests and clippy (macOS)", "cancelled", "GitHub Actions 2", 3)]);
+    assert_eq!(ci(t, &dir, &[]).status.code(), Some(1), "{}", text(&ci(t, &dir, &[])));
+    set_jobs(&[
+        job("Test table (Linux)", "failure", "GitHub Actions 1", 5),
+        job("macOS-only tests and clippy (macOS)", "cancelled", "", 0),
+    ]);
+    let out = ci(t, &dir, &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("failed at"), "{}", text(&out));
+
+    // --record: nothing recorded for a run with a job not run.
+    set_jobs(&[linux, job("macOS-only tests and clippy (macOS)", "cancelled", "", 0)]);
+    let claim = bk(&dir, &["claim", &format!("PR #1 b @ {sha}: a change"), "--tag", "pr", "--as", "val"]);
+    let out = ci(t, &dir, &["--record", &claim[..12], "--as", "val"]);
+    assert_eq!(out.status.code(), Some(4), "{}", text(&out));
+    assert!(text(&out).contains("nothing was recorded"), "{}", text(&out));
+    let shown: serde_json::Value = serde_json::from_str(&bk(&dir, &["show", &claim, "--json"])).unwrap();
+    let evidence = shown["referrers"].as_array().unwrap().iter().filter(|r| r["kind"] == "evidence").count();
+    assert_eq!(evidence, 0, "{shown}");
+}

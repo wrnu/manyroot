@@ -14,13 +14,18 @@
 # pull request of the same commit, which anyone can open on a public repository) is never read, and a
 # pull_request run counts only if its PR targets main. It also says what Actions leaves out, which only
 # the counted run checks (finding a5b068929177).
+# A job GitHub cancelled with no runner and no steps (one left in the queue until it timed out, note
+# 3be490258b13) never ran: it's reported as 'not run', neither a pass nor a fail.
 # It exits 0 only if the run completed, its conclusion is success and so is every job's; 1 if it
-# completed otherwise; 3 if it hasn't completed (run it again later); 2 if there's no such run, or it
-# can't read one.
+# completed otherwise, with at least one job that ran and didn't pass (or no jobs at all); 4 if every job
+# passed but one or more weren't run (re-run them: gh run rerun <id> --failed); 3 if it hasn't completed
+# (run it again later); 2 if there's no such run, or it can't read one.
 #
 # --record runs the main checkout's bk-evidence on <pr claim> with this script as the command, from a
 # clean checkout at the claim's head: the evidence is "scripts/ci-result @ <sha>", with this output and
-# exit code. A run that hasn't completed records a fail, so wait for it to complete first.
+# exit code. A run that hasn't completed records a fail, so wait for it to complete first. A run with a
+# job not run records nothing: it reads the run first and, on exit 4, says so and exits 4, since there's
+# no result to compare with the counted run.
 #
 # gh authenticates from its own credential store (gh auth login), with GH_TOKEN, GITHUB_TOKEN, the
 # enterprise token variables and GH_DEBUG unset for it, as in scripts/merge. Needs gh and jq.
@@ -52,6 +57,14 @@ if [ -n "$record" ]; then
   cd "$(git rev-parse --show-toplevel)"
   args=("$record")
   [ -z "$as" ] || args+=(--as "$as")
+  # A job not run isn't a result: read the run first, and record nothing for one.
+  code=0
+  "$here/ci-result" ${event:+--event "$event"} >/dev/null 2>&1 || code=$?
+  if [ "$code" -eq 4 ]; then
+    "$here/ci-result" ${event:+--event "$event"} || true
+    echo "ci-result: a job wasn't run, so there's no result to record; nothing was recorded on $record" >&2
+    exit 4
+  fi
   exec "$main/scripts/bk-evidence" "${args[@]}" -- scripts/ci-result ${event:+--event "$event"}
 fi
 [ -z "$as" ] || usage
@@ -98,11 +111,20 @@ if [ "$status" != completed ]; then
   exit 3
 fi
 jobs=$(get "actions/runs/$id/jobs?per_page=100") || fail "couldn't read run $id's jobs"
-jq -r '.jobs[] | "ci-result: job \(.name): \(.conclusion // .status)"' <<<"$jobs"
+# A job not run: cancelled, with no runner and no steps (GitHub never started it).
+not_run='def not_run: .conclusion == "cancelled" and (.runner_name // "") == "" and ((.steps // []) | length) == 0;'
+jq -r "$not_run"' .jobs[] | "ci-result: job \(.name): \(if not_run
+  then "not run (cancelled with no runner and no steps: GitHub never started it)" else .conclusion // .status end)"' <<<"$jobs"
 if [ "$conclusion" = success ] &&
   jq -e '(.jobs | length) > 0 and all(.jobs[]; .conclusion == "success")' <<<"$jobs" >/dev/null; then
   echo "ci-result: passed at $sha"
   exit 0
+fi
+# Every job passed or wasn't run, and one wasn't: not run, neither a pass nor a fail.
+if jq -e "$not_run"' any(.jobs[]; not_run) and all(.jobs[]; .conclusion == "success" or not_run)' <<<"$jobs" >/dev/null; then
+  skipped=$(jq -r "$not_run"' [.jobs[] | select(not_run) | .name] | join(", ")' <<<"$jobs")
+  echo "ci-result: not run at $sha: $skipped never got a runner, so this is neither a pass nor a fail; re-run with gh run rerun $id --failed" >&2
+  exit 4
 fi
 echo "ci-result: failed at $sha ($conclusion)" >&2
 exit 1
