@@ -535,6 +535,71 @@ fn a_merge_whose_restore_fails_too_tells_the_merges_failure_first() {
     assert!(restore.starts_with("git reset: ") && restore.contains("Unable to create"), "then the restore's: {err}");
 }
 
+/// A fork whose heads both change `tiny/stats.py`'s return line, met at a sync: its merge conflicts there.
+fn forked_with_a_conflict() -> Stores {
+    let mut s = Stores::new(&["agent-0", "agent-1"]);
+    let stats = std::fs::read_to_string(s.trees[0].join("tiny/stats.py")).expect("the seed's stats");
+    let line = stats.lines().find(|l| l.contains("return")).expect("a return line").to_string();
+    for (i, name) in [(0, "zero"), (1, "one")] {
+        s.ok(i, "edit_file", json!({"path": "tiny/stats.py", "old": line, "new": format!("{line}  # {name}")}));
+        s.ok(i, "integrate", json!({"note": format!("agent {i}'s tree")}));
+    }
+    for i in [0, 1, 0, 1] {
+        s.sync(i);
+    }
+    s
+}
+
+/// A conflict on a path git would quote (a non-ASCII byte, a double quote) is reported as the path is, so
+/// resolve can settle it and the merge can be integrated (finding f475a036f200).
+#[test]
+fn a_conflict_on_a_path_git_would_quote_can_be_settled() {
+    let mut s = Stores::new(&["agent-0", "agent-1"]);
+    let paths = ["tiny/café.py", "tiny/qu\"ote.py"];
+    // Each head adds both files, with its own text.
+    for (i, name) in [(0, "zero"), (1, "one")] {
+        for path in paths {
+            s.ok(i, "write_file", json!({"path": path, "text": format!("X = '{name}'\n")}));
+        }
+        s.ok(i, "integrate", json!({"note": format!("agent {i}'s tree")}));
+    }
+    for i in [0, 1, 0, 1] {
+        s.sync(i);
+    }
+    let merged = s.ok(0, "merge", json!({}));
+    assert_eq!(merged["conflicts"], json!(paths), "{merged}");
+    for path in paths {
+        s.ok(0, "write_file", json!({"path": path, "text": "X = 'both'\n"}));
+        s.ok(0, "resolve", json!({"path": path, "take": "tree"}));
+    }
+    let settled = s.ok(0, "integrate", json!({"note": "both heads, settled"}));
+    assert_eq!(settled["parents"].as_array().expect("parents").len(), 2, "{settled}");
+}
+
+/// A merge's conflicts are open until resolve settles them, even when the list of them is lost: a missing
+/// conflicts.txt is never read as none, and one that couldn't be written leaves no merge.txt behind to vouch
+/// for the tree (finding 1f85d3eb08d1).
+#[test]
+fn a_merges_conflicts_stay_open_when_their_list_is_lost() {
+    let mut s = forked_with_a_conflict();
+    let dir = s.trees[0].parent().expect("the copy's directory").to_path_buf();
+    let merged = s.ok(0, "merge", json!({}));
+    assert_eq!(merged["conflicts"], json!(["tiny/stats.py"]), "{merged}");
+    std::fs::remove_file(dir.join("conflicts.txt")).expect("the conflicts' list");
+    let err = s.tool(0, "integrate", json!({"note": "list lost"})).expect_err("the conflict is open");
+    assert!(err.contains("can't be read"), "{err}");
+
+    let mut s = forked_with_a_conflict();
+    let dir = s.trees[0].parent().expect("the copy's directory").to_path_buf();
+    // The conflicts' list can't be written: its temporary copy's name is taken by a directory.
+    std::fs::create_dir_all(dir.join("conflicts.txt.new/held")).expect("a directory in the way");
+    let err = s.tool(0, "merge", json!({})).expect_err("the list can't be written");
+    assert!(err.contains("conflicts.txt"), "{err}");
+    assert!(!dir.join("merge.txt").exists(), "no merge.txt vouches for the tree");
+    let err = s.tool(0, "integrate", json!({"note": "list unwritten"})).expect_err("the conflict is open");
+    assert!(err.contains("merge them into your tree first"), "{err}");
+}
+
 /// Bracken refuses to integrate a proposal on a forked line with "is forked", the words the mock's weave
 /// turn takes as the proposal left open for later (mock.rs, task 61c34b3c2704): this pins them, so a change
 /// to bracken's message fails here, not as a mock run's lost turn.
