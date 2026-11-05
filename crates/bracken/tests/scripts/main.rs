@@ -16,6 +16,7 @@ mod code_scope;
 mod ground_checkpoint;
 mod ground_guards;
 mod merge;
+mod nextest_profile;
 mod owner_approve;
 mod pi_prefix;
 mod queue;
