@@ -81,16 +81,73 @@ pub fn relay_until(
     }
 }
 
-/// Copies `from` to `to` until `from` ends, flushing as it goes; the bytes copied.
+/// Copies `from` to `to` until `from` ends, flushing as it goes; the bytes copied. A read a signal
+/// interrupted is read again: on Linux a socket read or write with a timeout set is never restarted after a
+/// signal or a stop and continue, whatever the handler's flags (signal(7)), and a sync relays through both
+/// (task `d1da2c2c41df`). `write_all` already retries its own.
 pub fn relay(from: &mut impl Read, to: &mut impl Write) -> Result<u64, String> {
     let mut buf = [0u8; 8192];
     let mut total = 0;
     loop {
-        let n = from.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = match from.read(&mut buf) {
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e.to_string()),
+        };
         if n == 0 {
             return Ok(total);
         }
         to.write_all(&buf[..n]).and_then(|()| to.flush()).map_err(|e| e.to_string())?;
         total += n as u64;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reads `chunks` in turn, failing with `Interrupted` before each one, as a socket read with a timeout
+    /// does on Linux when a signal arrives.
+    struct Interrupting {
+        chunks: Vec<&'static [u8]>,
+        interrupt_next: bool,
+        interrupts: usize,
+    }
+
+    impl Read for Interrupting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.interrupt_next {
+                self.interrupt_next = false;
+                self.interrupts += 1;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            self.interrupt_next = true;
+            if self.chunks.is_empty() {
+                return Ok(0);
+            }
+            let chunk = self.chunks.remove(0);
+            buf[..chunk.len()].copy_from_slice(chunk);
+            Ok(chunk.len())
+        }
+    }
+
+    #[test]
+    fn a_relay_reads_again_after_an_interrupted_read() {
+        let mut from = Interrupting { chunks: vec![b"one ", b"two"], interrupt_next: true, interrupts: 0 };
+        let mut to = Vec::new();
+        assert_eq!(relay(&mut from, &mut to), Ok(7));
+        assert_eq!(to, b"one two");
+        assert_eq!(from.interrupts, 3, "an interrupted read before each chunk and before the end");
+    }
+
+    #[test]
+    fn a_relay_still_fails_on_any_other_read_error() {
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+            }
+        }
+        assert!(relay(&mut Broken, &mut Vec::new()).is_err());
     }
 }
