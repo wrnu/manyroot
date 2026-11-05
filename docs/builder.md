@@ -37,6 +37,19 @@ Always use `scripts/bk`, never a `bracken` binary built from your branch. The ta
   - the command isn't an executable file: a shell builtin such as `true` or `echo` counts, so pass its path (`/usr/bin/true`) or wrap it in `bash -c '…'`;
   - the pinned `bracken` is too old to read details from a file: ask the manager to upgrade it.
 
+  Before each `pr` claim, record the checks [AGENTS.md](../AGENTS.md#tests) names, one `bk-evidence` call each, written out as below. Don't loop over them from a variable: the agents' shell is zsh, which doesn't word-split one, so `for c in "cargo fmt --check" …; do "$main/scripts/bk-evidence" <pr> -- $c; done` passes each command as a single word, which bk-evidence refuses as not found, recording nothing (gotcha `fc3c5c8c73b8`, process idea `b1c2e82cc6fb`). Here the packages are `bracken bracken-tree`, as `scripts/code-scope packages origin/main HEAD` prints for a docs change; use exactly the list it prints for yours, one `-p` each, and for the doctests only those of them with a library (never `bracken`). The light run matches these commands exactly, so add no flags to the first three or the doctests:
+
+  ```sh
+  "$main/scripts/bk-evidence" <pr> --as builder-<branch> -- cargo fmt --check
+  "$main/scripts/bk-evidence" <pr> --as builder-<branch> -- cargo clippy --all-targets -- -D warnings
+  "$main/scripts/bk-evidence" <pr> --as builder-<branch> -- cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+  "$main/scripts/bk-evidence" <pr> --as builder-<branch> -- cargo nextest run -P fast -p bracken -p bracken-tree
+  "$main/scripts/bk-evidence" <pr> --as builder-<branch> -- cargo test --doc -p bracken-tree
+  "$main/scripts/bk-evidence" <pr> --as builder-<branch> -- scripts/test-table --remote -p bracken -p bracken-tree
+  ```
+
+  Each call ends with `bk-evidence: recorded pass <id>` or `recorded fail <id>` on stderr; don't filter its output, and treat a call without that line as recording nothing.
+
   Your own evidence is recorded but never counts toward the merge gate; the manager re-runs the checks. So run only the packages [AGENTS.md](../AGENTS.md#tests) lists for what your branch changes, never the whole workspace's tests.
 - **A test you think is wrong:** never delete, skip or weaken it. Contribute a claim that `contradicts` it, with your reasoning.
 - **Review findings:** answer each confirmed finding by fixing it in a new head, proposing a deferral (a `question` claim saying what would fix it and when; if the manager agrees, it records the deferred task itself), or disputing it (a claim that `contradicts` it).
