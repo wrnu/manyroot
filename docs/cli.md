@@ -199,3 +199,50 @@ something that `implements` the contribution. Retracting that relation makes the
 A claim tagged `intent` without an expiry, or without a `refines` relation from its author, is an
 ordinary claim. Like every timestamp, the expiry is advisory: it's the author's clock, so readers
 treat it as a hint, not a lock.
+
+## Weave
+
+`bracken weave` keeps source trees in a Weave Ground: file versions and manifests imported from git,
+lines and their decisions, proposals, merges, and the checks that make a line green. The spec is
+[docs/design/weave.md](design/weave.md); this section follows `bracken weave <command> --help`. In this
+repository the Weave Ground is reached only through `scripts/weave`, which picks the Ground and refuses
+what an identity may not run (AGENTS.md).
+
+```sh
+bracken weave init --dir <new dir> --as alice     # the Weave marker and a `main` line
+bracken weave import --from-git HEAD --as alice   # or --index; --dry-run lists what it would write
+bracken weave propose --from-git HEAD --summary "..." --as alice   # against the line's head, or --base
+bracken weave integrate --proposals <id> --as alice                # integrator only
+bracken weave head                                # the line's head and its manifest
+bracken weave verify --git HEAD                   # the head against a commit's tree; non-zero if they differ
+```
+
+Every command takes `--dir` and `--as`, and `--line <id or name>` where it reads or writes a line (the
+default line otherwise). Every read has `--json`. A manifest is named by its content hash,
+`blake3:<hex>`; a decision or proposal by its id.
+
+| Command | What it does |
+|---|---|
+| `init [--purpose P]` | Creates a Weave Ground at `--dir`: the Weave marker and a `main` line, signed with `--as`. `--dir` must not exist yet and its parent must; refuses if the parent is inside a git checkout |
+| `import (--from-git REV \| --index) [--repo R] [--dry-run]` | Records a git tree as file versions (only those new to the Ground) and one manifest. Takes git's view only: a commit's tree, or the index. Refuses, writing nothing, if anything looks like a secret |
+| `checkout --manifest H <dir>` | Writes a manifest's tree into an empty directory. Never follows a symlink; on a failure part way, removes what it wrote |
+| `diff A B` | The per-file difference between two manifests or decisions, with a unified diff of each changed text file |
+| `verify --git REV [--at D \| --manifest H]` | Compares a manifest with a commit's tree: the same paths, modes and bytes, with the excluded root entries left out. Exits non-zero if they differ. Compares the line's head unless `--at` or `--manifest` names another |
+| `check` | Lists Weave payloads that are invalid or break the ancestor rule, manifests not yet complete, markers past the one that counts, and policy versions ignored for citing no owner decision. Exits non-zero when it lists any |
+| `head` | The line's head with its manifest, or every head of a forked line |
+| `log [--limit N] [--since D]` | The line's decisions, newest first in causal order (20 by default): manifest, parents, breakage and note |
+| `status [--index] [--at D]` | Git's `HEAD`, or its index, against the line's head (or `--at`, needed while the line is forked): each file added, modified, deleted or with its mode changed |
+| `propose [--from-git REV \| --index] [--base D] [--summary S] [--dry-run]` | Records a tree (git's view, with import's refusals) and a proposal to integrate it onto the line, against a base decision, by default the line's head |
+| `integrate` | Integrator: records the line's next decision, with every head of the line as a parent, so on a forked line it settles the fork. The tree is `--from-git REV` (default `HEAD`), `--index` or `--manifest H`, or `--proposals P...` merged in order onto the line's head, file by file against each one's base, with the resolutions the Ground holds; a conflict without one stops it, listed, and nothing is written. `--mirrors REV` (stage 2a) writes the merge only if it equals the commit's tree. `--run` runs the line's checks first, for your information only. `--answer`, `--breakage`, `--goal` and `--note` fill in the decision. Refuses if the decision wouldn't qualify |
+| `green [--manifest H]` | The line's green under its current policy, and per head each check's counted results, with the fails a later attempt replaced. With `--manifest`, any manifest the replica holds, leaving out the integrators' own results |
+| `review [--proposal P]` | Reviews of the line's heads and open proposals, and the objections the next move must answer, with the dispositions each allows |
+| `validate --manifest H [--check NAME]... [--again] [--timeout S] [--dry-run]` | Validator: runs the line's named checks (default: all) on a manifest through the sandboxed check runner, and records each result on it. Only for one of the line's validators; refuses a check you already have a latest result for unless `--again` |
+| `line create <name> --owner-decision ID` | Creates a line: its first policy version, signed by `--as`, who alone can change it. `--integrator`, `--validator`, `--goal-setter`, `--check NAME=ARGV`, `--executor` and the guardrails `--max-known`, `--max-age`, `--protected` set the policy |
+| `line policy <line> --owner-decision ID` | Writes a new version of the line's policy, superseding every current version. Only the line's author can; an option not given keeps the current value, and `--clear` empties a list |
+| `line merge <from> --into <line> [--base D] [--dry-run]` | Integrator: merges one line's head into another's, file by file against their merge base. With every conflict resolved, writes the merged manifest and a decision whose parents are both heads; otherwise lists the conflicts and writes nothing |
+| `resolve <path>` | Writes a resolution for the conflict at one path of a merge, named as `line merge` (`--into`, `--from`) or `integrate` (`--proposals`) names it: `--take into\|from\|<resolution>`, `--delete`, or `--file F`. `--markers F` writes nothing to the Ground, only a file with the conflicting regions between markers, to edit and give to `--file` |
+
+A policy version, from `line create` or `line policy`, counts only if it cites an owner decision with
+`--owner-decision`. In a merge, a text file both sides changed merges line by line, three-way; it
+conflicts only where both sides changed the same or adjacent lines differently. A conflict in a file
+that isn't text, a mode conflict, or a delete against a change always needs a resolution.
