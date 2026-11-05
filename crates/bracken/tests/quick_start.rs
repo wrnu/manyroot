@@ -29,9 +29,14 @@ fn quick_start_blocks(readme: &str) -> Vec<Vec<&str>> {
     let mut blocks = Vec::new();
     let mut open: Option<Vec<&str>> = None;
     for line in section {
-        // Any fence CommonMark knows, indented or not: ``` or ~~~, of any length. Only ```sh and a
-        // bare ``` at the line's start pass the asserts below, so no other kind of block goes unseen.
+        // A fence at up to three spaces' indent, or more inside a list: ``` or ~~~, of any length. Only
+        // ```sh and a bare ``` at the line's start pass the asserts below. The other blocks CommonMark
+        // knows, a block quote (which can hold a fence, as a GitHub alert '> [!TIP]' often does) and an
+        // indented code block, fail in `outside_a_block` (finding 1a6b1bc6f146).
         let fence = line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~");
+        if open.is_none() && !fence {
+            outside_a_block(line);
+        }
         match (&mut open, fence) {
             (None, true) => {
                 assert_eq!(
@@ -50,6 +55,27 @@ fn quick_start_blocks(readme: &str) -> Vec<Vec<&str>> {
     }
     assert!(open.is_none(), "README's quick start has an unclosed code block");
     blocks
+}
+
+/// Fails on a line outside the quick start's code blocks that could start a block the parser doesn't
+/// read: a block quote ('>' after any indent) or an indented code block (text indented four columns or
+/// more). Either could hold commands the test would never run.
+fn outside_a_block(line: &str) {
+    assert!(
+        !line.trim_start().starts_with('>'),
+        "README's quick start has a block quote, which can hold commands this test doesn't run; use a ```sh block \
+         or plain text: {line:?}"
+    );
+    // The indent's width in columns, a tab reaching the next multiple of four, as CommonMark counts it.
+    let indent = line
+        .chars()
+        .take_while(|c| *c == ' ' || *c == '\t')
+        .fold(0, |col, c| if c == '\t' { col + 4 - col % 4 } else { col + 1 });
+    assert!(
+        line.trim().is_empty() || indent < 4,
+        "README's quick start has an indented line, which can be a code block this test doesn't run; use a ```sh \
+         block: {line:?}"
+    );
 }
 
 /// The quick start as one shell script: the blocks without the dropped lines, each followed by a
@@ -206,6 +232,39 @@ mod parser {
     #[should_panic(expected = "must be ```sh")]
     fn an_indented_block_fails() {
         quick_start_blocks(&with_extra("- step:\n\n   ```sh\n   false\n   ```\n"));
+    }
+
+    /// Finding 1a6b1bc6f146's counterexample: a fence inside a GitHub alert, which GitHub renders as code.
+    #[test]
+    #[should_panic(expected = "has a block quote")]
+    fn a_block_quoted_block_fails() {
+        quick_start_blocks(&with_extra(
+            "> [!TIP]\n> Clean up afterwards:\n>\n> ```sh\n> bracken no-such-command\n> false\n> ```\n",
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "has a block quote")]
+    fn an_indented_block_quote_fails() {
+        quick_start_blocks(&with_extra("  > ```sh\n  > false\n  > ```\n"));
+    }
+
+    #[test]
+    #[should_panic(expected = "has an indented line")]
+    fn an_indented_code_block_fails() {
+        quick_start_blocks(&with_extra("Clean up afterwards:\n\n    bracken no-such-command\n    false\n"));
+    }
+
+    #[test]
+    #[should_panic(expected = "has an indented line")]
+    fn a_tab_indented_code_block_fails() {
+        quick_start_blocks(&with_extra("Clean up afterwards:\n\n  \tfalse\n"));
+    }
+
+    #[test]
+    fn blank_and_lightly_indented_lines_pass() {
+        let readme = with_extra("    \n\t\n   Indented three spaces, still a paragraph.\n");
+        assert_eq!(quick_start_blocks(&readme), vec![vec!["true"], vec!["true"]]);
     }
 
     #[test]
