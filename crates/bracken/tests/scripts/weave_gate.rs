@@ -7,8 +7,9 @@ use crate::support::*;
 /// A stand-in for scripts/weave, keeping the Weave Ground's state as files in `$T/weave`. A manifest is
 /// `blake3:` and the sha-256 of git's tree id, so `verify` compares trees. `green --manifest` reads the
 /// results `validate` wrote, one '<check> <pass|fail> <result>' line each; `$T/weave/fail-<check>` makes
-/// that check fail, `no-<check>` leaves it out of the policy, and `extra` lists more policy checks;
-/// `show` knows the ids in `proposals`.
+/// that check fail, `no-<check>` leaves it out of the policy, `unrecorded-<check>` makes validate stop
+/// there, recording nothing for it, as the real one does for a check that can't run, and `extra` lists
+/// more policy checks; `show` knows the ids in `proposals`.
 const WEAVE: &str = r#"#!/bin/bash
 set -euo pipefail
 W="$T/weave"
@@ -30,6 +31,11 @@ case "$sub" in
     state="$W/state-${m#blake3:}"
     while [ $# -gt 0 ]; do
       if [ "$1" = --check ]; then
+        if [ -e "$W/unrecorded-$2" ]; then
+          echo "progress: running $2" >&2
+          echo "error: check $2 can't run: no cargo-nextest on PATH; nothing was written for it" >&2
+          exit 1
+        fi
         n=$(( $(cat "$W/n" 2>/dev/null || echo 0) + 1 )); echo "$n" >"$W/n"
         verdict=pass; [ ! -e "$W/fail-$2" ] || verdict=fail
         { grep -v "^$2 " "$state" 2>/dev/null || true; echo "$2 $verdict $(printf '%064x' "$n")"; } >"$state.new"
@@ -333,6 +339,55 @@ fn each_fallback_records_nothing_and_asks_for_gits_counted_run() {
         commit_all(&b.dir, "main conflicts");
         assert!(run(&b.dir, "git", &["push", "-q", b.forge.to_str().unwrap(), "main"]).status.success());
         refused(&b, &claim1, 1, "doesn't merge cleanly onto main");
+    }
+}
+
+/// Gotcha c05efcb89101: when validate records nothing for a check (a tool missing from PATH, say), record
+/// says nothing was recorded, not that the check isn't green: with validate's exit code and last error
+/// line, and the tools the checks need that aren't on PATH, or that they all are.
+#[test]
+fn a_check_validate_recorded_nothing_for_says_so_and_why() {
+    for scripts in SCRIPTS {
+        let b = fixture(scripts, &|_, _| {});
+        b.gate("Weave gate: on");
+        let claim = b.with_proposal(1);
+        std::fs::write(b.weave_dir().join("unrecorded-table"), "").unwrap();
+        let pair = format!("{}:{}", &claim[..12], b.shas[0]);
+        let record = |path: &str| {
+            let out = b.command("scripts/weave-gate", &["record", &pair]).env("PATH", path).output().unwrap();
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+            assert!(b.pointers(&claim).is_empty(), "{scripts}: a pointer was recorded");
+            text(&out)
+        };
+        let stubs = b.tmp.path().join("stubs");
+        // This PATH lacks every directory holding cargo-nextest or boat.
+        let lacking: Vec<String> = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .filter(|d| !d.join("cargo-nextest").exists() && !d.join("boat").exists())
+            .map(|d| d.display().to_string())
+            .collect();
+        let lacking = format!("{}:{}", stubs.display(), lacking.join(":"));
+        let said = record(&lacking);
+        assert!(said.contains("nothing was recorded for check table on blake3:"), "{scripts}: {said}");
+        assert!(!said.contains("isn't green"), "{scripts}: it reads like a test failure: {said}");
+        assert!(said.contains("progress: running table"), "{scripts}: validate's output didn't show: {said}");
+        assert!(
+            said.contains("weave validate exited 1: error: check table can't run: no cargo-nextest on PATH"),
+            "{scripts}: {said}"
+        );
+        let missing = said.split("not on PATH: ").nth(1).unwrap_or_else(|| panic!("{scripts}: {said}"));
+        let missing = missing.split(')').next().unwrap();
+        assert!(missing.contains("cargo-nextest") && missing.contains("boat"), "{scripts}: {said}");
+        assert!(said.contains("so this is no test result") && said.contains("run git's counted run"), "{scripts}");
+
+        // Every tool there: it says so, and still that nothing was recorded.
+        let tools = b.tmp.path().join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        for t in ["cargo", "cargo-nextest", "boat", "timeout"] {
+            write_executable(&tools.join(t), "#!/bin/sh\nexit 0\n");
+        }
+        let said = record(&format!("{}:{lacking}", tools.display()));
+        assert!(said.contains("nothing was recorded for check table"), "{scripts}: {said}");
+        assert!(said.contains("every tool the checks need is on PATH"), "{scripts}: {said}");
     }
 }
 

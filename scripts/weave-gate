@@ -24,8 +24,11 @@
 # evidence on the pr claim, the pointer:
 #   'scripts/test-table --weave @ <sha> on <main sha> tree <key> manifest <H>'
 # with details naming H, M, the policy version and each check's counted result ids. Otherwise it names
-# why and says to run git's counted run, recording nothing. It falls back the same way, before anything
-# runs, when:
+# why and says to run git's counted run, recording nothing. A check with no result at all, pass or fail,
+# isn't a test failure: validate recorded nothing for it (a check that can't run stops validate and
+# records nothing, gotcha c05efcb89101), so it says that, with validate's exit code and last line of
+# error output, and which of the tools the checks need (cargo, cargo-nextest, boat, jq, timeout or
+# gtimeout) aren't on PATH. It falls back the same way, before anything runs, when:
 #   - the head doesn't merge cleanly onto main;
 #   - the pr claim names no 'Weave proposal <64 hex>' that the Weave Ground holds (weave-shadow --proposal
 #     needs it after the merge: it checks Weave's own merge against git's);
@@ -134,11 +137,36 @@ results() {
   for c in "${required[@]}"; do
     jq -e --arg c "$c" 'any(.checks[]; .check == $c)' <<<"$green" >/dev/null ||
       { echo "line main's policy has no check $c"; return 1; }
+    jq -e --arg c "$c" 'any(.checks[]; .check == $c and ((.passes + .fails) | length) > 0)' <<<"$green" >/dev/null ||
+      { echo "nothing was recorded for check $c on $1"; return 1; }
     jq -e --arg c "$c" 'any(.checks[]; .check == $c and .green == true and (.passes | length) > 0)' <<<"$green" >/dev/null ||
       { echo "check $c isn't green on $1"; return 1; }
   done
   jq -e '.green == true' <<<"$green" >/dev/null || { echo "not every check of line main's policy is green on $1"; return 1; }
   jq -r '"version \(.version)", ([.checks[] | .check as $c | .passes[] | "\($c) \(.result)"] | sort | .[])' <<<"$green"
+}
+
+# unrecorded_why <validate's exit code, or empty if it didn't run> <its error output file>: why validate
+# may have recorded nothing, as far as this can tell: how validate ended, and the tools the checks need
+# that aren't on PATH (a box check runs boat; the mac check cargo, cargo-nextest, jq and timeout).
+unrecorded_why() {
+  local said=() missing=() t last
+  if [ -z "$1" ]; then
+    said+=("weave validate didn't run")
+  elif [ "$1" -eq 0 ]; then
+    said+=("weave validate exited 0")
+  else
+    last=$(grep -v '^[[:space:]]*$' "$2" 2>/dev/null | tail -n 1 || true)
+    said+=("weave validate exited $1${last:+: $last}")
+  fi
+  for t in cargo cargo-nextest boat jq; do command -v "$t" >/dev/null || missing+=("$t"); done
+  command -v timeout >/dev/null || command -v gtimeout >/dev/null || missing+=("timeout or gtimeout")
+  if [ ${#missing[@]} -gt 0 ]; then
+    said+=("not on PATH: $(printf '%s, ' "${missing[@]}" | sed 's/, $//')")
+  else
+    said+=("every tool the checks need is on PATH")
+  fi
+  printf '%s; ' "${said[@]}" | sed 's/; $//'
 }
 
 # pending <manifest>: the required checks with no counted result on it at all, in order; or why not, and 1.
@@ -186,19 +214,28 @@ case "${1:-}" in
       { echo "weave-gate: $manifest doesn't verify equal to git's merge $commit; run git's counted run" >&2; exit 1; }
     echo "weave-gate: PR #$pr @ ${sha:0:12} merged with main ${tip:0:12} is $commit (key $key), manifest $manifest"
     todo=$(pending "$manifest") || fail "$todo"
+    validated='' errors=$(mktemp)
+    trap 'rm -f "$errors" "${details:-}"' EXIT
     if [ -n "$todo" ]; then
       args=()
       while IFS= read -r c; do args+=(--check "$c"); done <<<"$todo"
       echo "weave-gate: weave-runner validates $(tr '\n' ' ' <<<"$todo")on $manifest"
-      "$weave" --as weave-runner weave validate --line main --manifest "$manifest" "${args[@]}" ||
-        echo "weave-gate: weave validate failed or was refused; reading what it recorded" >&2
+      # Its error output still shows as it comes, and a copy is kept for unrecorded_why; with pipefail,
+      # the pipeline's status is validate's.
+      validated=0
+      { "$weave" --as weave-runner weave validate --line main --manifest "$manifest" "${args[@]}" 2>&1 >&3 3>&- |
+        tee "$errors" >&2; } 3>&1 || validated=$?
+      [ "$validated" -eq 0 ] ||
+        echo "weave-gate: weave validate failed or was refused (exit $validated); reading what it recorded" >&2
     fi
     if ! counted=$(results "$manifest"); then
+      if [[ $counted == "nothing was recorded for check "* ]]; then
+        counted+=" ($(unrecorded_why "$validated" "$errors")), so this is no test result"
+      fi
       echo "weave-gate: PR #$pr @ ${sha:0:12}: $counted; run git's counted run" >&2
       exit 1
     fi
     details=$(mktemp)
-    trap 'rm -f "$details"' EXIT
     {
       echo "manifest $manifest"
       echo "merged $commit tree $key on main $tip"

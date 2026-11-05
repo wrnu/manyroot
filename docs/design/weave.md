@@ -1625,7 +1625,9 @@ each need their own decision.
     - a head that changes `scripts/test-table`, its template copy, or
       `Cargo.lock` (the policy pins main's test-table, and the vendor
       directory follows main's lock);
-    - a check that isn't green;
+    - a check that isn't green, or one validate recorded nothing for
+      (`weave-gate` then says so and why, such as a tool missing from
+      PATH, rather than that the check isn't green);
     - batches.
   - Results are read only through `weave green --manifest`: each check's
     counted results on any manifest the replica holds, under the line's
