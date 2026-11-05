@@ -41,7 +41,8 @@
 #     "PR #<n> <branch> @ <HEAD's full sha>:", as a pr claim does. For evidence on a
 #     claim that isn't a pr claim (a finding, a task), pass --any-head; it refuses
 #     claims tagged pr, whose head must always match;
-#   - the identity (--as or BRACKEN_AGENT) is missing or can't sign here;
+#   - the identity (--as or BRACKEN_AGENT) is missing or can't sign here: neither its key file is here
+#     nor, for one whose key the team server holds, its team token;
 #   - the pinned bracken is too old to read details from a file (--details-file);
 #   - the command isn't an executable file (exit 127). A shell builtin, keyword or
 #     function is refused too: pass the program's path (`type -P true` gives
@@ -132,8 +133,18 @@ case "$kind" in
     exit 127
     ;;
 esac
-"$here/bk" id list | awk -v n="$agent" '$2 == n && NF == 2 { found = 1 } END { exit !found }' ||
-  fail "this replica can't sign as '$agent' (see scripts/bk id list)"
+# This replica signs as $agent with its key file, or, for an identity whose key the team server holds
+# ('(no local key)'), through the server with its team token, found as scripts/bk finds it: the main
+# checkout's .bracken-team, then tokens/<identity> in the team directory (note c0346a9af0dc).
+ids=$("$here/bk" id list)
+if ! awk -v n="$agent" '$2 == n && NF == 2 { found = 1 } END { exit !found }' <<<"$ids"; then
+  awk -v n="$agent" '$2 == n && NF == 5 && $3 $4 $5 == "(nolocalkey)" { found = 1 } END { exit !found }' <<<"$ids" ||
+    fail "this replica can't sign as '$agent' (see scripts/bk id list)"
+  main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+  team=$(cat "$main/.bracken-team" 2>/dev/null || true)
+  [[ $agent =~ ^[a-z0-9_-]{1,64}$ ]] && [ -n "$team" ] && [ -f "$team/tokens/$agent" ] ||
+    fail "this replica can't sign as '$agent': the team server holds its key, but it has no team token here (see scripts/bk id list)"
+fi
 # Outputs are captured first and searched with here-strings: under pipefail, a grep that stops
 # early in a pipeline kills the writer with SIGPIPE once the output passes the pipe buffer.
 help=$("$here/bk" evidence --help)

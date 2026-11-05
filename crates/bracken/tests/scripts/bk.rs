@@ -488,7 +488,12 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
     let real = env!("CARGO_BIN_EXE_bracken");
     for scripts in SCRIPTS {
         let copy = |name: &str| repo_root().join(scripts).join(name);
-        let files = [("scripts/bk", copy("bk")), ("scripts/team-server", copy("team-server"))];
+        let files = [
+            ("scripts/bk", copy("bk")),
+            ("scripts/team-server", copy("team-server")),
+            ("scripts/bk-evidence", copy("bk-evidence")),
+            ("scripts/code-scope", copy("code-scope")),
+        ];
         let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
         let (tmp, a) = repo(&files, ".bracken/\n.bracken-team\n", |_| {});
         let team = tmp.path().join("team");
@@ -582,6 +587,22 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         ok(sh("scripts/bk", &["claim", "signed locally"], Some("alice")), "alice's claim");
         assert_eq!(lines("signed.jsonl").len(), 1, "{scripts}");
         failed(sh("scripts/team-server", &["key", "alice"], None), "key for alice", "already an identity");
+        // bk-evidence records for it too: it has no key file here, but it has a team token (note c0346a9af0dc).
+        let head = String::from_utf8(run(&a, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
+        let out = ok(
+            sh("scripts/bk", &["claim", &format!("PR #1 main @ {head}: t"), "--tag", "pr"], Some("builder-x")),
+            "pr",
+        );
+        let pr = common::bare_ids(out.trim().to_owned());
+        let ran = tmp.path().join("ran");
+        let evidence = |agent: &str| {
+            let touch = ["bash", "-c", "touch \"$0\"", ran.to_str().unwrap()];
+            sh("scripts/bk-evidence", &[&[&pr[..12], "--as", agent, "--"][..], &touch].concat(), None)
+        };
+        ok(evidence("builder-x"), "bk-evidence as builder-x");
+        assert!(ran.exists(), "{scripts}: the command didn't run");
+        let signed = lines("signed.jsonl");
+        assert!(signed.len() == 3 && signed[2]["credential"] == "builder-x", "{scripts}: {signed:?}");
 
         // retire: the server signs nothing more for it, and its token is gone.
         let out = ok(sh("scripts/team-server", &["retire", "builder-x"], None), "retire");
@@ -589,6 +610,10 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         assert!(team.join("keys/retired/builder-x.json").exists() && !team.join("tokens/builder-x").exists());
         failed(sh("scripts/bk", &["claim", "after retiring"], Some("builder-x")), "after retiring", "no team token");
         failed(sh("scripts/team-server", &["token", "builder-x"], None), "token after retiring", "is retired");
+        // Without a token, bk-evidence refuses before it runs anything.
+        std::fs::remove_file(&ran).unwrap();
+        failed(evidence("builder-x"), "bk-evidence without a token", "no team token here");
+        assert!(!ran.exists(), "{scripts}: the command ran");
         failed(sh("scripts/team-server", &["key", "builder-x"], None), "key after retiring", "already an identity");
         ok(sh("scripts/bk", &["claim", "alice still writes"], Some("alice")), "alice after the restart");
         let retired = std::fs::read_to_string(team.join("keys/retired.jsonl")).unwrap();
