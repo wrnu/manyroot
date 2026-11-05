@@ -520,7 +520,7 @@ echo \"$* token=${GH_TOKEN:-none}\" >>\"$PRS/gh.log\"
 \
          [ ! -f \"$PRS/$3\" ] || exec cat \"$PRS/$3\"
 \
-         printf '{\"state\":\"OPEN\",\"headRefName\":\"%s\",\"headRefOid\":\"%s\"}\\n' \
+         printf '{\"state\":\"OPEN\",\"headRefName\":\"%s\",\"headRefOid\":\"%s\",\"isCrossRepository\":false}\\n' \
            \"$(git symbolic-ref --short HEAD)\" \"$(git rev-parse HEAD)\"
 ",
     );
@@ -655,10 +655,16 @@ echo \"$* token=${GH_TOKEN:-none}\" >>\"$PRS/gh.log\"
     let f1 = git(&["rev-parse", "HEAD"]);
     std::fs::write(prs.join("7.missing"), "").unwrap();
     refused("scripts/weave-propose", &["--pr", "7", "--as", "alice"], "can't read PR #7 on github.example/team/repo");
-    let answer = |n: &str, state: &str, branch: &str, sha: &str| {
-        let json = format!("{{\"state\":\"{state}\",\"headRefName\":\"{branch}\",\"headRefOid\":\"{sha}\"}}");
+    let answer_from = |n: &str, state: &str, branch: &str, sha: &str, fork: bool| {
+        let json = format!(
+            "{{\"state\":\"{state}\",\"headRefName\":\"{branch}\",\"headRefOid\":\"{sha}\",\"isCrossRepository\":{fork}}}"
+        );
         std::fs::write(prs.join(n), json).unwrap();
     };
+    let answer = |n: &str, state: &str, branch: &str, sha: &str| answer_from(n, state, branch, sha, false);
+    // A fork's PR from a branch of the same name, at this very commit (finding 46f7e9b16671).
+    answer_from("3", "OPEN", "f1", &f1, true);
+    refused("scripts/weave-propose", &["--pr", "3", "--as", "alice"], "its branch is in another repository (a fork)");
     answer("6", "MERGED", "f1", &f1);
     refused("scripts/weave-propose", &["--pr", "6", "--as", "alice"], "it is MERGED, not open");
     answer("5", "OPEN", "fast-threads", &c0);
@@ -670,13 +676,14 @@ echo \"$* token=${GH_TOKEN:-none}\" >>\"$PRS/gh.log\"
     answer("4", "OPEN", "f1", &c0);
     refused("scripts/weave-propose", &["--pr", "4", "--as", "alice"], "(wait until GitHub has the push)");
     // Later PRs reuse these numbers: from here, each PR is open at the branch and HEAD it is proposed from.
-    for n in ["4", "5", "6", "7.missing"] {
+    for n in ["3", "4", "5", "6", "7.missing"] {
         std::fs::remove_file(prs.join(n)).unwrap();
     }
     let log = std::fs::read_to_string(prs.join("gh.log")).unwrap();
     assert!(
-        log.lines()
-            .all(|l| l.ends_with("--repo github.example/team/repo --json state,headRefName,headRefOid token=none")),
+        log.lines().all(|l| l.ends_with(
+            "--repo github.example/team/repo --json state,headRefName,headRefOid,isCrossRepository token=none"
+        )),
         "{log}"
     );
     let p1 = proposal("1");
