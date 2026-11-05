@@ -26,7 +26,9 @@ in where it applies (named checks, re-runs, one counted run, reviews that
 survive a rebase, labelled ids, bounded reads, a namespaced goal tag), and
 its later items are listed in section 8.
 
-Nothing here is built yet. This is design only: one docs PR, no code.
+Build steps 1 to 10a (section 6) are merged, and so is stage 2b's step 1b, under which line main's
+results can stand in for git's counted run while the Weave gate is on (section 7). `bracken weave`'s
+commands are in [docs/cli.md](../cli.md), Weave.
 
 ## Summary
 
