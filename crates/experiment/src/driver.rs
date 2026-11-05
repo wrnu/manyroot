@@ -1088,7 +1088,7 @@ fn relay_session(
             if slot.is_none() {
                 match listener.accept() {
                     Ok((s, _)) => *slot = Some(s),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) => {}
                     Err(e) => return Err(format!("accepting a sync session: {e}")),
                 }
             }
