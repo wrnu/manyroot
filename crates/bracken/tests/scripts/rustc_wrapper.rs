@@ -136,14 +136,20 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
     // reaches sccache and the compiler (finding c3665d850bc9).
     //
     // Exit 254 (task f5849cee0423, gotcha fc6e6835ad88): a server started with a TMPDIR since deleted answers
-    // every compile with its fatal error, as sccache 0.19 does, and the compiler never runs. The wrapper says
-    // so in one line, stops that server, and runs the compiler itself. A compile the server ran and a signal
-    // killed (its note last on stdout) is passed on, never rerun, and so is every 254 without the copy.
+    // every compile with its fatal error, "sccache: encountered fatal error" on stderr, as sccache 0.19 does,
+    // and the compiler never runs. The wrapper says so in one line, stops that server, and runs the compiler
+    // itself. A compile the server ran and a signal killed (its note last on stdout) is passed on, never
+    // rerun. So is a 254 the compile chose, as a proc macro can, with no such line on stderr (finding
+    // 2d0978e6cdfd), or with it only on stdout or within another line, and every 254 without the copy of
+    // stdout or of stderr (here a mkfifo that fails).
     let failing = stubs.parent().unwrap().join("failing");
     let nocopy = stubs.parent().unwrap().join("nocopy");
     std::fs::create_dir_all(&failing).unwrap();
     std::fs::create_dir_all(&nocopy).unwrap();
     write_executable(&nocopy.join("mktemp"), "#!/bin/bash\nexit 1\n");
+    let nofifo = stubs.parent().unwrap().join("nofifo");
+    std::fs::create_dir_all(&nofifo).unwrap();
+    write_executable(&nofifo.join("mkfifo"), "#!/bin/bash\nexit 1\n");
     let jobserver = stubs.parent().unwrap().join("jobserver");
     // A line for each stub that reads it: sccache's, then the compiler's.
     std::fs::write(&jobserver, "jobserver\n".repeat(4)).unwrap();
@@ -166,24 +172,34 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
                  echo 'sccache: caused by: No such file or directory (os error 2) at path \"/tmp/w/tmp/sccacheX\"' >&2";
     let server_killed = "echo 'sccache: Compiler killed by signal 9'";
     let server_killed_partial = "printf 'partial'; echo 'sccache: Compiler killed by signal 9'";
+    // A proc macro's std::process::exit(254), run by the server's rustc: whatever the compile printed, and no
+    // fatal error from sccache.
+    let macro_exit = "echo 'error: proc macro said no' >&2";
+    let fatal_on_stdout = "echo 'sccache: encountered fatal error'";
+    let fatal_in_line = "echo 'note: sccache: encountered fatal error, it says' >&2";
     let stops = stubs.parent().unwrap().join("stops");
-    for (code, says, copy, ran) in [
-        (2, startup, true, "rustc"),
-        (2, denied, true, "rustc"),
-        (2, dropped, true, "rustc"),
-        (2, "", true, "rustc"),
-        (2, not_last, true, "rustc"),
-        (2, killed, true, "sccache"),
-        (2, decoy_killed, true, "sccache"),
-        (2, after_partial, true, "sccache"),
-        (2, denied, false, "rustc"),
-        (2, killed, false, "rustc"),
-        (254, stale, true, "rustc"),
-        (254, server_killed, true, "sccache"),
-        (254, server_killed_partial, true, "sccache"),
-        (254, stale, false, "sccache"),
-        (1, "", true, "sccache"),
-        (101, "", true, "sccache"),
+    for (code, says, copies, ran) in [
+        (2, startup, Copies::Both, "rustc"),
+        (2, denied, Copies::Both, "rustc"),
+        (2, dropped, Copies::Both, "rustc"),
+        (2, "", Copies::Both, "rustc"),
+        (2, not_last, Copies::Both, "rustc"),
+        (2, killed, Copies::Both, "sccache"),
+        (2, decoy_killed, Copies::Both, "sccache"),
+        (2, after_partial, Copies::Both, "sccache"),
+        (2, denied, Copies::None, "rustc"),
+        (2, killed, Copies::None, "rustc"),
+        (254, stale, Copies::Both, "rustc"),
+        (254, server_killed, Copies::Both, "sccache"),
+        (254, server_killed_partial, Copies::Both, "sccache"),
+        (254, stale, Copies::None, "sccache"),
+        (254, stale, Copies::StdoutOnly, "sccache"),
+        (254, "", Copies::Both, "sccache"),
+        (254, macro_exit, Copies::Both, "sccache"),
+        (254, fatal_on_stdout, Copies::Both, "sccache"),
+        (254, fatal_in_line, Copies::Both, "sccache"),
+        (1, "", Copies::Both, "sccache"),
+        (101, "", Copies::Both, "sccache"),
     ] {
         let _ = std::fs::remove_file(&stops);
         write_executable(
@@ -195,10 +211,10 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
                 seen.display()
             ),
         );
-        let path = if copy {
-            format!("{}:{base}", failing.display())
-        } else {
-            format!("{}:{}:{base}", nocopy.display(), failing.display())
+        let path = match copies {
+            Copies::Both => format!("{}:{base}", failing.display()),
+            Copies::StdoutOnly => format!("{}:{}:{base}", nofifo.display(), failing.display()),
+            Copies::None => format!("{}:{}:{base}", nocopy.display(), failing.display()),
         };
         let mut command = Command::new(bash);
         command
@@ -210,7 +226,7 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
             .env("PATH", path)
             .env("HOME", home);
         let out = command.output().unwrap();
-        let case = format!("{bash:?}: sccache exit {code}, {says:?}, copy {copy}");
+        let case = format!("{bash:?}: sccache exit {code}, {says:?}, copies {copies:?}");
         let s = std::fs::read_to_string(seen).unwrap();
         assert!(s.starts_with(&format!("{ran} ")), "{case}: {s}");
         assert!(s.lines().any(|l| l == "fd3=jobserver"), "{case}: fd 3 didn't reach {ran}: {s}");
@@ -232,4 +248,12 @@ fn rustc_wrapper_under(bash: &Path, wrapper: &Path, bin: &Path, stubs: &Path, se
         assert_eq!(said.len(), usize::from(fell_back), "{case}: {stderr}");
         assert!(said.iter().all(|l| l.contains("sccache failed on its own")), "{case}: {stderr}");
     }
+}
+
+/// Which copies of sccache's output the wrapper can make: stdout's needs mktemp, stderr's mktemp and mkfifo.
+#[derive(Debug, Clone, Copy)]
+enum Copies {
+    Both,
+    StdoutOnly,
+    None,
 }

@@ -22,12 +22,15 @@
 # 2bc99ca95dc3).
 #
 # Exit 254 comes from the server. A compile it ran that a signal killed ends 254, its note last on stdout,
-# "sccache: Compiler killed by signal <n>": passed on, never rerun. Any other 254 is sccache's own fatal
-# error: the server answers "sccache: encountered fatal error" on stderr in place of the compile's output,
-# as when it was started with a TMPDIR since deleted and can't make its temp dir (gotcha fc6e6835ad88,
-# task f5849cee0423). rustc itself never exits 254. Then the wrapper says so in one line on stderr; stops
-# that server, so the next compile starts a fresh one (only compiles already under way see the line too);
-# and runs the compiler itself. With no copy of stdout, every 254 is passed on, as before.
+# "sccache: Compiler killed by signal <n>": passed on, never rerun. sccache's own fatal error ends 254 too,
+# with "sccache: encountered fatal error" on stderr in place of the compile's output, as when the server was
+# started with a TMPDIR since deleted and can't make its temp dir (gotcha fc6e6835ad88, task f5849cee0423).
+# Code the compiler runs (a proc macro, say) can also end it 254 by choice, with no such line: that one is
+# the compile's own exit and is passed on, never rerun (finding 2d0978e6cdfd). Only a 254 with that line on
+# stderr, and no signal note, is sccache's: the wrapper says so in one line on stderr; stops that server, so
+# the next compile starts a fresh one (only compiles already under way see the line too); and runs the
+# compiler itself. Code a compile runs could still print that line itself and exit 254, to be rerun once.
+# With no copy of stdout or of stderr, every 254 is passed on.
 #
 # sccache's client sends its environment to the server, which runs the compiler with it. So sccache gets
 # only what a compile needs: the names cargo sets for a compile (CARGO_PKG_*, CARGO_BIN_EXE_*,
@@ -83,19 +86,42 @@ while IFS= read -r -d '' entry; do
   kept+=("$entry")
 done < <(/usr/bin/env -0)
 
-# sccache's stdout goes on through tee, with a copy in the private socket directory for its last line.
-# stderr isn't touched (rustc's diagnostics and artifact notices go there, as they come), and nor is any
-# other file descriptor: cargo's jobserver is on inherited ones (CARGO_MAKEFLAGS --jobserver-auth=3,5,
-# finding c3665d850bc9).
+# sccache's stdout goes on through tee, with a copy in the private socket directory for its last line, and
+# its stderr through a second tee reading a fifo there, with a copy for sccache's fatal error. stderr still
+# passes as it comes (rustc's diagnostics and artifact notices go there, and cargo's pipelining waits on
+# them). No other file descriptor is touched: cargo's jobserver is on inherited ones (CARGO_MAKEFLAGS
+# --jobserver-auth=3,5, finding c3665d850bc9), so the fifo takes a path, never a descriptor number, and the
+# wrapper waits on that tee as a job, which bash 3.2 can do and can't for a process substitution.
 out=$(mktemp "$socket_dir/stdout.XXXXXX" 2>/dev/null) || out=""
-trap '[[ -z $out ]] || rm -f -- "$out"' EXIT
+err=$(mktemp "$socket_dir/stderr.XXXXXX" 2>/dev/null) || err=""
+fifo=""
+if [[ -n $err ]] && mkfifo -m 600 "$err.fifo" 2>/dev/null; then
+  fifo=$err.fifo
+fi
+cleanup() {
+  for f in "$out" "$err" "$fifo"; do
+    [[ -z $f ]] || rm -f -- "$f"
+  done
+}
+trap cleanup EXIT
+run_sccache() {
+  /usr/bin/env -i "${kept[@]}" \
+    SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-15G}" \
+    SCCACHE_IGNORE_SERVER_IO_ERROR="${SCCACHE_IGNORE_SERVER_IO_ERROR:-1}" \
+    SCCACHE_SERVER_UDS="$socket_dir/server.sock" \
+    "$sccache" "$@"
+}
 set +e
-/usr/bin/env -i "${kept[@]}" \
-  SCCACHE_CACHE_SIZE="${SCCACHE_CACHE_SIZE:-15G}" \
-  SCCACHE_IGNORE_SERVER_IO_ERROR="${SCCACHE_IGNORE_SERVER_IO_ERROR:-1}" \
-  SCCACHE_SERVER_UDS="$socket_dir/server.sock" \
-  "$sccache" "$@" | tee -- "${out:-/dev/null}"
-rc=${PIPESTATUS[0]}
+if [[ -n $fifo ]]; then
+  tee -- "$err" <"$fifo" >&2 &
+  copier=$!
+  run_sccache "$@" 2>"$fifo" | tee -- "${out:-/dev/null}"
+  rc=${PIPESTATUS[0]}
+  wait "$copier"
+else
+  run_sccache "$@" | tee -- "${out:-/dev/null}"
+  rc=${PIPESTATUS[0]}
+fi
 set -e
 case $rc in
   2)
@@ -105,9 +131,12 @@ case $rc in
     fi
     ;;
   254)
-    # One the server ran and a signal killed, or any 254 without the copy: passed on. Any other: sccache's own
-    # fatal error, so its server is stopped, and the compile runs without it.
-    if [[ -z $out ]] || tail -n 1 -- "$out" | grep -Eq 'sccache: Compiler killed by signal [0-9]+$'; then
+    # sccache's own fatal error, its line on stderr: its server is stopped, and the compile runs without it.
+    # One the server ran and a signal killed, the compile's own 254 (finding 2d0978e6cdfd), or any 254
+    # without both copies: passed on.
+    if [[ -z $out || -z $fifo ]] ||
+      tail -n 1 -- "$out" | grep -Eq 'sccache: Compiler killed by signal [0-9]+$' ||
+      ! grep -Fqx 'sccache: encountered fatal error' -- "$err"; then
       exit 254
     fi
     echo "rustc-wrapper: sccache failed on its own (exit 254), not the compile: compiling without it, and" \
@@ -117,5 +146,5 @@ case $rc in
     ;;
   *) exit "$rc" ;;
 esac
-[[ -z $out ]] || rm -f -- "$out"
+cleanup
 exec "$@"
