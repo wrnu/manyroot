@@ -270,6 +270,11 @@ case "${1:-}" in
     [[ $name =~ ^[a-z0-9_-]{1,64}$ ]] || fail "'$name' isn't an identity name"
     # Resumable (finding 7dc098439105): each step is done only if it's still to do, so a retire that was
     # interrupted, or a key put back by hand, is finished by running it again.
+    # A link in place of a key file would make the cmp below compare a file with itself, and the rm
+    # delete the only copy (finding f6e5238e58db's verdict, 3d9b83e27f55): refuse before anything changes.
+    for key in "$dir/keys/$name.json" "$dir/keys/retired/$name.json"; do
+      [ ! -L "$key" ] || fail "$key is a symbolic link; tell the owner, nothing was changed"
+    done
     listed=false
     grep -q "\"name\":\"$name\"" "$dir/keys/retired.jsonl" 2>/dev/null && listed=true
     in_keys=false
@@ -279,7 +284,19 @@ case "${1:-}" in
     if ! $listed && ! $in_keys; then
       [ -e "$dir/keys/retired/$name.json" ] || fail "this server holds no key for $name"
     fi
-    $listed && ! $in_keys && ! $tokened && [ -e "$dir/keys/retired/$name.json" ] && fail "$name is already retired"
+    # A differing copy in keys/ stops retire before it lists the key, so a refused retire changes nothing.
+    if $in_keys && [ -e "$dir/keys/retired/$name.json" ]; then
+      cmp -s "$dir/keys/$name.json" "$dir/keys/retired/$name.json" ||
+        fail "$dir/keys/$name.json differs from the retired copy in $dir/keys/retired/; tell the owner, nothing was changed"
+    fi
+    if $listed && ! $in_keys && ! $tokened && [ -e "$dir/keys/retired/$name.json" ]; then
+      # Nothing is left on disk, but the restart leaves no trace there: a retire stopped after it rewrote
+      # tokens.b3 and before it restarted would leave a running server that still signs with the key and
+      # takes the token (finding f6e5238e58db). Restarting is harmless, so a running server is restarted.
+      can_restart
+      if [ -s "$dir/tokens.b3" ]; then restart "$name's retirement"; elif running_pid >/dev/null; then stop_server; fi
+      fail "$name is already retired"
+    fi
     can_restart
     if ! $listed; then
       agent=$(grep "\"name\":\"$name\"" "$dir/held.jsonl" | grep -oE '[0-9a-f]{64}' | tail -1) ||
@@ -288,8 +305,7 @@ case "${1:-}" in
     fi
     if $in_keys; then
       if [ -e "$dir/keys/retired/$name.json" ]; then
-        cmp -s "$dir/keys/$name.json" "$dir/keys/retired/$name.json" ||
-          fail "$dir/keys/$name.json differs from the retired copy in $dir/keys/retired/; tell the owner, nothing more was done"
+        # Identical: checked above.
         rm "$dir/keys/$name.json"
       else
         mv "$dir/keys/$name.json" "$dir/keys/retired/$name.json"
