@@ -206,9 +206,11 @@ pub(crate) enum WeaveCommand {
     /// Reviews of the line's heads and open proposals, and the objections the next move must answer,
     /// with the dispositions each allows.
     Review(review::ReviewArgs),
-    /// Validator: run the line's named checks (default: all of them) on a manifest through the check
-    /// runner, sandboxed, and record each result on the manifest. Only for one of the line's validators;
-    /// refuses a check you already have a latest result for on the manifest unless --again.
+    /// Validator: run the line's named checks (default: all of them) on a manifest, and record each
+    /// result on the manifest. A check runs sandboxed through the check runner, unless it has an executor:
+    /// a box check runs on a remote box, and a mac check on this Mac, unsandboxed. Only for one of the
+    /// line's validators; refuses a check you already have a latest result for on the manifest unless
+    /// --again.
     Validate(checks::ValidateArgs),
     /// Line policies, and merges between lines.
     Line {
