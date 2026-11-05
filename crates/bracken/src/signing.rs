@@ -55,19 +55,21 @@ impl Keys {
     pub fn read(dir: &Path) -> Result<Keys> {
         let mut signing = Self::read_dir(dir)?;
         let retired_dir = dir.join("retired");
-        let retired: Vec<Identity> = match fs::symlink_metadata(&retired_dir) {
+        let mut retired: Vec<Identity> = match fs::symlink_metadata(&retired_dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             _ => Self::read_dir(&retired_dir)?.into_values().collect(),
         };
         let mut ids: HashSet<AgentId> = retired.iter().map(Identity::agent_id).collect();
         ids.extend(Self::read_retired_list(&dir.join("retired.jsonl"))?);
-        signing.retain(|name, key| {
-            let keep = !ids.contains(&key.agent_id());
-            if !keep {
+        // A retired key found in `dir` isn't signed with, but stays the server's for the content check, so
+        // content holding it is still refused (finding 7794d137682f).
+        let names: Vec<String> = signing.keys().cloned().collect();
+        for name in names {
+            if ids.contains(&signing[&name].agent_id()) {
                 eprintln!("bracken serve: not signing for {name}: its key is retired");
+                retired.extend(signing.remove(&name));
             }
-            keep
-        });
+        }
         Ok(Keys { signing, retired })
     }
 

@@ -328,6 +328,9 @@ fn a_retired_key_is_refused_and_the_key_directory_is_checked() {
     let server = t.serve();
     let out = t.write(&server, "srv", &["claim", "moved back"]);
     assert!(!out.status.success() && stderr(&out).contains("holds no key for srv"), "{}", stderr(&out));
+    // Still the server's key for the content check (finding 7794d137682f).
+    let out = t.write(&server, "unscoped", &["claim", &pasted]);
+    assert!(!out.status.success() && stderr(&out).contains("private key of srv"), "{}", stderr(&out));
     let out = t.write(&server, "unscoped", &["claim", "unscoped still signs"]);
     assert!(out.status.success(), "{}", stderr(&out));
     assert_eq!(t.signed().len(), signed + 1);
