@@ -69,6 +69,19 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-11-04: signing through a trait, and a server that signs (task 9fdcbbc35806)
+
+Part A step 2 of docs/design/agent-keys.md. In `manyroot`, a contribution can be signed through the
+`Signer` trait (`Contribution::create_with`, `Store::contribute_with`), which `Identity` implements, and
+`ContributionContent` gains `encode` and a canonical-only `decode`. No byte changes: the encoding, ids, the
+signing context and the validity rules are as they were, the protocol guard's vectors and fixture Ground
+are unchanged, and every existing Ground opens. New in the CLI: `bracken serve --keys/--scopes/--signed`
+and its `POST /v1/<ground>/sign` request, `bracken id new --key-dir`, and `BRACKEN_SIGN_URL` and
+`BRACKEN_SIGN_TOKEN_FILE` for writes (docs/cli.md, Keys a server holds). An older binary can't sign for a
+server-held identity, but reads and verifies its contributions like any other. Nothing to migrate:
+existing identities keep their key files and sign from them. Upgrade the pinned binary before
+`scripts/team-server key` is used, since `scripts/bk` then needs it to sign through the server.
+
 ### 2026-10-31: Weave line policies gain executors
 
 Task `7fbf11b1a6a5` (plan `cc496dcee0e3`, part one). A line policy has an

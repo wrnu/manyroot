@@ -11,7 +11,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 
 use crate::id::{AgentId, ContributionId, GroundId, Signature};
-use crate::identity::{self, Identity};
+use crate::identity::{self, Identity, SignError, Signer};
 
 /// Protocol version written into every contribution.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -174,10 +174,51 @@ pub struct ContributionContent {
 }
 
 impl ContributionContent {
+    /// The content of a new contribution: `parents` in any order, with duplicates, and every id the body
+    /// references added.
+    fn assemble(
+        ground: GroundId,
+        author: AgentId,
+        parents: impl IntoIterator<Item = ContributionId>,
+        timestamp_ms: u64,
+        body: Body,
+    ) -> ContributionContent {
+        let mut set: BTreeSet<ContributionId> = parents.into_iter().collect();
+        set.extend(body.references());
+        ContributionContent {
+            protocol: PROTOCOL_VERSION,
+            ground,
+            author,
+            parents: set.into_iter().collect(),
+            timestamp_ms,
+            body,
+        }
+    }
+
     pub fn id(&self) -> ContributionId {
+        ContributionId(*blake3::hash(&self.encode()).as_bytes())
+    }
+
+    /// The canonical encoding, whose blake3 hash is the id: what a remote signer is sent.
+    pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         ciborium::into_writer(self, &mut bytes).expect("writing to a Vec cannot fail");
-        ContributionId(*blake3::hash(&bytes).as_bytes())
+        bytes
+    }
+
+    /// Decodes content in canonical encoding only, as [`Contribution::decode`] does a contribution: bytes
+    /// that don't re-encode to themselves are refused, so the id a signer computes is the one every
+    /// replica will.
+    pub fn decode(bytes: &[u8]) -> Result<ContributionContent, DecodeError> {
+        if bytes.len() > MAX_CONTRIBUTION_BYTES {
+            return Err(DecodeError::TooLarge(bytes.len()));
+        }
+        let content: ContributionContent =
+            ciborium::from_reader(bytes).map_err(|e| DecodeError::Malformed(e.to_string()))?;
+        if content.encode() != bytes {
+            return Err(DecodeError::NotCanonical);
+        }
+        Ok(content)
     }
 }
 
@@ -215,19 +256,29 @@ impl Contribution {
         timestamp_ms: u64,
         body: Body,
     ) -> Contribution {
-        let mut set: BTreeSet<ContributionId> = parents.into_iter().collect();
-        set.extend(body.references());
-        let content = ContributionContent {
-            protocol: PROTOCOL_VERSION,
-            ground,
-            author: identity.agent_id(),
-            parents: set.into_iter().collect(),
-            timestamp_ms,
-            body,
-        };
+        let content = ContributionContent::assemble(ground, identity.agent_id(), parents, timestamp_ms, body);
         let id = content.id();
         let signature = identity.sign(&id);
         Contribution { id, content, signature }
+    }
+
+    /// [`Contribution::create`] through any [`Signer`], such as one whose key is held elsewhere. Fails if
+    /// the signer does, or if what it returns isn't a valid signature by its author key over the id.
+    pub fn create_with(
+        ground: GroundId,
+        signer: &dyn Signer,
+        parents: impl IntoIterator<Item = ContributionId>,
+        timestamp_ms: u64,
+        body: Body,
+    ) -> Result<Contribution, SignError> {
+        let content = ContributionContent::assemble(ground, signer.agent_id(), parents, timestamp_ms, body);
+        let id = content.id();
+        let signature = signer.sign_content(&content, &id)?;
+        let c = Contribution { id, content, signature };
+        if !c.signature_is_valid() {
+            return Err(SignError("the signer returned a signature that doesn't verify under its author key".into()));
+        }
+        Ok(c)
     }
 
     pub fn id(&self) -> ContributionId {

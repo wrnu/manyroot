@@ -35,7 +35,7 @@ fn side(store: &Store, bounds: Bounds) -> Side {
 
 /// The host and port of an `http://` URL, which must name the loopback interface: there's no
 /// TLS, so a token sent anywhere else would cross the network in the clear.
-fn loopback(url: &str) -> Result<(String, u16)> {
+pub fn loopback(url: &str) -> Result<(String, u16)> {
     let rest = url.strip_prefix("http://").context("the URL must start with http://")?;
     let authority = rest.strip_suffix('/').unwrap_or(rest);
     if authority.contains('/') || authority.contains('@') {
@@ -115,6 +115,12 @@ struct Response {
     session: Option<String>,
     length: u64,
     early: Vec<u8>,
+}
+
+/// A response's status, its Content-Length, and the bytes read past its head, which start its body.
+pub fn response_head(stream: &mut impl Read) -> Result<(u16, u64, Vec<u8>)> {
+    let Response { status, length, early, .. } = read_response_head(stream)?;
+    Ok((status, length, early))
 }
 
 fn read_response_head(stream: &mut impl Read) -> Result<Response> {

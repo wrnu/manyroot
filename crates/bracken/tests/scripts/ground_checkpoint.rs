@@ -220,3 +220,95 @@ fn ground_checkpoint_refuses_a_ground_holding_a_weave_record() {
         assert!(run(&dir, "git", &["diff", "--cached", "--quiet"]).status.success(), "{scripts}: left staged");
     }
 }
+
+/// With a team server that holds keys, each checkpoint records the signing log's length and hash, and
+/// scopes.toml's hash, in a signing-log claim whenever either changed, says when scopes.toml did, and stops
+/// when the log no longer extends the one recorded (docs/design/agent-keys.md, 4.1; verdict 4386857e6cdb).
+#[test]
+fn ground_checkpoint_records_the_signing_log_and_stops_on_a_rewrite() {
+    let real = env!("CARGO_BIN_EXE_bracken");
+    for scripts in SCRIPTS {
+        let copy = |name: &str| repo_root().join(scripts).join(name);
+        let files = [
+            ("scripts/bk", copy("bk")),
+            ("scripts/team-server", copy("team-server")),
+            ("scripts/ground-checkpoint", copy("ground-checkpoint")),
+        ];
+        let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
+        let (tmp, dir) = repo(&files, ".bracken/identities/\n.bracken-team\n", |_| {});
+        let team = tmp.path().join("team");
+        let sh = |program: &str, args: &[&str], agent: Option<&str>| {
+            let mut c = command(&dir, program, args);
+            c.env("BRACKEN_BIN", real);
+            if let Some(agent) = agent {
+                c.env("BRACKEN_AGENT", agent);
+            }
+            c.output().unwrap()
+        };
+        let ok = |out: Output, what: &str| {
+            assert!(out.status.success(), "{scripts}: {what} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        struct Stop<'a>(&'a dyn Fn());
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                (self.0)()
+            }
+        }
+        let stop = || {
+            sh("scripts/team-server", &["stop"], None);
+        };
+        let _stop = Stop(&stop);
+        let records = || -> Vec<String> {
+            let log = ok(sh("scripts/bk", &["log", "--tag", "signing-log", "--json"], Some("manager")), "log");
+            let log: serde_json::Value = serde_json::from_str(&log).unwrap();
+            log.as_array().unwrap().iter().map(|c| c["body"]["statement"].as_str().unwrap().to_owned()).collect()
+        };
+        let checkpoint = || sh("scripts/ground-checkpoint", &[], Some("manager"));
+
+        ok(sh("scripts/bk", &["init", "--name", "team"], None), "init");
+        ok(sh("scripts/bk", &["id", "new", "manager"], None), "id new");
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+        ok(sh("scripts/team-server", &["setup", team.to_str().unwrap(), &port], None), "setup");
+        ok(sh("scripts/team-server", &["token", "manager"], None), "token");
+        ok(sh("scripts/team-server", &["start"], None), "start");
+        ok(sh("scripts/team-server", &["key", "builder-x"], None), "key");
+
+        let out = ok(checkpoint(), "the first checkpoint");
+        assert!(out.contains("recorded the signing log (0 bytes)"), "{scripts}: {out}");
+        let first = records();
+        assert!(first.len() == 1 && first[0].contains("signed.jsonl 0 bytes, blake3 "), "{scripts}: {first:?}");
+        let tracked = String::from_utf8(run(&dir, "git", &["ls-files", ".bracken"]).stdout).unwrap();
+        assert!(tracked.contains(".bracken/agents/builder-x.json"), "{scripts}: {tracked}");
+
+        // Nothing changed: nothing recorded.
+        let out = ok(checkpoint(), "a checkpoint with nothing new");
+        assert!(!out.contains("recorded the signing log"), "{scripts}: {out}");
+        assert_eq!(records().len(), 1, "{scripts}");
+
+        // A signature, and a scopes edit: both recorded, the edit named.
+        ok(sh("scripts/bk", &["claim", "signed by the server", "--tag", "note"], Some("builder-x")), "claim");
+        let scopes = team.join("scopes.toml");
+        let text = std::fs::read_to_string(&scopes).unwrap();
+        std::fs::write(&scopes, text.replace("\"tests\"]", "\"tests\"]\n# edited")).unwrap();
+        let out = ok(checkpoint(), "a checkpoint after a signature");
+        assert!(out.contains("scopes.toml changed since claim"), "{scripts}: {out}");
+        let length = std::fs::metadata(team.join("signed.jsonl")).unwrap().len();
+        assert!(out.contains(&format!("recorded the signing log ({length} bytes)")), "{scripts}: {out}");
+        assert_eq!(records().len(), 2, "{scripts}");
+
+        // An old entry rewritten: the checkpoint stops, committing nothing.
+        let log = std::fs::read_to_string(team.join("signed.jsonl")).unwrap();
+        std::fs::write(
+            team.join("signed.jsonl"),
+            log.replacen("\"credential\":\"builder-x\"", "\"credential\":\"builder-y\"", 1),
+        )
+        .unwrap();
+        ok(sh("scripts/bk", &["claim", "something new", "--tag", "note"], Some("manager")), "claim");
+        let head = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap();
+        let out = checkpoint();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains("no longer extends"), "{scripts}: {stderr}");
+        assert_eq!(String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap(), head, "{scripts}");
+    }
+}

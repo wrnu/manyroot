@@ -303,7 +303,10 @@ Not done yet:
 - **Key protection.** Identity keys are stored unencrypted under
   `.bracken/identities/`. Keep that folder out of git. The rest of
   `.bracken/` (contributions, `ground.json`, the public `agents/` directory)
-  is safe to commit, and git merges it without conflicts.
+  is safe to commit, and git merges it without conflicts. A team server can
+  hold new identities' keys instead and sign for them within a scope
+  (`bracken serve --keys`), but they're still files any process of the same
+  user can read.
 - **Governance.** Any key can contribute to any Ground it can reach, and keys
   are shared among this repository's agents, so who signed what is a
   convention, not a guarantee. The same holds for Weave's integrators and

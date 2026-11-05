@@ -479,3 +479,121 @@ fn bk_refuses_dir_weave_weave_media_types_and_sync_with_other_peers() {
         }
     }
 }
+
+/// Part A step 2 end to end (docs/design/agent-keys.md, 4.1 and 4.2): `team-server key` makes a new identity
+/// whose key only the team server holds, and bk's writes as it are signed by the server, within its scope,
+/// and logged; an identity with a key file still signs from it. `retire` stops the signing.
+#[test]
+fn team_server_holds_new_identities_keys_and_signs_for_them() {
+    let real = env!("CARGO_BIN_EXE_bracken");
+    for scripts in SCRIPTS {
+        let copy = |name: &str| repo_root().join(scripts).join(name);
+        let files = [("scripts/bk", copy("bk")), ("scripts/team-server", copy("team-server"))];
+        let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
+        let (tmp, a) = repo(&files, ".bracken/\n.bracken-team\n", |_| {});
+        let team = tmp.path().join("team");
+        let sh = |program: &str, args: &[&str], agent: Option<&str>| {
+            let mut c = command(&a, program, args);
+            c.env("BRACKEN_BIN", real);
+            if let Some(agent) = agent {
+                c.env("BRACKEN_AGENT", agent);
+            }
+            c.output().unwrap()
+        };
+        let ok = |out: Output, what: &str| {
+            assert!(out.status.success(), "{scripts}: {what} failed: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let failed = |out: Output, what: &str, why: &str| {
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            assert!(!out.status.success() && stderr.contains(why), "{scripts}: {what}: {stderr}");
+        };
+        struct Stop<'a>(&'a dyn Fn());
+        impl Drop for Stop<'_> {
+            fn drop(&mut self) {
+                (self.0)()
+            }
+        }
+        let stop = || {
+            sh("scripts/team-server", &["stop"], None);
+        };
+        let _stop = Stop(&stop);
+        let lines = |file: &str| -> Vec<serde_json::Value> {
+            let text = std::fs::read_to_string(team.join(file)).unwrap_or_default();
+            text.lines().map(|l| serde_json::from_str(l).unwrap()).collect()
+        };
+
+        ok(sh("scripts/bk", &["init", "--name", "team"], None), "init");
+        ok(sh("scripts/bk", &["id", "new", "alice"], None), "id new");
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+        ok(sh("scripts/team-server", &["setup", team.to_str().unwrap(), &port], None), "setup");
+        ok(sh("scripts/team-server", &["token", "alice"], None), "token");
+        ok(sh("scripts/team-server", &["start"], None), "start");
+
+        // An older binary, without serve --keys or id new --key-dir: key refuses before changing anything,
+        // so the server still restarts under it (finding 0d9dbdbc9f35).
+        let old = tmp.path().join("bracken-old");
+        write_executable(
+            &old,
+            "#!/usr/bin/env bash
+             for a in \"$@\"; do case $a in --keys|--scopes|--signed|--key-dir) echo \"error: unexpected argument '$a'\" >&2; exit 2 ;; esac; done
+             if [[ \" $* \" == *\" --help \"* ]]; then \"$REAL_BRACKEN\" \"$@\" | grep -v -e --keys -e --scopes -e --signed -e --key-dir; exit; fi
+             exec \"$REAL_BRACKEN\" \"$@\"
+",
+        );
+        let with_old =
+            |args: &[&str]| command(&a, "scripts/team-server", args).env("BRACKEN_BIN", &old).output().unwrap();
+        failed(with_old(&["key", "builder-x"]), "key with an old binary", "upgrade the pinned binary first");
+        assert!(
+            !team.join("keys").exists() && !team.join("scopes.toml").exists(),
+            "{scripts}: key changed the team dir"
+        );
+        assert!(!a.join(".bracken/agents/builder-x.json").exists(), "{scripts}");
+        let out = ok(with_old(&["token", "alice"]), "token with an old binary");
+        assert!(out.contains("restarting the server"), "{scripts}: {out}");
+        ok(sh("scripts/bk", &["claim", "after the old binary's restart"], Some("alice")), "alice");
+
+        // key: the private key in the team directory, the public entry in the main checkout's Ground.
+        let out = ok(sh("scripts/team-server", &["key", "builder-x"], None), "key");
+        assert!(out.contains("made builder-x") && out.contains("restarting the server"), "{scripts}: {out}");
+        assert!(team.join("keys/builder-x.json").exists(), "{scripts}");
+        let mode = std::fs::metadata(team.join("keys")).unwrap().permissions();
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&mode) & 0o777, 0o700, "{scripts}: keys/ mode");
+        assert!(!a.join(".bracken/identities/builder-x.json").exists(), "{scripts}: a key under the working tree");
+        let entry = std::fs::read_to_string(a.join(".bracken/agents/builder-x.json")).unwrap();
+        assert!(!entry.contains("secret_key"), "{scripts}: {entry}");
+        let held = lines("held.jsonl");
+        assert!(
+            held.len() == 1 && held[0]["name"] == "builder-x" && entry.contains(held[0]["agent"].as_str().unwrap())
+        );
+        assert!(team.join("scopes.toml").exists() && team.join("tokens/builder-x").exists(), "{scripts}");
+
+        // Its writes are the server's signatures, logged under its credential, and pushed.
+        let out = ok(sh("scripts/bk", &["claim", "signed by the server", "--tag", "note"], Some("builder-x")), "claim");
+        let id = common::bare_ids(out.trim().to_owned());
+        let signed = lines("signed.jsonl");
+        assert!(signed.len() == 1 && signed[0]["id"] == id.as_str() && signed[0]["credential"] == "builder-x");
+        assert!(lines("first-seen.jsonl").iter().any(|e| e["id"] == id.as_str()), "{scripts}: not pushed");
+        // Outside its scope: refused, nothing written.
+        let out = sh("scripts/bk", &["claim", "a decision", "--tag", "decision"], Some("builder-x"));
+        failed(out, "a decision tag", "not signed for builder-x");
+        assert_eq!(lines("signed.jsonl").len(), 1, "{scripts}");
+        // An existing identity signs from its key file, and the server logs nothing.
+        ok(sh("scripts/bk", &["claim", "signed locally"], Some("alice")), "alice's claim");
+        assert_eq!(lines("signed.jsonl").len(), 1, "{scripts}");
+        failed(sh("scripts/team-server", &["key", "alice"], None), "key for alice", "already an identity");
+
+        // retire: the server signs nothing more for it, and its token is gone.
+        let out = ok(sh("scripts/team-server", &["retire", "builder-x"], None), "retire");
+        assert!(out.contains("note it in a claim"), "{scripts}: {out}");
+        assert!(team.join("keys/retired/builder-x.json").exists() && !team.join("tokens/builder-x").exists());
+        failed(sh("scripts/bk", &["claim", "after retiring"], Some("builder-x")), "after retiring", "no team token");
+        failed(sh("scripts/team-server", &["token", "builder-x"], None), "token after retiring", "is retired");
+        failed(sh("scripts/team-server", &["key", "builder-x"], None), "key after retiring", "already an identity");
+        ok(sh("scripts/bk", &["claim", "alice still writes"], Some("alice")), "alice after the restart");
+
+        // With keys held, an older binary isn't started with flags it rejects: start says why.
+        ok(sh("scripts/team-server", &["stop"], None), "stop");
+        failed(with_old(&["start"]), "start with an old binary", "upgrade the pinned binary");
+    }
+}

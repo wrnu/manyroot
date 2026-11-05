@@ -180,7 +180,10 @@ fn ground_guards_report_contributions_first_pushed_under_another_credential() {
                 let team = dir.join("team");
                 std::fs::create_dir_all(&team).unwrap();
                 std::fs::write(dir.join(".bracken-team"), format!("{}\n", team.display())).unwrap();
-                let val = ids[0]["agent"].as_str().unwrap().to_owned();
+                let val = ids.as_array().unwrap().iter().find(|i| i["name"] == "val").unwrap()["agent"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
                 let text: String = lines.iter().map(|l| l.replace("VAL", &val) + "\n").collect();
                 std::fs::write(team.join("first-seen.jsonl"), text).unwrap();
             }
@@ -220,6 +223,25 @@ fn ground_guards_report_contributions_first_pushed_under_another_credential() {
             "{scripts}: {stdout}"
         );
 
+        // An identity made after <head>'s Ground was committed is only in the main checkout's live
+        // directory, which names it: its own pushes aren't reported, a relay of val's by it is
+        // (finding 5af610a0062c).
+        let newer = ground_guards(scripts, ".", ["main", "pr"], |dir: &Path| {
+            bk(dir, &["id", "new", "newer"]);
+            let newer: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join(".bracken/agents/newer.json")).unwrap())
+                    .unwrap();
+            let key = newer["agent"].as_str().unwrap().to_owned();
+            log(vec![entry('a', 1, "newer", &key), entry('b', 2, "newer", &key), entry('c', 3, "newer", "VAL")])(dir);
+        });
+        let stdout = String::from_utf8_lossy(&newer.stdout);
+        let reported: Vec<&str> = stdout.lines().filter(|l| l.contains("report: credential")).collect();
+        assert_eq!(
+            reported,
+            ["ground-guards: report: credential newer first pushed 1 of val's, newest cccccccccccc"],
+            "{scripts}: {stdout}"
+        );
+
         let none = ground_guards(scripts, ".", ["main", "pr"], |_| {});
         let stdout = String::from_utf8_lossy(&none.stdout);
         assert!(none.status.success() && stdout.contains("report: no team server here"), "{scripts}: {stdout}");
@@ -227,5 +249,53 @@ fn ground_guards_report_contributions_first_pushed_under_another_credential() {
         let bad = ground_guards(scripts, ".", ["main", "pr"], log(vec!["not json".to_owned()]));
         let stdout = String::from_utf8_lossy(&bad.stdout);
         assert!(bad.status.success() && stdout.contains("as JSON lines"), "{scripts}: {stdout}");
+    }
+}
+
+/// The report of contributions by a key the team server holds (its held.jsonl) that aren't in its signing
+/// log, so were signed with the key file outside it (docs/design/agent-keys.md, 4.1): here val's key is
+/// "held", and its one contribution, the vision artifact, is either in the log or not.
+#[test]
+fn ground_guards_report_contributions_by_held_keys_missing_from_the_signing_log() {
+    for scripts in SCRIPTS {
+        let team = |signed: bool| {
+            move |dir: &Path| {
+                let ids: serde_json::Value = serde_json::from_str(&bk(dir, &["id", "list", "--json"])).unwrap();
+                let val = ids[0]["agent"].as_str().unwrap().to_owned();
+                let log: serde_json::Value = serde_json::from_str(&bk(dir, &["log", "--json"])).unwrap();
+                let artifact = log[0]["id"].as_str().unwrap().to_owned();
+                let team = dir.join("team");
+                std::fs::create_dir_all(&team).unwrap();
+                std::fs::write(dir.join(".bracken-team"), format!("{}\n", team.display())).unwrap();
+                std::fs::write(team.join("first-seen.jsonl"), "").unwrap();
+                std::fs::write(team.join("held.jsonl"), format!("{{\"name\":\"val\",\"agent\":\"{val}\"}}\n")).unwrap();
+                if signed {
+                    let line = format!("{{\"id\":\"{artifact}\",\"credential\":\"val\",\"signed_ms\":1}}\n");
+                    std::fs::write(team.join("signed.jsonl"), line).unwrap();
+                }
+            }
+        };
+        let out = ground_guards(scripts, ".", ["main", "pr"], team(false));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{scripts}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+        let line =
+            stdout.lines().find(|l| l.contains("signed outside it")).unwrap_or_else(|| panic!("{scripts}: {stdout}"));
+        assert!(
+            line.starts_with("ground-guards: report: 1 by val, whose key the team server holds"),
+            "{scripts}: {line}"
+        );
+        assert!(stdout.contains("all guards pass at"), "{scripts}: {stdout}");
+
+        let out = ground_guards(scripts, ".", ["main", "pr"], team(true));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("every contribution by a key the team server holds is in its signing log"), "{stdout}");
+
+        let none = ground_guards(scripts, ".", ["main", "pr"], |dir: &Path| {
+            let team = dir.join("team");
+            std::fs::create_dir_all(&team).unwrap();
+            std::fs::write(dir.join(".bracken-team"), format!("{}\n", team.display())).unwrap();
+        });
+        let stdout = String::from_utf8_lossy(&none.stdout);
+        assert!(stdout.contains("the team server holds no keys"), "{scripts}: {stdout}");
     }
 }

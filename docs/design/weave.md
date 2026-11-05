@@ -787,7 +787,9 @@ would have to answer.
 `manyroot::Policy` acceptance, and `bracken accepted` says nothing about
 heads. A manifest made and tested by its own integrator has no independent
 pass under manyroot. Weave's green requires one, from `validators`, under
-the shared-keys caveat in the summary.
+the shared-keys caveat in the summary (narrowed, for identities made after
+part A of [agent-keys.md](agent-keys.md), to what the server's signing log
+and scopes catch).
 
 ## 3. The CLI
 

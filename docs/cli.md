@@ -152,12 +152,41 @@ listens on loopback only.
 ```sh
 bracken sync ../other-checkout       # exchange with another replica on disk
 bracken serve --tokens T --allow A --first-seen L   # serve this replica on 127.0.0.1
+bracken serve ... --keys K --scopes S --signed L2   # and sign for the identities whose keys are in K
 BRACKEN_TOKEN=... bracken sync http://127.0.0.1:<port>
 bracken sync --exec ssh host bracken --dir <path> serve --stdio
 bracken export ground.mrb            # or carry a bundle over any transport
 bracken join ground.mrb              # create a new replica from a bundle
 bracken import ground.mrb            # add a bundle to an existing replica
 ```
+
+### Keys a server holds
+
+A server can hold identities' keys and sign for them (docs/design/agent-keys.md, 4.1 and 4.2), so no key
+of theirs sits in a replica's `identities/`. `bracken id new <name> --key-dir <dir>` makes an identity with
+its private key in `<dir>` and only its public entry in the replica's `agents/`. `bracken serve --keys
+<dir> --scopes <file> --signed <log>` binds each credential in `--tokens` to the key of the same name in
+`<dir>` (which must be 0700), and answers `POST /v1/<ground>/sign`: the body is a contribution's content
+in canonical encoding, the reply its 64-byte signature. It signs only if the content re-encodes to the same
+bytes, is for its Ground and protocol 1, is authored by the token's own key, holds none of its keys (those in `<dir>/retired/` included, which it
+reads for this check only and never signs with), and is
+within that name's scope in `--scopes`, a TOML file it reads on every request:
+
+```toml
+[scope."builder-*"]          # a name, or a name's start and '*'; an exact name wins, then the longest
+kinds = ["claim", "relation", "evidence", "retract"]   # absent: nothing
+relations = ["implements", "refines"]                  # absent: none
+forbidden_tags = ["decision", "approval"]              # and tags = [...]: the only tags allowed
+```
+
+Before it answers, it appends `{"id", "credential", "signed_ms"}` to `--signed` and syncs it, so every
+signature it gave is in the log (a contribution it signed may still be refused by the client's replica
+afterwards, and never stored). A key file moved out of `<dir>`, or into `<dir>/retired/`, is no longer signed with.
+
+A write command signs with the identity's file in `identities/` if there is one. Otherwise, with
+`BRACKEN_SIGN_URL` (a loopback server's URL) and `BRACKEN_SIGN_TOKEN_FILE` set, it sends the content to
+that server and checks the signature it gets back before adding the contribution; `scripts/bk` sets both
+for its writes. The contribution is byte for byte what the key file would sign.
 
 ## Intents
 

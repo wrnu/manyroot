@@ -21,6 +21,7 @@ mod listing;
 mod remote;
 mod runs;
 mod serve;
+mod signing;
 mod snapshot;
 mod terminal;
 mod verify;
@@ -349,6 +350,16 @@ enum Command {
         /// Append-only log of each contribution stored for the first time, as JSON lines.
         #[arg(long, value_name = "PATH")]
         first_seen: Option<PathBuf>,
+        /// A private directory (0700) of identity files this server signs with: each credential is bound
+        /// to the key of the same name, and `POST /v1/<ground>/sign` signs for it (docs/cli.md).
+        #[arg(long, value_name = "DIR", conflicts_with = "stdio", requires_all = ["scopes", "signed"])]
+        keys: Option<PathBuf>,
+        /// With --keys: the TOML file of what each identity may sign, read on every request.
+        #[arg(long, value_name = "PATH", requires = "keys")]
+        scopes: Option<PathBuf>,
+        /// With --keys: the append-only log of each signature given, as JSON lines.
+        #[arg(long, value_name = "PATH", requires = "keys")]
+        signed: Option<PathBuf>,
         /// Contributions each author key, and each credential, may add in 24 hours.
         #[arg(long, default_value_t = 10_000)]
         quota_contributions: u64,
@@ -429,7 +440,13 @@ impl BoundsArgs {
 #[derive(Subcommand)]
 enum IdCommand {
     /// Create a new identity.
-    New { name: String },
+    New {
+        name: String,
+        /// Put the private key in this directory instead of the replica's identities/: a signing
+        /// server's key directory (`team-server key`). The public entry still goes in agents/.
+        #[arg(long, value_name = "DIR")]
+        key_dir: Option<PathBuf>,
+    },
     /// List known agents, marking those this replica can sign as.
     List {
         #[command(flatten)]
@@ -499,8 +516,11 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
         }
         Command::Weave(command) => return weave::run(&mut s, agent, command),
         Command::Watch(args) => return watch::run(s.into_inner(), agent, args),
-        Command::Id(IdCommand::New { name }) => {
-            let id = s.create_identity(&name)?;
+        Command::Id(IdCommand::New { name, key_dir }) => {
+            let id = match key_dir {
+                Some(dir) => s.create_identity_in(&name, &dir)?,
+                None => s.create_identity(&name)?,
+            };
             println!("{}", id.agent_id());
         }
         Command::Id(IdCommand::List { out }) => {
@@ -520,15 +540,15 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             }
         }
         Command::Claim { statement, tags, supersedes, out } => {
-            let who = signer(&s, agent)?;
+            let who = any_signer(&s, agent)?;
             let names = Names::load(&s)?;
-            let old = supersedes.iter().map(|id| own_claim(&s, &names, &who, id)).collect::<Result<BTreeSet<_>>>()?;
+            let old = supersedes.iter().map(|id| own_claim(&s, &names, &*who, id)).collect::<Result<BTreeSet<_>>>()?;
             let mut w = Writes::new(out.json);
-            let new = w.add(&mut s, &who, Body::Claim { statement, tags })?;
+            let new = w.add(&mut s, &*who, Body::Claim { statement, tags })?;
             for to in old {
                 let note = String::new();
                 let relation = Body::Relation { from: new, kind: RelationKind::Supersedes, to, note };
-                if let Err(e) = w.add(&mut s, &who, relation) {
+                if let Err(e) = w.add(&mut s, &*who, relation) {
                     w.finish_failed();
                     return Err(e.context(format!("claim {new} was recorded, but not all its supersedes relations")));
                 }
@@ -536,17 +556,17 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             w.finish();
         }
         Command::Artifact { file, name, media_type, implements, out } => {
-            let who = signer(&s, agent)?;
+            let who = any_signer(&s, agent)?;
             // Resolved first, so an unknown id writes nothing.
             let target = implements.as_deref().map(|id| resolve(&s, id)).transpose()?;
             let content = std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?;
             let name = name.unwrap_or_else(|| file.display().to_string());
             let mut w = Writes::new(out.json);
-            let artifact = w.add(&mut s, &who, Body::Artifact { name, media_type, content })?;
+            let artifact = w.add(&mut s, &*who, Body::Artifact { name, media_type, content })?;
             if let Some(to) = target {
                 let relation =
                     Body::Relation { from: artifact, kind: RelationKind::Implements, to, note: String::new() };
-                match w.add(&mut s, &who, relation) {
+                match w.add(&mut s, &*who, relation) {
                     Ok(_) => {}
                     // The artifact stays: the Ground is append-only. Its id is printed.
                     Err(e) => {
@@ -564,10 +584,10 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             w.finish();
         }
         Command::Relate { from, kind, to, note, out } => {
-            let who = signer(&s, agent)?;
+            let who = any_signer(&s, agent)?;
             let (from, to) = (resolve(&s, &from)?, resolve(&s, &to)?);
             let mut w = Writes::new(out.json);
-            w.add(&mut s, &who, Body::Relation { from, kind, to, note })?;
+            w.add(&mut s, &*who, Body::Relation { from, kind, to, note })?;
             w.finish();
         }
         Command::Evidence { target, verdict, method, details, details_file, run, command, depends_on, out } => {
@@ -593,7 +613,7 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             if !depends_on.is_empty() && verdict != Some(Verdict::Fail) {
                 bail!("--depends-on goes with a fail: it says what the fail needs that isn't accepted yet");
             }
-            let who = signer(&s, agent)?;
+            let who = any_signer(&s, agent)?;
             let target = resolve(&s, &target)?;
             if run {
                 // The signer and target are settled first, so a run is never wasted on a refusal after.
@@ -605,7 +625,7 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
                     details: outcome.details,
                 };
                 let mut w = Writes::new(out.json);
-                w.add(&mut s, &who, body)?;
+                w.add(&mut s, &*who, body)?;
                 BROKEN_PIPE_STATUS.store(i32::from(outcome.status), Ordering::Relaxed);
                 w.finish();
                 return Ok(ExitCode::from(outcome.status));
@@ -629,10 +649,10 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
                 );
             }
             let mut w = Writes::new(out.json);
-            let evidence = w.add(&mut s, &who, Body::Evidence { target, verdict, method, details })?;
+            let evidence = w.add(&mut s, &*who, Body::Evidence { target, verdict, method, details })?;
             for (i, &to) in needs.iter().enumerate() {
                 let body = Body::Relation { from: evidence, kind: RelationKind::DependsOn, to, note: String::new() };
-                match w.add(&mut s, &who, body) {
+                match w.add(&mut s, &*who, body) {
                     Ok(_) => {}
                     Err(e) => {
                         w.finish_failed();
@@ -648,10 +668,10 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             w.finish();
         }
         Command::Retract { target, reason, out } => {
-            let who = signer(&s, agent)?;
+            let who = any_signer(&s, agent)?;
             let target = resolve(&s, &target)?;
             let mut w = Writes::new(out.json);
-            w.add(&mut s, &who, Body::Retract { target, reason })?;
+            w.add(&mut s, &*who, Body::Retract { target, reason })?;
             w.finish();
         }
         Command::Log { kind, tag, author, current, since, limit, compact, full, open, triager, out } => {
@@ -872,7 +892,7 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             view::serve(s.dir(), policy, &view::Bind { ips: bind, port, names: hosts }, runs.as_deref())?;
         }
         Command::Intend { id, duration, out } => {
-            let who = signer(&s, agent)?;
+            let who = any_signer(&s, agent)?;
             let target = resolve(&s, &id)?;
             // RFC 3339 years have four digits, so the last expiry it can write is 9999-12-31T23:59:59Z.
             let last = std::time::UNIX_EPOCH + std::time::Duration::from_secs(253_402_300_799);
@@ -884,10 +904,10 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             let statement = format!("intent: working on {} until {until}", target.short());
             let tags = vec![INTENT_TAG.to_owned(), format!("{UNTIL_TAG}{until}")];
             let mut w = Writes::new(out.json);
-            let intent = w.add(&mut s, &who, Body::Claim { statement, tags })?;
+            let intent = w.add(&mut s, &*who, Body::Claim { statement, tags })?;
             let relation =
                 Body::Relation { from: intent, kind: RelationKind::Refines, to: target, note: String::new() };
-            match w.add(&mut s, &who, relation) {
+            match w.add(&mut s, &*who, relation) {
                 Ok(_) => w.finish(),
                 // The claim stays: the Ground is append-only. Its id is printed.
                 Err(e) => {
@@ -930,6 +950,9 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             allow,
             tokens,
             first_seen,
+            keys,
+            scopes,
+            signed,
             quota_contributions,
             quota_bytes,
             store_cap,
@@ -951,9 +974,15 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
                 idle: std::time::Duration::from_secs(idle),
                 max_sessions,
             };
+            let signing = match (&keys, &scopes, &signed) {
+                (Some(keys), Some(scopes), Some(signed)) => {
+                    Some(signing::Signing::open(signing::Keys::read(keys)?, scopes, signed)?)
+                }
+                _ => None,
+            };
             let intake = serve::Intake::new(s.into_inner(), policy, first_seen.as_deref())?;
             match tokens {
-                Some(tokens) => serve::serve_http(intake, tokens, port)?,
+                Some(tokens) => serve::serve_http(intake, tokens, signing, port)?,
                 None => serve::serve_stdio(intake)?,
             }
         }
@@ -1054,7 +1083,7 @@ impl Writes {
         Writes { json, written: Vec::new() }
     }
 
-    fn add(&mut self, s: &mut Store, who: &Identity, body: Body) -> Result<ContributionId> {
+    fn add(&mut self, s: &mut Store, who: &dyn Signer, body: Body) -> Result<ContributionId> {
         let kind = body.kind().as_str();
         let relation = match &body {
             Body::Relation { kind, .. } => Some(kind.as_str()),
@@ -1098,7 +1127,7 @@ impl Writes {
 /// The Ground is permanent and goes into git, so this catches the likely accidents: a key file
 /// attached as details or as an artifact, or a key pasted into text. A key re-encoded (base64)
 /// gets through.
-fn contribute(s: &mut Store, who: &Identity, body: Body) -> Result<ContributionId> {
+fn contribute(s: &mut Store, who: &dyn Signer, body: Body) -> Result<ContributionId> {
     let fields: Vec<&[u8]> = match &body {
         Body::Claim { statement, tags } => {
             std::iter::once(statement.as_bytes()).chain(tags.iter().map(|t| t.as_bytes())).collect()
@@ -1114,7 +1143,7 @@ fn contribute(s: &mut Store, who: &Identity, body: Body) -> Result<ContributionI
             bail!("this contribution contains the private key of identity {name:?}; it can't go into the Ground");
         }
     }
-    Ok(s.contribute(who, body)?)
+    Ok(s.contribute_with(who, body)?)
 }
 
 /// Each local identity's name and secret key, as lowercase hex and as bytes. Read from the
@@ -1151,15 +1180,40 @@ fn resolve(s: &Store, prefix: &str) -> Result<ContributionId> {
     Ok(s.graph().resolve_prefix(prefix)?)
 }
 
+/// The local identity `agent` names: Weave's records are signed only by keys in their Ground's replica.
 fn signer(s: &Store, agent: Option<&str>) -> Result<Identity> {
     let name = agent.context("this command signs a contribution: pass --as <NAME> or set BRACKEN_AGENT")?;
     Ok(s.identity(name)?)
 }
 
+/// The signer for `agent`: its identity file in this replica if there is one, as for every identity made
+/// before keys moved to the team server. Otherwise, with `BRACKEN_SIGN_URL` and `BRACKEN_SIGN_TOKEN_FILE`
+/// set (scripts/bk sets them), the team server, which holds the key of a name in the public directory
+/// (docs/design/agent-keys.md, 4.1).
+fn any_signer(s: &Store, agent: Option<&str>) -> Result<Box<dyn Signer>> {
+    let name = agent.context("this command signs a contribution: pass --as <NAME> or set BRACKEN_AGENT")?;
+    match s.identity(name) {
+        Err(StoreError::UnknownIdentity(_)) => {}
+        found => return Ok(Box::new(found?)),
+    }
+    let (Some(url), Some(token)) = (std::env::var_os("BRACKEN_SIGN_URL"), std::env::var_os("BRACKEN_SIGN_TOKEN_FILE"))
+    else {
+        bail!("no identity named {name:?} here, and no signing server (BRACKEN_SIGN_URL) to ask");
+    };
+    let url = url.into_string().map_err(|_| anyhow::anyhow!("BRACKEN_SIGN_URL isn't UTF-8"))?;
+    let agent = s
+        .agents()?
+        .into_iter()
+        .find(|a| a.name == name)
+        .with_context(|| format!("no identity named {name:?} in this replica's directory"))?
+        .agent;
+    Ok(Box::new(signing::RemoteSigner::new(&url, Path::new(&token), s.info().ground, agent)?))
+}
+
 /// Resolves a `--supersedes` target, which must be a claim `who` wrote. Superseding someone
 /// else's claim is refused: they may not see it as replaced, and the old claim's evidence and
 /// relations don't carry over.
-fn own_claim(s: &Store, names: &Names, who: &Identity, prefix: &str) -> Result<ContributionId> {
+fn own_claim(s: &Store, names: &Names, who: &dyn Signer, prefix: &str) -> Result<ContributionId> {
     let id = resolve(s, prefix)?;
     let c = s.graph().get(&id).expect("resolved ids exist");
     if !matches!(c.body(), Body::Claim { .. }) {

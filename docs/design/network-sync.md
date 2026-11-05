@@ -351,7 +351,11 @@ shared `.bracken/identities/` folder, so any agent can sign as any other
 (`--as`). Until each agent holds only its own key, the allowlist, retraction,
 evidence independence and the supersession rule in section 6 all hold inside
 the team only by the honour rule (process 2). A compromised machine yields
-every key on it.
+every key on it. Since part A of [agent-keys.md](agent-keys.md), new
+identities' keys are held by the server instead (`serve --keys`), which
+signs for a token's own key only, within a scope, and logs each signature;
+that limits mistakes and stolen tokens, not an agent that reads the key
+directory as the same user.
 
 **Keys on other machines.** Each machine generates its own identities
 locally, and only their public keys go to the server's allowlist. No one
