@@ -76,7 +76,11 @@ pub fn graph_at(repo: &Path, commit: &str) -> Result<PackageGraph> {
     metadata.build_graph().with_context(|| format!("building the package graph of {commit}"))
 }
 
-/// This host's target triple, as rustc names it: `$RUSTC` if it names one, as cargo takes it, else `rustc`.
+/// This host's target triple, as rustc names it: from `$RUSTC -vV` if `RUSTC` is set and not empty, else
+/// `rustc -vV`. That's only part of how cargo finds rustc: it doesn't apply `RUSTC_WRAPPER`,
+/// `RUSTC_WORKSPACE_WRAPPER` or `build.rustc`, and it takes an empty `RUSTC` as unset, where cargo tries to run
+/// a program named ''. Here that never gives a wrong host: a wrapper doesn't change the host, this repository
+/// sets no `build.rustc`, and with an empty `RUSTC` the `cargo metadata` run after this fails cleanly.
 fn host() -> Result<String> {
     let rustc = std::env::var_os("RUSTC").filter(|r| !r.is_empty()).unwrap_or_else(|| "rustc".into());
     let shown = rustc.to_string_lossy().into_owned();
