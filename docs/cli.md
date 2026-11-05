@@ -181,7 +181,8 @@ forbidden_tags = ["decision", "approval"]              # and tags = [...]: the o
 
 Before it answers, it appends `{"id", "credential", "signed_ms"}` to `--signed` and syncs it, so every
 signature it gave is in the log (a contribution it signed may still be refused by the client's replica
-afterwards, and never stored). A key file moved out of `<dir>`, or into `<dir>/retired/`, is no longer signed with.
+afterwards, and never stored). A key file moved out of `<dir>`, or into `<dir>/retired/`, is no longer signed with, nor is a key whose public
+key is in `<dir>/retired.jsonl` (`{"name", "agent"}` lines) or `<dir>/retired/`, even if a copy is back in `<dir>`.
 
 A write command signs with the identity's file in `identities/` if there is one. Otherwise, with
 `BRACKEN_SIGN_URL` (a loopback server's URL) and `BRACKEN_SIGN_TOKEN_FILE` set, it sends the content to

@@ -17,7 +17,7 @@
 //!
 //! [`RemoteSigner`] is the client's side: a [`Signer`] that sends the content and checks what comes back.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 use std::net::TcpStream;
@@ -48,14 +48,48 @@ impl Keys {
     /// Reads every `<name>.json` identity file directly in `dir`, binding it to credential `<name>`, and
     /// those in `dir/retired/`, if there is one, for the content check only. The directory must be private
     /// (no access for group or others), and each file's name its identity's.
+    ///
+    /// A key is retired if it's in `dir/retired/` or its public key is in `dir/retired.jsonl` (one
+    /// `{"name", "agent"}` per line, which `team-server retire` appends): one found in `dir` as well, put
+    /// back by hand or from a backup, is never signed with (finding ab071f5d3de6).
     pub fn read(dir: &Path) -> Result<Keys> {
-        let signing = Self::read_dir(dir)?;
+        let mut signing = Self::read_dir(dir)?;
         let retired_dir = dir.join("retired");
-        let retired = match fs::symlink_metadata(&retired_dir) {
+        let mut retired: Vec<Identity> = match fs::symlink_metadata(&retired_dir) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             _ => Self::read_dir(&retired_dir)?.into_values().collect(),
         };
+        let mut ids: HashSet<AgentId> = retired.iter().map(Identity::agent_id).collect();
+        ids.extend(Self::read_retired_list(&dir.join("retired.jsonl"))?);
+        // A retired key found in `dir` isn't signed with, but stays the server's for the content check, so
+        // content holding it is still refused (finding 7794d137682f).
+        let names: Vec<String> = signing.keys().cloned().collect();
+        for name in names {
+            if ids.contains(&signing[&name].agent_id()) {
+                eprintln!("bracken serve: not signing for {name}: its key is retired");
+                retired.extend(signing.remove(&name));
+            }
+        }
         Ok(Keys { signing, retired })
+    }
+
+    /// The public keys `retired.jsonl` lists, if it's there.
+    fn read_retired_list(path: &Path) -> Result<Vec<AgentId>> {
+        #[derive(Deserialize)]
+        struct Retired {
+            agent: AgentId,
+        }
+        let text = match fs::read_to_string(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            text => text.with_context(|| format!("reading {}", path.display()))?,
+        };
+        let mut ids = Vec::new();
+        for (n, line) in text.lines().enumerate().filter(|(_, l)| !l.trim().is_empty()) {
+            let r: Retired = serde_json::from_str(line)
+                .with_context(|| format!("{}:{}: not a retired key's entry", path.display(), n + 1))?;
+            ids.push(r.agent);
+        }
+        Ok(ids)
     }
 
     /// The name and key of a key this server holds, retired or not, whose private key is in `bytes`.

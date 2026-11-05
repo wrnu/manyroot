@@ -313,6 +313,29 @@ fn a_retired_key_is_refused_and_the_key_directory_is_checked() {
     let out = t.write(&server, "unscoped", &["claim", "nothing pasted"]);
     assert!(out.status.success(), "{}", stderr(&out));
     drop(server);
+    let signed = t.signed().len();
+
+    // A retired key put back in keys/ isn't signed with: copied back while retired/ still has it, or moved
+    // back with retired.jsonl naming it (finding ab071f5d3de6).
+    std::fs::copy(t.tmp.join("keys/retired/srv.json"), t.tmp.join("keys/srv.json")).unwrap();
+    let server = t.serve();
+    let out = t.write(&server, "srv", &["claim", "copied back"]);
+    assert!(!out.status.success() && stderr(&out).contains("holds no key for srv"), "{}", stderr(&out));
+    drop(server);
+    let srv = key(&t.client, "srv").to_hex();
+    std::fs::write(t.tmp.join("keys/retired.jsonl"), format!("{{\"name\":\"srv\",\"agent\":\"{srv}\"}}\n")).unwrap();
+    std::fs::remove_file(t.tmp.join("keys/retired/srv.json")).unwrap();
+    let server = t.serve();
+    let out = t.write(&server, "srv", &["claim", "moved back"]);
+    assert!(!out.status.success() && stderr(&out).contains("holds no key for srv"), "{}", stderr(&out));
+    // Still the server's key for the content check (finding 7794d137682f).
+    let out = t.write(&server, "unscoped", &["claim", &pasted]);
+    assert!(!out.status.success() && stderr(&out).contains("private key of srv"), "{}", stderr(&out));
+    let out = t.write(&server, "unscoped", &["claim", "unscoped still signs"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(t.signed().len(), signed + 1);
+    drop(server);
+    std::fs::rename(t.tmp.join("keys/srv.json"), t.tmp.join("keys/retired/srv.json")).unwrap();
 
     let start = |t: &Team| {
         cmd(&t.server)
