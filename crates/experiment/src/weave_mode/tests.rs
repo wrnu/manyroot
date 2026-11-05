@@ -300,12 +300,12 @@ fn an_items_revisions_dont_depend_on_its_texts_wording() {
     assert_eq!(index(real), json!({"id": "x", "kind": "change", "title": "T", "changes": ["a-1", "b"], "page": 1}));
 }
 
-/// A git diff of `n` new files, each `lines` lines long: its name-status and its patch.
+/// A git diff of `n` new files, each `lines` lines long: its name-status (`-z`) and its patch.
 fn big_diff(n: usize, lines: usize) -> (String, String) {
     let (mut status, mut patch) = (String::new(), String::new());
     for i in 0..n {
         let path = format!("pkg/m{i:03}.py");
-        status.push_str(&format!("A\t{path}\n"));
+        status.push_str(&format!("A\0{path}\0"));
         patch.push_str(&format!(
             "diff --git a/{path} b/{path}\nnew file mode 100644\n--- /dev/null\n+++ b/{path}\n@@ -0,0 +1,{lines} @@\n"
         ));
@@ -337,6 +337,65 @@ fn a_diff_splits_per_file_with_its_changes() {
     assert_eq!(paths, [("pkg/m000.py", "A"), ("pkg/m001.py", "A"), ("pkg/m002.py", "A")]);
     assert_eq!(files.iter().map(|f| f.text.as_str()).collect::<String>(), patch, "nothing lost");
     assert!(split_diff("", "").is_empty());
+}
+
+/// Task `24a43694bbbf`: a path is name-status's, never parsed from git's header, so one holding ` b/` keeps its
+/// name; and a type change's two sections are one file's, so the files after it keep their own changes.
+#[test]
+fn a_diffs_paths_and_changes_are_git_name_status() {
+    let status = "M\0x b/y\0T\0link\0D\0gone\0";
+    let patch = "diff --git a/x b/y b/x b/y\n--- a/x b/y\n+++ b/x b/y\n@@ -1 +1 @@\n-a\n+b\n\
+                 diff --git a/link b/link\ndeleted file mode 100644\n--- a/link\n+++ /dev/null\n@@ -1 +0,0 @@\n-hi\n\
+                 diff --git a/link b/link\nnew file mode 120000\n--- /dev/null\n+++ b/link\n@@ -0,0 +1 @@\n+y\n\
+                 diff --git a/gone b/gone\ndeleted file mode 100644\n--- a/gone\n+++ /dev/null\n@@ -1 +0,0 @@\n-z\n";
+    let files = split_diff(status, patch);
+    let paths: Vec<(&str, &str)> = files.iter().map(|f| (f.path.as_str(), f.change.as_str())).collect();
+    assert_eq!(paths, [("x b/y", "M"), ("link", "T"), ("gone", "D")]);
+    assert!(files[1].text.contains("-hi\n") && files[1].text.contains("+y\n"), "both sections: {}", files[1].text);
+    assert_eq!(files.iter().map(|f| f.text.as_str()).collect::<String>(), patch, "nothing lost");
+}
+
+/// Finding `f6bb7565bb90`: a diff is measured without encoding it, the same as serde_json counts it.
+#[test]
+fn a_texts_json_size_is_counted_as_serde_json_writes_it() {
+    let all: String = (0u32..0x80).filter_map(char::from_u32).chain("é€😀\u{7f}\u{2028}".chars()).collect();
+    for ch in all.chars() {
+        let s = ch.to_string();
+        assert_eq!(escaped_len(&s), json_len(&s) - 2, "{ch:?}");
+    }
+    assert_eq!(escaped_len(&all), json_len(&all) - 2);
+}
+
+/// Task `24a43694bbbf`, from review `f2869acaafee`: every file a page shows is named in its index, however many
+/// files and however long their paths. The reviewer's adversarial case: a 3,000-line file of quotes, backslashes
+/// and control characters at a 1,000-byte path, then 400 small files, every seventh with a 900-byte path.
+#[test]
+fn every_file_a_page_shows_is_in_its_index() {
+    let long = format!("{}/big.txt", "d".repeat(990));
+    let line = "+\"q\" \\ \u{1} tail\n";
+    let mut files = vec![FileDiff {
+        path: long.clone(),
+        change: "A".into(),
+        text: format!("diff --git a/{long} b/{long}\n{}", line.repeat(3000)),
+    }];
+    for i in 0..400 {
+        let path = if i % 7 == 0 { format!("{}/f{i}.py", "e".repeat(890)) } else { format!("pkg/f{i}.py") };
+        files.push(FileDiff { text: format!("diff --git a/{path} b/{path}\n+x = {i}\n"), path, change: "A".into() });
+    }
+    let pages = all_pages(&files);
+    assert!(pages.len() > 2, "{} pages", pages.len());
+    let mut shown = 0;
+    for (k, p) in pages.iter().enumerate() {
+        let listed: Vec<&str> =
+            p["files"].as_array().expect("files").iter().filter_map(|f| f["path"].as_str()).collect();
+        for f in &files {
+            if p["diff"].as_str().expect("text").contains(&format!("diff --git a/{} ", f.path)) {
+                assert!(listed.contains(&f.path.as_str()), "page {}: {} shown, not listed", k + 1, f.path);
+                shown += 1;
+            }
+        }
+    }
+    assert_eq!(shown, files.len(), "each file's diff starts on one page");
 }
 
 /// Finding `e97ef2cd6d6e`: a diff over the bound comes in pages, in order, with nothing lost: a small one is
