@@ -85,7 +85,18 @@ prepare() {
   # Limits from network-sync.md, "Memory, for choosing step 3's limits".
   serve=("$bin" --dir "$dir/ground" serve --port "${url##*:}" --tokens "$dir/tokens.b3" --allow "$dir/allow"
     --first-seen "$dir/first-seen.jsonl" --batch-bytes 17825792 --id-budget 8388608 --max-sessions 16)
-  [ ! -d "$dir/keys" ] || serve+=(--keys "$dir/keys" --scopes "$dir/scopes.toml" --signed "$dir/signed.jsonl")
+  if [ -d "$dir/keys" ]; then
+    signs ||
+      fail "$dir/keys holds keys, but $bin can't sign for them (no serve --keys): upgrade the pinned binary (docs/releases.md); nothing was started"
+    serve+=(--keys "$dir/keys" --scopes "$dir/scopes.toml" --signed "$dir/signed.jsonl")
+  fi
+}
+
+# Whether $bin can hold keys: serve --keys/--scopes/--signed and id new --key-dir (finding 0d9dbdbc9f35).
+signs() {
+  local serve_help id_help
+  serve_help=$("$bin" serve --help 2>/dev/null) && id_help=$("$bin" id new --help 2>/dev/null) || return 1
+  [[ $serve_help == *--keys* && $serve_help == *--scopes* && $serve_help == *--signed* && $id_help == *--key-dir* ]]
 }
 
 # Restarts the server if it runs, so it reads its tokens, allowlist and keys again: a token it doesn't know
@@ -219,6 +230,9 @@ case "${1:-}" in
     known=$(identities)
     [[ $known != *"\"name\": \"$name\""* ]] || fail "$name is already an identity; key makes new ones only"
     ! grep -q "\"name\":\"$name\"" "$dir/held.jsonl" 2>/dev/null || fail "$name was held by this server before"
+    # Before anything in the team directory changes: with keys/ present every start passes --keys, which
+    # an older binary refuses, and the server would stay down for everyone.
+    signs || fail "$bin can't hold keys (no serve --keys or id new --key-dir): upgrade the pinned binary first (docs/releases.md); nothing was changed"
     mkdir -p "$dir/keys/retired"
     chmod 700 "$dir/keys" "$dir/keys/retired"
     [ -e "$dir/scopes.toml" ] || first_scopes >"$dir/scopes.toml"

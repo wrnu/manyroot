@@ -168,7 +168,8 @@ its private key in `<dir>` and only its public entry in the replica's `agents/`.
 <dir> --scopes <file> --signed <log>` binds each credential in `--tokens` to the key of the same name in
 `<dir>` (which must be 0700), and answers `POST /v1/<ground>/sign`: the body is a contribution's content
 in canonical encoding, the reply its 64-byte signature. It signs only if the content re-encodes to the same
-bytes, is for its Ground and protocol 1, is authored by the token's own key, holds none of its keys, and is
+bytes, is for its Ground and protocol 1, is authored by the token's own key, holds none of its keys (those in `<dir>/retired/` included, which it
+reads for this check only and never signs with), and is
 within that name's scope in `--scopes`, a TOML file it reads on every request:
 
 ```toml
@@ -180,7 +181,7 @@ forbidden_tags = ["decision", "approval"]              # and tags = [...]: the o
 
 Before it answers, it appends `{"id", "credential", "signed_ms"}` to `--signed` and syncs it, so every
 signature it gave is in the log (a contribution it signed may still be refused by the client's replica
-afterwards, and never stored). A key file moved out of `<dir>` is no longer signed with.
+afterwards, and never stored). A key file moved out of `<dir>`, or into `<dir>/retired/`, is no longer signed with.
 
 A write command signs with the identity's file in `identities/` if there is one. Otherwise, with
 `BRACKEN_SIGN_URL` (a loopback server's URL) and `BRACKEN_SIGN_TOKEN_FILE` set, it sends the content to

@@ -36,12 +36,34 @@ use serde::{Deserialize, Serialize};
 use crate::wire::{Refused, Timed};
 
 /// The keys a server signs with, by the credential each is bound to.
-pub struct Keys(HashMap<String, Identity>);
+pub struct Keys {
+    /// The keys it signs with, by credential.
+    signing: HashMap<String, Identity>,
+    /// Retired keys (`<dir>/retired/`), never signed with, read only so content holding one is refused
+    /// too (finding 6f54cb439f9b).
+    retired: Vec<Identity>,
+}
 
 impl Keys {
-    /// Reads every `<name>.json` identity file directly in `dir`, binding it to credential `<name>`. The
-    /// directory must be private (no access for group or others), and each file's name its identity's.
+    /// Reads every `<name>.json` identity file directly in `dir`, binding it to credential `<name>`, and
+    /// those in `dir/retired/`, if there is one, for the content check only. The directory must be private
+    /// (no access for group or others), and each file's name its identity's.
     pub fn read(dir: &Path) -> Result<Keys> {
+        let signing = Self::read_dir(dir)?;
+        let retired_dir = dir.join("retired");
+        let retired = match fs::symlink_metadata(&retired_dir) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            _ => Self::read_dir(&retired_dir)?.into_values().collect(),
+        };
+        Ok(Keys { signing, retired })
+    }
+
+    /// The name and key of a key this server holds, retired or not, whose private key is in `bytes`.
+    fn held_key_in(&self, bytes: &[u8]) -> Option<&str> {
+        self.signing.values().chain(&self.retired).find(|k| k.key_is_in(bytes)).map(Identity::name)
+    }
+
+    fn read_dir(dir: &Path) -> Result<HashMap<String, Identity>> {
         let m = fs::symlink_metadata(dir).with_context(|| format!("reading {}", dir.display()))?;
         if !m.is_dir() {
             bail!("{} isn't a directory", dir.display());
@@ -68,7 +90,7 @@ impl Keys {
             }
             keys.insert(name.to_owned(), identity);
         }
-        Ok(Keys(keys))
+        Ok(keys)
     }
 }
 
@@ -166,7 +188,7 @@ impl Signing {
     /// The signature for `bytes`, a contribution's canonical content, by the key bound to `credential`.
     pub fn sign(&self, ground: GroundId, credential: &str, bytes: &[u8]) -> Result<Vec<u8>, Refused> {
         let forbidden = |reason: String| Refused::new(403, reason);
-        let key = self.keys.0.get(credential).ok_or_else(|| {
+        let key = self.keys.signing.get(credential).ok_or_else(|| {
             forbidden(format!("this server holds no key for {credential}, so it signs nothing for it"))
         })?;
         let content = ContributionContent::decode(bytes)
@@ -182,7 +204,7 @@ impl Signing {
                 "the content's author isn't {credential}'s key, the only one it may sign as"
             )));
         }
-        if let Some((name, _)) = self.keys.0.iter().find(|(_, k)| k.key_is_in(bytes)) {
+        if let Some(name) = self.keys.held_key_in(bytes) {
             return Err(forbidden(format!("the content holds the private key of {name}; it can't go into the Ground")));
         }
         let text = fs::read_to_string(&self.scopes).map_err(|e| {

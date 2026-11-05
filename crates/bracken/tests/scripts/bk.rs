@@ -530,6 +530,29 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         ok(sh("scripts/team-server", &["token", "alice"], None), "token");
         ok(sh("scripts/team-server", &["start"], None), "start");
 
+        // An older binary, without serve --keys or id new --key-dir: key refuses before changing anything,
+        // so the server still restarts under it (finding 0d9dbdbc9f35).
+        let old = tmp.path().join("bracken-old");
+        write_executable(
+            &old,
+            "#!/usr/bin/env bash
+             for a in \"$@\"; do case $a in --keys|--scopes|--signed|--key-dir) echo \"error: unexpected argument '$a'\" >&2; exit 2 ;; esac; done
+             if [[ \" $* \" == *\" --help \"* ]]; then \"$REAL_BRACKEN\" \"$@\" | grep -v -e --keys -e --scopes -e --signed -e --key-dir; exit; fi
+             exec \"$REAL_BRACKEN\" \"$@\"
+",
+        );
+        let with_old =
+            |args: &[&str]| command(&a, "scripts/team-server", args).env("BRACKEN_BIN", &old).output().unwrap();
+        failed(with_old(&["key", "builder-x"]), "key with an old binary", "upgrade the pinned binary first");
+        assert!(
+            !team.join("keys").exists() && !team.join("scopes.toml").exists(),
+            "{scripts}: key changed the team dir"
+        );
+        assert!(!a.join(".bracken/agents/builder-x.json").exists(), "{scripts}");
+        let out = ok(with_old(&["token", "alice"]), "token with an old binary");
+        assert!(out.contains("restarting the server"), "{scripts}: {out}");
+        ok(sh("scripts/bk", &["claim", "after the old binary's restart"], Some("alice")), "alice");
+
         // key: the private key in the team directory, the public entry in the main checkout's Ground.
         let out = ok(sh("scripts/team-server", &["key", "builder-x"], None), "key");
         assert!(out.contains("made builder-x") && out.contains("restarting the server"), "{scripts}: {out}");
@@ -568,5 +591,9 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         failed(sh("scripts/team-server", &["token", "builder-x"], None), "token after retiring", "is retired");
         failed(sh("scripts/team-server", &["key", "builder-x"], None), "key after retiring", "already an identity");
         ok(sh("scripts/bk", &["claim", "alice still writes"], Some("alice")), "alice after the restart");
+
+        // With keys held, an older binary isn't started with flags it rejects: start says why.
+        ok(sh("scripts/team-server", &["stop"], None), "stop");
+        failed(with_old(&["start"]), "start with an old binary", "upgrade the pinned binary");
     }
 }

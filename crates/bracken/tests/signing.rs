@@ -296,11 +296,22 @@ fn the_server_signs_only_its_own_canonical_content_within_scope() {
 fn a_retired_key_is_refused_and_the_key_directory_is_checked() {
     let t = team();
     std::fs::create_dir(t.tmp.join("keys/retired")).unwrap();
+    set_mode(&t.tmp.join("keys/retired"), 0o700);
     std::fs::rename(t.tmp.join("keys/srv.json"), t.tmp.join("keys/retired/srv.json")).unwrap();
     let server = t.serve();
     let out = t.write(&server, "srv", &["claim", "after retiring"]);
     assert!(!out.status.success() && stderr(&out).contains("holds no key for srv"), "{}", stderr(&out));
     assert!(t.signed().is_empty());
+    // A retired key is still the server's: content holding it is refused (finding 6f54cb439f9b).
+    let retired = std::fs::read_to_string(t.tmp.join("keys/retired/srv.json")).unwrap();
+    let secret: Value = serde_json::from_str(&retired).unwrap();
+    let pasted = format!("pasted: {}", secret["secret_key"].as_str().unwrap());
+    std::fs::write(t.tmp.join("scopes.toml"), SCOPES.replace("\"srv*\"", "\"*\"")).unwrap();
+    let out = t.write(&server, "unscoped", &["claim", &pasted]);
+    assert!(!out.status.success() && stderr(&out).contains("private key of srv"), "{}", stderr(&out));
+    assert!(t.signed().is_empty());
+    let out = t.write(&server, "unscoped", &["claim", "nothing pasted"]);
+    assert!(out.status.success(), "{}", stderr(&out));
     drop(server);
 
     let start = |t: &Team| {
