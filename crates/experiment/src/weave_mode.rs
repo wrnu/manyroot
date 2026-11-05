@@ -778,6 +778,18 @@ impl WeaveStore {
             .map_err(|e| format!("no {file}: {e}"))
     }
 
+    /// The paths the agent's merge left in conflict, as merge listed them: a JSON array, read untrimmed, so a
+    /// path keeps any space at its ends (finding `59a8baa8e126`).
+    fn conflicts(&self) -> Result<Vec<String>, String> {
+        let text = std::fs::read_to_string(self.config.dir.join("conflicts.txt"))
+            .map_err(|e| format!("no conflicts.txt: {e}"))?;
+        serde_json::from_str(&text).map_err(|e| format!("conflicts.txt: {e}"))
+    }
+
+    fn save_conflicts(&self, paths: &[&str]) -> Result<(), String> {
+        self.save("conflicts.txt", &Value::from(paths).to_string())
+    }
+
     /// Writes `file` whole or not at all: a temporary copy beside it, renamed over it (finding `1f85d3eb08d1`).
     fn save(&self, file: &str, value: &str) -> Result<(), String> {
         let (path, temp) = (self.config.dir.join(file), self.config.dir.join(format!("{file}.new")));
@@ -1395,10 +1407,10 @@ impl WeaveStore {
                 // Each conflict is settled by resolve, so one with no markers to find, such as a binary file's,
                 // never passes unsettled (finding e26a1c74e007). A merge whose conflicts can't be read has them
                 // open (finding 1f85d3eb08d1).
-                let conflicts = self.saved("conflicts.txt").map_err(|e| {
+                let conflicts = self.conflicts().map_err(|e| {
                     format!("your merge's conflicts can't be read ({}): merge the heads again", short(&e))
                 })?;
-                match conflicts.lines().find(|l| !l.is_empty()) {
+                match conflicts.first() {
                     Some(path) => Err(format!(
                         "your merge's conflict at {} isn't settled: settle it, then resolve it with no proposals",
                         short(path)
@@ -1451,7 +1463,7 @@ impl WeaveStore {
             self.git(&["reset", "-q", "--hard", &keep])?;
             return Err(e);
         }
-        self.save("conflicts.txt", &conflicts.join("\n"))?;
+        self.save_conflicts(&conflicts.iter().map(String::as_str).collect::<Vec<_>>())?;
         self.save("merge.txt", &ids.join("\n"))?;
         Ok(json!({"heads": ids, "conflicts": conflicts}))
     }
@@ -1560,8 +1572,8 @@ impl WeaveStore {
     /// Settles a conflict the agent's merge reported at `path`: its working tree's file as it stands (`tree`),
     /// with no conflict marker left, or the file deleted (`delete`).
     fn settle(&mut self, path: &str, take: &str) -> Result<Value, String> {
-        let conflicts = self.saved("conflicts.txt").map_err(|_| "you have no merge with conflicts to settle")?;
-        if !conflicts.lines().any(|l| l == path) {
+        let conflicts = self.conflicts().map_err(|_| "you have no merge with conflicts to settle")?;
+        if !conflicts.iter().any(|c| c == path) {
             return Err(format!("your merge reported no conflict at {} to settle", short(path)));
         }
         let file = self.file(path)?;
@@ -1580,8 +1592,8 @@ impl WeaveStore {
             }
             other => return Err(format!("take {}: a merge's conflict takes tree or delete", short(other))),
         }
-        let left: Vec<&str> = conflicts.lines().filter(|l| !l.is_empty() && *l != path).collect();
-        self.save("conflicts.txt", &left.join("\n"))?;
+        let left: Vec<&str> = conflicts.iter().map(String::as_str).filter(|c| *c != path).collect();
+        self.save_conflicts(&left)?;
         Ok(json!({"settled": path, "conflicts": left}))
     }
 }

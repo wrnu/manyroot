@@ -551,11 +551,12 @@ fn forked_with_a_conflict() -> Stores {
 }
 
 /// A conflict on a path git would quote (a non-ASCII byte, a double quote) is reported as the path is, so
-/// resolve can settle it and the merge can be integrated (finding f475a036f200).
+/// resolve can settle it and the merge can be integrated (finding f475a036f200); so is one with a space at
+/// either end, first or last in the list, and no other name settles it (finding 59a8baa8e126).
 #[test]
-fn a_conflict_on_a_path_git_would_quote_can_be_settled() {
+fn a_conflict_on_a_path_git_would_quote_or_trim_can_be_settled() {
     let mut s = Stores::new(&["agent-0", "agent-1"]);
-    let paths = ["tiny/café.py", "tiny/qu\"ote.py"];
+    let paths = [" lead.py", "tiny/café.py", "tiny/qu\"ote.py", "tiny/x.py "];
     // Each head adds both files, with its own text.
     for (i, name) in [(0, "zero"), (1, "one")] {
         for path in paths {
@@ -568,6 +569,10 @@ fn a_conflict_on_a_path_git_would_quote_can_be_settled() {
     }
     let merged = s.ok(0, "merge", json!({}));
     assert_eq!(merged["conflicts"], json!(paths), "{merged}");
+    for trimmed in ["lead.py", "tiny/x.py"] {
+        let err = s.tool(0, "resolve", json!({"path": trimmed, "take": "delete"})).expect_err("not a conflict");
+        assert!(err.contains("no conflict"), "{trimmed}: {err}");
+    }
     for path in paths {
         s.ok(0, "write_file", json!({"path": path, "text": "X = 'both'\n"}));
         s.ok(0, "resolve", json!({"path": path, "take": "tree"}));
