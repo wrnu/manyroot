@@ -29,7 +29,10 @@ fn quick_start_blocks(readme: &str) -> Vec<Vec<&str>> {
     let mut blocks = Vec::new();
     let mut open: Option<Vec<&str>> = None;
     for line in section {
-        match (&mut open, line.starts_with("```")) {
+        // Any fence CommonMark knows, indented or not: ``` or ~~~, of any length. Only ```sh and a
+        // bare ``` at the line's start pass the asserts below, so no other kind of block goes unseen.
+        let fence = line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~");
+        match (&mut open, fence) {
             (None, true) => {
                 assert_eq!(
                     line, "```sh",
@@ -176,4 +179,38 @@ fn readme_quick_start_runs() {
         weave.ends_with(&expected),
         "the Weave block must end by printing {expected:?}\nits stdout:\n{weave}\nstderr:\n{stderr}"
     );
+}
+
+#[cfg(test)]
+mod parser {
+    use super::quick_start_blocks;
+
+    const README: &str = "# T\n\n## Quick start\n\n```sh\ntrue\n```\n\nThen:\n\n```sh\ntrue\n```\n\n## Next\n";
+
+    fn with_extra(extra: &str) -> String {
+        README.replace("\n## Next", &format!("\n{extra}\n## Next"))
+    }
+
+    #[test]
+    fn reads_the_sh_blocks() {
+        assert_eq!(quick_start_blocks(README), vec![vec!["true"], vec!["true"]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be ```sh")]
+    fn a_tilde_block_fails() {
+        quick_start_blocks(&with_extra("~~~sh\nfalse\n~~~\n"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be ```sh")]
+    fn an_indented_block_fails() {
+        quick_start_blocks(&with_extra("- step:\n\n   ```sh\n   false\n   ```\n"));
+    }
+
+    #[test]
+    #[should_panic(expected = "must close with a bare ```")]
+    fn an_indented_close_fails() {
+        quick_start_blocks(&README.replacen("true\n```", "true\n  ```", 1));
+    }
 }
