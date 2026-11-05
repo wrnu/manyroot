@@ -591,6 +591,18 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         failed(sh("scripts/team-server", &["token", "builder-x"], None), "token after retiring", "is retired");
         failed(sh("scripts/team-server", &["key", "builder-x"], None), "key after retiring", "already an identity");
         ok(sh("scripts/bk", &["claim", "alice still writes"], Some("alice")), "alice after the restart");
+        let retired = std::fs::read_to_string(team.join("keys/retired.jsonl")).unwrap();
+        assert!(retired.contains("\"name\":\"builder-x\"") && !retired.contains("secret"), "{scripts}: {retired}");
+        // Put back by hand, it is still retired: token and retire refuse it (finding ab071f5d3de6).
+        std::fs::rename(team.join("keys/retired/builder-x.json"), team.join("keys/builder-x.json")).unwrap();
+        failed(sh("scripts/team-server", &["token", "builder-x"], None), "token after a move back", "is retired");
+        failed(sh("scripts/team-server", &["retire", "builder-x"], None), "retire again", "already retired");
+        std::fs::rename(team.join("keys/builder-x.json"), team.join("keys/retired/builder-x.json")).unwrap();
+
+        // A restart under a binary that can't serve the held keys refuses before stopping the server, which
+        // goes on serving (finding d8703c51297c).
+        failed(with_old(&["token", "alice"]), "token with an old binary and keys held", "left as it is");
+        ok(sh("scripts/bk", &["claim", "the server is still up"], Some("alice")), "alice after the refusal");
 
         // With keys held, an older binary isn't started with flags it rejects: start says why.
         ok(sh("scripts/team-server", &["stop"], None), "stop");
