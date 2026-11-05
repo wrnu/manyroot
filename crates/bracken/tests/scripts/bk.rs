@@ -488,7 +488,12 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
     let real = env!("CARGO_BIN_EXE_bracken");
     for scripts in SCRIPTS {
         let copy = |name: &str| repo_root().join(scripts).join(name);
-        let files = [("scripts/bk", copy("bk")), ("scripts/team-server", copy("team-server"))];
+        let files = [
+            ("scripts/bk", copy("bk")),
+            ("scripts/team-server", copy("team-server")),
+            ("scripts/bk-evidence", copy("bk-evidence")),
+            ("scripts/code-scope", copy("code-scope")),
+        ];
         let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
         let (tmp, a) = repo(&files, ".bracken/\n.bracken-team\n", |_| {});
         let team = tmp.path().join("team");
@@ -582,6 +587,22 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         ok(sh("scripts/bk", &["claim", "signed locally"], Some("alice")), "alice's claim");
         assert_eq!(lines("signed.jsonl").len(), 1, "{scripts}");
         failed(sh("scripts/team-server", &["key", "alice"], None), "key for alice", "already an identity");
+        // bk-evidence records for it too: it has no key file here, but it has a team token (note c0346a9af0dc).
+        let head = String::from_utf8(run(&a, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
+        let out = ok(
+            sh("scripts/bk", &["claim", &format!("PR #1 main @ {head}: t"), "--tag", "pr"], Some("builder-x")),
+            "pr",
+        );
+        let pr = common::bare_ids(out.trim().to_owned());
+        let ran = tmp.path().join("ran");
+        let evidence = |agent: &str| {
+            let touch = ["bash", "-c", "touch \"$0\"", ran.to_str().unwrap()];
+            sh("scripts/bk-evidence", &[&[&pr[..12], "--as", agent, "--"][..], &touch].concat(), None)
+        };
+        ok(evidence("builder-x"), "bk-evidence as builder-x");
+        assert!(ran.exists(), "{scripts}: the command didn't run");
+        let signed = lines("signed.jsonl");
+        assert!(signed.len() == 3 && signed[2]["credential"] == "builder-x", "{scripts}: {signed:?}");
 
         // retire: the server signs nothing more for it, and its token is gone.
         let out = ok(sh("scripts/team-server", &["retire", "builder-x"], None), "retire");
@@ -589,6 +610,10 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         assert!(team.join("keys/retired/builder-x.json").exists() && !team.join("tokens/builder-x").exists());
         failed(sh("scripts/bk", &["claim", "after retiring"], Some("builder-x")), "after retiring", "no team token");
         failed(sh("scripts/team-server", &["token", "builder-x"], None), "token after retiring", "is retired");
+        // Without a token, bk-evidence refuses before it runs anything.
+        std::fs::remove_file(&ran).unwrap();
+        failed(evidence("builder-x"), "bk-evidence without a token", "no team token here");
+        assert!(!ran.exists(), "{scripts}: the command ran");
         failed(sh("scripts/team-server", &["key", "builder-x"], None), "key after retiring", "already an identity");
         ok(sh("scripts/bk", &["claim", "alice still writes"], Some("alice")), "alice after the restart");
         let retired = std::fs::read_to_string(team.join("keys/retired.jsonl")).unwrap();
@@ -616,6 +641,38 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         let listed = std::fs::read_to_string(team.join("keys/retired.jsonl")).unwrap();
         assert_eq!(listed.matches("\"builder-y\"").count(), 1, "{scripts}: {listed}");
         failed(sh("scripts/team-server", &["retire", "builder-y"], None), "retire builder-y again", "already retired");
+        // A retire stopped after it rewrote tokens.b3 and before the restart leaves nothing on disk, but the
+        // running server still signs with the key and takes the token: running retire again restarts it
+        // (finding f6e5238e58db).
+        ok(sh("scripts/team-server", &["key", "builder-z"], None), "key builder-z");
+        let held = std::fs::read_to_string(team.join("held.jsonl")).unwrap();
+        let z = held.lines().find(|l| l.contains("\"builder-z\"")).unwrap();
+        let mut list = std::fs::OpenOptions::new().append(true).open(team.join("keys/retired.jsonl")).unwrap();
+        std::io::Write::write_all(&mut list, format!("{z}\n").as_bytes()).unwrap();
+        drop(list);
+        std::fs::rename(team.join("keys/builder-z.json"), team.join("keys/retired/builder-z.json")).unwrap();
+        let token = std::fs::read(team.join("tokens/builder-z")).unwrap();
+        std::fs::remove_file(team.join("tokens/builder-z")).unwrap();
+        let tokens = std::fs::read_to_string(team.join("tokens.b3")).unwrap();
+        let kept: String = tokens.lines().filter(|l| !l.starts_with("builder-z ")).map(|l| format!("{l}\n")).collect();
+        std::fs::write(team.join("tokens.b3"), kept).unwrap();
+        // The old token, offered again: the running server still signs, which is what the re-run must end.
+        std::fs::write(team.join("tokens/builder-z"), &token).unwrap();
+        let before = lines("signed.jsonl").len();
+        ok(sh("scripts/bk", &["claim", "before the restart"], Some("builder-z")), "builder-z before the restart");
+        assert_eq!(lines("signed.jsonl").len(), before + 1, "{scripts}");
+        std::fs::remove_file(team.join("tokens/builder-z")).unwrap();
+        let pid = std::fs::read_to_string(team.join("server.pid")).unwrap();
+        let out = sh("scripts/team-server", &["retire", "builder-z"], None);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("restarting the server"), "{scripts}: {out:?}");
+        failed(out, "retire after a stop before the restart", "already retired");
+        assert_ne!(std::fs::read_to_string(team.join("server.pid")).unwrap(), pid, "{scripts}: not restarted");
+        std::fs::write(team.join("tokens/builder-z"), &token).unwrap();
+        assert!(!sh("scripts/bk", &["claim", "after the restart"], Some("builder-z")).status.success(), "{scripts}");
+        assert_eq!(lines("signed.jsonl").len(), before + 1, "{scripts}: signed after the restart");
+        std::fs::remove_file(team.join("tokens/builder-z")).unwrap();
+        ok(sh("scripts/bk", &["claim", "alice after builder-z"], Some("alice")), "alice after builder-z");
+        ok(sh("scripts/team-server", &["key", "builder-w"], None), "key builder-w");
 
         // A restart under a binary that can't serve the held keys refuses before stopping the server, which
         // goes on serving (finding d8703c51297c).
@@ -625,5 +682,26 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         // With keys held, an older binary isn't started with flags it rejects: start says why.
         ok(sh("scripts/team-server", &["stop"], None), "stop");
         failed(with_old(&["start"]), "start with an old binary", "upgrade the pinned binary");
+
+        // A refused retire changes nothing: a differing copy in keys/retired/ is found before the key is
+        // listed, and a link in place of either key file is refused before it's compared or removed.
+        let snapshot = || {
+            let read = |f: &str| std::fs::read(team.join(f)).ok();
+            [read("keys/retired.jsonl"), read("keys/builder-w.json"), read("tokens/builder-w"), read("tokens.b3")]
+        };
+        let before = snapshot();
+        std::fs::write(team.join("keys/retired/builder-w.json"), "{}\n").unwrap();
+        failed(sh("scripts/team-server", &["retire", "builder-w"], None), "retire with a differing copy", "differs");
+        assert_eq!(snapshot(), before, "{scripts}: a refused retire changed the team dir");
+        std::fs::remove_file(team.join("keys/retired/builder-w.json")).unwrap();
+        std::os::unix::fs::symlink(team.join("keys/builder-w.json"), team.join("keys/retired/builder-w.json")).unwrap();
+        failed(sh("scripts/team-server", &["retire", "builder-w"], None), "retire with a linked copy", "symbolic link");
+        assert_eq!(snapshot(), before, "{scripts}: a refused retire changed the team dir");
+        std::fs::remove_file(team.join("keys/retired/builder-w.json")).unwrap();
+        std::fs::rename(team.join("keys/builder-w.json"), team.join("builder-w.json")).unwrap();
+        std::os::unix::fs::symlink(team.join("builder-w.json"), team.join("keys/builder-w.json")).unwrap();
+        failed(sh("scripts/team-server", &["retire", "builder-w"], None), "retire with a linked key", "symbolic link");
+        assert_eq!(snapshot(), before, "{scripts}: a refused retire changed the team dir");
+        assert!(team.join("builder-w.json").exists() && !team.join("keys/retired/builder-w.json").exists());
     }
 }
