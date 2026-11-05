@@ -50,6 +50,8 @@ Always use `scripts/bk`, never a `bracken` binary built from your branch. The ta
 
   Each call ends with `bk-evidence: recorded pass <id>` or `recorded fail <id>` on stderr; don't filter its output, and treat a call without that line as recording nothing.
 
+  When your head changes `scripts/merge` or `scripts/verify-seq`, or their copies in `.claude/skills/agent-team-kickoff/templates/`, also record the scripts tests the fast profile leaves out, which otherwise run only in `--remote`'s Linux box: `"$main/scripts/bk-evidence" <pr> --as builder-<branch> -- cargo nextest run -P fast -p bracken --test scripts --ignore-default-filter -E 'not default()'`. `default()` is the profile's `default-filter` in `.config/nextest.toml`, so this selects exactly the tests that filter excludes and follows it when it changes (`cargo nextest list` with the same arguments shows them).
+
   Your own evidence is recorded but never counts toward the merge gate; the manager re-runs the checks. So run only the packages [AGENTS.md](../AGENTS.md#tests) lists for what your branch changes, never the whole workspace's tests.
 - **A test you think is wrong:** never delete, skip or weaken it. Contribute a claim that `contradicts` it, with your reasoning.
 - **Review findings:** answer each confirmed finding by fixing it in a new head, proposing a deferral (a `question` claim saying what would fix it and when; if the manager agrees, it records the deferred task itself), or disputing it (a claim that `contradicts` it).
