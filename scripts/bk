@@ -16,7 +16,9 @@
 #     then confirms its heads cover it (one retry). Don't report work done on a failed write: it is only local
 #     until a later sync pushes it.
 #   - a read pulls first, with a short timeout, and falls back to the local replica, saying so on
-#     stderr. With BK_PULL=required (scripts/merge) a read fails instead.
+#     stderr. An identity with no token reads the local replica, and every read says so, naming the
+#     identity and how the manager issues its token. With BK_PULL=required (scripts/merge) a read fails
+#     instead.
 #   - watch is a read. With --follow it also syncs with the server before each look, on its own
 #     --interval (at least 2 seconds), through watch's --sync and --token-file, which only bk gives.
 #     If the pinned bracken has watch --feed, bk gives that too: watch then waits on the server's change
@@ -159,8 +161,14 @@ if [ "$cmd" = watch ] && $follow && [ -n "$token" ]; then
   # The change feed (task 09bf8248e69b), once the pinned bracken has it.
   ! "$bin" watch --help 2>/dev/null | grep -q -- '--feed' || more+=(--feed)
 fi
+# With no token a read still works, from the local replica, and says plainly why, naming the identity and
+# who issues its token, so a new identity learns it before its first write is refused (task 140d6b4ffff7).
 if [ -z "$token" ]; then
-  err="no team token for '${who:-}'; set BRACKEN_AGENT to your identity"
+  if [ -z "$who" ]; then
+    err="no identity given: set BRACKEN_AGENT to your identity, or pass --as <identity>"
+  else
+    err="identity '$who' has no team token, so its writes will be refused; the manager issues one with scripts/team-server token $who"
+  fi
   [ "$cmd" != watch ] || ! $follow || [ "${BK_PULL:-}" = required ] ||
     echo "bk: watch --follow won't sync with the team server ($err): it reads only the local replica, which sees others' work only when something else pulls" >&2
 elif sync_team "$([ "${BK_PULL:-}" = required ] && echo 60 || echo 5)"; then

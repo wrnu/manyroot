@@ -114,6 +114,17 @@ fn team_server_bk_confirms_writes_and_the_gate_fails_closed() {
         assert!(shown.contains("from bob") && stderr.is_empty(), "{scripts}: {shown} {stderr}");
         let (shown, _) = ok(sh(&b, "scripts/bk", &["show", alice.trim()], Some("bob")), "bob reads");
         assert!(shown.contains("from alice"), "{scripts}: {shown}");
+        // An identity with no token still reads, from the local replica, and is told plainly whose token is
+        // missing and who issues it (task 140d6b4ffff7); with no identity at all, how to give one. Alice's
+        // read above, with a token, says nothing.
+        let (shown, stderr) = ok(sh(&a, "scripts/bk", &["show", alice.trim()], Some("carol")), "carol reads");
+        assert!(shown.contains("from alice"), "{scripts}: {shown}");
+        let told = "identity 'carol' has no team token, so its writes will be refused; \
+                    the manager issues one with scripts/team-server token carol";
+        assert!(stderr.contains(told) && stderr.lines().count() == 1, "{scripts}: {stderr}");
+        let (shown, stderr) = ok(sh(&a, "scripts/bk", &["show", alice.trim()], None), "a read as no one");
+        assert!(shown.contains("from alice"), "{scripts}: {shown}");
+        assert!(stderr.contains("no identity given: set BRACKEN_AGENT"), "{scripts}: {stderr}");
         // watch is a read: it pulls first. With --follow it syncs again on its interval, so a write from
         // the other replica shows up while it runs.
         let (out, _) = ok(sh(&a, "scripts/bk", &["watch"], Some("alice")), "alice watches");
