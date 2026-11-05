@@ -13,7 +13,8 @@
 #       worktree. The summary is 'PR #<n> <branch> @ <sha>'. Prints 'proposal <id>': name it in the pr claim
 #       as 'Weave proposal <id>'. Before it, if the base is an ancestor's, it prints 'base <id> mirrors
 #       <commit>, an ancestor of the merge-base ...'. The identity (default BRACKEN_AGENT) is created in the
-#       Weave Ground the first time.
+#       Weave Ground the first time. Before anything is proposed, it checks with gh that PR #<n> on origin is
+#       open, on this branch of origin's own (not a fork's), at HEAD, and refuses otherwise, naming what differs.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -43,6 +44,33 @@ sha=$(git -C "$repo" rev-parse HEAD)
 pushed=$(git -C "$repo" rev-parse -q --verify "refs/remotes/origin/$branch") ||
   fail "origin has no $branch yet: push first, then propose what was pushed"
 [ "$pushed" = "$sha" ] || fail "HEAD $sha isn't what origin/$branch has ($pushed): propose only the pushed commit"
+
+# PR #<n> must be this branch's, open, at HEAD, and from origin itself, not a fork's branch of the same name
+# (finding 46f7e9b16671), or the proposal would name another PR for good (task 75374db84761, stray proposal
+# e4df4bb710e2). gh authenticates from its own credential store only, with the
+# token variables unset as in scripts/merge, and never prompts. origin's URL isn't printed: it can carry a
+# password.
+origin=$(git -C "$repo" config --get remote.origin.url) || fail "no remote origin to find PR #$pr on"
+[[ $origin =~ ^https://([^/@]+)/([^/]+)/([^/]+)$ ]] ||
+  fail "origin's URL isn't https://<host>/<owner>/<repo>, with no user or password in it"
+on="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]%.git}"
+view=$(env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_DEBUG -u DEBUG \
+  -u GH_HOST -u GH_REPO GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
+  gh pr view "$pr" --repo "$on" --json state,headRefName,headRefOid,isCrossRepository 2>&1) ||
+  fail "can't read PR #$pr on $on with gh, so nothing was proposed: ${view##*$'\n'}"
+field() { jq -er --arg f "$1" '.[$f] | strings' <<<"$view" 2>/dev/null || echo '?'; }
+state=$(field state) head_ref=$(field headRefName) head_oid=$(field headRefOid)
+cross=$(jq -r '.isCrossRepository | if . == false then "no" elif . == true then "yes" else "?" end' <<<"$view" 2>/dev/null ||
+  echo '?')
+differs=()
+[ "$cross" = no ] || differs+=("its branch is in another repository (a fork), not $on")
+[ "$state" = OPEN ] || differs+=("it is $state, not open")
+[ "$head_ref" = "$branch" ] || differs+=("its branch is $head_ref, not $branch")
+[ "$head_oid" = "$sha" ] || differs+=("its head is $head_oid, not HEAD $sha (wait until GitHub has the push)")
+if [ ${#differs[@]} -gt 0 ]; then
+  msg=$(printf '%s; ' "${differs[@]}")
+  fail "PR #$pr on $on isn't this branch's open PR at HEAD: ${msg%; }. Nothing was proposed: give the number gh pr create printed"
+fi
 git -C "$repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no refs/remotes/origin/main"
 fork=$(git -C "$repo" merge-base HEAD refs/remotes/origin/main) || fail "$branch shares no history with origin/main"
 

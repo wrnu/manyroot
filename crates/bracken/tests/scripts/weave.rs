@@ -505,9 +505,29 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     bk(&dir, &["id", "new", "bob"]);
     bk(&dir, &["id", "new", "manager"]);
     std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    // A stand-in gh for weave-propose's PR check (task 75374db84761): PR #<n> is open at the checkout's branch
+    // and HEAD, unless prs/<n> holds its answer, or prs/<n>.missing exists. It logs each call with whether a
+    // token reached it. Never the real gh.
+    let (stubs, prs) = (tmp.path().join("gh-stubs"), tmp.path().join("prs"));
+    std::fs::create_dir_all(&prs).unwrap();
+    std::fs::create_dir_all(&stubs).unwrap();
+    write_executable(
+        &stubs.join("gh"),
+        "#!/bin/sh
+echo \"$* token=${GH_TOKEN:-none}\" >>\"$PRS/gh.log\"
+\
+         [ ! -e \"$PRS/$3.missing\" ] || { echo 'GraphQL: Could not resolve to a PullRequest' >&2; exit 1; }
+\
+         [ ! -f \"$PRS/$3\" ] || exec cat \"$PRS/$3\"
+\
+         printf '{\"state\":\"OPEN\",\"headRefName\":\"%s\",\"headRefOid\":\"%s\",\"isCrossRepository\":false}\\n' \
+           \"$(git symbolic-ref --short HEAD)\" \"$(git rev-parse HEAD)\"
+",
+    );
+    let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
     let script = |name: &str, args: &[&str]| -> Output {
         let mut c = command(&dir, name, args);
-        c.env("HOME", &home).output().unwrap()
+        c.env("HOME", &home).env("PATH", &path).env("PRS", &prs).env("GH_TOKEN", "t0ken").output().unwrap()
     };
     let ok = |name: &str, args: &[&str]| -> String {
         let out = script(name, args);
@@ -627,8 +647,45 @@ fn weave_shadow_merges_builders_proposals_and_counts_the_fallbacks() {
     refused("scripts/weave-propose", &["--pr", "9", "--as", "alice"], "push first");
     refused("scripts/weave", &["weave", "integrate", "--as", "alice"], "only --as weave-integrator");
 
-    // PR #1: proposed, merged by git, then merged by Weave equal to it.
+    // PR #1: proposed, merged by git, then merged by Weave equal to it. First, weave-propose checks with gh
+    // that PR #<n> is open, on this branch, at HEAD, and refuses a wrong number or a stale head before it
+    // proposes anything (task 75374db84761).
     branch("f1", &|| write("f1.txt", "f1\n"));
+    git(&["remote", "add", "origin", "https://github.example/team/repo.git"]);
+    let f1 = git(&["rev-parse", "HEAD"]);
+    std::fs::write(prs.join("7.missing"), "").unwrap();
+    refused("scripts/weave-propose", &["--pr", "7", "--as", "alice"], "can't read PR #7 on github.example/team/repo");
+    let answer_from = |n: &str, state: &str, branch: &str, sha: &str, fork: bool| {
+        let json = format!(
+            "{{\"state\":\"{state}\",\"headRefName\":\"{branch}\",\"headRefOid\":\"{sha}\",\"isCrossRepository\":{fork}}}"
+        );
+        std::fs::write(prs.join(n), json).unwrap();
+    };
+    let answer = |n: &str, state: &str, branch: &str, sha: &str| answer_from(n, state, branch, sha, false);
+    // A fork's PR from a branch of the same name, at this very commit (finding 46f7e9b16671).
+    answer_from("3", "OPEN", "f1", &f1, true);
+    refused("scripts/weave-propose", &["--pr", "3", "--as", "alice"], "its branch is in another repository (a fork)");
+    answer("6", "MERGED", "f1", &f1);
+    refused("scripts/weave-propose", &["--pr", "6", "--as", "alice"], "it is MERGED, not open");
+    answer("5", "OPEN", "fast-threads", &c0);
+    refused(
+        "scripts/weave-propose",
+        &["--pr", "5", "--as", "alice"],
+        &format!("its branch is fast-threads, not f1; its head is {c0}, not HEAD {f1}"),
+    );
+    answer("4", "OPEN", "f1", &c0);
+    refused("scripts/weave-propose", &["--pr", "4", "--as", "alice"], "(wait until GitHub has the push)");
+    // Later PRs reuse these numbers: from here, each PR is open at the branch and HEAD it is proposed from.
+    for n in ["3", "4", "5", "6", "7.missing"] {
+        std::fs::remove_file(prs.join(n)).unwrap();
+    }
+    let log = std::fs::read_to_string(prs.join("gh.log")).unwrap();
+    assert!(
+        log.lines().all(|l| l.ends_with(
+            "--repo github.example/team/repo --json state,headRefName,headRefOid,isCrossRepository token=none"
+        )),
+        "{log}"
+    );
     let p1 = proposal("1");
     let m1 = squash("f1", "1");
     gate("1");
