@@ -7,8 +7,14 @@
 #
 # Each is named exactly, by its test binary and its name, so a renamed or moved test falls back into
 # the fast tier rather than out of every run.
+#
+# The fast profile also runs 4 tests at a time (task c29555cbb440): builders share one Mac, and under
+# that load a run at the default, one test per CPU, failed on load alone. An explicit `-j <n>` or
+# `--test-threads <n>` still overrides it. Only this profile is set: the default profile, which
+# scripts/test-table, the counted run and CI use, keeps nextest's default.
 
 [profile.fast]
+test-threads = 4
 default-filter = """
 not (
     (binary_id(=bracken::scripts) & (
