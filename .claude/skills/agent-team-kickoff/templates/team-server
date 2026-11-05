@@ -27,8 +27,9 @@
 # out, and its public entry in the main checkout's .bracken/agents/ through bracken, as id new does; held.jsonl
 # lists every such identity's name and public key, for scripts/ground-guards. The server signs only within
 # <dir>/scopes.toml (key writes a first one, which the manager edits; the server reads it on every
-# request), and logs each signature in signed.jsonl. retire moves the key to <dir>/keys/retired/, where the
-# server doesn't read it, and drops its token; note it in a claim. Existing identities keep their key
+# request), and logs each signature in signed.jsonl. retire records the key in <dir>/keys/retired.jsonl,
+# moves it to <dir>/keys/retired/ and drops its token; note it in a claim. The server never signs with a key
+# that is in retired/ or named in retired.jsonl, even one put back in keys/ by hand. Existing identities keep their key
 # files in .bracken/identities/ and sign as they do.
 #
 # Once scripts/services install has made the server a launchd agent, launchd keeps it running: start
@@ -103,6 +104,7 @@ signs() {
 # would let the identity write locally and block everyone's pushes.
 restart() {
   local old
+  can_restart
   if managed; then
     echo "team-server: restarting the server through launchd, so it knows $1"
     old=$(running_pid || true)
@@ -112,6 +114,21 @@ restart() {
     echo "team-server: restarting the server, so it knows $1"
     stop_server
     start_server
+  fi
+}
+
+# Whether $1 was retired: its key in keys/retired/, or its name in keys/retired.jsonl, which stays when a
+# key file is moved back (finding ab071f5d3de6).
+retired() {
+  [ -e "$dir/keys/retired/$1.json" ] || grep -q "\"name\":\"$1\"" "$dir/keys/retired.jsonl" 2>/dev/null
+}
+
+# Refuses, before anything changes, when a running server would have to restart under a binary that can't
+# serve the held keys: stopping it would leave it down, and a token replaced without the restart would lock
+# its identity out (finding d8703c51297c).
+can_restart() {
+  if [ -d "$dir/keys" ] && { managed || running_pid >/dev/null; } && ! signs; then
+    fail "$dir/keys holds keys, but $bin can't sign for them (no serve --keys): upgrade the pinned binary (docs/releases.md); nothing was changed, and the running server was left as it is"
   fi
 }
 
@@ -215,9 +232,10 @@ case "${1:-}" in
     name=$2
     team_dir
     [[ $name =~ ^[a-z0-9_-]{1,64}$ ]] || fail "'$name' isn't an identity name"
-    [ ! -e "$dir/keys/retired/$name.json" ] || fail "$name is retired: its key is no longer signed with"
+    retired "$name" && fail "$name is retired: its key is no longer signed with"
     known=$(identities)
     [[ $known == *"\"name\": \"$name\""* ]] || fail "no identity $name in the main checkout's Ground"
+    can_restart
     issue_token
     restart "$name"
     ;;
@@ -250,8 +268,33 @@ case "${1:-}" in
     name=$2
     team_dir
     [[ $name =~ ^[a-z0-9_-]{1,64}$ ]] || fail "'$name' isn't an identity name"
-    [ -f "$dir/keys/$name.json" ] || fail "this server holds no key for $name"
-    mv "$dir/keys/$name.json" "$dir/keys/retired/$name.json"
+    # Resumable (finding 7dc098439105): each step is done only if it's still to do, so a retire that was
+    # interrupted, or a key put back by hand, is finished by running it again.
+    listed=false
+    grep -q "\"name\":\"$name\"" "$dir/keys/retired.jsonl" 2>/dev/null && listed=true
+    in_keys=false
+    [ -f "$dir/keys/$name.json" ] && in_keys=true
+    tokened=false
+    { [ -e "$dir/tokens/$name" ] || grep -q "^$name " "$dir/tokens.b3" 2>/dev/null; } && tokened=true
+    if ! $listed && ! $in_keys; then
+      [ -e "$dir/keys/retired/$name.json" ] || fail "this server holds no key for $name"
+    fi
+    $listed && ! $in_keys && ! $tokened && [ -e "$dir/keys/retired/$name.json" ] && fail "$name is already retired"
+    can_restart
+    if ! $listed; then
+      agent=$(grep "\"name\":\"$name\"" "$dir/held.jsonl" | grep -oE '[0-9a-f]{64}' | tail -1) ||
+        fail "$name isn't in $dir/held.jsonl, so its public key is unknown"
+      printf '{"name":"%s","agent":"%s"}\n' "$name" "$agent" >>"$dir/keys/retired.jsonl"
+    fi
+    if $in_keys; then
+      if [ -e "$dir/keys/retired/$name.json" ]; then
+        cmp -s "$dir/keys/$name.json" "$dir/keys/retired/$name.json" ||
+          fail "$dir/keys/$name.json differs from the retired copy in $dir/keys/retired/; tell the owner, nothing more was done"
+        rm "$dir/keys/$name.json"
+      else
+        mv "$dir/keys/$name.json" "$dir/keys/retired/$name.json"
+      fi
+    fi
     rm -f "$dir/tokens/$name"
     { grep -v "^$name " "$dir/tokens.b3" || true; } >"$dir/tokens.b3.new"
     mv "$dir/tokens.b3.new" "$dir/tokens.b3"

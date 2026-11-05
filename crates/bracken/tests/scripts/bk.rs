@@ -591,6 +591,36 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         failed(sh("scripts/team-server", &["token", "builder-x"], None), "token after retiring", "is retired");
         failed(sh("scripts/team-server", &["key", "builder-x"], None), "key after retiring", "already an identity");
         ok(sh("scripts/bk", &["claim", "alice still writes"], Some("alice")), "alice after the restart");
+        let retired = std::fs::read_to_string(team.join("keys/retired.jsonl")).unwrap();
+        assert!(retired.contains("\"name\":\"builder-x\"") && !retired.contains("secret"), "{scripts}: {retired}");
+        // Put back by hand, it is still retired: token refuses it (finding ab071f5d3de6), and retire puts it
+        // away again (finding 7dc098439105).
+        std::fs::rename(team.join("keys/retired/builder-x.json"), team.join("keys/builder-x.json")).unwrap();
+        failed(sh("scripts/team-server", &["token", "builder-x"], None), "token after a move back", "is retired");
+        ok(sh("scripts/team-server", &["retire", "builder-x"], None), "retire after a move back");
+        assert!(team.join("keys/retired/builder-x.json").exists() && !team.join("keys/builder-x.json").exists());
+        failed(sh("scripts/team-server", &["retire", "builder-x"], None), "retire again", "already retired");
+        // An interrupted retire, stopped after it listed the key: running it again finishes it.
+        ok(sh("scripts/team-server", &["key", "builder-y"], None), "key builder-y");
+        let held = std::fs::read_to_string(team.join("held.jsonl")).unwrap();
+        let y = held.lines().find(|l| l.contains("\"builder-y\"")).unwrap();
+        let mut list = std::fs::OpenOptions::new().append(true).open(team.join("keys/retired.jsonl")).unwrap();
+        std::io::Write::write_all(&mut list, format!("{y}\n").as_bytes()).unwrap();
+        drop(list);
+        assert!(team.join("tokens/builder-y").exists() && team.join("keys/builder-y.json").exists());
+        ok(sh("scripts/team-server", &["retire", "builder-y"], None), "retire after an interrupted one");
+        assert!(team.join("keys/retired/builder-y.json").exists() && !team.join("keys/builder-y.json").exists());
+        assert!(!team.join("tokens/builder-y").exists(), "{scripts}");
+        let tokens = std::fs::read_to_string(team.join("tokens.b3")).unwrap();
+        assert!(!tokens.contains("builder-y "), "{scripts}: {tokens}");
+        let listed = std::fs::read_to_string(team.join("keys/retired.jsonl")).unwrap();
+        assert_eq!(listed.matches("\"builder-y\"").count(), 1, "{scripts}: {listed}");
+        failed(sh("scripts/team-server", &["retire", "builder-y"], None), "retire builder-y again", "already retired");
+
+        // A restart under a binary that can't serve the held keys refuses before stopping the server, which
+        // goes on serving (finding d8703c51297c).
+        failed(with_old(&["token", "alice"]), "token with an old binary and keys held", "left as it is");
+        ok(sh("scripts/bk", &["claim", "the server is still up"], Some("alice")), "alice after the refusal");
 
         // With keys held, an older binary isn't started with flags it rejects: start says why.
         ok(sh("scripts/team-server", &["stop"], None), "stop");
