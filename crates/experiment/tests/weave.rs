@@ -203,7 +203,7 @@ fn a_copy_works_on_the_tree_through_weave() {
     let decision = integrated["decision"].as_str().expect("a decision").to_string();
     // diff shows each changed file's text (decision b423e8767735), and leaves the agent's tree alone.
     let diff = s.ok(0, "diff", json!({"a": &seed[..12], "b": &decision[..12]}));
-    assert_eq!(diff["files"], json!([{"path": "tiny/total.py", "change": "A", "page": 1}]), "{diff}");
+    assert_eq!(diff["files"], json!([{"path": "tiny/total.py", "change": "added", "page": 1}]), "{diff}");
     let text = diff["diff"].as_str().expect("text");
     assert!(
         text.starts_with("diff --git a/tiny/total.py b/tiny/total.py\n") && text.contains("+def total(xs):"),

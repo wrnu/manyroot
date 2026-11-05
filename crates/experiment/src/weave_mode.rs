@@ -391,7 +391,22 @@ fn fit<T: serde::Serialize>(mut parts: Vec<T>, budget: usize) -> (Vec<T>, Vec<T>
     (parts, rest)
 }
 
-/// One changed file of a diff: its path, git's letter for its change, and its unified diff.
+/// The size of `s` in JSON text, without its quotes: serde_json's escaping, counted rather than done, so
+/// measuring a diff costs no allocation (finding `f6bb7565bb90`).
+fn escaped_len(s: &str) -> usize {
+    s.bytes().map(escaped_byte_len).sum()
+}
+
+/// The size of byte `b` of UTF-8 text in JSON text: two for the short escapes, six for `\u00XX`, otherwise one.
+fn escaped_byte_len(b: u8) -> usize {
+    match b {
+        b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
+        0..0x20 => 6,
+        _ => 1,
+    }
+}
+
+/// One changed file of a diff: its path, its change (git's letter, or Weave's word), and its unified diff.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FileDiff {
     pub path: String,
@@ -399,12 +414,20 @@ pub struct FileDiff {
     pub text: String,
 }
 
-/// `git diff`'s output split per file, its paths and changes from `--name-status`'s, in the same order. A file
-/// of git's patch whose header names no path takes the next name-status line's.
+/// `git diff`'s output split per file, its paths and changes from `--name-status -z`'s, in the same order, so a
+/// path is the file's own, never parsed out of a header (a path holding ` b/` was mislabelled). git writes two
+/// sections for a file whose type changed (a file to a symlink) under one name-status entry: sections with the
+/// same header line are one file's. A section past the name-status entries takes its header's path.
 pub fn split_diff(name_status: &str, patch: &str) -> Vec<FileDiff> {
-    let mut status = name_status.lines().filter(|l| !l.is_empty()).map(|l| match l.split_once('\t') {
-        Some((c, p)) => (c.to_string(), p.rsplit('\t').next().unwrap_or(p).to_string()),
-        None => (String::new(), l.to_string()),
+    let mut fields = name_status.split('\0').filter(|f| !f.is_empty());
+    let mut status = std::iter::from_fn(move || {
+        let change = fields.next()?;
+        // A rename or copy names both paths; this file is the second. --no-renames makes none.
+        let mut path = fields.next().unwrap_or_default();
+        if change.starts_with(['R', 'C']) {
+            path = fields.next().unwrap_or(path);
+        }
+        Some((change.to_string(), path.to_string()))
     });
     let mut starts: Vec<usize> = patch
         .match_indices("diff --git ")
@@ -412,32 +435,50 @@ pub fn split_diff(name_status: &str, patch: &str) -> Vec<FileDiff> {
         .filter(|at| *at == 0 || patch.as_bytes()[at - 1] == b'\n')
         .collect();
     starts.push(patch.len());
-    starts
-        .windows(2)
-        .map(|w| {
-            let text = &patch[w[0]..w[1]];
-            let (change, listed) = status.next().unwrap_or_default();
-            let path = text.lines().next().and_then(|l| l.rsplit_once(" b/")).map_or(listed, |(_, p)| p.to_string());
-            FileDiff { path, change, text: text.to_string() }
-        })
-        .collect()
+    let mut files: Vec<FileDiff> = Vec::new();
+    let mut last_header = "";
+    for w in starts.windows(2) {
+        let text = &patch[w[0]..w[1]];
+        let header = text.lines().next().unwrap_or_default();
+        match files.last_mut() {
+            Some(f) if header == last_header => f.text.push_str(text),
+            _ => {
+                let (change, path) = status.next().unwrap_or_else(|| {
+                    (String::new(), header.rsplit_once(" b/").map_or(header, |(_, p)| p).to_string())
+                });
+                files.push(FileDiff { path, change, text: text.to_string() });
+            }
+        }
+        last_header = header;
+    }
+    files
 }
 
 /// `text` in pieces of at most `budget` bytes of JSON text each, cut after a line where it can, inside a line
-/// only one that alone is over the budget, and never inside a character.
+/// only one that alone is over the budget, and never inside a character. Each line is measured once, so this is
+/// linear in `text` (finding `f6bb7565bb90`).
 fn pieces(text: &str, budget: usize) -> Vec<&str> {
     let mut out = Vec::new();
-    let (mut from, mut size) = (0, 0);
-    for (at, ch) in text.char_indices() {
-        let n = json_len(&ch.to_string()) - 2;
+    let (mut from, mut size, mut at) = (0, 0, 0);
+    for line in text.split_inclusive('\n') {
+        let n = escaped_len(line);
         if size + n > budget && at > from {
-            // Back to the last line's end in this piece, if it has one.
-            let cut = text[from..at].rfind('\n').map_or(at, |i| from + i + 1);
-            out.push(&text[from..cut]);
-            size = json_len(&text[cut..at]) - 2;
-            from = cut;
+            out.push(&text[from..at]);
+            (from, size) = (at, 0);
         }
-        size += n;
+        if n <= budget {
+            size += n;
+        } else {
+            for (i, ch) in line.char_indices() {
+                let c = if ch.is_ascii() { escaped_byte_len(ch as u8) } else { ch.len_utf8() };
+                if size + c > budget && at + i > from {
+                    out.push(&text[from..at + i]);
+                    (from, size) = (at + i, 0);
+                }
+                size += c;
+            }
+        }
+        at += line.len();
     }
     if from < text.len() {
         out.push(&text[from..]);
@@ -447,55 +488,75 @@ fn pieces(text: &str, budget: usize) -> Vec<&str> {
 
 /// One page of a diff (task `a5253414e178`, finding `e97ef2cd6d6e`): every file's diff is on some page, a file
 /// too large for one page across as many as it needs, each part saying which, so nothing is out of reach and no
-/// advice loops. Page `page` (from 1) has its text, and an index of the files with the pages each is on: those
-/// of this page first, then the rest in order, as many as fit, with a count of the rest. `extra` holds the
-/// tool's own fields.
+/// advice loops. Page `page` (from 1) has its text, and an index of the files with the pages each is on: every
+/// file of this page first, room for them kept when the pages are made (task `24a43694bbbf`), then the rest in
+/// order, as many as fit, with a count of the rest. `extra` holds the tool's own fields. The work is linear in
+/// the diff's size, whichever page is asked for (finding `f6bb7565bb90`).
 pub fn diff_page(files: &[FileDiff], page: usize, mut extra: Value) -> Result<Value, String> {
     // Room for a continued part's first line, which names the file.
     let budget = |f: &FileDiff| PAGE_TEXT_BYTES.saturating_sub(json_len(&f.path) + 64).max(1024);
-    let mut parts: Vec<(usize, String)> = Vec::new();
+    // Each part: its file, its text and the text's size as JSON.
+    let mut parts: Vec<(usize, String, usize)> = Vec::new();
     for (i, f) in files.iter().enumerate() {
         let split = pieces(&f.text, budget(f));
         let n = split.len();
         for (k, p) in split.into_iter().enumerate() {
             let head = if n > 1 { format!("[{}: part {} of {n}]\n", f.path, k + 1) } else { String::new() };
-            parts.push((i, head + p));
+            let text = head + p;
+            let size = escaped_len(&text) + 2;
+            parts.push((i, text, size));
         }
     }
-    // Pages in order, a part going on the page before unless it would pass the budget.
-    let mut pages: Vec<Vec<usize>> = Vec::new();
-    let mut size = usize::MAX;
-    for (j, (_, text)) in parts.iter().enumerate() {
-        let n = json_len(text);
-        if size.saturating_add(n) > PAGE_TEXT_BYTES {
-            pages.push(Vec::new());
-            size = 0;
-        }
-        size += n;
-        pages.last_mut().expect("a page").push(j);
-    }
-    let count = pages.len().max(1);
-    if page == 0 || page > count {
-        return Err(format!("page {page}: the diff has {count} pages, from 1"));
-    }
-    let on: &[usize] = pages.get(page - 1).map_or(&[], Vec::as_slice);
-    let text: String = on.iter().map(|&j| parts[j].1.as_str()).collect();
-    let span = |i: usize| -> (usize, usize) {
-        let mut at = pages.iter().enumerate().filter(|(_, p)| p.iter().any(|&j| parts[j].0 == i)).map(|(k, _)| k + 1);
-        let first = at.next().unwrap_or(1);
-        (first, at.next_back().unwrap_or(first))
-    };
-    let entry = |i: usize| {
-        let (first, last) = span(i);
+    let entry = |i: usize, first: usize, last: usize| {
         let mut e = json!({"path": files[i].path, "change": files[i].change, "page": first});
         if last > first {
             e["last_page"] = json!(last);
         }
         e
     };
+    // An entry's most room in the index, as fit counts it: no page number is past the count of parts.
+    let most = parts.len().max(1);
+    let room: Vec<usize> = (0..files.len()).map(|i| json_len(&entry(i, most, most + 1)) + 1).collect();
+    // Pages in order, a part going on the page before unless its text would pass PAGE_TEXT_BYTES, or its text and
+    // the index entries of the page's files LIST_BYTES.
+    let mut pages: Vec<Vec<usize>> = Vec::new();
+    let (mut text_size, mut size, mut last_file) = (usize::MAX, usize::MAX, usize::MAX);
+    for (j, &(i, _, n)) in parts.iter().enumerate() {
+        let listing = if i == last_file { 0 } else { room[i] };
+        if text_size.saturating_add(n) > PAGE_TEXT_BYTES || size.saturating_add(n + listing) > LIST_BYTES {
+            pages.push(Vec::new());
+            (text_size, size) = (0, room[i]);
+        } else {
+            size += listing;
+        }
+        text_size += n;
+        size += n;
+        last_file = i;
+        pages.last_mut().expect("a page").push(j);
+    }
+    let count = pages.len().max(1);
+    if page == 0 || page > count {
+        return Err(format!("page {page}: the diff has {count} pages, from 1"));
+    }
+    // Each file's first and last page, from 1.
+    let mut span = vec![(1, 1); files.len()];
+    let mut seen = vec![false; files.len()];
+    for (k, p) in pages.iter().enumerate() {
+        for &j in p {
+            let i = parts[j].0;
+            if !seen[i] {
+                (span[i], seen[i]) = ((k + 1, k + 1), true);
+            }
+            span[i].1 = k + 1;
+        }
+    }
+    let on: &[usize] = pages.get(page - 1).map_or(&[], Vec::as_slice);
+    let text: String = on.iter().map(|&j| parts[j].1.as_str()).collect();
+    let used: usize = on.iter().map(|&j| parts[j].2).sum();
     let here: std::collections::BTreeSet<usize> = on.iter().map(|&j| parts[j].0).collect();
-    let order: Vec<usize> = here.iter().copied().chain((0..files.len()).filter(|i| !here.contains(i))).collect();
-    let (listed, unlisted) = fit(order.into_iter().map(entry).collect(), LIST_BYTES - PAGE_TEXT_BYTES);
+    let order = here.iter().copied().chain((0..files.len()).filter(|i| !here.contains(i)));
+    let (listed, unlisted) =
+        fit(order.map(|i| entry(i, span[i].0, span[i].1)).collect(), LIST_BYTES.saturating_sub(used));
     extra["files"] = json!(listed);
     if !unlisted.is_empty() {
         extra["files_not_listed"] = json!(unlisted.len());
@@ -1106,13 +1167,14 @@ impl WeaveStore {
         diff_page(&files?, page, json!({"base": self.saved("base.txt")?}))
     }
 
-    /// `git diff <args>` on the tree's repository, per file, with no renames, so each file is one path.
+    /// `git diff <args>` on the tree's repository, per file, with no renames, so each file is one path, as it is
+    /// (`-z`: not git's quoted form).
     fn file_diffs(&mut self, args: &[&str]) -> Result<Vec<FileDiff>, String> {
         let run = |s: &mut WeaveStore, how: &[&str]| {
             let argv = [&["diff", "--no-color", "--no-ext-diff", "--no-renames"][..], how, args].concat();
             s.git(&argv).map(|o| String::from_utf8_lossy(&o).into_owned())
         };
-        let (status, patch) = (run(self, &["--name-status"])?, run(self, &[])?);
+        let (status, patch) = (run(self, &["--name-status", "-z"])?, run(self, &[])?);
         Ok(split_diff(&status, &patch))
     }
 
@@ -1128,7 +1190,20 @@ impl WeaveStore {
         let trees = self.manifest_tree(&ma).and_then(|ta| Ok((ta, self.manifest_tree(&mb)?)));
         match trees {
             Ok((ta, tb)) => {
-                let files = self.file_diffs(&[ta.as_str(), tb.as_str(), "--"])?;
+                let mut files = self.file_diffs(&[ta.as_str(), tb.as_str(), "--"])?;
+                // Weave's word for each change (added, modified, deleted, mode changed), as bracken weave diff
+                // gives it, in place of git's letter (task `24a43694bbbf`).
+                let words: std::collections::HashMap<&str, &str> = v["files"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|f| Some((f["path"].as_str()?, f["change"].as_str()?)))
+                    .collect();
+                for f in &mut files {
+                    if let Some(word) = words.get(f.path.as_str()) {
+                        f.change = (*word).to_string();
+                    }
+                }
                 diff_page(&files, page, extra)
             }
             Err(e) => {
