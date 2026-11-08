@@ -230,7 +230,7 @@ tripwire don't match it (section 4).
 | `format_guard.rs` `unicode_tables_are_pinned` | Unicode's version, and a digest of `fold` over every scalar value, which covers icu_casemap's data and the ignorables | Version mismatch, or the digest |
 | `format_guard.rs`, the line-merge tests | The line merge (1.6): vectors, the cap, and the cases where git differs | `vector <i>`, `<n> lines`, or the `KNOWN_DIFFERENT` list |
 | `crates/tree/tests/paths.rs` | Every path, folding, collision and symlink-target rule, both ways; the length limits relative to their constants | An assertion naming the rule |
-| `refuse_unreadable` (`crates/bracken/src/weave.rs` 820-829), over `crates/tree/src/lines.rs` 246-251 and 309-322 (finding `5d50422b9e11`) | A line-media-type artifact that doesn't decode with this build, and supersedes a counted version of its own author's in a relation that author signed. `integrate`, `validate`, `line policy` and `line merge` refuse while one exists (`weave.rs` 612; `weave/merge.rs` 303, 397, 641; `weave/checks.rs` 262), and every other read warns (`judged_for`, `weave.rs` 802-809). A decision that doesn't decode is dropped (`lines.rs` 264-268). A record under a media type this build doesn't know is never collected, so it's neither refused nor warned about | The refusal names the version and says to upgrade |
+| `refuse_unreadable` (`crates/bracken/src/weave.rs` 820-829), over `crates/tree/src/lines.rs` 246-251 and 309-322 (finding `5d50422b9e11`) | A line-media-type artifact that doesn't decode with this build, and supersedes a counted version of its own author's in a relation that author signed. `integrate`, `validate`, `line policy` and `line merge` refuse while one exists anywhere in the Ground, on any line (`weave.rs` 612; `weave/merge.rs` 303, 397, 641; `weave/checks.rs` 262): the list isn't scoped to the line a command acts on (`restrict`, `lines.rs` 524, never filters it), and anyone can open a line (`weave/merge.rs` 260-296), so any signer can stop every line this way. Every other read warns (`judged_for`, `weave.rs` 802-809). `scripts/weave-gate` refuses too, but only by accident: `green_of` (`scripts/weave-gate` 120-128) captures `weave green`'s stderr with its output, so the warning line breaks the JSON and the gate says the output isn't in the shape it reads. A decision that doesn't decode is dropped (`lines.rs` 264-268). A record under a media type this build doesn't know is never collected, so it's neither refused nor warned about | The refusal names the version and says to upgrade |
 | `crates/tree/tests/lines.rs` | The ancestor rule: a reference that isn't an ancestor makes the record `NotAnAncestor` and views ignore it | An assertion |
 | `crates/tree/tests/weave_fixture.rs` with `tests/fixtures/weave-v1` | A Ground written by `bracken-tree` 0.1.0: 80 contributions with pinned ids, covering every media type, results, reviews, a goal and a policy change. It checks that it opens, that every record reads back to its bytes, every derived status, and that the scenario rebuilds the fixture byte for byte. Since the ids are pinned, so is every byte the scenario writes: `details` from `details()`, argv-only methods, change hashes, `Exit::Code`'s text. | An id, byte or status mismatch, or the rebuild differing |
 | `crates/tree/tests/coordination_fixture.rs` and `crates/bracken/tests/coordination_fixture.rs` | The coordination fixture `ground-v1` reads as recorded with Weave linked in, and Weave finds nothing of its own there | A status or acceptance mismatch |
@@ -252,7 +252,7 @@ tripwire don't match it (section 4).
 | Line with executors, Executor | `executors_are_left_out_when_there_are_none`, round trips, `line_rules` | **G1**: no golden bytes for a line with an executor, of either kind; the fixture predates executors |
 | `owner_decision` and its null rule | golden line; `line_rules`; the fixture's derived statuses | none |
 | The ancestor rule | `lines.rs`'s tests; the fixture, every record of which passes it | none |
-| A policy version this build can't read | `refuse_unreadable` (2.1), for the same media type only, under its author limit | **G8**: `weave green` and `scripts/weave-gate` only warn; an unreadable decision is dropped silently; a new media type isn't seen at all |
+| A policy version this build can't read | `refuse_unreadable` (2.1), for the same media type only, and Ground-wide | **G8**: the refusal isn't scoped per line, so any signer can stop every line; `weave green` only warns, and `scripts/weave-gate` refuses only by accident; an unreadable decision is dropped silently. **Not covered by G8**: a record under a new media type isn't seen at all, and would need a further reader change |
 | The marker that counts, and its author | the fixture's derived statuses (its default line and the null-`owner_decision` version); the coordination fixture test's `counted_marker() == None` | none |
 | Decision | golden vector; `decision_rules`; `a_decision_refers_to_at_most_max_references`; the fixture, which holds decisions with `source` null and set | none |
 | Proposal and its change | golden proposal (its `change` field is an arbitrary hash); change rows by value; the fixture's proposals, whose ids pin their recomputed `change` | **G2**: no golden vector pins a change list's hash directly |
@@ -337,24 +337,30 @@ full table, and adds pins without changing any format.
   2026-10-31): a policy version with executors, and a result written
   through `details_with_run`. This needs the same review as any fixture
   change.
-- **G8. Extend `refuse_unreadable`, keeping its author limit.** It
-  already refuses to act while a policy version doesn't decode (2.1). G8:
+- **G8. Scope `refuse_unreadable` per line, and extend it.** Today it
+  refuses Ground-wide (2.1), which lets any signer stop every line, and
+  that has to close before the join. G8:
+  - counts an unreadable policy version only against the line of the
+    counted version it supersedes, under today's rule (it supersedes a
+    counted version of its own author's, in a relation that author signed,
+    `lines.rs` 309-322). `integrate`, `validate`, `line policy`, `line
+    merge`, `weave green` and `scripts/weave-gate` refuse only when a line
+    they act on holds one. A line someone opens for themselves can then
+    stop only that line;
   - decodes a payload's `v` first, as generic CBOR, so the refusal names
     the version whatever v2's fields are (section 3);
-  - makes `weave green` and `scripts/weave-gate` refuse, not warn, for a
-    line holding an unreadable policy version that counts by today's rule:
-    it supersedes a counted version of its own author's, in a relation
-    that author signed (`lines.rs` 309-322);
+  - makes `weave green` refuse instead of warning, and gives
+    `scripts/weave-gate` its own explicit refusal in place of today's
+    accidental one;
   - treats a decision that doesn't decode the same way only where it isn't
     retracted, names a line in a top-level `line` field (read as generic
     CBOR), and is signed by an integrator under the last readable policy
     in force on that line. Today such a decision is dropped.
 
   Any other unreadable record is ignored and listed by `weave check`, as
-  today. So nobody without authority on a line can stop it with one
-  record: a `{v: 99}` decision by a non-integrator changes nothing. This is
-  a reader change, shipped in the readers-first release before any v2 is
-  written. It changes no format.
+  today. A record under a media type this build doesn't know isn't
+  covered: G8 doesn't collect it. This is a reader change, shipped in the
+  readers-first release before any v2 is written. It changes no format.
 
 ## 3. Changing a frozen format after the freeze
 
@@ -370,8 +376,8 @@ full table, and adds pins without changing any format.
 - **A new version.** A changed record carries `"v": 2` under the same
   media type and prefix (question 2). A binary that reads only v1 refuses
   it. For a policy version, `refuse_unreadable` (2.1) then stops
-  `integrate`, `validate`, `line policy` and `line merge`, within its author
-  limit. Any other kind is ignored by views and listed by `weave check`.
+  `integrate`, `validate`, `line policy` and `line merge` on every line,
+  until G8 scopes it to the version's own line. Any other kind is ignored by views and listed by `weave check`.
   The Ground still opens and syncs, since manyroot sees an artifact. The
   refusal's
   wording depends on v2's fields. `Record::decode` (`format.rs` 114-117)
@@ -417,8 +423,13 @@ full table, and adds pins without changing any format.
   **What it doesn't cover, stated plainly.** A decision is judged under
   the policy in force in its own causal past. A writer who leaves the
   minimum-declaring policy version out of a decision's causal parents gets
-  that decision judged under the old policy. It qualifies, it can be the
-  line's only head, and nothing forks. That's the same exposure every
+  that decision judged under the old policy, and it qualifies. Until a
+  decision under the new policy exists, it can be the line's only head, and
+  nothing forks. After that, the dodging decision can't name one as a
+  parent without pulling the new policy into its past (the ancestor rule),
+  so it sits beside it as a second head: the line forks, and `weave head`
+  shows it. The next honest `integrate` lists every head as a parent
+  (`weave.rs` 613-615), so it adopts the dodge without saying so. That's the same exposure every
   policy change has today, such as removing a validator. Proposals,
   manifests, resolutions and file versions carry no policy, so the cutover
   doesn't reach them at all. Question 7 asks whether that's acceptable.
@@ -428,7 +439,7 @@ full table, and adds pins without changing any format.
   which is the right effect. After the freeze, such a field bumps `v`, so
   a reader that knows v2 can tell the two shapes apart. A refusal names the
   version only on binaries with G8, but `refuse_unreadable` already refuses
-  on a line holding such a policy version.
+  while such a policy version exists, Ground-wide until G8.
 - **Pinned-not-frozen changes** (1.6) stay protocol class with a
   releases.md entry, as today, but need no new version: they change views,
   not records. They take the same readers-first rollout when two binaries
@@ -451,10 +462,13 @@ full table, and adds pins without changing any format.
   binary reading the coordination Ground must not compute green under a
   policy that's no longer in force. The readers-first rollout is a rule
   that nothing checks. Today `refuse_unreadable` stops a stale binary from
-  acting under an old policy, but `weave green` only warns. G8 makes green
-  and the gate refuse too, within the same author limits, and must be in
-  every gate reader before any v2 is written. That holds only if a format
-  change keeps its media type (question 2).
+  acting under an old policy, but on every line at once, so any signer can
+  stop every line with one record of their own. `weave green` only warns,
+  and `scripts/weave-gate` refuses only by accident (2.1). G8 scopes the
+  refusal to the lines a command acts on, and makes green and the gate
+  refuse deliberately. It must be in every gate reader before the join and
+  before any v2 is written. That holds only if a format change keeps its
+  media type, since G8 doesn't see a new one (question 2).
 - **The join's own record is frozen too.** Step 3 of the join writes a
   marker with `in_place` set. Its format is frozen (1.3), but no golden
   vector pins it yet, so G1 should land before the join.
@@ -508,10 +522,14 @@ full table, and adds pins without changing any format.
    `validate`, `line policy` and `line merge` (2.1). A new media type is
    never collected, so today's binaries act under the superseded policy
    with no warning, the fail-open that finding `5d50422b9e11` closed. The
-   cost is a less helpful message (`not in canonical encoding` when v2's
-   fields differ) until G8. A new media type would need G8's extension in
-   every reader before it's written. A v2 that closes a hole in decisions
-   also takes section 3's cutover.
+   cost, until G8: today's refusal is Ground-wide, so a v2 policy version
+   on any line stops `integrate`, `validate`, `line policy` and `line merge`
+   on every line for each binary that hasn't been upgraded, and the
+   message (`not in canonical encoding` when v2's fields differ) doesn't
+   say to upgrade. Readers-first keeps that from happening to honest
+   binaries. A new media type would need a reader change beyond G8, which
+   doesn't collect unknown media types. A v2 that closes a hole in
+   decisions also takes section 3's cutover.
 3. **Whose go a frozen-format change needs.** Protocol-class merges are
    delegated to the manager today, logged as `owner-review` (decision
    `adcb78b88c6c`). Keep that for frozen formats, or require your own go?
@@ -520,11 +538,13 @@ full table, and adds pins without changing any format.
    at the join it reaches the coordination Ground. Changes to the
    pinned-not-frozen rules stay delegated.
 4. **Close the guard gaps before the freeze?** G1 to G6 are small build
-   tasks; G7 needs a fixture change; G8 matters only before a v2.
-   *Recommended: land G1 to G6 first, then your go to freeze; G7 and G8
-   can follow.* The freeze would rest on pins that
-   don't fully exist yet otherwise, notably the join's marker (G1) and the
-   review rule (G6).
+   tasks; G7 needs a fixture change; G8 is a reader change.
+   *Recommended: land G1 to G6 first, then your go to freeze; G7 can
+   follow, and G8 must land before the join and before any v2.* The freeze
+   would otherwise rest on pins that don't fully exist yet, notably the
+   join's marker (G1) and the review rule (G6). G8 closes today's
+   Ground-wide stop (2.1) before the join opens the Ground to more
+   writers.
 5. **Pin the Unicode and encoding crates exactly** (`=` versions in
    `Cargo.toml` for `unicode-normalization`, `icu_casemap`, `ciborium` and
    `blake3`)? *Recommended: yes, as part of G6.* The digest and the golden
