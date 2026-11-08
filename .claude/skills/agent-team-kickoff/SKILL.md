@@ -87,7 +87,7 @@ Do these steps from the **main checkout**, not a worktree: it holds the live Gro
    for who in owner manager reviewer security triage; do scripts/bk id new "$who"; done
    ```
 
-   Builders get an identity when they're launched: `builder-<branch>`.
+   Builders get an identity, `builder-<branch>`, and its token before they're launched, checked with `scripts/team-server ready <identity>` (process section 6, Starting builders).
 5. **Seed it.** Record the project profile's decisions as claims tagged `decision` (section 4.1). Contribute the vision document as an artifact named by its path (`scripts/bk artifact <vision doc> --name <vision doc> --media-type text/markdown --as manager`). Then record the goal as a claim tagged `goal`, with process section 1's wording filled in, and `relate <goal> depends_on <vision artifact>`.
 
 ### 2.2 Files

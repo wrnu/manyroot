@@ -452,6 +452,17 @@ enum IdCommand {
         #[command(flatten)]
         out: Output,
     },
+    /// What a team server would sign for `name` under a scopes file, parsed and matched exactly as the
+    /// server does (`team-server ready`). Fails, naming why, when the file doesn't parse: the server then
+    /// signs nothing. Reads only the file.
+    Scope {
+        name: String,
+        /// The team server's scopes.toml.
+        #[arg(long, value_name = "FILE")]
+        scopes: PathBuf,
+        #[command(flatten)]
+        out: Output,
+    },
 }
 
 fn main() -> ExitCode {
@@ -486,6 +497,18 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Weave(weave::WeaveCommand::Init { purpose, out }) => {
             return weave::init(cli.dir.as_deref(), cli.agent.as_deref(), purpose, out);
         }
+        Command::Id(IdCommand::Scope { name, scopes, out }) => {
+            let text = std::fs::read_to_string(&scopes).with_context(|| format!("reading {}", scopes.display()))?;
+            let scope = signing::scope_of(&text, &name).with_context(|| format!("{}", scopes.display()))?;
+            if out.json {
+                print_json(&json!({"name": name, "scope": scope}));
+            } else {
+                match scope {
+                    Some(scope) => println!("{}: {}", terminal::printable(&name), scope.describe()),
+                    None => println!("{}: no scope, so a server signs nothing for it", terminal::printable(&name)),
+                }
+            }
+        }
         Command::Verify { out } => {
             let s = snapshot::verify(&ground_dir(cli.dir.as_deref())?)?;
             let n = s.graph().len();
@@ -511,7 +534,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
 /// Runs a command on the replica, opened through its verified snapshot (docs/cli.md, The verified snapshot).
 fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Command) -> Result<ExitCode> {
     match command {
-        Command::Init { .. } | Command::Join { .. } | Command::Verify { .. } => {
+        Command::Init { .. } | Command::Join { .. } | Command::Verify { .. } | Command::Id(IdCommand::Scope { .. }) => {
             unreachable!("handled before opening a store")
         }
         Command::Weave(command) => return weave::run(&mut s, agent, command),

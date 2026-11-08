@@ -9,6 +9,7 @@
 #   team-server start | stop
 #   team-server run                  the server in the foreground, for launchd (scripts/services)
 #   team-server check                wait until the server listens and answers a sync
+#   team-server ready <identity>     before launching a builder: whether <identity> can write (read-only)
 #
 # <dir> holds everything, mode 0700: the server's own replica (ground/), the tokens (tokens/<identity>,
 # 0600, one per identity, which scripts/bk reads), their blake3 hashes (tokens.b3, which the server
@@ -32,6 +33,15 @@
 # that is in retired/ or named in retired.jsonl, even one put back in keys/ by hand. Existing identities keep their key
 # files in .bracken/identities/ and sign as they do.
 #
+# ready reads only: whether an identity can write through scripts/bk, before its builder is launched (task
+# 9c46177b622d). It says whether the main checkout's Ground knows it; whether it signs with a key file in
+# .bracken/identities/ or the server holds its key, and then what the server's scopes.toml lets it sign, read
+# by the pinned bracken exactly as the server reads it, which must include claims, relations and evidence;
+# whether its token file matches its hash in tokens.b3; and whether it was retired. Anything it can't
+# check counts as not ready. It prints no token, key or environment, changes nothing and
+# never restarts the server, so it is safe during a counted run or a merge. It exits 0 only when the
+# identity is ready.
+#
 # Once scripts/services install has made the server a launchd agent, launchd keeps it running: start
 # and stop refuse (stopping it would only restart it; scripts/services uninstall stops it), and token
 # restarts it through launchd.
@@ -43,7 +53,7 @@ bin="${BRACKEN_BIN:-$main/.bracken-bin/bin/bracken}"
 marker="$main/.bracken-team"
 fail() { echo "team-server: $*" >&2; exit 1; }
 usage() {
-  echo "usage: team-server setup <dir> [port] | token <identity> | key <identity> | retire <identity> | start | stop | run | check" >&2
+  echo "usage: team-server setup <dir> [port] | token <identity> | key <identity> | retire <identity> | start | stop | run | check | ready <identity>" >&2
   exit 2
 }
 # The launchd agent scripts/services installs, and whether it is loaded for this checkout (its working
@@ -121,6 +131,24 @@ restart() {
 # key file is moved back (finding ab071f5d3de6).
 retired() {
   [ -e "$dir/keys/retired/$1.json" ] || grep -q "\"name\":\"$1\"" "$dir/keys/retired.jsonl" 2>/dev/null
+}
+
+# What the server would sign for $1, from bracken id scope: the pinned binary's own parse and match of
+# scopes.toml, the server's code (findings 5bee4ea274aa, 945af04e6c99). Sets $scope_line (its one-line
+# answer) or $scope_err (why there's none to trust), and returns 1 for the latter.
+scope_for() {
+  local out
+  scope_line='' scope_err=''
+  if ! "$bin" id scope --help >/dev/null 2>&1; then
+    scope_err="the pinned bracken can't read scopes.toml as the server does (it has no id scope): upgrade the pinned binary (docs/releases.md)"
+    return 1
+  fi
+  [ -f "$dir/scopes.toml" ] || { scope_err="there's no $dir/scopes.toml, so the server signs nothing"; return 1; }
+  out=$("$bin" id scope "$1" --scopes "$dir/scopes.toml" 2>&1) || {
+    scope_err="scopes.toml doesn't parse as the server reads it, so the server signs nothing: ${out##*$'\n'}"
+    return 1
+  }
+  scope_line=${out#"$1: "}
 }
 
 # Refuses, before anything changes, when a running server would have to restart under a binary that can't
@@ -348,6 +376,75 @@ case "${1:-}" in
     [ $# -eq 1 ] || usage
     team_dir
     await_up || exit 1
+    ;;
+  ready)
+    [ $# -eq 2 ] || usage
+    name=$2
+    team_dir
+    [[ $name =~ ^[a-z0-9_-]{1,64}$ ]] || fail "'$name' isn't an identity name"
+    missing=()
+    say() { echo "team-server: $name: $*"; }
+    known=$(identities)
+    if [[ $known == *"\"name\": \"$name\""* ]]; then
+      say "known to the main checkout's Ground"
+    else
+      say "not known to the main checkout's Ground"
+      missing+=("make it with team-server key $name (with the owner's approval of the identity)")
+    fi
+    if retired "$name"; then
+      say "retired: the server no longer signs for it"
+      missing+=("it is retired: choose another identity")
+    else
+      say "not retired"
+    fi
+    held=false
+    [ -f "$dir/keys/$name.json" ] && grep -q "\"name\":\"$name\"" "$dir/held.jsonl" 2>/dev/null && held=true
+    if [ -f "$main/.bracken/identities/$name.json" ]; then
+      say "signs with its key file in .bracken/identities/"
+    elif $held; then
+      if scope_for "$name"; then
+        say "its key is held by the server, whose scopes.toml gives it: $scope_line"
+        if [ "$scope_line" = "no scope, so a server signs nothing for it" ]; then
+          missing+=("add a scope for it to $dir/scopes.toml: with none, the server signs nothing for it")
+        else
+          kinds=${scope_line#kinds }
+          kinds=" ${kinds%%;*}, "
+          lacking=()
+          for kind in claim relation evidence; do
+            [[ $kinds == *" $kind,"* ]] || lacking+=("$kind")
+          done
+          [ ${#lacking[@]} -eq 0 ] ||
+            missing+=("its scope in $dir/scopes.toml must allow the kinds a builder writes; it lacks: ${lacking[*]}")
+        fi
+      else
+        say "its key is held by the server, but $scope_err"
+        missing+=("fix that, then run ready again")
+      fi
+    elif ! retired "$name"; then
+      say "has no key file and no key held by the server, so it can't sign"
+      missing+=("make it with team-server key $name, or choose an identity that has a key")
+    fi
+    # The token file must hash to its line in tokens.b3, which is what the server checks: an interrupted
+    # token leaves a new file beside the old hash (finding 945af04e6c99). Neither is printed.
+    recorded=$(awk -v n="$name" '$1 == n { print $2 }' "$dir/tokens.b3" 2>/dev/null | tail -1)
+    if [ ! -s "$dir/tokens/$name" ] || [ -z "$recorded" ]; then
+      say "has no team token"
+      retired "$name" || missing+=("issue its token with team-server token $name (restarts the server: not during a counted run or a merge)")
+    elif ! command -v b3sum >/dev/null; then
+      say "has a token file, but b3sum isn't here to check it against tokens.b3"
+      missing+=("install b3sum (cargo install --locked b3sum), then run ready again")
+    elif [ "$(b3sum --no-names <"$dir/tokens/$name")" != "$recorded" ]; then
+      say "has a token file that doesn't match its hash in tokens.b3, so the server would refuse it"
+      missing+=("issue it again with team-server token $name (restarts the server: not during a counted run or a merge)")
+    else
+      say "has a team token, matching tokens.b3"
+    fi
+    if [ ${#missing[@]} -gt 0 ]; then
+      printf 'team-server: %s is not ready to launch:\n' "$name" >&2
+      printf '  - %s\n' "${missing[@]}" >&2
+      exit 1
+    fi
+    say "ready to launch"
     ;;
   *) usage ;;
 esac
