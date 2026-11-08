@@ -26,7 +26,7 @@ You are a **builder**: one task, one worktree, one branch, one PR. You build and
 
 ## Contributing to the Ground
 
-Always use `scripts/bk`, never a `bracken` binary built from your branch. The table of what to contribute is in [AGENTS.md](../AGENTS.md#the-ground). As a builder:
+Always use `scripts/bk`, never a `bracken` binary built from your branch. Your identity and its team token exist before you start. If a read says your identity has no team token, stop and tell the manager before you write anything. The table of what to contribute is in [AGENTS.md](../AGENTS.md#the-ground). As a builder:
 
 - **As you learn:** a `note` for anything another agent would want (an interface choice, a gotcha, a dead end), related to your task.
 - **Each pushed head:** first `"$main/scripts/weave-propose" --pr <n>` from your worktree, the main checkout's copy (Weave stage 2a, [development.md](development.md#weave-shadow-dogfood-stages-1-and-2a)). It proposes the pushed commit to the Weave Ground and prints `proposal <id>`. Then a `pr` claim (`PR #<n> <branch> @ <full sha>: <title>`, ending `Weave proposal <id>`), `relate <pr> implements <task>`, and for a later head add `--supersedes <old>` to the new `pr` claim. If `weave-propose` refuses, say why in the `pr` claim instead; the merge then falls back to the import.

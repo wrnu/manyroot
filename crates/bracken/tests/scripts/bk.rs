@@ -716,3 +716,105 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
         assert!(team.join("builder-w.json").exists() && !team.join("keys/retired/builder-w.json").exists());
     }
 }
+
+/// Task 9c46177b622d: `team-server ready <identity>`, the manager's read-only check before launching a
+/// builder, on a throwaway team directory with no server running. It names each thing an identity needs to
+/// write (known, a key the server holds or a key file, a scope covering a held key, a token, not retired)
+/// and what to run for what's missing, and exits 0 only when nothing is. It prints no token or key, and
+/// changes nothing in the team directory: no server is started.
+#[test]
+fn team_server_ready_says_whether_an_identity_can_write() {
+    let real = env!("CARGO_BIN_EXE_bracken");
+    for scripts in SCRIPTS {
+        let copy = |name: &str| repo_root().join(scripts).join(name);
+        let files = [("scripts/bk", copy("bk")), ("scripts/team-server", copy("team-server"))];
+        let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
+        let (tmp, a) = repo(&files, ".bracken/\n.bracken-team\n", |_| {});
+        let team = tmp.path().join("team");
+        let sh = |args: &[&str]| command(&a, "scripts/team-server", args).env("BRACKEN_BIN", real).output().unwrap();
+        let ok = |args: &[&str]| {
+            let out = sh(args);
+            assert!(out.status.success(), "{scripts}: {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let bk = |args: &[&str]| {
+            let out = command(&a, "scripts/bk", args).env("BRACKEN_BIN", real).output().unwrap();
+            assert!(out.status.success(), "{scripts}: bk {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        // Its full output, and whether it said the identity is ready.
+        let ready = |name: &str| -> (String, bool) {
+            let out = sh(&["ready", name]);
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            let said = text.contains(&format!("team-server: {name}: ready to launch"));
+            assert_eq!(out.status.success(), said, "{scripts}: {name}: {text}");
+            (text, said)
+        };
+
+        bk(&["init", "--name", "team"]);
+        bk(&["id", "new", "alice"]);
+        bk(&["id", "new", "bob"]);
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port().to_string();
+        ok(&["setup", team.to_str().unwrap(), &port]);
+        ok(&["token", "alice"]);
+        ok(&["key", "builder-held"]);
+        ok(&["key", "builder-gone"]);
+        ok(&["retire", "builder-gone"]);
+        assert!(!team.join("server.pid").exists(), "{scripts}: a server was started");
+
+        // A key-file identity with a token, and a server-held one under the first scopes' builder-*.
+        let (text, said) = ready("alice");
+        assert!(said && text.contains("signs with its key file in .bracken/identities/"), "{scripts}: {text}");
+        let (text, said) = ready("builder-held");
+        assert!(said && text.contains("signs for it under scope \"builder-*\""), "{scripts}: {text}");
+        assert!(text.contains("has a team token") && text.contains("not retired"), "{scripts}: {text}");
+
+        // No token: says which command issues it, and that it restarts the server.
+        let (text, said) = ready("bob");
+        assert!(!said && text.contains("has no team token"), "{scripts}: {text}");
+        assert!(text.contains("team-server token bob (restarts the server"), "{scripts}: {text}");
+        // Unknown: says to make it with key.
+        let (text, said) = ready("builder-new");
+        assert!(!said && text.contains("not known to the main checkout's Ground"), "{scripts}: {text}");
+        assert!(text.contains("team-server key builder-new"), "{scripts}: {text}");
+        // Retired.
+        let (text, said) = ready("builder-gone");
+        assert!(!said && text.contains("retired: the server no longer signs for it"), "{scripts}: {text}");
+        // A held key that no scope covers: an exact entry for another name, and patterns that don't match.
+        let scopes = team.join("scopes.toml");
+        let first = std::fs::read_to_string(&scopes).unwrap();
+        std::fs::write(&scopes, first.replace("[scope.\"builder-*\"]", "[scope.\"builder-x\"]\n[scope.\"rev*\"]"))
+            .unwrap();
+        let (text, said) = ready("builder-held");
+        assert!(!said && text.contains("no entry in scopes.toml covers it"), "{scripts}: {text}");
+        // The exact name wins over a longer pattern.
+        std::fs::write(&scopes, format!("{first}\n[scope.\"builder-held\"]\n[scope.\"builder-he*\"]\n")).unwrap();
+        let (text, said) = ready("builder-held");
+        assert!(said && text.contains("under scope \"builder-held\""), "{scripts}: {text}");
+        std::fs::write(&scopes, format!("{first}\n[scope.\"builder-he*\"]\n")).unwrap();
+        let (text, said) = ready("builder-held");
+        assert!(said && text.contains("under scope \"builder-he*\""), "{scripts}: {text}");
+
+        // Nothing secret is printed, and nothing in the team directory changed.
+        let listing = || {
+            let out = command(&team, "ls", &["-laR"]).output().unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let before = listing();
+        for name in ["alice", "bob", "builder-held", "builder-new", "builder-gone"] {
+            let (text, _) = ready(name);
+            for token in std::fs::read_dir(team.join("tokens")).unwrap().flatten() {
+                let secret = std::fs::read_to_string(token.path()).unwrap();
+                assert!(!text.contains(secret.trim()), "{scripts}: {name}: a token was printed");
+            }
+            for key in std::fs::read_dir(team.join("keys")).unwrap().flatten().filter(|e| e.path().is_file()) {
+                let json: serde_json::Value =
+                    serde_json::from_str(&std::fs::read_to_string(key.path()).unwrap()).unwrap_or_default();
+                for v in json.as_object().into_iter().flat_map(|o| o.values()).filter_map(|v| v.as_str()) {
+                    assert!(v.len() < 32 || !text.contains(v), "{scripts}: {name}: key material was printed");
+                }
+            }
+        }
+        assert_eq!(listing(), before, "{scripts}: ready changed the team directory");
+        let out = sh(&["ready", "Not A Name"]);
+        assert!(!out.status.success() && String::from_utf8_lossy(&out.stderr).contains("isn't an identity name"));
+    }
+}

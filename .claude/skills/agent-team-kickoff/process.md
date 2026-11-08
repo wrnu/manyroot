@@ -169,7 +169,7 @@ Spend the quota you have most of. Default model for the manager, builders and se
 
 ### Starting builders
 
-The manager creates the builder's identity (`scripts/bk id new builder-<branch>`), contributes the `task` claim, and uses **launch-builder** (base `main`, from origin). For stacked work, base on the parent branch, not from origin. Use **delegate** instead for short child work whose answer the manager needs.
+The manager makes the builder's identity and its team token when it writes the `task` claim, before launching, so the builder's first write isn't refused and no server restart lands mid-task: with a team server that holds keys, `scripts/team-server key <identity>` (with the owner's approval of the identity), or an existing identity reused; otherwise `scripts/bk id new builder-<branch>` and `scripts/team-server token <identity>`. Either restarts the server, so never while a counted run or merge is in progress. `scripts/team-server ready <identity>`, which only reads, must then say it's ready to launch. The manager contributes the `task` claim and uses **launch-builder** (base `main`, from origin). For stacked work, base on the parent branch, not from origin. Use **delegate** instead for short child work whose answer the manager needs.
 
 **Brief a builder like a peer who knows nothing yet.** Agents most often fail by not knowing when to stop, drifting from the task and guessing instead of asking. The brief goes in the `task` claim, using this template. The launch message is just: "Role: builder. Read docs/builder.md, then `scripts/bk show <task id>`."
 
