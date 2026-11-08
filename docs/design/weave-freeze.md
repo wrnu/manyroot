@@ -338,15 +338,20 @@ full table, and adds pins without changing any format.
   through `details_with_run`. This needs the same review as any fixture
   change.
 - **G8. Scope `refuse_unreadable` per line, and extend it.** Today it
-  refuses Ground-wide (2.1), which lets any signer stop every line, and
-  that has to close before the join. G8:
+  refuses Ground-wide (2.1), so any signer can stop every line this way.
+  G8 narrows that one cause. It doesn't end the any-writer stop, which has
+  other causes (2.5). G8:
   - counts an unreadable policy version only against the line of the
     counted version it supersedes, under today's rule (it supersedes a
     counted version of its own author's, in a relation that author signed,
     `lines.rs` 309-322). `integrate`, `validate`, `line policy`, `line
-    merge`, `weave green` and `scripts/weave-gate` refuse only when a line
-    they act on holds one. A line someone opens for themselves can then
-    stop only that line;
+    merge`, `weave green` and `scripts/weave-gate` refuse when any line the
+    command judges holds one: the lines it picks, the default line, and
+    the line of every decision `restrict` brings into the judgement
+    (`lines.rs` 535-544), such as another line's decisions that a line
+    merge brought in. Scoping it to the lines a command acts on alone would
+    reopen finding `5d50422b9e11`'s fail-open, for decisions judged under
+    another line's chain;
   - decodes a payload's `v` first, as generic CBOR, so the refusal names
     the version whatever v2's fields are (section 3);
   - makes `weave green` refuse instead of warning, and gives
@@ -361,6 +366,36 @@ full table, and adds pins without changing any format.
   today. A record under a media type this build doesn't know isn't
   covered: G8 doesn't collect it. This is a reader change, shipped in the
   readers-first release before any v2 is written. It changes no format.
+- **G9. Resolve a line name only among authorised lines.** Today
+  `resolve_line` and `lines_for` (`crates/bracken/src/weave.rs` 784-797,
+  847-855) take every line of a name, and refuse a name two lines share.
+  G9 resolves a name only among lines whose first version is by the
+  counted marker's author, the same author the default-line rule uses. A
+  line anyone else opens is then reached by its id only. That's a reader
+  change, with no format change. It narrows one more cause of 2.5's stop
+  and closes no other.
+
+### 2.5 Weave assumes its writers are trusted
+
+Weave today assumes that every writer of its Ground is trusted. That's
+true now: only team identities write to `~/bracken-weave/manyroot`, only
+through `scripts/weave`, on this machine (weave.md section 5). It stops
+being true at the join, when every writer of the coordination Ground can
+write Weave records.
+
+Under that assumption, **any writer can currently stop a line, or
+main**, with an ordinary record of their own that only they can retract.
+The known ways:
+
+| Stop | How | Code |
+|---|---|---|
+| An unreadable policy version | Open a line of your own, write an artifact under the line media type that doesn't decode, and relate it `supersedes` your own version. `refuse_unreadable` is Ground-wide, so `integrate`, `validate`, `line policy` and `line merge` refuse on every line (finding `8c1867a7611c`) | `crates/bracken/src/weave.rs` 820-829; `crates/tree/src/lines.rs` 309-322, 524; `crates/bracken/src/weave/merge.rs` 258-296, 492-496 |
+| A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Name lookup then refuses `main` as shared, so `weave green --line main` and `weave validate --line main` fail, and `scripts/weave-gate` reads main by name (finding `b6b6ccfd1255`) | `crates/bracken/src/weave.rs` 784-797, 847-855; `crates/bracken/src/weave/merge.rs` 258-296; `scripts/weave-gate` 122, 226 |
+
+**This list is what reviews of this design found, not a proof that no
+other stop exists.** G8 and G9 each narrow one cause; neither, nor both
+together, is claimed to end the any-writer stop. Ending it before the join
+is question 8.
 
 ## 3. Changing a frozen format after the freeze
 
@@ -465,10 +500,16 @@ full table, and adds pins without changing any format.
   acting under an old policy, but on every line at once, so any signer can
   stop every line with one record of their own. `weave green` only warns,
   and `scripts/weave-gate` refuses only by accident (2.1). G8 scopes the
-  refusal to the lines a command acts on, and makes green and the gate
-  refuse deliberately. It must be in every gate reader before the join and
-  before any v2 is written. That holds only if a format change keeps its
-  media type, since G8 doesn't see a new one (question 2).
+  refusal to the lines a command judges, and makes green and the gate
+  refuse deliberately. It must be in every gate reader before any v2 is
+  written. That holds only if a format change keeps its media type, since
+  G8 doesn't see a new one (question 2).
+- **The join assumes hostile writers, and Weave doesn't yet.** After the
+  join, everyone who writes to the coordination Ground can write Weave
+  records. Today any writer can stop a line or main (2.5), and the known
+  causes are only what reviews found. So the join waits for a review of
+  Weave that assumes a hostile writer, and for what it finds to be
+  hardened or accepted (question 8).
 - **The join's own record is frozen too.** Step 3 of the join writes a
   marker with `in_place` set. Its format is frozen (1.3), but no golden
   vector pins it yet, so G1 should land before the join.
@@ -540,11 +581,11 @@ full table, and adds pins without changing any format.
 4. **Close the guard gaps before the freeze?** G1 to G6 are small build
    tasks; G7 needs a fixture change; G8 is a reader change.
    *Recommended: land G1 to G6 first, then your go to freeze; G7 can
-   follow, and G8 must land before the join and before any v2.* The freeze
-   would otherwise rest on pins that don't fully exist yet, notably the
-   join's marker (G1) and the review rule (G6). G8 closes today's
-   Ground-wide stop (2.1) before the join opens the Ground to more
-   writers.
+   follow; G8 and G9 must land before the join, and G8 before any v2.*
+   The freeze would otherwise rest on pins that don't fully exist yet,
+   notably the join's marker (G1) and the review rule (G6). G8 and G9
+   each narrow one known stop (2.5); neither ends the any-writer stop,
+   which is question 8.
 5. **Pin the Unicode and encoding crates exactly** (`=` versions in
    `Cargo.toml` for `unicode-normalization`, `icu_casemap`, `ciborium` and
    `blake3`)? *Recommended: yes, as part of G6.* The digest and the golden
@@ -567,3 +608,14 @@ full table, and adds pins without changing any format.
    change already has, and closing it is about who may write to a line
    (agent-keys.md, part B), not about formats. A v2 that closes a hole in
    another kind needs its own design, under question 3's go.
+8. **Harden Weave against hostile writers before the join?** Weave
+   assumes every writer is trusted (2.5), which holds today and stops
+   holding at the join. Any writer can currently stop a line or main, and
+   the known causes are only what reviews of this design found.
+   *Recommended: yes, make it a precondition of the join.* Before the
+   join's go, an independent review assumes any writer of the Ground is
+   hostile and examines every Weave reader: the CLI's commands,
+   `scripts/weave-gate` and `scripts/merge`. Each stop or wrong answer it
+   finds is either fixed, or accepted by you in writing. G8 and G9 are
+   inputs to that review, not a substitute for it. The freeze itself
+   doesn't wait for this, since it changes no format.
