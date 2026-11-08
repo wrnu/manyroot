@@ -139,7 +139,7 @@ struct ScopeFile {
 
 /// What one identity may sign. Every list is what's allowed, and an absent one allows nothing, except the
 /// tags: `tags`, if given, lists the only tags a claim may carry, and `forbidden_tags` those it may not.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Scope {
     #[serde(default)]
@@ -152,6 +152,21 @@ pub struct Scope {
 }
 
 impl Scope {
+    /// The scope in one line, for `bracken id scope`.
+    pub fn describe(&self) -> String {
+        let list = |v: Vec<String>| if v.is_empty() { "none".to_owned() } else { v.join(", ") };
+        let tags = match &self.tags {
+            Some(t) => list(t.clone()),
+            None => "any".to_owned(),
+        };
+        format!(
+            "kinds {}; relations {}; tags {tags}; forbidden tags {}",
+            list(self.kinds.iter().map(|k| k.to_string()).collect()),
+            list(self.relations.iter().map(|r| r.to_string()).collect()),
+            list(self.forbidden_tags.clone())
+        )
+    }
+
     /// Why `body` is outside this scope, if it is.
     fn refuses(&self, body: &Body) -> Option<String> {
         let kind = body.kind();

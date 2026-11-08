@@ -35,8 +35,10 @@
 #
 # ready reads only: whether an identity can write through scripts/bk, before its builder is launched (task
 # 9c46177b622d). It says whether the main checkout's Ground knows it; whether it signs with a key file in
-# .bracken/identities/ or the server holds its key (and then which scopes.toml entry covers it); whether it
-# has a token; and whether it was retired. It prints no token, key or environment, changes nothing and
+# .bracken/identities/ or the server holds its key, and then what the server's scopes.toml lets it sign, read
+# by the pinned bracken exactly as the server reads it, which must include claims, relations and evidence;
+# whether its token file matches its hash in tokens.b3; and whether it was retired. Anything it can't
+# check counts as not ready. It prints no token, key or environment, changes nothing and
 # never restarts the server, so it is safe during a counted run or a merge. It exits 0 only when the
 # identity is ready.
 #
@@ -131,19 +133,22 @@ retired() {
   [ -e "$dir/keys/retired/$1.json" ] || grep -q "\"name\":\"$1\"" "$dir/keys/retired.jsonl" 2>/dev/null
 }
 
-# The scopes.toml entry that covers $1, as the server picks it: its exact name, else the longest 'start*'
-# pattern it begins with. Prints nothing if none does.
-scope_entry() {
-  local entry best=''
-  [ -f "$dir/scopes.toml" ] || return 0
-  while IFS= read -r entry; do
-    if [ "$entry" = "$1" ]; then
-      best=$entry
-      break
-    fi
-    [[ $entry == *'*' && $1 == "${entry%\*}"* && ${#entry} -gt ${#best} && $best != "$1" ]] && best=$entry
-  done < <(sed -n 's/^[[:space:]]*\[scope\."\([^"]*\)"\][[:space:]]*$/\1/p' "$dir/scopes.toml")
-  printf '%s' "$best"
+# What the server would sign for $1, from bracken id scope: the pinned binary's own parse and match of
+# scopes.toml, the server's code (findings 5bee4ea274aa, 945af04e6c99). Sets $scope_line (its one-line
+# answer) or $scope_err (why there's none to trust), and returns 1 for the latter.
+scope_for() {
+  local out
+  scope_line='' scope_err=''
+  if ! "$bin" id scope --help >/dev/null 2>&1; then
+    scope_err="the pinned bracken can't read scopes.toml as the server does (it has no id scope): upgrade the pinned binary (docs/releases.md)"
+    return 1
+  fi
+  [ -f "$dir/scopes.toml" ] || { scope_err="there's no $dir/scopes.toml, so the server signs nothing"; return 1; }
+  out=$("$bin" id scope "$1" --scopes "$dir/scopes.toml" 2>&1) || {
+    scope_err="scopes.toml doesn't parse as the server reads it, so the server signs nothing: ${out##*$'\n'}"
+    return 1
+  }
+  scope_line=${out#"$1: "}
 }
 
 # Refuses, before anything changes, when a running server would have to restart under a binary that can't
@@ -397,22 +402,42 @@ case "${1:-}" in
     if [ -f "$main/.bracken/identities/$name.json" ]; then
       say "signs with its key file in .bracken/identities/"
     elif $held; then
-      entry=$(scope_entry "$name")
-      if [ -n "$entry" ]; then
-        say "its key is held by the server, which signs for it under scope \"$entry\""
+      if scope_for "$name"; then
+        say "its key is held by the server, whose scopes.toml gives it: $scope_line"
+        if [ "$scope_line" = "no scope, so a server signs nothing for it" ]; then
+          missing+=("add a scope for it to $dir/scopes.toml: with none, the server signs nothing for it")
+        else
+          kinds=${scope_line#kinds }
+          kinds=" ${kinds%%;*}, "
+          lacking=()
+          for kind in claim relation evidence; do
+            [[ $kinds == *" $kind,"* ]] || lacking+=("$kind")
+          done
+          [ ${#lacking[@]} -eq 0 ] ||
+            missing+=("its scope in $dir/scopes.toml must allow the kinds a builder writes; it lacks: ${lacking[*]}")
+        fi
       else
-        say "its key is held by the server, but no entry in scopes.toml covers it, so nothing would be signed"
-        missing+=("add a scope for it to $dir/scopes.toml")
+        say "its key is held by the server, but $scope_err"
+        missing+=("fix that, then run ready again")
       fi
     elif ! retired "$name"; then
       say "has no key file and no key held by the server, so it can't sign"
       missing+=("make it with team-server key $name, or choose an identity that has a key")
     fi
-    if [ -s "$dir/tokens/$name" ] && grep -q "^$name " "$dir/tokens.b3" 2>/dev/null; then
-      say "has a team token"
-    else
+    # The token file must hash to its line in tokens.b3, which is what the server checks: an interrupted
+    # token leaves a new file beside the old hash (finding 945af04e6c99). Neither is printed.
+    recorded=$(awk -v n="$name" '$1 == n { print $2 }' "$dir/tokens.b3" 2>/dev/null | tail -1)
+    if [ ! -s "$dir/tokens/$name" ] || [ -z "$recorded" ]; then
       say "has no team token"
       retired "$name" || missing+=("issue its token with team-server token $name (restarts the server: not during a counted run or a merge)")
+    elif ! command -v b3sum >/dev/null; then
+      say "has a token file, but b3sum isn't here to check it against tokens.b3"
+      missing+=("install b3sum (cargo install --locked b3sum), then run ready again")
+    elif [ "$(b3sum --no-names <"$dir/tokens/$name")" != "$recorded" ]; then
+      say "has a token file that doesn't match its hash in tokens.b3, so the server would refuse it"
+      missing+=("issue it again with team-server token $name (restarts the server: not during a counted run or a merge)")
+    else
+      say "has a team token, matching tokens.b3"
     fi
     if [ ${#missing[@]} -gt 0 ]; then
       printf 'team-server: %s is not ready to launch:\n' "$name" >&2

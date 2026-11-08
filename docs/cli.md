@@ -184,6 +184,11 @@ signature it gave is in the log (a contribution it signed may still be refused b
 afterwards, and never stored). A key file moved out of `<dir>`, or into `<dir>/retired/`, is no longer signed with, nor is a key whose public
 key is in `<dir>/retired.jsonl` (`{"name", "agent"}` lines) or `<dir>/retired/`, even if a copy is back in `<dir>`.
 
+`bracken id scope <name> --scopes <file> [--json]` says what a server would sign for `<name>` under that
+scopes file, parsed and matched by the server's own code: its kinds, relations and tags, or that it has no
+scope. A file the server couldn't parse fails it, naming why; the server would then sign nothing. It reads
+only the file, and needs no replica. `scripts/team-server ready` uses it.
+
 A write command signs with the identity's file in `identities/` if there is one. Otherwise, with
 `BRACKEN_SIGN_URL` (a loopback server's URL) and `BRACKEN_SIGN_TOKEN_FILE` set, it sends the content to
 that server and checks the signature it gets back before adding the contribution; `scripts/bk` sets both

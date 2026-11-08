@@ -764,8 +764,11 @@ fn team_server_ready_says_whether_an_identity_can_write() {
         let (text, said) = ready("alice");
         assert!(said && text.contains("signs with its key file in .bracken/identities/"), "{scripts}: {text}");
         let (text, said) = ready("builder-held");
-        assert!(said && text.contains("signs for it under scope \"builder-*\""), "{scripts}: {text}");
-        assert!(text.contains("has a team token") && text.contains("not retired"), "{scripts}: {text}");
+        assert!(said && text.contains("gives it: kinds claim, relation, evidence, retract;"), "{scripts}: {text}");
+        assert!(
+            text.contains("has a team token, matching tokens.b3") && text.contains("not retired"),
+            "{scripts}: {text}"
+        );
 
         // No token: says which command issues it, and that it restarts the server.
         let (text, said) = ready("bob");
@@ -778,20 +781,77 @@ fn team_server_ready_says_whether_an_identity_can_write() {
         // Retired.
         let (text, said) = ready("builder-gone");
         assert!(!said && text.contains("retired: the server no longer signs for it"), "{scripts}: {text}");
-        // A held key that no scope covers: an exact entry for another name, and patterns that don't match.
+
+        // Scopes are read by the binary exactly as the server reads them (findings 5bee4ea274aa and
+        // 945af04e6c99). A file the server can't parse signs nothing, so it's never ready: an uppercase name,
+        // a '*' inside a name, a duplicate table.
         let scopes = team.join("scopes.toml");
         let first = std::fs::read_to_string(&scopes).unwrap();
-        std::fs::write(&scopes, first.replace("[scope.\"builder-*\"]", "[scope.\"builder-x\"]\n[scope.\"rev*\"]"))
-            .unwrap();
+        let full = "kinds = [\"claim\", \"relation\", \"evidence\"]";
+        let scoped = |text: &str| -> (String, bool) {
+            std::fs::write(&scopes, text).unwrap();
+            ready("builder-held")
+        };
+        for bad in [
+            format!("{first}\n[scope.\"Reviewer\"]\n{full}\n"),
+            format!("{first}\n[scope.\"a*b\"]\n{full}\n"),
+            format!("{first}\n[scope.\"builder-*\"]\n{full}\n"),
+        ] {
+            let (text, said) = scoped(&bad);
+            assert!(!said && text.contains("scopes.toml doesn't parse as the server reads it"), "{scripts}: {text}");
+        }
+        // A scope that allows nothing, or not every kind a builder writes.
+        let (text, said) = scoped("[scope.\"builder-held\"]\n");
+        assert!(!said && text.contains("it lacks: claim relation evidence"), "{scripts}: {text}");
+        let (text, said) = scoped("[scope.\"builder-*\"]\nkinds = [\"claim\", \"relation\"]\n");
+        assert!(!said && text.contains("it lacks: evidence"), "{scripts}: {text}");
+        // No entry covers it: an exact entry for another name, and a pattern that doesn't match.
+        let (text, said) = scoped(&format!("[scope.\"builder-x\"]\n{full}\n[scope.\"rev*\"]\n{full}\n"));
+        assert!(!said && text.contains("add a scope for it"), "{scripts}: {text}");
+        // No scopes.toml at all.
+        std::fs::remove_file(&scopes).unwrap();
         let (text, said) = ready("builder-held");
-        assert!(!said && text.contains("no entry in scopes.toml covers it"), "{scripts}: {text}");
-        // The exact name wins over a longer pattern.
-        std::fs::write(&scopes, format!("{first}\n[scope.\"builder-held\"]\n[scope.\"builder-he*\"]\n")).unwrap();
+        assert!(!said && text.contains("there's no"), "{scripts}: {text}");
+        // The other valid forms of a table are read as the server reads them: a bare key, a literal string,
+        // inline tables under [scope].
+        for good in [
+            format!("[scope.builder-held]\n{full}\n"),
+            format!("[scope.'builder-*']\n{full}\n"),
+            "[scope]\nbuilder-held = { kinds = [\"claim\", \"relation\", \"evidence\"] }\n".to_owned(),
+        ] {
+            let (text, said) = scoped(&good);
+            assert!(said, "{scripts}: {good}: {text}");
+        }
+        // The exact name wins over a longer pattern, and a longer pattern over a shorter one.
+        let (_, said) = scoped(&format!("[scope.\"builder-held\"]\n{full}\n[scope.\"builder-he*\"]\n"));
+        assert!(said, "{scripts}: the exact name");
+        let (_, said) = scoped(&format!("[scope.\"builder-he*\"]\n{full}\n[scope.\"b*\"]\n"));
+        assert!(said, "{scripts}: the longer pattern");
+        let (_, said) = scoped(&format!("[scope.\"builder-he*\"]\n[scope.\"b*\"]\n{full}\n"));
+        assert!(!said, "{scripts}: the longer pattern, which allows nothing");
+        std::fs::write(&scopes, &first).unwrap();
+        // A pinned binary that can't read scopes as the server does: not ready, saying to upgrade it.
+        let old = tmp.path().join("bracken-old");
+        write_executable(
+            &old,
+            "#!/usr/bin/env bash\n[ \"$1 $2\" != 'id scope' ] || { echo \"error: unrecognized subcommand 'scope'\" >&2; exit 2; }\n\
+             exec \"$REAL_BRACKEN\" \"$@\"\n",
+        );
+        let out =
+            command(&a, "scripts/team-server", &["ready", "builder-held"]).env("BRACKEN_BIN", &old).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && text.contains("upgrade the pinned binary"), "{scripts}: {text}");
+        let (text, said) = ready("alice");
+        assert!(said, "{scripts}: a key-file identity needs no scope: {text}");
+
+        // A token file that doesn't match its hash in tokens.b3, as an interrupted token leaves it.
+        let token = team.join("tokens/builder-held");
+        let kept = std::fs::read(&token).unwrap();
+        std::fs::write(&token, "0".repeat(64)).unwrap();
         let (text, said) = ready("builder-held");
-        assert!(said && text.contains("under scope \"builder-held\""), "{scripts}: {text}");
-        std::fs::write(&scopes, format!("{first}\n[scope.\"builder-he*\"]\n")).unwrap();
-        let (text, said) = ready("builder-held");
-        assert!(said && text.contains("under scope \"builder-he*\""), "{scripts}: {text}");
+        assert!(!said && text.contains("doesn't match its hash in tokens.b3"), "{scripts}: {text}");
+        std::fs::write(&token, kept).unwrap();
+        assert!(ready("builder-held").1, "{scripts}: the token restored");
 
         // Nothing secret is printed, and nothing in the team directory changed.
         let listing = || {
