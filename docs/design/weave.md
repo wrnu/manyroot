@@ -1384,7 +1384,10 @@ Weave's own payload formats are pinned instead:
 
 Changing a pinned format is reviewed as protocol class: an independent
 review, the manager's go logged as `owner-review`, and an entry in
-`docs/releases.md`.
+`docs/releases.md`. [weave-freeze.md](weave-freeze.md) designs the freeze:
+exactly what is frozen, which guard catches a change to each part and where
+none does yet, and what a frozen-format change takes. Nothing is frozen
+until the owner's go.
 
 **Deferred protocol changes.** These aren't needed for v0, and each needs
 its own go. The `Body` and `RelationKind` sets are closed, and an older
