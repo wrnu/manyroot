@@ -84,7 +84,16 @@ record's own validity rule.
 The policy rule about a null `owner_decision` is frozen too: only the first
 `main` version written by the counted marker's author may carry null, and
 views ignore every other version that does (`crates/tree/src/lines.rs`
-284-296; weave.md section 1, *Lines*).
+284-296; weave.md section 1, *Lines*). It's the one frozen rule that
+depends on who signed, and on which marker counts, so both are frozen
+with it:
+- **the marker that counts**: the valid, non-retracted marker with no other
+  such marker among its causal ancestors, the smallest id among concurrent
+  ones (`ground.rs` 330; weave.md section 1, *Lines*, decision
+  `049d02449a94`);
+- **its author**: the AgentId that signed the marker. A change to whose
+  signature stands for that author, such as a delegate's under part B, is
+  a change to this rule (section 4).
 
 **The ancestor rule is frozen too**, since it's a validity rule: Weave's
 replacement for protocol rule 5 for references inside payloads (weave.md
@@ -128,12 +137,13 @@ records are valid, so they can change without a new format version. A
 change still needs every reader upgraded before it's relied on, since two
 binaries on different rules show different views (section 3):
 
-- **The derivation rules** in weave.md section 2: the marker that counts, the default line, the policy in
+- **The derivation rules** in weave.md section 2: the default line, the policy in
   force and the current policy, qualification rules 1 to 6, heads, forks
   and merge bases, counted results and the latest-result rule, green,
   reviews and goals, and open objections. That's `crates/tree/src/`
   `lines.rs`, `results.rs`, `reviews.rs` and `objections.rs`, apart from
-  the rules 1.3 freezes, which live in the same files. `crates/tree/tests/weave_fixture.rs`'s
+  the rules 1.3 freezes (the null `owner_decision` rule, the marker that
+  counts and the ancestor rule), which live in the same files. `crates/tree/tests/weave_fixture.rs`'s
   `every_derived_status_is_as_pinned` pins their results on the fixture.
   Per-agent keys (part B) would change some of them (agent-keys.md 4.10),
   which is one reason they stay outside the freeze.
@@ -181,14 +191,26 @@ it.
 |---|---|---|
 | Import's exclusions, deny-list and key scan, and its symlink-target check (relative, UTF-8, not empty, no NUL, every component passing 1.4's component rules) | `crates/tree/src/import.rs` (338 for targets), `secrets.rs` | before a file version is written |
 | `materialize`'s checks: the manifest's validity, then each symlink's target, as at import | `crates/tree/src/materialize.rs` 66-83 | before anything is written to disk, by `weave checkout`, the sandboxed runner (`check.rs` 319) and the outside runner (`check/outside.rs` 197) |
-| The runner's output rules: `recorded_tail` and the key rules it matches, `LOG_CAP`, the `log withheld: …` and `output withheld: …` branches, and whether the log artifact is written | `crates/tree/src/check.rs` 973; `crates/bracken/src/weave/checks.rs` 541-560; `crates/tree/src/results.rs` 59-88 | before a result or log artifact is written |
+| The key set the scans match: every known identity's key, in hex and raw, which no PEM rule catches (`SecretRule::KnownIdentityKey`) | `crates/bracken/src/weave.rs` `known_keys` (993) | before import's scan, `resolve --file`'s, and the runner's output rules |
+| `weave resolve --file`'s own refusals: the file must be inside the checkout, its path not deny-listed, its bytes clean by the scan | `crates/bracken/src/weave/merge.rs` `resolution_file` and `checkout_path` (1403-1446) | before a resolution's file version is written |
+| The runner's output rules: `recorded_tail` and the key rules it matches, `LOG_CAP`, the `log withheld: …` and `output withheld: …` branches, and whether the log artifact is written | `crates/tree/src/check.rs` 973-985; `crates/bracken/src/weave/checks.rs` 541-560; `crates/tree/src/results.rs` 59-88 | before a result or log artifact is written |
+| The symlink-target rule both import and `materialize` call | `crates/tree/src/path.rs` `validate_symlink_target` (146) | as above |
 
 **Their class is security-sensitive.** A change needs an independent review
 as well as the security review every PR gets, and the full table. Loosening
 one also needs a releases.md entry. Once the join puts these outputs into
 the coordination Ground, they're public and permanent. Today the files in
-`crates/tree/src/` already take the full table. `crates/bracken/src/weave/checks.rs`
-doesn't, which is G6's job.
+`crates/tree/src/` already take the full table. `crates/bracken/src/weave.rs`
+and `crates/bracken/src/weave/` don't, and nothing asks for the independent
+review: that's G6's job, keyed on those directories.
+
+**A tightened refusal protects only where it runs.** It needs no
+readers-first rollout, since it changes no view. But import's scan and
+the runner's output rules run in the writer, so until every writer and
+runner uses the release (the pinned `.bracken-bin`, `~/bracken-weave`'s
+binary, the box and mac runners), an old one keeps writing what the new
+one would refuse, permanently. For an output rule or a key scan, that
+upgrade should be prompt, and the releases.md entry says so.
 
 **The runner's log artifact** is written under this rule. Its media type is
 `text/plain`, not a Weave type, and it's named `<check> output on <hash>`,
@@ -229,6 +251,7 @@ tripwire don't match it (section 4).
 | Line with executors, Executor | `executors_are_left_out_when_there_are_none`, round trips, `line_rules` | **G1**: no golden bytes for a line with an executor, of either kind; the fixture predates executors |
 | `owner_decision` and its null rule | golden line; `line_rules`; the fixture's derived statuses | none |
 | The ancestor rule | `lines.rs`'s tests; the fixture, every record of which passes it | none |
+| The marker that counts, and its author | the fixture's derived statuses (its default line and the null-`owner_decision` version); the coordination fixture test's `counted_marker() == None` | none |
 | Decision | golden vector; `decision_rules`; `a_decision_refers_to_at_most_max_references`; the fixture, which holds decisions with `source` null and set | none |
 | Proposal and its change | golden proposal (its `change` field is an arbitrary hash); change rows by value; the fixture's proposals, whose ids pin their recomputed `change` | **G2**: no golden vector pins a change list's hash directly |
 | Resolution | golden vector; `resolution_rules`; the fixture | none |
@@ -236,7 +259,7 @@ tripwire don't match it (section 4).
 | Definition hash, method | relative assertions in `format_guard.rs`; the fixture pins argv-only methods through its evidence ids | **G2**: no golden value for a definition hash with an executor, of either kind |
 | Details, the counted part | the fixture (`details()` with `Exit::Code` and a text tail) | **G4**: nothing pins `details_with_run`'s first two lines, or `details` with a withheld tail or another `Exit` variant |
 | Any of the above, as a review requirement | AGENTS.md and releases.md, read by people | **G6**: nothing mechanical requires protocol-class review for a Weave format change. `scripts/merge` never asks for `owner-review`; `code-scope full` doesn't list `format_guard.rs` or `paths.rs`; AGENTS.md's protocol bullet names only manyroot's files and `docs/protocol.md` |
-| The refusals in 1.8, as a review requirement | the security review every PR gets | **G6**: `crates/bracken/src/weave/checks.rs` takes a light run, and nothing asks for an independent review |
+| The refusals in 1.8, as a review requirement | the security review every PR gets | **G6**: `crates/bracken/src/weave.rs` and `crates/bracken/src/weave/` take a light run, and nothing asks for an independent review for any 1.8 file |
 
 ### 2.3 Docs that disagree with the code
 
@@ -280,8 +303,12 @@ full table, and adds pins without changing any format.
     `crates/tree/tests/{format_guard,paths,lines,weave_fixture}.rs` and
     `crates/tree/tests/fixtures/`, and a `Cargo.lock` change to
     `unicode-normalization`, `icu_casemap`, `ciborium`, `blake3` or
-    `imara-diff`, each with its reason. It prints `security:` lines, too, for
-    `crates/bracken/src/weave/checks.rs` and `crates/tree/src/secrets.rs`.
+    `imara-diff`, each with its reason. It also prints a `security:` line
+    for every changed path in 1.8's directories: all of `crates/tree/src/`
+    (import, `materialize`, `check.rs`, `check/`, `path.rs`, `results.rs` and
+    `secrets.rs` are all there, and a new file there lands in the set by
+    itself), `crates/bracken/src/weave.rs` and `crates/bracken/src/weave/`.
+    So every file 1.8 names gets one, including files that don't exist yet.
   - `scripts/merge`, through main's copy of `code-scope` as it does for
     `full`, refuses a head for which `frozen` prints anything unless the
     coordination Ground holds a current claim tagged `owner-review`, by
@@ -292,23 +319,33 @@ full table, and adds pins without changing any format.
     pr claim and sha. For a `security:` line, it needs an independent
     review's pass on the pr claim at that sha. Each refusal says which path
     and what's missing.
-  - `crates/bracken/src/weave/checks.rs`, `format_guard.rs`, `paths.rs` and
-    `lines.rs` join `code-scope full`'s list.
+  - `crates/bracken/src/weave.rs`, `crates/bracken/src/weave/`,
+    `format_guard.rs`, `paths.rs` and `lines.rs` join `code-scope full`'s
+    list.
   - AGENTS.md's protocol bullet names `crates/tree/src/` and this page.
 
-  This makes every `crates/tree/src/` change log an `owner-review`, which is
-  more than the frozen items strictly need. A narrower list would be
-  cheaper, but it would rot. An `owner-review` is one claim, and the owner's
-  own go is asked only where a pin or the fixture changes.
+  This makes every `crates/tree/src/` change log an `owner-review` and get
+  an independent review, and every change to Weave's CLI an independent
+  review and the full table. That's more than the frozen items and the
+  refusals strictly need. A narrower list would be cheaper, but it would
+  rot. An `owner-review` is one claim, and the owner's own go is asked
+  only where a pin or the fixture changes.
 - **G7. Extend the fixture** by appending to the end of the
   `write_weave_v1_fixture` scenario, so no existing id changes (releases.md,
   2026-10-31): a policy version with executors, and a result written
   through `details_with_run`. This needs the same review as any fixture
   change.
-- **G8. Read `v` before the full decode.** Decode a payload as a generic
-  CBOR map, check `v`, and only then decode it as the record. A refusal
-  then names the version whatever v2's fields are (section 3). This is a
-  reader change, shipped in the readers-first release before any v2 is
+- **G8. Read `v` before the full decode, and fail closed.** Decode a
+  payload as a generic CBOR map, check `v`, and only then decode it as the
+  record, so a refusal names the version whatever v2's fields are (section
+  3). Then, where a line holds a policy version or a decision with a `v`
+  (or a Weave media type) this build can't read, that line's views (the
+  policy in force, heads, green) are unavailable, with the record named,
+  and `weave green`, `scripts/weave-gate` and `scripts/merge` refuse. They
+  aren't computed without the record, since a policy version that's
+  skipped leaves the line under the one before, still counting a validator
+  it removed. Records of other kinds, and other lines, read as before. This
+  is a reader change, shipped in the readers-first release before any v2 is
   written. It changes no format: v1 records are valid exactly as before.
 
 ## 3. Changing a frozen format after the freeze
@@ -348,6 +385,27 @@ full table, and adds pins without changing any format.
   reading v1: `weave-v1` stays checked in with its test, and a
   `weave-v2` fixture is added beside it. A writer may stop writing v1;
   no reader may stop reading it.
+- **A cutover, where v2 closes a hole.** Reading v1 forever doesn't mean
+  accepting new v1 records forever. Otherwise anyone who can write to the
+  Ground, a compromised integrator key say, keeps writing v1 records
+  without whatever v2 added, and the fix never applies to them. So a v2
+  made to close a hole defines, as part of its own frozen rules, a cutover
+  on each line:
+  - a v1 record of a kind v2 replaces, on a line, is invalid if that
+    line's v2 record of the same kind, or a policy version that declares
+    v2 the minimum, is among its causal ancestors;
+  - no record before v2 has a v2 record among its ancestors, so no
+    existing record's validity changes;
+  - a writer who avoids the cutover by leaving it out of a record's
+    parents writes a record concurrent with it. That forks the line, which
+    `weave head` reports, and only a decision descending from the cutover
+    settles the fork;
+  - the cutover is enforced by readers that know v2, which is why the
+    readers-first rollout comes first.
+
+  The same applies to a new media type (question 2's alternative): the old
+  type stays readable, so it needs the same rule. Whether a v2 that closes
+  no hole defines a cutover is question 7.
 - **An added optional field** is still a new version. The executors field
   went in as an optional field under v1, encoded only when present. A
   binary from before it rejects a line that has one as not canonical,
@@ -359,9 +417,11 @@ full table, and adds pins without changing any format.
   not records. They take the same readers-first rollout when two binaries
   on different rules would show different heads.
 - **Refusals at write and use** (1.8) may tighten in any release, under
-  their own review. They need no rollout: an old binary that still writes
-  what a new one refuses produces valid records, which the new binary
-  reads and, where it must, refuses to materialize.
+  their own review. They need no readers-first rollout: an old binary that
+  still writes what a new one refuses produces valid records, which the new
+  binary reads and, where it must, refuses to materialize. But they protect
+  only once every writer and runner uses the release (1.8), so that upgrade
+  is part of shipping the fix.
 
 ## 4. The join, and agent-keys.md 4.10
 
@@ -370,6 +430,12 @@ full table, and adds pins without changing any format.
   the coordination Ground. From then on, a Weave format change affects
   every reader of that Ground: `scripts/bk`, `scripts/merge`, the pinned
   binary and the coordination fixture tests.
+- **The merge gate relies on failing closed.** After the join, a stale
+  binary reading the coordination Ground must not compute green under a
+  policy that's no longer in force. The readers-first rollout is a rule
+  that nothing checks, so the gate relies on G8: a line holding a record
+  this build can't read has no green. G8 must be in every gate reader
+  before any v2 is written.
 - **The join's own record is frozen too.** Step 3 of the join writes a
   marker with `in_place` set. Its format is frozen (1.3), but no golden
   vector pins it yet, so G1 should land before the join.
@@ -397,8 +463,12 @@ full table, and adds pins without changing any format.
   4.8). They don't change the frozen formats. Part B would change who counts
   as a validator or integrator, which is a derivation rule. That's why those
   rules are pinned, not frozen (1.6): part B can change them with a
-  protocol-class review and no new format version. Validity, the ancestor
-  rule included, doesn't depend on who signed, so part B leaves it alone. `owner_decision` stays
+  protocol-class review and no new format version. Validity mostly doesn't
+  depend on who signed. The exception is the null `owner_decision` rule,
+  which depends on the counted marker and its author (1.3), so they're
+  frozen with it. A part B change to which marker counts, or to whose
+  signature stands for its author, is a frozen-format change (section 3),
+  not a derivation change. `owner_decision` stays
   text naming a coordination claim, which `scripts/weave` checks (4.10's
   last point).
 
@@ -421,7 +491,9 @@ full table, and adds pins without changing any format.
    rollout.* `v` is the field each record already carries for this, and one
    media type per kind keeps `references`, the scripts' matchers and
    `weave check` grouped by kind. If you'd rather not depend on G8, a new
-   media type under the same prefix is the safe alternative.
+   media type under the same prefix is the safe alternative. Either way, a
+   v2 that closes a hole needs section 3's cutover, or the old version
+   stays a way around it.
 3. **Whose go a frozen-format change needs.** Protocol-class merges are
    delegated to the manager today, logged as `owner-review` (decision
    `adcb78b88c6c`). Keep that for frozen formats, or require your own go?
@@ -446,3 +518,10 @@ full table, and adds pins without changing any format.
    changes no format and blocks no merge. The count is about whether Weave's
    merges are trustworthy, not about its formats. The join still waits for
    both, and for its own go.
+7. **A cutover for every v2, or only for one that closes a hole?** Section
+   3's cutover makes new v1 records of a replaced kind invalid on a line
+   once v2 is among their ancestors. *Recommended: define one for every v2,
+   with its rule frozen as part of v2.* It costs one rule per version. It
+   means old writers stop being able to move a line once it has moved to
+   v2, which is what readers-first already expects, and it avoids having to
+   decide, under pressure, whether a given change closes a hole.
