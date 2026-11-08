@@ -3,8 +3,9 @@
 use crate::support::*;
 
 /// A repository with ci-result, bk-evidence and code-scope, a Ground with identity `val`, origin on a
-/// GitHub URL, and a `gh` stub that answers the runs query from `$T/runs.json` and the jobs query from
-/// `$T/jobs.json`, logging each call and any token variable it sees to `$T/gh.log`.
+/// GitHub URL, and a `gh` stub that answers the runs query from `$T/runs.json`, the jobs query from
+/// `$T/jobs.json` and the pull requests query from `$T/pulls.json` (failing without it), logging each
+/// call and any token variable it sees to `$T/gh.log`.
 fn ci_repo() -> (tempfile::TempDir, PathBuf, String) {
     let (tmp, dir, _) = workspace(&repo_root().join("scripts/bk-evidence"));
     copy_executable(&repo_root().join("scripts/ci-result"), &dir.join("scripts/ci-result"));
@@ -21,6 +22,7 @@ fn ci_repo() -> (tempfile::TempDir, PathBuf, String) {
          case \"${!#}\" in\n\
            */actions/workflows/ci.yml/runs\\?head_sha=*) cat \"$T/runs.json\" ;;\n\
            */actions/runs/*/jobs*) cat \"$T/jobs.json\" ;;\n\
+           */pulls\\?state=all\\&head=*) cat \"$T/pulls.json\" ;;\n\
            *) exit 1 ;;\nesac\n",
     );
     (tmp, dir, sha)
@@ -57,7 +59,7 @@ fn run_from(
     let main = "b".repeat(40);
     let prs = base.map_or(String::new(), |b| format!(r#"{{"base":{{"ref":"{b}","sha":"{main}"}}}}"#));
     format!(
-        r#"{{"id":{id},"head_sha":"{sha}","event":"{event}","status":"{status}","conclusion":{conclusion},"run_attempt":1,"html_url":"https://github.example/o/r/actions/runs/{id}","head_repository":{{"full_name":"{head_repo}"}},"pull_requests":[{prs}]}}"#
+        r#"{{"id":{id},"head_sha":"{sha}","event":"{event}","status":"{status}","conclusion":{conclusion},"run_attempt":1,"html_url":"https://github.example/o/r/actions/runs/{id}","head_branch":"b","head_repository":{{"full_name":"{head_repo}"}},"pull_requests":[{prs}]}}"#
     )
 }
 
@@ -197,6 +199,73 @@ fn ci_result_reads_only_origins_own_runs_never_a_forks() {
     // The repository's name compares as GitHub does, without regard to case.
     runs(t, &[run_from(500, &sha, "push", "completed", Some("success"), "O/R", None)]);
     assert_eq!(ci(t, &dir, &[]).status.code(), Some(0), "{}", text(&ci(t, &dir, &[])));
+}
+
+/// Task 9a15d3ef1c2b: once a head's PR has merged, GitHub lists no PR on its pull_request run. ci-result
+/// then reads the PR from the repository's pull requests, by the run's branch, and counts the run only if
+/// every PR there of origin's branch at this sha targets main. A fork's run of the same sha is still never
+/// read, nor looked up; a PR of a fork, of another sha or against another base doesn't make a run count.
+#[test]
+fn ci_result_finds_a_merged_heads_pull_request_run() {
+    let (tmp, dir, sha) = ci_repo();
+    let t = tmp.path();
+    jobs(t, &[("Test table (Linux)", "success")]);
+    let pr = |number: u32, head_sha: &str, head_repo: &str, base: &str| {
+        format!(
+            r#"{{"number":{number},"state":"closed","head":{{"ref":"b","sha":"{head_sha}","repo":{{"full_name":"{head_repo}"}}}},"base":{{"ref":"{base}","sha":"{}"}}}}"#,
+            "b".repeat(40)
+        )
+    };
+    let pulls = |prs: &[String]| std::fs::write(t.join("pulls.json"), format!("[{}]", prs.join(","))).unwrap();
+    let merged = |id, conclusion| run_from(id, &sha, "pull_request", "completed", Some(conclusion), "o/r", None);
+    let push = run_json(8, &sha, "push", "completed", Some("failure"));
+
+    // The merged head: its pull_request run, not the push run, by default and with --event.
+    pulls(&[pr(3, &sha, "o/r", "main")]);
+    runs(t, &[merged(7, "success"), push.clone()]);
+    for args in [&[][..], &["--event", "pull_request"][..]] {
+        let out = ci(t, &dir, args);
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(0), "{said}");
+        assert!(said.contains("run 7, pull_request") && said.contains("for PR #3 (closed)"), "{said}");
+    }
+    let log = std::fs::read_to_string(t.join("gh.log")).unwrap();
+    assert!(log.contains("repos/o/r/pulls?state=all&head=o:b&per_page=100"), "{log}");
+    assert!(log.lines().all(|l| l.contains(" -X GET ")), "{log}");
+
+    // A fork's newer failed run of the same sha, also with no PR listed: never read, nor looked up.
+    std::fs::remove_file(t.join("gh.log")).unwrap();
+    let fork = run_from(9, &sha, "pull_request", "completed", Some("failure"), "mallory/r", None);
+    runs(t, &[merged(7, "success"), fork.clone()]);
+    assert_eq!(ci(t, &dir, &[]).status.code(), Some(0), "{}", text(&ci(t, &dir, &[])));
+    runs(t, &[fork]);
+    assert_eq!(ci(t, &dir, &[]).status.code(), Some(2), "{}", text(&ci(t, &dir, &[])));
+    let log = std::fs::read_to_string(t.join("gh.log")).unwrap();
+    assert_eq!(log.matches("/pulls?").count(), 1, "a fork's run was looked up: {log}");
+
+    // A PR against another base, alone or beside one against main; only a fork's PR or one at another sha:
+    // the pull_request run doesn't count, so the default falls back to the push run, and --event finds none.
+    runs(t, &[merged(7, "success"), push]);
+    for prs in [
+        vec![pr(4, &sha, "o/r", "release")],
+        vec![pr(3, &sha, "o/r", "main"), pr(4, &sha, "o/r", "release")],
+        vec![pr(5, &sha, "mallory/r", "main"), pr(6, &"c".repeat(40), "o/r", "main")],
+        vec![],
+    ] {
+        pulls(&prs);
+        let out = ci(t, &dir, &[]);
+        assert_eq!(out.status.code(), Some(1), "{prs:?}: {}", text(&out));
+        assert!(text(&out).contains("run 8, push"), "{prs:?}: {}", text(&out));
+        let out = ci(t, &dir, &["--event", "pull_request"]);
+        assert_eq!(out.status.code(), Some(2), "{prs:?}: {}", text(&out));
+        assert!(text(&out).contains("no ci.yml run on o/r"), "{prs:?}: {}", text(&out));
+    }
+
+    // Pull requests it can't read: it says so, exit 2, rather than falling back to the push run.
+    std::fs::remove_file(t.join("pulls.json")).unwrap();
+    let out = ci(t, &dir, &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(text(&out).contains("couldn't read o/r's pull requests from b"), "{}", text(&out));
 }
 
 /// Note 3be490258b13: a job GitHub cancelled with no runner and no steps (left in the queue) wasn't run. It's
