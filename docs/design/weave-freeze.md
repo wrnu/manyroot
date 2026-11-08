@@ -191,7 +191,7 @@ it.
 |---|---|---|
 | Import's exclusions, deny-list and key scan, and its symlink-target check (relative, UTF-8, not empty, no NUL, every component passing 1.4's component rules) | `crates/tree/src/import.rs` (338 for targets), `secrets.rs` | before a file version is written |
 | `materialize`'s checks: the manifest's validity, then each symlink's target, as at import | `crates/tree/src/materialize.rs` 66-83 | before anything is written to disk, by `weave checkout`, the sandboxed runner (`check.rs` 319) and the outside runner (`check/outside.rs` 197) |
-| The key set the scans match: every known identity's key, in hex and raw, which no PEM rule catches (`SecretRule::KnownIdentityKey`) | `crates/bracken/src/weave.rs` `known_keys` (993) | before import's scan, `resolve --file`'s, and the runner's output rules |
+| The key set the scans match: every known identity's key, in hex and raw, which no PEM rule catches (`SecretRule::KnownIdentityKey`) | `crates/bracken/src/weave.rs` `known_keys` (993), for import and `resolve --file`; the runner builds its own set from the same identity directories (`crates/bracken/src/weave/checks.rs` 143-148) | before import's and `resolve --file`'s scans, and before the runner's output rules |
 | `weave resolve --file`'s own refusals: the file must be inside the checkout, its path not deny-listed, its bytes clean by the scan | `crates/bracken/src/weave/merge.rs` `resolution_file` and `checkout_path` (1403-1446) | before a resolution's file version is written |
 | The runner's output rules: `recorded_tail` and the key rules it matches, `LOG_CAP`, the `log withheld: …` and `output withheld: …` branches, and whether the log artifact is written | `crates/tree/src/check.rs` 973-985; `crates/bracken/src/weave/checks.rs` 541-560; `crates/tree/src/results.rs` 59-88 | before a result or log artifact is written |
 | The symlink-target rule both import and `materialize` call | `crates/tree/src/path.rs` `validate_symlink_target` (146) | as above |
@@ -230,6 +230,7 @@ tripwire don't match it (section 4).
 | `format_guard.rs` `unicode_tables_are_pinned` | Unicode's version, and a digest of `fold` over every scalar value, which covers icu_casemap's data and the ignorables | Version mismatch, or the digest |
 | `format_guard.rs`, the line-merge tests | The line merge (1.6): vectors, the cap, and the cases where git differs | `vector <i>`, `<n> lines`, or the `KNOWN_DIFFERENT` list |
 | `crates/tree/tests/paths.rs` | Every path, folding, collision and symlink-target rule, both ways; the length limits relative to their constants | An assertion naming the rule |
+| `refuse_unreadable` (`crates/bracken/src/weave.rs` 820-829), over `crates/tree/src/lines.rs` 246-251 and 309-322 (finding `5d50422b9e11`) | A line-media-type artifact that doesn't decode with this build, and supersedes a counted version of its own author's in a relation that author signed. `integrate`, `validate`, `line policy` and `line merge` refuse while one exists (`weave.rs` 612; `weave/merge.rs` 303, 397, 641; `weave/checks.rs` 262), and every other read warns (`judged_for`, `weave.rs` 802-809). A decision that doesn't decode is dropped (`lines.rs` 264-268). A record under a media type this build doesn't know is never collected, so it's neither refused nor warned about | The refusal names the version and says to upgrade |
 | `crates/tree/tests/lines.rs` | The ancestor rule: a reference that isn't an ancestor makes the record `NotAnAncestor` and views ignore it | An assertion |
 | `crates/tree/tests/weave_fixture.rs` with `tests/fixtures/weave-v1` | A Ground written by `bracken-tree` 0.1.0: 80 contributions with pinned ids, covering every media type, results, reviews, a goal and a policy change. It checks that it opens, that every record reads back to its bytes, every derived status, and that the scenario rebuilds the fixture byte for byte. Since the ids are pinned, so is every byte the scenario writes: `details` from `details()`, argv-only methods, change hashes, `Exit::Code`'s text. | An id, byte or status mismatch, or the rebuild differing |
 | `crates/tree/tests/coordination_fixture.rs` and `crates/bracken/tests/coordination_fixture.rs` | The coordination fixture `ground-v1` reads as recorded with Weave linked in, and Weave finds nothing of its own there | A status or acceptance mismatch |
@@ -251,6 +252,7 @@ tripwire don't match it (section 4).
 | Line with executors, Executor | `executors_are_left_out_when_there_are_none`, round trips, `line_rules` | **G1**: no golden bytes for a line with an executor, of either kind; the fixture predates executors |
 | `owner_decision` and its null rule | golden line; `line_rules`; the fixture's derived statuses | none |
 | The ancestor rule | `lines.rs`'s tests; the fixture, every record of which passes it | none |
+| A policy version this build can't read | `refuse_unreadable` (2.1), for the same media type only, under its author limit | **G8**: `weave green` and `scripts/weave-gate` only warn; an unreadable decision is dropped silently; a new media type isn't seen at all |
 | The marker that counts, and its author | the fixture's derived statuses (its default line and the null-`owner_decision` version); the coordination fixture test's `counted_marker() == None` | none |
 | Decision | golden vector; `decision_rules`; `a_decision_refers_to_at_most_max_references`; the fixture, which holds decisions with `source` null and set | none |
 | Proposal and its change | golden proposal (its `change` field is an arbitrary hash); change rows by value; the fixture's proposals, whose ids pin their recomputed `change` | **G2**: no golden vector pins a change list's hash directly |
@@ -335,18 +337,24 @@ full table, and adds pins without changing any format.
   2026-10-31): a policy version with executors, and a result written
   through `details_with_run`. This needs the same review as any fixture
   change.
-- **G8. Read `v` before the full decode, and fail closed.** Decode a
-  payload as a generic CBOR map, check `v`, and only then decode it as the
-  record, so a refusal names the version whatever v2's fields are (section
-  3). Then, where a line holds a policy version or a decision with a `v`
-  (or a Weave media type) this build can't read, that line's views (the
-  policy in force, heads, green) are unavailable, with the record named,
-  and `weave green`, `scripts/weave-gate` and `scripts/merge` refuse. They
-  aren't computed without the record, since a policy version that's
-  skipped leaves the line under the one before, still counting a validator
-  it removed. Records of other kinds, and other lines, read as before. This
-  is a reader change, shipped in the readers-first release before any v2 is
-  written. It changes no format: v1 records are valid exactly as before.
+- **G8. Extend `refuse_unreadable`, keeping its author limit.** It
+  already refuses to act while a policy version doesn't decode (2.1). G8:
+  - decodes a payload's `v` first, as generic CBOR, so the refusal names
+    the version whatever v2's fields are (section 3);
+  - makes `weave green` and `scripts/weave-gate` refuse, not warn, for a
+    line holding an unreadable policy version that counts by today's rule:
+    it supersedes a counted version of its own author's, in a relation
+    that author signed (`lines.rs` 309-322);
+  - treats a decision that doesn't decode the same way only where it isn't
+    retracted, names a line in a top-level `line` field (read as generic
+    CBOR), and is signed by an integrator under the last readable policy
+    in force on that line. Today such a decision is dropped.
+
+  Any other unreadable record is ignored and listed by `weave check`, as
+  today. So nobody without authority on a line can stop it with one
+  record: a `{v: 99}` decision by a non-integrator changes nothing. This is
+  a reader change, shipped in the readers-first release before any v2 is
+  written. It changes no format.
 
 ## 3. Changing a frozen format after the freeze
 
@@ -361,8 +369,11 @@ full table, and adds pins without changing any format.
   heads.
 - **A new version.** A changed record carries `"v": 2` under the same
   media type and prefix (question 2). A binary that reads only v1 refuses
-  it, its views ignore the record, and `weave check` lists it. The Ground
-  still opens and syncs, since manyroot sees an artifact. The refusal's
+  it. For a policy version, `refuse_unreadable` (2.1) then stops
+  `integrate`, `validate`, `line policy` and `line merge`, within its author
+  limit. Any other kind is ignored by views and listed by `weave check`.
+  The Ground still opens and syncs, since manyroot sees an artifact. The
+  refusal's
   wording depends on v2's fields. `Record::decode` (`format.rs` 114-117)
   runs `from_cbor` first, which re-encodes and compares (81-86), and only
   then checks `v`. Serde drops an unknown field and fills a missing
@@ -385,33 +396,39 @@ full table, and adds pins without changing any format.
   reading v1: `weave-v1` stays checked in with its test, and a
   `weave-v2` fixture is added beside it. A writer may stop writing v1;
   no reader may stop reading it.
-- **A cutover, where v2 closes a hole.** Reading v1 forever doesn't mean
-  accepting new v1 records forever. Otherwise anyone who can write to the
-  Ground, a compromised integrator key say, keeps writing v1 records
-  without whatever v2 added, and the fix never applies to them. So a v2
-  made to close a hole defines, as part of its own frozen rules, a cutover
-  on each line:
-  - a v1 record of a kind v2 replaces, on a line, is invalid if that
-    line's v2 record of the same kind, or a policy version that declares
-    v2 the minimum, is among its causal ancestors;
-  - no record before v2 has a v2 record among its ancestors, so no
-    existing record's validity changes;
-  - a writer who avoids the cutover by leaving it out of a record's
-    parents writes a record concurrent with it. That forks the line, which
-    `weave head` reports, and only a decision descending from the cutover
-    settles the fork;
-  - the cutover is enforced by readers that know v2, which is why the
-    readers-first rollout comes first.
+- **A cutover, where v2 closes a hole in decisions.** Reading v1 forever
+  doesn't mean v1 decisions qualify forever. Otherwise a writer, a
+  compromised integrator key say, keeps writing v1 decisions without what
+  v2 added. The cutover uses the existing policy machinery, and no new
+  trigger:
+  - v2's line policy can declare a minimum version. A v1 decision whose
+    policy in force (`lines.rs` 729-768) declares v2 the minimum doesn't
+    qualify. That's a qualification rule, defined with v2 and frozen with
+    it;
+  - only the line's author can write that policy version (the supersedes
+    rule, `lines.rs` 273-283), under the owner's decision (1.3). No other
+    record triggers the cutover, so nobody without authority on the line
+    can invalidate honest records;
+  - no existing record changes, since no policy declares a minimum before
+    v2;
+  - step 1's release reads it and refuses to write a v1 decision on a line
+    whose current policy declares v2 the minimum.
 
-  The same applies to a new media type (question 2's alternative): the old
-  type stays readable, so it needs the same rule. Whether a v2 that closes
-  no hole defines a cutover is question 7.
+  **What it doesn't cover, stated plainly.** A decision is judged under
+  the policy in force in its own causal past. A writer who leaves the
+  minimum-declaring policy version out of a decision's causal parents gets
+  that decision judged under the old policy. It qualifies, it can be the
+  line's only head, and nothing forks. That's the same exposure every
+  policy change has today, such as removing a validator. Proposals,
+  manifests, resolutions and file versions carry no policy, so the cutover
+  doesn't reach them at all. Question 7 asks whether that's acceptable.
 - **An added optional field** is still a new version. The executors field
   went in as an optional field under v1, encoded only when present. A
   binary from before it rejects a line that has one as not canonical,
   which is the right effect. After the freeze, such a field bumps `v`, so
   a reader that knows v2 can tell the two shapes apart. A refusal names the
-  version only on binaries with G8.
+  version only on binaries with G8, but `refuse_unreadable` already refuses
+  on a line holding such a policy version.
 - **Pinned-not-frozen changes** (1.6) stay protocol class with a
   releases.md entry, as today, but need no new version: they change views,
   not records. They take the same readers-first rollout when two binaries
@@ -433,9 +450,11 @@ full table, and adds pins without changing any format.
 - **The merge gate relies on failing closed.** After the join, a stale
   binary reading the coordination Ground must not compute green under a
   policy that's no longer in force. The readers-first rollout is a rule
-  that nothing checks, so the gate relies on G8: a line holding a record
-  this build can't read has no green. G8 must be in every gate reader
-  before any v2 is written.
+  that nothing checks. Today `refuse_unreadable` stops a stale binary from
+  acting under an old policy, but `weave green` only warns. G8 makes green
+  and the gate refuse too, within the same author limits, and must be in
+  every gate reader before any v2 is written. That holds only if a format
+  change keeps its media type (question 2).
 - **The join's own record is frozen too.** Step 3 of the join writes a
   marker with `in_place` set. Its format is frozen (1.3), but no golden
   vector pins it yet, so G1 should land before the join.
@@ -483,17 +502,16 @@ full table, and adds pins without changing any format.
    without a format version. The records are what can never be
    rewritten.
 2. **How a format changes.** A new `v` under the same media type, or a new
-   media type? Today's binaries ignore either one and `weave check` lists
-   it. A new media type gets the clearer refusal from them, `unknown Weave
-   media type`, where a new `v` with new fields gets `not in canonical
-   encoding` (section 3). *Recommended: a new `v`, with G8 in the
-   readers-first release that any v2 needs anyway, so G8 adds no extra
-   rollout.* `v` is the field each record already carries for this, and one
-   media type per kind keeps `references`, the scripts' matchers and
-   `weave check` grouped by kind. If you'd rather not depend on G8, a new
-   media type under the same prefix is the safe alternative. Either way, a
-   v2 that closes a hole needs section 3's cutover, or the old version
-   stays a way around it.
+   media type? *Recommended: a new `v` under the same media type.* It's
+   the option that fails closed with today's binaries. A policy version
+   with a new `v` doesn't decode, so `refuse_unreadable` stops `integrate`,
+   `validate`, `line policy` and `line merge` (2.1). A new media type is
+   never collected, so today's binaries act under the superseded policy
+   with no warning, the fail-open that finding `5d50422b9e11` closed. The
+   cost is a less helpful message (`not in canonical encoding` when v2's
+   fields differ) until G8. A new media type would need G8's extension in
+   every reader before it's written. A v2 that closes a hole in decisions
+   also takes section 3's cutover.
 3. **Whose go a frozen-format change needs.** Protocol-class merges are
    delegated to the manager today, logged as `owner-review` (decision
    `adcb78b88c6c`). Keep that for frozen formats, or require your own go?
@@ -518,10 +536,14 @@ full table, and adds pins without changing any format.
    changes no format and blocks no merge. The count is about whether Weave's
    merges are trustworthy, not about its formats. The join still waits for
    both, and for its own go.
-7. **A cutover for every v2, or only for one that closes a hole?** Section
-   3's cutover makes new v1 records of a replaced kind invalid on a line
-   once v2 is among their ancestors. *Recommended: define one for every v2,
-   with its rule frozen as part of v2.* It costs one rule per version. It
-   means old writers stop being able to move a line once it has moved to
-   v2, which is what readers-first already expects, and it avoids having to
-   decide, under pressure, whether a given change closes a hole.
+7. **Is a policy-version cutover enough for a v2 that closes a hole?**
+   Section 3's cutover is a v2 line policy declaring a minimum version.
+   It's written only by the line's author, under your decision. It stops
+   v1 decisions qualifying wherever that policy is in force. It doesn't
+   stop a writer who leaves the policy out of a decision's causal past,
+   and it doesn't reach proposals, manifests, resolutions or file
+   versions. *Recommended: yes, use it only for a v2 that closes a hole in
+   decisions, and accept the gap.* The gap is the exposure every policy
+   change already has, and closing it is about who may write to a line
+   (agent-keys.md, part B), not about formats. A v2 that closes a hole in
+   another kind needs its own design, under question 3's go.
