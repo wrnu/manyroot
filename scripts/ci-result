@@ -12,7 +12,9 @@
 # prints the run's URL, event, attempt, the PR's base for a pull_request run, and each job's conclusion.
 # Only origin's own runs count (finding 6ef8d93b7020): a run whose head repository is another (a fork's
 # pull request of the same commit, which anyone can open on a public repository) is never read, and a
-# pull_request run counts only if its PR targets main. It also says what Actions leaves out, which only
+# pull_request run counts only if its PR targets main. After the PR is closed, as once it has merged,
+# GitHub lists no PR on the run, and the PR is read from the repository's pull requests, by the run's
+# branch and the sha. It also says what Actions leaves out, which only
 # the counted run checks (finding a5b068929177).
 # A job GitHub cancelled with no runner and no steps (one left in the queue until it timed out, note
 # 3be490258b13) never ran: it's reported as 'not run', neither a pass nor a fail.
@@ -88,13 +90,32 @@ get() { gh_ api --hostname "$host" -X GET -H "Accept: application/vnd.github+jso
 
 runs=$(get "actions/workflows/ci.yml/runs?head_sha=$sha&per_page=100") ||
   fail "couldn't read ci.yml's runs for $sha from $host (is gh logged in? gh auth login --hostname $host)"
-# The latest run of the event, by id, among origin's own runs of the sha (and for pull_request, those
-# whose PR targets main); with no event given, pull_request first, then push.
-run=$(jq -ce --arg sha "$sha" --arg event "$event" --arg repo "$repo" '[.workflow_runs[]
-  | select(.head_sha == $sha and (.head_repository.full_name // "" | ascii_downcase) == ($repo | ascii_downcase)
-      and (.event != "pull_request" or (.pull_requests | length) > 0 and all(.pull_requests[]; .base.ref == "main")))] as $r
+# Origin's own runs of the sha: a fork's are never read, nor looked up below.
+own=$(jq -ce --arg sha "$sha" --arg repo "$repo" '[.workflow_runs[]
+  | select(.head_sha == $sha and (.head_repository.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))]' \
+  <<<"$runs") || fail "couldn't read ci.yml's runs for $sha: not the JSON GitHub sends"
+# Once its PR is closed (merged, as every head is after scripts/merge), GitHub lists no PR on a
+# pull_request run: its pull_requests array is empty (note 415d217b1015). Its PR is then read from the
+# repository's pull requests, by the run's branch: those whose head is origin's branch at this sha. The
+# run counts below only if there's one at least and all of them target main, as for a listed PR.
+found='{}'
+while IFS= read -r branch; do
+  q=$(jq -rn --arg owner "${repo%%/*}" --arg branch "$branch" '"\($owner):\($branch | @uri)"')
+  found=$(get "pulls?state=all&head=$q&per_page=100" |
+    jq -ce --arg branch "$branch" --arg sha "$sha" --arg repo "$repo" --argjson found "$found" \
+      '$found + {($branch): [.[] | select(.head.sha == $sha and .head.ref == $branch
+        and (.head.repo.full_name // "" | ascii_downcase) == ($repo | ascii_downcase))]}') ||
+    fail "couldn't read $repo's pull requests from $branch, to find the base of a pull_request run whose PR is closed"
+done < <(jq -r '[.[] | select(.event == "pull_request" and (.pull_requests | length) == 0)
+  | .head_branch // empty] | unique[]' <<<"$own")
+# The latest run of the event, by id, among those (and for pull_request, those whose PR targets main);
+# with no event given, pull_request first, then push.
+run=$(jq -ce --arg event "$event" --argjson found "$found" 'map(
+    if .event == "pull_request" and (.pull_requests | length) == 0
+    then .pull_requests = ($found[.head_branch // ""] // []) | .closed_pr = true else . end
+    | select(.event != "pull_request" or (.pull_requests | length) > 0 and all(.pull_requests[]; .base.ref == "main"))) as $r
   | (if $event != "" then [$event] else ["pull_request", "push"] end)
-  | map(. as $e | [$r[] | select(.event == $e)] | max_by(.id)) | map(select(. != null)) | first' <<<"$runs") ||
+  | map(. as $e | [$r[] | select(.event == $e)] | max_by(.id)) | map(select(. != null)) | first' <<<"$own") ||
   fail "no ci.yml run on $repo for $sha${event:+ ($event)}: push the head, or start one with gh workflow run ci.yml --ref <branch>"
 id=$(jq -r .id <<<"$run")
 [[ $id =~ ^[0-9]+$ ]] || fail "a run without a numeric id"
@@ -102,7 +123,9 @@ status=$(jq -r .status <<<"$run")
 conclusion=$(jq -r '.conclusion // "none"' <<<"$run")
 echo "ci-result: $(jq -r .html_url <<<"$run")"
 echo "ci-result: run $id, $(jq -r .event <<<"$run") on $sha, attempt $(jq -r .run_attempt <<<"$run"): $status, $conclusion"
-if [ "$(jq -r .event <<<"$run")" = pull_request ]; then
+if [ "$(jq -r .closed_pr <<<"$run")" = true ]; then
+  echo "ci-result: pull_request run: the head merged with main, for $(jq -r '[.pull_requests[] | "PR #\(.number) (\(.state))"] | join(", ")' <<<"$run"); GitHub no longer lists the PR on the run, so its base is read from the PR, and the commit of main it merged with isn't shown"
+elif [ "$(jq -r .event <<<"$run")" = pull_request ]; then
   echo "ci-result: pull_request run: the head merged with $(jq -r '.pull_requests[0].base | "\(.ref) at \(.sha)"' <<<"$run") as of the run"
 fi
 echo "ci-result: Actions leaves out what only the counted run checks: the Docker-backed macos_only tests (the macOS job has no Docker and lists them as skipped), and --split's check that every test runs on Linux or the Mac"
