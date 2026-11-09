@@ -407,13 +407,13 @@ records of their own. The known ways:
 
 | Stop or takeover | How | Code |
 |---|---|---|
-| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored, so the honest main vanishes. Under G9, the name `main` resolves only among their lines, so `scripts/weave-gate` reads their line, where they can name themselves validator and write passing results. That forges what the gate reads, which is worse than a stop. Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`) | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-296; `scripts/weave-gate` 122, 226 |
+| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored along with its links. What `scripts/weave-gate` then reads by the name `main` depends on the honest main's history. If it has only its first policy version, that line vanishes and `main` names only theirs, so the gate reads their line today, without G9, where they can name themselves validator and write passing results. If it has a later policy version, that version becomes a line named `main` of its own, so today the name is refused as shared: a stop, not a takeover. Once G9 lands, `main` resolves only among their lines in both cases, so the gate reads theirs. Reading their line forges what the gate reads, which is worse than a stop. Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`) | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-300, 849-851 (`lines`); `crates/bracken/src/weave.rs` 784-797, 847-855; `scripts/weave-gate` 122, 226 |
 | An unreadable policy version | Open a line of your own, write an artifact under the line media type that doesn't decode, and relate it `supersedes` your own version. `refuse_unreadable` is Ground-wide, so `integrate`, `validate`, `line policy` and `line merge` refuse on every line (finding `8c1867a7611c`) | `crates/bracken/src/weave.rs` 820-829; `crates/tree/src/lines.rs` 309-322, 524; `crates/bracken/src/weave/merge.rs` 258-296, 492-496 |
 | A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Name lookup then refuses `main` as shared, so `weave green --line main` and `weave validate --line main` fail, and `scripts/weave-gate` reads main by name (finding `b6b6ccfd1255`) | `crates/bracken/src/weave.rs` 784-797, 847-855; `crates/bracken/src/weave/merge.rs` 258-296; `scripts/weave-gate` 122, 226 |
 
 **This list is what reviews of this design found, not a proof that no
 other stop exists.** G8 and G9 each narrow one cause; neither, nor both
-together, is claimed to end the any-writer stop, and neither touches the
+together, is claimed to end the any-writer stop, and neither closes the
 forged-marker takeover. G9 holds only while the counted marker is honest.
 Ending them before the join is question 8.
 
@@ -424,6 +424,13 @@ Ending them before the join is question 8.
   on which marker counts. Its fix likely changes the marker rule 1.3
   freezes, which once the freeze holds is a section-3 change; that's why the
   freeze waits for it (section 4);
+- only its author can retract a forged marker, and an honest writer can
+  answer only with a marker of their own with an even smaller id. So the
+  forged-marker fix must rest on who may write a marker, not on id order
+  (note `ba9e77679d4f`);
+- `scripts/weave-gate` checks none of the problems Weave's index reports,
+  the extra-marker problem included, so the takeover is silent there (note
+  `ba9e77679d4f`);
 - after G8, if main's integrator merges a hostile writer's line into main,
   that writer can still stop main with an unreadable version on their own
   line;
@@ -711,8 +718,8 @@ Ending them before the join is question 8.
    changes no format. It does wait for one of its findings: the
    forged-marker takeover's fix likely changes the marker rule 1.3
    freezes, which once the freeze holds is a section-3 change. So either
-   that fix lands before the freeze, or the marker rule is left out of the
-   freeze, or its fix is accepted as a v2 under section 3.
+   that fix lands before the freeze, or it's planned as a v2 under section
+   3.
 
    *Answered (owner, 2026-11-09, decision `bae92c497714`):* yes, a
    hostile-writer review and hardening is a precondition of the join. And,
