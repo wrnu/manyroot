@@ -551,6 +551,205 @@ fn a_manifest_with_an_overlong_path_is_refused_before_folding() {
     ));
 }
 
+// Guards G1 to G5 (docs/design/weave-freeze.md, section 2.4; task a61fb528dc18). Every value below is
+// what today's code gives. A failure means a frozen format changed: that is protocol class, as the module
+// comment says. Don't update a value to make it pass.
+
+/// [`line`] with its test check run on the validator's Mac.
+fn with_mac_executor() -> Line {
+    let mut l = line();
+    l.executors.insert("test".to_owned(), executor(ExecutorKind::Mac, "scripts/test-table", b"the table"));
+    l
+}
+
+/// G1: (what, payload hex, content hash) for the line and marker shapes `GOLDEN` leaves out.
+const GOLDEN_SHAPES: &[(&str, &str, &str)] = &[
+    (
+        "line with a box executor",
+        "a9617601646e616d65646d61696e6b696e7465677261746f7273815820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16a76616c696461746f7273815820a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a26c676f616c5f73657474657273815820a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a366636865636b73a263666d748365636172676f63666d74672d2d636865636b64746573748365636172676f64746573746b2d2d776f726b7370616365696578656375746f7273a16474657374a3646b696e6463626f786673637269707472736372697074732f746573742d7461626c656b7363726970745f686173685820047f88e9dc91aec8d0181b288a3ce5e27386504a5585d05cfbb017397389ce876a67756172647261696c73a3696d61785f6b6e6f776e03676d61785f616765056970726f746563746564816f6372617465732f6d616e79726f6f746e6f776e65725f6465636973696f6e6c343662393165303165646332",
+        "blake3:2784058528241c507b00fe2277b4a755685e2aa0adb7853126431184aa350252",
+    ),
+    (
+        "line with a mac executor",
+        "a9617601646e616d65646d61696e6b696e7465677261746f7273815820a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a16a76616c696461746f7273815820a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a26c676f616c5f73657474657273815820a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a366636865636b73a263666d748365636172676f63666d74672d2d636865636b64746573748365636172676f64746573746b2d2d776f726b7370616365696578656375746f7273a16474657374a3646b696e64636d61636673637269707472736372697074732f746573742d7461626c656b7363726970745f686173685820047f88e9dc91aec8d0181b288a3ce5e27386504a5585d05cfbb017397389ce876a67756172647261696c73a3696d61785f6b6e6f776e03676d61785f616765056970726f746563746564816f6372617465732f6d616e79726f6f746e6f776e65725f6465636973696f6e6c343662393165303165646332",
+        "blake3:4c608d2571c0580d841ab81fb653e69651c0212237264a3c71275310071430c2",
+    ),
+    (
+        "marker with in_place set",
+        "a361760167707572706f736567646f67666f6f6468696e5f706c61636558200909090909090909090909090909090909090909090909090909090909090909",
+        "blake3:61faee9a6c5291fc8f3c9be38bb0e5aeca1ba223542ffd9ab7eefb24ff063951",
+    ),
+];
+
+#[test]
+fn golden_vectors_for_executors_and_in_place() {
+    let actual: Vec<(&str, String, String)> = [
+        ("line with a box executor", with_executor().encode()),
+        ("line with a mac executor", with_mac_executor().encode()),
+        ("marker with in_place set", Marker { in_place: Some(id(9)), ..marker() }.encode()),
+    ]
+    .into_iter()
+    .map(|(what, bytes)| (what, hex::encode(&bytes), ContentHash::of(&bytes).to_string()))
+    .collect();
+    for (what, hex, hash) in &actual {
+        println!("    (\"{what}\", \"{hex}\", \"{hash}\"),");
+    }
+    let golden: Vec<(&str, String, String)> =
+        GOLDEN_SHAPES.iter().map(|(w, h, c)| (*w, (*h).to_owned(), (*c).to_owned())).collect();
+    assert_eq!(actual, golden, "a Weave payload format changed: this is protocol class");
+}
+
+/// G2: a check's definition hash and method, without an executor and with each kind.
+#[test]
+fn golden_definition_hashes_and_methods() {
+    let argv: Vec<String> = ["cargo", "test", "--workspace"].iter().map(|w| w.to_string()).collect();
+    let boxed = executor(ExecutorKind::Box, "scripts/test-table", b"the table");
+    let mac = executor(ExecutorKind::Mac, "scripts/test-table", b"the table");
+    let actual: Vec<(&str, String)> = [("argv only", None), ("box", Some(&boxed)), ("mac", Some(&mac))]
+        .into_iter()
+        .map(|(what, executor)| (what, CheckDefinition { name: "test", argv: &argv, executor }.method()))
+        .collect();
+    for (what, method) in &actual {
+        println!("    (\"{what}\", \"{method}\"),");
+    }
+    let golden = [
+        ("argv only", "test blake3:1f32a00f8d1d7b2e1f37df68163c3459e8a7c9dc710a89562c1fc3f4412f1ea6"),
+        ("box", "test blake3:b8147a7a3da17c52de31fd27115304b066ade1a731c603a2590584418325d7b3"),
+        ("mac", "test blake3:24e0f4396af62389b792b283f3680cdb0b034b963eda6f8f1af7c226ee204f9d"),
+    ];
+    assert_eq!(actual, golden.map(|(w, m)| (w, m.to_owned())), "a definition hash changed: this is protocol class");
+    // The policies that hold these checks give the same methods.
+    assert_eq!(line().check_method("test").as_deref(), Some(actual[0].1.as_str()));
+    assert_eq!(with_executor().check_method("test").as_deref(), Some(actual[1].1.as_str()));
+    assert_eq!(with_mac_executor().check_method("test").as_deref(), Some(actual[2].1.as_str()));
+    for (_, method) in &actual {
+        let (name, hash) = parse_method(method).expect("a method parses");
+        assert_eq!((name, hash.to_string()), ("test", method["test ".len()..].to_owned()));
+    }
+}
+
+/// G2: a change list with an added, a deleted, a changed and a mode-only row, which is a proposal's
+/// `change`.
+#[test]
+fn golden_change_hash() {
+    let base =
+        Manifest::new(vec![entry("a", b"1", Mode::File), entry("b", b"1", Mode::File), entry("c", b"1", Mode::File)]);
+    let new = Manifest::new(vec![
+        entry("a", b"2", Mode::File),
+        entry("b", b"1", Mode::Executable),
+        entry("d", b"1", Mode::File),
+    ]);
+    let change = Change::between(&base, &new);
+    let kinds: Vec<(&str, bool, bool)> =
+        change.entries().iter().map(|e| (e.path.as_str(), e.before.is_some(), e.after.is_some())).collect();
+    assert_eq!(kinds, [("a", true, true), ("b", true, true), ("c", true, false), ("d", false, true)]);
+    assert_eq!(change.hash().to_string(), "blake3:7efec8382149409dfcfbbb82b4c9d60e96ea9eab0b17ecc42e3dabead4d4c44a");
+}
+
+/// G3: the limits, by value. paths.rs and the rule tests check behaviour relative to the constants, so a
+/// changed constant would pass them.
+#[test]
+fn limits_are_pinned_by_value() {
+    assert_eq!(MAX_REFERENCES, 1024);
+    assert_eq!(bracken_tree::path::MAX_PATH_BYTES, 4096);
+    assert_eq!(bracken_tree::path::MAX_COMPONENT_BYTES, 255);
+}
+
+/// G4: a result's details, as text, for each way a check ends, a withheld tail, and a check run outside
+/// the sandbox; and `parse_details` reads the same manifest and attempt back from each.
+#[test]
+fn golden_details() {
+    use bracken_tree::check::{Exit, RecordedTail};
+    use bracken_tree::results::{details, details_with_run, parse_details};
+    use bracken_tree::secrets::SecretRule;
+
+    let manifest = manifest().content_hash();
+    let argv: Vec<String> = ["cargo", "test", "--workspace"].iter().map(|w| w.to_string()).collect();
+    let text = RecordedTail::Text("test result: ok\n".to_owned());
+    let withheld = RecordedTail::Withheld {
+        size: 1234,
+        // A PEM private-key header, built at run time: the literal would make import refuse this file.
+        hash: ContentHash::of(format!("-----BEGIN {}-----", "PRIVATE KEY").as_bytes()),
+        rule: SecretRule::PemPrivateKey,
+    };
+    let run: Vec<String> = [
+        "commit 89aa6f1a00000000000000000000000000000000",
+        "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904",
+        "bundle sha256:0000000000000000000000000000000000000000000000000000000000000000",
+        "box bx-1",
+    ]
+    .iter()
+    .map(|l| l.to_string())
+    .collect();
+    let actual: Vec<(&str, u64, String)> = vec![
+        ("exit code", 1, details(&manifest, 1, &argv, &Exit::Code(0), &text)),
+        ("signal", 2, details(&manifest, 2, &argv, &Exit::Signal(9), &text)),
+        ("timed out", 3, details(&manifest, 3, &argv, &Exit::TimedOut, &text)),
+        ("left group", 4, details(&manifest, 4, &argv, &Exit::LeftGroup(vec![4242, 4243]), &text)),
+        ("held output", 5, details(&manifest, 5, &argv, &Exit::HeldOutput, &text)),
+        ("withheld tail", 6, details(&manifest, 6, &argv, &Exit::Code(1), &withheld)),
+        ("with run", 7, details_with_run(&manifest, 7, &argv, &Exit::Code(0), &run, &text)),
+    ];
+    for (what, _, details) in &actual {
+        println!("    (\"{what}\", {details:?}),");
+    }
+    let golden: [(&str, &str); 7] = [
+        (
+            "exit code",
+            "blake3:cf8a96e087621b97a95bff66994b6e31d29275b19b5e2ef390f101f88f923568\nattempt 1\nargv [\"cargo\", \"test\", \"--workspace\"]\nexit 0\n\ntest result: ok\n",
+        ),
+        (
+            "signal",
+            "blake3:cf8a96e087621b97a95bff66994b6e31d29275b19b5e2ef390f101f88f923568\nattempt 2\nargv [\"cargo\", \"test\", \"--workspace\"]\nkilled by signal 9\n\ntest result: ok\n",
+        ),
+        (
+            "timed out",
+            "blake3:cf8a96e087621b97a95bff66994b6e31d29275b19b5e2ef390f101f88f923568\nattempt 3\nargv [\"cargo\", \"test\", \"--workspace\"]\ntimed out\n\ntest result: ok\n",
+        ),
+        (
+            "left group",
+            "blake3:cf8a96e087621b97a95bff66994b6e31d29275b19b5e2ef390f101f88f923568\nattempt 4\nargv [\"cargo\", \"test\", \"--workspace\"]\nfailed: 2 of its processes left the process group, and were killed ([4242, 4243])\n\ntest result: ok\n",
+        ),
+        (
+            "held output",
+            "blake3:cf8a96e087621b97a95bff66994b6e31d29275b19b5e2ef390f101f88f923568\nattempt 5\nargv [\"cargo\", \"test\", \"--workspace\"]\nfailed: a process it started still held its output open after it ended\n\ntest result: ok\n",
+        ),
+        // "as it matched it holds ...": a known wording slip, kept on purpose (question 92508112ed80).
+        (
+            "withheld tail",
+            "blake3:cf8a96e087621b97a95bff66994b6e31d29275b19b5e2ef390f101f88f923568\nattempt 6\nargv [\"cargo\", \"test\", \"--workspace\"]\nexit 1\n\noutput withheld: 1234 bytes, blake3:bccd14c333101b93c34b293ee47247d701e9baf78b20ccd7f01c2fafc598985e, as it matched it holds a PEM private-key header",
+        ),
+        (
+            "with run",
+            "blake3:cf8a96e087621b97a95bff66994b6e31d29275b19b5e2ef390f101f88f923568\nattempt 7\nargv [\"cargo\", \"test\", \"--workspace\"]\nexit 0\ncommit 89aa6f1a00000000000000000000000000000000\ntree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nbundle sha256:0000000000000000000000000000000000000000000000000000000000000000\nbox bx-1\n\ntest result: ok\n",
+        ),
+    ];
+    let got: Vec<(&str, &str)> = actual.iter().map(|(w, _, d)| (*w, d.as_str())).collect();
+    assert_eq!(got, golden, "a result's details changed: this is protocol class");
+    for (what, attempt, details) in &actual {
+        assert_eq!(parse_details(details), Some((manifest, *attempt)), "{what}");
+    }
+}
+
+/// G5: a content hash's text form is `blake3:` and 64 lowercase hex digits; nothing else parses.
+#[test]
+fn content_hash_text_form() {
+    use bracken_tree::hash::ParseHashError;
+
+    let hex = "2d1ebfa706ba230165250f744796a92accba5e1b6fa357983b65319da33f8e93";
+    let parsed: ContentHash = format!("blake3:{hex}").parse().expect("the labelled form parses");
+    assert_eq!(parsed, ContentHash::of(FILE_BYTES));
+    assert_eq!(parsed.to_string(), format!("blake3:{hex}"));
+    assert_eq!(hex.parse::<ContentHash>(), Err(ParseHashError::Unlabelled), "bare");
+    assert_eq!(hex.to_ascii_uppercase().parse::<ContentHash>(), Err(ParseHashError::Unlabelled), "bare uppercase");
+    let upper = format!("blake3:{}", hex.to_ascii_uppercase());
+    assert_eq!(upper.parse::<ContentHash>(), Err(ParseHashError::Malformed), "uppercase hex");
+    assert_eq!(format!("BLAKE3:{hex}").parse::<ContentHash>(), Err(ParseHashError::Malformed), "uppercase label");
+    assert_eq!(format!("blake3:{}", &hex[..63]).parse::<ContentHash>(), Err(ParseHashError::Malformed), "short");
+    assert_eq!("blake3:".parse::<ContentHash>(), Err(ParseHashError::Malformed), "empty");
+    assert_eq!(format!("blake3:{hex}0").parse::<ContentHash>(), Err(ParseHashError::Malformed), "long");
+}
+
 /// The Unicode tables folding depends on are pinned: unicode-normalization's
 /// version, and a digest of `fold` over every scalar value, which also covers
 /// icu_casemap's case-folding data and the default-ignorable list. A dependency
