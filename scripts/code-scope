@@ -6,6 +6,7 @@
 #   code-scope key <commit>
 #   code-scope chain <main> <head>...
 #   code-scope full <base> <head>
+#   code-scope frozen <base> <head>
 #   code-scope packages <base> <head>
 #   code-scope light-passes <sha> <package>... <the author's pass methods, on standard input>
 #
@@ -46,6 +47,24 @@
 # scripts/merge refuses a light pass for it: this list is the one both read. Another project replaces
 # the list with its own.
 #
+# frozen names what <head> changed since its merge base with <base> that Weave's format freeze guards
+# (docs/design/weave-freeze.md 2.4, G6; decision bae92c497714), for scripts/merge. The set is keyed on
+# directories, as full's list is, never on a list of modules, so a module split or a new file lands in it
+# by itself. One line for each, each with its reason, and exit 0 if it printed any; exit 1, saying so, if
+# none; 2 on an error. Renames count as a deletion and an addition, and a change only in comments counts
+# too: nothing here asks bracken-scope.
+#   'code-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
+#     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, and, as
+#     'code-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
+#     crate the frozen formats rest on: unicode-normalization, icu_casemap, ciborium, blake3, imara-diff.
+#     merge asks for a current owner-review claim by manager naming the pr claim and the head.
+#   'code-scope: owner: <path> (<why>)': a path that holds a golden vector or a pinned fixture value
+#     (format_guard.rs, weave_fixture.rs, tests/fixtures/), whose change needs the owner's own go
+#     (question 3): merge asks for an approval the owner ran, of the pr claim.
+#   'code-scope: security: <path> (<why>)': a path in a directory that holds the refusals of the
+#     freeze's section 1.8, crates/tree/src/, crates/bracken/src/weave.rs and crates/bracken/src/weave/:
+#     merge asks for an independent review's pass at the head.
+#
 # packages prints, one a line and sorted, the workspace packages what <head> changed since its merge base
 # with <base> affects: the scope a light run must test, whatever the builder ran (findings 0095e19fcdb7,
 # 4825c59b07e9). Every package, if full names a path; otherwise what 'bracken-scope packages' says of the
@@ -67,7 +86,7 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: code-scope docs-only <base> <head> | code-scope key <commit> | code-scope chain <main> <head>... | code-scope full <base> <head> | code-scope packages <base> <head> | code-scope light-passes <sha> <package>..." >&2
+  echo "usage: code-scope docs-only <base> <head> | code-scope key <commit> | code-scope chain <main> <head>... | code-scope full <base> <head> | code-scope frozen <base> <head> | code-scope packages <base> <head> | code-scope light-passes <sha> <package>..." >&2
   exit 2
 }
 
@@ -92,12 +111,61 @@ full_mode() {
     docs/protocol.md) echo "the protocol class" ;;
     crates/tree/src/* | crates/tree/Cargo.toml | crates/tree/tests/weave_fixture.rs | crates/tree/tests/fixtures/*)
       echo "crates/tree's source, or the Weave validity code the weave-v1 fixture pins" ;;
+    # The freeze's other guards, and Weave's CLI, which holds refusals the freeze names (weave-freeze.md
+    # 2.4, G6).
+    crates/tree/tests/format_guard.rs | crates/tree/tests/paths.rs | crates/tree/tests/lines.rs)
+      echo "a guard of Weave's frozen formats" ;;
+    crates/bracken/src/weave.rs | crates/bracken/src/weave/*) echo "Weave's CLI, which holds refusals the format freeze names" ;;
     .cargo/* | rust-toolchain*) echo "the build's configuration" ;;
     # A build script runs at every build and changes its package without a manifest change (finding
     # 398c794c1707): any build.rs, at any depth.
     build.rs | */build.rs) echo "a build script" ;;
     *) return 1 ;;
   esac
+}
+
+# What the format freeze guards (see frozen in the header). frozen_mode <path> prints why <path> is in the
+# frozen set, or returns 1; owner_mode why a change to it needs the owner's own go; security_mode why it
+# needs an independent review. Each keyed on directories.
+frozen_mode() {
+  case "$1" in
+    crates/tree/src/*) echo "crates/tree's source, which holds Weave's frozen formats and their rules" ;;
+    crates/tree/Cargo.toml) echo "crates/tree's manifest: what its formats build from" ;;
+    crates/tree/tests/format_guard.rs) echo "the format guard: golden vectors and pins" ;;
+    crates/tree/tests/paths.rs) echo "the path, folding and collision rules' guard" ;;
+    crates/tree/tests/lines.rs) echo "the ancestor rule's guard" ;;
+    crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's test and its pinned values" ;;
+    crates/tree/tests/fixtures/*) echo "a Weave fixture" ;;
+    *) return 1 ;;
+  esac
+}
+owner_mode() {
+  case "$1" in
+    crates/tree/tests/format_guard.rs) echo "golden vectors and pinned values: the owner's own go" ;;
+    crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's pinned values: the owner's own go" ;;
+    crates/tree/tests/fixtures/*) echo "a Weave fixture: the owner's own go" ;;
+    *) return 1 ;;
+  esac
+}
+security_mode() {
+  case "$1" in
+    crates/tree/src/*) echo "crates/tree's source, where the freeze's refusals at write and use live" ;;
+    crates/bracken/src/weave.rs | crates/bracken/src/weave/*) echo "Weave's CLI, where the freeze's refusals at use live" ;;
+    *) return 1 ;;
+  esac
+}
+# The crates whose Cargo.lock entries the frozen formats rest on: Unicode's tables and folding, the
+# encoding, the content hash, and the line merge.
+FROZEN_CRATES='unicode-normalization icu_casemap ciborium blake3 imara-diff'
+# lock_entry <commit> <crate>: <crate>'s [[package]] entries in <commit>'s Cargo.lock, blank if none.
+lock_entry() {
+  { git show "$1:Cargo.lock" 2>/dev/null || true; } | awk -v n="$2" 'BEGIN { RS = "" } $0 ~ "\nname = \"" n "\"\n" { print; print "" }'
+}
+# lock_versions <entries>: their versions, space-separated, or 'none'.
+lock_versions() {
+  local v
+  v=$(sed -n 's/^version = "\(.*\)"$/\1/p' <<<"$1" | tr '\n' ' ' | sed 's/ $//')
+  echo "${v:-none}"
 }
 
 # Sets helper to bracken-scope's binary, once: $CODE_SCOPE_TOKENS, or this checkout's crates/scope built;
@@ -225,6 +293,35 @@ case "${1:-}" in
       fi
     done <"$changed"
     $found || { echo "code-scope: no path since $base needs the full table"; exit 1; }
+    ;;
+  frozen)
+    [ $# -eq 3 ] || usage
+    base=$(git merge-base "$2" "$3") || exit 2
+    head=$(git rev-parse --verify -q "$3^{commit}") || exit 2
+    changed=$(mktemp)
+    trap 'rm -f "$changed"' EXIT
+    git diff --no-renames --name-only -z "$base" "$head" >"$changed" || exit 2
+    found=false
+    while IFS= read -r -d '' path; do
+      if why=$(frozen_mode "$path"); then found=true; echo "code-scope: frozen: $path ($why)"; fi
+      if why=$(owner_mode "$path"); then found=true; echo "code-scope: owner: $path ($why)"; fi
+      if why=$(security_mode "$path"); then found=true; echo "code-scope: security: $path ($why)"; fi
+      if [ "$path" = Cargo.lock ]; then
+        for crate in $FROZEN_CRATES; do
+          before=$(lock_entry "$base" "$crate")
+          after=$(lock_entry "$head" "$crate")
+          [ "$before" != "$after" ] || continue
+          found=true
+          was=$(lock_versions "$before") now=$(lock_versions "$after")
+          if [ "$was" = "$now" ]; then
+            echo "code-scope: frozen: Cargo.lock ($crate $was: its entry changed, and Weave's frozen formats rest on it)"
+          else
+            echo "code-scope: frozen: Cargo.lock ($crate $was -> $now, and Weave's frozen formats rest on it)"
+          fi
+        done
+      fi
+    done <"$changed"
+    $found || { echo "code-scope: nothing since $base is frozen or holds the freeze's refusals"; exit 1; }
     ;;
   docs-only)
     [ $# -eq 3 ] || usage

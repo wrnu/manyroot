@@ -849,6 +849,146 @@ fn merge_with_owner_approval_needs_an_owner_signed_approval_of_the_pr_claim_itse
     }
 }
 
+/// Weave's format freeze, G6 (docs/design/weave-freeze.md 2.4, task e1d2cb38d478): merge's frozen check,
+/// through main's code-scope frozen. A head that changes nothing it names passes. One that changes
+/// crates/tree's source, the format guard and Weave's CLI is refused, naming each path and what's missing,
+/// until it has: a current owner-review claim by manager whose first line names the pr claim's full id and
+/// the head's sha (not one by another author, naming a short id or only the sha, naming them only below
+/// the first line, retracted, or superseded); an approval the owner ran of the pr claim, which owner
+/// related supports it (not a delegated one, a manager's, one of another claim, or one with no supports
+/// relation); and a reviewer's independent review pass at the head (not the security review's, a fail, one
+/// at another sha, or a retracted one). A code-scope that fails refuses it too.
+fn merge_refuses_a_frozen_change_without_the_freezes_review(scripts: &str) {
+    let change = |dir: &Path| {
+        put(dir, "crates/tree/src/format.rs", "a format change\n");
+        put(dir, "crates/tree/tests/format_guard.rs", "// a golden vector changed\n");
+        put(dir, "crates/bracken/src/weave/merge.rs", "a refusal changed\n");
+    };
+    let plain = merge_dry_run(scripts, |dir| put(dir, "code.txt", "a change\n"), |_| {});
+    let line = check_line(&plain, "frozen");
+    assert!(plain.status.success(), "{scripts}: {line}");
+    assert!(line.starts_with("ok ") && line.contains("nothing frozen"), "{scripts}: {line}");
+
+    let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, |_| {}, change, |_| {}, None);
+    let frozen = |merge: &mut Command| {
+        let out = merge.output().unwrap();
+        (out.status.code(), check_line(&out, "frozen"))
+    };
+    bk(&dir, &["id", "new", "owner"]);
+    bk(&dir, &["id", "new", "reviewer"]);
+    bk(&dir, &["id", "new", "security"]);
+    let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+    let claim = prs[0]["id"].as_str().unwrap().to_owned();
+    let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "pr"]).stdout).unwrap().trim().to_owned();
+    let (src, guard, cli) =
+        ("crates/tree/src/format.rs", "crates/tree/tests/format_guard.rs", "crates/bracken/src/weave/merge.rs");
+    let no_review = format!("{src} {guard}: no current owner-review claim by manager");
+    let no_approval = format!("{guard}: no current approval the owner ran");
+    let no_pass = format!("{cli} {src}: no independent review's pass");
+    let refused = |merge: &mut Command, lacks: &[&str], what: &str| {
+        let (code, line) = frozen(merge);
+        assert_eq!(code, Some(1), "{scripts}: {what}: {line}");
+        assert!(line.starts_with("FAIL"), "{scripts}: {what}: {line}");
+        for l in lacks {
+            assert!(line.contains(l), "{scripts}: {what}: lacks {l:?}: {line}");
+        }
+        for l in [&no_review, &no_approval, &no_pass] {
+            assert_eq!(line.contains(l.as_str()), lacks.contains(&l.as_str()), "{scripts}: {what}: {l:?}: {line}");
+        }
+    };
+    let all = [no_review.as_str(), no_approval.as_str(), no_pass.as_str()];
+    refused(&mut merge, &all, "nothing yet");
+
+    // The owner-review: only the manager's current claim naming both in its first line.
+    let review = |text: &str, who: &str| bk(&dir, &["claim", text, "--tag", "owner-review", "--as", who]);
+    let named = format!("Owner-review (manager): frozen change, pr claim {claim} @ {sha}");
+    review(&named, "builder");
+    review(&format!("Owner-review: pr claim {} @ {sha}", &claim[..12]), "manager");
+    review(&format!("Owner-review: @ {sha}"), "manager");
+    review(&format!("Owner-review: pr claim {claim}"), "manager");
+    review(&format!("Owner-review: pr claim {claim}0 @ {sha}"), "manager");
+    review(&format!("Owner-review: a frozen change\npr claim {claim} @ {sha}"), "manager");
+    let retracted = review(&named, "manager");
+    bk(&dir, &["retract", &retracted, "--as", "manager"]);
+    refused(&mut merge, &all, "no owner-review that counts");
+    let counted = review(&named, "manager");
+    refused(&mut merge, &[&no_approval, &no_pass], "an owner-review");
+    bk(
+        &dir,
+        &["claim", "Owner-review: withdrawn", "--tag", "owner-review", "--supersedes", &counted, "--as", "manager"],
+    );
+    refused(&mut merge, &all, "a superseded owner-review");
+    review(&named, "manager");
+
+    // The owner's own approval of the claim.
+    let approve = |text: String, tags: &[&str], who: &str, supports: Option<&str>| {
+        let mut args = vec!["claim", text.as_str(), "--tag", "approval"];
+        for t in tags {
+            args.extend(["--tag", t]);
+        }
+        args.extend(["--as", who]);
+        let id = bk(&dir, &args);
+        if let Some(to) = supports {
+            bk(&dir, &["relate", &id, "supports", to, "--as", who]);
+        }
+        id
+    };
+    let ran = format!("Approval (owner, 2026-11-09, run by the owner) of {claim}: the format change");
+    let delegated = format!(
+        "Approval (owner, 2026-11-09, signed by the manager on the owner's delegation for this approval only; the owner said: 'yes') of {claim}: it"
+    );
+    approve(delegated, &["delegated"], "owner", Some(&claim));
+    approve(ran.clone(), &[], "manager", Some(&claim));
+    approve(ran.clone(), &[], "owner", None);
+    let other = bk(&dir, &["claim", "another claim", "--tag", "note", "--as", "builder"]);
+    approve(format!("Approval (owner, 2026-11-09, run by the owner) of {other}: it"), &[], "owner", Some(&claim));
+    let withdrawn = approve(ran.clone(), &[], "owner", Some(&claim));
+    bk(&dir, &["retract", &withdrawn, "--as", "owner"]);
+    refused(&mut merge, &[&no_approval, &no_pass], "no approval that counts");
+    approve(ran, &[], "owner", Some(&claim));
+    refused(&mut merge, &[&no_pass], "an approval");
+
+    // The independent review's pass at the head.
+    let evidence = |verdict: &str, method: &str, who: &str| {
+        bk(&dir, &["evidence", &claim, verdict, "--method", method, "--as", who])
+    };
+    evidence("pass", &format!("security review (claude-opus-5-5) @ {sha}"), "security");
+    evidence("pass", &format!("independent review (claude-opus-5-5) @ {sha}"), "val");
+    evidence("fail", &format!("independent review (claude-opus-5-5) @ {sha}"), "reviewer");
+    evidence("pass", &format!("independent review (claude-opus-5-5) @ {}", "f".repeat(40)), "reviewer");
+    let gone = evidence("pass", &format!("independent review (claude-opus-5-5) @ {sha}"), "reviewer");
+    bk(&dir, &["retract", &gone, "--as", "reviewer"]);
+    refused(&mut merge, &[&no_pass], "no independent review that counts");
+    evidence("pass", &format!("independent review (claude-opus-5-5) @ {sha}"), "reviewer");
+    let (code, line) = frozen(&mut merge);
+    assert_eq!(code, Some(0), "{scripts}: {line}");
+    assert!(line.starts_with("ok ") && line.contains("the freeze's review is there"), "{scripts}: {line}");
+
+    // A code-scope frozen that fails decides nothing.
+    let real = dir.join("../code-scope.real");
+    copy_executable(&dir.join("scripts/code-scope"), &real);
+    write_executable(
+        &dir.join("scripts/code-scope"),
+        &format!(
+            "#!/usr/bin/env bash\n[ \"$1\" != frozen ] || {{ echo 'no such commit' >&2; exit 2; }}\nexec {} \"$@\"\n",
+            real.display()
+        ),
+    );
+    let (code, line) = frozen(&mut merge);
+    assert_eq!(code, Some(1), "{scripts}: {line}");
+    assert!(line.starts_with("FAIL") && line.contains("code-scope frozen failed (exit 2)"), "{scripts}: {line}");
+}
+
+#[test]
+fn merge_refuses_a_frozen_change_without_the_freezes_review_in_scripts() {
+    merge_refuses_a_frozen_change_without_the_freezes_review(SCRIPTS[0]);
+}
+
+#[test]
+fn merge_refuses_a_frozen_change_without_the_freezes_review_in_the_kickoff_templates() {
+    merge_refuses_a_frozen_change_without_the_freezes_review(SCRIPTS[1]);
+}
+
 /// Task d5dc6c27c7f2 (finding d9682243cef7): merge's findings check decides through the real binary's
 /// `findings`. An untriaged finding refuses the merge, a confirmed one too; one the manager deferred to a
 /// current task of theirs doesn't. And a `findings --json` in any other shape refuses it, whatever it
