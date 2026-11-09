@@ -857,7 +857,9 @@ fn merge_with_owner_approval_needs_an_owner_signed_approval_of_the_pr_claim_itse
 /// the first line, retracted, or superseded); an approval the owner ran of the pr claim, which owner
 /// related supports it (not a delegated one, a manager's, one of another claim, or one with no supports
 /// relation); and a reviewer's independent review pass at the head (not the security review's, a fail, one
-/// at another sha, or a retracted one). A code-scope that fails refuses it too.
+/// at another sha, or a retracted one). The check fails closed: a code-scope frozen that fails, exits 1,
+/// or prints a line it can't read, a path with a newline split over two included, refuses it too, and
+/// only exit 3 with its one line is nothing to check (findings db2dc1c6120e, e3f9ae2b1820).
 fn merge_refuses_a_frozen_change_without_the_freezes_review(scripts: &str) {
     let change = |dir: &Path| {
         put(dir, "crates/tree/src/format.rs", "a format change\n");
@@ -964,19 +966,60 @@ fn merge_refuses_a_frozen_change_without_the_freezes_review(scripts: &str) {
     assert_eq!(code, Some(0), "{scripts}: {line}");
     assert!(line.starts_with("ok ") && line.contains("the freeze's review is there"), "{scripts}: {line}");
 
-    // A code-scope frozen that fails decides nothing.
+    // The check fails closed (findings db2dc1c6120e, e3f9ae2b1820): with every review there, a code-scope
+    // frozen standing in for main's that fails, exits 1 (as set -e does), or prints what the check can't
+    // read decides nothing. Only exit 3 with exactly its one line is nothing to check.
     let real = dir.join("../code-scope.real");
     copy_executable(&dir.join("scripts/code-scope"), &real);
+    let (out, exit) = (dir.join("../frozen.out"), dir.join("../frozen.exit"));
     write_executable(
         &dir.join("scripts/code-scope"),
         &format!(
-            "#!/usr/bin/env bash\n[ \"$1\" != frozen ] || {{ echo 'no such commit' >&2; exit 2; }}\nexec {} \"$@\"\n",
+            "#!/usr/bin/env bash\n[ \"$1\" != frozen ] || {{ cat {}; echo 'a message' >&2; exit \"$(cat {})\"; }}\nexec {} \"$@\"\n",
+            out.display(),
+            exit.display(),
             real.display()
         ),
     );
-    let (code, line) = frozen(&mut merge);
-    assert_eq!(code, Some(1), "{scripts}: {line}");
-    assert!(line.starts_with("FAIL") && line.contains("code-scope frozen failed (exit 2)"), "{scripts}: {line}");
+    let nothing = format!("code-scope: nothing since {sha} is frozen or holds the freeze's refusals\n");
+    let line_of = |kind: &str, path: &str| format!("code-scope: {kind}: {path} (why)\n");
+    for (prints, code, says) in [
+        (String::new(), 2, "code-scope frozen failed (exit 2), so the freeze check can't decide: a message"),
+        (nothing.clone(), 1, "code-scope frozen failed (exit 1)"),
+        (
+            "code-scope: all good\n".to_owned(),
+            3,
+            "exited 3 with an answer for nothing to check that isn't its one line",
+        ),
+        (format!("{nothing}{}", line_of("frozen", src)), 3, "exited 3 with an answer for nothing to check"),
+        (String::new(), 0, "exited 0 with no line at all"),
+        (line_of("unknown", src), 0, "exited 0 with a line it can't read: "),
+        // A newline in a path, split over two lines, after a line that reads.
+        (format!("{}code-scope: frozen: crates/tree/src/a\nb.rs (why)\n", line_of("frozen", src)), 0, "can't read"),
+        (format!("code-scope: security: {cli}\n"), 0, "a line it can't read"),
+    ] {
+        std::fs::write(&out, &prints).unwrap();
+        std::fs::write(&exit, code.to_string()).unwrap();
+        let (status, line) = frozen(&mut merge);
+        let what = format!("{scripts}: exit {code} printing {prints:?}");
+        assert_eq!(status, Some(1), "{what}: {line}");
+        assert!(line.starts_with("FAIL") && line.contains(says), "{what}: {line}");
+    }
+    std::fs::write(&out, &nothing).unwrap();
+    std::fs::write(&exit, "3").unwrap();
+    let (status, line) = frozen(&mut merge);
+    assert_eq!(status, Some(0), "{scripts}: {line}");
+    assert!(line.starts_with("ok ") && line.contains("nothing frozen: nothing since"), "{scripts}: {line}");
+
+    // End to end, main's real code-scope refuses a head adding a file with a newline in its name.
+    let newline = |dir: &Path| put(dir, "crates/tree/tests/fixtures/a\nb", "a fixture\n");
+    let out = merge_dry_run(scripts, newline, |_| {});
+    let line = check_line(&out, "frozen");
+    assert_eq!(out.status.code(), Some(1), "{scripts}: {line}");
+    assert!(
+        line.starts_with("FAIL") && line.contains("failed (exit 2)") && line.contains("control character"),
+        "{line}"
+    );
 }
 
 #[test]

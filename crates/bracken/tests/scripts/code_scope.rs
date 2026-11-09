@@ -203,9 +203,10 @@ fn lock(entries: &[(&str, &str, &str)]) -> String {
 /// manifest, the format guard, paths.rs, lines.rs, the fixture test and tests/fixtures/, and a Cargo.lock
 /// change to the entry of a crate the formats rest on, each with its reason; an 'owner:' line for a golden
 /// vector or pinned fixture value; and a 'security:' line for every path in the directories of the
-/// freeze's refusals, Weave's CLI included. It exits 1 for a head that changes none of these, crates/tree's
-/// other tests and another crate's Cargo.lock entry included, and 2 on an error. full names the new paths
-/// in its list too.
+/// freeze's refusals, Weave's CLI included. It exits 3, with its one line, for a head that changes none of
+/// these, crates/tree's other tests and another crate's Cargo.lock entry included, and 2 on an error. A
+/// changed path holding a newline or a tab is an error, named escaped, with nothing on standard output
+/// (findings db2dc1c6120e, e3f9ae2b1820). full names the new paths in its list too.
 #[test]
 fn code_scope_frozen_names_the_freezes_paths_each_with_what_it_needs() {
     let base_lock = lock(&[("blake3", "1.8.7", "aa"), ("serde", "1.0.0", "bb"), ("icu_casemap", "2.4.0", "cc")]);
@@ -325,7 +326,7 @@ fn code_scope_frozen_names_the_freezes_paths_each_with_what_it_needs() {
             assert_eq!(frozen(head), (Some(0), out), "{scripts}: {head}");
         }
 
-        // Nothing the freeze guards: exit 1, saying so.
+        // Nothing the freeze guards: exit 3, saying so.
         branch("elsewhere", &|| {
             put(&dir, "crates/tree/tests/merge.rs", "another test\n");
             put(&dir, "crates/bracken/src/main.rs", "the rest of the CLI\n");
@@ -333,10 +334,26 @@ fn code_scope_frozen_names_the_freezes_paths_each_with_what_it_needs() {
         });
         for head in ["other", "elsewhere"] {
             let (code, out) = frozen(head);
-            assert_eq!(code, Some(1), "{scripts}: {head}: {out}");
+            assert_eq!(code, Some(3), "{scripts}: {head}: {out}");
             assert!(out.starts_with("code-scope: nothing since ") && out.lines().count() == 1, "{scripts}: {out}");
         }
         assert_eq!(frozen("no-such-branch").0, Some(2), "{scripts}");
+
+        // A path with a newline or a tab, frozen or not, anywhere among the changes: refused, named escaped.
+        for (name, file, escaped) in [
+            ("newline", "crates/tree/src/a\nb.rs", "$'crates/tree/src/a\\nb.rs'"),
+            ("tab", "notes/x\ty.txt", "$'notes/x\\ty.txt'"),
+        ] {
+            branch(name, &|| {
+                put(&dir, "crates/tree/src/format.rs", "format, changed again\n");
+                put(&dir, file, "a name with a control character\n");
+            });
+            let out = run(&dir, "scripts/code-scope", &["frozen", "main", name]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(2), "{scripts}: {name}: {stderr}");
+            assert!(out.stdout.is_empty(), "{scripts}: {name}: {:?}", out.stdout);
+            assert!(stderr.contains("control character") && stderr.contains(escaped), "{scripts}: {name}: {stderr}");
+        }
         assert_eq!(run(&dir, "scripts/code-scope", &["frozen", "main"]).status.code(), Some(2), "{scripts}");
 
         // full's list holds the freeze's guards and Weave's CLI (G6).

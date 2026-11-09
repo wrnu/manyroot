@@ -58,7 +58,9 @@
 #      scripts/owner-approve, not --delegated, of the pr claim's full id, that owner related supports the
 #      claim (the claim names the sha); a 'security:' path (the directories of the freeze's refusals,
 #      section 1.8) needs a pass by reviewer, not retracted, on the claim, 'independent review (<model>)
-#      @ <sha>'. Each refusal names the paths and what's missing. A code-scope failure fails the check;
+#      @ <sha>'. Each refusal names the paths and what's missing. Only frozen's exit 3 and its one line mean
+#      nothing to check; any other exit, or an exit 0 with a line that isn't '<kind>: <path> (<why>)' of
+#      those three kinds, fails the check (findings db2dc1c6120e, e3f9ae2b1820);
 #   7. with --owner-approval, for a PR whose class needs the owner's go (docs/development.md, Owner
 #      approvals): a current claim tagged approval, written by owner (scripts/owner-approve), that owner
 #      related supports this pr claim itself, by its full id. An approval of a task, another PR or an
@@ -639,11 +641,31 @@ if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
   check FAIL frozen "$sha isn't on origin"
 else
   rc=0
-  frozen=$(cd "$main" && "$here/code-scope" frozen "$tip" "$sha" 2>&1) || rc=$?
-  if [ "$rc" = 1 ]; then
-    check ok frozen "$frozen_case: $(tail -n 1 <<<"$frozen" | sed 's/^code-scope: //')"
-  elif [ "$rc" != 0 ]; then
-    check FAIL frozen "code-scope frozen failed (exit $rc), so the freeze check can't decide: $(tr '\n' ' ' <<<"$frozen")"
+  frozen_err=$(mktemp)
+  frozen=$(cd "$main" && "$here/code-scope" frozen "$tip" "$sha" 2>"$frozen_err") || rc=$?
+  frozen_why=$(tr '\n' ' ' <"$frozen_err" | sed 's/ $//')
+  rm -f "$frozen_err"
+  # Fail closed (findings db2dc1c6120e, e3f9ae2b1820): only exit 3 with exactly its one line means nothing
+  # to check, and exit 0 counts only if every line is '<kind>: <path> (<why>)' of a kind this check knows.
+  # Anything else, a failure or output it can't read, decides nothing.
+  unread=''
+  if [ "$rc" = 0 ]; then
+    [ -n "$frozen" ] || unread="no line at all"
+    while IFS= read -r l; do
+      [ -n "$unread" ] && break
+      [[ $l =~ ^code-scope:\ (frozen|owner|security):\ [^[:cntrl:]]+\ \([^[:cntrl:]]+\)$ ]] ||
+        unread="a line it can't read: $(printf '%q' "$l")"
+    done <<<"$frozen"
+  elif [ "$rc" = 3 ]; then
+    [[ $frozen =~ ^code-scope:\ nothing\ since\ [0-9a-f]{40,64}\ is\ frozen\ or\ holds\ the\ freeze\'s\ refusals$ ]] ||
+      unread="an answer for nothing to check that isn't its one line: $(printf '%q' "$frozen")"
+  fi
+  if [ "$rc" = 3 ] && [ -z "$unread" ]; then
+    check ok frozen "$frozen_case: ${frozen#code-scope: }"
+  elif [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
+    check FAIL frozen "code-scope frozen failed (exit $rc), so the freeze check can't decide: ${frozen_why:-no message}"
+  elif [ -n "$unread" ]; then
+    check FAIL frozen "code-scope frozen exited $rc with $unread, so the freeze check can't decide"
   else
     missing=() have=()
     # paths_of <kind>: the paths code-scope named with 'code-scope: <kind>: <path> (<why>)', space-separated.

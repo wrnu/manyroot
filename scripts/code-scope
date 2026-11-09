@@ -50,9 +50,13 @@
 # frozen names what <head> changed since its merge base with <base> that Weave's format freeze guards
 # (docs/design/weave-freeze.md 2.4, G6; decision bae92c497714), for scripts/merge. The set is keyed on
 # directories, as full's list is, never on a list of modules, so a module split or a new file lands in it
-# by itself. One line for each, each with its reason, and exit 0 if it printed any; exit 1, saying so, if
-# none; 2 on an error. Renames count as a deletion and an addition, and a change only in comments counts
-# too: nothing here asks bracken-scope.
+# by itself. One line for each, each with its reason, and exit 0 if it printed any. If none, it prints
+# 'code-scope: nothing since <merge base> is frozen or holds the freeze's refusals' and exits 3, an answer
+# of its own, so a failure (exit 1 from set -e included) never reads as nothing to check; 2 on an error. A
+# changed path holding a newline or another control character is an error, named escaped on standard
+# error with nothing on standard output, since one couldn't be printed a line each (findings
+# db2dc1c6120e, e3f9ae2b1820). Renames count as a deletion and an addition, and a change only in comments
+# counts too: nothing here asks bracken-scope.
 #   'code-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, and, as
 #     'code-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
@@ -301,6 +305,13 @@ case "${1:-}" in
     changed=$(mktemp)
     trap 'rm -f "$changed"' EXIT
     git diff --no-renames --name-only -z "$base" "$head" >"$changed" || exit 2
+    # Every path first, so a refusal prints nothing on standard output.
+    while IFS= read -r -d '' path; do
+      if [[ $path == *[[:cntrl:]]* ]]; then
+        echo "code-scope: frozen: a changed path holds a newline or another control character, so it can't be named a line each: $(printf '%q' "$path")" >&2
+        exit 2
+      fi
+    done <"$changed"
     found=false
     while IFS= read -r -d '' path; do
       if why=$(frozen_mode "$path"); then found=true; echo "code-scope: frozen: $path ($why)"; fi
@@ -321,7 +332,7 @@ case "${1:-}" in
         done
       fi
     done <"$changed"
-    $found || { echo "code-scope: nothing since $base is frozen or holds the freeze's refusals"; exit 1; }
+    $found || { echo "code-scope: nothing since $base is frozen or holds the freeze's refusals"; exit 3; }
     ;;
   docs-only)
     [ $# -eq 3 ] || usage
