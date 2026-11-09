@@ -668,7 +668,8 @@ fn golden_details() {
     let text = RecordedTail::Text("test result: ok\n".to_owned());
     let withheld = RecordedTail::Withheld {
         size: 1234,
-        hash: ContentHash::of(b"-----BEGIN PRIVATE KEY-----"),
+        // A PEM private-key header, built at run time: the literal would make import refuse this file.
+        hash: ContentHash::of(format!("-----BEGIN {}-----", "PRIVATE KEY").as_bytes()),
         rule: SecretRule::PemPrivateKey,
     };
     let run: Vec<String> = [
