@@ -2,7 +2,12 @@
 
 Design only: it changes no format, code, test or fixture (task
 `d8cc249f0c92`, decision `285f7e43f540` (a), step 3 of the Weave order in
-decision `b4a3456de597`). Nothing is frozen until the owner's go. It pins:
+decision `b4a3456de597`). Nothing is frozen until the owner's go. The
+owner answered section 5's questions on 2026-11-09 (decision
+`bae92c497714`), and each answer is recorded under its question. The freeze
+itself still needs the owner's separate go, and that go waits for the fix to
+the forged-marker takeover (2.5), or for that fix to be planned as a v2
+(section 4). It pins:
 1. what the freeze covers, by file, and what it leaves out;
 2. how a change would be caught today, and where nothing would catch it;
 3. what a frozen-format change takes once the freeze holds;
@@ -94,6 +99,10 @@ with it:
 - **its author**: the AgentId that signed the marker. A change to whose
   signature stands for that author, such as a delegate's under part B, is
   a change to this rule (section 4).
+
+Any writer can make their own marker the one that counts (2.5, the
+forged-marker takeover). Its fix likely changes this rule, which is why
+the freeze waits for that fix or for its plan as a v2 (section 4).
 
 **The ancestor rule is frozen too**, since it's a validity rule: Weave's
 replacement for protocol rule 5 for references inside payloads (weave.md
@@ -370,32 +379,70 @@ full table, and adds pins without changing any format.
   `resolve_line` and `lines_for` (`crates/bracken/src/weave.rs` 784-797,
   847-855) take every line of a name, and refuse a name two lines share.
   G9 resolves a name only among lines whose first version is by the
-  counted marker's author, the same author the default-line rule uses. A
-  line anyone else opens is then reached by its id only. That's a reader
-  change, with no format change. It narrows one more cause of 2.5's stop
-  and closes no other.
+  counted marker's author, the same author the default-line rule uses.
+  That's a reader change, with no format change. **G9 is only as sound as
+  the counted marker.** While the counted marker is honest, a line anyone
+  else opens is reached by its id only, and a second `main` no longer
+  stops main-by-name readers. But any writer can make their own marker the
+  counted one (2.5, the forged-marker takeover). Then G9 resolves names
+  only among that writer's lines, so `main`, and the line
+  `scripts/weave-gate` reads, are theirs. So G9 narrows the duplicate-name
+  stop while markers are trusted, and closes no other cause. It isn't a
+  protection against a hostile writer.
 
 ### 2.5 Weave assumes its writers are trusted
 
 Weave today assumes that every writer of its Ground is trusted. That's
 true now: only team identities write to `~/bracken-weave/manyroot`, only
-through `scripts/weave`, on this machine (weave.md section 5). It stops
-being true at the join, when every writer of the coordination Ground can
-write Weave records.
+through `scripts/weave`, on this machine (weave.md section 5). That holds by
+convention (AGENTS.md) and by `scripts/weave`'s refusals, not by anything
+that stops a local process writing to `~/bracken-weave` directly. The
+Ground doesn't sync, so that's within the trusted-writer assumption. It
+stops being true at the join, when every writer of the coordination Ground
+can write Weave records.
 
-Under that assumption, **any writer can currently stop a line, or
-main**, with an ordinary record of their own that only they can retract.
-The known ways:
+Under that assumption, **any writer can currently stop a line, or main,
+and can take over the default line and the name `main`**, with ordinary
+records of their own. The known ways:
 
-| Stop | How | Code |
+| Stop or takeover | How | Code |
 |---|---|---|
+| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored along with its links. What `scripts/weave-gate` then reads by the name `main` depends on the honest main's history. If it has only its first policy version, that line vanishes and `main` names only theirs, so the gate reads their line today, without G9, where they can name themselves validator and write passing results. If it has a later policy version, that version becomes a line named `main` of its own, so today the name is refused as shared: a stop, not a takeover. Once G9 lands, `main` resolves only among their lines in both cases, so the gate reads theirs. Reading their line forges what the gate reads, which is worse than a stop. Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`) | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-300, 849-851 (`lines`); `crates/bracken/src/weave.rs` 784-797, 847-855; `scripts/weave-gate` 122, 226 |
 | An unreadable policy version | Open a line of your own, write an artifact under the line media type that doesn't decode, and relate it `supersedes` your own version. `refuse_unreadable` is Ground-wide, so `integrate`, `validate`, `line policy` and `line merge` refuse on every line (finding `8c1867a7611c`) | `crates/bracken/src/weave.rs` 820-829; `crates/tree/src/lines.rs` 309-322, 524; `crates/bracken/src/weave/merge.rs` 258-296, 492-496 |
 | A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Name lookup then refuses `main` as shared, so `weave green --line main` and `weave validate --line main` fail, and `scripts/weave-gate` reads main by name (finding `b6b6ccfd1255`) | `crates/bracken/src/weave.rs` 784-797, 847-855; `crates/bracken/src/weave/merge.rs` 258-296; `scripts/weave-gate` 122, 226 |
 
 **This list is what reviews of this design found, not a proof that no
 other stop exists.** G8 and G9 each narrow one cause; neither, nor both
-together, is claimed to end the any-writer stop. Ending it before the join
-is question 8.
+together, is claimed to end the any-writer stop, and neither closes the
+forged-marker takeover. G9 holds only while the counted marker is honest.
+Ending them before the join is question 8.
+
+**Inputs for question 8's hostile-writer review, known so far** (note
+`4062ce03a8d7`, from the round-6 independent review; evidence
+`9122c219ead0`, the round-6 security review):
+- the forged-marker takeover above: G9 and the default-line rule both rest
+  on which marker counts. Its fix likely changes the marker rule 1.3
+  freezes, which once the freeze holds is a section-3 change; that's why the
+  freeze waits for it (section 4);
+- only its author can retract a forged marker, and an honest writer can
+  answer only with a marker of their own with an even smaller id. So the
+  forged-marker fix must rest on who may write a marker, not on id order
+  (note `ba9e77679d4f`);
+- `scripts/weave-gate` checks none of the problems Weave's index reports,
+  the extra-marker problem included, so the takeover is silent there (note
+  `ba9e77679d4f`);
+- after G8, if main's integrator merges a hostile writer's line into main,
+  that writer can still stop main with an unreadable version on their own
+  line;
+- a second line named `main` is judged by `lines_for` today, so under G8
+  alone an unreadable version on it still stops main-by-name readers. G9
+  removes that only while the counted marker is honest;
+- `scripts/weave`'s check that `owner_decision` names an existing claim
+  doesn't bind a writer who bypasses `scripts/weave` after the join: the
+  binary checks its shape only (`crates/bracken/src/weave/merge.rs`
+  492-497);
+- a record under a media type this build doesn't know is never collected,
+  so it's unseen (2.1).
 
 ## 3. Changing a frozen format after the freeze
 
@@ -493,6 +540,13 @@ is question 8.
   the coordination Ground. From then on, a Weave format change affects
   every reader of that Ground: `scripts/bk`, `scripts/merge`, the pinned
   binary and the coordination fixture tests.
+- **The freeze waits for the forged-marker fix** (decision
+  `bae92c497714`, on finding `26d9361e0a9f`). Any writer can make their
+  own marker the counted one (2.5). 1.3 freezes the marker rule, and
+  section 3 rules out changing a validity rule in place, so a fix that
+  changes it becomes a frozen-format change once the freeze holds. So the
+  owner's go to freeze waits until that fix has landed, or until it's
+  planned as a v2 under section 3.
 - **The merge gate relies on failing closed.** After the join, a stale
   binary reading the coordination Ground must not compute green under a
   policy that's no longer in force. The readers-first rollout is a rule
@@ -506,8 +560,9 @@ is question 8.
   G8 doesn't see a new one (question 2).
 - **The join assumes hostile writers, and Weave doesn't yet.** After the
   join, everyone who writes to the coordination Ground can write Weave
-  records. Today any writer can stop a line or main (2.5), and the known
-  causes are only what reviews found. So the join waits for a review of
+  records. Today any writer can stop a line or main, or take over the
+  default line and the name `main` with a forged marker (2.5), and the
+  known causes are only what reviews found. So the join waits for a review of
   Weave that assumes a hostile writer, and for what it finds to be
   hardened or accepted (question 8).
 - **The join's own record is frozen too.** Step 3 of the join writes a
@@ -556,6 +611,14 @@ is question 8.
    changeable under review. A security fix needs the refusals to tighten
    without a format version. The records are what can never be
    rewritten.
+
+   *Answered (owner, 2026-11-09, decision `bae92c497714`):* yes. 1.1 to
+   1.5 are frozen as version 1, with every validity rule, the ancestor rule
+   and the counted-marker rule included; 1.6 is pinned, not frozen; 1.8's
+   refusals may tighten as security-sensitive changes; 1.7 is left out.
+   Since the marker rule is frozen, the forged-marker fix (2.5) is a
+   section-3 change once the freeze holds, so the freeze waits for it
+   (section 4, question 8).
 2. **How a format changes.** A new `v` under the same media type, or a new
    media type? *Recommended: a new `v` under the same media type.* It's
    the option that fails closed with today's binaries. A policy version
@@ -571,6 +634,9 @@ is question 8.
    binaries. A new media type would need a reader change beyond G8, which
    doesn't collect unknown media types. A v2 that closes a hole in
    decisions also takes section 3's cutover.
+
+   *Answered (owner, 2026-11-09, decision `bae92c497714`):* a format
+   changes by a new `v` under the same media type.
 3. **Whose go a frozen-format change needs.** Protocol-class merges are
    delegated to the manager today, logged as `owner-review` (decision
    `adcb78b88c6c`). Keep that for frozen formats, or require your own go?
@@ -578,25 +644,50 @@ is question 8.
    A frozen-format change is rare, can't be undone once records exist, and
    at the join it reaches the coordination Ground. Changes to the
    pinned-not-frozen rules stay delegated.
+
+   *Answered (owner, 2026-11-09, decision `bae92c497714`):* a
+   frozen-format change needs the owner's own go until the join; it's no
+   longer delegated under decision `adcb78b88c6c`. Pinned-not-frozen
+   changes (1.6) stay delegated, logged as `owner-review`.
+
+   *Note for G6:* the repository's rules don't say this yet, and must
+   follow. AGENTS.md's protocol bullet gives protocol class "the manager's
+   go (logged as `owner-review`)", and development.md's *Placeholder
+   values* table delegates protocol-class merges to the manager under
+   `adcb78b88c6c` (`<project-specific gated actions>`). Both should say
+   that a change to a frozen Weave format needs the owner's own go until
+   the join. G6 already changes AGENTS.md's protocol bullet, so that's
+   where it lands, with development.md's row beside it.
 4. **Close the guard gaps before the freeze?** G1 to G6 are small build
    tasks; G7 needs a fixture change; G8 is a reader change.
    *Recommended: land G1 to G6 first, then your go to freeze; G7 can
    follow; G8 and G9 must land before the join, and G8 before any v2.*
    The freeze would otherwise rest on pins that don't fully exist yet,
    notably the join's marker (G1) and the review rule (G6). G8 and G9
-   each narrow one known stop (2.5); neither ends the any-writer stop,
-   which is question 8.
+   each narrow one known stop (2.5), G9 only while the counted marker is
+   honest; neither ends the any-writer stop, which is question 8.
+
+   *Answered (owner, 2026-11-09, decision `bae92c497714`):* land G1 to G6
+   before the freeze; G7 may follow; G8 and G9 before the join, and G8
+   before any v2.
 5. **Pin the Unicode and encoding crates exactly** (`=` versions in
    `Cargo.toml` for `unicode-normalization`, `icu_casemap`, `ciborium` and
    `blake3`)? *Recommended: yes, as part of G6.* The digest and the golden
    vectors already fail on a change. An exact pin stops `cargo update`
    pulling one in, so a routine dependency bump doesn't turn into a
    protocol-class PR.
+
+   *Answered (owner, 2026-11-09, decision `bae92c497714`):* yes, pin
+   `unicode-normalization`, `icu_casemap`, `ciborium` and `blake3` exactly,
+   as part of G6.
 6. **Timing against stage 2b.** Freeze independently of the 20 Weave-gated
    merges (decision `b4a3456de597` step 1)? *Recommended: yes.* The freeze
    changes no format and blocks no merge. The count is about whether Weave's
    merges are trustworthy, not about its formats. The join still waits for
    both, and for its own go.
+
+   *Answered (owner, 2026-11-09, decision `bae92c497714`):* yes, the
+   freeze doesn't wait on the Weave-gated merge count.
 7. **Is a policy-version cutover enough for a v2 that closes a hole?**
    Section 3's cutover is a v2 line policy declaring a minimum version.
    It's written only by the line's author, under your decision. It stops
@@ -608,14 +699,30 @@ is question 8.
    change already has, and closing it is about who may write to a line
    (agent-keys.md, part B), not about formats. A v2 that closes a hole in
    another kind needs its own design, under question 3's go.
+
+   *Answered (owner, 2026-11-09, decision `bae92c497714`):* yes, a v2
+   that closes a hole in decisions uses the policy-version cutover, and
+   its stated gap is accepted.
 8. **Harden Weave against hostile writers before the join?** Weave
    assumes every writer is trusted (2.5), which holds today and stops
-   holding at the join. Any writer can currently stop a line or main, and
-   the known causes are only what reviews of this design found.
+   holding at the join. Any writer can currently stop a line or main, or
+   take over the default line and the name `main` with a forged marker,
+   and the known causes are only what reviews of this design found.
    *Recommended: yes, make it a precondition of the join.* Before the
    join's go, an independent review assumes any writer of the Ground is
    hostile and examines every Weave reader: the CLI's commands,
    `scripts/weave-gate` and `scripts/merge`. Each stop or wrong answer it
    finds is either fixed, or accepted by you in writing. G8 and G9 are
-   inputs to that review, not a substitute for it. The freeze itself
-   doesn't wait for this, since it changes no format.
+   inputs to that review, not a substitute for it, and so are the inputs
+   2.5 lists. The freeze doesn't wait for the whole review, since it
+   changes no format. It does wait for one of its findings: the
+   forged-marker takeover's fix likely changes the marker rule 1.3
+   freezes, which once the freeze holds is a section-3 change. So either
+   that fix lands before the freeze, or it's planned as a v2 under section
+   3.
+
+   *Answered (owner, 2026-11-09, decision `bae92c497714`):* yes, a
+   hostile-writer review and hardening is a precondition of the join. And,
+   on finding `26d9361e0a9f`, the freeze waits for the fix to the
+   forged-marker takeover, or for that fix to be planned as a v2, before
+   the owner's go to freeze (section 4).
