@@ -372,3 +372,122 @@ fn code_scope_frozen_names_the_freezes_paths_each_with_what_it_needs() {
         assert_eq!(run(&dir, "scripts/code-scope", &["full", "main", "elsewhere"]).status.code(), Some(1), "{scripts}");
     }
 }
+
+/// Makes a commit in `dir` with git's plumbing, through an index of its own, never the working tree: the
+/// tree of `from` with `files` (path, contents) written over it, and `parents` as its parents. So a path in
+/// a case a case-insensitive filesystem would fold is committed as given. Returns its sha.
+fn plumb(dir: &Path, from: &str, parents: &[&str], files: &[(&str, &str)]) -> String {
+    let index = dir.join(format!("../index-{}", files.len() + parents.len() * 100 + from.len() * 10_000));
+    let _ = std::fs::remove_file(&index);
+    let git = |args: &[&str]| {
+        let out = command(dir, "git", args).env("GIT_INDEX_FILE", &index).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&["read-tree", from]);
+    let blob = dir.join("../plumb-blob");
+    for (path, text) in files {
+        std::fs::write(&blob, text).unwrap();
+        let oid = git(&["hash-object", "-w", blob.to_str().unwrap()]);
+        git(&["update-index", "--add", "--cacheinfo", &format!("100644,{oid},{path}")]);
+    }
+    let tree = git(&["write-tree"]);
+    let mut args = vec!["commit-tree", tree.as_str(), "-m", "plumbed"];
+    for p in parents {
+        args.extend(["-p", p]);
+    }
+    git(&args)
+}
+
+/// Findings 89119f47ba5c and bb7107f27076. Paths are matched with ASCII case folded, since a
+/// case-insensitive checkout (macOS's default) writes Crates/Tree/src/x.rs over crates/tree/src/x.rs: frozen
+/// and full name a case variant of their paths. frozen refuses, exit 2 naming both, a changed path that
+/// differs only in case from another path in the merged tree. With several merge bases (a criss-cross
+/// history, which a diff from one can miss), frozen refuses, exit 2, and full says every package is
+/// needed, as packages then gives.
+#[test]
+fn code_scope_folds_case_and_fails_closed_on_a_collision_or_a_criss_cross() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("code-scope");
+        let files = [("scripts/code-scope", scope.as_path())];
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/format.rs", "format\n");
+            put(dir, "notes.txt", "notes\n");
+        });
+        let stub = affected_stub(&tmp.path().join("bracken-scope"));
+        let scope = |args: &[&str]| {
+            let out = command(&dir, "scripts/code-scope", args).env("CODE_SCOPE_TOKENS", &stub).output().unwrap();
+            let said =
+                (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+            (out.status.code(), said.0, said.1)
+        };
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let head = |files: &[(&str, &str)]| plumb(&dir, &main, &[&main], files);
+
+        // Case variants of each kind, none colliding with a path that exists: named, as their kind.
+        let variants = head(&[
+            ("Crates/Tree/src/New.rs", "new\n"),
+            ("crates/tree/CARGO.toml", "[package]\n"),
+            ("crates/tree/tests/FIXTURES/x", "fixture\n"),
+            ("crates/bracken/src/WEAVE.rs", "cli\n"),
+        ]);
+        let (code, out, err) = scope(&["frozen", &main, &variants]);
+        assert_eq!(code, Some(0), "{scripts}: {out}{err}");
+        for line in [
+            "code-scope: frozen: Crates/Tree/src/New.rs (",
+            "code-scope: security: Crates/Tree/src/New.rs (",
+            "code-scope: frozen: crates/tree/CARGO.toml (",
+            "code-scope: frozen: crates/tree/tests/FIXTURES/x (",
+            "code-scope: owner: crates/tree/tests/FIXTURES/x (",
+            "code-scope: security: crates/bracken/src/WEAVE.rs (",
+        ] {
+            assert!(out.contains(line), "{scripts}: {line}: {out}");
+        }
+        let (code, out, _) = scope(&["full", &main, &variants]);
+        assert_eq!(code, Some(0), "{scripts}: {out}");
+        for path in ["Crates/Tree/src/New.rs", "crates/tree/CARGO.toml", "crates/bracken/src/WEAVE.rs"] {
+            assert!(out.contains(&format!("code-scope: full: {path} (")), "{scripts}: {path}: {out}");
+        }
+        let (code, out, _) = scope(&["full", &main, &head(&[("CARGO.toml", "[workspace]\n")])]);
+        assert!(code == Some(0) && out.contains("code-scope: full: CARGO.toml (the workspace's CARGO.toml)"), "{out}");
+
+        // A case collision in the merged tree: refused, naming both, whether the path is frozen or not, and
+        // whichever side came first.
+        for (path, other) in [
+            ("Crates/Tree/src/format.rs", "crates/tree/src/format.rs"),
+            ("crates/tree/src/FORMAT.rs", "crates/tree/src/format.rs"),
+            ("NOTES.txt", "notes.txt"),
+        ] {
+            let (code, out, err) = scope(&["frozen", &main, &head(&[(path, "over it\n")])]);
+            assert_eq!(code, Some(2), "{scripts}: {path}: {out}{err}");
+            assert!(out.is_empty(), "{scripts}: {path}: {out}");
+            assert!(err.contains("differing only in case") && err.contains(path) && err.contains(other), "{err}");
+        }
+        // Two new paths that collide with each other.
+        let (code, _, err) = scope(&["frozen", &main, &head(&[("docs/a.md", "a\n"), ("docs/A.md", "A\n")])]);
+        assert!(code == Some(2) && err.contains("docs/A.md and docs/a.md"), "{scripts}: {err}");
+
+        // A head that doesn't merge cleanly: refused.
+        let tip = plumb(&dir, &main, &[&main], &[("notes.txt", "main's\n")]);
+        let (code, _, err) = scope(&["frozen", &tip, &head(&[("notes.txt", "the head's\n")])]);
+        assert!(code == Some(2) && err.contains("doesn't merge cleanly"), "{scripts}: {err}");
+
+        // A criss-cross (the finding's counterexample): B2 changes a frozen file, B1 something else; the tip
+        // merges B2 into B1, and the head merges them too, putting the frozen file back.
+        let b2 = head(&[("crates/tree/src/f.rs", "y\n")]);
+        let b1 = head(&[("notes.txt", "b1\n")]);
+        let tip = plumb(&dir, &b2, &[&b1, &b2], &[("notes.txt", "b1\n")]);
+        let crossed = plumb(&dir, &b1, &[&b2, &b1], &[]);
+        let (code, out, err) = scope(&["frozen", &tip, &crossed]);
+        assert_eq!(code, Some(2), "{scripts}: {out}{err}");
+        assert!(out.is_empty() && err.contains("are all merge bases") && err.contains("criss-cross"), "{err}");
+        let (code, out, _) = scope(&["full", &tip, &crossed]);
+        assert!(
+            code == Some(0) && out.starts_with("code-scope: full: every package (") && out.contains("criss-cross"),
+            "{out}"
+        );
+        let (code, out, _) = scope(&["packages", &tip, &crossed]);
+        let all = "bracken\nbracken-demo\nbracken-experiment\nbracken-scope\nbracken-tree\nmanyroot\n";
+        assert_eq!((code, out.as_str()), (Some(0), all), "{scripts}");
+    }
+}

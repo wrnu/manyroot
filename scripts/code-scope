@@ -42,7 +42,8 @@
 #
 # full exits 0 when what <head> changed since its merge base with <base> touches a path a light counted
 # run can't cover (decision 464d3ccca45e, answer 10cf8a5053a3), printing one 'code-scope: full: <path>
-# (<why>)' line for each, and exits 1, saying so, when it touches none; 2 on an error. Renames count as
+# (<why>)' line for each, or, when <base> and <head> have several merge bases (a criss-cross history,
+# finding bb7107f27076), one 'code-scope: full: every package (...)' line, as packages then gives every package; and exits 1, saying so, when it touches none; 2 on an error. Renames count as
 # a deletion and an addition, as for docs-only. scripts/verify-seq --light refuses such a head, and
 # scripts/merge refuses a light pass for it: this list is the one both read. Another project replaces
 # the list with its own.
@@ -55,7 +56,11 @@
 # of its own, so a failure (exit 1 from set -e included) never reads as nothing to check; 2 on an error. A
 # changed path holding a newline or another control character is an error, named escaped on standard
 # error with nothing on standard output, since one couldn't be printed a line each (findings
-# db2dc1c6120e, e3f9ae2b1820). Renames count as a deletion and an addition, and a change only in comments
+# db2dc1c6120e, e3f9ae2b1820). So is a changed path that differs only in ASCII case from another path in the
+# merged tree (<base> merged with <head>, as GitHub's squash merge makes it), naming both: a
+# case-insensitive checkout writes one over the other; a head that doesn't merge cleanly; and several
+# merge bases, a criss-cross history a diff from one can miss (findings 89119f47ba5c, bb7107f27076). Every
+# path is matched with its ASCII letters lowercased, here and in full. Renames count as a deletion and an addition, and a change only in comments
 # counts too: nothing here asks bracken-scope.
 #   'code-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, and, as
@@ -102,6 +107,12 @@ docs() {
   esac
 }
 
+# lower <path>: <path> with ASCII letters lowercased. The modes below match on it, since a case-insensitive
+# checkout (macOS's default) writes Crates/Tree/src/lib.rs over crates/tree/src/lib.rs (finding 89119f47ba5c).
+lower() { printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'; }
+# bases <base> <head>: their merge bases, one a line; exit 2 if there's none.
+bases() { git merge-base --all "$1" "$2" || exit 2; }
+
 # Why a change to $1 needs the full table, printed; or nothing, returning 1. The protocol class (AGENTS.md:
 # encoding, ids, the signing context and validity rules) is crates/manyroot and docs/protocol.md. The
 # Weave validity code the weave-v1 fixture pins is all of crates/tree's source and manifest, whatever
@@ -109,11 +120,11 @@ docs() {
 # be317d39449b): a list of modules would miss lib.rs, which decides what each module compiles from, and
 # rot as modules are added. .cargo/, rust-toolchain* and any build.rs change every build.
 full_mode() {
-  case "$1" in
+  case "$(lower "$1")" in
     crates/manyroot/*) echo "crates/manyroot, the protocol crate" ;;
-    Cargo.toml | Cargo.lock) echo "the workspace's $1" ;;
+    cargo.toml | cargo.lock) echo "the workspace's $1" ;;
     docs/protocol.md) echo "the protocol class" ;;
-    crates/tree/src/* | crates/tree/Cargo.toml | crates/tree/tests/weave_fixture.rs | crates/tree/tests/fixtures/*)
+    crates/tree/src/* | crates/tree/cargo.toml | crates/tree/tests/weave_fixture.rs | crates/tree/tests/fixtures/*)
       echo "crates/tree's source, or the Weave validity code the weave-v1 fixture pins" ;;
     # The freeze's other guards, and Weave's CLI, which holds refusals the freeze names (weave-freeze.md
     # 2.4, G6).
@@ -132,9 +143,9 @@ full_mode() {
 # frozen set, or returns 1; owner_mode why a change to it needs the owner's own go; security_mode why it
 # needs an independent review. Each keyed on directories.
 frozen_mode() {
-  case "$1" in
+  case "$(lower "$1")" in
     crates/tree/src/*) echo "crates/tree's source, which holds Weave's frozen formats and their rules" ;;
-    crates/tree/Cargo.toml) echo "crates/tree's manifest: what its formats build from" ;;
+    crates/tree/cargo.toml) echo "crates/tree's manifest: what its formats build from" ;;
     crates/tree/tests/format_guard.rs) echo "the format guard: golden vectors and pins" ;;
     crates/tree/tests/paths.rs) echo "the path, folding and collision rules' guard" ;;
     crates/tree/tests/lines.rs) echo "the ancestor rule's guard" ;;
@@ -144,7 +155,7 @@ frozen_mode() {
   esac
 }
 owner_mode() {
-  case "$1" in
+  case "$(lower "$1")" in
     crates/tree/tests/format_guard.rs) echo "golden vectors and pinned values: the owner's own go" ;;
     crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's pinned values: the owner's own go" ;;
     crates/tree/tests/fixtures/*) echo "a Weave fixture: the owner's own go" ;;
@@ -152,7 +163,7 @@ owner_mode() {
   esac
 }
 security_mode() {
-  case "$1" in
+  case "$(lower "$1")" in
     crates/tree/src/*) echo "crates/tree's source, where the freeze's refusals at write and use live" ;;
     crates/bracken/src/weave.rs | crates/bracken/src/weave/*) echo "Weave's CLI, where the freeze's refusals at use live" ;;
     *) return 1 ;;
@@ -224,7 +235,11 @@ scope_packages() {
 case "${1:-}" in
   packages)
     [ $# -eq 3 ] || usage
-    base=$(git merge-base "$2" "$3") || exit 2
+    all_bases=$(bases "$2" "$3") || exit 2
+    # Several merge bases: a criss-cross history, which a diff from one can miss, so every package, as full
+    # says (finding bb7107f27076).
+    if [ "$(wc -l <<<"$all_bases")" -gt 1 ]; then scope_packages --all "$3"; exit 0; fi
+    base=$all_bases
     changed=$(mktemp)
     trap 'rm -f "$changed"' EXIT
     git diff --no-renames --name-only -z "$base" "$3" >"$changed" || exit 2
@@ -285,7 +300,12 @@ case "${1:-}" in
     ;;
   full)
     [ $# -eq 3 ] || usage
-    base=$(git merge-base "$2" "$3") || exit 2
+    all_bases=$(bases "$2" "$3") || exit 2
+    if [ "$(wc -l <<<"$all_bases")" -gt 1 ]; then
+      echo "code-scope: full: every package ($(tr "\n" " " <<<"$all_bases" | sed "s/ \$//") are all merge bases of $2 and $3: a criss-cross history, which a diff from one of them can miss)"
+      exit 0
+    fi
+    base=$all_bases
     changed=$(mktemp)
     trap 'rm -f "$changed"' EXIT
     git diff --no-renames --name-only -z "$base" "$3" >"$changed" || exit 2
@@ -300,7 +320,12 @@ case "${1:-}" in
     ;;
   frozen)
     [ $# -eq 3 ] || usage
-    base=$(git merge-base "$2" "$3") || exit 2
+    all_bases=$(bases "$2" "$3") || exit 2
+    if [ "$(wc -l <<<"$all_bases")" -gt 1 ]; then
+      echo "code-scope: frozen: $(tr "\n" " " <<<"$all_bases" | sed "s/ \$//") are all merge bases of $2 and $3: a criss-cross history, which a diff from one of them can miss, so this can't say what's frozen" >&2
+      exit 2
+    fi
+    base=$all_bases
     head=$(git rev-parse --verify -q "$3^{commit}") || exit 2
     changed=$(mktemp)
     trap 'rm -f "$changed"' EXIT
@@ -312,6 +337,24 @@ case "${1:-}" in
         exit 2
       fi
     done <"$changed"
+    # A changed path that differs only in ASCII case from another path in the merged tree: a case-insensitive
+    # checkout (macOS's default) writes one over the other (finding 89119f47ba5c), so refuse, naming both.
+    merged=$(git merge-tree --write-tree --no-messages "$2" "$head" 2>/dev/null) ||
+      { echo "code-scope: frozen: $head doesn't merge cleanly onto $2, so the merged tree can't be checked" >&2; exit 2; }
+    tree_paths=$(mktemp)
+    trap 'rm -f "$changed" "$tree_paths"' EXIT
+    git ls-tree -r -z --name-only "${merged%%$'\n'*}" | tr '\0' '\n' >"$tree_paths" || exit 2
+    collisions=$(tr '\0' '\n' <"$changed" | LC_ALL=C awk 'NR == FNR { ch[$0] = 1; next }
+      { k = tolower($0)
+        if (!(k in first)) { first[k] = $0; next }
+        if (!(k in all)) all[k] = first[k]
+        all[k] = all[k] " and " $0
+        if (($0 in ch) || (first[k] in ch)) hit[k] = 1 }
+      END { for (k in hit) print all[k] }' - "$tree_paths") || exit 2
+    if [ -n "$collisions" ]; then
+      echo "code-scope: frozen: paths differing only in case, which a case-insensitive checkout writes over each other: $(tr '\n' ';' <<<"$collisions" | sed 's/;$//; s/;/; /g')" >&2
+      exit 2
+    fi
     found=false
     while IFS= read -r -d '' path; do
       if why=$(frozen_mode "$path"); then found=true; echo "code-scope: frozen: $path ($why)"; fi
