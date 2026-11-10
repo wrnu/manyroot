@@ -49,6 +49,18 @@
 #   6. scripts/ground-guards passes on the sha against main's tip: no keys or stray
 #      files under .bracken/, the Ground append-only, the Ground opens, and
 #      docs/vision.md matches it;
+#   frozen: what Weave's format freeze guards (docs/design/weave-freeze.md 2.4, G6; decision
+#      bae92c497714), as main's scripts/code-scope frozen names it for the head since main's tip. If it
+#      names anything, then for each kind of line it prints: a 'frozen:' path needs a current claim
+#      tagged owner-review, by manager, not retracted or superseded, whose first line names the pr
+#      claim's full id and the head's full sha; an 'owner:' path (a golden vector, a pinned fixture value,
+#      tests/fixtures/) also needs the owner's own go (question 3): a current approval the owner ran with
+#      scripts/owner-approve, not --delegated, of the pr claim's full id, that owner related supports the
+#      claim (the claim names the sha); a 'security:' path (the directories of the freeze's refusals,
+#      section 1.8) needs a pass by reviewer, not retracted, on the claim, 'independent review (<model>)
+#      @ <sha>'. Each refusal names the paths and what's missing. Only frozen's exit 3 and its one line mean
+#      nothing to check; any other exit, or an exit 0 with a line that isn't '<kind>: <path> (<why>)' of
+#      those three kinds, fails the check (findings db2dc1c6120e, e3f9ae2b1820);
 #   7. with --owner-approval, for a PR whose class needs the owner's go (docs/development.md, Owner
 #      approvals): a current claim tagged approval, written by owner (scripts/owner-approve), that owner
 #      related supports this pr claim itself, by its full id. An approval of a task, another PR or an
@@ -622,6 +634,96 @@ else
   check FAIL guards "$( (grep '^ground-guards:' <<<"$guards" || tail -1 <<<"$guards") | tail -1)"
 fi
 
+# 6a. The format freeze (docs/design/weave-freeze.md 2.4, G6; decision bae92c497714), through main's
+# code-scope, as for full: see the header.
+frozen_case="nothing frozen"
+if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  check FAIL frozen "$sha isn't on origin"
+else
+  rc=0
+  frozen_err=$(mktemp)
+  frozen=$(cd "$main" && "$here/code-scope" frozen "$tip" "$sha" 2>"$frozen_err") || rc=$?
+  frozen_why=$(tr '\n' ' ' <"$frozen_err" | sed 's/ $//')
+  rm -f "$frozen_err"
+  # Fail closed (findings db2dc1c6120e, e3f9ae2b1820): only exit 3 with exactly its one line means nothing
+  # to check, and exit 0 counts only if every line is '<kind>: <path> (<why>)' of a kind this check knows.
+  # Anything else, a failure or output it can't read, decides nothing.
+  unread=''
+  if [ "$rc" = 0 ]; then
+    [ -n "$frozen" ] || unread="no line at all"
+    while IFS= read -r l; do
+      [ -n "$unread" ] && break
+      [[ $l =~ ^code-scope:\ (frozen|owner|security):\ [^[:cntrl:]]+\ \([^[:cntrl:]]+\)$ ]] ||
+        unread="a line it can't read: $(printf '%q' "$l")"
+    done <<<"$frozen"
+  elif [ "$rc" = 3 ]; then
+    [[ $frozen =~ ^code-scope:\ nothing\ since\ [0-9a-f]{40,64}\ is\ frozen\ or\ holds\ the\ freeze\'s\ refusals$ ]] ||
+      unread="an answer for nothing to check that isn't its one line: $(printf '%q' "$frozen")"
+  fi
+  if [ "$rc" = 3 ] && [ -z "$unread" ]; then
+    check ok frozen "$frozen_case: ${frozen#code-scope: }"
+  elif [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
+    check FAIL frozen "code-scope frozen failed (exit $rc), so the freeze check can't decide: ${frozen_why:-no message}"
+  elif [ -n "$unread" ]; then
+    check FAIL frozen "code-scope frozen exited $rc with $unread, so the freeze check can't decide"
+  else
+    missing=() have=()
+    # paths_of <kind>: the paths code-scope named with 'code-scope: <kind>: <path> (<why>)', space-separated.
+    paths_of() { sed -n "s/^code-scope: $1: \\(.*\\) (.*)\$/\\1/p" <<<"$frozen" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+    frozen_paths=$(paths_of frozen) owner_paths=$(paths_of owner) security_paths=$(paths_of security)
+    # A full id or sha, named as a word of its own: not part of a longer hex string.
+    named() { printf '(^|[^0-9a-f])%s([^0-9a-f]|$)' "$1"; }
+    if [ -n "$frozen_paths" ]; then
+      reviews=$(bk log --tag owner-review --current --json) || fail "couldn't read the current owner-review claims"
+      review=$(jq -r --arg id "$(named "$full")" --arg sha "$(named "$sha")" '[.[] | select(.kind == "claim"
+        and .author_name == "manager" and .retracted == false and (.superseded_by_others | length) == 0
+        and (.body.tags | index("owner-review"))
+        and ((.body.statement // "") | split("\n")[0] | test($id) and test($sha)))] | .[0].id // empty' <<<"$reviews")
+      if [ -n "$review" ]; then
+        have+=("owner-review ${review:0:12}")
+      else
+        missing+=("$frozen_paths: no current owner-review claim by manager whose first line names pr claim $full and $sha")
+      fi
+    fi
+    if [ -n "$owner_paths" ]; then
+      approvals=$(bk log --tag approval --current --json) || fail "couldn't read the current approvals"
+      # The owner's own go (question 3): one the owner ran, never one signed on the owner's delegation,
+      # naming this pr claim and supporting it by the owner's own relation. The claim names the sha.
+      approval=''
+      for a in $(jq -r --arg t "$full" '.referrers[] | select(.kind == "relation" and .retracted == false
+        and .author_name == "owner" and .body.kind == "supports" and .body.to == $t) | .body.from' <<<"$shown"); do
+        if jq -e --arg a "$a" --arg of "of $full:" 'any(.[]; .id == $a and .author_name == "owner"
+          and .retracted == false and (.superseded_by_others | length) == 0 and (.body.tags | index("approval"))
+          and ((.body.tags | index("delegated")) | not) and ((.body.statement // "") | contains($of)))' \
+          <<<"$approvals" >/dev/null; then
+          approval=$a
+          break
+        fi
+      done
+      if [ -n "$approval" ]; then
+        have+=("the owner's approval ${approval:0:12}")
+      else
+        missing+=("$owner_paths: no current approval the owner ran (scripts/owner-approve $full, not --delegated) that names and supports pr claim $full at $sha")
+      fi
+    fi
+    if [ -n "$security_paths" ]; then
+      if jq -e --arg full "$full" --arg m "^independent review \\(.+\\) @ $sha\$" 'any(.referrers[]; .kind == "evidence"
+        and .retracted == false and .author_name == "reviewer" and .body.target == $full
+        and .body.verdict == "pass" and (.body.method | test($m)))' <<<"$shown" >/dev/null; then
+        have+=("an independent review's pass at $sha")
+      else
+        missing+=("$security_paths: no independent review's pass (reviewer evidence 'independent review (<model>) @ $sha') on pr claim $full")
+      fi
+    fi
+    if [ ${#missing[@]} -eq 0 ]; then
+      frozen_case="frozen or refusal paths changed, and the freeze's review is there: $(printf '%s; ' "${have[@]}" | sed 's/; $//')"
+      check ok frozen "$frozen_case"
+    else
+      check FAIL frozen "the head changes what Weave's format freeze guards: $(printf '%s; ' "${missing[@]}" | sed 's/; $//')"
+    fi
+  fi
+fi
+
 # 7. The owner's own approval, when the class needs it.
 owner_case="not required for this class"
 if $owner_approval; then
@@ -657,8 +759,8 @@ if $dry_run; then
   exit 0
 fi
 
-printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\ngithub head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nowner: %s\n' \
-  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$owner_case" >"$details"
+printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\ngithub head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nfrozen: %s\nowner: %s\n' \
+  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$frozen_case" "$owner_case" >"$details"
 written=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
   fail "couldn't record the merge-gate evidence; not merging"
 # The first line's last word: 'evidence <id>' (task d4e958fd6719), or a bare id from an older pinned binary.
