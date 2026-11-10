@@ -316,28 +316,51 @@ in reader configuration.
 adopt it without re-signing every record, which changes every id. **Not
 proposed.**
 
-### H. Detection only
+### H. Detection only: the interim check
 
-**Rule.** No rule changes. `scripts/weave-gate` refuses when the counted
-marker's author isn't the expected identity (decision `03534914ec55` (2),
-note `4064049282f2` (1)).
+**Rule.** No rule changes. `scripts/weave-gate` refuses a Weave Ground that
+may have been taken over. This is the interim detection of decision
+`03534914ec55` (2) (note `4064049282f2` (1)), built in PR #31 (task
+`5c616750e3f9`, report `dfe0f5938ff8`). Its `taken_over` check runs in
+both `record` and `check`, and fails closed when:
+- `weave check --json` reports an `extra_marker` problem, or no counted
+  marker;
+- line main's first version, the default line, isn't signed with the key
+  the Weave Ground holds for `weave-integrator` (compared by key, not by
+  name);
+- `weave head --line main`, the name `green` and `validate` read, names a
+  line other than the default one;
+- any of those reads fails.
 
-**What it refuses.** A gate pass under a forged marker: the takeover
-becomes a stop at the gate. It doesn't touch the CLI's views.
+`record` then exits 1 and says to run git's counted run; `check` exits 1,
+so `scripts/merge` ignores the Weave pointer.
 
-**What it changes.** `scripts/weave-gate` only.
+**What it refuses.** A gate pass under a forged marker, or with a second
+line named `main` in play: the takeover becomes a stop at the gate, and
+the merge falls back to git's counted run. It doesn't touch the CLI's
+views.
+
+**What it changes.** `scripts/weave-gate` and its kickoff-template copy.
 
 **Frozen rule?** No.
 
-**Existing Grounds.** Unchanged.
+**Existing Grounds.** Unchanged. On `~/bracken-weave/manyroot`, which holds
+one marker and a `main` by `weave-integrator` with no problems (section 2),
+it should pass; PR #31's report says it wasn't run there.
 
-**Residual risk.** The takeover still holds everywhere but the gate, and
-the gate's stop is permanent, for the reason under D. Decision
-`03534914ec55` builds it as interim detection. Under A, it should check
-that the counted marker's author is the pinned root, which A makes always
-true unless the pin is missing or changed. It **must not** refuse on any
-extra marker once A lands: that hands every writer a stop, since anyone can
-write a marker.
+**Residual risk.** The takeover still holds everywhere but the gate:
+`weave head`, `green` and the default line still follow the forged marker
+for any other reader. At the gate it's a stop, and only the forger can
+end it, by retracting their marker (the reason under D); until then every
+Weave-gated merge falls back to git's run, which is a cost, not a wrong
+answer. It also rests on a name: the expected author is whatever key the
+local Ground holds for `weave-integrator`. **Once A lands, the check should
+narrow.** Under A, a marker by anyone but the root is ignored, so refusing
+on any `extra_marker` hands every writer a stop for nothing: anyone can
+write a marker. It should then refuse only when there's no counted marker,
+or the counted marker's author isn't the pinned root (which A makes
+impossible unless the pin is missing or changed), and keep its check of
+`weave head --line main`.
 
 ## 3. Comparison
 
@@ -390,7 +413,8 @@ first exception; it's why landing it now is cheap.
 Readers first, as weave-freeze.md section 3 asks for any rule two binaries
 could disagree on:
 1. The build PR: option A in `crates/tree` and `crates/bracken`, `weave
-   root set`, the committed `.config/weave-root`, and the scripts' check.
+   root set`, the committed `.config/weave-root`, the scripts' check, and
+   PR #31's gate check narrowed as question 5 says.
 2. Upgrade both binaries that read the Weave Ground, the pinned
    `.bracken-bin` and `~/bracken-weave`'s, then run `weave root set` with
    `weave-integrator`'s AgentId through `scripts/weave`, as the manager
@@ -399,7 +423,7 @@ could disagree on:
 3. Only then does the freeze's go follow (decision `bae92c497714`).
 
 A binary from before step 1 still counts the old way, so until step 2 the
-gate's detection (H) is what notices a forgery. Before the join nothing
+gate's detection (H, PR #31) is what notices a forgery. Before the join nothing
 outside this machine reads the Weave Ground, so the upgrade is the whole of
 step 2. At the join, the coordination Ground's root is pinned in the join
 PR, before the marker is written (question 2), and every reader of that
@@ -438,10 +462,11 @@ Ground must already have the fix.
    markers, while the root's key keeps every other power; an identity can
    be pinned before its marker exists, which the join needs; and part B
    grants keys, not records.
-5. **The gate's detection (decision `03534914ec55` (2)).** Once A lands,
-   refuse only when the counted marker's author isn't the pinned root, or
-   there's no counted marker; never because some other marker exists.
-   *Recommended: yes.* Refusing on any extra marker gives every writer a
+5. **The gate's detection (decision `03534914ec55` (2), PR #31).** Once A
+   lands, narrow PR #31's check: refuse only when the counted marker's
+   author isn't the pinned root, or there's no counted marker, or `weave
+   head --line main` names another line; never because some other marker
+   exists. *Recommended: yes.* Refusing on any extra marker gives every writer a
    permanent stop, since only a marker's author can retract it.
 6. **What the freeze locks.** Freeze "only a marker signed by the Ground's
    root can count, and among the root's markers, the causally first,

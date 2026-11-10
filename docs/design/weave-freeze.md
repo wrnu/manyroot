@@ -429,9 +429,15 @@ Ending them before the join is question 8.
   forged-marker fix must rest on who may write a marker, not on id order
   (note `ba9e77679d4f`). [weave-marker.md](weave-marker.md) compares the
   fixes and recommends a pinned root identity, landed before the freeze;
-- `scripts/weave-gate` checks none of the problems Weave's index reports,
-  the extra-marker problem included, so the takeover is silent there (note
-  `ba9e77679d4f`);
+- `scripts/weave-gate` used to check none of the problems Weave's index
+  reports, so the takeover was silent there (note `ba9e77679d4f`). PR #31
+  (task `5c616750e3f9`) adds an interim detection: the gate refuses when
+  `weave check --json` reports an extra marker or no counted marker, when
+  line main's first version isn't signed with `weave-integrator`'s key, or
+  when `weave head --line main` names another line. That turns the
+  takeover into a stop at the gate, which falls back to git's counted run.
+  It's detection, not a fix: other readers still follow a forged marker,
+  and only its author can retract it (weave-marker.md, option H);
 - after G8, if main's integrator merges a hostile writer's line into main,
   that writer can still stop main with an unreadable version on their own
   line;
