@@ -65,7 +65,9 @@
 # 5b38ef3c9557), and main tracks no such path. frozen and full both read what <head> changed since the merge
 # base and every path that differs between <base> and the merged tree, since the merge carries a head's edit
 # onto a path main renamed (finding e1a2fe970409); full answers every package for a path outside
-# printable ASCII or a head that doesn't merge cleanly. Renames count as a deletion and an addition, and a change only in comments
+# printable ASCII or a head that doesn't merge cleanly. A changed path that is a symlink or a gitlink in
+# the merged tree or <head> is refused too, and makes full answer every package: main tracks neither. The
+# case check compares each path's leading directories as well (finding 304dd65b233c). Renames count as a deletion and an addition, and a change only in comments
 # counts too: nothing here asks bracken-scope.
 #   'code-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, and, as
@@ -144,6 +146,20 @@ unprintable() {
 }
 # escaped <path>: <path> quoted for the shell, every byte outside printable ASCII escaped.
 escaped() { LC_ALL=C bash -c 'printf %q "$1"' _ "$1"; }
+
+# special_changed <changed file> <tree>...: each path in <changed file> (NUL-separated, printable ASCII by
+# then) that is a symlink (mode 120000) or a gitlink (160000) in any <tree>, one '<path> (<what>)' a line.
+# main tracks neither, and a symlink named as a case variant of a directory replaces that directory on a
+# case-insensitive checkout (finding 304dd65b233c), so both are refused rather than judged.
+special_changed() {
+  local changed=$1 t
+  shift
+  for t in "$@"; do git ls-tree -r -z "$t" || return 1; done | tr '\0' '\n' |
+    LC_ALL=C awk -F'\t' -v list="$changed" 'BEGIN { while ((getline l < list) > 0) ch[l] = 1 }
+      { split($1, m, " ") }
+      (m[1] == "120000" || m[1] == "160000") && ($2 in ch) && !(($2, m[1]) in said) {
+        said[$2, m[1]] = 1; print $2 " (" (m[1] == "120000" ? "a symlink" : "a gitlink") ")" }'
+}
 
 # Why a change to $1 needs the full table, printed; or nothing, returning 1. The protocol class (AGENTS.md:
 # encoding, ids, the signing context and validity rules) is crates/manyroot and docs/protocol.md. The
@@ -351,6 +367,14 @@ case "${1:-}" in
         exit 0
       fi
     done <"$changed"
+    lines=$(mktemp)
+    trap 'rm -f "$changed" "$lines"' EXIT
+    tr '\0' '\n' <"$changed" >"$lines"
+    special=$(special_changed "$lines" "$merged" "$3") || exit 2
+    if [ -n "$special" ]; then
+      echo "code-scope: full: every package (a changed path is a symlink or a gitlink: $(tr '\n' ';' <<<"$special" | sed 's/;$//; s/;/; /g'))"
+      exit 0
+    fi
     found=false
     while IFS= read -r -d '' path; do
       if why=$(full_mode "$path") && ! comment_only "$2" "$base" "$3" "$path"; then
@@ -382,18 +406,38 @@ case "${1:-}" in
         exit 2
       fi
     done <"$changed"
+    lines=$(mktemp)
+    trap 'rm -f "$changed" "$tree_paths" "$lines"' EXIT
+    tr '\0' '\n' <"$changed" >"$lines"
+    special=$(special_changed "$lines" "$merged" "$head") || exit 2
+    if [ -n "$special" ]; then
+      echo "code-scope: frozen: a changed path is a symlink or a gitlink, which main tracks none of, so it's refused: $(tr '\n' ';' <<<"$special" | sed 's/;$//; s/;/; /g')" >&2
+      exit 2
+    fi
     # A changed path that differs only in ASCII case from another path in the merged tree: a case-insensitive
     # checkout (macOS's default) writes one over the other (finding 89119f47ba5c), so refuse, naming both.
     git ls-tree -r -z --name-only "$merged" | tr '\0' '\n' >"$tree_paths" || exit 2
-    collisions=$(tr '\0' '\n' <"$changed" | LC_ALL=C awk 'NR == FNR { ch[$0] = 1; next }
-      { k = tolower($0)
-        if (!(k in first)) { first[k] = $0; next }
-        if (!(k in all)) all[k] = first[k]
-        all[k] = all[k] " and " $0
-        if (($0 in ch) || (first[k] in ch)) hit[k] = 1 }
-      END { for (k in hit) print all[k] }' - "$tree_paths") || exit 2
+    # Each path and each of its leading directories (finding 304dd65b233c: a case variant of a directory
+    # replaces it): any two spellings with one lowercase form, one of them from a changed path, collide.
+    collisions=$(LC_ALL=C awk '
+      function add(p, touched,   n, i, part, pre, k) {
+        n = split(p, part, "/")
+        pre = ""
+        for (i = 1; i <= n; i++) {
+          pre = (i == 1) ? part[1] : pre "/" part[i]
+          k = tolower(pre)
+          if (touched) hit[k] = 1
+          if ((k, pre) in seen) continue
+          seen[k, pre] = 1
+          all[k] = (k in all) ? all[k] " and " pre : pre
+          count[k]++
+        }
+      }
+      NR == FNR { add($0, 1); next }
+      { add($0, 0) }
+      END { for (k in hit) if (count[k] > 1) print all[k] }' "$lines" "$tree_paths") || exit 2
     if [ -n "$collisions" ]; then
-      echo "code-scope: frozen: paths differing only in case, which a case-insensitive checkout writes over each other: $(tr '\n' ';' <<<"$collisions" | sed 's/;$//; s/;/; /g')" >&2
+      echo "code-scope: frozen: paths or directories differing only in case, which a case-insensitive checkout writes over each other: $(tr '\n' ';' <<<"$collisions" | sed 's/;$//; s/;/; /g')" >&2
       exit 2
     fi
     found=false

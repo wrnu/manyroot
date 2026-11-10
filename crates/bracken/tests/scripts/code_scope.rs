@@ -378,6 +378,13 @@ fn code_scope_frozen_names_the_freezes_paths_each_with_what_it_needs() {
 /// a case a case-insensitive filesystem would fold is committed as given. A path with empty contents is
 /// removed. Returns its sha.
 fn plumb(dir: &Path, from: &str, parents: &[&str], files: &[(&str, &str)]) -> String {
+    let entries: Vec<(&str, &str, &str)> = files.iter().map(|(p, t)| ("100644", *p, *t)).collect();
+    plumb_modes(dir, from, parents, &entries)
+}
+
+/// As [`plumb`], each entry (mode, path, contents) with its mode: for 120000, a symlink, the contents are its
+/// target; for 160000, a gitlink, the contents are the commit it names.
+fn plumb_modes(dir: &Path, from: &str, parents: &[&str], files: &[(&str, &str, &str)]) -> String {
     let index = dir.join(format!("../index-{}", files.len() + parents.len() * 100 + from.len() * 10_000));
     let _ = std::fs::remove_file(&index);
     let git = |args: &[&str]| {
@@ -387,15 +394,19 @@ fn plumb(dir: &Path, from: &str, parents: &[&str], files: &[(&str, &str)]) -> St
     };
     git(&["read-tree", from]);
     let blob = dir.join("../plumb-blob");
-    for (path, text) in files {
+    for (mode, path, text) in files {
         // Empty contents remove the path.
         if text.is_empty() {
             git(&["update-index", "--force-remove", path]);
             continue;
         }
-        std::fs::write(&blob, text).unwrap();
-        let oid = git(&["hash-object", "-w", blob.to_str().unwrap()]);
-        git(&["update-index", "--add", "--cacheinfo", &format!("100644,{oid},{path}")]);
+        let oid = if *mode == "160000" {
+            (*text).to_owned()
+        } else {
+            std::fs::write(&blob, text).unwrap();
+            git(&["hash-object", "-w", blob.to_str().unwrap()])
+        };
+        git(&["update-index", "--add", "--cacheinfo", &format!("{mode},{oid},{path}")]);
     }
     let tree = git(&["write-tree"]);
     let mut args = vec!["commit-tree", tree.as_str(), "-m", "plumbed"];
@@ -430,18 +441,24 @@ fn code_scope_folds_case_and_fails_closed_on_a_collision_or_a_criss_cross() {
         let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
         let head = |files: &[(&str, &str)]| plumb(&dir, &main, &[&main], files);
 
-        // Case variants of each kind, none colliding with a path that exists: named, as their kind.
+        // Case variants of each kind, none colliding with a path or directory that exists: named, as their
+        // kind. (Crates/Tree/src/New.rs collides with the directory crates/: refused below, and full names it.)
         let variants = head(&[
-            ("Crates/Tree/src/New.rs", "new\n"),
             ("crates/tree/CARGO.toml", "[package]\n"),
             ("crates/tree/tests/FIXTURES/x", "fixture\n"),
             ("crates/bracken/src/WEAVE.rs", "cli\n"),
         ]);
         let (code, out, err) = scope(&["frozen", &main, &variants]);
         assert_eq!(code, Some(0), "{scripts}: {out}{err}");
+        let variants = head(&[
+            ("Crates/Tree/src/New.rs", "new\n"),
+            ("crates/tree/CARGO.toml", "[package]\n"),
+            ("crates/tree/tests/FIXTURES/x", "fixture\n"),
+            ("crates/bracken/src/WEAVE.rs", "cli\n"),
+        ]);
+        let (code, _, err) = scope(&["frozen", &main, &variants]);
+        assert!(code == Some(2) && err.contains("Crates and crates"), "{scripts}: {err}");
         for line in [
-            "code-scope: frozen: Crates/Tree/src/New.rs (",
-            "code-scope: security: Crates/Tree/src/New.rs (",
             "code-scope: frozen: crates/tree/CARGO.toml (",
             "code-scope: frozen: crates/tree/tests/FIXTURES/x (",
             "code-scope: owner: crates/tree/tests/FIXTURES/x (",
@@ -557,5 +574,54 @@ fn code_scope_refuses_non_ascii_paths_and_reads_what_the_merge_changes() {
         let (code, out, _) = scope(&["full", &tip, &edit]);
         assert_eq!(code, Some(0), "{scripts}: {out}");
         assert!(out.contains("code-scope: full: crates/tree/src/f.rs ("), "{scripts}: {out}");
+    }
+}
+
+/// Finding 304dd65b233c. main tracks no symlink and no gitlink, so a changed path that is either in the
+/// merged tree or the head is refused by frozen, exit 2 naming it, and makes full answer every package: a
+/// symlink crates/tree/SRC would replace crates/tree/src on a case-insensitive checkout. And the case check
+/// compares leading directories too: crates/TREE/x.rs and Crates/x, ordinary files, are refused, naming both
+/// spellings. An ordinary head still exits 3.
+#[test]
+fn code_scope_refuses_links_and_directory_case_variants() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("code-scope");
+        let files = [("scripts/code-scope", scope.as_path())];
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/lib.rs", "lib\n");
+            put(dir, "notes.txt", "notes\n");
+        });
+        let stub = affected_stub(&tmp.path().join("bracken-scope"));
+        let scope = |args: &[&str]| {
+            let out = command(&dir, "scripts/code-scope", args).env("CODE_SCOPE_TOKENS", &stub).output().unwrap();
+            let said =
+                (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+            (out.status.code(), said.0, said.1)
+        };
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let head = |entries: &[(&str, &str, &str)]| plumb_modes(&dir, &main, &[&main], entries);
+
+        for (what, entry, named) in [
+            ("a symlink", ("120000", "crates/tree/SRC", "../../docs/evilsrc"), "crates/tree/SRC (a symlink)"),
+            ("a gitlink", ("160000", "vendor/sub", main.as_str()), "vendor/sub (a gitlink)"),
+        ] {
+            let h = head(&[entry]);
+            let (code, out, err) = scope(&["frozen", &main, &h]);
+            assert_eq!(code, Some(2), "{scripts}: {what}: {out}{err}");
+            assert!(out.is_empty() && err.contains(named), "{scripts}: {what}: {err}");
+            let (code, out, _) = scope(&["full", &main, &h]);
+            assert_eq!(code, Some(0), "{scripts}: {what}: {out}");
+            assert!(out.starts_with("code-scope: full: every package (") && out.contains(named), "{scripts}: {out}");
+        }
+        for (path, both) in [("crates/TREE/x.rs", "crates/TREE and crates/tree"), ("Crates/x", "Crates and crates")] {
+            let (code, out, err) = scope(&["frozen", &main, &head(&[("100644", path, "a file\n")])]);
+            assert_eq!(code, Some(2), "{scripts}: {path}: {out}{err}");
+            assert!(out.is_empty(), "{scripts}: {path}: {out}");
+            // The changed spelling comes first.
+            assert!(err.contains("differing only in case") && err.contains(both), "{scripts}: {path}: {err}");
+        }
+        let (code, out, err) = scope(&["frozen", &main, &head(&[("100644", "notes.txt", "more\n")])]);
+        assert_eq!(code, Some(3), "{scripts}: {out}{err}");
+        assert!(out.starts_with("code-scope: nothing since "), "{scripts}: {out}");
     }
 }
