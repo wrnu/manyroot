@@ -7,7 +7,8 @@ Design only: it changes no format, code, test or fixture (task
 owner's go to freeze wait until this fix has landed, or is planned as a v2.
 Nothing here is decided until the owner answers section 6.
 
-File references are to `main` at 3668b09c.
+File references are to `main` at 3668b09c, except `scripts/weave-gate`,
+which is at 1f7d5f20, after PR #31.
 
 ## Summary
 
@@ -15,7 +16,10 @@ File references are to `main` at 3668b09c.
   counted one and, by varying `purpose` until its id is the smaller, make it
   count (`crates/tree/src/ground.rs` 328-330). Its author then owns the
   default line and the null-`owner_decision` exemption, and so the name
-  `main` and what `scripts/weave-gate` reads (weave-freeze.md 2.5).
+  `main` for every reader that resolves it (weave-freeze.md 2.5). Since
+  PR #31, `scripts/weave-gate` refuses such a Ground instead of reading it
+  (option H). And a marker placed before the honest one needs no race at
+  all: at the join, it counts outright (section 1).
 - **What a fix has to rest on.** Only its author can retract a marker, and
   an honest answer by id order can always be undercut in about two tries
   (notes `ba9e77679d4f`, `4064049282f2`). The Ground holds nothing that tells
@@ -35,13 +39,20 @@ File references are to `main` at 3668b09c.
   v1 records read (section 4). It changes no record's bytes, and no view of
   any Ground we hold: `~/bracken-weave/manyroot` and its backups have one
   marker, by the identity that would be pinned.
-- **What it doesn't fix.** Whoever holds the root's key still has all of
-  this authority. On this machine every Weave key is a file any agent can
-  read, so against an agent that sets out to forge, nothing changes until
-  the join puts Weave's identities on the team server (agent-keys.md,
-  section 2 and 4.10). The pin is local configuration, as editable as any
-  verifier here (agent-keys.md 4.6). Weave-freeze.md 2.5's other stops stay
-  open.
+- **What it doesn't fix.** Whoever holds the root's key has all of this
+  authority. **On this machine, A never stops an agent that sets out to
+  forge, before the join or after it.** Today every Weave key is a file any
+  agent can read. After the join the root would be server-held, but any
+  agent running as the owner's user can read the server's key directory
+  too (agent-keys.md section 2, *What a same-user agent can still do*), and
+  the owner has refused a separate macOS user. So A stops mistakes, agents
+  steered wrong that don't go looking for keys, and, after the join only,
+  writers off this machine who hold a scoped token and no key. Before the
+  join there are no tokens at all: `scripts/weave` checks `--as
+  weave-integrator` by name only (96-99). The pin is local configuration,
+  as editable as any verifier here (agent-keys.md 4.6). Weave-freeze.md
+  2.5's other stops stay open, and until G9 a second line named `main`
+  still stops the gate.
 
 ## 1. The rule today, and why id order can't fix it
 
@@ -60,6 +71,18 @@ File references are to `main` at 3668b09c.
   `purpose` makes it win in about two tries. Then the attacker writes a
   `main` with a null `owner_decision`, and the honest main's first version
   is ignored with its links (weave-freeze.md 2.5 has the rest).
+- **The pre-placed marker: no race needed.** A new contribution takes every
+  current head as its parents (`Store::contribute_with`,
+  `crates/manyroot/src/store.rs` 268). So a marker written into a Ground
+  before the honest one ends up in the honest one's causal past, and under
+  today's rule it counts outright and the honest one never can
+  (`ground.rs` 330). It doesn't arise in `~/bracken-weave/manyroot`, whose
+  marker `weave init` wrote first. It does at the join: `weave init
+  --in-place` writes the root's marker into the busy coordination Ground
+  (weave.md section 5, step 3), and any key there that may sign an
+  artifact, the manager's or a legacy key with every kind in scope
+  (agent-keys.md 4.9), can write a marker first. That's worse than the
+  race: no tries, and nothing the join's writer can do afterwards.
 - **Why no Ground-internal rule helps.** The honest marker in
   `~/bracken-weave/manyroot` is `488c40418f98`, by `weave-integrator`
   (`6bc92b40…`), with no parents: `weave init` writes it first. A forgery
@@ -101,7 +124,14 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
   `Option<AgentId>`); the counted marker is found among the root's markers;
   a marker by anyone else is a problem of its own (say
   `Problem::NotByRoot`), so `weave check` tells a forgery from the root's
-  own second marker.
+  own second marker. **The ancestry used for counting is built over the
+  root's markers only.** Today `Ancestry::build` (`ground.rs` 309) gives
+  each marker one bit, whether any other valid marker is below it. A
+  build that keeps that and only filters the candidates would find the
+  root's marker below a non-root one placed earlier (section 1, the
+  pre-placed marker), so no marker would count: no default line, every
+  `bracken weave` write refused, and only the forger able to end it, D's
+  permanent stop.
 - `crates/tree/src/lines.rs`: nothing. It reads `ix.counted_marker()`, whose
   author is now the root.
 - `crates/bracken/src/weave.rs` and `weave/`: where the root comes from
@@ -125,11 +155,15 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
   expects the smaller id to count, which may be eve's. That expectation
   flips: with alice as root, alice's counts whatever the ids. A new case
   covers the attack itself (eve's marker with empty parents and the smaller
-  id, eve's null `main`, and the honest main still the default). The `weave-v1` fixture's
-  statuses don't move, since its one marker is alice's
-  (`weave_fixture.rs` 339, 705) and alice is pinned; its pinned ids and
-  bytes don't change, since no record does. `crates/bracken/tests/weave.rs`
-  462 gains a forged marker by a second identity.
+  id, eve's null `main`, and the honest main still the default). Another
+  covers the pre-placed marker: eve's marker in the causal past of alice's,
+  expecting alice's to count. `crates/tree/tests/weave_fixture.rs` calls
+  `Index::build` (704, 867) and asserts the counted marker, so it must pass
+  alice as root and the file changes; the fixture's statuses don't move,
+  since its one marker is alice's (339, 705), and its pinned ids and bytes
+  don't change, since no record does. Every other test that calls
+  `Index::build` changes the same way. `crates/bracken/tests/weave.rs` 462
+  gains a forged marker by a second identity.
 - Docs: weave.md section 1 (*Lines*, the marker that counts), weave-freeze.md
   1.3, and a releases.md note: readers need the root, and old binaries count
   the old way (section 5).
@@ -156,11 +190,19 @@ unchanged.
   another marker, a second null-`main`, or a new policy version of `main`
   (main's author is the root). In `~/bracken-weave/manyroot` every key,
   `weave-integrator`'s included, is a file in `identities/` that any agent
-  on this machine can read (agent-keys.md, section 2). So against an agent
-  that sets out to forge, A changes nothing there. It protects against a
-  writer who holds only their own key or a scoped token, which is the
-  writer the join adds once Weave's identities are server-held
-  (agent-keys.md 4.10).
+  on this machine can read (agent-keys.md, section 2). After the join the
+  root would be server-held, but the server's key directory is just as
+  readable to an agent running as the owner's user (agent-keys.md section
+  2), and the owner has refused a separate macOS user. So an agent that
+  sets out to forge can sign as the root on this machine before and after
+  the join: for example a second null-`main` with an id smaller than the
+  honest one's, which `lines.rs` 234-236 then picks as the default line
+  (`firsts` is ordered by id) and 291-296 exempt. A protects against
+  mistakes, against agents that don't go looking for keys, and, after the
+  join only, against writers off this machine with a scoped token and no
+  key. Before the join no tokens exist for this Ground, and `scripts/weave`
+  checks `--as weave-integrator` by name only (96-99). Question 8 of
+  weave-freeze.md, the hostile-writer review, has to weigh this.
 - **The pin is local configuration.** An agent that edits
   `.config/weave-root`, the replica's `weave-root` or the binary can point
   every reader on this machine at its own key (agent-keys.md 4.6). The
@@ -175,16 +217,24 @@ unchanged.
   compute different default lines. A reader without one fails closed. A
   binary from before the fix still counts any writer's marker, so the fix
   protects a reader only once it's upgraded (section 5).
-- **Rotating or losing the root isn't designed.** A new root has no marker
-  and no `main`, so changing the pin would move the default line to a line
-  that doesn't exist yet. If the root's key is lost, the existing marker
-  still counts and decisions still qualify, but `main`'s policy can't
-  change. A rotation needs its own design, with part B or a v2 (question 7).
+- **Rotating, losing or having the root's key stolen isn't designed.** A
+  new root has no marker and no `main`, so changing the pin would move the
+  default line to a line that doesn't exist yet. If the root's key is lost,
+  the existing marker still counts and decisions still qualify, but
+  `main`'s policy can't change. If it's stolen, the thief can do anything
+  the root can: retract the root's marker and `main`'s versions (a
+  retraction is its author's, `graph.rs` 177-178), write a new marker and a
+  `main` of their own, and change `main`'s policy. Nothing in A takes that
+  authority back short of a new root, which is the rotation that isn't
+  designed. That needs its own design, with part B or a v2 (question 7).
 - **A non-root can still write a line named `main`.** It's not the default
   line, and its null `owner_decision` is ignored. Until G9, it still stops
   main-by-name readers as a duplicate name (weave-freeze.md 2.5, finding
-  `b6b6ccfd1255`); with G9 it's reached by its id only, now soundly, since
-  the counted marker is the root's.
+  `b6b6ccfd1255`), the gate included: PR #31's check refuses when `weave
+  head --line main` fails or names another line, and keeps doing so after
+  question 5's narrowing. So A doesn't remove that stop. With G9 the line
+  is reached by its id only, now soundly, since the counted marker is the
+  root's.
 
 ### B. A pinned marker id
 
@@ -396,10 +446,15 @@ So the fix lands before the freeze, as a change to a rule that isn't frozen
 yet. It's still protocol class: an independent review, a security review,
 the full table (it touches `crates/tree/src/`), and an `owner-review` for
 each `frozen:` line `code-scope frozen` prints (`crates/tree/src/`,
-`crates/tree/tests/lines.rs`; development.md, *Owner approvals*). Strictly,
-nothing is frozen yet, so question 3's rule that a frozen-format change
-needs the owner's own go doesn't bind it. It's recommended anyway: it
-rewrites the rule 1.3 is about to freeze, and the freeze waits on it.
+`crates/tree/tests/lines.rs`, `crates/tree/tests/weave_fixture.rs`;
+development.md, *Owner approvals*). **It also needs the owner's own go,
+now, not just as a recommendation:** the build changes
+`crates/tree/tests/weave_fixture.rs`, which calls `Index::build` (704, 867)
+and must pass the root, and `code-scope`'s `owner_mode` marks that file as
+needing the owner's own approval, which `scripts/merge` already enforces
+(G6, PR #29), whether or not the freeze has started. It would be asked for
+anyway: the change rewrites the rule 1.3 is about to freeze, and the
+freeze waits on it.
 
 The cost of changing it in place is small, and for a reason worth stating:
 on every Ground with one marker, by the pinned root, the old and new rules
@@ -435,19 +490,29 @@ Ground must already have the fix.
    by the Ground's root can count, and today's rule picks among the root's
    own. *Recommended: yes.* It's the only option that refuses a forgery
    outright without handing any writer a stop (D) or waiting for part B
-   (F), and it changes no view of any Ground we hold. Its limit is stated
-   plainly: it protects against writers without the root's key, which on
-   this machine, before the join, means it guards against mistakes and
-   scoped tokens, not a forging agent.
+   (F), and it changes no view of any Ground we hold. Its limits, stated
+   plainly: it protects only against writers without the root's key. On
+   this machine that's mistakes and agents that don't go looking for keys,
+   before the join and after it, since a same-user agent can read the team
+   server's keys too (agent-keys.md section 2). After the join it adds
+   writers off this machine with a scoped token. It never stops an agent
+   here that sets out to forge. And it doesn't remove the stop a second
+   line named `main` causes, at the gate or elsewhere, until G9 lands.
 2. **Who is the root?** For `~/bracken-weave/manyroot`, `weave-integrator`,
    which wrote its marker and `main`. For the coordination Ground at the
    join, decide with the join; record now that it must be a server-held
-   identity whose scope allows only Weave's marker and line artifacts and
-   their `supersedes` relations. *Recommended: yes to both.* Pinning
+   identity with a token of its own. *Recommended: yes to both.* Pinning
    `weave-integrator` moves nothing. An owner-held root would mean a new
-   marker and a new `main`, which moves the default line. A narrow
-   server-held root at the join means a stolen builder token can't sign as
-   it (agent-keys.md 4.2).
+   marker and a new `main`, which moves the default line. A server-held
+   root means a stolen builder token can't sign as it, though an agent on
+   this machine can still read its key (question 1). A scope narrower than
+   that, only Weave's marker and line artifacts, **can't be expressed
+   today**: part A's `Scope` (`crates/bracken/src/signing.rs` 144-152) holds
+   body kinds, relation kinds and tags, with no media type, so a root that
+   may sign any artifact may sign a decision, a manifest or a non-Weave
+   artifact too. Enforcing it would need a media-type field in `Scope`,
+   a part A change with a task of its own; the question only asks that the
+   join's design decide whether to make it.
 3. **Where does the pin live?** In the replica, as `weave-root` beside
    `ground.json`, written by `weave init` or once by `weave root set`, and in
    the repository as `.config/weave-root`, which `scripts/weave` and
@@ -467,7 +532,10 @@ Ground must already have the fix.
    author isn't the pinned root, or there's no counted marker, or `weave
    head --line main` names another line; never because some other marker
    exists. *Recommended: yes.* Refusing on any extra marker gives every writer a
-   permanent stop, since only a marker's author can retract it.
+   permanent stop, since only a marker's author can retract it. The
+   narrowed check still refuses while a second line named `main` exists
+   (`weave head --line main` fails on a shared name), so that stop stays
+   until G9; this question doesn't remove it.
 6. **What the freeze locks.** Freeze "only a marker signed by the Ground's
    root can count, and among the root's markers, the causally first,
    smallest id among concurrent ones", and leave how a reader learns the
@@ -475,9 +543,13 @@ Ground must already have the fix.
    committed pin. *Recommended: yes.* Part B can then supply the root
    through its role function later without a frozen-format change, which
    weave-freeze.md section 4 otherwise says it would be.
-7. **Rotating or losing the root.** Leave it undesigned for now, as an
-   accepted gap, to be designed with part B or before the join, whichever
-   is first. *Recommended: yes.* Today a new root has no `main`, so a pin
-   change moves the default line to a line that doesn't exist; designing
-   that well needs part B's revocation, and nothing needs a rotation before
-   the join.
+7. **Rotating, losing or having the root's key stolen.** Leave it
+   undesigned for now, as an accepted gap, to be designed with part B or
+   before the join, whichever is first. *Recommended: yes.* Today a new
+   root has no `main`, so a pin change moves the default line to a line
+   that doesn't exist; designing that well needs part B's revocation. A
+   lost key freezes `main`'s policy. A stolen key is worse: the thief can
+   retract the root's marker and `main`, and write their own, and only a
+   new root, which is this undesigned rotation, takes that back. Nothing
+   needs a rotation before the join, but the gap is real from today, since
+   any agent here can read the root's key (question 1).
