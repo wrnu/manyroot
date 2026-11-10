@@ -427,7 +427,8 @@ Ending them before the join is question 8.
 - only its author can retract a forged marker, and an honest writer can
   answer only with a marker of their own with an even smaller id. So the
   forged-marker fix must rest on who may write a marker, not on id order
-  (note `ba9e77679d4f`);
+  (note `ba9e77679d4f`). [weave-marker.md](weave-marker.md) compares the
+  fixes and recommends a pinned root identity, landed before the freeze;
 - `scripts/weave-gate` checks none of the problems Weave's index reports,
   the extra-marker problem included, so the takeover is silent there (note
   `ba9e77679d4f`);
@@ -726,3 +727,9 @@ Ending them before the join is question 8.
    on finding `26d9361e0a9f`, the freeze waits for the fix to the
    forged-marker takeover, or for that fix to be planned as a v2, before
    the owner's go to freeze (section 4).
+
+   *The fix's design* is [weave-marker.md](weave-marker.md) (task
+   `730b5d1a92a9`): it recommends that only a marker signed by a pinned
+   root identity can count, and finds that the fix can't be a v2 under
+   section 3, since a forged marker is a valid v1 record, so it lands
+   before the freeze. Its questions are open.
