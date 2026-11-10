@@ -1,6 +1,7 @@
 //! scripts/weave-gate, verify-seq --weave and scripts/merge's Weave pass (plan cc496dcee0e3 step 1b,
 //! design note 4f98bbf64314, decision bbbf898cbcfe): the switch, the pointer recorded and counted, each
-//! fallback, and a forged or stale pointer refused.
+//! fallback, a forged or stale pointer refused, and a Weave Ground that may be taken over by a forged
+//! marker refused (finding 26d9361e0a9f).
 
 use crate::support::*;
 
@@ -9,7 +10,9 @@ use crate::support::*;
 /// results `validate` wrote, one '<check> <pass|fail> <result>' line each; `$T/weave/fail-<check>` makes
 /// that check fail, `no-<check>` leaves it out of the policy, `unrecorded-<check>` makes validate stop
 /// there, recording nothing for it, as the real one does for a check that can't run, and `extra` lists
-/// more policy checks; `show` knows the ids in `proposals`.
+/// more policy checks; `show` knows the ids in `proposals`. The reads weave-gate's takeover check makes
+/// (`id list`, `weave check`, `weave head`, and `show` of anything but a proposal) go to the real bracken,
+/// on the throwaway Weave Ground at `$T/weave/ground` that [`weave_ground`] builds.
 const WEAVE: &str = r#"#!/bin/bash
 set -euo pipefail
 W="$T/weave"
@@ -19,7 +22,10 @@ if [ "$1" = --as ]; then as=$2; shift 2; fi
 echo "${as:-none} $*" >>"$W/calls"
 hash_of() { echo "blake3:$(git -C "$1" rev-parse "$2^{tree}" | shasum -a 256 | cut -c1-64)"; }
 opt() { local want=$1; shift; while [ $# -gt 0 ]; do [ "$1" != "$want" ] || { echo "$2"; return; }; shift; done; }
-if [ "$1" = show ]; then grep -qxF "$2" "$W/proposals" 2>/dev/null; exit; fi
+if [ "$1" = show ] && grep -qxF "$2" "$W/proposals" 2>/dev/null; then exit 0; fi
+case "$1 ${2:-}" in
+  "id "* | "show "* | "weave check" | "weave head") exec "$REAL_BRACKEN" --dir "$W/ground" "$@" ;;
+esac
 [ "$1" = weave ] || exit 9
 sub=$2
 shift 2
@@ -62,9 +68,53 @@ case "$sub" in
 esac
 "#;
 
-/// A Batch whose repository also holds scripts/weave-gate and the stand-in scripts/weave.
+/// The real bracken on the throwaway Weave Ground at `ground`.
+fn on_ground(ground: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_bracken"))
+        .arg("--dir")
+        .arg(ground)
+        .args(args)
+        .env_remove("BRACKEN_DIR")
+        .env_remove("BRACKEN_AGENT")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "bracken {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// (Re)builds the stand-in's Weave Ground, `$T/weave/ground`, with the real bracken: weave init signed by
+/// `author`, writing the marker and line main, and with `integrator`, an identity named weave-integrator
+/// there too when `author` isn't it. Returns the Ground's path.
+fn weave_ground(tmp: &Path, author: &str, integrator: bool) -> PathBuf {
+    let weave = tmp.join("weave");
+    std::fs::create_dir_all(&weave).unwrap();
+    let ground = weave.join("ground");
+    if ground.exists() {
+        std::fs::remove_dir_all(&ground).unwrap();
+    }
+    on_ground(&ground, &["weave", "init", "--as", author]);
+    if integrator && author != "weave-integrator" {
+        on_ground(&ground, &["id", "new", "weave-integrator"]);
+    }
+    ground
+}
+
+/// A second Weave marker in `ground`, signed by a new identity, forger: as any writer can (finding
+/// 26d9361e0a9f), going round scripts/weave.
+fn forge_marker(ground: &Path) {
+    on_ground(ground, &["id", "new", "forger"]);
+    let marker = bracken_tree::Marker { v: 1, purpose: "forged".to_owned(), in_place: None };
+    let path = ground.parent().unwrap().join("marker.cbor");
+    std::fs::write(&path, bracken_tree::Record::encode(&marker)).unwrap();
+    let path = path.to_str().unwrap();
+    let media = bracken_tree::format::MARKER_MEDIA_TYPE;
+    on_ground(ground, &["artifact", path, "--name", "weave", "--media-type", media, "--as", "forger"]);
+}
+
+/// A Batch whose repository also holds scripts/weave-gate and the stand-in scripts/weave, with an honest
+/// Weave Ground for its reads: marker and line main by weave-integrator.
 fn fixture(scripts: &str, extra: &dyn Fn(&Path, usize)) -> Batch {
-    Batch::shaped(
+    let b = Batch::shaped(
         scripts,
         3,
         &[],
@@ -75,7 +125,9 @@ fn fixture(scripts: &str, extra: &dyn Fn(&Path, usize)) -> Batch {
         },
         &|_| 0,
         extra,
-    )
+    );
+    weave_ground(b.tmp.path(), "weave-integrator", true);
+    b
 }
 
 impl Batch {
@@ -717,5 +769,51 @@ fn check_refuses_a_main_older_than_the_heads_branch_point() {
         let out = b.command("scripts/weave-gate", &args).output().unwrap();
         assert!(!out.status.success(), "{scripts}: {}", text(&out));
         assert!(text(&out).contains("doesn't hold the head's merge base"), "{scripts}: {}", text(&out));
+    }
+}
+
+/// Finding 26d9361e0a9f, decision 03534914ec55: record and check both refuse, failing closed, a Weave
+/// Ground that may have been taken over: an extra marker, line main by another identity, no key of
+/// weave-integrator's, and a second line named main. An honest pointer recorded before stops counting.
+#[test]
+fn a_weave_ground_that_may_be_taken_over_is_refused() {
+    for scripts in SCRIPTS {
+        let b = fixture(scripts, &|_, _| {});
+        b.gate("Weave gate: on");
+        let claim = b.with_proposal(1);
+        let out = b.record(&claim, 1);
+        assert!(out.status.success(), "{scripts}: the honest Ground: {}", text(&out));
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: the honest pointer counts");
+        let refused = |b: &Batch, why: &str| {
+            let out = b.record(&claim, 1);
+            let t = text(&out);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {why}: {t}");
+            assert!(
+                t.contains("refused: ") && t.contains(why) && t.contains("run git's counted run"),
+                "{scripts}: {t}"
+            );
+            assert_eq!(b.pointers(&claim).len(), 1, "{scripts}: {why}: a pointer was recorded");
+            let out = b.merge_one(1, &claim, true);
+            let scope = check_line(&out, "scope");
+            assert!(!out.status.success() && scope.starts_with("FAIL"), "{scripts}: {why}: {}", text(&out));
+            assert!(text(&out).contains(why), "{scripts}: {why}: {}", text(&out));
+        };
+
+        let ground = b.tmp.path().join("weave/ground");
+        forge_marker(&ground);
+        refused(&b, "extra marker(s)");
+
+        weave_ground(b.tmp.path(), "other", true);
+        refused(&b, "is by other (");
+        refused(&b, ", not weave-integrator (");
+
+        weave_ground(b.tmp.path(), "other", false);
+        refused(&b, "holds no key it can sign with as weave-integrator");
+
+        let ground = weave_ground(b.tmp.path(), "weave-integrator", true);
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: honest again");
+        on_ground(&ground, &["id", "new", "forger"]);
+        on_ground(&ground, &["weave", "line", "create", "main", "--owner-decision", &"a".repeat(12), "--as", "forger"]);
+        refused(&b, "--line main names no single line");
     }
 }
