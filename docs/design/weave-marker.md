@@ -137,16 +137,49 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
 - `crates/bracken/src/weave.rs` and `weave/`: where the root comes from
   (question 3). Recommended: `weave init` writes it beside `ground.json`,
   as a file `weave-root` holding the AgentId in hex; every `bracken weave`
-  command reads it; a missing or malformed file is no root. A one-time
-  `weave root set <AgentId>` for a Ground that predates it, refusing when a
-  root is already set and when that AgentId hasn't signed a valid marker.
-  `weave check` prints the root.
+  command reads it; a missing or malformed file is no root. `weave root
+  set <AgentId>` writes it, refusing when that AgentId hasn't signed a
+  valid marker, and refusing when a root is already set unless `--replace
+  <AgentId>` names the root it replaces. `weave check` prints the root.
+  The binary's own refusals guard against mistakes only; which root may be
+  set is the scripts' business (next points).
 - `scripts/weave`, `scripts/weave-gate`, `scripts/weave-shadow`: a
   committed pin, `.config/weave-root` (the Weave Ground's id and its root
-  AgentId), checked against the replica's `weave-root` before anything
-  runs; a mismatch or a missing file refuses. `scripts/code-scope frozen`
-  lists `.config/weave-root`, so a change to it takes the owner's go like
-  any frozen rule (development.md, Owner approvals).
+  AgentId), read from the main checkout's `main` commit (`git show
+  main:.config/weave-root`), never from a working tree, and checked
+  against the replica's `weave-root` before anything runs; a mismatch or a
+  missing file refuses. `scripts/code-scope frozen` lists
+  `.config/weave-root`, so a change to it takes the owner's go like any
+  frozen rule (development.md, Owner approvals).
+- **How the replica's pin gets set: one exception in `scripts/weave`.**
+  When the replica's `weave-root` is missing, or differs from the
+  committed pin, `scripts/weave` refuses everything except `weave root
+  set` given exactly the committed pin's AgentId (with `--replace <the
+  replica's current root>` when one is set). It runs that, then reads the
+  replica's `weave-root` back and refuses unless it now equals the
+  committed pin. `scripts/weave-gate` and `scripts/weave-shadow` get no
+  exception: they refuse until the pin is set. So the one way to set or
+  change a replica's pin is to move it to the committed value, by a
+  scripted command, with no hand edit of the Ground. The same command is
+  the first-time setting (rollout step 2); the repair for a backup made
+  before the pin existed, once it's back at `~/bracken-weave/manyroot`;
+  and the recovery when someone ran `weave root set` with another AgentId
+  first, outside `scripts/weave` (note `5330b58ece22`): `--replace` moves
+  the replica back to the committed pin. Changing which root is right
+  takes a change to `.config/weave-root`, a reviewed PR with the owner's
+  go, never a command.
+
+  Residual risk: between the build PR's upgrade and step 2, every
+  Weave-gated merge falls back to git's counted run, since the gate
+  refuses with no replica pin; step 2 follows the upgrade directly, so
+  that window costs runs, not checking. Anyone who can run `scripts/weave`
+  can run the exception, but it can only write the committed value, which
+  is the manager's own step. An agent that bypasses `scripts/weave`, runs
+  the binary on the Ground directly and sets another root gets a stop, not
+  a takeover: every script refuses on the mismatch until the exception
+  moves the pin back. An agent that edits `scripts/weave` itself, or
+  commits a different pin on `main` locally, is the forging agent of
+  agent-keys.md section 2, which nothing here stops.
 - Tests: `crates/tree/tests/lines.rs`'s
   `a_marker_written_after_the_first_cant_take_the_default_line` (478-524)
   pins today's rule with alice's and eve's markers. Its first half expects
@@ -180,8 +213,9 @@ before the freeze (section 4). What's frozen afterwards is the rule
 AgentId as root, the counted marker, the default line and every view are
 unchanged. Its backups hold the same records, so the same holds; a backup
 made after the replica's `weave-root` exists carries it, since
-`weave-backup` copies the whole directory, and one made before needs
-`weave root set` with the committed pin. The `weave-v1` fixture: unchanged,
+`weave-backup` copies the whole directory, and one made before gets it
+from the `scripts/weave` exception above once it's restored to
+`~/bracken-weave/manyroot`. The `weave-v1` fixture: unchanged,
 with alice pinned. The coordination Ground: no marker, nothing to count,
 unchanged.
 
@@ -471,10 +505,15 @@ could disagree on:
    root set`, the committed `.config/weave-root`, the scripts' check, and
    PR #31's gate check narrowed as question 5 says.
 2. Upgrade both binaries that read the Weave Ground, the pinned
-   `.bracken-bin` and `~/bracken-weave`'s, then run `weave root set` with
-   `weave-integrator`'s AgentId through `scripts/weave`, as the manager
+   `.bracken-bin` and `~/bracken-weave`'s. `scripts/weave` now refuses
+   everything but the exception in option A, since the replica has no
+   pin. Then, as the manager, run `scripts/weave weave root set
+   <weave-integrator's AgentId>`, which the exception lets through because
+   it equals the committed pin, and which `scripts/weave` checks it wrote
    (never by hand, AGENTS.md). Check that `weave check` names the same
-   marker and lists no problem, and `weave head --line main` the same line.
+   marker and lists no problem, and `weave head --line main` the same
+   line. Until this step, Weave-gated merges fall back to git's counted
+   run.
 3. Only then does the freeze's go follow (decision `bae92c497714`).
 
 A binary from before step 1 still counts the old way, so until step 2 the
@@ -514,10 +553,13 @@ Ground must already have the fix.
    a part A change with a task of its own; the question only asks that the
    join's design decide whether to make it.
 3. **Where does the pin live?** In the replica, as `weave-root` beside
-   `ground.json`, written by `weave init` or once by `weave root set`, and in
+   `ground.json`, written by `weave init` or by `weave root set`, and in
    the repository as `.config/weave-root`, which `scripts/weave` and
-   `scripts/weave-gate` check against the replica's before running.
-   `code-scope frozen` lists `.config/weave-root`. *Recommended: yes.* The
+   `scripts/weave-gate` check against the replica's before running. The
+   only way to set or change the replica's copy through the scripts is
+   `scripts/weave`'s one exception, which can only move it to the
+   committed value (option A). `code-scope frozen` lists
+   `.config/weave-root`. *Recommended: yes.* The
    replica's copy lets `bracken weave` stand alone and travels with
    backups. The committed copy is public, reviewed and visible in git. A
    change to either is caught by the other, and a change to the committed
