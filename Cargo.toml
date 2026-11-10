@@ -12,15 +12,19 @@ repository = "https://github.com/wrnu/manyroot"
 manyroot = { path = "crates/manyroot" }
 bracken-tree = { path = "crates/tree" }
 anyhow = "1"
-blake3 = "1"
-ciborium = "0.2"
+# Pinned exactly, as Weave's format freeze asks (decision bae92c497714, Q5; docs/design/weave-freeze.md):
+# blake3 is the content hash, ciborium the canonical encoding, icu_casemap and unicode-normalization
+# the folding paths are compared by. A bump changes Cargo.lock, which scripts/code-scope frozen names.
+blake3 = "=1.8.7"
+ciborium = "=0.2.2"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "2"
 getrandom = "0.3"
 hex = "0.4"
 httparse = "1"
 humantime = "2"
-icu_casemap = "2"
+# Pinned exactly with blake3 above.
+icu_casemap = "=2.4.0"
 # Pinned exactly: the line merge's results are part of what the format guard pins (task 7cbd0a0ce7d0).
 imara-diff = { version = "=0.2.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -29,7 +33,8 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 toml = "1"
-unicode-normalization = "0.1"
+# Pinned exactly with blake3 above.
+unicode-normalization = "=0.1.26"
 unicode-properties = { version = "0.1", default-features = false, features = ["general-category"] }
 
 # Line tables keep file and line numbers in panics and backtraces but drop the rest of the debug info,
