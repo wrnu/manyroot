@@ -60,7 +60,12 @@
 # merged tree (<base> merged with <head>, as GitHub's squash merge makes it), naming both: a
 # case-insensitive checkout writes one over the other; a head that doesn't merge cleanly; and several
 # merge bases, a criss-cross history a diff from one can miss (findings 89119f47ba5c, bb7107f27076). Every
-# path is matched with its ASCII letters lowercased, here and in full. Renames count as a deletion and an addition, and a change only in comments
+# path is matched with its ASCII letters lowercased, here and in full. A path holding any byte outside
+# printable ASCII is refused too, named escaped: APFS folds some non-ASCII letters onto ASCII ones (finding
+# 5b38ef3c9557), and main tracks no such path. frozen and full both read what <head> changed since the merge
+# base and every path that differs between <base> and the merged tree, since the merge carries a head's edit
+# onto a path main renamed (finding e1a2fe970409); full answers every package for a path outside
+# printable ASCII or a head that doesn't merge cleanly. Renames count as a deletion and an addition, and a change only in comments
 # counts too: nothing here asks bracken-scope.
 #   'code-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, and, as
@@ -112,6 +117,33 @@ docs() {
 lower() { printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'; }
 # bases <base> <head>: their merge bases, one a line; exit 2 if there's none.
 bases() { git merge-base --all "$1" "$2" || exit 2; }
+
+# merged_tree <tip> <head>: the tree GitHub's squash merge of <head> onto <tip> gives, as git merge-tree
+# computes it; fails on a conflict.
+merged_tree() {
+  local out
+  out=$(git merge-tree --write-tree --no-messages "$1" "$2" 2>/dev/null) || return 1
+  echo "${out%%$'\n'*}"
+}
+# changed_paths <tip> <head> <base> <merged> <file>: into <file>, NUL-separated and once each, what <head>
+# changed since <base>, and every path that differs between <tip> and <merged>: the merge detects renames on
+# main's side, so a head's edit can land on a path main moved, which the first diff never names (finding
+# e1a2fe970409).
+changed_paths() {
+  { git diff --no-renames --name-only -z "$3" "$2" && git diff --no-renames --name-only -z "$1" "$4"; } |
+    LC_ALL=C sort -uz >"$5"
+}
+# unprintable <path>: whether <path> holds a byte outside printable ASCII (0x20-0x7e): a control character,
+# or a letter a filesystem may fold onto another (APFS folds the long s onto s and the Kelvin sign onto k,
+# finding 5b38ef3c9557). main tracks no such path, so these are refused rather than folded.
+# The '.' keeps a newline left over: command substitution strips trailing newlines.
+unprintable() {
+  local rest
+  rest=$(printf '%s' "$1" | LC_ALL=C tr -d ' -~'; echo .)
+  [ "$rest" != . ]
+}
+# escaped <path>: <path> quoted for the shell, every byte outside printable ASCII escaped.
+escaped() { LC_ALL=C bash -c 'printf %q "$1"' _ "$1"; }
 
 # Why a change to $1 needs the full table, printed; or nothing, returning 1. The protocol class (AGENTS.md:
 # encoding, ids, the signing context and validity rules) is crates/manyroot and docs/protocol.md. The
@@ -306,9 +338,19 @@ case "${1:-}" in
       exit 0
     fi
     base=$all_bases
+    merged=$(merged_tree "$2" "$3") || {
+      echo "code-scope: full: every package ($3 doesn't merge cleanly onto $2, so what the merge changes can't be read)"
+      exit 0
+    }
     changed=$(mktemp)
     trap 'rm -f "$changed"' EXIT
-    git diff --no-renames --name-only -z "$base" "$3" >"$changed" || exit 2
+    changed_paths "$2" "$3" "$base" "$merged" "$changed" || exit 2
+    while IFS= read -r -d '' path; do
+      if unprintable "$path"; then
+        echo "code-scope: full: every package (a changed path holds a byte outside printable ASCII: $(escaped "$path"))"
+        exit 0
+      fi
+    done <"$changed"
     found=false
     while IFS= read -r -d '' path; do
       if why=$(full_mode "$path") && ! comment_only "$2" "$base" "$3" "$path"; then
@@ -327,23 +369,22 @@ case "${1:-}" in
     fi
     base=$all_bases
     head=$(git rev-parse --verify -q "$3^{commit}") || exit 2
+    merged=$(merged_tree "$2" "$head") ||
+      { echo "code-scope: frozen: $head doesn't merge cleanly onto $2, so the merged tree can't be checked" >&2; exit 2; }
     changed=$(mktemp)
-    trap 'rm -f "$changed"' EXIT
-    git diff --no-renames --name-only -z "$base" "$head" >"$changed" || exit 2
+    tree_paths=$(mktemp)
+    trap 'rm -f "$changed" "$tree_paths"' EXIT
+    changed_paths "$2" "$head" "$base" "$merged" "$changed" || exit 2
     # Every path first, so a refusal prints nothing on standard output.
     while IFS= read -r -d '' path; do
-      if [[ $path == *[[:cntrl:]]* ]]; then
-        echo "code-scope: frozen: a changed path holds a newline or another control character, so it can't be named a line each: $(printf '%q' "$path")" >&2
+      if unprintable "$path"; then
+        echo "code-scope: frozen: a changed path holds a newline, another control character or a byte outside printable ASCII, so it's refused: $(escaped "$path")" >&2
         exit 2
       fi
     done <"$changed"
     # A changed path that differs only in ASCII case from another path in the merged tree: a case-insensitive
     # checkout (macOS's default) writes one over the other (finding 89119f47ba5c), so refuse, naming both.
-    merged=$(git merge-tree --write-tree --no-messages "$2" "$head" 2>/dev/null) ||
-      { echo "code-scope: frozen: $head doesn't merge cleanly onto $2, so the merged tree can't be checked" >&2; exit 2; }
-    tree_paths=$(mktemp)
-    trap 'rm -f "$changed" "$tree_paths"' EXIT
-    git ls-tree -r -z --name-only "${merged%%$'\n'*}" | tr '\0' '\n' >"$tree_paths" || exit 2
+    git ls-tree -r -z --name-only "$merged" | tr '\0' '\n' >"$tree_paths" || exit 2
     collisions=$(tr '\0' '\n' <"$changed" | LC_ALL=C awk 'NR == FNR { ch[$0] = 1; next }
       { k = tolower($0)
         if (!(k in first)) { first[k] = $0; next }
@@ -364,6 +405,10 @@ case "${1:-}" in
         for crate in $FROZEN_CRATES; do
           before=$(lock_entry "$base" "$crate")
           after=$(lock_entry "$head" "$crate")
+          if [ "$before" = "$after" ]; then
+            before=$(lock_entry "$2" "$crate")
+            after=$(lock_entry "$merged" "$crate")
+          fi
           [ "$before" != "$after" ] || continue
           found=true
           was=$(lock_versions "$before") now=$(lock_versions "$after")
