@@ -228,12 +228,13 @@ default line otherwise). Every read has `--json`. A manifest is named by its con
 
 | Command | What it does |
 |---|---|
-| `init [--purpose P]` | Creates a Weave Ground at `--dir`: the Weave marker and a `main` line, signed with `--as`. `--dir` must not exist yet and its parent must; refuses if the parent is inside a git checkout |
+| `init [--purpose P]` | Creates a Weave Ground at `--dir`: the Weave marker and a `main` line, signed with `--as`, whose AgentId it writes as the Ground's root (`weave-root`). `--dir` must not exist yet and its parent must; refuses if the parent is inside a git checkout |
 | `import (--from-git REV \| --index) [--repo R] [--dry-run]` | Records a git tree as file versions (only those new to the Ground) and one manifest. Takes git's view only: a commit's tree, or the index. Refuses, writing nothing, if anything looks like a secret |
 | `checkout --manifest H <dir>` | Writes a manifest's tree into an empty directory. Never follows a symlink; on a failure part way, removes what it wrote |
 | `diff A B` | The per-file difference between two manifests or decisions, with a unified diff of each changed text file |
 | `verify --git REV [--at D \| --manifest H]` | Compares a manifest with a commit's tree: the same paths, modes and bytes, with the excluded root entries left out. Exits non-zero if they differ. Compares the line's head unless `--at` or `--manifest` names another |
-| `check` | Lists Weave payloads that are invalid or break the ancestor rule, manifests not yet complete, markers past the one that counts, and policy versions ignored for citing no owner decision. Exits non-zero when it lists any |
+| `check` | Prints the replica's root, then lists Weave payloads that are invalid or break the ancestor rule, manifests not yet complete, the root's markers past the one that counts, markers not by the root, and policy versions ignored for citing no owner decision. Exits non-zero when it lists any. `--json` adds `ground`, `root` and `marker` |
+| `root set <AgentId> [--replace <AgentId>]` | Sets the replica's root, the one identity whose marker can count, in the file `weave-root` beside `ground.json` (`weave init` writes it for its signer). Refuses unless that AgentId signed a valid marker here, and, when a root is already set, unless `--replace` names it. In this repository only `scripts/weave`'s one exception runs it, and only to the committed pin `.config/weave-root` (docs/design/weave-marker.md, option A) |
 | `head` | The line's head with its manifest, or every head of a forked line |
 | `log [--limit N] [--since D]` | The line's decisions, newest first in causal order (20 by default): manifest, parents, breakage and note |
 | `status [--index] [--at D]` | Git's `HEAD`, or its index, against the line's head (or `--at`, needed while the line is forked): each file added, modified, deleted or with its mode changed |

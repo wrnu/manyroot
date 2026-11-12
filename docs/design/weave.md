@@ -313,14 +313,21 @@ policy:
 - An integrator who isn't the line's author can't change the line's
   guardrails, because only the author can change the policy (again a
   convention under shared keys).
-- **The marker that counts** is the valid, non-retracted Weave marker with
-  no other such marker among its causal ancestors. If several are
-  concurrent, the smallest id among them counts, and `weave check` lists the
-  others. So a marker written after the first has been seen, by anyone, can
-  never take over the default line (finding `d8168e1a9ebb`, decision
-  `049d02449a94`). A deliberately concurrent marker, written with forged
-  parents, is outside the threat model of decision `7529dd229d6f`: mistakes,
-  not adversaries, under shared keys.
+- **The marker that counts** is signed by the Ground's **root**, one
+  AgentId every reader is given (decision `d01c83b654d1`,
+  [weave-marker.md](weave-marker.md) option A): the root's valid,
+  non-retracted marker with no other marker of the root's among its causal
+  ancestors. If several of the root's are concurrent, the smallest id among
+  them counts. A marker by anyone else never counts, whatever its parents or
+  id, and `weave check` lists it (`not_by_root`) apart from the root's own
+  extra ones (`extra_marker`). So neither a marker written after the first
+  has been seen (finding `d8168e1a9ebb`, decision `049d02449a94`) nor a
+  forged concurrent or earlier one (finding `26d9361e0a9f`) can take over
+  the default line without the root's key. A replica's root is the
+  `weave-root` file beside `ground.json`, which `weave init` writes for its
+  signer and `weave root set` changes; a reader with no root has no counted
+  marker. In this repository `scripts/weave` also checks it against the
+  committed pin, `.config/weave-root`.
 - The **default line** is the line named `main` by that marker's author.
   Only a line's first artifact that supersedes no version in the replica is
   a candidate, so a version that joins another line's chain stops being

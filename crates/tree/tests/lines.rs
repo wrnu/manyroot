@@ -9,10 +9,10 @@ use bracken_tree::format::{
     Change, DECISION_MEDIA_TYPE, Decision, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line, Manifest, Marker,
     Proposal, Record, VERSION,
 };
-use bracken_tree::ground::Index;
+use bracken_tree::ground::{Index, Problem};
 use bracken_tree::lines::{DIVERGED_SHOWN, InvalidProposal, Lines, Unqualified};
 use bracken_tree::{ContentHash, Entry, Mode};
-use manyroot::{Body, Contribution, ContributionId, Graph, GroundId, Identity, RelationKind};
+use manyroot::{AgentId, Body, Contribution, ContributionId, Graph, GroundId, Identity, RelationKind};
 
 const GROUND: GroundId = GroundId([5; 32]);
 
@@ -95,7 +95,7 @@ impl World {
     }
 
     fn lines(&self) -> Lines {
-        checked(&self.g)
+        checked(&self.g, self.alice.agent_id())
     }
 
     fn head_labels(&self) -> BTreeSet<&'static str> {
@@ -112,8 +112,8 @@ impl World {
 
 /// Lines built from the index, checked against Lines built by walking the graph for every question: the
 /// same verdict for every decision and proposal, and no question missed (answer b2dbc4f5e810).
-fn checked(g: &Graph) -> Lines {
-    let ix = Index::build(g);
+fn checked(g: &Graph, root: AgentId) -> Lines {
+    let ix = Index::build(g, Some(root));
     let lines = Lines::build(g, &ix);
     let walked = Lines::build_by_walking(g, &ix);
     assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
@@ -378,9 +378,9 @@ fn a_reference_that_isnt_an_ancestor_is_ignored() {
     assert_eq!(w.unqualified(&d), Unqualified::NotALine(version));
 
     // weave check lists the references that break the rule.
-    let ix = Index::build(&w.g);
+    let ix = Index::build(&w.g, Some(w.alice.agent_id()));
     assert!(ix.problems().iter().any(|p| matches!(p,
-        bracken_tree::ground::Problem::NotAnAncestor { id, reference } if *id == bad && *reference == d1)));
+        Problem::NotAnAncestor { id, reference } if *id == bad && *reference == d1)));
 }
 
 #[test]
@@ -403,10 +403,10 @@ fn a_decision_needs_its_manifest_complete_and_stays_unretracted() {
     w.record(&alice, &wrong);
     let d = w.decide(&alice, "wrong size", wrong.content_hash(), &[], None);
     assert!(matches!(w.unqualified(&d), Unqualified::ManifestIncomplete { missing: 1, .. }));
-    let ix = Index::build(&w.g);
+    let ix = Index::build(&w.g, Some(w.alice.agent_id()));
     assert_eq!(ix.missing(&wrong), ["a"]);
     assert!(ix.problems().iter().any(|p| matches!(p,
-        bracken_tree::ground::Problem::Incomplete { hash, .. } if *hash == wrong.content_hash())));
+        Problem::Incomplete { hash, .. } if *hash == wrong.content_hash())));
     // Once the file arrives, the first qualifies: completeness converges on sync.
     w.add(&alice, file(b"never written"));
     let first = *w.labels.iter().find(|(_, l)| **l == "lacking").expect("labelled").0;
@@ -476,10 +476,11 @@ fn a_line_stays_a_line_for_decisions_made_before_it_superseded_a_version() {
 
 #[test]
 fn a_marker_written_after_the_first_cant_take_the_default_line() {
-    // Finding d8168e1a9ebb, decision 049d02449a94.
+    // Finding d8168e1a9ebb, decision 049d02449a94, and since decision d01c83b654d1, only the root's.
     let mut w = World::new(counter());
-    let eve = Rc::new(who("eve"));
-    let first = Index::build(&w.g).counted_marker().expect("alice's marker");
+    let (alice, eve) = (w.alice.clone(), Rc::new(who("eve")));
+    let root = Some(alice.agent_id());
+    let first = Index::build(&w.g, root).counted_marker().expect("alice's marker");
     // Eve, having seen alice's marker, writes markers until one has a smaller id.
     let mut n = 0;
     let eves = loop {
@@ -490,15 +491,46 @@ fn a_marker_written_after_the_first_cant_take_the_default_line() {
         }
     };
     let eves_main = w.record(&eve, &policy(&[&eve]));
-    let ix = Index::build(&w.g);
-    assert_eq!(ix.counted_marker(), Some(first), "the causally first marker counts, not the smallest id");
+    // Alice's own later marker is extra; eve's are not the root's.
+    let alices_second = w.record(&alice, &Marker { v: VERSION, purpose: "again".into(), in_place: None });
+    let ix = Index::build(&w.g, root);
+    assert_eq!(ix.counted_marker(), Some(first), "the root's causally first marker counts, not the smallest id");
     assert!(ix.problems().iter().any(|p| matches!(p,
-        bracken_tree::ground::Problem::ExtraMarker { id, counted } if *id == eves && *counted == first)));
+        Problem::NotByRoot { id, author, root: r } if *id == eves && *author == eve.agent_id() && *r == root)));
+    assert!(ix.problems().iter().any(|p| matches!(p,
+        Problem::ExtraMarker { id, counted } if *id == alices_second && *counted == first)));
+    assert_eq!(ix.problems().iter().filter(|p| matches!(p, Problem::NotByRoot { .. })).count(), n);
     let lines = w.lines();
     assert_eq!(lines.default_line(), Some(w.line));
     assert!(lines.line(&eves_main).is_some());
 
-    // Concurrent markers: neither is in the other's past, so the smallest id counts.
+    // Concurrent markers: neither is in the other's past. Only the root's counts, whatever the ids.
+    for (root, other) in [(&w.alice, &eve), (&eve, &w.alice)] {
+        let mut g = Graph::new(GROUND);
+        let mine = Contribution::create(
+            GROUND,
+            root,
+            [],
+            1,
+            artifact(&Marker { v: VERSION, purpose: "a".into(), in_place: None }),
+        );
+        let theirs = Contribution::create(
+            GROUND,
+            other,
+            [],
+            2,
+            artifact(&Marker { v: VERSION, purpose: "b".into(), in_place: None }),
+        );
+        let (mine_id, theirs_id) = (mine.id(), theirs.id());
+        g.insert(mine).expect("valid");
+        g.insert(theirs).expect("valid");
+        let ix = Index::build(&g, Some(root.agent_id()));
+        assert_eq!(ix.counted_marker(), Some(mine_id));
+        assert_eq!(ix.problems().len(), 1, "{:?}", ix.problems());
+        assert!(matches!(&ix.problems()[0], Problem::NotByRoot { id, .. } if *id == theirs_id));
+    }
+
+    // Two concurrent markers by the root: the smallest id counts, the other is extra.
     let mut g = Graph::new(GROUND);
     let a = Contribution::create(
         GROUND,
@@ -509,7 +541,7 @@ fn a_marker_written_after_the_first_cant_take_the_default_line() {
     );
     let b = Contribution::create(
         GROUND,
-        &eve,
+        &w.alice,
         [],
         2,
         artifact(&Marker { v: VERSION, purpose: "b".into(), in_place: None }),
@@ -517,12 +549,86 @@ fn a_marker_written_after_the_first_cant_take_the_default_line() {
     let smaller = a.id().min(b.id());
     g.insert(a).expect("valid");
     g.insert(b).expect("valid");
-    let ix = Index::build(&g);
+    let ix = Index::build(&g, root);
     assert_eq!(ix.counted_marker(), Some(smaller));
-    assert_eq!(
-        ix.problems().iter().filter(|p| matches!(p, bracken_tree::ground::Problem::ExtraMarker { .. })).count(),
-        1
+    assert_eq!(ix.problems().iter().filter(|p| matches!(p, Problem::ExtraMarker { .. })).count(), 1);
+}
+
+/// The attack of docs/design/weave-marker.md section 1: eve's marker with no parents and the smaller id,
+/// then eve's main citing no owner decision. Under the root rule, neither takes anything.
+#[test]
+fn a_forged_marker_with_a_smaller_id_never_counts() {
+    let mut w = World::new(counter());
+    let (alice, eve) = (w.alice.clone(), Rc::new(who("eve")));
+    let root = Some(alice.agent_id());
+    let honest = Index::build(&w.g, root).counted_marker().expect("alice's marker");
+    let mut n = 0;
+    let forged = loop {
+        n += 1;
+        let marker = artifact(&Marker { v: VERSION, purpose: format!("forged {n}"), in_place: None });
+        let id = w.add_after(&eve, vec![], marker);
+        if id < honest {
+            break id;
+        }
+    };
+    let eves_main = w.record(&eve, &Line { owner_decision: None, ..policy(&[&eve]) });
+    let ix = Index::build(&w.g, root);
+    assert_eq!(ix.counted_marker(), Some(honest));
+    assert!(ix.problems().iter().any(|p| matches!(p, Problem::NotByRoot { id, .. } if *id == forged)));
+    assert!(!ix.problems().iter().any(|p| matches!(p, Problem::ExtraMarker { .. })));
+    let lines = w.lines();
+    assert_eq!(lines.default_line(), Some(w.line), "the honest main stays the default line");
+    assert!(lines.ignored_versions().contains(&eves_main), "eve's null owner_decision is ignored");
+    assert!(lines.line(&eves_main).is_none());
+}
+
+/// A marker by someone else, written before the root's and so in its causal past, leaves the root's
+/// counted: the ancestry used for counting is built over the root's markers only.
+#[test]
+fn a_pre_placed_marker_leaves_the_roots_marker_counted() {
+    let mut g = Graph::new(GROUND);
+    let (alice, eve) = (who("alice"), who("eve"));
+    let first = Contribution::create(
+        GROUND,
+        &eve,
+        [],
+        1,
+        artifact(&Marker { v: VERSION, purpose: "early".into(), in_place: None }),
     );
+    let eves = first.id();
+    g.insert(first).expect("valid");
+    let honest = Contribution::create(
+        GROUND,
+        &alice,
+        [eves],
+        2,
+        artifact(&Marker { v: VERSION, purpose: "honest".into(), in_place: None }),
+    );
+    let alices = honest.id();
+    g.insert(honest).expect("valid");
+    assert!(g.is_ancestor(&eves, &alices));
+    let ix = Index::build(&g, Some(alice.agent_id()));
+    assert_eq!(ix.counted_marker(), Some(alices));
+    assert_eq!(ix.problems().len(), 1, "{:?}", ix.problems());
+    assert!(matches!(&ix.problems()[0], Problem::NotByRoot { id, .. } if *id == eves));
+    // With eve as root, eve's counts and alice's is the one not by the root.
+    let ix = Index::build(&g, Some(eve.agent_id()));
+    assert_eq!(ix.counted_marker(), Some(eves));
+}
+
+/// A reader with no root has no counted marker, so no default line; every marker is listed.
+#[test]
+fn no_root_means_no_counted_marker() {
+    let w = World::new(counter());
+    let ix = Index::build(&w.g, None);
+    assert_eq!(ix.counted_marker(), None);
+    assert_eq!(ix.root(), None);
+    assert!(matches!(ix.problems(), [Problem::NotByRoot { root: None, .. }]), "{:?}", ix.problems());
+    assert_eq!(Lines::build(&w.g, &ix).default_line(), None);
+    // A root that signed no marker is the same.
+    let ix = Index::build(&w.g, Some(w.bob.agent_id()));
+    assert_eq!(ix.counted_marker(), None);
+    assert_eq!(Lines::build(&w.g, &ix).default_line(), None);
 }
 
 #[test]
@@ -707,8 +813,8 @@ fn assert_kept(lines: &Lines, relations: usize, askers: usize) {
 
 /// Builds the lines without `checked`, whose walk per question takes most of a minute on the larger
 /// shapes; still with no question missed.
-fn unchecked(g: &Graph) -> Lines {
-    let ix = Index::build(g);
+fn unchecked(g: &Graph, root: AgentId) -> Lines {
+    let ix = Index::build(g, Some(root));
     let lines = Lines::build(g, &ix);
     assert_eq!((lines.stats().fallbacks, ix.ancestry_stats().fallbacks), (0, 0));
     assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
@@ -726,7 +832,7 @@ fn many_decisions_after_a_long_chain_share_one_answer_vector() {
     let m0 = w.tree(&alice, b"zero");
     let versions = w.chain(&alice, K);
     let decisions = w.decide_on(&alice, w.line, m0, D);
-    let lines = unchecked(&w.g);
+    let lines = unchecked(&w.g, w.alice.agent_id());
     let stats = lines.stats();
     assert_eq!((stats.list_entries, stats.questions), (K, D * K), "{stats:?}");
     // Each decision's past adds the one before, which no relation is: the same class.
@@ -852,11 +958,11 @@ fn a_line_superseding_a_dropped_version_asks_the_whole_chain() {
 fn many_markers_are_answered_without_a_walk() {
     let mut w = World::new(counter());
     let alice = w.alice.clone();
-    let first = Index::build(&w.g).counted_marker().expect("alice's marker");
+    let first = Index::build(&w.g, Some(w.alice.agent_id())).counted_marker().expect("alice's marker");
     for _ in 0..200 {
         w.record(&alice, &Marker { v: VERSION, purpose: "test".into(), in_place: None });
     }
-    let ix = Index::build(&w.g);
+    let ix = Index::build(&w.g, Some(w.alice.agent_id()));
     assert_eq!(ix.counted_marker(), Some(first));
     assert_eq!(ix.ancestry_stats().fallbacks, 0);
     assert_eq!(ix.problems().len(), 200, "the rest are extra");
@@ -964,7 +1070,7 @@ fn a_diverged_policy_is_kept_once_however_many_decisions_find_it() {
         w.supersede(&alice, version, w.line);
     }
     let decisions = w.decide_on(&alice, w.line, m0, D);
-    let lines = unchecked(&w.g);
+    let lines = unchecked(&w.g, w.alice.agent_id());
     assert_eq!(lines.current_versions(&w.line).len(), K);
     let shown = |d: &ContributionId| match lines.verdict(d) {
         Some(Err(Unqualified::PolicyDiverged { versions, count })) => (versions.clone(), *count),

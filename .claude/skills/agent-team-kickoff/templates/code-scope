@@ -70,7 +70,8 @@
 # case check compares each path's leading directories as well (finding 304dd65b233c). Renames count as a deletion and an addition, and a change only in comments
 # counts too: nothing here asks bracken-scope.
 #   'code-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
-#     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, and, as
+#     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, the committed pin
+#     .config/weave-root (docs/design/weave-marker.md, option A), and, as
 #     'code-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
 #     crate the frozen formats rest on: unicode-normalization, icu_casemap, ciborium, blake3, imara-diff.
 #     merge asks for a current owner-review claim by manager naming the pr claim and the head.
@@ -199,6 +200,7 @@ frozen_mode() {
     crates/tree/tests/lines.rs) echo "the ancestor rule's guard" ;;
     crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's test and its pinned values" ;;
     crates/tree/tests/fixtures/*) echo "a Weave fixture" ;;
+    .config/weave-root) echo "the Weave Ground's committed pin: its id, and the root whose marker counts" ;;
     *) return 1 ;;
   esac
 }

@@ -113,13 +113,19 @@ fn init_writes_a_marker_and_a_main_line_and_keeps_keys_private() {
     let w = Weave::new();
     let out = w.ok(&["weave", "init", "--as", AS]);
     let lines: Vec<&str> = out.lines().collect();
-    assert_eq!(lines.len(), 2, "{out}");
-    let marker = lines[0].strip_prefix("marker ").expect("a labelled marker line");
-    let line = lines[1].strip_prefix("line ").and_then(|l| l.strip_suffix(" (main)")).expect("a labelled line");
-    assert!(hex64(marker) && hex64(line), "{out}");
+    assert_eq!(lines.len(), 3, "{out}");
+    let root = lines[0].strip_prefix("root ").expect("a labelled root line");
+    let marker = lines[1].strip_prefix("marker ").expect("a labelled marker line");
+    let line = lines[2].strip_prefix("line ").and_then(|l| l.strip_suffix(" (main)")).expect("a labelled line");
+    assert!(hex64(root) && hex64(marker) && hex64(line), "{out}");
+    // The root is the signer, written beside ground.json (docs/design/weave-marker.md, option A).
+    assert_eq!(w.json(&["id", "list", "--json"])[0]["agent"], root);
+    assert_eq!(fs::read_to_string(w.ground.join("weave-root")).expect("weave-root").trim(), root);
+    assert_eq!(w.ok(&["weave", "check"]), format!("root {root}\nno problems\n"));
+    assert_eq!(w.json(&["weave", "check", "--json"])["root"], root);
     let mode = fs::metadata(w.ground.join("identities")).expect("identities").permissions().mode() & 0o777;
     assert_eq!(mode, 0o700);
-    assert_eq!(w.ok(&["weave", "check"]).trim(), "no problems");
+    assert_eq!(w.ok(&["weave", "check"]).trim().lines().last(), Some("no problems"));
     assert_eq!(w.json(&["weave", "check", "--json"])["marker"], marker);
 
     // Not twice: --dir must be new.
@@ -495,7 +501,23 @@ fn check_lists_invalid_payloads_incomplete_manifests_and_extra_markers() {
         "--as",
         AS,
     ]);
-    // A second marker.
+    // A second marker, by the root, and a forged one by another identity, which never counts.
+    w.ok(&["id", "new", "eve"]);
+    let forged = bracken_tree::Marker { v: 1, purpose: "forged".to_owned(), in_place: None };
+    let forged_path = w._tmp.path().join("forged.cbor");
+    fs::write(&forged_path, bracken_tree::Record::encode(&forged)).expect("write");
+    let media = "application/vnd.bracken.weave.ground+cbor";
+    let forged_out = w.ok(&[
+        "artifact",
+        forged_path.to_str().expect("UTF-8"),
+        "--name",
+        "weave",
+        "--media-type",
+        media,
+        "--as",
+        "eve",
+    ]);
+    let forged_id = forged_out.split_whitespace().nth(1).expect("an id").to_owned();
     let marker = bracken_tree::Marker { v: 1, purpose: "again".to_owned(), in_place: None };
     let path = w._tmp.path().join("marker.cbor");
     fs::write(&path, bracken_tree::Record::encode(&marker)).expect("write");
@@ -517,12 +539,18 @@ fn check_lists_invalid_payloads_incomplete_manifests_and_extra_markers() {
         json["problems"].as_array().expect("problems").iter().map(|p| p["problem"].as_str().expect("named")).collect();
     let mut sorted = kinds.clone();
     sorted.sort();
-    assert_eq!(sorted, ["extra_marker", "incomplete", "invalid_payload"], "{json}");
+    assert_eq!(sorted, ["extra_marker", "incomplete", "invalid_payload", "not_by_root"], "{json}");
+    let not_by_root =
+        json["problems"].as_array().expect("problems").iter().find(|p| p["problem"] == "not_by_root").expect("one");
+    assert_eq!(not_by_root["id"], forged_id.as_str(), "{json}");
+    assert_eq!(not_by_root["root"], json["root"], "{json}");
+    let counted = json["marker"].as_str().expect("a counted marker");
+    assert_eq!(w.json(&["show", counted, "--json"])["author_name"], AS, "the root's first marker still counts");
     let incomplete =
         json["problems"].as_array().expect("problems").iter().find(|p| p["problem"] == "incomplete").expect("one");
     assert_eq!(incomplete["missing"][0], "missing.txt");
     let (_, text) = w.fails(&["weave", "check"]);
-    assert_eq!(text.lines().count(), 3, "{text}");
+    assert_eq!(text.lines().count(), 5, "the root, then four problems: {text}");
     // An incomplete manifest isn't checked out.
     let hash = incomplete["manifest"].as_str().expect("a hash").to_owned();
     let target = w._tmp.path().join("out");
@@ -577,4 +605,66 @@ fn verify_and_check_escape_control_characters() {
     let (_, out) = w.fails(&["weave", "check"]);
     assert!(out.contains("red"), "{out}");
     assert!(!out.contains('\u{1b}'), "{out:?}");
+}
+
+/// docs/design/weave-marker.md, option A: a replica's root is its weave-root file. Without one, no marker
+/// counts and every weave write refuses. `weave root set` sets it only to an AgentId that signed a valid
+/// marker here, and once one is set, only with --replace naming it.
+#[test]
+fn root_set_needs_a_marker_by_the_root_and_replace_names_the_current_one() {
+    let w = Weave::initialized();
+    let root = fs::read_to_string(w.ground.join("weave-root")).expect("weave-root").trim().to_owned();
+    w.ok(&["id", "new", "eve"]);
+    let eve = w
+        .json(&["id", "list", "--json"])
+        .as_array()
+        .expect("identities")
+        .iter()
+        .find(|i| i["name"] == "eve")
+        .expect("eve")["agent"]
+        .as_str()
+        .expect("an AgentId")
+        .to_owned();
+
+    // A root is set: changing it needs --replace naming it.
+    let (err, _) = w.fails(&["weave", "root", "set", &eve]);
+    assert!(err.contains("already") && err.contains(&format!("--replace {root}")), "{err}");
+    let (err, _) = w.fails(&["weave", "root", "set", &eve, "--replace", &eve]);
+    assert!(err.contains("isn't this replica's root"), "{err}");
+    // Eve signed no marker, so she can't be the root.
+    let (err, _) = w.fails(&["weave", "root", "set", &eve, "--replace", &root]);
+    assert!(err.contains("signed no valid Weave marker"), "{err}");
+    let (err, _) = w.fails(&["weave", "root", "set", &eve[..12], "--replace", &root]);
+    assert!(err.contains("give all 64 hex digits"), "{err}");
+    assert_eq!(fs::read_to_string(w.ground.join("weave-root")).expect("weave-root").trim(), root, "nothing written");
+
+    // With no weave-root, nothing counts and writes refuse; root set needs no --replace then.
+    fs::remove_file(w.ground.join("weave-root")).expect("remove weave-root");
+    let check = w.run(&["weave", "check", "--json"]);
+    assert!(!check.status.success(), "the root's marker is listed as not by the root");
+    let json: Value = serde_json::from_slice(&check.stdout).expect("JSON");
+    assert_eq!((json["root"].clone(), json["marker"].clone()), (Value::Null, Value::Null), "{json}");
+    assert_eq!(json["problems"][0]["problem"], "not_by_root", "{json}");
+    let (err, _) = w.fails(&["weave", "import", "--as", AS]);
+    assert!(err.contains("no Weave marker by its root"), "{err}");
+    let (err, _) = w.fails(&["weave", "root", "set", &root, "--replace", &root]);
+    assert!(err.contains("no root set"), "{err}");
+    assert_eq!(w.ok(&["weave", "root", "set", &root]), format!("root {root}\n"));
+    assert_eq!(w.ok(&["weave", "check"]), format!("root {root}\nno problems\n"));
+
+    // Eve writes a marker: now she may be set as root, and then hers is the one that counts.
+    let forged = bracken_tree::Marker { v: 1, purpose: "eve".to_owned(), in_place: None };
+    let path = w._tmp.path().join("eve.cbor");
+    fs::write(&path, bracken_tree::Record::encode(&forged)).expect("write");
+    let media = "application/vnd.bracken.weave.ground+cbor";
+    let out =
+        w.ok(&["artifact", path.to_str().expect("UTF-8"), "--name", "weave", "--media-type", media, "--as", "eve"]);
+    let eves = out.split_whitespace().nth(1).expect("an id").to_owned();
+    let honest: Value = serde_json::from_slice(&w.run(&["weave", "check", "--json"]).stdout).expect("JSON");
+    assert_eq!(honest["problems"][0]["problem"], "not_by_root", "{honest}");
+    assert_ne!(honest["marker"], eves.as_str());
+    let set = w.json(&["weave", "root", "set", &eve, "--replace", &root, "--json"]);
+    assert_eq!((set["root"].as_str(), set["replaced"].as_str()), (Some(eve.as_str()), Some(root.as_str())));
+    let now: Value = serde_json::from_slice(&w.run(&["weave", "check", "--json"]).stdout).expect("JSON");
+    assert_eq!(now["marker"], eves.as_str(), "{now}");
 }

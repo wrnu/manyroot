@@ -1,0 +1,6 @@
+# The Weave Ground's committed pin (docs/design/weave-marker.md, option A; decision d01c83b654d1).
+# scripts/weave, weave-gate and weave-shadow read it from refs/heads/main only, and refuse unless the
+# Weave Ground's ground.json and its replica's weave-root file match it. Changing it is a frozen-rule
+# change: scripts/code-scope frozen lists it, so it takes the owner's go.
+ground 440c0dfaa4d1a3e67168f5eefa5426162faab0653c57ba4217b7231c7d7a5345
+root 6bc92b401e36be06cf432a65cb2cbd7cc765c56b6ad40a3c0c5ffb9c24c6298b

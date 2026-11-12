@@ -92,10 +92,13 @@ views ignore every other version that does (`crates/tree/src/lines.rs`
 284-296; weave.md section 1, *Lines*). It's the one frozen rule that
 depends on who signed, and on which marker counts, so both are frozen
 with it:
-- **the marker that counts**: the valid, non-retracted marker with no other
-  such marker among its causal ancestors, the smallest id among concurrent
-  ones (`ground.rs` 330; weave.md section 1, *Lines*, decision
-  `049d02449a94`);
+- **the marker that counts**: only a marker signed by the Ground's root can
+  count, and among the root's valid, non-retracted markers, the one with no
+  other of the root's among its causal ancestors, the smallest id among
+  concurrent ones (`ground.rs`, `Index::build`; weave.md section 1, *Lines*;
+  decisions `049d02449a94` and `d01c83b654d1`, weave-marker.md option A).
+  How a reader learns the root (the replica's `weave-root` file and the
+  committed `.config/weave-root`) isn't frozen (weave-marker.md question 6);
 - **its author**: the AgentId that signed the marker. A change to whose
   signature stands for that author, such as a delegate's under part B, is
   a change to this rule (section 4).
@@ -430,7 +433,10 @@ Ending them before the join is question 8.
   answer only with a marker of their own with an even smaller id. So the
   forged-marker fix must rest on who may write a marker, not on id order
   (note `ba9e77679d4f`). [weave-marker.md](weave-marker.md) compares the
-  fixes and recommends a pinned root identity, landed before the freeze;
+  fixes and recommends a pinned root identity, landed before the freeze.
+  The owner chose it (decision `d01c83b654d1`), and task `8ffd4b252d9a`
+  builds it: only a marker signed by the Ground's root counts, so a writer
+  without the root's key can no longer take the counted marker;
 - `scripts/weave-gate` used to check none of the problems Weave's index
   reports, so the takeover was silent there (note `ba9e77679d4f`). PR #31
   (task `5c616750e3f9`) adds an interim detection: the gate refuses when
@@ -439,7 +445,12 @@ Ending them before the join is question 8.
   when `weave head --line main` names another line. That turns the
   takeover into a stop at the gate, which falls back to git's counted run.
   It's detection, not a fix: other readers still follow a forged marker,
-  and only its author can retract it (weave-marker.md, option H);
+  and only its author can retract it (weave-marker.md, option H). Once
+  option A landed, the check narrowed (decision `d01c83b654d1` (5)): it
+  refuses when the Weave Ground or its replica's root isn't the committed
+  pin's, when there's no counted marker or it isn't the pinned root's, or
+  when `weave head --line main` names another line, and never because some
+  other marker exists;
 - after G8, if main's integrator merges a hostile writer's line into main,
   that writer can still stop main with an unreadable version on their own
   line;

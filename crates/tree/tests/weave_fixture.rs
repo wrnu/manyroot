@@ -701,7 +701,7 @@ fn every_derived_status_is_as_pinned() {
     let (alice, bob, carol) = (identity(ALICE).agent_id(), identity(BOB).agent_id(), identity(CAROL).agent_id());
     let [m1, m2, m3, m4] = manifests().map(|m| m.content_hash());
 
-    let ix = Index::build(g);
+    let ix = Index::build(g, Some(alice));
     assert_eq!(ix.counted_marker(), Some(n.marker));
     assert_eq!(ix.problems(), &[]);
     for (hash, kind) in [(m1, "manifest"), (m2, "manifest"), (m3, "manifest"), (m4, "manifest")] {
@@ -864,7 +864,7 @@ fn every_derived_status_is_as_pinned() {
     for c in chain {
         before.insert(c.clone()).expect("each one's parents come first");
     }
-    let before_ix = Index::build(&before);
+    let before_ix = Index::build(&before, Some(identity(ALICE).agent_id()));
     let before_lines = Lines::build(&before, &before_ix);
     assert!(
         before_lines.objections().differ_from_walking(&before_ix, &before_lines).is_empty(),
