@@ -69,6 +69,34 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-11-11: only the Weave Ground's root's marker counts (task 8ffd4b252d9a)
+
+Option A of docs/design/weave-marker.md (owner decision `d01c83b654d1`), closing the forged-marker
+takeover (finding `26d9361e0a9f`). A Weave reader is given the Ground's **root**, one AgentId, and only a
+marker that root signed can count; among the root's markers, the old rule picks (causally first, smallest
+id among concurrent ones). `Index::build` takes the root, and the ancestry used for counting covers the
+root's markers only, so a marker someone else placed earlier can't keep the root's from counting. No
+record's bytes change: the formats, ids and the weave-v1 fixture's pinned values are as they were.
+- **Where the root comes from.** A replica's `weave-root` file beside `ground.json`. `weave init` writes it
+  for its signer; `weave root set <AgentId> [--replace <current>]` sets it. A replica without one has no
+  counted marker: no default line, and every `bracken weave` write refuses. In this repository,
+  `scripts/weave`, `weave-gate` and `weave-shadow` also check the Weave Ground's id and the replica's root
+  against the committed pin `.config/weave-root`, read from `refs/heads/main` (`scripts/weave-pin`), and
+  refuse on any mismatch; `scripts/weave` lets through only `weave root set <the pinned root>`.
+- **Old and new binaries.** On every Ground we hold, the rules agree: `~/bracken-weave/manyroot` and its
+  backups have one marker, by `weave-integrator`, the pinned root. They differ only on a Ground holding a
+  marker by someone else, where an older binary still counts it the old way. `weave check` now prints the
+  root and lists a marker not by it as `not_by_root`; `--json` adds `ground` and `root`.
+- **Migration: rollout step 2, the manager's, right after the merge.** Upgrade both binaries that read the
+  Weave Ground (the pinned `.bracken-bin` and `~/bracken-weave`'s). Until the next step every script that
+  reads the Weave Ground refuses, so Weave-gated merges fall back to git's counted run, and no merge is
+  shadowed or backed up. Then run `scripts/weave weave root set
+  6bc92b401e36be06cf432a65cb2cbd7cc765c56b6ad40a3c0c5ffb9c24c6298b`, never by hand; `scripts/weave` checks
+  it wrote the pin. Check that `scripts/weave weave check` names the same marker (`488c40418f98`) and no
+  problem, and `scripts/weave weave head --line main` the same line; then shadow this merge. A backup made
+  before this step lacks `weave-root`; once put back at `~/bracken-weave/manyroot` (by the manager, with the
+  owner's go: no script restores one), the same command sets it.
+
 ### 2026-11-04: signing through a trait, and a server that signs (task 9fdcbbc35806)
 
 Part A step 2 of docs/design/agent-keys.md. In `manyroot`, a contribution can be signed through the

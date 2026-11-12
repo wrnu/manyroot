@@ -2,6 +2,10 @@
 //! versions and manifests by content hash, the marker that counts, what each
 //! contribution is, and what `weave check` lists.
 //!
+//! Only a marker signed by the Ground's root, an AgentId the reader is given,
+//! can count (docs/design/weave-marker.md, option A; decision d01c83b654d1).
+//! A reader with no root has no counted marker.
+//!
 //! Retracted records are left out of every view, except file versions and
 //! manifests: they are content, named by hash, so they are held retracted or not.
 //! An invalid payload makes no contribution invalid: Weave just ignores it, and
@@ -32,8 +36,11 @@ pub enum Problem {
     NotAnAncestor { id: ContributionId, reference: ContributionId },
     /// A manifest whose files this replica doesn't all hold, at the sizes it names.
     Incomplete { id: ContributionId, hash: ContentHash, missing: Vec<String> },
-    /// A valid marker other than the one that counts: written after it, or concurrent with it.
+    /// A valid marker by the root other than the one that counts: written after it, or concurrent with it.
     ExtraMarker { id: ContributionId, counted: ContributionId },
+    /// A valid marker not signed by the root, or any marker when the reader has no root: it never counts,
+    /// whatever its parents or id.
+    NotByRoot { id: ContributionId, author: AgentId, root: Option<AgentId> },
 }
 
 /// An index of one replica's Weave records.
@@ -45,8 +52,10 @@ pub struct Index {
     sizes: BTreeMap<ContentHash, u64>,
     /// Valid manifests by content hash: artifact ids, retracted or not, ascending, and the manifest.
     manifests: BTreeMap<ContentHash, (Vec<ContributionId>, Manifest)>,
-    /// Valid markers, ascending.
-    markers: Vec<ContributionId>,
+    /// Valid markers, ascending, with their authors.
+    markers: Vec<(ContributionId, AgentId)>,
+    /// The Ground's root: only its markers can count.
+    root: Option<AgentId>,
     /// Valid resolutions, by key.
     resolutions: Resolutions,
     /// The marker that counts.
@@ -192,8 +201,9 @@ fn references(media_type: &str, content: &[u8]) -> Result<Vec<ContributionId>, F
 }
 
 impl Index {
-    pub fn build(g: &Graph) -> Index {
-        let mut index = Index::default();
+    /// Indexes `g`'s Weave records, counting only markers signed by `root`; with no root, none counts.
+    pub fn build(g: &Graph, root: Option<AgentId>) -> Index {
+        let mut index = Index { root, ..Index::default() };
         let mut ids: Vec<ContributionId> = g.iter().map(|c| c.id()).collect();
         ids.sort();
         let mut paths = PathCache::new();
@@ -278,7 +288,7 @@ impl Index {
                 }
             }
             if media_type == MARKER_MEDIA_TYPE {
-                index.markers.push(id);
+                index.markers.push((id, c.author()));
             }
             if media_type == RESOLUTION_MEDIA_TYPE {
                 index.resolutions.insert(id, Resolution::decode(content).expect("decoded above"));
@@ -306,7 +316,12 @@ impl Index {
                 retracted: g.is_retracted(&id),
             });
         }
-        index.ancestry = Ancestry::build(g, &refs, &index.markers);
+        // The ancestry used for counting is built over the root's markers only, so a marker by anyone else
+        // placed before the root's, and so in its causal past, can't keep the root's from counting
+        // (docs/design/weave-marker.md, option A).
+        let rooted: Vec<ContributionId> =
+            index.markers.iter().filter(|(_, author)| Some(*author) == root).map(|(id, _)| *id).collect();
+        index.ancestry = Ancestry::build(g, &refs, &rooted);
         for record in found {
             match record {
                 Err(problem) => index.problems.push(problem),
@@ -325,21 +340,35 @@ impl Index {
                 index.problems.push(Problem::Incomplete { id: ids[0], hash: *hash, missing });
             }
         }
-        // Decision 049d02449a94: the marker that counts has no other valid marker in its causal past,
-        // so one written after it has been seen never takes over. Among concurrent ones, the smallest id.
-        index.counted = index.markers.iter().find(|m| index.ancestry.below_a_marker(m) == Some(false)).copied();
-        if let Some(counted) = index.counted {
-            for id in index.markers.iter().filter(|id| **id != counted) {
+        // Decision d01c83b654d1: only the root's markers can count. Among them, decision 049d02449a94: the
+        // marker that counts has no other of the root's valid markers in its causal past, so one written
+        // after it has been seen never takes over. Among concurrent ones, the smallest id.
+        index.counted = rooted.iter().find(|m| index.ancestry.below_a_marker(m) == Some(false)).copied();
+        for (id, author) in &index.markers {
+            if Some(*author) != root {
+                index.problems.push(Problem::NotByRoot { id: *id, author: *author, root });
+            } else if let Some(counted) = index.counted.filter(|c| c != id) {
                 index.problems.push(Problem::ExtraMarker { id: *id, counted });
             }
         }
         index
     }
 
-    /// The marker that counts: the valid, non-retracted marker with no other such
-    /// marker among its causal ancestors, the smallest id if several are concurrent.
+    /// The marker that counts: the root's valid, non-retracted marker with no other such
+    /// marker of the root's among its causal ancestors, the smallest id if several are concurrent.
+    /// `None` without a root, or when the root has signed no such marker.
     pub fn counted_marker(&self) -> Option<ContributionId> {
         self.counted
+    }
+
+    /// The root this index was built with: the only author whose markers can count.
+    pub fn root(&self) -> Option<AgentId> {
+        self.root
+    }
+
+    /// Whether `agent` signed a valid, non-retracted marker in this replica, whatever the root.
+    pub fn has_marker_by(&self, agent: &AgentId) -> bool {
+        self.markers.iter().any(|(_, author)| author == agent)
     }
 
     /// Whether `a` is a strict causal ancestor of `b`, where `b` is a valid record that names `a`: the

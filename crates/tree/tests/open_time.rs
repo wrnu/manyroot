@@ -133,7 +133,7 @@ fn a_fifty_megabyte_ground_opens_and_its_views_hold() {
     let s = Store::open(&dir).expect("the fixture opens");
     let open = t.elapsed();
     let t = Instant::now();
-    let ix = Index::build(s.graph());
+    let ix = Index::build(s.graph(), Some(who.agent_id()));
     let index = t.elapsed();
     let t = Instant::now();
     let lines = Lines::build(s.graph(), &ix);

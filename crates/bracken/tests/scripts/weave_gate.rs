@@ -111,23 +111,34 @@ fn forge_marker(ground: &Path) {
     on_ground(ground, &["artifact", path, "--name", "weave", "--media-type", media, "--as", "forger"]);
 }
 
-/// A Batch whose repository also holds scripts/weave-gate and the stand-in scripts/weave, with an honest
-/// Weave Ground for its reads: marker and line main by weave-integrator.
+/// The pin `ground`'s replica wants: its Ground id and its weave-root, as `.config/weave-root` holds them.
+fn pin_text(ground: &Path) -> String {
+    let info: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ground.join("ground.json")).unwrap()).unwrap();
+    let root = std::fs::read_to_string(ground.join("weave-root")).unwrap();
+    format!("ground {}\nroot {}\n", info["ground"].as_str().unwrap(), root.trim())
+}
+
+/// A Batch whose repository also holds scripts/weave-gate, scripts/weave-pin and the stand-in scripts/weave,
+/// with an honest Weave Ground for its reads, marker and line main by weave-integrator, whose pin main holds
+/// from its first commit (docs/design/weave-marker.md, option A).
 fn fixture(scripts: &str, extra: &dyn Fn(&Path, usize)) -> Batch {
-    let b = Batch::shaped(
+    Batch::shaped(
         scripts,
         3,
         &[],
         false,
         &|dir| {
             copy_executable(&repo_root().join(scripts).join("weave-gate"), &dir.join("scripts/weave-gate"));
+            copy_executable(&repo_root().join("scripts/weave-pin"), &dir.join("scripts/weave-pin"));
             write_executable(&dir.join("scripts/weave"), WEAVE);
+            let ground = weave_ground(dir.parent().unwrap(), "weave-integrator", true);
+            std::fs::create_dir_all(dir.join(".config")).unwrap();
+            std::fs::write(dir.join(".config/weave-root"), pin_text(&ground)).unwrap();
         },
         &|_| 0,
         extra,
-    );
-    weave_ground(b.tmp.path(), "weave-integrator", true);
-    b
+    )
 }
 
 impl Batch {
@@ -772,9 +783,11 @@ fn check_refuses_a_main_older_than_the_heads_branch_point() {
     }
 }
 
-/// Finding 26d9361e0a9f, decision 03534914ec55: record and check both refuse, failing closed, a Weave
-/// Ground that may have been taken over: an extra marker, line main by another identity, no key of
-/// weave-integrator's, and a second line named main. An honest pointer recorded before stops counting.
+/// Finding 26d9361e0a9f, decisions 03534914ec55 and d01c83b654d1 (5): record and check both refuse, failing
+/// closed, a Weave Ground they can't trust: a replica root that isn't the committed pin's, no root, a Ground
+/// that isn't the pinned one, and a second line named main. A forged marker by another identity is no reason
+/// to refuse: under the root rule it never counts, and refusing would hand every writer a stop. An honest
+/// pointer recorded before stops counting while the Ground can't be trusted.
 #[test]
 fn a_weave_ground_that_may_be_taken_over_is_refused() {
     for scripts in SCRIPTS {
@@ -785,6 +798,7 @@ fn a_weave_ground_that_may_be_taken_over_is_refused() {
         assert!(out.status.success(), "{scripts}: the honest Ground: {}", text(&out));
         assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: the honest pointer counts");
         let refused = |b: &Batch, why: &str| {
+            let pointers = b.pointers(&claim).len();
             let out = b.record(&claim, 1);
             let t = text(&out);
             assert_eq!(out.status.code(), Some(1), "{scripts}: {why}: {t}");
@@ -792,28 +806,50 @@ fn a_weave_ground_that_may_be_taken_over_is_refused() {
                 t.contains("refused: ") && t.contains(why) && t.contains("run git's counted run"),
                 "{scripts}: {t}"
             );
-            assert_eq!(b.pointers(&claim).len(), 1, "{scripts}: {why}: a pointer was recorded");
+            assert_eq!(b.pointers(&claim).len(), pointers, "{scripts}: {why}: a pointer was recorded");
             let out = b.merge_one(1, &claim, true);
             let scope = check_line(&out, "scope");
             assert!(!out.status.success() && scope.starts_with("FAIL"), "{scripts}: {why}: {}", text(&out));
             assert!(text(&out).contains(why), "{scripts}: {why}: {}", text(&out));
         };
 
+        // A forged marker never counts, so the gate reads the Ground as before.
         let ground = b.tmp.path().join("weave/ground");
+        let root = std::fs::read_to_string(ground.join("weave-root")).unwrap().trim().to_owned();
         forge_marker(&ground);
-        refused(&b, "extra marker(s)");
+        let checked: serde_json::Value = serde_json::from_str(&{
+            let out = std::process::Command::new(env!("CARGO_BIN_EXE_bracken"))
+                .args(["--dir", ground.to_str().unwrap(), "weave", "check", "--json"])
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        })
+        .unwrap();
+        assert_eq!(checked["problems"][0]["problem"], "not_by_root", "{scripts}: {checked}");
+        let out = b.record(&claim, 1);
+        assert!(out.status.success(), "{scripts}: a forged marker is no stop: {}", text(&out));
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: still counts with a forged marker");
 
-        weave_ground(b.tmp.path(), "other", true);
-        refused(&b, "is by other (");
-        refused(&b, ", not weave-integrator (");
-
-        weave_ground(b.tmp.path(), "other", false);
-        refused(&b, "holds no key it can sign with as weave-integrator");
-
-        let ground = weave_ground(b.tmp.path(), "weave-integrator", true);
+        // The replica's root moved off the pin, by the binary run directly: a stop, not a takeover.
+        let ids: serde_json::Value = serde_json::from_str(&on_ground(&ground, &["id", "list", "--json"])).unwrap();
+        let forger = ids.as_array().unwrap().iter().find(|i| i["name"] == "forger").unwrap()["agent"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        on_ground(&ground, &["weave", "root", "set", &forger, "--replace", &root]);
+        refused(&b, &format!("the Weave Ground's root is {forger}, not the committed pin's {root}"));
+        // No root at all.
+        std::fs::remove_file(ground.join("weave-root")).unwrap();
+        refused(&b, "the Weave Ground's root is not set");
+        on_ground(&ground, &["weave", "root", "set", &root]);
         assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: honest again");
-        on_ground(&ground, &["id", "new", "forger"]);
+
+        // A second line named main, by the forger.
         on_ground(&ground, &["weave", "line", "create", "main", "--owner-decision", &"a".repeat(12), "--as", "forger"]);
         refused(&b, "--line main names no single line");
+
+        // Another Ground altogether: not the one main pins.
+        weave_ground(b.tmp.path(), "weave-integrator", true);
+        refused(&b, "not the committed pin's");
     }
 }

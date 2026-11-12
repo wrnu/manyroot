@@ -5,10 +5,11 @@ Design only: it changes no format, code, test or fixture (task
 `26d9361e0a9f`, the forged-marker takeover in
 [weave-freeze.md](weave-freeze.md) 2.5. Decision `bae92c497714` makes the
 owner's go to freeze wait until this fix has landed, or is planned as a v2.
-Nothing here is decided until the owner answers section 6.
+The owner answered section 6 on 2026-11-11, yes to every recommendation
+(decision `d01c83b654d1`).
 
 File references are to `main` at 3668b09c, except `scripts/weave-gate`,
-which is at 1f7d5f20, after PR #31.
+which is at 1f7d5f20, after PR #31. Task `8ffd4b252d9a` builds option A.
 
 ## Summary
 
@@ -145,8 +146,11 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
   set is the scripts' business (next points).
 - `scripts/weave`, `scripts/weave-gate`, `scripts/weave-shadow`: a
   committed pin, `.config/weave-root` (the Weave Ground's id and its root
-  AgentId), read from the main checkout's `main` commit (`git show
-  main:.config/weave-root`), never from a working tree, and checked
+  AgentId), read from the main checkout's branch `main` by its full ref
+  (`git rev-parse --verify refs/heads/main^{commit}`, then `git show
+  <that sha>:.config/weave-root`; never a bare `main`, which git resolves to
+  a tag named `main` first, finding `e096533fd85e`), never from a working
+  tree, and checked
   against the replica's `weave-root` before anything runs; a mismatch or a
   missing file refuses. `scripts/code-scope frozen` lists
   `.config/weave-root`, so a change to it takes the owner's go like any
@@ -162,7 +166,11 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
   change a replica's pin is to move it to the committed value, by a
   scripted command, with no hand edit of the Ground. The same command is
   the first-time setting (rollout step 2); the repair for a backup made
-  before the pin existed, once it's back at `~/bracken-weave/manyroot`;
+  before the pin existed, once it's back at `~/bracken-weave/manyroot`
+  (no script restores a backup: putting one back is a hand change to the
+  Weave Ground, so it's the manager's, with the owner's go, by moving the
+  copy `scripts/weave-backup --verify` accepted into place while nothing
+  runs against the Ground; then the exception sets its pin);
   and the recovery when someone ran `weave root set` with another AgentId
   first, outside `scripts/weave` (note `5330b58ece22`): `--replace` moves
   the replica back to the committed pin. Changing which root is right
@@ -516,6 +524,13 @@ could disagree on:
    run.
 3. Only then does the freeze's go follow (decision `bae92c497714`).
 
+From the moment step 1's scripts reach `main` until step 2, the replica has
+no `weave-root`, so every script that reads the Weave Ground refuses:
+`scripts/weave` runs only its exception, and `scripts/weave-gate` and
+`scripts/weave-shadow` refuse everything, so every Weave-gated merge falls
+back to git's counted run and no merge is shadowed. `scripts/weave-backup`
+reads the live Ground through `scripts/weave`, so it refuses too. The
+shadow run for step 1's own merge therefore follows step 2, not the merge.
 A binary from before step 1 still counts the old way, so until step 2 the
 gate's detection (H, PR #31) is what notices a forgery. Before the join nothing
 outside this machine reads the Weave Ground, so the upgrade is the whole of

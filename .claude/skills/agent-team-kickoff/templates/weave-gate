@@ -46,12 +46,13 @@
 # pointer's details name (a later re-run or fail makes the pointer stale). Otherwise it prints why on one
 # line and exits 1.
 #
-# Both record and check first refuse, failing closed, a Weave Ground that may have been taken over by a
-# forged marker (finding 26d9361e0a9f, decision 03534914ec55): one whose index, by weave check --json,
-# reports an extra marker; or whose default line isn't line main by weave-integrator, the identity whose
-# key this Ground holds and the gate imports with; or where --line main names another line than the
-# default one. A writer who makes their own marker the counted one leaves the honest marker extra, and
-# line main theirs. This detects the takeover; it doesn't prevent it. record exits 1, saying to run git's
+# Both record and check first refuse, failing closed, a Weave Ground they can't trust (finding
+# 26d9361e0a9f; decision d01c83b654d1 (5), narrowing decision 03534914ec55's check once option A of
+# docs/design/weave-marker.md landed): one whose Ground id or replica root isn't the committed pin's
+# (scripts/weave-pin check: no exception here, so until the pin is set, it refuses everything); one with no
+# counted marker; one whose counted marker isn't signed by the pinned root; or where --line main names
+# another line than the default one. Another identity's marker never counts under the root rule, so it is
+# no reason to refuse: refusing on one would hand every writer a stop. record exits 1, saying to run git's
 # counted run, and check exits 1 with the reason; if any of these reads fails, it refuses the same way.
 #
 # Results are read only through weave green --manifest, by scripts/weave (decision bbbf898cbcfe).
@@ -62,7 +63,7 @@ main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-d
 weave="$here/weave"
 # The checks a pointer needs, in the order validate runs them: mac reads table's passing log.
 required=(fmt clippy table mac)
-# The integrator: it signs the gate's imports, and line main's first version must be its.
+# The integrator: it signs the gate's imports.
 integrator=weave-integrator
 # Paths whose change by the head means git's counted run: the policy pins main's test-table, and the
 # vendor directory follows main's Cargo.lock.
@@ -117,38 +118,25 @@ fallback() {
   return 1
 }
 
-# taken_over: sets why and returns 0 if the Weave Ground may have been taken over by a forged marker
-# (finding 26d9361e0a9f), or if it can't tell; returns 1 if it reads as honest. Its integrator's key is
-# the one this Ground can sign with as $integrator, compared with the line's author key, never a name.
+# taken_over: sets why and returns 0 if the Weave Ground can't be trusted, or if it can't tell; returns 1 if
+# it reads as honest: the committed pin's Ground and root, a counted marker by that root, and --line main
+# naming the default line.
 taken_over() {
-  local checked extra n ids key default named shown author
+  local pin root checked marker author default named
+  pin=$("$here/weave-pin" check 2>&1) || { why=$(tail -n 1 <<<"$pin"); why=${why#weave-pin: }; return 0; }
+  root=${pin#* }
   # weave check exits 1 whenever it lists a problem, so its JSON is read whatever its exit code.
   checked=$("$weave" weave check --json 2>/dev/null) || true
-  jq -e '(.marker | type) == "string" and (.problems | type) == "array"' <<<"$checked" >/dev/null 2>&1 ||
-    { why="weave check --json didn't give the counted marker and the index's problems"; return 0; }
-  extra=$(jq -c '[.problems[] | select(.problem == "extra_marker")]' <<<"$checked")
-  n=$(jq length <<<"$extra")
-  if [ "$n" -gt 0 ]; then
-    why="Weave's index reports $n extra marker(s), such as $(jq -r '.[0].id[:12]' <<<"$extra"), beside the counted"
-    why+=" marker $(jq -r '.marker[:12]' <<<"$checked"): line main may be forged (finding 26d9361e0a9f)"
-    return 0
-  fi
-  ids=$("$weave" id list --json 2>/dev/null) || { why="couldn't list the Weave Ground's identities"; return 0; }
-  key=$(jq -r --arg n "$integrator" '[.[] | select(.name == $n and .can_sign == true) | .agent]
-    | if length == 1 then .[0] else "" end' <<<"$ids" 2>/dev/null) || key=''
-  [ -n "$key" ] || { why="the Weave Ground holds no key it can sign with as $integrator"; return 0; }
+  marker=$(jq -r '.marker // empty' <<<"$checked" 2>/dev/null) || marker=''
+  [ -n "$marker" ] || { why="the Weave Ground has no counted marker by its root ${root:0:12}"; return 0; }
+  author=$("$weave" show "$marker" --json 2>/dev/null | jq -r '.author // empty' 2>/dev/null) || author=''
+  [ "$author" = "$root" ] ||
+    { why="the counted marker ${marker:0:12} is by ${author:0:12}, not the pinned root ${root:0:12}"; return 0; }
   default=$("$weave" weave head --json 2>/dev/null | jq -r '.line // empty' 2>/dev/null) || default=''
   [ -n "$default" ] || { why="weave head names no default line"; return 0; }
   named=$("$weave" weave head --line main --json 2>/dev/null | jq -r '.line // empty' 2>/dev/null) || named=''
   [ "$named" = "$default" ] ||
     { why="--line main names ${named:-no single line}, not the default line ${default:0:12}"; return 0; }
-  shown=$("$weave" show "$default" --json 2>/dev/null) || { why="can't show line main's first version $default"; return 0; }
-  author=$(jq -r '.author // empty' <<<"$shown" 2>/dev/null) || author=''
-  if [ "$author" != "$key" ]; then
-    why="line main's first version, ${default:0:12}, is by $(jq -r '.author_name // empty' <<<"$shown" 2>/dev/null)"
-    why+=" (${author:0:12}), not $integrator (${key:0:12}): line main may be forged (finding 26d9361e0a9f)"
-    return 0
-  fi
   return 1
 }
 
