@@ -1071,6 +1071,26 @@ impl WeaveStore {
         let path = self.config.dir.join("join.mrb");
         std::fs::write(&path, bundle).map_err(|e| format!("writing the bundle: {e}"))?;
         self.bracken(&["join".into(), "--".into(), path.to_string_lossy().into_owned()])?;
+        // A joined replica has no root (docs/design/weave-marker.md, option A), so no marker counts in it yet.
+        // As for the setter's key below, the copy trusts the hub's Ground as joined, before any agent has
+        // written to it: it holds exactly one marker, the hub's, whose author becomes this replica's root.
+        // weave check exits 1 while it lists the marker as not the root's: its JSON is read whatever its exit.
+        let argv: Vec<String> = ["weave", "check", "--json"].iter().map(|a| a.to_string()).collect();
+        let out = self.bracken_output(&argv)?;
+        let checked: Value =
+            serde_json::from_slice(&out.stdout).map_err(|e| format!("weave check printed bad JSON: {e}"))?;
+        let markers: Vec<&str> = checked["problems"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["problem"] == "not_by_root")
+            .filter_map(|p| p["author"].as_str())
+            .collect();
+        let [root] = markers[..] else {
+            return Err(format!("the hub's Ground as joined holds {} Weave markers, not one", markers.len()));
+        };
+        let root = root.to_string();
+        self.bracken(&["weave".into(), "root".into(), "set".into(), "--".into(), root])?;
         let key = self.bracken(&["id".into(), "new".into(), "--".into(), self.config.identity.clone()])?;
         let key = String::from_utf8_lossy(&key).trim().to_string();
         self.save("key.txt", &key)?;
