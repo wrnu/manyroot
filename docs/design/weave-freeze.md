@@ -266,24 +266,24 @@ tripwire don't match it (section 4).
 | Canonical CBOR, `v`, unknown fields | golden vectors; `non_canonical_payloads_are_refused`; `only_version_1_is_read`; the fixture | none |
 | The seven media types and the prefix | golden vectors (media type strings), `artifact_names_and_media_types`; the scripts' tests for the prefix | none |
 | Artifact names, goal tag | `artifact_names_and_media_types`; the fixture's ids | none |
-| Content hash, the `blake3:` text form | golden vectors (hashes); `hash.rs` unit tests | G5: the unit tests live in `src/`, so they're covered by `full`, but no golden vector pins a text-form parse |
+| Content hash, the `blake3:` text form | golden vectors (hashes); `hash.rs` unit tests | G5: the unit tests live in `src/`, so they're covered by `full`, but no golden vector pins a text-form parse. Closed by PR #28: `content_hash_text_form` |
 | Modes, file values | golden manifest (all three modes) and resolution; `unknown_modes_are_refused` | none |
 | Manifest | golden vector; `manifest_rules`; the fixture | none |
-| Marker | golden vector with `in_place` null; the fixture | **G1**: nothing pins a marker with `in_place` set by its bytes, and that's the record the join writes |
+| Marker | golden vector with `in_place` null; the fixture | **G1**: nothing pins a marker with `in_place` set by its bytes, and that's the record the join writes. Closed by PR #28: `golden_vectors_for_executors_and_in_place` |
 | Line without executors | golden vector; `line_rules`; the fixture | none |
-| Line with executors, Executor | `executors_are_left_out_when_there_are_none`, round trips, `line_rules` | **G1**: no golden bytes for a line with an executor, of either kind; the fixture predates executors |
+| Line with executors, Executor | `executors_are_left_out_when_there_are_none`, round trips, `line_rules` | **G1**: no golden bytes for a line with an executor, of either kind; the fixture predates executors. Closed by PR #28: `golden_vectors_for_executors_and_in_place`; the fixture still predates them (G7) |
 | `owner_decision` and its null rule | golden line; `line_rules`; the fixture's derived statuses | none |
 | The ancestor rule | `lines.rs`'s tests; the fixture, every record of which passes it | none |
 | A policy version this build can't read | `refuse_unreadable` (2.1), for the same media type only, and Ground-wide | **G8**: the refusal isn't scoped per line, so any signer can stop every line; `weave green` only warns, and `scripts/weave-gate` refuses only by accident; an unreadable decision is dropped silently. **Not covered by G8**: a record under a new media type isn't seen at all, and would need a further reader change |
 | The marker that counts, and its author | the fixture's derived statuses (its default line and the null-`owner_decision` version); the coordination fixture test's `counted_marker() == None` | none |
 | Decision | golden vector; `decision_rules`; `a_decision_refers_to_at_most_max_references`; the fixture, which holds decisions with `source` null and set | none |
-| Proposal and its change | golden proposal (its `change` field is an arbitrary hash); change rows by value; the fixture's proposals, whose ids pin their recomputed `change` | **G2**: no golden vector pins a change list's hash directly |
+| Proposal and its change | golden proposal (its `change` field is an arbitrary hash); change rows by value; the fixture's proposals, whose ids pin their recomputed `change` | **G2**: no golden vector pins a change list's hash directly. Closed by PR #28: `golden_change_hash` |
 | Resolution | golden vector; `resolution_rules`; the fixture | none |
-| Path rules, folding, collisions | `paths.rs`; the Unicode digest; `manifest_rules`; the deep-path test | **G3**: `MAX_PATH_BYTES`, `MAX_COMPONENT_BYTES` and `MAX_REFERENCES` are tested only through their constants (`paths.rs` 213-235, `format_guard.rs` 391-405), so changing a constant's value passes every test unless it's off by a lot. `VERSION` isn't in this gap: the golden manifest and resolution are written with it, and `only_version_1_is_read` fails if it changes |
-| Definition hash, method | relative assertions in `format_guard.rs`; the fixture pins argv-only methods through its evidence ids | **G2**: no golden value for a definition hash with an executor, of either kind |
-| Details, the counted part | the fixture (`details()` with `Exit::Code` and a text tail) | **G4**: nothing pins `details_with_run`'s first two lines, or `details` with a withheld tail or another `Exit` variant |
-| Any of the above, as a review requirement | AGENTS.md and releases.md, read by people | **G6**: nothing mechanical requires protocol-class review for a Weave format change. `scripts/merge` never asks for `owner-review`; `code-scope full` doesn't list `format_guard.rs` or `paths.rs`; AGENTS.md's protocol bullet names only manyroot's files and `docs/protocol.md` |
-| The refusals in 1.8, as a review requirement | the security review every PR gets | **G6**: `crates/bracken/src/weave.rs` and `crates/bracken/src/weave/` take a light run, and nothing asks for an independent review for any 1.8 file |
+| Path rules, folding, collisions | `paths.rs`; the Unicode digest; `manifest_rules`; the deep-path test | **G3**: `MAX_PATH_BYTES`, `MAX_COMPONENT_BYTES` and `MAX_REFERENCES` are tested only through their constants (`paths.rs` 213-235, `format_guard.rs` 391-405), so changing a constant's value passes every test unless it's off by a lot. `VERSION` isn't in this gap: the golden manifest and resolution are written with it, and `only_version_1_is_read` fails if it changes. Closed by PR #28: `limits_are_pinned_by_value` |
+| Definition hash, method | relative assertions in `format_guard.rs`; the fixture pins argv-only methods through its evidence ids | **G2**: no golden value for a definition hash with an executor, of either kind. Closed by PR #28: `golden_definition_hashes_and_methods` |
+| Details, the counted part | the fixture (`details()` with `Exit::Code` and a text tail) | **G4**: nothing pins `details_with_run`'s first two lines, or `details` with a withheld tail or another `Exit` variant. Closed by PR #28: `golden_details` |
+| Any of the above, as a review requirement | AGENTS.md and releases.md, read by people | **G6**: nothing mechanical requires protocol-class review for a Weave format change. `scripts/merge` never asks for `owner-review`; `code-scope full` doesn't list `format_guard.rs` or `paths.rs`; AGENTS.md's protocol bullet names only manyroot's files and `docs/protocol.md`. Closed by PR #29: `scripts/code-scope frozen` and `scripts/merge`'s `frozen` check, which asks for the `owner-review`; both test files joined `code-scope full`; the bullet names `crates/tree/src/` and this page |
+| The refusals in 1.8, as a review requirement | the security review every PR gets | **G6**: `crates/bracken/src/weave.rs` and `crates/bracken/src/weave/` take a light run, and nothing asks for an independent review for any 1.8 file. Closed by PR #29: they joined `code-scope full`, and `code-scope frozen`'s `security:` lines make `scripts/merge` ask for an independent review's pass |
 
 ### 2.3 Docs that disagree with the code
 
@@ -605,8 +605,9 @@ Ending them before the join is question 8.
   the join waits for a review of Weave that assumes a hostile writer, and
   for what it finds to be hardened or accepted (question 8).
 - **The join's own record is frozen too.** Step 3 of the join writes a
-  marker with `in_place` set. Its format is frozen (1.3), but no golden
-  vector pins it yet, so G1 should land before the join.
+  marker with `in_place` set. Its format is frozen (1.3), and G1 pins it
+  by bytes and content hash: `format_guard.rs`
+  `golden_vectors_for_executors_and_in_place`, landed in PR #28.
 - **The join relies on two frozen things.**
   - Content hashes don't depend on the Ground, and manifests encode the
     same in either Ground, so step 4's manifest hash can equal the dogfood
