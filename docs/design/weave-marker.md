@@ -156,12 +156,18 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
   `.config/weave-root`, so a change to it takes the owner's go like any
   frozen rule (development.md, Owner approvals).
 - **How the replica's pin gets set: one exception in `scripts/weave`.**
-  When the replica's `weave-root` is missing, or differs from the
-  committed pin, `scripts/weave` refuses everything except `weave root
+  When the replica's `weave-root` is missing, unreadable, or differs from
+  the committed pin, `scripts/weave` refuses everything except `weave root
   set` given exactly the committed pin's AgentId (with `--replace <the
-  replica's current root>` when one is set). It runs that, then reads the
-  replica's `weave-root` back and refuses unless it now equals the
-  committed pin. `scripts/weave-gate` and `scripts/weave-shadow` get no
+  replica's current root>` when the binary reads one). The file counts as
+  the pin's only when its bytes are exactly the pinned AgentId and a
+  newline, as `weave root set` writes it. Anything else is read by the
+  pinned binary itself (`weave check --json`'s `root`), so `--replace`
+  names the root the binary sees, and a malformed file, which the binary
+  reads as no root, is repaired by the same command without `--replace`
+  (task `724ecb3b196d`). It runs that, then reads the replica's
+  `weave-root` back and refuses unless it now holds exactly the committed
+  pin. `scripts/weave-gate` and `scripts/weave-shadow` get no
   exception: they refuse until the pin is set. So the one way to set or
   change a replica's pin is to move it to the committed value, by a
   scripted command, with no hand edit of the Ground. The same command is
@@ -185,7 +191,9 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
   is the manager's own step. An agent that bypasses `scripts/weave`, runs
   the binary on the Ground directly and sets another root gets a stop, not
   a takeover: every script refuses on the mismatch until the exception
-  moves the pin back. An agent that edits `scripts/weave` itself, or
+  moves the pin back. A `weave-root` the binary can't replace, such as a
+  directory, still fails closed and takes a hand repair by the manager.
+  An agent that edits `scripts/weave` itself, or
   commits a different pin on `main` locally, is the forging agent of
   agent-keys.md section 2, which nothing here stops.
 - Tests: `crates/tree/tests/lines.rs`'s
@@ -531,8 +539,12 @@ no `weave-root`, so every script that reads the Weave Ground refuses:
 back to git's counted run and no merge is shadowed. `scripts/weave-backup`
 reads the live Ground through `scripts/weave`, so it refuses too. The
 shadow run for step 1's own merge therefore follows step 2, not the merge.
-A binary from before step 1 still counts the old way, so until step 2 the
-gate's detection (H, PR #31) is what notices a forgery. Before the join nothing
+A binary from before step 1 still counts the old way, but no script acts on
+its count: its `weave check --json` gives no Ground id, so `scripts/weave-pin
+check` fails and the gate refuses, and under the new binary the replica has
+no pin. So from step 1's merge until step 2 every Weave script refuses and
+nothing Weave-gated counts at all, which is stricter than the gate's
+detection (H, PR #31), not reliant on it. Before the join nothing
 outside this machine reads the Weave Ground, so the upgrade is the whole of
 step 2. At the join, the coordination Ground's root is pinned in the join
 PR, before the marker is written (question 2), and every reader of that

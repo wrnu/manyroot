@@ -1479,7 +1479,8 @@ fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
 /// docs/design/weave-marker.md, option A: scripts/weave runs nothing until the Weave Ground's id and its
 /// replica's root are the committed pin's, .config/weave-root on refs/heads/main, never a tag named main
 /// (finding e096533fd85e). Its one exception is exactly 'weave root set <the pinned root>', with --replace
-/// naming the replica's root when one is set; it reads the file back. weave-pin prints the pin.
+/// naming the replica's root when the binary reads one, so a malformed weave-root is repaired with no hand
+/// edit; it reads the file back. weave-pin prints the pin.
 #[test]
 fn weave_runs_only_on_the_pinned_ground_and_root_set_moves_only_to_the_pin() {
     let (_tmp, dir, home, _) = weave_repo();
@@ -1574,4 +1575,30 @@ fn weave_runs_only_on_the_pinned_ground_and_root_set_moves_only_to_the_pin() {
     refused(&["weave", "root", "set", &root, "--replace", &root], "the only command run until it is");
     ok(&["weave", "root", "set", &root]);
     assert!(check().starts_with(&format!("root {root}\n")));
+
+    // A malformed weave-root (task 724ecb3b196d): the binary reads no root from it, so the exception is the
+    // same command with no --replace, which the binary accepts, and it writes exactly the pin back. Before,
+    // the script demanded '--replace <the bad text>', which the binary refuses, and only a hand edit got out.
+    let (head, tail) = root.split_at(32);
+    for bad in [format!("{root} junk\n"), format!("{head} {tail}\n"), format!("{root}\0\n"), "x".to_owned()] {
+        std::fs::write(ground.join("weave-root"), &bad).unwrap();
+        let unreadable = "this replica's root is not set: its weave-root file holds no AgentId the binary reads";
+        refused(&["weave", "head"], unreadable);
+        let only = format!("the only command run until it is: scripts/weave weave root set {root}\n");
+        refused(&["weave", "root", "set", &root, "--replace", &root], &only);
+        refused(&["weave", "root", "set", &forger], &only);
+        let set = ok(&["weave", "root", "set", &root]);
+        assert_eq!(set.trim(), format!("root {root}"), "{bad:?}");
+        assert_eq!(std::fs::read_to_string(ground.join("weave-root")).unwrap(), format!("{root}\n"), "{bad:?}");
+        assert!(check().starts_with(&format!("root {root}\n")), "{bad:?}");
+    }
+    // A file the binary does read, though not as weave root set writes it: --replace names what the binary
+    // reads. The pin in capitals is the pin, so everything runs; the forger's is the forger's.
+    std::fs::write(ground.join("weave-root"), format!(" {}\r\n", root.to_uppercase())).unwrap();
+    assert!(check().starts_with(&format!("root {root}\n")));
+    refused(&["weave", "root", "set", &root], "already the committed pin's");
+    std::fs::write(ground.join("weave-root"), forger.to_uppercase()).unwrap();
+    refused(&["weave", "head"], &format!("this replica's root is {forger}, not the committed pin's {root}"));
+    ok(&["weave", "root", "set", &root, "--replace", &forger]);
+    assert_eq!(std::fs::read_to_string(ground.join("weave-root")).unwrap(), format!("{root}\n"));
 }

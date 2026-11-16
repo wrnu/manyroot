@@ -35,11 +35,15 @@
 # init, the Ground's id in ground.json and its replica's root, the weave-root file beside it, must be the
 # ones .config/weave-root holds on the main checkout's refs/heads/main (scripts/weave-pin). A mismatch, or
 # no pin on either side, refuses everything, with one exception, when the Ground's id matches and only the
-# replica's root is missing or differs: exactly 'weave root set <the pinned root>', with '--replace <the
-# replica's root>' when one is set. It runs that, reads the replica's weave-root back, and fails unless it
-# now holds the pinned root. So the one way to set or move a replica's root through the scripts is to the
-# committed value; weave root set is refused once the replica matches. Changing which root is right is a
-# change to .config/weave-root, which scripts/code-scope frozen lists.
+# replica's root is missing, unreadable or differs: exactly 'weave root set <the pinned root>', with
+# '--replace <the replica's root>' when the binary reads one. The replica's weave-root counts as the pin's
+# only when its bytes are exactly the pinned root and a newline, as weave root set writes it; anything else
+# is read by the pinned binary itself (weave check --json's root), so --replace names exactly the root the
+# binary sees, and a malformed file, which the binary reads as no root, is repaired by the same command
+# without --replace, with no hand edit. It runs that, reads the replica's weave-root back, and fails unless
+# it now holds exactly the pinned root. So the one way to set or move a replica's root through the scripts
+# is to the committed value; weave root set is refused once the replica matches. Changing which root is
+# right is a change to .config/weave-root, which scripts/code-scope frozen lists.
 # Creating the Weave Ground (weave init) waits for the owner's go.
 set -euo pipefail
 
@@ -160,8 +164,21 @@ if [ "$sub" != init ]; then
     fail "can't read the Ground id in $ground/ground.json"
   [ "$ours" = "$pin_ground" ] ||
     fail "refused: the Ground at $ground is $ours, not the committed pin's $pin_ground (.config/weave-root on main)"
-  replica=''
-  [ ! -f "$ground/weave-root" ] || replica=$(tr -d '[:space:]' <"$ground/weave-root")
+  # The replica's root as the binary reads it: the file as weave root set writes it, or else what the
+  # binary's weave check reports, so that the exception's --replace is never one the binary refuses.
+  replica='' shown=''
+  if [ -f "$ground/weave-root" ] && cmp -s "$ground/weave-root" <(printf '%s\n' "$pin_root"); then
+    replica=$pin_root
+  else
+    command -v jq >/dev/null || fail "needs jq to read this replica's root"
+    # weave check exits 1 whenever it lists a problem, so its JSON is read whatever its exit code.
+    checked=$(BRACKEN_DIR="$ground" "$bin" weave check --json 2>/dev/null) || true
+    replica=$(jq -er 'if (.ground | type) == "string" then (.root // "") else error end' <<<"$checked" 2>/dev/null) ||
+      fail "can't read this replica's root: weave check --json failed on $ground"
+    [[ -z $replica || $replica =~ ^[0-9a-f]{64}$ ]] || fail "weave check --json gave a root that isn't an AgentId"
+    [ -n "$replica" ] || { [ ! -e "$ground/weave-root" ] && [ ! -L "$ground/weave-root" ]; } ||
+      shown="not set: its weave-root file holds no AgentId the binary reads"
+  fi
   if [ "$replica" = "$pin_root" ]; then
     [ "$sub" != root ] ||
       fail "weave root is refused: this replica's root is already the committed pin's, $pin_root; changing it is a change to .config/weave-root"
@@ -174,7 +191,7 @@ if [ "$sub" != init ]; then
       for i in "${!exact[@]}"; do [ "${given[$i]}" = "${exact[$i]}" ] || same=false; done
     fi
     $same ||
-      fail "refused: this replica's root is ${replica:-not set}, not the committed pin's $pin_root (.config/weave-root on main); the only command run until it is: scripts/weave ${exact[*]}"
+      fail "refused: this replica's root is ${shown:-${replica:-not set}}, not the committed pin's $pin_root (.config/weave-root on main); the only command run until it is: scripts/weave ${exact[*]}"
     root_set=true
   fi
 fi
@@ -182,9 +199,8 @@ fi
 export BRACKEN_DIR="$ground"
 if $root_set; then
   "$bin" "$@" || exit
-  now=''
-  [ ! -f "$ground/weave-root" ] || now=$(tr -d '[:space:]' <"$ground/weave-root")
-  [ "$now" = "$pin_root" ] || fail "weave root set ran, but the replica's root is ${now:-not set}, not $pin_root"
+  [ -f "$ground/weave-root" ] && cmp -s "$ground/weave-root" <(printf '%s\n' "$pin_root") ||
+    fail "weave root set ran, but the replica's weave-root file doesn't hold exactly $pin_root"
   exit 0
 fi
 # A box or mac check's runner script is the main checkout's, the copy line main's policy pins (plan

@@ -12,7 +12,9 @@ use crate::support::*;
 /// there, recording nothing for it, as the real one does for a check that can't run, and `extra` lists
 /// more policy checks; `show` knows the ids in `proposals`. The reads weave-gate's takeover check makes
 /// (`id list`, `weave check`, `weave head`, and `show` of anything but a proposal) go to the real bracken,
-/// on the throwaway Weave Ground at `$T/weave/ground` that [`weave_ground`] builds.
+/// on the throwaway Weave Ground at `$T/weave/ground` that [`weave_ground`] builds, except that
+/// `$T/weave/counted-marker` makes `weave check` report the id it holds as the counted marker, as no honest
+/// binary would for a marker not by the root.
 const WEAVE: &str = r#"#!/bin/bash
 set -euo pipefail
 W="$T/weave"
@@ -23,6 +25,11 @@ echo "${as:-none} $*" >>"$W/calls"
 hash_of() { echo "blake3:$(git -C "$1" rev-parse "$2^{tree}" | shasum -a 256 | cut -c1-64)"; }
 opt() { local want=$1; shift; while [ $# -gt 0 ]; do [ "$1" != "$want" ] || { echo "$2"; return; }; shift; done; }
 if [ "$1" = show ] && grep -qxF "$2" "$W/proposals" 2>/dev/null; then exit 0; fi
+if [ "$1 ${2:-}" = "weave check" ] && [ -e "$W/counted-marker" ]; then
+  checked=$("$REAL_BRACKEN" --dir "$W/ground" "$@") || true
+  jq --arg m "$(cat "$W/counted-marker")" '.marker = $m' <<<"$checked"
+  exit 1
+fi
 case "$1 ${2:-}" in
   "id "* | "show "* | "weave check" | "weave head") exec "$REAL_BRACKEN" --dir "$W/ground" "$@" ;;
 esac
@@ -100,15 +107,16 @@ fn weave_ground(tmp: &Path, author: &str, integrator: bool) -> PathBuf {
 }
 
 /// A second Weave marker in `ground`, signed by a new identity, forger: as any writer can (finding
-/// 26d9361e0a9f), going round scripts/weave.
-fn forge_marker(ground: &Path) {
+/// 26d9361e0a9f), going round scripts/weave. Returns its id.
+fn forge_marker(ground: &Path) -> String {
     on_ground(ground, &["id", "new", "forger"]);
     let marker = bracken_tree::Marker { v: 1, purpose: "forged".to_owned(), in_place: None };
     let path = ground.parent().unwrap().join("marker.cbor");
     std::fs::write(&path, bracken_tree::Record::encode(&marker)).unwrap();
     let path = path.to_str().unwrap();
     let media = bracken_tree::format::MARKER_MEDIA_TYPE;
-    on_ground(ground, &["artifact", path, "--name", "weave", "--media-type", media, "--as", "forger"]);
+    let out = on_ground(ground, &["artifact", path, "--name", "weave", "--media-type", media, "--as", "forger"]);
+    out.lines().next().unwrap().split(' ').next_back().unwrap().to_owned()
 }
 
 /// The pin `ground`'s replica wants: its Ground id and its weave-root, as `.config/weave-root` holds them.
@@ -783,6 +791,86 @@ fn check_refuses_a_main_older_than_the_heads_branch_point() {
     }
 }
 
+/// Record and check both refuse PR #1's `claim` saying `why`, recording no pointer: verify-seq --weave exits
+/// 1, and scripts/merge's scope check fails.
+fn refused_for(b: &Batch, scripts: &str, claim: &str, why: &str) {
+    let pointers = b.pointers(claim).len();
+    let out = b.record(claim, 1);
+    let t = text(&out);
+    assert_eq!(out.status.code(), Some(1), "{scripts}: {why}: {t}");
+    assert!(t.contains("refused: ") && t.contains(why) && t.contains("run git's counted run"), "{scripts}: {t}");
+    assert_eq!(b.pointers(claim).len(), pointers, "{scripts}: {why}: a pointer was recorded");
+    let out = b.merge_one(1, claim, true);
+    let scope = check_line(&out, "scope");
+    assert!(!out.status.success() && scope.starts_with("FAIL"), "{scripts}: {why}: {}", text(&out));
+    assert!(text(&out).contains(why), "{scripts}: {why}: {}", text(&out));
+}
+
+/// A fixture with the gate on and PR #1's honest pointer recorded and counted: its claim, the Weave
+/// Ground's path, its root and its counted marker.
+fn honest_pointer(scripts: &str) -> (Batch, String, PathBuf, String, String) {
+    let b = fixture(scripts, &|_, _| {});
+    b.gate("Weave gate: on");
+    let claim = b.with_proposal(1);
+    let out = b.record(&claim, 1);
+    assert!(out.status.success(), "{scripts}: the honest Ground: {}", text(&out));
+    assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: the honest pointer counts");
+    let ground = b.tmp.path().join("weave/ground");
+    let checked: serde_json::Value = serde_json::from_str(&on_ground(&ground, &["weave", "check", "--json"])).unwrap();
+    let (root, marker) = (checked["root"].as_str().unwrap().to_owned(), checked["marker"].as_str().unwrap().to_owned());
+    (b, claim, ground, root, marker)
+}
+
+/// The pin still matches, so weave-pin check, which the gate runs first, passes: what refuses is later.
+fn pin_matches(b: &Batch, scripts: &str) {
+    let out = b.command("scripts/weave-pin", &["check"]).output().unwrap();
+    assert!(out.status.success(), "{scripts}: weave-pin check: {}", text(&out));
+}
+
+/// Finding c8d9cb58a438, decision d01c83b654d1 (5): with the pin matching, a Weave Ground with no counted
+/// marker is refused for that reason. The root retracted its only marker, so the real binary counts none.
+#[test]
+fn a_pinned_ground_with_no_counted_marker_is_refused() {
+    for scripts in SCRIPTS {
+        let (b, claim, ground, root, marker) = honest_pointer(scripts);
+        on_ground(&ground, &["retract", &marker, "--as", "weave-integrator"]);
+        pin_matches(&b, scripts);
+        refused_for(
+            &b,
+            scripts,
+            &claim,
+            &format!("the Weave Ground has no counted marker by its root {}", &root[..12]),
+        );
+    }
+}
+
+/// Finding c8d9cb58a438, decision d01c83b654d1 (5): with the pin matching, a Weave Ground whose counted
+/// marker isn't signed by the pinned root is refused for that reason. No honest binary counts such a marker,
+/// so the stand-in reports the forger's as counted, as a binary that broke the root rule would.
+#[test]
+fn a_pinned_ground_whose_counted_marker_isnt_the_roots_is_refused() {
+    for scripts in SCRIPTS {
+        let (b, claim, ground, root, _) = honest_pointer(scripts);
+        let forged = forge_marker(&ground);
+        let ids: serde_json::Value = serde_json::from_str(&on_ground(&ground, &["id", "list", "--json"])).unwrap();
+        let forger = ids.as_array().unwrap().iter().find(|i| i["name"] == "forger").unwrap()["agent"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        // The forged marker alone changes nothing: it doesn't count.
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: a forged marker is no stop");
+        std::fs::write(b.weave_dir().join("counted-marker"), &forged).unwrap();
+        pin_matches(&b, scripts);
+        let why = format!(
+            "the counted marker {} is by {}, not the pinned root {}",
+            &forged[..12],
+            &forger[..12],
+            &root[..12]
+        );
+        refused_for(&b, scripts, &claim, &why);
+    }
+}
+
 /// Finding 26d9361e0a9f, decisions 03534914ec55 and d01c83b654d1 (5): record and check both refuse, failing
 /// closed, a Weave Ground they can't trust: a replica root that isn't the committed pin's, no root, a Ground
 /// that isn't the pinned one, and a second line named main. A forged marker by another identity is no reason
@@ -791,31 +879,10 @@ fn check_refuses_a_main_older_than_the_heads_branch_point() {
 #[test]
 fn a_weave_ground_that_may_be_taken_over_is_refused() {
     for scripts in SCRIPTS {
-        let b = fixture(scripts, &|_, _| {});
-        b.gate("Weave gate: on");
-        let claim = b.with_proposal(1);
-        let out = b.record(&claim, 1);
-        assert!(out.status.success(), "{scripts}: the honest Ground: {}", text(&out));
-        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: the honest pointer counts");
-        let refused = |b: &Batch, why: &str| {
-            let pointers = b.pointers(&claim).len();
-            let out = b.record(&claim, 1);
-            let t = text(&out);
-            assert_eq!(out.status.code(), Some(1), "{scripts}: {why}: {t}");
-            assert!(
-                t.contains("refused: ") && t.contains(why) && t.contains("run git's counted run"),
-                "{scripts}: {t}"
-            );
-            assert_eq!(b.pointers(&claim).len(), pointers, "{scripts}: {why}: a pointer was recorded");
-            let out = b.merge_one(1, &claim, true);
-            let scope = check_line(&out, "scope");
-            assert!(!out.status.success() && scope.starts_with("FAIL"), "{scripts}: {why}: {}", text(&out));
-            assert!(text(&out).contains(why), "{scripts}: {why}: {}", text(&out));
-        };
+        let (b, claim, ground, root, _) = honest_pointer(scripts);
+        let refused = |b: &Batch, why: &str| refused_for(b, scripts, &claim, why);
 
         // A forged marker never counts, so the gate reads the Ground as before.
-        let ground = b.tmp.path().join("weave/ground");
-        let root = std::fs::read_to_string(ground.join("weave-root")).unwrap().trim().to_owned();
         forge_marker(&ground);
         let checked: serde_json::Value = serde_json::from_str(&{
             let out = std::process::Command::new(env!("CARGO_BIN_EXE_bracken"))
