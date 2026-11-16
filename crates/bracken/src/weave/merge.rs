@@ -249,7 +249,7 @@ pub(crate) struct ResolveArgs {
 pub(super) fn require_marker(ix: &Index) -> Result<()> {
     if ix.counted_marker().is_none() {
         bail!(
-            "this Ground holds no Weave marker, so weave writes nothing here; create a Weave Ground with `bracken weave init`"
+            "this Ground holds no Weave marker by its root (weave-root), so weave writes nothing here; create a Weave Ground with `bracken weave init`, or set its root with `bracken weave root set`"
         );
     }
     Ok(())
@@ -258,7 +258,7 @@ pub(super) fn require_marker(ix: &Index) -> Result<()> {
 pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> Result<ExitCode> {
     match command {
         LineCommand::Create { name, policy, dry_run, out } => {
-            let ix = Index::build(s.graph());
+            let ix = super::weave_index(s);
             if !dry_run {
                 require_marker(&ix)?;
             }
@@ -295,7 +295,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             Ok(ExitCode::SUCCESS)
         }
         LineCommand::Policy { line, name, from, clear, policy, dry_run, out } => {
-            let ix = Index::build(s.graph());
+            let ix = super::weave_index(s);
             if !dry_run {
                 require_marker(&ix)?;
             }
@@ -389,7 +389,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             Ok(ExitCode::SUCCESS)
         }
         LineCommand::Merge { from, into, base, dry_run, note, out } => {
-            let ix = Index::build(s.graph());
+            let ix = super::weave_index(s);
             if !dry_run {
                 require_marker(&ix)?;
             }
@@ -515,7 +515,7 @@ fn parse_executor(given: &str, runner: Option<&Path>) -> Result<(String, Executo
 
 pub(crate) fn propose(s: &mut Store, agent: Option<&str>, args: ProposeArgs) -> Result<ExitCode> {
     let ProposeArgs { line, base, from_git, index, summary, dry_run, repo, out } = args;
-    let ix = Index::build(s.graph());
+    let ix = super::weave_index(s);
     if !dry_run {
         require_marker(&ix)?;
     }
@@ -634,7 +634,7 @@ pub(crate) fn integrate_proposals(
     decide_args: &super::review::DecideArgs,
     out: Output,
 ) -> Result<ExitCode> {
-    let ix = Index::build(s.graph());
+    let ix = super::weave_index(s);
     require_marker(&ix)?;
     let named: Vec<Option<&str>> = proposals.iter().map(|p| Some(p.as_str())).chain([line]).collect();
     let lines = super::lines_for(s, &ix, &named);
@@ -1079,7 +1079,7 @@ fn write_merge(
             return Err(e.context("the candidate was written, and no decision"));
         }
     }
-    let ix = Index::build(s.graph());
+    let ix = super::weave_index(s);
     // Its own line and its parents' lines, as rule 3 judges its parents.
     let lines = super::judged_for(s, &ix, |l| {
         let parents = decision.parents.iter().filter_map(|p| l.decision(p)).map(|p| p.decision.line);
@@ -1195,7 +1195,7 @@ fn conflict_at(g: &manyroot::Graph, ix: &Index, target: &Target, path: &str) -> 
 pub(crate) fn resolve(s: &mut Store, agent: Option<&str>, args: ResolveArgs) -> Result<ExitCode> {
     let ResolveArgs { path, into, from, base, proposals, line, take, delete, file, markers, mode, dry_run, repo, out } =
         args;
-    let ix = Index::build(s.graph());
+    let ix = super::weave_index(s);
     if !dry_run && markers.is_none() {
         require_marker(&ix)?;
     }

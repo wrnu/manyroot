@@ -254,7 +254,7 @@ pub(super) fn current_policy<'l>(lines: &'l Lines, line: &ContributionId) -> Res
 
 pub(crate) fn validate(s: &mut Store, agent: Option<&str>, args: ValidateArgs) -> Result<ExitCode> {
     let ValidateArgs { manifest, line, checks: names, again, timeout, dry_run, runner, out } = args;
-    let ix = Index::build(s.graph());
+    let ix = super::weave_index(s);
     if !dry_run {
         super::merge::require_marker(&ix)?;
     }
@@ -345,7 +345,7 @@ pub(crate) fn validate(s: &mut Store, agent: Option<&str>, args: ValidateArgs) -
         planned.into_iter().partition(|p| p.executor.as_ref().is_some_and(|e| e.kind == ExecutorKind::Mac));
     let mut recorded = run_checks(s, &who, &run, &ix, version, &hash, target, held, &first, &Inputs::new(), out.json);
     if recorded.failure.is_none() && !mac.is_empty() {
-        let ix = Index::build(s.graph());
+        let ix = super::weave_index(s);
         let lines = super::lines_for(s, &ix, &[Some(&line.to_string())]);
         let results = Checks::build(s.graph(), &ix, &lines);
         let (_, policy) = current_policy(&lines, &line)?;
@@ -390,7 +390,7 @@ pub(super) fn run_for_integrate(
     hash: &ContentHash,
     json: bool,
 ) -> Result<Recorded> {
-    let ix = Index::build(s.graph());
+    let ix = super::weave_index(s);
     let lines = super::judged_for(s, &ix, |_| vec![*line]);
     let (version, policy) = current_policy(&lines, line)?;
     let manifest = complete_manifest(&ix, hash)?;

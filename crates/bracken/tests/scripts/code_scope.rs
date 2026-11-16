@@ -263,12 +263,14 @@ fn code_scope_frozen_names_the_freezes_paths_each_with_what_it_needs() {
             put(&dir, "crates/tree/tests/lines.rs", "// lines\n");
             put(&dir, "crates/tree/tests/weave_fixture.rs", "// the fixture\n");
             put(&dir, "crates/tree/tests/fixtures/weave-v1/objects/ab", "bytes\n");
+            put(&dir, ".config/weave-root", "ground 00\n");
         });
         assert_eq!(
             frozen("guards"),
             (
                 Some(0),
-                "code-scope: frozen: crates/tree/Cargo.toml (crates/tree's manifest: what its formats build from)\n\
+                "code-scope: frozen: .config/weave-root (the Weave Ground's committed pin: its id, and the root whose marker counts)\n\
+                 code-scope: frozen: crates/tree/Cargo.toml (crates/tree's manifest: what its formats build from)\n\
                  code-scope: frozen: crates/tree/tests/fixtures/weave-v1/objects/ab (a Weave fixture)\n\
                  code-scope: owner: crates/tree/tests/fixtures/weave-v1/objects/ab (a Weave fixture: the owner's own go)\n\
                  code-scope: frozen: crates/tree/tests/format_guard.rs (the format guard: golden vectors and pins)\n\

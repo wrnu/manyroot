@@ -27,7 +27,7 @@ fn the_coordination_fixture_reads_unchanged_with_weave_linked_in() {
     let g = store.graph();
 
     // Weave's views over it, built first, find nothing of Weave's.
-    let ix = Index::build(g);
+    let ix = Index::build(g, None);
     assert_eq!(ix.counted_marker(), None);
     assert_eq!(ix.problems(), &[]);
     // Its evidence names no Weave check, and no claim is a Weave goal. Index::reviews lists every supports

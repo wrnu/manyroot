@@ -170,7 +170,7 @@ fn counted_text(c: &Counted, checks: &Checks, names: &Names) -> String {
 /// results, with the fails a later attempt replaced.
 pub(crate) fn green(s: &Store, args: GreenArgs) -> Result<ExitCode> {
     let g = s.graph();
-    let ix = Index::build(g);
+    let ix = super::weave_index(s);
     require_marker(&ix)?;
     let lines = super::lines_for(s, &ix, &[args.line.as_deref()]);
     let line = resolve_line(s, &lines, args.line.as_deref(), "--line")?;
@@ -332,7 +332,7 @@ fn open_text(o: &Open, names: &Names) -> String {
 /// answer. With --proposal, that proposal alone.
 pub(crate) fn review(s: &Store, args: ReviewArgs) -> Result<ExitCode> {
     let g = s.graph();
-    let ix = Index::build(g);
+    let ix = super::weave_index(s);
     require_marker(&ix)?;
     let lines = super::lines_for(s, &ix, &[args.line.as_deref(), args.proposal.as_deref()]);
     let reviews = Reviews::build(&ix, &lines);

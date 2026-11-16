@@ -30,6 +30,16 @@
 #     56dadb600ba2);
 #   - --runner, and a '--', on weave validate and a line write: it gives them --runner <the main checkout>
 #     itself, the directory a box or mac check's pinned runner script is in (plan cc496dcee0e3).
+#
+# The committed pin (docs/design/weave-marker.md, option A; decision d01c83b654d1): for anything but weave
+# init, the Ground's id in ground.json and its replica's root, the weave-root file beside it, must be the
+# ones .config/weave-root holds on the main checkout's refs/heads/main (scripts/weave-pin). A mismatch, or
+# no pin on either side, refuses everything, with one exception, when the Ground's id matches and only the
+# replica's root is missing or differs: exactly 'weave root set <the pinned root>', with '--replace <the
+# replica's root>' when one is set. It runs that, reads the replica's weave-root back, and fails unless it
+# now holds the pinned root. So the one way to set or move a replica's root through the scripts is to the
+# committed value; weave root set is refused once the replica matches. Changing which root is right is a
+# change to .config/weave-root, which scripts/code-scope frozen lists.
 # Creating the Weave Ground (weave init) waits for the owner's go.
 set -euo pipefail
 
@@ -141,7 +151,42 @@ if [ -f "$ground/ground.json" ] && [ -f "$main/.bracken/ground.json" ]; then
     fail "the Ground at $ground has the coordination Ground's id ($ours); it isn't the Weave Ground"
 fi
 
+# The committed pin. weave init makes a new Ground, so it has none yet.
+root_set=false
+if [ "$sub" != init ]; then
+  pin=$("$here/weave-pin") || fail "refused: no committed pin to check the Weave Ground against"
+  pin_ground=${pin% *} pin_root=${pin#* }
+  [ -f "$ground/ground.json" ] && ours=$(ground_id "$ground/ground.json") && [ -n "$ours" ] ||
+    fail "can't read the Ground id in $ground/ground.json"
+  [ "$ours" = "$pin_ground" ] ||
+    fail "refused: the Ground at $ground is $ours, not the committed pin's $pin_ground (.config/weave-root on main)"
+  replica=''
+  [ ! -f "$ground/weave-root" ] || replica=$(tr -d '[:space:]' <"$ground/weave-root")
+  if [ "$replica" = "$pin_root" ]; then
+    [ "$sub" != root ] ||
+      fail "weave root is refused: this replica's root is already the committed pin's, $pin_root; changing it is a change to .config/weave-root"
+  else
+    exact=(weave root set "$pin_root")
+    [ -z "$replica" ] || exact+=(--replace "$replica")
+    given=("$@") same=false
+    if [ ${#given[@]} -eq ${#exact[@]} ]; then
+      same=true
+      for i in "${!exact[@]}"; do [ "${given[$i]}" = "${exact[$i]}" ] || same=false; done
+    fi
+    $same ||
+      fail "refused: this replica's root is ${replica:-not set}, not the committed pin's $pin_root (.config/weave-root on main); the only command run until it is: scripts/weave ${exact[*]}"
+    root_set=true
+  fi
+fi
+
 export BRACKEN_DIR="$ground"
+if $root_set; then
+  "$bin" "$@" || exit
+  now=''
+  [ ! -f "$ground/weave-root" ] || now=$(tr -d '[:space:]' <"$ground/weave-root")
+  [ "$now" = "$pin_root" ] || fail "weave root set ran, but the replica's root is ${now:-not set}, not $pin_root"
+  exit 0
+fi
 # A box or mac check's runner script is the main checkout's, the copy line main's policy pins (plan
 # cc496dcee0e3; weave.md section 3, Checks outside the sandbox): weave validate and a line write get
 # --runner "$main" from here, never one of the caller's.

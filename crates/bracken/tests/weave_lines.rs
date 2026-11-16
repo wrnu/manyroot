@@ -243,6 +243,9 @@ fn two_integrators_fork_the_line_and_a_merge_settles_it() {
     w.ok(&["export", bundle.to_str().expect("UTF-8")]);
     let other = w.tmp.path().join("other");
     w.ok_on(&other, &["join", bundle.to_str().expect("UTF-8")]);
+    // A joined replica is given its root, the AgentId whose marker counts (weave-marker.md, option A).
+    let root = std::fs::read_to_string(w.ground.join("weave-root")).expect("weave-root");
+    w.ok_on(&other, &["weave", "root", "set", root.trim()]);
     let bob = w.ok_on(&other, &["id", "new", "bob"]).trim().to_owned();
 
     // The line's author adds bob as an integrator: a new policy version that supersedes the first.
@@ -411,7 +414,7 @@ fn a_line_is_created_and_changed_only_with_an_owner_decision_and_by_its_author()
     assert_eq!(w.heads_on(&w.ground), [first.as_str()], "main hasn't moved");
     let err = w.fails(&["weave", "line", "merge", "main", "--into", "dev", "--as", "bob"]);
     assert!(err.contains("nothing to merge"), "{err}");
-    assert_eq!(w.ok(&["weave", "check"]).trim(), "no problems");
+    assert_eq!(w.ok(&["weave", "check"]).trim().lines().last(), Some("no problems"));
 
     // A version written by hand without an owner decision is listed by check and counts for nothing.
     let alice = w.json(&["id", "list", "--json"])[0]["agent"].as_str().expect("an agent").to_owned();
@@ -559,7 +562,7 @@ fn a_text_file_changed_on_both_sides_merges_line_by_line() {
     let diff = w.json(&["weave", "diff", &base, &d, "--json"]);
     assert_eq!(diff["files"][0]["path"], "c.txt");
     assert_eq!(diff["files"][0]["after"]["hash"], hash(merged));
-    assert_eq!(w.ok(&["weave", "check"]).trim(), "no problems");
+    assert_eq!(w.ok(&["weave", "check"]).trim().lines().last(), Some("no problems"));
     let out = w.ok(&["weave", "integrate", "--proposals", &p4, "--as", AS]);
     assert!(out.contains("merged lines: c.txt\n"), "{out}");
 
@@ -619,7 +622,7 @@ fn resolve_and_the_listing_see_a_version_an_earlier_step_merged_by_lines() {
     assert_eq!(done["merged_lines"], json!(["c.txt"]));
     let diff = w.json(&["weave", "diff", &base, done["decision"].as_str().expect("id"), "--json"]);
     assert_eq!(diff["files"][0]["after"]["hash"], hash(merged));
-    assert_eq!(w.ok(&["weave", "check"]).trim(), "no problems");
+    assert_eq!(w.ok(&["weave", "check"]).trim().lines().last(), Some("no problems"));
 }
 
 /// Finding f34ae4b848c0: a merge names the paths it merged by lines, by path. Another path holding the
@@ -715,7 +718,7 @@ fn markers_write_a_text_conflict_out_to_edit_and_file_records_it() {
     assert_eq!(done["resolutions"], json!([r]));
     let diff = w.json(&["weave", "diff", &base, done["decision"].as_str().expect("id"), "--json"]);
     assert_eq!(diff["files"][0]["after"]["hash"], hash(b"one\ntwo\n3\n4\nfive\n"));
-    assert_eq!(w.ok(&["weave", "check"]).trim(), "no problems");
+    assert_eq!(w.ok(&["weave", "check"]).trim().lines().last(), Some("no problems"));
 }
 
 /// Finding 445429f73583: the markers of an executable file are executable, so --file records the mode
@@ -939,6 +942,9 @@ fn a_criss_cross_has_two_merge_bases_and_needs_base() {
     w.ok(&["export", bundle.to_str().expect("UTF-8")]);
     let other = w.tmp.path().join("other");
     w.ok_on(&other, &["join", bundle.to_str().expect("UTF-8")]);
+    // A joined replica is given its root, the AgentId whose marker counts (weave-marker.md, option A).
+    let root = std::fs::read_to_string(w.ground.join("weave-root")).expect("weave-root");
+    w.ok_on(&other, &["weave", "root", "set", root.trim()]);
     let bob = w.ok_on(&other, &["id", "new", "bob"]).trim().to_owned();
     w.ok(&["weave", "line", "policy", "dev", "--integrator", &bob, "--owner-decision", OD, "--as", AS]);
     w.sync(&w.ground, &other);

@@ -86,7 +86,7 @@ fn the_binary_reads_the_coordination_fixture_unchanged() {
         assert_eq!(layer, want, "{name}");
         assert_eq!(accepted["conflicts"], expected["evaluation"]["conflicts"], "{name}");
     }
-    assert_eq!(bracken(&["weave", "check"]).trim(), "no problems");
+    assert_eq!(bracken(&["weave", "check"]).trim().lines().last(), Some("no problems"));
     // Reads write nothing to the Ground. They may write their own local cache beside it, the verified
     // snapshot in cache/ (task ac538d60e8f9, docs/cli.md), which git ignores and nothing replicates.
     let mut after = files(&ground);
