@@ -44,8 +44,11 @@
 #       Every decision's note says which, and each run ends by counting them on line main since stage 2a
 #       began.
 #
-# "Line main" is always the default line: the line named main whose first version the marker's author,
-# weave-integrator, wrote. Anyone can write another line named main, which never becomes the default, so
+# Every run but --init first checks the committed pin, .config/weave-root on main (scripts/weave-pin
+# check), and refuses unless the Weave Ground and its replica's root match it.
+#
+# "Line main" is always the default line: the line named main whose first version the counted marker's
+# author, the Ground's root, weave-integrator, wrote. Anyone can write another line named main, which never becomes the default, so
 # this script never names line main by name, where such a line would make it ambiguous (finding
 # b5b5871cc017). It gives no --line, or the default line's id.
 set -euo pipefail
@@ -153,6 +156,10 @@ git -C "$repo" rev-parse -q --verify refs/remotes/origin/main >/dev/null ||
   fail "$repo has no refs/remotes/origin/main to check $sha against"
 git -C "$repo" merge-base --is-ancestor "$sha" refs/remotes/origin/main ||
   fail "$sha isn't on refs/remotes/origin/main: only merged commits are shadowed"
+# The committed pin (docs/design/weave-marker.md, option A): the Weave Ground's id and its replica's root
+# must be .config/weave-root's on main, before the Weave Ground is read or written. No exception here: until the
+# replica's root is set (rollout step 2, scripts/weave weave root set), every shadow run refuses.
+pinned=$("$here/weave-pin" check 2>&1) || fail "refused: ${pinned##*weave-pin: }"
 head=$("$weave" weave head --json)
 [ "$(jq -r '.forked' <<<"$head")" = false ] || fail "line main is forked; settle it before shadowing more commits"
 decision=$(jq -r '.heads[0].decision // empty' <<<"$head")

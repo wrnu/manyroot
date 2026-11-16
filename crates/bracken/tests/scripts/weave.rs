@@ -12,7 +12,8 @@ fn weave_repo() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
 /// [`weave_repo`], with more scripts beside scripts/weave.
 fn weave_repo_with(more: &[(&str, &Path)]) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
     let weave = repo_root().join("scripts/weave");
-    let mut files: Vec<(&str, &Path)> = vec![("scripts/weave", &weave)];
+    let pin = repo_root().join("scripts/weave-pin");
+    let mut files: Vec<(&str, &Path)> = vec![("scripts/weave", &weave), ("scripts/weave-pin", &pin)];
     files.extend_from_slice(more);
     let (tmp, dir) = repo(&files, ".bracken/\n", |_| {});
     bk(&dir, &["init", "--name", "coordination"]);
@@ -24,6 +25,31 @@ fn weave_repo_with(more: &[(&str, &Path)]) -> (tempfile::TempDir, PathBuf, PathB
         "#!/bin/sh\ncase \" $* \" in *\" show \"*) exec \"$REAL_BRACKEN\" \"$@\" ;; esac\necho \"BRACKEN_DIR=$BRACKEN_DIR $*\"\n",
     );
     (tmp, dir, home, stub)
+}
+
+/// The Weave Ground under `home` as the committed pin wants it: '<ground id> <root>' from its ground.json
+/// and its replica's weave-root.
+fn pin_of(home: &Path) -> (String, String) {
+    let ground = home.join("bracken-weave/manyroot");
+    let info: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(ground.join("ground.json")).unwrap()).unwrap();
+    let root = std::fs::read_to_string(ground.join("weave-root")).unwrap();
+    (info["ground"].as_str().unwrap().to_owned(), root.trim().to_owned())
+}
+
+/// Commits `.config/weave-root` naming `ground` and `root` on `dir`'s branch main, which must be checked out.
+fn commit_pin(dir: &Path, ground: &str, root: &str) {
+    assert_eq!(git_out(dir, &["symbolic-ref", "--short", "HEAD"]).trim(), "main", "pin on main");
+    std::fs::create_dir_all(dir.join(".config")).unwrap();
+    std::fs::write(dir.join(".config/weave-root"), format!("# the pin\nground {ground}\nroot {root}\n")).unwrap();
+    git_out(dir, &["add", ".config/weave-root"]);
+    git_out(dir, &["commit", "-qm", "the Weave Ground's pin", "--", ".config/weave-root"]);
+}
+
+/// Commits the pin of the Weave Ground under `home`, as made: rollout step 1's pin for a new Ground.
+fn pin(dir: &Path, home: &Path) {
+    let (ground, root) = pin_of(home);
+    commit_pin(dir, &ground, &root);
 }
 
 /// A claim tagged decision in the coordination Ground of a [`weave_repo`], for --owner-decision.
@@ -56,10 +82,16 @@ fn weave_opens_only_the_weave_ground_and_refuses_what_it_must() {
     std::fs::create_dir(home.join("bracken-weave")).unwrap();
     let out = weave(&dir, script, &home, None, &["weave", "init", "--as", "weave-integrator"]);
     assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    pin(&dir, &home);
     let ground = home.join("bracken-weave/manyroot");
     assert!(ground.join("ground.json").is_file());
     let out = weave(&dir, script, &home, None, &["weave", "check"]);
-    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "no problems", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim().lines().last(),
+        Some("no problems"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     refused(&home, &["weave", "init", "--as", "weave-integrator"], "already exists");
 
     for (args, expected) in [
@@ -133,6 +165,7 @@ fn weave_runs_validate_only_for_a_validator() {
     let real = |args: &[&str]| weave(&dir, "scripts/weave", &home, None, args);
     let out = real(&["weave", "init", "--as", "weave-integrator"]);
     assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    pin(&dir, &home);
 
     // A stub whose plan is $PLAN, and which otherwise says it ran.
     let stub = tmp.path().join("plan-stub");
@@ -253,7 +286,8 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     refused(&["--init", "--owner-decision", &approval], "bracken-weave doesn't exist");
     refused(&["HEAD"], "has no refs/remotes/origin/main");
     git_out(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-    refused(&["HEAD"], "no Weave Ground at");
+    // weave-shadow checks the committed pin before it reads the Weave Ground (weave-marker.md, option A).
+    refused(&["HEAD"], "no committed pin");
 
     std::fs::create_dir(home.join("bracken-weave")).unwrap();
     // A wrong owner's go is refused before anything is created: only an approval signed by owner will do.
@@ -281,9 +315,26 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
             tmp.path().join("bracken")
         ),
     );
+    // The new Ground has no committed pin yet, so scripts/weave refuses everything after weave init
+    // (docs/design/weave-marker.md, option A); once its pin is on main, --init resumes.
     let out = run_in(Some(&flaky), &["--init", "--owner-decision", &approval]);
     assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no committed pin"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert!(ground.exists(), "the failure came after weave init");
+    pin(&dir, &home);
+    // The pin is a merged commit too: origin/main follows main.
+    git_out(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let out = run_in(Some(&flaky), &["--init", "--owner-decision", &approval]);
+    assert_eq!(out.status.code(), Some(1), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("flaky: failed once"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let out = run_in(Some(&flaky), &["--init", "--owner-decision", &approval]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "resumed --init: {}", String::from_utf8_lossy(&out.stderr));
@@ -541,6 +592,8 @@ echo \"$* token=${GH_TOKEN:-none}\" >>\"$PRS/gh.log\"
         assert_eq!(out.status.code(), Some(1), "{name} {args:?}: {stderr}{stdout}");
         assert!(stderr.contains(expected), "{name} {args:?}: expected {expected:?} in {stderr}{stdout}");
     };
+    refused("scripts/weave-shadow", &["--init", "--owner-decision", &approval], "no committed pin");
+    pin(&dir, &home);
     ok("scripts/weave-shadow", &["--init", "--owner-decision", &approval]);
     let git = |args: &[&str]| git_out(&dir, args);
     let write = |path: &str, text: &str| std::fs::write(dir.join(path), text).unwrap();
@@ -1086,7 +1139,10 @@ echo \"$* token=${GH_TOKEN:-none}\" >>\"$PRS/gh.log\"
 #[test]
 fn weave_needs_an_owner_decision_for_line_writes() {
     let (_tmp, dir, home, stub) = weave_repo();
-    std::fs::create_dir_all(home.join("bracken-weave/manyroot")).unwrap();
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let out = weave(&dir, "scripts/weave", &home, None, &["weave", "init", "--as", "weave-integrator"]);
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    pin(&dir, &home);
     let decision = owner_decision(&dir);
     let note = bk(&dir, &["claim", "a note", "--tag", "note", "--as", "manager"]);
     let retracted = bk(&dir, &["claim", "withdrawn", "--tag", "decision", "--as", "manager"]);
@@ -1131,6 +1187,7 @@ fn weave_refuses_hand_made_weave_records_but_line_writes_work() {
     std::fs::create_dir(home.join("bracken-weave")).unwrap();
     let out = weave(&dir, "scripts/weave", &home, None, &["weave", "init", "--as", "weave-integrator"]);
     assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    pin(&dir, &home);
     for (args, expected) in [
         (
             &["artifact", "p.cbor", "--media-type", "application/vnd.bracken.weave.line+cbor", "--as", "a"][..],
@@ -1179,7 +1236,7 @@ fn weave_refuses_hand_made_weave_records_but_line_writes_work() {
     let lines: Vec<&str> = changed.lines().collect();
     assert_eq!(lines.len(), 2, "{changed}");
     assert!(lines[0].starts_with("line ") && lines[1].starts_with("relation ") && lines[1].ends_with(" (supersedes)"));
-    assert_eq!(real(&["weave", "check"]).trim(), "no problems");
+    assert_eq!(real(&["weave", "check"]).trim().lines().last(), Some("no problems"));
 }
 
 /// Task 5b81f744a0ea: scripts/weave-backup copies the Weave Ground, identities included, to
@@ -1282,6 +1339,7 @@ fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
         String::from_utf8(out.stdout).unwrap()
     };
     let init = ok(&["weave", "init", "--as", "weave-integrator"]);
+    pin(&dir, &home);
     let marker = init.lines().find_map(|l| l.strip_prefix("marker ")).expect("a marker").to_owned();
     ok(&["claim", "hello", "--as", "weave-integrator"]);
     let ground = home.join("bracken-weave/manyroot");
@@ -1416,4 +1474,104 @@ fn weave_backup_copies_the_weave_ground_whole_and_keeps_the_newest() {
     assert!(copy.exists(), "the symlink's target is kept");
     let out = run_backup(&["--verify", &s(&b.join(&new))]);
     assert!(String::from_utf8_lossy(&out.stdout).contains(": 4 contributions, 1 heads, 1 identities"));
+}
+
+/// docs/design/weave-marker.md, option A: scripts/weave runs nothing until the Weave Ground's id and its
+/// replica's root are the committed pin's, .config/weave-root on refs/heads/main, never a tag named main
+/// (finding e096533fd85e). Its one exception is exactly 'weave root set <the pinned root>', with --replace
+/// naming the replica's root when one is set; it reads the file back. weave-pin prints the pin.
+#[test]
+fn weave_runs_only_on_the_pinned_ground_and_root_set_moves_only_to_the_pin() {
+    let (_tmp, dir, home, _) = weave_repo();
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let run = |args: &[&str]| weave(&dir, "scripts/weave", &home, None, args);
+    let refused = |args: &[&str], expected: &str| {
+        let out = run(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}{}", String::from_utf8_lossy(&out.stdout));
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr}");
+    };
+    let ok = |args: &[&str]| {
+        let out = run(args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    // weave check exits 1 here, listing the forger's marker as not the root's: its output is the root's line.
+    let check = || {
+        let out = run(&["weave", "check"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!stderr.contains("weave: "), "scripts/weave refused weave check: {stderr}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let out = run(&["weave", "init", "--as", "weave-integrator"]);
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    let ground = home.join("bracken-weave/manyroot");
+    let (id, root) = pin_of(&home);
+    // A new Ground has no pin on main yet: everything is refused.
+    refused(&["weave", "check"], "no committed pin");
+    refused(&["weave", "root", "set", &root], "no committed pin");
+
+    // The binary run directly, past scripts/weave, as an agent could: a second identity's marker.
+    let real = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_bracken"))
+            .args(args)
+            .env("BRACKEN_DIR", &ground)
+            .env_remove("BRACKEN_AGENT")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "bracken {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
+    };
+    real(&["id", "new", "forger"]);
+    let ids: serde_json::Value = serde_json::from_str(&real(&["id", "list", "--json"])).unwrap();
+    let forger =
+        ids.as_array().unwrap().iter().find(|i| i["name"] == "forger").unwrap()["agent"].as_str().unwrap().to_owned();
+    let marker = dir.parent().unwrap().join("marker.cbor");
+    let bytes = bracken_tree::Record::encode(&bracken_tree::Marker { v: 1, purpose: "f".into(), in_place: None });
+    std::fs::write(&marker, bytes).unwrap();
+    let media = bracken_tree::format::MARKER_MEDIA_TYPE;
+    real(&["artifact", marker.to_str().unwrap(), "--name", "weave", "--media-type", media, "--as", "forger"]);
+
+    // A pin of another Ground refuses everything, the exception included.
+    commit_pin(&dir, &"0".repeat(64), &root);
+    refused(&["weave", "check"], "not the committed pin's");
+    refused(&["weave", "root", "set", &root], "not the committed pin's");
+
+    // The right pin: everything runs, and weave root set is refused while the replica matches it.
+    commit_pin(&dir, &id, &root);
+    let pin_out = command(&dir, "scripts/weave-pin", &[]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&pin_out.stdout).trim(), format!("{id} {root}"));
+    assert!(check().starts_with(&format!("root {root}\n")));
+    refused(&["weave", "root", "set", &root], "already the committed pin's");
+    refused(&["weave", "root", "set", &forger, "--replace", &root], "already the committed pin's");
+
+    // A tag named main, pointing at a pin naming the forger, is ignored: only refs/heads/main counts.
+    let main_sha = git_out(&dir, &["rev-parse", "refs/heads/main"]).trim().to_owned();
+    commit_pin(&dir, &id, &forger);
+    let forged_main = git_out(&dir, &["rev-parse", "HEAD"]).trim().to_owned();
+    git_out(&dir, &["reset", "-q", "--hard", &main_sha]);
+    git_out(&dir, &["tag", "main", &forged_main]);
+    let shown = git_out(&dir, &["show", "main:.config/weave-root"]);
+    assert!(shown.contains(&forger), "a bare 'main' resolves to the tag: {shown}");
+    assert!(check().starts_with(&format!("root {root}\n")), "the tag changes nothing");
+    refused(&["weave", "root", "set", &forger, "--replace", &root], "already the committed pin's");
+
+    // The replica's root moved off the pin, by the binary directly: a stop, not a takeover.
+    real(&["weave", "root", "set", &forger, "--replace", &root]);
+    refused(&["weave", "check"], &format!("this replica's root is {forger}, not the committed pin's {root}"));
+    refused(&["weave", "root", "set", &root], &format!("scripts/weave weave root set {root} --replace {forger}"));
+    refused(&["weave", "root", "set", &forger, "--replace", &forger], "the only command run until it is");
+    refused(&["weave", "root", "set", &root, "--replace", &forger, "--json"], "the only command run until it is");
+    refused(&["--as", "weave-integrator", "weave", "root", "set", &root, "--replace", &forger], "the only command");
+    let set = ok(&["weave", "root", "set", &root, "--replace", &forger]);
+    assert_eq!(set.trim(), format!("root {root}"));
+    assert_eq!(std::fs::read_to_string(ground.join("weave-root")).unwrap().trim(), root);
+    assert!(check().starts_with(&format!("root {root}\n")));
+
+    // No root at all (a backup made before the pin existed): the same exception, with no --replace.
+    std::fs::remove_file(ground.join("weave-root")).unwrap();
+    refused(&["weave", "head"], "this replica's root is not set");
+    refused(&["weave", "root", "set", &root, "--replace", &root], "the only command run until it is");
+    ok(&["weave", "root", "set", &root]);
+    assert!(check().starts_with(&format!("root {root}\n")));
 }

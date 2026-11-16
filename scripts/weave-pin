@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# weave-pin: the Weave Ground's committed pin, .config/weave-root (docs/design/weave-marker.md, option A;
+# decision d01c83b654d1): the Weave Ground's id and its root, the one AgentId whose marker can count.
+#
+#   weave-pin            prints '<ground id> <root AgentId>', both 64 lowercase hex digits
+#   weave-pin check      also reads the Weave Ground through scripts/weave (weave check --json), and exits 0
+#                        only if its Ground id and its replica's root are the pin's
+#
+# The pin is read from the main checkout's refs/heads/main, the branch named main, resolved in full: never
+# a bare 'main', which git resolves to a tag named main first (finding e096533fd85e), and never a working
+# tree. The file holds exactly one 'ground <hex>' line and one 'root <hex>' line, besides blank lines and
+# '#' comments. Anything else, or no such file on main, refuses: it prints why on stderr and exits 1.
+set -euo pipefail
+
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+common=$(git -C "$here" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || {
+  echo "weave-pin: $here is not inside a git repository" >&2
+  exit 1
+}
+main=$(dirname "$common")
+fail() { echo "weave-pin: $*" >&2; exit 1; }
+
+sha=$(git -C "$main" rev-parse --verify -q 'refs/heads/main^{commit}') ||
+  fail "the main checkout $main has no branch main (refs/heads/main), so there's no committed pin"
+text=$(git -C "$main" show "$sha:.config/weave-root" 2>/dev/null) ||
+  fail "main ($sha) has no .config/weave-root, so there's no committed pin"
+ground='' root=''
+while IFS= read -r line || [ -n "$line" ]; do
+  case "$line" in
+    '' | '#'*) continue ;;
+  esac
+  if [[ $line =~ ^ground\ ([0-9a-f]{64})$ ]] && [ -z "$ground" ]; then
+    ground=${BASH_REMATCH[1]}
+  elif [[ $line =~ ^root\ ([0-9a-f]{64})$ ]] && [ -z "$root" ]; then
+    root=${BASH_REMATCH[1]}
+  else
+    fail "main's .config/weave-root has a line that isn't one 'ground <64 hex>' or one 'root <64 hex>': $line"
+  fi
+done <<<"$text"
+[ -n "$ground" ] && [ -n "$root" ] || fail "main's .config/weave-root needs both a 'ground' and a 'root' line"
+
+case "${1:-}" in
+  '') [ $# -eq 0 ] || fail "usage: weave-pin [check]"; echo "$ground $root" ;;
+  check)
+    [ $# -eq 1 ] || fail "usage: weave-pin [check]"
+    command -v jq >/dev/null || fail "needs jq"
+    # weave check exits 1 whenever it lists a problem, so its JSON is read whatever its exit code.
+    checked=$("$here/weave" weave check --json 2>/dev/null) || true
+    jq -e '(.ground | type) == "string"' <<<"$checked" >/dev/null 2>&1 ||
+      fail "weave check --json didn't give the Weave Ground's id and root"
+    ours=$(jq -r .ground <<<"$checked") theirs=$(jq -r '.root // ""' <<<"$checked")
+    [ "$ours" = "$ground" ] ||
+      fail "the Weave Ground is ${ours:0:12}, not the committed pin's ${ground:0:12} (.config/weave-root)"
+    [ "$theirs" = "$root" ] ||
+      fail "the Weave Ground's root is ${theirs:-not set}, not the committed pin's $root: set it with scripts/weave weave root set $root${theirs:+ --replace $theirs}"
+    echo "$ground $root"
+    ;;
+  *) fail "usage: weave-pin [check]" ;;
+esac

@@ -23,7 +23,7 @@ use bracken_tree::secrets::KnownKeys;
 use bracken_tree::{ContentHash, Entry, diff};
 use clap::Subcommand;
 use manyroot::contribution::MAX_CONTRIBUTION_BYTES;
-use manyroot::{Body, Contribution, ContributionId, Identity, Store};
+use manyroot::{AgentId, Body, Contribution, ContributionId, Identity, Store};
 use serde_json::{Value, json};
 
 use super::{Output, contribute, decide, print_json, write_stdout};
@@ -223,6 +223,80 @@ pub(crate) enum WeaveCommand {
     /// Write a resolution for the conflict at one path of a merge, named as `line merge` (--into, --from)
     /// or `integrate` (--proposals) names it.
     Resolve(merge::ResolveArgs),
+    /// The Ground's root: the one identity whose marker can count (docs/design/weave-marker.md, option A).
+    Root {
+        #[command(subcommand)]
+        command: RootCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum RootCommand {
+    /// Set this replica's root, in the file weave-root beside ground.json. Refuses unless the AgentId
+    /// signed a valid marker here, and, when a root is already set, unless --replace names it.
+    Set {
+        /// The new root's AgentId: 64 hex digits.
+        #[arg(value_name = "AGENT_ID")]
+        agent: String,
+        /// The root this one replaces, which must be the one set now: 64 hex digits.
+        #[arg(long, value_name = "AGENT_ID")]
+        replace: Option<String>,
+        #[command(flatten)]
+        out: Output,
+    },
+}
+
+/// The file beside ground.json that names a replica's root, an AgentId in hex.
+pub(crate) const ROOT_FILE: &str = "weave-root";
+
+/// This replica's root, from its weave-root file; a missing or malformed file is no root.
+pub(crate) fn root(dir: &Path) -> Option<AgentId> {
+    std::fs::read_to_string(dir.join(ROOT_FILE)).ok()?.trim().parse().ok()
+}
+
+/// The index of `s`'s Weave records, counting only its root's markers.
+pub(crate) fn weave_index(s: &Store) -> Index {
+    Index::build(s.graph(), root(s.dir()))
+}
+
+/// Writes `root` as the replica's weave-root, by a rename, so a reader sees the old file or the new one.
+fn write_root(dir: &Path, root: &AgentId) -> Result<()> {
+    let temp = dir.join(format!(".{ROOT_FILE}.{}.tmp", std::process::id()));
+    std::fs::write(&temp, format!("{root}\n")).with_context(|| format!("writing {}", temp.display()))?;
+    std::fs::rename(&temp, dir.join(ROOT_FILE)).with_context(|| format!("replacing {}", dir.join(ROOT_FILE).display()))
+}
+
+fn parse_agent(value: &str, what: &str) -> Result<AgentId> {
+    value.parse().with_context(|| format!("{what} {value:?} isn't an AgentId: give all 64 hex digits"))
+}
+
+/// `weave root set`: guards against mistakes only. Which root is right is the scripts' business, against
+/// the committed pin .config/weave-root.
+fn set_root(s: &Store, agent: &str, replace: Option<&str>, out: Output) -> Result<ExitCode> {
+    let new = parse_agent(agent, "the root")?;
+    let current = root(s.dir());
+    match (current, replace) {
+        (Some(current), None) => {
+            bail!("this replica's root is already {current}; to change it, pass --replace {current}")
+        }
+        (Some(current), Some(replace)) if parse_agent(replace, "--replace")? != current => {
+            bail!("--replace {replace} isn't this replica's root, which is {current}; nothing was written")
+        }
+        (None, Some(replace)) => {
+            bail!("--replace {replace}: this replica has no root set, so there's nothing to replace")
+        }
+        _ => {}
+    }
+    if !Index::build(s.graph(), Some(new)).has_marker_by(&new) {
+        bail!("{new} signed no valid Weave marker in this Ground, so it can't be its root; nothing was written");
+    }
+    write_root(s.dir(), &new)?;
+    if out.json {
+        print_json(&json!({"root": new, "replaced": current}));
+    } else {
+        println!("root {new}");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `weave init`, which creates its Ground and so runs before any is opened.
@@ -280,6 +354,8 @@ pub(crate) fn init(dir: Option<&Path>, agent: Option<&str>, purpose: String, out
         owner_decision: None,
     };
     let marker_id = write_record(&mut s, &who, &marker)?;
+    // The marker's author is the Ground's root (docs/design/weave-marker.md, option A).
+    write_root(s.dir(), &who.agent_id()).context("the marker was written, but not the weave-root file")?;
     let line_id = match write_record(&mut s, &who, &line) {
         Ok(id) => id,
         Err(e) => {
@@ -293,8 +369,11 @@ pub(crate) fn init(dir: Option<&Path>, agent: Option<&str>, purpose: String, out
         }
     };
     if out.json {
-        print_json(&json!({"ground": s.info().ground, "dir": dir, "marker": marker_id, "line": line_id}));
+        print_json(
+            &json!({"ground": s.info().ground, "dir": dir, "root": who.agent_id(), "marker": marker_id, "line": line_id}),
+        );
     } else {
+        println!("root {}", who.agent_id());
         println!("marker {marker_id}");
         println!("line {line_id} (main)");
     }
@@ -320,7 +399,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             import_tree(s, agent, &repo, &source, dry_run, out)
         }
         WeaveCommand::Checkout { manifest, target: dir, out } => {
-            let ix = Index::build(s.graph());
+            let ix = weave_index(s);
             let hash = manifest_hash(s, &ix, &manifest, "--manifest")?;
             let manifest = complete_manifest(&ix, &hash)?;
             let g = s.graph();
@@ -334,7 +413,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             Ok(ExitCode::SUCCESS)
         }
         WeaveCommand::Diff { a, b, out } => {
-            let ix = Index::build(s.graph());
+            let ix = weave_index(s);
             let lines = lines_for(s, &ix, &[Some(&a), Some(&b)]);
             let (ha, hb) =
                 (tree_at(s, &ix, &lines, &a, "the first tree")?, tree_at(s, &ix, &lines, &b, "the second tree")?);
@@ -399,7 +478,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             Ok(ExitCode::SUCCESS)
         }
         WeaveCommand::Verify { git, at, manifest, line, repo, out } => {
-            let ix = Index::build(s.graph());
+            let ix = weave_index(s);
             let lines = lines_for(s, &ix, &[at.as_deref(), line.as_deref()]);
             let hash = match (at, manifest) {
                 (Some(at), _) => decision_manifest(s, &lines, &at, "--at")?,
@@ -428,7 +507,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             Ok(decide(equal))
         }
         WeaveCommand::Check { out } => {
-            let ix = Index::build(s.graph());
+            let ix = weave_index(s);
             let mut rows: Vec<Value> = ix.problems().iter().map(problem_json).collect();
             // Which versions count needs no line judged: only the default line is.
             for id in lines_for(s, &ix, &[]).ignored_versions() {
@@ -438,10 +517,17 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
                 }));
             }
             if out.json {
-                print_json(&json!({"marker": ix.counted_marker(), "problems": rows}));
-            } else if rows.is_empty() {
-                println!("no problems");
+                print_json(
+                    &json!({"ground": s.info().ground, "root": ix.root(), "marker": ix.counted_marker(), "problems": rows}),
+                );
             } else {
+                match ix.root() {
+                    Some(root) => println!("root {root}"),
+                    None => println!("no root: this replica has no valid {ROOT_FILE} file, so no marker counts"),
+                }
+                if rows.is_empty() {
+                    println!("no problems");
+                }
                 for row in &rows {
                     println!("{}", crate::terminal::printable(row["text"].as_str().unwrap_or_default()));
                 }
@@ -449,7 +535,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             Ok(decide(rows.is_empty()))
         }
         WeaveCommand::Head { line, out } => {
-            let ix = Index::build(s.graph());
+            let ix = weave_index(s);
             let lines = lines_for(s, &ix, &[line.as_deref()]);
             let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
             let name = &lines.line(&line).expect("resolved").policy.name;
@@ -476,7 +562,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             Ok(ExitCode::SUCCESS)
         }
         WeaveCommand::Log { line, limit, since, out } => {
-            let ix = Index::build(s.graph());
+            let ix = weave_index(s);
             let lines = lines_for(s, &ix, &[line.as_deref(), since.as_deref()]);
             let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
             let since = since.map(|d| decision_id(s, &lines, &d, "--since")).transpose()?;
@@ -513,7 +599,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             Ok(ExitCode::SUCCESS)
         }
         WeaveCommand::Status { index, line, at, repo, out } => {
-            let ix = Index::build(s.graph());
+            let ix = weave_index(s);
             let lines = lines_for(s, &ix, &[line.as_deref(), at.as_deref()]);
             let at = match at {
                 Some(at) => Some(decision_id(s, &lines, &at, "--at")?),
@@ -572,6 +658,9 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         WeaveCommand::Line { command } => merge::line(s, agent, command),
         WeaveCommand::Propose(args) => merge::propose(s, agent, args),
         WeaveCommand::Resolve(args) => merge::resolve(s, agent, args),
+        WeaveCommand::Root { command: RootCommand::Set { agent: new, replace, out } } => {
+            set_root(s, &new, replace.as_deref(), out)
+        }
         WeaveCommand::Integrate { line, from_git, index, manifest, note, run, timeout, repo, decide, out, .. } => {
             let source = match (manifest, index) {
                 (Some(m), _) => Given::Manifest(m),
@@ -602,10 +691,10 @@ fn integrate(
     repo: &Path,
     out: Output,
 ) -> Result<ExitCode> {
-    let ix = Index::build(s.graph());
+    let ix = weave_index(s);
     if ix.counted_marker().is_none() {
         bail!(
-            "this Ground holds no Weave marker, so weave writes nothing here; create a Weave Ground with `bracken weave init`"
+            "this Ground holds no Weave marker by its root (weave-root), so weave writes nothing here; create a Weave Ground with `bracken weave init`, or set its root with `bracken weave root set`"
         );
     }
     let lines = lines_for(s, &ix, &[line]);
@@ -690,7 +779,7 @@ fn integrate(
         }
     }
 
-    let ix = Index::build(s.graph());
+    let ix = weave_index(s);
     let lines = judged_for(s, &ix, |_| vec![line]);
     let decision = draft(hash, commit);
     if let Err(why) = lines.judge_new(s.graph(), &ix, who.agent_id(), &decision) {
@@ -985,6 +1074,13 @@ fn problem_json(p: &Problem) -> Value {
             "problem": "extra_marker", "id": id, "counted": counted,
             "text": format!("extra marker {id}: the one that counts is {counted}"),
         }),
+        Problem::NotByRoot { id, author, root } => json!({
+            "problem": "not_by_root", "id": id, "author": author, "root": root,
+            "text": match root {
+                Some(root) => format!("marker {id} by {author} isn't the root's ({root}), so it never counts"),
+                None => format!("marker {id} by {author}: this replica has no root, so no marker counts"),
+            },
+        }),
     }
 }
 
@@ -1013,10 +1109,10 @@ fn import_tree(
     dry_run: bool,
     out: Output,
 ) -> Result<ExitCode> {
-    let ix = Index::build(s.graph());
+    let ix = weave_index(s);
     if !dry_run && ix.counted_marker().is_none() {
         bail!(
-            "this Ground holds no Weave marker, so weave writes nothing here; create a Weave Ground with `bracken weave init`"
+            "this Ground holds no Weave marker by its root (weave-root), so weave writes nothing here; create a Weave Ground with `bracken weave init`, or set its root with `bracken weave root set`"
         );
     }
     let plan = import::plan(repo, source, &known_keys(s, repo)?)?;

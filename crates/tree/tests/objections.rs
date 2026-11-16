@@ -268,7 +268,7 @@ impl World {
 
     /// Lines, built by the index and by walking, which must agree, with no question walked.
     fn lines(&self) -> (Index, Lines) {
-        let ix = Index::build(&self.g);
+        let ix = Index::build(&self.g, Some(self.alice.agent_id()));
         let lines = Lines::build(&self.g, &ix);
         let walked = Lines::build_by_walking(&self.g, &ix);
         for id in self.g.iter().map(|c| c.id()) {
@@ -957,7 +957,7 @@ fn a_flood_over_many_ancestors_is_answered_by_one_line_wide_answer() {
     let head = *chain.last().expect("the head");
     let m2 = w.tree(&[("a", b"2")]);
     let line = w.line;
-    let ix = Index::build(&w.g);
+    let ix = Index::build(&w.g, Some(w.alice.agent_id()));
     let lines = Lines::build(&w.g, &ix);
     assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     let none = w.draft(m2.0, &[head], |_| {});
@@ -968,7 +968,7 @@ fn a_flood_over_many_ancestors_is_answered_by_one_line_wide_answer() {
     let e = w.add(&alice, artifact(&one));
     let m3 = w.tree(&[("a", b"3")]);
     let after = w.decide(m3.0, &[e], |_| {});
-    let ix = Index::build(&w.g);
+    let ix = Index::build(&w.g, Some(w.alice.agent_id()));
     let lines = Lines::build(&w.g, &ix);
     assert!(lines.objections().differ_from_walking(&ix, &lines).is_empty(), "windows and a walk disagree");
     assert_eq!(lines.verdict(&e).expect("judged").as_ref().map(|_| ()), Ok(()), "one reference");
@@ -1116,14 +1116,14 @@ fn a_line_nobody_asks_about_costs_a_reader_of_main_nothing() {
     const N: usize = 300;
     let mut w = World::new();
     let (main, stray) = main_and_a_stray_line(&mut w, N);
-    let ix = Index::build(&w.g);
+    let ix = Index::build(&w.g, Some(w.alice.agent_id()));
     let read = Lines::build_for(&w.g, &ix, |_| vec![]);
     let full = Lines::build(&w.g, &ix);
     assert!(main.iter().all(|d| read.verdict(d) == full.verdict(d) && read.verdict(d).is_some_and(|v| v.is_ok())));
     assert!(stray.iter().all(|d| read.verdict(d).is_none()), "no stray decision is judged");
     let mut alone = World::new();
     let (main_alone, _) = main_and_a_stray_line(&mut alone, 1);
-    let ix_alone = Index::build(&alone.g);
+    let ix_alone = Index::build(&alone.g, Some(alone.alice.agent_id()));
     let read_alone = Lines::build_for(&alone.g, &ix_alone, |_| vec![]);
     assert_eq!(main_alone.len(), main.len());
     let (with, without) = (read.obligation_stats(), read_alone.obligation_stats());
@@ -1139,7 +1139,7 @@ fn asking_about_a_line_judges_it_fully() {
     const N: usize = 60;
     let mut w = World::new();
     let (_, stray) = main_and_a_stray_line(&mut w, N);
-    let ix = Index::build(&w.g);
+    let ix = Index::build(&w.g, Some(w.alice.agent_id()));
     let full = Lines::build(&w.g, &ix);
     let line = full.decision(&stray[0]).expect("a decision").decision.line;
     let asked = Lines::build_for(&w.g, &ix, |_| vec![line]);
@@ -1181,7 +1181,7 @@ fn lines_merged_one_by_one_cost_each_its_own_path() {
         let merges = lines_merged_one_by_one(&mut w, n);
         let (_, lines) = w.lines();
         assert!(merges.iter().all(|m| lines.verdict(m).expect("judged").is_ok()), "every merge qualifies");
-        let ix = Index::build(&w.g);
+        let ix = Index::build(&w.g, Some(w.alice.agent_id()));
         let before = allocated();
         Lines::build(&w.g, &ix);
         made.push(allocated() - before);
@@ -1208,7 +1208,7 @@ fn measure_long_lines() {
             for lines_n in [4_000, 8_000] {
                 let mut w = World::new();
                 lines_merged_one_by_one(&mut w, lines_n);
-                let ix = Index::build(&w.g);
+                let ix = Index::build(&w.g, Some(w.alice.agent_id()));
                 let (t, before) = (std::time::Instant::now(), allocated());
                 Lines::build(&w.g, &ix);
                 let made = allocated() - before;
@@ -1237,7 +1237,7 @@ fn measure_long_lines() {
             let who = if made_up { bob.clone() } else { w.alice.clone() };
             w.add(&who, artifact(&d));
         }
-        let ix = Index::build(&w.g);
+        let ix = Index::build(&w.g, Some(w.alice.agent_id()));
         let t = std::time::Instant::now();
         let lines = Lines::build(&w.g, &ix);
         let ok = lines.verdict(&previous).expect("judged").is_ok();
