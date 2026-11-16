@@ -3,10 +3,13 @@
 Design only: it changes no format, code, test or fixture (task
 `730b5d1a92a9`, decision `03534914ec55` (1)). It answers finding
 `26d9361e0a9f`, the forged-marker takeover in
-[weave-freeze.md](weave-freeze.md) 2.5. Decision `bae92c497714` makes the
-owner's go to freeze wait until this fix has landed, or is planned as a v2.
+[weave-freeze.md](weave-freeze.md) 2.5. Decision `bae92c497714` made the
+owner's go to freeze wait until this fix had landed, or was planned as a v2.
 The owner answered section 6 on 2026-11-11, yes to every recommendation
-(decision `d01c83b654d1`).
+(decision `d01c83b654d1`). Option A landed in PRs #32 and #33 and was
+rolled out (decision `dff4d5df9f15`), and the freeze then took effect on
+2026-11-16, at `main` 3842e089 (decision `0290487abd90`), with A's
+root-signed rule as the marker that counts.
 
 File references are to `main` at 3668b09c, except `scripts/weave-gate`,
 which is at 1f7d5f20, after PR #31. Task `8ffd4b252d9a` builds option A.
@@ -35,7 +38,8 @@ which is at 1f7d5f20, after PR #31. Task `8ffd4b252d9a` builds option A.
   can no longer take the default line, the exemption or, under G9, the name
   `main`.
 - **It changes a rule the freeze will lock** (1.3's marker that counts),
-  so it **lands before the freeze**. It can't be "a v2 under section 3":
+  so it **lands before the freeze**. It did (PRs #32 and #33), and the
+  freeze followed (decision `0290487abd90`). It can't be "a v2 under section 3":
   the forgery is a valid v1 marker, and section 3 changes nothing about how
   v1 records read (section 4). It changes no record's bytes, and no view of
   any Ground we hold: `~/bracken-weave/manyroot` and its backups have one
@@ -530,7 +534,9 @@ could disagree on:
    marker and lists no problem, and `weave head --line main` the same
    line. Until this step, Weave-gated merges fall back to git's counted
    run.
-3. Only then does the freeze's go follow (decision `bae92c497714`).
+3. Only then does the freeze's go follow (decision `bae92c497714`). Steps
+   1 and 2 were done (PRs #32 and #33, decision `dff4d5df9f15`), and the
+   go followed on 2026-11-16 (decision `0290487abd90`).
 
 From the moment step 1's scripts reach `main` until step 2, the replica has
 no `weave-root`, so every script that reads the Weave Ground refuses:
