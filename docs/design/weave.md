@@ -1393,8 +1393,10 @@ Changing a pinned format is reviewed as protocol class: an independent
 review, the manager's go logged as `owner-review`, and an entry in
 `docs/releases.md`. [weave-freeze.md](weave-freeze.md) designs the freeze:
 exactly what is frozen, which guard catches a change to each part and where
-none does yet, and what a frozen-format change takes. Nothing is frozen
-until the owner's go.
+none does yet, and what a frozen-format change takes. The formats are
+frozen as version 1 since 2026-11-16, at `main` 3842e089 (decision
+`0290487abd90`), and a change to a frozen format now needs the owner's own
+go until the join (decision `bae92c497714`).
 
 **Deferred protocol changes.** These aren't needed for v0, and each needs
 its own go. The `Body` and `RelationKind` sets are closed, and an older

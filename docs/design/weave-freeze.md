@@ -1,13 +1,18 @@
 # Freezing Weave's formats
 
-Design only: it changes no format, code, test or fixture (task
-`d8cc249f0c92`, decision `285f7e43f540` (a), step 3 of the Weave order in
-decision `b4a3456de597`). Nothing is frozen until the owner's go. The
-owner answered section 5's questions on 2026-11-09 (decision
-`bae92c497714`), and each answer is recorded under its question. The freeze
-itself still needs the owner's separate go, and that go waits for the fix to
-the forged-marker takeover (2.5), or for that fix to be planned as a v2
-(section 4). It pins:
+**Weave's formats are frozen as version 1 since 2026-11-16, at `main`
+3842e089** (decision `0290487abd90`): 1.1 to 1.5 as this page describes
+them, with 1.3's marker that counts being option A's root-signed rule.
+This page was written as a design only, and it changed no format, code,
+test or fixture (task `d8cc249f0c92`, decision `285f7e43f540` (a), step 3
+of the Weave order in decision `b4a3456de597`). The owner answered section
+5's questions on 2026-11-09 (decision `bae92c497714`), and each answer is
+recorded under its question. The freeze then waited for its preconditions:
+the guard gaps G1 to G5 (PR #28) and G6 (PR #29), and the fix to the
+forged-marker takeover (2.5), option A of
+[weave-marker.md](weave-marker.md) (decision `d01c83b654d1`, PRs #32 and
+#33, rolled out under decision `dff4d5df9f15`). The owner's go followed
+(decision `0290487abd90`). It pins:
 1. what the freeze covers, by file, and what it leaves out;
 2. how a change would be caught today, and where nothing would catch it;
 3. what a frozen-format change takes once the freeze holds;
@@ -103,9 +108,14 @@ with it:
   signature stands for that author, such as a delegate's under part B, is
   a change to this rule (section 4).
 
-Any writer can make their own marker the one that counts (2.5, the
-forged-marker takeover). Its fix likely changes this rule, which is why
-the freeze waits for that fix or for its plan as a v2 (section 4).
+Until option A, any writer could make their own marker the one that
+counts (2.5, the forged-marker takeover). Option A changed this rule
+before the freeze (PRs #32 and #33, decision `d01c83b654d1`), so the rule
+frozen as version 1 is the root-signed one above: a writer without the
+root's key can't make a marker count. Whoever holds the root's key still
+can, among the root's own markers, and on this machine that key is a file
+any agent can read (weave-marker.md, *Summary*; its rotation,
+loss and theft are an accepted gap, decision `d01c83b654d1` (7)).
 
 **The ancestor rule is frozen too**, since it's a validity rule: Weave's
 replacement for protocol rule 5 for references inside payloads (weave.md
@@ -386,14 +396,16 @@ full table, and adds pins without changing any format.
   That's a reader change, with no format change. **G9 is only as sound as
   the counted marker.** While the counted marker is honest, a line anyone
   else opens is reached by its id only, and a second `main` no longer
-  stops main-by-name readers. But any writer can make their own marker the
-  counted one (2.5, the forged-marker takeover). Then G9 resolves names
-  only among that writer's lines, so `main` is theirs for every reader
-  that resolves it. `scripts/weave-gate` refuses such a Ground instead of
-  reading it, since PR #31 (`taken_over`, `scripts/weave-gate` 123-153),
-  but other readers follow the forged line. So G9 narrows the duplicate-name
-  stop while markers are trusted, and closes no other cause. It isn't a
-  protection against a hostile writer.
+  stops main-by-name readers. When this was written, any writer could make
+  their own marker the counted one (2.5, the forged-marker takeover). Then
+  G9 would resolve names only among that writer's lines, so `main` would
+  be theirs for every reader that resolves it, and `scripts/weave-gate`
+  refused such a Ground instead of reading it, since PR #31. Since option
+  A (PRs #32 and #33, decision `d01c83b654d1`), only a marker signed by
+  the Ground's root counts, so that takes the root's key. So G9 narrows
+  the duplicate-name stop while the root's markers are trusted, and closes
+  no other cause. It isn't a protection against a hostile writer who holds
+  the root's key.
 
 ### 2.5 Weave assumes its writers are trusted
 
@@ -406,37 +418,41 @@ Ground doesn't sync, so that's within the trusted-writer assumption. It
 stops being true at the join, when every writer of the coordination Ground
 can write Weave records.
 
-Under that assumption, **any writer can currently stop a line, or main,
-and can take over the default line and the name `main`**, with ordinary
-records of their own. The known ways:
+Under that assumption, **any writer can currently stop a line, or main**,
+with ordinary records of their own, and until option A (PRs #32 and #33)
+could also **take over the default line and the name `main`**. The known
+ways:
 
 | Stop or takeover | How | Code |
 |---|---|---|
-| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored along with its links. What the name `main` then resolves to depends on the honest main's history. If it has only its first policy version, that line vanishes and `main` names only theirs, so `weave green --line main` and `weave validate --line main` read their line, where they can name themselves validator and write passing results. If it has a later policy version, that version becomes a line named `main` of its own, so the name is refused as shared: a stop, not a takeover. Once G9 lands, `main` resolves only among their lines in both cases. `scripts/weave-gate` read their line too, until PR #31: its `taken_over` check now refuses when Weave's index reports an extra marker, when the default line's first version isn't signed with `weave-integrator`'s key, or when `--line main` names another line, so the gate stops instead of reading it, with or without G9 (option H of [weave-marker.md](weave-marker.md)). Every other reader still follows the forged line. A marker placed before the honest one needs no race: it's in the honest one's causal past and counts outright (weave-marker.md, section 1). Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`) | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-300, 849-851 (`lines`); `crates/bracken/src/weave.rs` 784-797, 847-855; `scripts/weave-gate` 123-153 (`taken_over`, since PR #31), 237, 306 |
+| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored along with its links. What the name `main` then resolves to depends on the honest main's history. If it has only its first policy version, that line vanishes and `main` names only theirs, so `weave green --line main` and `weave validate --line main` read their line, where they can name themselves validator and write passing results. If it has a later policy version, that version becomes a line named `main` of its own, so the name is refused as shared: a stop, not a takeover. Once G9 lands, `main` resolves only among their lines in both cases. `scripts/weave-gate` read their line too, until PR #31: its `taken_over` check then refused when Weave's index reported an extra marker, when the default line's first version wasn't signed with `weave-integrator`'s key, or when `--line main` named another line, so the gate stopped instead of reading it, with or without G9 (option H of [weave-marker.md](weave-marker.md)). Since option A (decision `d01c83b654d1` (5), PRs #32 and #33) it refuses only when `scripts/weave-pin check` fails, when there's no counted marker, when the counted marker isn't by the pinned root, when there's no default line, or when `--line main` names another line; an extra marker alone no longer stops it, so a second marker by the root's key holder passes the gate. Every other reader still follows the forged line. A marker placed before the honest one needs no race: it's in the honest one's causal past and counts outright (weave-marker.md, section 1). Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`). **Closed before the freeze by option A** (decision `d01c83b654d1`, PRs #32 and #33): only a marker signed by the Ground's root counts, so a forged marker by anyone else never counts and `weave check` lists it as `not_by_root`. The takeover now needs the root's key | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-300, 849-851 (`lines`); `crates/bracken/src/weave.rs` 784-797, 847-855; `scripts/weave-gate` 124-141 (`taken_over`, since PR #31, narrowed by PR #32), 155, 172 |
 | An unreadable policy version | Open a line of your own, write an artifact under the line media type that doesn't decode, and relate it `supersedes` your own version. `refuse_unreadable` is Ground-wide, so `integrate`, `validate`, `line policy` and `line merge` refuse on every line (finding `8c1867a7611c`) | `crates/bracken/src/weave.rs` 820-829; `crates/tree/src/lines.rs` 309-322, 524; `crates/bracken/src/weave/merge.rs` 258-296, 492-496 |
-| A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Name lookup then refuses `main` as shared, so `weave green --line main` and `weave validate --line main` fail, and `scripts/weave-gate` reads main by name, so it stops too; since PR #31 its `taken_over` check refuses first, when `weave head --line main` fails (finding `b6b6ccfd1255`) | `crates/bracken/src/weave.rs` 784-797, 847-855; `crates/bracken/src/weave/merge.rs` 258-296; `scripts/weave-gate` 142-144 (`taken_over`), 167, 275 |
+| A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Name lookup then refuses `main` as shared, so `weave green --line main` and `weave validate --line main` fail, and `scripts/weave-gate` reads main by name, so it stops too; since PR #31 its `taken_over` check refuses first, when `weave head --line main` fails (finding `b6b6ccfd1255`) | `crates/bracken/src/weave.rs` 784-797, 847-855; `crates/bracken/src/weave/merge.rs` 258-296; `scripts/weave-gate` 136-139 (`taken_over`), 155, 172 |
 
 **This list is what reviews of this design found, not a proof that no
 other stop exists.** G8 and G9 each narrow one cause; neither, nor both
 together, is claimed to end the any-writer stop, and neither closes the
-forged-marker takeover. G9 holds only while the counted marker is honest.
+forged-marker takeover, which option A closed for a writer without the
+root's key. G9 holds only while the counted marker is honest.
 Ending them before the join is question 8.
 
 **Inputs for question 8's hostile-writer review, known so far** (note
 `4062ce03a8d7`, from the round-6 independent review; evidence
 `9122c219ead0`, the round-6 security review):
 - the forged-marker takeover above: G9 and the default-line rule both rest
-  on which marker counts. Its fix likely changes the marker rule 1.3
-  freezes, which once the freeze holds is a section-3 change; that's why the
-  freeze waits for it (section 4);
+  on which marker counts. Its fix changed the marker rule 1.3 freezes, so
+  the freeze waited for it (section 4). Option A landed before the freeze
+  (PRs #32 and #33), so the frozen rule is the root-signed one, and what
+  remains for the review is a writer who holds the root's key;
 - only its author can retract a forged marker, and an honest writer can
   answer only with a marker of their own with an even smaller id. So the
   forged-marker fix must rest on who may write a marker, not on id order
   (note `ba9e77679d4f`). [weave-marker.md](weave-marker.md) compares the
   fixes and recommends a pinned root identity, landed before the freeze.
   The owner chose it (decision `d01c83b654d1`), and task `8ffd4b252d9a`
-  builds it: only a marker signed by the Ground's root counts, so a writer
-  without the root's key can no longer take the counted marker;
+  built it (PRs #32 and #33), before the freeze: only a marker signed by
+  the Ground's root counts, so a writer without the root's key can no
+  longer take the counted marker;
 - `scripts/weave-gate` used to check none of the problems Weave's index
   reports, so the takeover was silent there (note `ba9e77679d4f`). PR #31
   (task `5c616750e3f9`) adds an interim detection: the gate refuses when
@@ -560,13 +576,16 @@ Ending them before the join is question 8.
   the coordination Ground. From then on, a Weave format change affects
   every reader of that Ground: `scripts/bk`, `scripts/merge`, the pinned
   binary and the coordination fixture tests.
-- **The freeze waits for the forged-marker fix** (decision
-  `bae92c497714`, on finding `26d9361e0a9f`). Any writer can make their
+- **The freeze waited for the forged-marker fix** (decision
+  `bae92c497714`, on finding `26d9361e0a9f`). Any writer could make their
   own marker the counted one (2.5). 1.3 freezes the marker rule, and
   section 3 rules out changing a validity rule in place, so a fix that
-  changes it becomes a frozen-format change once the freeze holds. So the
-  owner's go to freeze waits until that fix has landed, or until it's
-  planned as a v2 under section 3.
+  changes it would have become a frozen-format change once the freeze
+  held. So the owner's go to freeze waited until that fix had landed, or
+  until it was planned as a v2 under section 3. It landed: option A (PRs
+  #32 and #33, decision `d01c83b654d1`), and the go followed on 2026-11-16
+  (decision `0290487abd90`). A writer without the root's key can no longer
+  take the counted marker.
 - **The merge gate relies on failing closed.** After the join, a stale
   binary reading the coordination Ground must not compute green under a
   policy that's no longer in force. The readers-first rollout is a rule
@@ -580,11 +599,11 @@ Ending them before the join is question 8.
   G8 doesn't see a new one (question 2).
 - **The join assumes hostile writers, and Weave doesn't yet.** After the
   join, everyone who writes to the coordination Ground can write Weave
-  records. Today any writer can stop a line or main, or take over the
-  default line and the name `main` with a forged marker (2.5), and the
-  known causes are only what reviews found. So the join waits for a review of
-  Weave that assumes a hostile writer, and for what it finds to be
-  hardened or accepted (question 8).
+  records. Today any writer can stop a line or main (2.5); taking over the
+  default line and the name `main` with a forged marker now takes the
+  root's key (option A). The known causes are only what reviews found. So
+  the join waits for a review of Weave that assumes a hostile writer, and
+  for what it finds to be hardened or accepted (question 8).
 - **The join's own record is frozen too.** Step 3 of the join writes a
   marker with `in_place` set. Its format is frozen (1.3), but no golden
   vector pins it yet, so G1 should land before the join.
@@ -639,6 +658,9 @@ Ending them before the join is question 8.
    Since the marker rule is frozen, the forged-marker fix (2.5) is a
    section-3 change once the freeze holds, so the freeze waits for it
    (section 4, question 8).
+
+   *Status:* frozen as version 1 since 2026-11-16, at `main` 3842e089
+   (decision `0290487abd90`), with option A's marker rule (PRs #32, #33).
 2. **How a format changes.** A new `v` under the same media type, or a new
    media type? *Recommended: a new `v` under the same media type.* It's
    the option that fails closed with today's binaries. A policy version
@@ -690,6 +712,10 @@ Ending them before the join is question 8.
    *Answered (owner, 2026-11-09, decision `bae92c497714`):* land G1 to G6
    before the freeze; G7 may follow; G8 and G9 before the join, and G8
    before any v2.
+
+   *Status:* G1 to G5 landed in PR #28 and G6 in PR #29, before the freeze
+   (decision `0290487abd90`), which repeats that G7 may follow and G8 and
+   G9 must land before the join, G8 before any v2.
 5. **Pin the Unicode and encoding crates exactly** (`=` versions in
    `Cargo.toml` for `unicode-normalization`, `icu_casemap`, `ciborium` and
    `blake3`)? *Recommended: yes, as part of G6.* The digest and the golden
@@ -752,3 +778,9 @@ Ending them before the join is question 8.
    root identity can count, and finds that the fix can't be a v2 under
    section 3, since a forged marker is a valid v1 record, so it lands
    before the freeze. Its questions are open.
+
+   *Status:* the owner answered weave-marker.md's questions on 2026-11-11
+   (decision `d01c83b654d1`), option A landed in PRs #32 and #33 and was
+   rolled out (decision `dff4d5df9f15`), and the freeze followed on
+   2026-11-16 (decision `0290487abd90`). The hostile-writer review is still
+   a precondition of the join.
