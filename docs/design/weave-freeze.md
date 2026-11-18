@@ -388,14 +388,25 @@ full table, and adds pins without changing any format.
   today. A record under a media type this build doesn't know isn't
   covered: G8 doesn't collect it. This is a reader change, shipped in the
   readers-first release before any v2 is written. It changes no format.
-- **G9. Resolve a line name only among authorised lines.** Today
-  `resolve_line` and `lines_for` (`crates/bracken/src/weave.rs` 784-797,
-  847-855) take every line of a name, and refuse a name two lines share.
-  G9 resolves a name only among lines whose first version is by the
-  counted marker's author, the same author the default-line rule uses.
-  That's a reader change, with no format change. **G9 is only as sound as
-  the counted marker.** While the counted marker is honest, a line anyone
-  else opens is reached by its id only, and a second `main` no longer
+- **G9. Resolve a line name only among authorised lines.** **Landed**
+  (task `b4a9456b4e88`). Before it, `resolve_line` and `lines_for` took
+  every line of a name, and refused a name two lines share. Now they
+  resolve a name only among the current lines whose first version is by
+  the counted marker's author, the same author the default-line rule uses
+  (`crates/bracken/src/weave.rs` 885-901, 937-993). That's a reader change,
+  with no format change. A line anyone else opens is reached by its id
+  only, and naming its name doesn't judge it. Two lines of one name by the
+  marker's author still make that name refused as shared; a name only
+  others' lines carry is refused, listing their ids; with no counted
+  marker, no name reaches a line. `weave line list` lists every line,
+  marking the default line and each line a name doesn't reach (`reach`:
+  `name`, `name_shared` or `id_only`), and `weave check` lists a line by
+  anyone else that shares a name with one of the marker's author's lines as
+  `name_by_id_only`. `scripts/weave-gate`'s `taken_over` is unchanged: it
+  refuses when `weave head --line main` doesn't name the default line,
+  which a second `main` opened by anyone else no longer causes, while one
+  by the root's key holder still does. **G9 is only as sound as the counted
+  marker.** While the counted marker is honest, a second `main` no longer
   stops main-by-name readers. When this was written, any writer could make
   their own marker the counted one (2.5, the forged-marker takeover). Then
   G9 would resolve names only among that writer's lines, so `main` would
@@ -425,9 +436,9 @@ ways:
 
 | Stop or takeover | How | Code |
 |---|---|---|
-| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored along with its links. What the name `main` then resolves to depends on the honest main's history. If it has only its first policy version, that line vanishes and `main` names only theirs, so `weave green --line main` and `weave validate --line main` read their line, where they can name themselves validator and write passing results. If it has a later policy version, that version becomes a line named `main` of its own, so the name is refused as shared: a stop, not a takeover. Once G9 lands, `main` resolves only among their lines in both cases. `scripts/weave-gate` read their line too, until PR #31: its `taken_over` check then refused when Weave's index reported an extra marker, when the default line's first version wasn't signed with `weave-integrator`'s key, or when `--line main` named another line, so the gate stopped instead of reading it, with or without G9 (option H of [weave-marker.md](weave-marker.md)). Since option A (decision `d01c83b654d1` (5), PRs #32 and #33) it refuses only when `scripts/weave-pin check` fails, when there's no counted marker, when the counted marker isn't by the pinned root, when there's no default line, or when `--line main` names another line; an extra marker alone no longer stops it, so a second marker by the root's key holder passes the gate. Every other reader still follows the forged line. A marker placed before the honest one needs no race: it's in the honest one's causal past and counts outright (weave-marker.md, section 1). Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`). **Closed before the freeze by option A** (decision `d01c83b654d1`, PRs #32 and #33): only a marker signed by the Ground's root counts, so a forged marker by anyone else never counts and `weave check` lists it as `not_by_root`. The takeover now needs the root's key | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-300, 849-851 (`lines`); `crates/bracken/src/weave.rs` 784-797, 847-855; `scripts/weave-gate` 124-141 (`taken_over`, since PR #31, narrowed by PR #32), 155, 172 |
+| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored along with its links. What the name `main` then resolves to depends on the honest main's history. If it has only its first policy version, that line vanishes and `main` names only theirs, so `weave green --line main` and `weave validate --line main` read their line, where they can name themselves validator and write passing results. If it has a later policy version, that version becomes a line named `main` of its own, so the name was refused as shared: a stop, not a takeover. Since G9 (task `b4a9456b4e88`), `main` resolves only among the marker author's lines, so a forged marker would make it name only theirs in both cases. `scripts/weave-gate` read their line too, until PR #31: its `taken_over` check then refused when Weave's index reported an extra marker, when the default line's first version wasn't signed with `weave-integrator`'s key, or when `--line main` named another line, so the gate stopped instead of reading it, with or without G9 (option H of [weave-marker.md](weave-marker.md)). Since option A (decision `d01c83b654d1` (5), PRs #32 and #33) it refuses only when `scripts/weave-pin check` fails, when there's no counted marker, when the counted marker isn't by the pinned root, when there's no default line, or when `--line main` names another line; an extra marker alone no longer stops it, so a second marker by the root's key holder passes the gate. Every other reader still follows the forged line. A marker placed before the honest one needs no race: it's in the honest one's causal past and counts outright (weave-marker.md, section 1). Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`). **Closed before the freeze by option A** (decision `d01c83b654d1`, PRs #32 and #33): only a marker signed by the Ground's root counts, so a forged marker by anyone else never counts and `weave check` lists it as `not_by_root`. The takeover now needs the root's key | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-300, 849-851 (`lines`); `crates/bracken/src/weave.rs` 885-901, 937-993 (name resolution, since G9); `scripts/weave-gate` 124-141 (`taken_over`, since PR #31, narrowed by PR #32), 155, 172 |
 | An unreadable policy version | Open a line of your own, write an artifact under the line media type that doesn't decode, and relate it `supersedes` your own version. `refuse_unreadable` is Ground-wide, so `integrate`, `validate`, `line policy` and `line merge` refuse on every line (finding `8c1867a7611c`) | `crates/bracken/src/weave.rs` 820-829; `crates/tree/src/lines.rs` 309-322, 524; `crates/bracken/src/weave/merge.rs` 258-296, 492-496 |
-| A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Name lookup then refuses `main` as shared, so `weave green --line main` and `weave validate --line main` fail, and `scripts/weave-gate` reads main by name, so it stops too; since PR #31 its `taken_over` check refuses first, when `weave head --line main` fails (finding `b6b6ccfd1255`) | `crates/bracken/src/weave.rs` 784-797, 847-855; `crates/bracken/src/weave/merge.rs` 258-296; `scripts/weave-gate` 136-139 (`taken_over`), 155, 172 |
+| A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Before G9, name lookup then refused `main` as shared, so `weave green --line main` and `weave validate --line main` failed, and `scripts/weave-gate`, which reads main by name, stopped too: since PR #31 its `taken_over` check refused first, when `weave head --line main` failed (finding `b6b6ccfd1255`). **Narrowed by G9** (task `b4a9456b4e88`): a name reaches only the lines the counted marker's author opened, so another writer's `main` is reached by its id only, isn't judged when a reader names `main`, and is listed by `weave check` as `name_by_id_only` and by `weave line list` as `id_only`; `--line main` and the gate read the default line as before. A second `main` by the root's key holder still makes the name refused as shared, and the gate refuses | `crates/bracken/src/weave.rs` 885-901, 937-993; `crates/bracken/src/weave/merge.rs` 315-351 (`line create`); `scripts/weave-gate` 136-139 (`taken_over`), 155, 172 |
 
 **This list is what reviews of this design found, not a proof that no
 other stop exists.** G8 and G9 each narrow one cause; neither, nor both
@@ -470,9 +481,11 @@ Ending them before the join is question 8.
 - after G8, if main's integrator merges a hostile writer's line into main,
   that writer can still stop main with an unreadable version on their own
   line;
-- a second line named `main` is judged by `lines_for` today, so under G8
-  alone an unreadable version on it still stops main-by-name readers. G9
-  removes that only while the counted marker is honest;
+- since G9, `lines_for` doesn't judge a second line named `main` by
+  anyone but the marker's author when a reader names `main`, so once G8
+  scopes `refuse_unreadable` per line, an unreadable version on it won't
+  stop main-by-name readers; that holds only while the counted marker is
+  honest;
 - `scripts/weave`'s check that `owner_decision` names an existing claim
   doesn't bind a writer who bypasses `scripts/weave` after the join: the
   binary checks its shape only (`crates/bracken/src/weave/merge.rs`
