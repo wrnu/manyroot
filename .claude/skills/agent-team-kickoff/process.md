@@ -252,6 +252,8 @@ When something costs time, gets lost, needs the owner when it shouldn't, or near
 - Everyone proposes via `process` claims. The manager decides, and records a `decision` that `supports` or `contradicts` the proposal.
 - **Small changes** (wording, a missing step, a checklist item, a better brief, a lint rule, a gotcha or preference claim, a local script): the manager makes them, merges them (they deploy nothing) and mentions them in its next update.
 - **Bigger changes:** a short proposal to the owner: problem, change, cost, and which numbers (below) it should move.
+- **Every process decision**, small or big, names the number it should move, in one line of its `decision` claim, written before it takes effect. About two weeks later the manager records a claim that `refines` the decision with what moved, and proposes reverting it if nothing did.
+- Process claims about one recurring problem `refine` the first claim about it, so the problem's history is one `scripts/bk show` away.
 
 ### Keeping the skill current
 
@@ -264,7 +266,7 @@ The skill is the team's process, and the owner wants it to match where developme
 
 ### Measuring
 
-Judge the process by results, not by whether steps were followed. Once a week, the manager (or a scheduled run reporting to it) contributes a claim tagged `metrics` with the week's row:
+Judge the process by results, not by whether steps were followed. Every week, the manager (or a scheduled run reporting to it) contributes a claim tagged `metrics` with the week's row:
 
 | Week | PRs merged | Reverts / follow-up fixes | Problems that reached users | Owner asks (gated / other) | Review findings (real / rejected) | Ground conflicts (opened / settled) | Notes |
 |---|---|---|---|---|---|---|---|
@@ -276,7 +278,7 @@ Get the numbers from the Ground and GitHub, don't estimate:
 - **Ground conflicts:** divergences and contradictions opened and settled. Persistent ones point at unclear ownership or vague tasks.
 - **Merges and reverts:** `gh pr list --state merged --search "merged:>=<date>"`.
 
-Use `scripts/bk log --tag <tag> --json` with `jq`. A bigger process change comes with the current numbers; about two weeks later the manager reports what moved, and proposes reverting it if nothing improved.
+Use `scripts/bk log --tag <tag> --json` with `jq`. These rows are the numbers a process decision names and its two-week check reads.
 
 These numbers are also **Bracken's own Phase 1 data**: the Ground is the experiment's record of whether semantic contributions help a team.
 
