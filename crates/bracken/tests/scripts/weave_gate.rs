@@ -920,3 +920,48 @@ fn a_weave_ground_that_may_be_taken_over_is_refused() {
         refused(&b, "not the committed pin's");
     }
 }
+
+/// A policy version on `ground` that no build so far decodes, a version 2 with other fields than version 1's,
+/// superseding `line`'s version in `who`'s own relation: its id.
+fn unreadable_version(ground: &Path, line: &str, who: &str) -> String {
+    let path = ground.parent().unwrap().join("future.cbor");
+    std::fs::write(&path, [0xa2, 0x61, b'v', 0x02, 0x64, b'n', b'a', b'm', b'e', 0x64, b'm', b'a', b'i', b'n'])
+        .unwrap();
+    let media = bracken_tree::format::LINE_MEDIA_TYPE;
+    let out = on_ground(ground, &["artifact", path.to_str().unwrap(), "--media-type", media, "--as", who]);
+    let id = out.trim().strip_prefix("artifact ").unwrap().to_owned();
+    on_ground(ground, &["relate", &id, "supersedes", line, "--as", who]);
+    id
+}
+
+/// G8 (docs/design/weave-freeze.md 2.4): record and check refuse, by their own check and not by accident, a
+/// Weave Ground where a record on a line main's judgement reads doesn't decode, as weave head --line main
+/// warns; one on a line main never reads is no reason to, so another writer's line can't stop the gate.
+#[test]
+fn a_record_main_judges_that_doesnt_decode_is_refused() {
+    for scripts in SCRIPTS {
+        let (b, claim, ground, _, _) = honest_pointer(scripts);
+        // On another writer's line: main doesn't read it.
+        on_ground(&ground, &["id", "new", "mallory"]);
+        let out = on_ground(
+            &ground,
+            &["weave", "line", "create", "evil", "--owner-decision", &"a".repeat(12), "--as", "mallory"],
+        );
+        let evil = out.trim().strip_prefix("line ").and_then(|l| l.strip_suffix(" (evil)")).unwrap().to_owned();
+        unreadable_version(&ground, &evil, "mallory");
+        let out = b.record(&claim, 1);
+        assert!(out.status.success(), "{scripts}: another line's record is no stop: {}", text(&out));
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: still counts");
+
+        // On main, by main's author: refused, naming it.
+        let head: serde_json::Value = serde_json::from_str(&on_ground(&ground, &["weave", "head", "--json"])).unwrap();
+        let main = head["line"].as_str().unwrap().to_owned();
+        let future = unreadable_version(&ground, &main, "weave-integrator");
+        refused_for(&b, scripts, &claim, "line main's judgement holds a record this binary can't read");
+        refused_for(&b, scripts, &claim, &future);
+
+        // Retracted, it counts for nothing, and the gate reads the Ground again.
+        on_ground(&ground, &["retract", &future, "--as", "weave-integrator"]);
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: honest again");
+    }
+}

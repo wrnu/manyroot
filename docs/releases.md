@@ -69,6 +69,33 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-11-17: an unreadable Weave record stops only the lines that judge it (task ca6338ee7701)
+
+G8 of docs/design/weave-freeze.md, a reader change shipped before any Weave v2 is written (decisions
+`bae92c497714` Q4, `0290487abd90`). No record's bytes, validity rule, golden vector or fixture changes, and
+every existing Ground opens and reads as before; what changes is which commands refuse, and what they say.
+- **Scoped per line.** A policy version that doesn't decode counts only against the line of the counted
+  version it supersedes (in a relation its own author signed, as before). `integrate`, `validate`, `line
+  policy`, `line merge` and now `weave green` refuse only when a line they judge holds one: the lines they
+  name, the default line, and the line of every decision their judgement brings in, such as another line's
+  decision a line merge took in (keeping finding `5d50422b9e11`'s fail-open closed). Another writer's line
+  no longer stops main. Every command judges the default line, so one on main still stops them all.
+- **Decisions too.** A decision that doesn't decode counts the same way when it isn't retracted, its
+  top-level `line`, read as generic CBOR, names a counted version in its causal past, and its author is an
+  integrator under the policy in force there. Any other is ignored and listed by `weave check`, as before.
+- **The refusal names the version.** A payload's `v` is read first as generic CBOR, so a version 2 with
+  other fields says `payload has format version 2; this build reads version 1` instead of `not in canonical
+  encoding`. `weave check` still prints the decoder's own error.
+- **`weave green` refuses** where it warned, and `scripts/weave-gate` refuses explicitly (`line main's
+  judgement holds a record this binary can't read`) when `weave head --line main` warns of one, in place of
+  the refusal it got by accident from that warning breaking green's JSON (gotcha `098c2193c7ab`).
+- **Old and new binaries.** Nothing on our Grounds triggers either rule today, so they agree. An older
+  binary refuses more, Ground-wide, and warns on green instead of refusing; the gate's check matches its
+  warning too, so the gate fails closed across the upgrade. **Migration:** upgrade both binaries that read
+  the Weave Ground (the pinned `.bracken-bin` and `~/bracken-weave`'s) after the merge, as for any CLI
+  change, and in any case before a v2 record is written (weave-freeze.md section 3, step 2); never roll
+  back below this release once a v2 exists.
+
 ### 2026-11-11: only the Weave Ground's root's marker counts (task 8ffd4b252d9a)
 
 Option A of docs/design/weave-marker.md (owner decision `d01c83b654d1`), closing the forged-marker

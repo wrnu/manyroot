@@ -890,11 +890,9 @@ pub(crate) fn lines_for(s: &Store, ix: &Index, given: &[Option<&str>]) -> Lines 
 /// how many rule-5 questions it asked, so a test can check what a command pays for a line it doesn't name.
 pub(crate) fn judged_for<'a>(s: &Store, ix: &Index, pick: impl FnOnce(&Lines) -> Vec<ContributionId> + 'a) -> Lines {
     let lines = Lines::build_for(s.graph(), ix, pick);
-    if let Some(first) = lines.unreadable_versions().first() {
+    if let Some(said) = unreadable_said(&lines) {
         eprintln!(
-            "bracken: warning: {} line version(s) here, such as {first}, don't decode with this build, so a line may be \
-             read under an older version of its policy: upgrade bracken (docs/releases.md)",
-            lines.unreadable_versions().len()
+            "bracken: warning: {said}, so a line may be read under an older version of its policy: upgrade bracken (docs/releases.md)"
         );
     }
     if std::env::var_os("BRACKEN_WEAVE_STATS").is_some() {
@@ -904,14 +902,29 @@ pub(crate) fn judged_for<'a>(s: &Store, ix: &Index, pick: impl FnOnce(&Lines) ->
     lines
 }
 
-/// Refuses to run checks or move a line while a line version here doesn't decode with this build: its
-/// predecessor would stand in for it (finding 5d50422b9e11).
+/// What [`Lines::unreadable`] holds, said once: how many, and the first, with its line and why it doesn't
+/// decode. Both the warning and the refusal keep the words "don't decode with this build", which
+/// scripts/weave-gate matches, as it did an older build's warning.
+fn unreadable_said(lines: &Lines) -> Option<String> {
+    let first = lines.unreadable().first()?;
+    Some(format!(
+        "{} record(s) on the lines this judges don't decode with this build, such as {} {} on line {} ({})",
+        lines.unreadable().len(),
+        first.kind.as_str(),
+        first.id,
+        first.line,
+        first.why
+    ))
+}
+
+/// Refuses to judge or move a line while a record on a line the command judges doesn't decode with this
+/// build: a policy version's predecessor would stand in for it, or a decision would be left out (finding
+/// 5d50422b9e11, docs/design/weave-freeze.md G8).
 pub(crate) fn refuse_unreadable(lines: &Lines, what: &str) -> Result<()> {
-    if let Some(first) = lines.unreadable_versions().first() {
+    if let Some(said) = unreadable_said(lines) {
         bail!(
-            "{} line version(s) here, such as {first}, don't decode with this build, so {what} could act under an older \
-             policy than the one in force; nothing was done: upgrade bracken (docs/releases.md)",
-            lines.unreadable_versions().len()
+            "{said}, so {what} could act under an older policy than the one in force, or miss a decision; nothing \
+             was done: upgrade bracken (docs/releases.md)"
         );
     }
     Ok(())
