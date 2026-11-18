@@ -252,7 +252,7 @@ tripwire don't match it (section 4).
 | `format_guard.rs` `unicode_tables_are_pinned` | Unicode's version, and a digest of `fold` over every scalar value, which covers icu_casemap's data and the ignorables | Version mismatch, or the digest |
 | `format_guard.rs`, the line-merge tests | The line merge (1.6): vectors, the cap, and the cases where git differs | `vector <i>`, `<n> lines`, or the `KNOWN_DIFFERENT` list |
 | `crates/tree/tests/paths.rs` | Every path, folding, collision and symlink-target rule, both ways; the length limits relative to their constants | An assertion naming the rule |
-| `refuse_unreadable` (`crates/bracken/src/weave.rs` 820-829), over `crates/tree/src/lines.rs` 246-251 and 309-322 (finding `5d50422b9e11`) | A line-media-type artifact that doesn't decode with this build, and supersedes a counted version of its own author's in a relation that author signed. `integrate`, `validate`, `line policy` and `line merge` refuse while one exists anywhere in the Ground, on any line (`weave.rs` 612; `weave/merge.rs` 303, 397, 641; `weave/checks.rs` 262): the list isn't scoped to the line a command acts on (`restrict`, `lines.rs` 524, never filters it), and anyone can open a line (`weave/merge.rs` 260-296), so any signer can stop every line this way. Every other read warns (`judged_for`, `weave.rs` 802-809). `scripts/weave-gate` refuses too, but only by accident: `green_of` (`scripts/weave-gate` 165-174) captures `weave green`'s stderr with its output, so the warning line breaks the JSON and the gate says the output isn't in the shape it reads. A decision that doesn't decode is dropped (`lines.rs` 264-268). A record under a media type this build doesn't know is never collected, so it's neither refused nor warned about | The refusal names the version and says to upgrade |
+| `refuse_unreadable` (`crates/bracken/src/weave.rs` 938), over `Lines::unreadable` (`crates/tree/src/lines.rs` 314, 366, `read_lines` 655, `count_unreadable` 701; findings `5d50422b9e11`, `c9da29e1ac4b`, `9c0ae448ee12`, `0783a2caf192`, G8) | A record that doesn't decode with this build and would change a line: a line-media-type artifact that supersedes a counted version of its own author's, in a relation that author signed; or a decision artifact of a version this build doesn't read (its `v`, read as generic CBOR, above 1), not retracted, whose top-level `line` (read as generic CBOR) names a counted version in its causal past, by an integrator under the policy in force there. Each counts only against its own line, and a command reports it only on a line it judges: the lines it names, the default line, and, from each decision on those whose author integrates its line under the policy in force for it, its parents' lines, decoded or not, following the decoded parents the same way (`read_lines`). An undecodable parent of a version this build doesn't read, with a top-level `line`, brings that line in whoever wrote it, as a build that reads it may find its author integrates the line under a version this one can't read (finding `0783a2caf192`). A decision by anyone else brings no line in. There `integrate`, `validate`, `green` and `line merge` refuse (`weave.rs` 715; `weave/merge.rs` 452, 696; `weave/checks.rs` 262; `weave/review.rs` 177), `line policy` refuses for a policy version only (`refuse_unreadable_policy`, `weave.rs` 947; `weave/merge.rs` 358), and every other read warns (`judged_for`, `weave.rs` 905). `scripts/weave-gate`'s `taken_over` (125-152) refuses when `weave head --line main` warns of one. Any other payload that doesn't decode is ignored by views and listed by `weave check`. A record under a media type this build doesn't know is never collected, so it's neither refused nor warned about | The refusal names the record, its line and its format version, read first as generic CBOR (`format.rs` `undecodable_why`, 117), and says to upgrade |
 | `crates/tree/tests/lines.rs` | The ancestor rule: a reference that isn't an ancestor makes the record `NotAnAncestor` and views ignore it | An assertion |
 | `crates/tree/tests/weave_fixture.rs` with `tests/fixtures/weave-v1` | A Ground written by `bracken-tree` 0.1.0: 80 contributions with pinned ids, covering every media type, results, reviews, a goal and a policy change. It checks that it opens, that every record reads back to its bytes, every derived status, and that the scenario rebuilds the fixture byte for byte. Since the ids are pinned, so is every byte the scenario writes: `details` from `details()`, argv-only methods, change hashes, `Exit::Code`'s text. | An id, byte or status mismatch, or the rebuild differing |
 | `crates/tree/tests/coordination_fixture.rs` and `crates/bracken/tests/coordination_fixture.rs` | The coordination fixture `ground-v1` reads as recorded with Weave linked in, and Weave finds nothing of its own there | A status or acceptance mismatch |
@@ -274,7 +274,7 @@ tripwire don't match it (section 4).
 | Line with executors, Executor | `executors_are_left_out_when_there_are_none`, round trips, `line_rules` | **G1**: no golden bytes for a line with an executor, of either kind; the fixture predates executors. Closed by PR #28: `golden_vectors_for_executors_and_in_place`; the fixture still predates them (G7) |
 | `owner_decision` and its null rule | golden line; `line_rules`; the fixture's derived statuses | none |
 | The ancestor rule | `lines.rs`'s tests; the fixture, every record of which passes it | none |
-| A policy version this build can't read | `refuse_unreadable` (2.1), for the same media type only, and Ground-wide | **G8**: the refusal isn't scoped per line, so any signer can stop every line; `weave green` only warns, and `scripts/weave-gate` refuses only by accident; an unreadable decision is dropped silently. **Not covered by G8**: a record under a new media type isn't seen at all, and would need a further reader change |
+| A policy version this build can't read | `refuse_unreadable` (2.1), for the same media types only, per line | **G8**: the refusal wasn't scoped per line, so any signer could stop every line; `weave green` only warned, and `scripts/weave-gate` refused only by accident; an unreadable decision was dropped silently. Closed by task `ca6338ee7701` (branch `weave-g8-unreadable`): the tests `an_unreadable_policy_version_stops_only_the_lines_that_judge_it`, `an_unreadable_decision_stops_its_line_only_from_an_integrator`, `only_a_decision_by_an_integrator_brings_another_line_into_a_judgement`, `only_a_newer_decision_counts_and_line_policy_still_runs` and `a_record_main_judges_that_doesnt_decode_is_refused`. **Not covered by G8**: a record under a new media type isn't seen at all, and would need a further reader change |
 | The marker that counts, and its author | the fixture's derived statuses (its default line and the null-`owner_decision` version); the coordination fixture test's `counted_marker() == None` | none |
 | Decision | golden vector; `decision_rules`; `a_decision_refers_to_at_most_max_references`; the fixture, which holds decisions with `source` null and set | none |
 | Proposal and its change | golden proposal (its `change` field is an arbitrary hash); change rows by value; the fixture's proposals, whose ids pin their recomputed `change` | **G2**: no golden vector pins a change list's hash directly. Closed by PR #28: `golden_change_hash` |
@@ -359,8 +359,8 @@ full table, and adds pins without changing any format.
   2026-10-31): a policy version with executors, and a result written
   through `details_with_run`. This needs the same review as any fixture
   change.
-- **G8. Scope `refuse_unreadable` per line, and extend it.** Today it
-  refuses Ground-wide (2.1), so any signer can stop every line this way.
+- **G8. Scope `refuse_unreadable` per line, and extend it.** Before G8 it
+  refused Ground-wide, so any signer could stop every line this way.
   G8 narrows that one cause. It doesn't end the any-writer stop, which has
   other causes (2.5). G8:
   - counts an unreadable policy version only against the line of the
@@ -369,31 +369,55 @@ full table, and adds pins without changing any format.
     `lines.rs` 309-322). `integrate`, `validate`, `line policy`, `line
     merge`, `weave green` and `scripts/weave-gate` refuse when any line the
     command judges holds one: the lines it picks, the default line, and
-    the line of every decision `restrict` brings into the judgement
-    (`lines.rs` 535-544), such as another line's decisions that a line
-    merge brought in. Scoping it to the lines a command acts on alone would
-    reopen finding `5d50422b9e11`'s fail-open, for decisions judged under
-    another line's chain;
+    the lines a decision on those brings in when its author integrates its
+    line under the policy in force for it (`read_lines`): its parents'
+    lines, such as another line's decisions that a line merge brought in,
+    and so on through parents whose authors integrate theirs. Scoping it to
+    the lines a command acts on alone would reopen finding
+    `5d50422b9e11`'s fail-open, for decisions judged under another line's
+    chain. A decision by anyone else can't qualify whatever its parents
+    are, so it brings no line in (finding `c9da29e1ac4b`);
   - decodes a payload's `v` first, as generic CBOR, so the refusal names
     the version whatever v2's fields are (section 3);
   - makes `weave green` refuse instead of warning, and gives
     `scripts/weave-gate` its own explicit refusal in place of today's
     accidental one;
-  - treats a decision that doesn't decode the same way only where it isn't
-    retracted, names a line in a top-level `line` field (read as generic
-    CBOR), and is signed by an integrator under the last readable policy
-    in force on that line. Today such a decision is dropped.
+  - treats a decision that doesn't decode the same way only where its `v`
+    is a version this build doesn't read, it isn't retracted, names a line
+    in a top-level `line` field (read as generic CBOR), and is signed by an
+    integrator under the last readable policy in force on that line. Today
+    such a decision is dropped. A malformed version 1 never decodes in any
+    build, so it stays ignored (finding `9c0ae448ee12`). `line policy`
+    refuses for a policy version only, so the line's author can still
+    remove the integrator who wrote one, though the stop lasts (2.5).
 
   Any other unreadable record is ignored and listed by `weave check`, as
   today. A record under a media type this build doesn't know isn't
   covered: G8 doesn't collect it. This is a reader change, shipped in the
   readers-first release before any v2 is written. It changes no format.
+
+  **Closed by task `ca6338ee7701`** (branch `weave-g8-unreadable`, releases.md
+  2026-11-17), as written, with these readings. Every command judges the
+  default line, so an unreadable record on main still stops every line's
+  commands; one on another writer's line stops only the lines that judge
+  it. A decision that names a line counts under the policy in force in its
+  own causal past among the versions this build reads, and a decoded
+  decision whose author integrates its line brings the line of each
+  parent that doesn't decode into the judgement, whoever wrote that
+  parent: a build that reads the parent may find its author integrates
+  that line under a version this one can't read (finding
+  `0783a2caf192`). The version is read only for the refusal
+  (`format.rs` `payload_version`, `undecodable_why`): `Record::decode` is
+  unchanged, so validity and `weave check`'s wording are too. The gate's
+  refusal matches `weave head --line main`'s warning, whose words an older
+  binary's Ground-wide warning shares, so the gate fails closed across the
+  upgrade; its `green_of` still captures stderr, which no longer decides.
 - **G9. Resolve a line name only among authorised lines.** **Landed**
   (task `b4a9456b4e88`). Before it, `resolve_line` and `lines_for` took
   every line of a name, and refused a name two lines share. Now they
   resolve a name only among the current lines whose first version is by
   the counted marker's author, the same author the default-line rule uses
-  (`crates/bracken/src/weave.rs` 885-901, 937-993). That's a reader change,
+  (`crates/bracken/src/weave.rs` 885-901, 950-1006). That's a reader change,
   with no format change. A line anyone else opens is reached by its id
   only, and naming its name doesn't judge it. Two lines of one name by the
   marker's author still make that name refused as shared; a name only
@@ -436,9 +460,10 @@ ways:
 
 | Stop or takeover | How | Code |
 |---|---|---|
-| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored along with its links. What the name `main` then resolves to depends on the honest main's history. If it has only its first policy version, that line vanishes and `main` names only theirs, so `weave green --line main` and `weave validate --line main` read their line, where they can name themselves validator and write passing results. If it has a later policy version, that version becomes a line named `main` of its own, so the name was refused as shared: a stop, not a takeover. Since G9 (task `b4a9456b4e88`), `main` resolves only among the marker author's lines, so a forged marker would make it name only theirs in both cases. `scripts/weave-gate` read their line too, until PR #31: its `taken_over` check then refused when Weave's index reported an extra marker, when the default line's first version wasn't signed with `weave-integrator`'s key, or when `--line main` named another line, so the gate stopped instead of reading it, with or without G9 (option H of [weave-marker.md](weave-marker.md)). Since option A (decision `d01c83b654d1` (5), PRs #32 and #33) it refuses only when `scripts/weave-pin check` fails, when there's no counted marker, when the counted marker isn't by the pinned root, when there's no default line, or when `--line main` names another line; an extra marker alone no longer stops it, so a second marker by the root's key holder passes the gate. Every other reader still follows the forged line. A marker placed before the honest one needs no race: it's in the honest one's causal past and counts outright (weave-marker.md, section 1). Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`). **Closed before the freeze by option A** (decision `d01c83b654d1`, PRs #32 and #33): only a marker signed by the Ground's root counts, so a forged marker by anyone else never counts and `weave check` lists it as `not_by_root`. The takeover now needs the root's key | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-300, 849-851 (`lines`); `crates/bracken/src/weave.rs` 885-901, 937-993 (name resolution, since G9); `scripts/weave-gate` 124-141 (`taken_over`, since PR #31, narrowed by PR #32), 155, 172 |
-| An unreadable policy version | Open a line of your own, write an artifact under the line media type that doesn't decode, and relate it `supersedes` your own version. `refuse_unreadable` is Ground-wide, so `integrate`, `validate`, `line policy` and `line merge` refuse on every line (finding `8c1867a7611c`) | `crates/bracken/src/weave.rs` 820-829; `crates/tree/src/lines.rs` 309-322, 524; `crates/bracken/src/weave/merge.rs` 258-296, 492-496 |
-| A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Before G9, name lookup then refused `main` as shared, so `weave green --line main` and `weave validate --line main` failed, and `scripts/weave-gate`, which reads main by name, stopped too: since PR #31 its `taken_over` check refused first, when `weave head --line main` failed (finding `b6b6ccfd1255`). **Narrowed by G9** (task `b4a9456b4e88`): a name reaches only the lines the counted marker's author opened, so another writer's `main` is reached by its id only, isn't judged when a reader names `main`, and is listed by `weave check` as `name_by_id_only` and by `weave line list` as `id_only`; `--line main` and the gate read the default line as before. A second `main` by the root's key holder still makes the name refused as shared, and the gate refuses | `crates/bracken/src/weave.rs` 885-901, 937-993; `crates/bracken/src/weave/merge.rs` 315-351 (`line create`); `scripts/weave-gate` 136-139 (`taken_over`), 155, 172 |
+| A forged marker: takeover, not a stop | Any writer signs a marker of their own whose parents leave out the counted one (empty parents, say), and varies `purpose` until its id is smaller than the counted marker's: about two tries on average. Their marker now counts, so they're the marker's author. They write a line named `main` with `owner_decision` null. The default line is now theirs, and the honest main's first version, whose `owner_decision` is null, is ignored along with its links. What the name `main` then resolves to depends on the honest main's history. If it has only its first policy version, that line vanishes and `main` names only theirs, so `weave green --line main` and `weave validate --line main` read their line, where they can name themselves validator and write passing results. If it has a later policy version, that version becomes a line named `main` of its own, so the name was refused as shared: a stop, not a takeover. Since G9 (task `b4a9456b4e88`), `main` resolves only among the marker author's lines, so a forged marker would make it name only theirs in both cases. `scripts/weave-gate` read their line too, until PR #31: its `taken_over` check then refused when Weave's index reported an extra marker, when the default line's first version wasn't signed with `weave-integrator`'s key, or when `--line main` named another line, so the gate stopped instead of reading it, with or without G9 (option H of [weave-marker.md](weave-marker.md)). Since option A (decision `d01c83b654d1` (5), PRs #32 and #33) it refuses only when `scripts/weave-pin check` fails, when there's no counted marker, when the counted marker isn't by the pinned root, when there's no default line, or when `--line main` names another line; an extra marker alone no longer stops it, so a second marker by the root's key holder passes the gate. Every other reader still follows the forged line. A marker placed before the honest one needs no race: it's in the honest one's causal past and counts outright (weave-marker.md, section 1). Decision `049d02449a94` left a forged marker to the trusted-writer model (finding `26d9361e0a9f`). **Closed before the freeze by option A** (decision `d01c83b654d1`, PRs #32 and #33): only a marker signed by the Ground's root counts, so a forged marker by anyone else never counts and `weave check` lists it as `not_by_root`. The takeover now needs the root's key | `crates/tree/src/ground.rs` 328-330; `crates/manyroot/src/graph.rs` 159-166 (a writer chooses any present parents); `crates/tree/src/lines.rs` 234-236 (`find_default_line`), 284-300, 849-851 (`lines`); `crates/bracken/src/weave.rs` 885-901, 950-1006 (name resolution, since G9); `scripts/weave-gate` 125-152 (`taken_over`, since PR #31, narrowed by PR #32, extended by G8), 166, 183 |
+| An unreadable policy version | Open a line of your own, write an artifact under the line media type that doesn't decode, and relate it `supersedes` your own version. Until G8, `refuse_unreadable` was Ground-wide, so `integrate`, `validate`, `line policy` and `line merge` refused on every line (finding `8c1867a7611c`). Since G8 it stops only the lines whose judgement reads that line: your own, and a line where a decision by that line's integrator, or a chain of such decisions, names a decision on yours as a parent, as a line merge does, whoever wrote that parent decision, decoded or not (finding `0783a2caf192`). A decision on main by someone who doesn't integrate main brings no line in (finding `c9da29e1ac4b`). Main's integrator merging your line into main, or an unreadable record on main itself, still stops main | `crates/bracken/src/weave.rs` 938; `crates/tree/src/lines.rs` 366, 655, 701; `crates/bracken/src/weave/merge.rs` 258-296, 492-496 |
+| An unreadable decision | An integrator of a line writes a decision artifact of a version this build doesn't read (`v` above 1) naming that line. Since G8 it stops every command that judges the line but `line policy`, and every command judges the default line, so an integrator of main stops every line. It's judged by the policy in its own causal past, so removing its author with `line policy` doesn't end it: only its author's retraction, or a build that reads its version, does. A malformed version 1, or one by anyone who doesn't integrate the line, stops nothing (finding `9c0ae448ee12`) | `crates/tree/src/lines.rs` 309, 359; `crates/bracken/src/weave.rs` 938, 947 |
+| A duplicate line name | `weave line create main` takes any signer, and `owner_decision` is checked for its shape only. Before G9, name lookup then refused `main` as shared, so `weave green --line main` and `weave validate --line main` failed, and `scripts/weave-gate`, which reads main by name, stopped too: since PR #31 its `taken_over` check refused first, when `weave head --line main` failed (finding `b6b6ccfd1255`). **Narrowed by G9** (task `b4a9456b4e88`): a name reaches only the lines the counted marker's author opened, so another writer's `main` is reached by its id only, isn't judged when a reader names `main`, and is listed by `weave check` as `name_by_id_only` and by `weave line list` as `id_only`; `--line main` and the gate read the default line as before. A second `main` by the root's key holder still makes the name refused as shared, and the gate refuses | `crates/bracken/src/weave.rs` 885-901, 950-1006; `crates/bracken/src/weave/merge.rs` 315-351 (`line create`); `scripts/weave-gate` 137-140 (`taken_over`), 166, 183 |
 
 **This list is what reviews of this design found, not a proof that no
 other stop exists.** G8 and G9 each narrow one cause; neither, nor both
@@ -480,7 +505,8 @@ Ending them before the join is question 8.
   other marker exists;
 - after G8, if main's integrator merges a hostile writer's line into main,
   that writer can still stop main with an unreadable version on their own
-  line;
+  line, and any integrator of main can stop it with an unreadable
+  decision that outlasts their removal (finding `9c0ae448ee12`);
 - since G9, `lines_for` doesn't judge a second line named `main` by
   anyone but the marker's author when a reader names `main`, so once G8
   scopes `refuse_unreadable` per line, an unreadable version on it won't
@@ -506,9 +532,11 @@ Ending them before the join is question 8.
   heads.
 - **A new version.** A changed record carries `"v": 2` under the same
   media type and prefix (question 2). A binary that reads only v1 refuses
-  it. For a policy version, `refuse_unreadable` (2.1) then stops
-  `integrate`, `validate`, `line policy` and `line merge` on every line,
-  until G8 scopes it to the version's own line. Any other kind is ignored by views and listed by `weave check`.
+  it. For a policy version, or a decision by an integrator naming a line,
+  `refuse_unreadable` (2.1) then stops `integrate`, `validate`, `green`,
+  `line policy` (for a policy version only) and `line merge` on every line
+  whose judgement reads that line (G8); a binary from before G8 stops them on every line. Any other
+  kind is ignored by views and listed by `weave check`.
   The Ground still opens and syncs, since manyroot sees an artifact. The
   refusal's
   wording depends on v2's fields. `Record::decode` (`format.rs` 114-117)
@@ -517,8 +545,11 @@ Ending them before the join is question 8.
   optional one, so for a v2 whose fields differ from v1's the re-encoding
   differs, and every binary written so far says `payload is not in
   canonical encoding`. Only a v2 with exactly v1's fields gets `payload has
-  format version 2; this build reads version 1`. So today's refusal doesn't
-  say to upgrade. G8 fixes that for binaries from its release on.
+  format version 2; this build reads version 1`. So a refusal from before
+  G8 doesn't say to upgrade. G8 fixes that for binaries from its release
+  on: `refuse_unreadable` reads `v` first as generic CBOR and names it,
+  whatever v2's fields, while `weave check` still prints the decoder's
+  error.
 - **Readers first, then writers**, as releases.md already requires for
   executors (2026-10-31). An old binary that ignores a new decision or
   policy version computes different heads, or reads a line under a policy
@@ -569,8 +600,9 @@ Ending them before the join is question 8.
   binary from before it rejects a line that has one as not canonical,
   which is the right effect. After the freeze, such a field bumps `v`, so
   a reader that knows v2 can tell the two shapes apart. A refusal names the
-  version only on binaries with G8, but `refuse_unreadable` already refuses
-  while such a policy version exists, Ground-wide until G8.
+  version only on binaries with G8, but `refuse_unreadable` refuses while
+  such a policy version exists: on the lines that judge it with G8,
+  Ground-wide on a binary from before it.
 - **Pinned-not-frozen changes** (1.6) stay protocol class with a
   releases.md entry, as today, but need no new version: they change views,
   not records. They take the same readers-first rollout when two binaries
@@ -602,12 +634,13 @@ Ending them before the join is question 8.
 - **The merge gate relies on failing closed.** After the join, a stale
   binary reading the coordination Ground must not compute green under a
   policy that's no longer in force. The readers-first rollout is a rule
-  that nothing checks. Today `refuse_unreadable` stops a stale binary from
-  acting under an old policy, but on every line at once, so any signer can
-  stop every line with one record of their own. `weave green` only warns,
-  and `scripts/weave-gate` refuses only by accident (2.1). G8 scopes the
-  refusal to the lines a command judges, and makes green and the gate
-  refuse deliberately. It must be in every gate reader before any v2 is
+  that nothing checks. `refuse_unreadable` stops a stale binary from
+  acting under an old policy. Before G8 it did so on every line at once,
+  so any signer could stop every line with one record of their own, `weave
+  green` only warned, and `scripts/weave-gate` refused only by accident.
+  G8 (task `ca6338ee7701`) scopes the refusal to the lines a command
+  judges, and makes green and the gate refuse deliberately (2.1). It must
+  be in every gate reader before any v2 is
   written. That holds only if a format change keeps its media type, since
   G8 doesn't see a new one (question 2).
 - **The join assumes hostile writers, and Weave doesn't yet.** After the

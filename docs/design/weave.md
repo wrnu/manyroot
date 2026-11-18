@@ -1069,14 +1069,23 @@ before, which has no executors (finding `5d50422b9e11`). So every binary
 that reads a Weave Ground, the pinned one included, must be at least the
 build that added executors before a policy with them is written, and is
 never rolled back below it (docs/releases.md). From that build on, a line
-version that doesn't decode is reported: `weave head`, `green`, `review`
-and the other reads warn, `weave check` lists it, and `validate`,
-`integrate`, `line policy` and `line merge` refuse, doing nothing, until
-the binary is upgraded. Only an artifact that would change a line counts:
-one that supersedes a version of its own author's, in a relation that
-author signed, as a policy change does. A stray artifact, or one whose
-relation someone else signed, changes no line here, and `weave check` alone
-lists it (finding `e89cf76e9ea2`). The definition hash of a check with
+version that doesn't decode is reported. Only an artifact that would change
+a line counts: one that supersedes a version of its own author's, in a
+relation that author signed, as a policy change does. A stray artifact, or
+one whose relation someone else signed, changes no line here, and `weave
+check` alone lists it (finding `e89cf76e9ea2`). Since G8
+([weave-freeze.md](weave-freeze.md) 2.4), one counts only against the line
+of the version it supersedes, and a decision that doesn't decode counts too
+when its `v` is a version this build doesn't read, it isn't retracted,
+names a line in a top-level `line` field, and is by an integrator under the
+policy in force there. A command reports one only on a line it judges:
+those it names, the default line, and the lines a decision on those brings
+in when its author integrates its line: its parents' lines, and so on. A
+decision by anyone else brings no line in. There, `weave head`, `review`
+and the other reads warn, and `validate`, `integrate`, `green` and `line
+merge` refuse, as `line policy` does for a policy version, doing nothing, naming the record, its line and its
+format version, until the binary is upgraded. `weave check` lists every
+payload that doesn't decode. The definition hash of a check with
 an executor is that of `[name, argv, executor]`, so a result names the
 kind, the script and its hash, and changing any of them is a new policy
 version, under the owner's decision.

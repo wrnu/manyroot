@@ -86,6 +86,41 @@ pub fn from_cbor<T: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<T, For
     Ok(value)
 }
 
+/// A field of a payload's top-level map, read as generic CBOR whatever the payload's other fields are, so
+/// a reader can say what a record it can't decode carries (docs/design/weave-freeze.md, G8). This never
+/// makes a payload valid: [`Record::decode`] alone says that.
+fn payload_field(bytes: &[u8], key: &str) -> Option<ciborium::Value> {
+    let ciborium::Value::Map(entries) = ciborium::from_reader::<ciborium::Value, _>(bytes).ok()? else { return None };
+    entries.into_iter().find(|(k, _)| matches!(k, ciborium::Value::Text(t) if t == key)).map(|(_, v)| v)
+}
+
+/// The format version a payload's top-level `v` holds, if it is an unsigned integer, read as generic CBOR.
+pub fn payload_version(bytes: &[u8]) -> Option<u64> {
+    match payload_field(bytes, "v")? {
+        ciborium::Value::Integer(v) => u64::try_from(v).ok(),
+        _ => None,
+    }
+}
+
+/// The contribution a payload's top-level `line` holds, if it is a byte string of an id's length, read as
+/// generic CBOR.
+pub fn payload_line(bytes: &[u8]) -> Option<ContributionId> {
+    match payload_field(bytes, "line")? {
+        ciborium::Value::Bytes(b) => Some(ContributionId(b.try_into().ok()?)),
+        _ => None,
+    }
+}
+
+/// Why a payload doesn't decode, naming its version whatever its fields when that isn't one this build
+/// reads: [`Record::decode`] checks canonical encoding first, so a version 2 with fields version 1 lacks
+/// would otherwise say only that it isn't canonical (docs/design/weave-freeze.md, section 3).
+pub fn undecodable_why(bytes: &[u8], error: FormatError) -> FormatError {
+    match payload_version(bytes) {
+        Some(v) if v != VERSION => FormatError::Version(v),
+        _ => error,
+    }
+}
+
 /// A Weave record with a CBOR payload.
 pub trait Record: Serialize + DeserializeOwned {
     const MEDIA_TYPE: &'static str;

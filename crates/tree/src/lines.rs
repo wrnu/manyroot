@@ -21,7 +21,8 @@ use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
 
 use crate::ancestry::{self, Ancestry, Stats};
 use crate::format::{
-    Change, DECISION_MEDIA_TYPE, Decision, Disposition, LINE_MEDIA_TYPE, Line, PROPOSAL_MEDIA_TYPE, Proposal, Record,
+    Change, DECISION_MEDIA_TYPE, Decision, Disposition, FormatError, LINE_MEDIA_TYPE, Line, PROPOSAL_MEDIA_TYPE,
+    Proposal, Record, VERSION, payload_line, payload_version, undecodable_why,
 };
 use crate::ground::Index;
 use crate::hash::ContentHash;
@@ -119,6 +120,44 @@ pub enum Unqualified {
 /// make D decisions keep up to D x K versions (task a90865cb60db).
 pub const DIVERGED_SHOWN: usize = 8;
 
+/// What kind of record an [`Unreadable`] is, by its media type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadableKind {
+    PolicyVersion,
+    Decision,
+}
+
+impl UnreadableKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UnreadableKind::PolicyVersion => "policy version",
+            UnreadableKind::Decision => "decision",
+        }
+    }
+}
+
+/// A record, not retracted, that doesn't decode with this build and would change a line if it did
+/// (docs/design/weave-freeze.md, G8): a newer build's, such as a version 2. Its line reads as if it weren't
+/// there, so the commands that judge that line say so, and those that act on it refuse. It is either a line
+/// artifact that supersedes a counted version of its own author's, in a relation that author signed, as a
+/// policy change does (finding 5d50422b9e11); or a decision artifact of a version this build doesn't read
+/// whose top-level `line`, read as generic CBOR, names a counted version in its causal past, by an integrator
+/// under the policy in force there among the versions this build reads (finding 9c0ae448ee12). Any other record that doesn't decode is left to `weave check` (finding
+/// e89cf76e9ea2).
+#[derive(Debug, Clone)]
+pub struct Unreadable {
+    pub id: ContributionId,
+    pub kind: UnreadableKind,
+    /// Why it doesn't decode: its format version, whatever its fields, when that isn't one this build
+    /// reads ([`crate::format::undecodable_why`]).
+    pub why: FormatError,
+    /// The line it counts against: the first artifact of a chain this build judges that holds a version it
+    /// supersedes, or the line it names.
+    pub line: ContributionId,
+    /// The counted versions it would change: those it supersedes, or the one it names as its line.
+    touches: Vec<ContributionId>,
+}
+
 /// A qualifying decision's line and the policy version in force for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Qualified {
@@ -166,12 +205,15 @@ pub struct Lines {
     default_line: Option<ContributionId>,
     /// Policy versions ignored for want of an owner decision.
     ignored: Vec<ContributionId>,
-    /// Line artifacts, not retracted, that don't decode with this build and would be a policy change if
-    /// they did: a version a newer build wrote, such as one with a field this build doesn't know
-    /// (finding 5d50422b9e11), superseding a known version as a policy change does. Their lines read as
-    /// if they weren't there, so the commands that judge lines say so. One that would change no line
-    /// here is left to `weave check` (finding e89cf76e9ea2).
-    unreadable: Vec<ContributionId>,
+    /// The records that don't decode with this build and would change a line this build judges, in causal
+    /// order ([`Unreadable`]). Before the build knows which lines it judges, every one that would change
+    /// some line.
+    unreadable: Vec<Unreadable>,
+    /// The line each undecodable decision names, for every one of a newer version that names a line in a
+    /// top-level field and isn't retracted, whether its author integrates that line or not: what
+    /// [`Lines::read_lines`] follows from a parent an integrator's decision names (finding 0783a2caf192).
+    /// Emptied once the build knows which lines it reads.
+    undecoded_decisions: HashMap<ContributionId, ContributionId>,
     /// What answering the chain questions did.
     stats: Stats,
     /// Every objection, and what rules 5 and 6 read of each decision.
@@ -248,7 +290,7 @@ impl Lines {
                     Ok(policy) => {
                         lines.versions.insert(*id, Version { id: *id, author: c.author(), policy });
                     }
-                    Err(_) => undecoded.push(*id),
+                    Err(e) => undecoded.push((*id, UnreadableKind::PolicyVersion, undecodable_why(content, e), None)),
                 },
                 PROPOSAL_MEDIA_TYPE => {
                     if let Ok(proposal) = Proposal::decode(content) {
@@ -260,12 +302,21 @@ impl Lines {
                         }
                     }
                 }
-                DECISION_MEDIA_TYPE => {
-                    if let Ok(decision) = Decision::decode(content) {
+                DECISION_MEDIA_TYPE => match Decision::decode(content) {
+                    Ok(decision) => {
                         lines.decisions.insert(*id, DecisionRecord { id: *id, author: c.author(), decision });
                         lines.order.push(*id);
                     }
-                }
+                    // One that names no line, or is retracted, would change nothing here, whatever it holds. Nor
+                    // would one of a version this build reads, a malformed version 1: no build ever decodes it,
+                    // so it is left to `weave check`, as before G8 (finding 9c0ae448ee12).
+                    Err(e) => {
+                        let newer = payload_version(content).is_some_and(|v| v > VERSION);
+                        if let Some(line) = payload_line(content).filter(|_| newer && !g.is_retracted(id)) {
+                            undecoded.push((*id, UnreadableKind::Decision, undecodable_why(content, e), Some(line)));
+                        }
+                    }
+                },
                 _ => {}
             }
         }
@@ -306,19 +357,50 @@ impl Lines {
             links.retain(|_, list| !list.is_empty());
         }
         lines.ignored = ignored.into_iter().collect();
-        // An undecodable artifact counts only where it would displace a version, by the rule above: it
-        // supersedes a counted version of its own author's, in a relation that author signed.
+        // An undecodable line artifact counts only where it would displace a version, by the rule above: it
+        // supersedes a counted version of its own author's, in a relation that author signed. An undecodable
+        // decision counts only where its line, in its causal past, has a policy in force among the versions
+        // read here under which its author integrates: anywhere else it couldn't qualify (G8).
+        lines.undecoded_decisions =
+            undecoded.iter().filter_map(|(id, _, _, line)| line.map(|line| (*id, line))).collect();
         lines.unreadable = undecoded
             .into_iter()
-            .filter(|id| {
-                let author = g.get(id).expect("listed by the graph").author();
-                g.referrers(id).any(|r| {
-                    matches!(r.body(), Body::Relation { from, kind: RelationKind::Supersedes, to, .. }
-                        if from == id
-                            && lines.versions.get(to).is_some_and(|old| old.author == author)
-                            && r.author() == author
-                            && !g.is_retracted(&r.id()))
-                })
+            .filter_map(|(id, kind, why, line)| {
+                let author = g.get(&id).expect("listed by the graph").author();
+                let touches: Vec<ContributionId> = match line {
+                    None => g
+                        .referrers(&id)
+                        .filter_map(|r| match r.body() {
+                            Body::Relation { from, kind: RelationKind::Supersedes, to, .. }
+                                if *from == id
+                                    && lines.versions.get(to).is_some_and(|old| old.author == author)
+                                    && r.author() == author
+                                    && !g.is_retracted(&r.id()) =>
+                            {
+                                Some(*to)
+                            }
+                            _ => None,
+                        })
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect(),
+                    Some(line) => {
+                        // A walk, as the index answers only the questions it was built with; the cheap test
+                        // comes first, so only a decision by someone some version of the line names as an
+                        // integrator pays for one.
+                        let before = |a: &ContributionId| g.is_ancestor(a, &id);
+                        let integrates = lines.chain_versions(&line).any(|v| v.policy.integrators.contains(&author))
+                            && before(&line)
+                            && lines.chain(&line, false, before).is_ok()
+                            && lines
+                                .newest(&line, &before)
+                                .iter()
+                                .any(|v| lines.versions[v].policy.integrators.contains(&author));
+                        if integrates { vec![line] } else { vec![] }
+                    }
+                };
+                let line = *touches.first()?;
+                Some(Unreadable { id, kind, why, line, touches })
             })
             .collect();
         if let Some(pick) = pick {
@@ -348,6 +430,9 @@ impl Lines {
         // 3 whatever it must answer, and so does every descendant (finding e4f57cd207b6). Those rules
         // are judged as before; this only leaves out what they make moot.
         let mut may_qualify: HashSet<ContributionId> = HashSet::new();
+        // Those whose author integrates under the policy in force for them, whatever their parents: only
+        // they bring other lines into a scoped judgement ([`Lines::read_lines`]).
+        let mut integrating: HashSet<ContributionId> = HashSet::new();
         for id in &lines.order {
             let record = &lines.decisions[id];
             let d = &record.decision;
@@ -367,10 +452,17 @@ impl Lines {
                 Some(Err(_)) => false,
                 None => true,
             };
+            if integrates {
+                integrating.insert(*id);
+            }
             if integrates && d.parents.iter().all(|p| may_qualify.contains(p)) {
                 may_qualify.insert(*id);
             }
         }
+        let read = lines.read_lines(&integrating);
+        drop(integrating);
+        lines.undecoded_decisions = HashMap::new();
+        lines.count_unreadable(read);
         let mut obligations = Obligations::new(ix, &lines, &lines.order, may_qualify);
         // What answers settle is asked first, as the windows depend on it. Answers naming the line name
         // the window, so settling then takes two passes: the first leaves them out, and its windows, which
@@ -548,6 +640,77 @@ impl Lines {
         self.proposals = judged;
         self.unjudged_proposals = rest.into_iter().map(|(id, r)| (id, r.proposal)).collect();
         self.scope = Some(scope);
+    }
+
+    /// Every line a scoped judgement reads a policy of, given the decisions whose author integrates their
+    /// line under the policy in force for them: the lines picked and, from each decision on them whose
+    /// author integrates, its line and those of its parents, decoded or not, following the
+    /// parents that are decoded. A decision by anyone else fails rule 2 whatever its parents are, so what
+    /// they are on changes nothing judged here, and a writer who integrates no line judged can't bring
+    /// another line into it (finding c9da29e1ac4b). One whose author does is judged with its parents, under
+    /// their lines' policies, so an unreadable record on those lines counts (finding 5d50422b9e11, G8). An
+    /// undecodable parent brings its line in whoever wrote it: an integrator chose it, and a build that
+    /// reads its version may find its author integrates that line under a version this one can't read
+    /// (finding 0783a2caf192).
+    fn read_lines(&self, integrating: &HashSet<ContributionId>) -> Option<BTreeSet<ContributionId>> {
+        let scope = self.scope.as_ref()?;
+        let mut read = scope.lines.clone();
+        let mut seen: HashSet<ContributionId> = HashSet::new();
+        let mut stack: Vec<ContributionId> =
+            self.order.iter().filter(|id| scope.lines.contains(&self.decisions[*id].decision.line)).copied().collect();
+        while let Some(id) = stack.pop() {
+            let Some(d) = self.decisions.get(&id) else { continue };
+            if !seen.insert(id) || !integrating.contains(&id) {
+                continue;
+            }
+            read.insert(d.decision.line);
+            for p in &d.decision.parents {
+                if let Some(parent) = self.decisions.get(p) {
+                    read.insert(parent.decision.line);
+                    stack.push(*p);
+                } else if let Some(line) = self.undecoded_decisions.get(p) {
+                    read.insert(*line);
+                }
+            }
+        }
+        Some(read)
+    }
+
+    /// Each version of the chains of `starts`, with the first of `starts`, ascending, whose chain holds it.
+    fn chains_of(&self, starts: impl IntoIterator<Item = ContributionId>) -> BTreeMap<ContributionId, ContributionId> {
+        let mut of = BTreeMap::new();
+        for line in starts.into_iter().collect::<BTreeSet<_>>() {
+            let mut stack = vec![line];
+            while let Some(v) = stack.pop() {
+                if self.versions.contains_key(&v) && !of.contains_key(&v) {
+                    of.insert(v, line);
+                    stack.extend(self.successors.get(&v).into_iter().flatten().map(|(_, next)| *next));
+                }
+            }
+        }
+        of
+    }
+
+    /// Every version of `line`'s chain, whatever any record's causal past holds.
+    fn chain_versions(&self, line: &ContributionId) -> impl Iterator<Item = &Version> {
+        self.chains_of([*line]).into_keys().map(|v| &self.versions[&v])
+    }
+
+    /// Keeps the [`Unreadable`] records that touch a chain of `judged`, the lines a scoped build reads, each
+    /// named by the line whose chain that is. With no scope, every line is judged, so all of them count.
+    fn count_unreadable(&mut self, judged: Option<BTreeSet<ContributionId>>) {
+        let scoped = judged.is_some();
+        let starts = judged.unwrap_or_else(|| {
+            self.versions.keys().filter(|id| !self.predecessors.contains_key(id)).copied().collect()
+        });
+        let reach = self.chains_of(starts);
+        self.unreadable.retain_mut(|u| match u.touches.iter().find_map(|t| reach.get(t)) {
+            Some(line) => {
+                u.line = *line;
+                true
+            }
+            None => !scoped,
+        });
     }
 
     /// Judges a decision by rules 2 to 4, given which of the contributions it names are
@@ -866,9 +1029,11 @@ impl Lines {
         &self.ignored
     }
 
-    /// Line artifacts, not retracted, that this build can't decode, in causal order: while there are
-    /// any, a line may be read under an older version of its policy than the one in force.
-    pub fn unreadable_versions(&self) -> &[ContributionId] {
+    /// The records this build can't decode that would change a line it judges, in causal order
+    /// ([`Unreadable`]): while there are any, such a line may be read under an older version of its policy
+    /// than the one in force, or without a decision that qualifies. One on a line this build doesn't judge
+    /// isn't listed, so it stops no command on another line (G8).
+    pub fn unreadable(&self) -> &[Unreadable] {
         &self.unreadable
     }
 

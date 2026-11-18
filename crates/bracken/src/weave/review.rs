@@ -173,6 +173,8 @@ pub(crate) fn green(s: &Store, args: GreenArgs) -> Result<ExitCode> {
     let ix = super::weave_index(s);
     require_marker(&ix)?;
     let lines = super::lines_for(s, &ix, &[args.line.as_deref()]);
+    // A green read under an older policy, or missing a decision, would count results that don't (G8).
+    super::refuse_unreadable(&lines, "weave green")?;
     let line = resolve_line(s, &ix, &lines, args.line.as_deref(), "--line")?;
     let checks = Checks::build(g, &ix, &lines);
     let names = Names::load(s)?;

@@ -50,8 +50,9 @@
 # 26d9361e0a9f; decision d01c83b654d1 (5), narrowing decision 03534914ec55's check once option A of
 # docs/design/weave-marker.md landed): one whose Ground id or replica root isn't the committed pin's
 # (scripts/weave-pin check: no exception here, so until the pin is set, it refuses everything); one with no
-# counted marker; one whose counted marker isn't signed by the pinned root; or where --line main names
-# another line than the default one. Another identity's marker never counts under the root rule, so it is
+# counted marker; one whose counted marker isn't signed by the pinned root; where --line main names
+# another line than the default one; or where a record on a line main's judgement reads doesn't decode
+# with the pinned binary (docs/design/weave-freeze.md G8), as weave head --line main warns. Another identity's marker never counts under the root rule, so it is
 # no reason to refuse: refusing on one would hand every writer a stop. record exits 1, saying to run git's
 # counted run, and check exits 1 with the reason; if any of these reads fails, it refuses the same way.
 #
@@ -119,10 +120,10 @@ fallback() {
 }
 
 # taken_over: sets why and returns 0 if the Weave Ground can't be trusted, or if it can't tell; returns 1 if
-# it reads as honest: the committed pin's Ground and root, a counted marker by that root, and --line main
-# naming the default line.
+# it reads as honest: the committed pin's Ground and root, a counted marker by that root, --line main
+# naming the default line, and no record on the lines main's judgement reads that this binary can't decode.
 taken_over() {
-  local pin root checked marker author default named
+  local pin root checked marker author default named said
   pin=$("$here/weave-pin" check 2>&1) || { why=$(tail -n 1 <<<"$pin"); why=${why#weave-pin: }; return 0; }
   root=${pin#* }
   # weave check exits 1 whenever it lists a problem, so its JSON is read whatever its exit code.
@@ -137,6 +138,16 @@ taken_over() {
   named=$("$weave" weave head --line main --json 2>/dev/null | jq -r '.line // empty' 2>/dev/null) || named=''
   [ "$named" = "$default" ] ||
     { why="--line main names ${named:-no single line}, not the default line ${default:0:12}"; return 0; }
+  # A policy version or decision the pinned binary can't decode would have main judged without it, under an
+  # older policy, so its results can't be counted (docs/design/weave-freeze.md G8). weave head warns of one
+  # on the lines it judges, in words an older binary's Ground-wide warning shares, so this refuses with
+  # either; weave green refuses outright from G8's release on.
+  said=$("$weave" weave head --line main --json 2>&1 >/dev/null) || true
+  if grep -q "don't decode with this build" <<<"$said"; then
+    said=$(grep -m 1 "don't decode with this build" <<<"$said")
+    why="line main's judgement holds a record this binary can't read (${said#bracken: warning: })"
+    return 0
+  fi
   return 1
 }
 

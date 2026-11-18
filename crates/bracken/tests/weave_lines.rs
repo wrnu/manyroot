@@ -1313,6 +1313,408 @@ fn a_line_version_that_doesnt_decode_is_reported_and_integrate_refuses() {
     assert!(String::from_utf8_lossy(&out.stdout).contains(&future), "{}", String::from_utf8_lossy(&out.stdout));
 }
 
+/// A CBOR map of `v` 2 and `fields` (text keys, values already encoded), with fewer and other fields than
+/// version 1's: the shape a newer build might write, which this build can't decode.
+fn v2_payload(fields: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    fn text(s: &str) -> Vec<u8> {
+        let mut out = vec![0x60 | u8::try_from(s.len()).expect("short")];
+        out.extend_from_slice(s.as_bytes());
+        out
+    }
+    let mut out = vec![0xa0 | u8::try_from(fields.len() + 1).expect("few fields")];
+    out.extend(text("v"));
+    out.push(0x02);
+    for (key, value) in fields {
+        out.extend(text(key));
+        out.extend_from_slice(value);
+    }
+    out
+}
+
+/// A contribution id as a CBOR byte string.
+fn id_bytes(hex: &str) -> Vec<u8> {
+    let mut out = vec![0x58, 32];
+    out.extend((0..64).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex")));
+    out
+}
+
+impl Weave {
+    /// An artifact of `media_type` holding `bytes`, signed by `who`: its id.
+    fn artifact(&self, bytes: &[u8], media_type: &str, who: &str) -> String {
+        let file = self.tmp.path().join("payload.cbor");
+        fs::write(&file, bytes).expect("write");
+        let out = self.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", media_type, "--as", who]);
+        out.trim().strip_prefix("artifact ").expect("labelled").to_owned()
+    }
+
+    /// `args` run, and whether its stderr says a record here doesn't decode, with that stderr.
+    fn says_unreadable(&self, args: &[&str]) -> (bool, String) {
+        let out = self.run_on(&self.ground, args);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        (stderr.contains("don't decode with this build"), stderr)
+    }
+
+    /// Every command G8 names refuses on `line`, saying why and writing nothing, and a read warns; each
+    /// names `id`, on `on`, and `why`. For an unreadable decision, `weave line policy` reads only the policy
+    /// chain, so it isn't stopped (finding 9c0ae448ee12).
+    fn refused_on(&self, line: &str, id: &str, on: &str, why: &str) {
+        self.refused(line, id, on, why, false);
+    }
+
+    /// [`Weave::refused_on`] for an unreadable decision.
+    fn refused_on_decision(&self, line: &str, id: &str, on: &str, why: &str) {
+        self.refused(line, id, on, why, true);
+    }
+
+    fn refused(&self, line: &str, id: &str, on: &str, why: &str, decision: bool) {
+        let before = self.contributions();
+        let manifest =
+            self.json(&["weave", "head", "--json"])["heads"][0]["manifest"].as_str().expect("a head").to_owned();
+        let commands: [&[&str]; 6] = [
+            &["weave", "integrate", "--line", line, "--as", AS],
+            &["weave", "green", "--line", line],
+            &["weave", "green", "--line", line, "--manifest", &manifest],
+            &["weave", "validate", "--line", line, "--manifest", &manifest, "--dry-run", "--as", AS],
+            &["weave", "line", "policy", line, "--owner-decision", OD, "--as", AS],
+            &["weave", "line", "merge", "main", "--into", line, "--as", AS],
+        ];
+        for args in commands {
+            if args[1..3] == ["line", "merge"] && line == "main" || decision && args[1..3] == ["line", "policy"] {
+                continue;
+            }
+            let out = self.run_on(&self.ground, args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{args:?} went ahead: {stderr}");
+            for said in ["don't decode with this build", "nothing was done", "upgrade bracken", id, on, why] {
+                assert!(stderr.contains(said), "{args:?} doesn't say {said:?}: {stderr}");
+            }
+        }
+        assert_eq!(self.contributions(), before, "a refused command wrote something");
+        let (warned, stderr) = self.says_unreadable(&["weave", "head", "--line", line, "--json"]);
+        assert!(warned && stderr.contains(id), "head --line {line} doesn't warn: {stderr}");
+        if decision {
+            let args =
+                ["weave", "line", "policy", line, "--integrator", AS, "--owner-decision", OD, "--as", AS, "--dry-run"];
+            // It still warns, as every read of the line does, but goes on.
+            let out = self.run_on(&self.ground, &args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!stderr.contains("nothing was done"), "line policy on {line} is stopped by a decision: {stderr}");
+        }
+    }
+
+    /// No command G8 names refuses on `line` for an unreadable record, and no read of it warns.
+    /// Reads must succeed; the dry runs may fail for their own reasons, but not this one.
+    fn unaffected(&self, line: &str, what: &str) {
+        let manifest =
+            self.json(&["weave", "head", "--json"])["heads"][0]["manifest"].as_str().expect("a head").to_owned();
+        for (args, must_pass) in [
+            (&["weave", "head", "--line", line][..], true),
+            (&["weave", "green", "--line", line], true),
+            (&["weave", "green", "--line", line, "--manifest", &manifest], true),
+            (&["weave", "validate", "--line", line, "--manifest", &manifest, "--dry-run", "--as", AS], false),
+            (
+                &["weave", "line", "policy", line, "--integrator", AS, "--owner-decision", OD, "--as", AS, "--dry-run"],
+                false,
+            ),
+        ] {
+            let out = self.run_on(&self.ground, args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!stderr.contains("don't decode with this build"), "{what}: {args:?} is stopped: {stderr}");
+            assert!(!stderr.contains("Usage:"), "{args:?}: {stderr}");
+            assert!(out.status.success() || !must_pass, "{what}: {args:?} failed: {stderr}");
+        }
+    }
+}
+
+// G8 (docs/design/weave-freeze.md 2.4): a policy version this build can't decode counts only against the line
+// of the counted version it supersedes, and stops every command that judges that line: one that names it,
+// and one whose judgement brings in a decision on it, as a line merge does (keeping finding 5d50422b9e11's
+// fail-open closed). The refusal names the version, whatever v2's fields. Another writer's line can no longer
+// stop main this way.
+#[test]
+fn an_unreadable_policy_version_stops_only_the_lines_that_judge_it() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    w.ok(&["id", "new", "mallory"]);
+    let out = w.ok(&["weave", "line", "create", "evil", "--owner-decision", OD, "--as", "mallory"]);
+    let evil = out.trim().strip_prefix("line ").and_then(|l| l.strip_suffix(" (evil)")).expect("labelled").to_owned();
+    w.ok(&["weave", "line", "merge", "main", "--into", &evil, "--as", "mallory"]);
+    w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
+    w.ok(&["weave", "line", "create", "quiet", "--owner-decision", OD, "--as", AS]);
+    // dev takes evil's decision in, so dev's judgement reads evil's chain.
+    w.ok(&["weave", "line", "merge", &evil, "--into", "dev", "--as", AS]);
+
+    // A version 2 with other fields than version 1's, superseding evil's version in mallory's own relation.
+    let future = w.artifact(&v2_payload(&[("name", vec![0x64, b'e', b'v', b'i', b'l'])]), LINE_MEDIA_TYPE, "mallory");
+    w.ok(&["relate", &future, "supersedes", &evil, "--as", "mallory"]);
+
+    let why = "payload has format version 2; this build reads version 1";
+    w.refused_on(&evil, &future, &evil, why);
+    w.refused_on("dev", &future, &evil, why);
+    w.unaffected("main", "another writer's line");
+    w.unaffected("quiet", "another writer's line");
+    w.commit("a.txt", b"two\n");
+    let d = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves: {d}");
+
+    // weave check lists it, as any payload that doesn't decode.
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&future));
+
+    // Retracted, it counts for nothing.
+    w.ok(&["retract", &future, "--as", "mallory"]);
+    w.unaffected(&evil, "a retracted version");
+    w.unaffected("dev", "a retracted version");
+}
+
+// G8: a decision this build can't decode counts the same way only where it isn't retracted, names a line in a
+// top-level `line` read as generic CBOR, and is by an integrator under the line's policy in force in its past.
+// Otherwise it is ignored, as before, and weave check lists it.
+#[test]
+fn an_unreadable_decision_stops_its_line_only_from_an_integrator() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    let main = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the line").to_owned();
+    w.ok(&["id", "new", "mallory"]);
+    w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
+    let text = vec![0x64, b'n', b'o', b't', b'e'];
+
+    // Ignored: one naming no line, one naming no counted version, and one by someone who doesn't integrate.
+    let ignored = [
+        w.artifact(&v2_payload(&[("note", text.clone())]), DECISION_MEDIA_TYPE, AS),
+        w.artifact(&v2_payload(&[("line", id_bytes(&"ab".repeat(32)))]), DECISION_MEDIA_TYPE, AS),
+        w.artifact(&v2_payload(&[("line", id_bytes(&main))]), DECISION_MEDIA_TYPE, "mallory"),
+    ];
+    w.unaffected("main", "an ignored decision");
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    let checked = String::from_utf8_lossy(&out.stdout);
+    for id in &ignored {
+        assert!(checked.contains(id.as_str()), "weave check doesn't list {id}: {checked}");
+    }
+
+    // By main's integrator, naming main: main's commands refuse. So do dev's, since every command judges the
+    // default line too.
+    let future = w.artifact(&v2_payload(&[("line", id_bytes(&main))]), DECISION_MEDIA_TYPE, AS);
+    w.refused_on_decision("main", &future, &main, "payload has format version 2; this build reads version 1");
+    w.refused_on_decision("dev", &future, &main, "payload has format version 2; this build reads version 1");
+    // Retracted, it is ignored again.
+    w.ok(&["retract", &future, "--as", AS]);
+    w.unaffected("main", "a retracted decision");
+
+    // One on mallory's own line, which she integrates, stops nothing else, until a decision on dev names it
+    // as a parent: dev's judgement then reads evil's line, as it would if the parent decoded.
+    let out = w.ok(&["weave", "line", "create", "evil", "--owner-decision", OD, "--as", "mallory"]);
+    let evil = out.trim().strip_prefix("line ").and_then(|l| l.strip_suffix(" (evil)")).expect("labelled").to_owned();
+    let theirs = w.artifact(&v2_payload(&[("line", id_bytes(&evil))]), DECISION_MEDIA_TYPE, "mallory");
+    w.unaffected("main", "a decision on another writer's line");
+    w.unaffected("dev", "a decision on another writer's line");
+    let dev = w.json(&["weave", "head", "--line", "dev", "--json"])["line"].as_str().expect("the line").to_owned();
+    let manifest = w.json(&["weave", "head", "--json"])["heads"][0]["manifest"].as_str().expect("a head").to_owned();
+    let child = Decision {
+        v: VERSION,
+        line: dev.parse().expect("an id"),
+        manifest: manifest.parse().expect("a hash"),
+        parents: vec![theirs.parse().expect("an id")],
+        proposals: vec![],
+        breakage: vec![],
+        answers: vec![],
+        resolutions: vec![],
+        goals: vec![],
+        source: None,
+        note: "after evil's".into(),
+    };
+    w.artifact(&child.encode(), DECISION_MEDIA_TYPE, AS);
+    w.refused_on_decision("dev", &theirs, &evil, "payload has format version 2; this build reads version 1");
+    w.unaffected("main", "a decision on another writer's line");
+}
+
+impl Weave {
+    /// A version 1 decision on `line`, with `parents`, at the default line's head manifest, signed by `who`.
+    fn decision_on(&self, line: &str, parents: &[&str], who: &str) -> String {
+        let manifest =
+            self.json(&["weave", "head", "--json"])["heads"][0]["manifest"].as_str().expect("a head").to_owned();
+        let d = Decision {
+            v: VERSION,
+            line: line.parse().expect("an id"),
+            manifest: manifest.parse().expect("a hash"),
+            parents: parents.iter().map(|p| p.parse().expect("an id")).collect(),
+            proposals: vec![],
+            breakage: vec![],
+            answers: vec![],
+            resolutions: vec![],
+            goals: vec![],
+            source: None,
+            note: format!("by {who}"),
+        };
+        self.artifact(&d.encode(), DECISION_MEDIA_TYPE, who)
+    }
+}
+
+// Finding c9da29e1ac4b: a decision whose author doesn't integrate its line fails rule 2 whatever its parents
+// are, so it brings no other line into a judgement. Mallory, no integrator of main, writes a decision on main
+// whose parent is an unreadable decision on her own line, or a decoded one on her line whose policy has an
+// unreadable version: main, and so every line, isn't stopped. The same parent named by a decision of main's
+// integrator does bring her line in, and stops main (finding 5d50422b9e11 stays closed).
+#[test]
+fn only_a_decision_by_an_integrator_brings_another_line_into_a_judgement() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    let main = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the line").to_owned();
+    w.ok(&["id", "new", "mallory"]);
+    w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
+    let dev = w.json(&["weave", "head", "--line", "dev", "--json"])["line"].as_str().expect("the line").to_owned();
+    let why = "payload has format version 2; this build reads version 1";
+    let evil_line = |name: &str| {
+        let out = w.ok(&["weave", "line", "create", name, "--owner-decision", OD, "--as", "mallory"]);
+        out.trim().strip_prefix("line ").and_then(|l| l.split(' ').next()).expect("labelled").to_owned()
+    };
+
+    // An unreadable decision on evil, and mallory's decision on main naming it as a parent.
+    let evil = evil_line("evil");
+    let theirs = w.artifact(&v2_payload(&[("line", id_bytes(&evil))]), DECISION_MEDIA_TYPE, "mallory");
+    w.decision_on(&main, &[&theirs], "mallory");
+    w.unaffected("main", "a non-integrator's decision naming an unreadable parent");
+    w.unaffected("dev", "a non-integrator's decision naming an unreadable parent");
+    w.refused_on_decision(&evil, &theirs, &evil, why);
+    w.commit("a.txt", b"two\n");
+    let d = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves: {d}");
+
+    // A decoded decision on bad, whose policy has an unreadable version, named by mallory's decision on main.
+    let bad = evil_line("bad");
+    w.ok(&["weave", "line", "merge", "main", "--into", &bad, "--as", "mallory"]);
+    let on_bad = w.json(&["weave", "head", "--line", &bad, "--json"])["heads"][0]["decision"]
+        .as_str()
+        .expect("a head")
+        .to_owned();
+    let future = w.artifact(&v2_payload(&[("name", vec![0x63, b'b', b'a', b'd'])]), LINE_MEDIA_TYPE, "mallory");
+    w.ok(&["relate", &future, "supersedes", &bad, "--as", "mallory"]);
+    w.decision_on(&main, &[&on_bad], "mallory");
+    w.unaffected("main", "a non-integrator's decision naming a parent on a stopped line");
+    w.unaffected("dev", "a non-integrator's decision naming a parent on a stopped line");
+    w.refused_on(&bad, &future, &bad, why);
+
+    // The same parents named by a decision of dev's integrator: dev's judgement reads both lines, as it
+    // would if they decoded, and refuses; main still moves.
+    w.decision_on(&dev, &[&on_bad], AS);
+    w.refused_on("dev", &future, &bad, why);
+    w.ok(&["retract", &future, "--as", "mallory"]);
+    w.unaffected("dev", "a retracted version");
+    w.decision_on(&dev, &[&theirs], AS);
+    w.refused_on_decision("dev", &theirs, &evil, why);
+    w.unaffected("main", "an integrator's decision on another line");
+}
+
+// Finding 0783a2caf192: an unreadable parent decision brings its line in whoever wrote it, once an integrator's
+// decision names it. Mallory supersedes her line x with a version 2 that, in a build that reads it, may name
+// bob an integrator of x; bob writes a version 2 decision on x, which this build can't tell qualifies. A
+// decision of dev's integrator naming bob's as a parent reads x, so x's unreadable version stops dev. The same
+// parent named by mallory's decision on main, which she doesn't integrate, stops nothing (finding
+// c9da29e1ac4b stays closed).
+#[test]
+fn an_unreadable_parent_brings_its_line_in_whoever_wrote_it() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    let main = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the line").to_owned();
+    w.ok(&["id", "new", "mallory"]);
+    w.ok(&["id", "new", "bob"]);
+    w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
+    let dev = w.json(&["weave", "head", "--line", "dev", "--json"])["line"].as_str().expect("the line").to_owned();
+    let out = w.ok(&["weave", "line", "create", "x", "--owner-decision", OD, "--as", "mallory"]);
+    let x = out.trim().strip_prefix("line ").and_then(|l| l.strip_suffix(" (x)")).expect("labelled").to_owned();
+    let future = w.artifact(&v2_payload(&[("name", vec![0x61, b'x'])]), LINE_MEDIA_TYPE, "mallory");
+    w.ok(&["relate", &future, "supersedes", &x, "--as", "mallory"]);
+    let bobs = w.artifact(&v2_payload(&[("line", id_bytes(&x))]), DECISION_MEDIA_TYPE, "bob");
+    let why = "payload has format version 2; this build reads version 1";
+
+    w.unaffected("dev", "a line no decision on it names");
+    w.decision_on(&main, &[&bobs], "mallory");
+    w.unaffected("main", "a non-integrator's decision naming an unreadable parent");
+    w.unaffected("dev", "a non-integrator's decision naming an unreadable parent");
+
+    w.decision_on(&dev, &[&bobs], AS);
+    w.refused_on("dev", &future, &x, why);
+    w.unaffected("main", "an integrator's decision on another line");
+}
+
+// Finding 9c0ae448ee12: only a decision of a version this build doesn't read counts. A malformed version 1,
+// which no build ever decodes, is ignored and listed by weave check, as before G8, even from an integrator.
+// A version 2 by an integrator stops the line, and its author can still change the line's policy, to remove
+// that integrator: weave line policy reads only the policy chain. The decision's past still names its
+// author as an integrator, so the line stays stopped until bracken reads version 2 (or its author retracts
+// it).
+#[test]
+fn only_a_newer_decision_counts_and_line_policy_still_runs() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    let main = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the line").to_owned();
+    w.ok(&["id", "new", "mallory"]);
+    w.ok(&["weave", "line", "policy", "main", "--integrator", "mallory", "--owner-decision", OD, "--as", AS]);
+
+    // {v: 1, line: main}: no manifest, so no build decodes it.
+    let mut malformed = v2_payload(&[("line", id_bytes(&main))]);
+    malformed[3] = 0x01;
+    let malformed = w.artifact(&malformed, DECISION_MEDIA_TYPE, "mallory");
+    w.unaffected("main", "a malformed version 1 decision");
+    w.commit("a.txt", b"two\n");
+    let d = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves: {d}");
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    let checked = String::from_utf8_lossy(&out.stdout);
+    assert!(checked.contains(malformed.as_str()), "weave check doesn't list {malformed}: {checked}");
+
+    // A version 2 by her stops main, but not line policy, which removes her.
+    let future = w.artifact(&v2_payload(&[("line", id_bytes(&main))]), DECISION_MEDIA_TYPE, "mallory");
+    w.refused_on_decision("main", &future, &main, "payload has format version 2; this build reads version 1");
+    w.ok(&[
+        "weave",
+        "line",
+        "policy",
+        "main",
+        "--clear",
+        "integrators",
+        "--integrator",
+        AS,
+        "--owner-decision",
+        OD,
+        "--as",
+        AS,
+    ]);
+    let (stopped, stderr) = w.says_unreadable(&["weave", "integrate", "--as", AS]);
+    assert!(stopped, "her decision's past still names her: {stderr}");
+    w.ok(&["retract", &future, "--as", "mallory"]);
+    w.unaffected("main", "a retracted decision");
+}
+
+// G8 with G9: a line another writer opens under the name main isn't judged when a command names main, so a
+// record on it that doesn't decode stops nothing there, whether a policy version or a decision by its
+// integrator. Named by its id, that line is judged, and its commands refuse.
+#[test]
+fn an_unreadable_record_on_another_writers_main_stops_only_that_line() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    w.ok(&["id", "new", "mallory"]);
+    let theirs =
+        w.id_of(&["weave", "line", "create", "main", "--owner-decision", OD, "--as", "mallory", "--json"], "line");
+    let why = "payload has format version 2; this build reads version 1";
+
+    let future = w.artifact(&v2_payload(&[("name", vec![0x64, b'm', b'a', b'i', b'n'])]), LINE_MEDIA_TYPE, "mallory");
+    w.ok(&["relate", &future, "supersedes", &theirs, "--as", "mallory"]);
+    w.unaffected("main", "a version on another writer's main");
+    w.refused_on(&theirs, &future, &theirs, why);
+    w.commit("a.txt", b"two\n");
+    let d = w.json(&["weave", "integrate", "--line", "main", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves: {d}");
+    w.ok(&["retract", &future, "--as", "mallory"]);
+
+    let decided = w.artifact(&v2_payload(&[("line", id_bytes(&theirs))]), DECISION_MEDIA_TYPE, "mallory");
+    w.unaffected("main", "a decision on another writer's main");
+    w.refused_on_decision(&theirs, &decided, &theirs, why);
+    w.commit("a.txt", b"three\n");
+    let d = w.json(&["weave", "integrate", "--line", "main", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves: {d}");
+}
+
 /// Gap G9 (docs/design/weave-freeze.md section 2.4): a name reaches only the lines the counted marker's
 /// author opened. Another writer's line named main no longer stops `--line main`, stays reachable by its
 /// id, and `weave line list` and `weave check` mark it.
