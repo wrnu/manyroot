@@ -32,7 +32,7 @@ use bracken_tree::format::{
 };
 use bracken_tree::ground::{Index, kind_of};
 use bracken_tree::import::{self, Source};
-use bracken_tree::lines::{Lines, Unqualified};
+use bracken_tree::lines::{Lines, Unqualified, Version};
 use bracken_tree::merge::{self as files, Conflict, MergeError, Resolutions, Resolved};
 use bracken_tree::{ContentHash, diff, path, secrets};
 use clap::{ArgGroup, Args, Subcommand, ValueEnum};
@@ -47,6 +47,13 @@ use crate::{Names, Output, contribute, decide, print_json, signer, write_stdout}
 
 #[derive(Subcommand)]
 pub(crate) enum LineCommand {
+    /// Every current line, by the id of its first artifact, with its name and author. Marks the default
+    /// line, and each line a name doesn't reach: a name reaches only the lines the counted marker's author
+    /// opened, so anyone else's line is reached by its id only.
+    List {
+        #[command(flatten)]
+        out: Output,
+    },
     /// Create a line: its first policy version, signed by --as, who alone can change it later. With no
     /// --integrator or --goal-setter, the author is the only one.
     Create {
@@ -257,6 +264,54 @@ pub(super) fn require_marker(ix: &Index) -> Result<()> {
 
 pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> Result<ExitCode> {
     match command {
+        LineCommand::List { out } => {
+            let ix = super::weave_index(s);
+            let lines = super::lines_for(s, &ix, &[]);
+            let author = super::marker_author(s, &ix);
+            let names = Names::load(s)?;
+            // How a line is reached: by its name, or by its id only, because the marker's author didn't
+            // open it or opened another line of its name (gap G9).
+            let listed: Vec<(&Version, &str, bool)> = lines
+                .lines()
+                .map(|v| {
+                    let reach = if Some(v.author) != author {
+                        "id_only"
+                    } else if super::by_name(&lines, author.as_ref(), &v.policy.name).nth(1).is_some() {
+                        "name_shared"
+                    } else {
+                        "name"
+                    };
+                    (v, reach, lines.default_line() == Some(v.id))
+                })
+                .collect();
+            if out.json {
+                let rows: Vec<Value> = listed
+                    .iter()
+                    .map(|(v, reach, default)| {
+                        json!({"line": v.id, "name": v.policy.name, "author": v.author.to_string(),
+                               "author_name": names.display(&v.author), "default": default,
+                               "by_name": *reach == "name", "reach": reach})
+                    })
+                    .collect();
+                print_json(&json!({"marker_author": author.map(|a| a.to_string()), "lines": rows}));
+                return Ok(ExitCode::SUCCESS);
+            }
+            for (v, reach, default) in &listed {
+                let name = crate::terminal::printable(&v.policy.name);
+                let by = crate::terminal::printable(&names.display(&v.author));
+                let default = if *default { ", the default line" } else { "" };
+                let reach = match *reach {
+                    "id_only" => ": by id only, as the counted marker's author didn't open it",
+                    "name_shared" => ": by id only, as another line the counted marker's author opened shares its name",
+                    _ => "",
+                };
+                println!("line {} ({name}) by {by}{default}{reach}", v.id);
+            }
+            if listed.is_empty() {
+                println!("no lines");
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         LineCommand::Create { name, policy, dry_run, out } => {
             let ix = super::weave_index(s);
             if !dry_run {
@@ -301,7 +356,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             }
             let lines = super::lines_for(s, &ix, &[Some(&line)]);
             super::refuse_unreadable(&lines, "weave line policy")?;
-            let first = resolve_line(s, &lines, Some(&line), "the line")?;
+            let first = resolve_line(s, &ix, &lines, Some(&line), "the line")?;
             let who = signer(s, agent)?;
             let author = lines.line(&first).expect("resolved").author;
             // Core supersession counts only when the old version's author signs it.
@@ -520,7 +575,7 @@ pub(crate) fn propose(s: &mut Store, agent: Option<&str>, args: ProposeArgs) -> 
         require_marker(&ix)?;
     }
     let lines = super::lines_for(s, &ix, &[line.as_deref(), base.as_deref()]);
-    let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
+    let line = resolve_line(s, &ix, &lines, line.as_deref(), "--line")?;
     let base = match base {
         Some(b) => {
             let id = decision_id(s, &lines, &b, "--base")?;
@@ -698,8 +753,8 @@ fn integrators_of(s: &Store, ix: &Index, lines: &Lines, line: &ContributionId) -
 
 /// `line merge <from> --into <into>`, and resolve's --into and --from.
 fn lines_target(s: &Store, lines: &Lines, ix: &Index, into: &str, from: &str, base: Option<&str>) -> Result<Target> {
-    let into_line = resolve_line(s, lines, Some(into), "--into")?;
-    let from_line = resolve_line(s, lines, Some(from), "the line merged in")?;
+    let into_line = resolve_line(s, ix, lines, Some(into), "--into")?;
+    let from_line = resolve_line(s, ix, lines, Some(from), "the line merged in")?;
     ensure!(into_line != from_line, "a line can't be merged into itself");
     let head = |line: &ContributionId| -> Result<ContributionId> {
         match lines.heads(line).as_slice() {
@@ -801,7 +856,7 @@ fn proposals_target(s: &Store, lines: &Lines, ix: &Index, line: Option<&str>, gi
     }
     let first = ids.first().context("--proposals needs at least one proposal")?;
     let line = match line {
-        Some(l) => resolve_line(s, lines, Some(l), "--line")?,
+        Some(l) => resolve_line(s, ix, lines, Some(l), "--line")?,
         None => lines.proposal(first).expect("checked").proposal.line,
     };
     for id in &ids {

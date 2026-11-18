@@ -873,8 +873,9 @@ fn a_pinned_ground_whose_counted_marker_isnt_the_roots_is_refused() {
 
 /// Finding 26d9361e0a9f, decisions 03534914ec55 and d01c83b654d1 (5): record and check both refuse, failing
 /// closed, a Weave Ground they can't trust: a replica root that isn't the committed pin's, no root, a Ground
-/// that isn't the pinned one, and a second line named main. A forged marker by another identity is no reason
-/// to refuse: under the root rule it never counts, and refusing would hand every writer a stop. An honest
+/// that isn't the pinned one, and a second line named main by the root. A forged marker, or a line named main,
+/// by another identity is no reason to refuse: under the root rule the marker never counts, a name reaches
+/// only the root's lines (gap G9), and refusing would hand every writer a stop. An honest
 /// pointer recorded before stops counting while the Ground can't be trusted.
 #[test]
 fn a_weave_ground_that_may_be_taken_over_is_refused() {
@@ -911,8 +912,14 @@ fn a_weave_ground_that_may_be_taken_over_is_refused() {
         on_ground(&ground, &["weave", "root", "set", &root]);
         assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: honest again");
 
-        // A second line named main, by the forger.
+        // A second line named main, by the forger: the name main doesn't reach it (gap G9), so it's no stop.
         on_ground(&ground, &["weave", "line", "create", "main", "--owner-decision", &"a".repeat(12), "--as", "forger"]);
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: another's main is no stop");
+        // A second line named main by the root's key holder: --line main is ambiguous, so the gate refuses.
+        on_ground(
+            &ground,
+            &["weave", "line", "create", "main", "--owner-decision", &"a".repeat(12), "--as", "weave-integrator"],
+        );
         refused(&b, "--line main names no single line");
 
         // Another Ground altogether: not the one main pins.

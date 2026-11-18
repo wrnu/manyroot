@@ -173,7 +173,7 @@ pub(crate) fn green(s: &Store, args: GreenArgs) -> Result<ExitCode> {
     let ix = super::weave_index(s);
     require_marker(&ix)?;
     let lines = super::lines_for(s, &ix, &[args.line.as_deref()]);
-    let line = resolve_line(s, &lines, args.line.as_deref(), "--line")?;
+    let line = resolve_line(s, &ix, &lines, args.line.as_deref(), "--line")?;
     let checks = Checks::build(g, &ix, &lines);
     let names = Names::load(s)?;
     if let Some(manifest) = &args.manifest {
@@ -353,7 +353,7 @@ pub(crate) fn review(s: &Store, args: ReviewArgs) -> Result<ExitCode> {
         line = lines.proposal_named(&id).expect("a proposal").line;
         proposals = vec![id];
     } else {
-        line = resolve_line(s, &lines, args.line.as_deref(), "--line")?;
+        line = resolve_line(s, &ix, &lines, args.line.as_deref(), "--line")?;
         heads = lines.heads(&line).into_iter().map(|h| (h, reviews.of_decision(&lines, &h))).collect();
         open = lines.open_objections(g, &ix, &line);
         // Open proposals: valid ones on the line whose change no qualifying decision on it lists.

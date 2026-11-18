@@ -406,16 +406,19 @@ fn weave_shadow_records_each_merged_commit_and_verifies_it() {
     assert_eq!(policy["validators"], serde_json::json!([runner["agent"]]), "{policy}");
     assert_eq!(policy["integrators"].as_array().unwrap().len(), 1, "{policy}");
 
-    // Someone else's line named main: it never becomes the default line, and from here on naming main is
-    // ambiguous, so the script mustn't name it.
+    // Someone else's line named main: it never becomes the default line, and the name main doesn't reach
+    // it (gap G9), so naming main still names the default line.
     let weave_ok = |args: &[&str]| {
         let out = command(&dir, "scripts/weave", args).env("HOME", &home).output().unwrap();
         assert!(out.status.success(), "weave {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).unwrap()
     };
     weave_ok(&["id", "new", "mallory"]);
     weave_ok(&["weave", "line", "create", "main", "--owner-decision", &decision, "--as", "mallory"]);
-    let out = command(&dir, "scripts/weave", &["weave", "head", "--line", "main"]).env("HOME", &home).output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stderr).contains("2 lines are named"), "{out:?}");
+    let named: serde_json::Value =
+        serde_json::from_str(&weave_ok(&["weave", "head", "--line", "main", "--json"])).unwrap();
+    let default: serde_json::Value = serde_json::from_str(&weave_ok(&["weave", "head", "--json"])).unwrap();
+    assert_eq!(named["line"], default["line"], "{named} {default}");
     refused(&["--init", "--owner-decision", &approval], "already set up");
 
     // Three successive first-parent commits, oldest first, in a clone sharing this repository's objects:
