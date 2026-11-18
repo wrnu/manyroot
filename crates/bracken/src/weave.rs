@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use bracken_tree::format::{Decision, Guardrails, Line, Manifest, Marker, Record, VERSION};
 use bracken_tree::ground::{Index, Problem, kind_of};
 use bracken_tree::import::{self, Exclusion, Plan, Source};
-use bracken_tree::lines::{DecisionRecord, Lines, Unqualified, Version};
+use bracken_tree::lines::{DecisionRecord, Lines, Unqualified, Unreadable, UnreadableKind, Version};
 use bracken_tree::materialize::materialize;
 use bracken_tree::secrets::KnownKeys;
 use bracken_tree::{ContentHash, Entry, diff};
@@ -904,7 +904,7 @@ pub(crate) fn lines_for(s: &Store, ix: &Index, given: &[Option<&str>]) -> Lines 
 /// how many rule-5 questions it asked, so a test can check what a command pays for a line it doesn't name.
 pub(crate) fn judged_for<'a>(s: &Store, ix: &Index, pick: impl FnOnce(&Lines) -> Vec<ContributionId> + 'a) -> Lines {
     let lines = Lines::build_for(s.graph(), ix, pick);
-    if let Some(said) = unreadable_said(&lines) {
+    if let Some(said) = unreadable_said(lines.unreadable().iter()) {
         eprintln!(
             "bracken: warning: {said}, so a line may be read under an older version of its policy: upgrade bracken (docs/releases.md)"
         );
@@ -919,11 +919,12 @@ pub(crate) fn judged_for<'a>(s: &Store, ix: &Index, pick: impl FnOnce(&Lines) ->
 /// What [`Lines::unreadable`] holds, said once: how many, and the first, with its line and why it doesn't
 /// decode. Both the warning and the refusal keep the words "don't decode with this build", which
 /// scripts/weave-gate matches, as it did an older build's warning.
-fn unreadable_said(lines: &Lines) -> Option<String> {
-    let first = lines.unreadable().first()?;
+fn unreadable_said<'a>(listed: impl Iterator<Item = &'a Unreadable>) -> Option<String> {
+    let listed: Vec<&Unreadable> = listed.collect();
+    let first = listed.first()?;
     Some(format!(
         "{} record(s) on the lines this judges don't decode with this build, such as {} {} on line {} ({})",
-        lines.unreadable().len(),
+        listed.len(),
         first.kind.as_str(),
         first.id,
         first.line,
@@ -935,7 +936,20 @@ fn unreadable_said(lines: &Lines) -> Option<String> {
 /// build: a policy version's predecessor would stand in for it, or a decision would be left out (finding
 /// 5d50422b9e11, docs/design/weave-freeze.md G8).
 pub(crate) fn refuse_unreadable(lines: &Lines, what: &str) -> Result<()> {
-    if let Some(said) = unreadable_said(lines) {
+    refuse_listed(lines.unreadable().iter(), what)
+}
+
+/// [`refuse_unreadable`] for `weave line policy`, which reads only the policy chain: it refuses on an
+/// unreadable policy version, which could leave it superseding the wrong version, but not on a decision,
+/// which changes no policy. So a line's author can still change its policy, to remove an integrator,
+/// say, while a decision of theirs no build here decodes stops the line's other commands (finding
+/// 9c0ae448ee12).
+pub(crate) fn refuse_unreadable_policy(lines: &Lines, what: &str) -> Result<()> {
+    refuse_listed(lines.unreadable().iter().filter(|u| u.kind == UnreadableKind::PolicyVersion), what)
+}
+
+fn refuse_listed<'a>(listed: impl Iterator<Item = &'a Unreadable>, what: &str) -> Result<()> {
+    if let Some(said) = unreadable_said(listed) {
         bail!(
             "{said}, so {what} could act under an older policy than the one in force, or miss a decision; nothing \
              was done: upgrade bracken (docs/releases.md)"

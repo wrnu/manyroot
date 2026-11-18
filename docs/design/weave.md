@@ -1076,12 +1076,14 @@ one whose relation someone else signed, changes no line here, and `weave
 check` alone lists it (finding `e89cf76e9ea2`). Since G8
 ([weave-freeze.md](weave-freeze.md) 2.4), one counts only against the line
 of the version it supersedes, and a decision that doesn't decode counts too
-when it isn't retracted, names a line in a top-level `line` field, and is
-by an integrator under the policy in force there. A command reports one
-only on a line it judges: those it names, the default line, and the line of
-every decision its judgement brings in. There, `weave head`, `review` and
-the other reads warn, and `validate`, `integrate`, `green`, `line policy`
-and `line merge` refuse, doing nothing, naming the record, its line and its
+when its `v` is a version this build doesn't read, it isn't retracted,
+names a line in a top-level `line` field, and is by an integrator under the
+policy in force there. A command reports one only on a line it judges:
+those it names, the default line, and the lines a decision on those brings
+in when its author integrates its line: its parents' lines, and so on. A
+decision by anyone else brings no line in. There, `weave head`, `review`
+and the other reads warn, and `validate`, `integrate`, `green` and `line
+merge` refuse, as `line policy` does for a policy version, doing nothing, naming the record, its line and its
 format version, until the binary is upgraded. `weave check` lists every
 payload that doesn't decode. The definition hash of a check with
 an executor is that of `[name, argv, executor]`, so a result names the

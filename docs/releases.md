@@ -77,12 +77,22 @@ every existing Ground opens and reads as before; what changes is which commands 
 - **Scoped per line.** A policy version that doesn't decode counts only against the line of the counted
   version it supersedes (in a relation its own author signed, as before). `integrate`, `validate`, `line
   policy`, `line merge` and now `weave green` refuse only when a line they judge holds one: the lines they
-  name, the default line, and the line of every decision their judgement brings in, such as another line's
-  decision a line merge took in (keeping finding `5d50422b9e11`'s fail-open closed). Another writer's line
-  no longer stops main. Every command judges the default line, so one on main still stops them all.
-- **Decisions too.** A decision that doesn't decode counts the same way when it isn't retracted, its
-  top-level `line`, read as generic CBOR, names a counted version in its causal past, and its author is an
-  integrator under the policy in force there. Any other is ignored and listed by `weave check`, as before.
+  name, the default line, and the lines a decision on those brings in when its author integrates its line
+  under the policy in force for it: its parents' lines, decoded or not, and so on through parents whose
+  authors integrate theirs, such as another line's decision a line merge took in (keeping finding
+  `5d50422b9e11`'s fail-open closed). A decision by anyone else brings no line in, since it can't qualify
+  whatever its parents are (finding `c9da29e1ac4b`). So a writer who integrates no line a command judges
+  can't stop it: another writer's line no longer stops main, unless main's integrator merges it in. Every
+  command judges the default line, so one on main still stops them all.
+- **Decisions too.** A decision that doesn't decode counts the same way only when its payload's `v`, read
+  as generic CBOR, is a version this build doesn't read (above 1), it isn't retracted, its top-level `line`
+  names a counted version in its causal past, and its author is an integrator under the policy in force
+  there. Any other, a malformed version 1 included, is ignored and listed by `weave check`, as before
+  (finding `9c0ae448ee12`). `line policy` refuses only for a policy version, never for a decision, which
+  changes no policy: so the line's author can still remove an integrator who wrote one. That doesn't lift
+  the stop: the decision is judged under the policy in its own past, which still names its author, so the
+  line's other commands refuse until bracken reads its version or its author retracts it. Any integrator
+  of a line a command judges, main's included, can stop it this way, and removing them doesn't end it.
 - **The refusal names the version.** A payload's `v` is read first as generic CBOR, so a version 2 with
   other fields says `payload has format version 2; this build reads version 1` instead of `not in canonical
   encoding`. `weave check` still prints the decoder's own error.

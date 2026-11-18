@@ -22,7 +22,7 @@ use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
 use crate::ancestry::{self, Ancestry, Stats};
 use crate::format::{
     Change, DECISION_MEDIA_TYPE, Decision, Disposition, FormatError, LINE_MEDIA_TYPE, Line, PROPOSAL_MEDIA_TYPE,
-    Proposal, Record, payload_line, undecodable_why,
+    Proposal, Record, VERSION, payload_line, payload_version, undecodable_why,
 };
 use crate::ground::Index;
 use crate::hash::ContentHash;
@@ -140,9 +140,9 @@ impl UnreadableKind {
 /// (docs/design/weave-freeze.md, G8): a newer build's, such as a version 2. Its line reads as if it weren't
 /// there, so the commands that judge that line say so, and those that act on it refuse. It is either a line
 /// artifact that supersedes a counted version of its own author's, in a relation that author signed, as a
-/// policy change does (finding 5d50422b9e11); or a decision artifact whose top-level `line`, read as generic
-/// CBOR, names a counted version in its causal past, by an integrator under the policy in force there among
-/// the versions this build reads. Any other record that doesn't decode is left to `weave check` (finding
+/// policy change does (finding 5d50422b9e11); or a decision artifact of a version this build doesn't read
+/// whose top-level `line`, read as generic CBOR, names a counted version in its causal past, by an integrator
+/// under the policy in force there among the versions this build reads (finding 9c0ae448ee12). Any other record that doesn't decode is left to `weave check` (finding
 /// e89cf76e9ea2).
 #[derive(Debug, Clone)]
 pub struct Unreadable {
@@ -302,9 +302,12 @@ impl Lines {
                         lines.decisions.insert(*id, DecisionRecord { id: *id, author: c.author(), decision });
                         lines.order.push(*id);
                     }
-                    // One that names no line, or is retracted, would change nothing here, whatever it holds.
+                    // One that names no line, or is retracted, would change nothing here, whatever it holds. Nor
+                    // would one of a version this build reads, a malformed version 1: no build ever decodes it,
+                    // so it is left to `weave check`, as before G8 (finding 9c0ae448ee12).
                     Err(e) => {
-                        if let Some(line) = payload_line(content).filter(|_| !g.is_retracted(id)) {
+                        let newer = payload_version(content).is_some_and(|v| v > VERSION);
+                        if let Some(line) = payload_line(content).filter(|_| newer && !g.is_retracted(id)) {
                             undecoded.push((*id, UnreadableKind::Decision, undecodable_why(content, e), Some(line)));
                         }
                     }
@@ -393,8 +396,9 @@ impl Lines {
                 Some(Unreadable { id, kind, why, line, touches })
             })
             .collect();
-        let judged_lines = pick.map(|pick| lines.restrict(g, ix, pick));
-        lines.count_unreadable(judged_lines);
+        if let Some(pick) = pick {
+            lines.restrict(g, ix, pick);
+        }
         let mut chains = if walking { HashMap::new() } else { lines.ask_chains(g) };
         let missed = Cell::new(0);
         // A chain verdict nothing asked for: a bug, so walk, and count it (answer b2dbc4f5e810).
@@ -419,6 +423,9 @@ impl Lines {
         // 3 whatever it must answer, and so does every descendant (finding e4f57cd207b6). Those rules
         // are judged as before; this only leaves out what they make moot.
         let mut may_qualify: HashSet<ContributionId> = HashSet::new();
+        // Those whose author integrates under the policy in force for them, whatever their parents: only
+        // they bring other lines into a scoped judgement ([`Lines::read_lines`]).
+        let mut integrating: HashSet<ContributionId> = HashSet::new();
         for id in &lines.order {
             let record = &lines.decisions[id];
             let d = &record.decision;
@@ -438,10 +445,16 @@ impl Lines {
                 Some(Err(_)) => false,
                 None => true,
             };
+            if integrates {
+                integrating.insert(*id);
+            }
             if integrates && d.parents.iter().all(|p| may_qualify.contains(p)) {
                 may_qualify.insert(*id);
             }
         }
+        let read = lines.read_lines(&integrating);
+        drop(integrating);
+        lines.count_unreadable(read);
         let mut obligations = Obligations::new(ix, &lines, &lines.order, may_qualify);
         // What answers settle is asked first, as the windows depend on it. Answers naming the line name
         // the window, so settling then takes two passes: the first leaves them out, and its windows, which
@@ -592,11 +605,7 @@ impl Lines {
     /// with the versions of its chain; the decisions on them and every decision those descend from; and
     /// the proposals on them. As nothing is judged yet, the first artifacts are those that supersede no
     /// version, as [`Lines::lines`] and the default line take them.
-    ///
-    /// Returns every line the judgement reads a policy of: those, the line of every decision judged, and
-    /// the line of every [`Unreadable`] decision one of those names as a parent, which would be judged if
-    /// it decoded (G8). An unreadable record on any of them changes what is judged here, so it counts.
-    fn restrict(&mut self, g: &Graph, ix: &Index, pick: Pick<'_>) -> BTreeSet<ContributionId> {
+    fn restrict(&mut self, g: &Graph, ix: &Index, pick: Pick<'_>) {
         self.firsts = self.versions.keys().filter(|id| !self.predecessors.contains_key(id)).copied().collect();
         self.default_line = self.find_default_line(g, ix);
         let mut scope = Scope { lines: pick(self).into_iter().collect(), versions: BTreeSet::new() };
@@ -608,19 +617,13 @@ impl Lines {
             }
         }
         let mut judging: HashSet<ContributionId> = HashSet::new();
-        let mut read = scope.lines.clone();
-        let unreadable: HashMap<ContributionId, ContributionId> =
-            self.unreadable.iter().filter(|u| u.kind == UnreadableKind::Decision).map(|u| (u.id, u.line)).collect();
         let mut stack: Vec<ContributionId> =
             self.decisions.values().filter(|d| scope.lines.contains(&d.decision.line)).map(|d| d.id).collect();
         while let Some(id) = stack.pop() {
             if let Some(d) = self.decisions.get(&id)
                 && judging.insert(id)
             {
-                read.insert(d.decision.line);
                 stack.extend(d.decision.parents.iter().copied());
-            } else if let Some(line) = unreadable.get(&id) {
-                read.insert(*line);
             }
         }
         self.order.retain(|id| judging.contains(id));
@@ -629,7 +632,39 @@ impl Lines {
         self.proposals = judged;
         self.unjudged_proposals = rest.into_iter().map(|(id, r)| (id, r.proposal)).collect();
         self.scope = Some(scope);
-        read
+    }
+
+    /// Every line a scoped judgement reads a policy of, given the decisions whose author integrates their
+    /// line under the policy in force for them: the lines picked and, from each decision on them whose
+    /// author integrates, its line and those of its parents, decoded or [`Unreadable`], following the
+    /// parents that are decoded. A decision by anyone else fails rule 2 whatever its parents are, so what
+    /// they are on changes nothing judged here, and a writer who integrates no line judged can't bring
+    /// another line into it (finding c9da29e1ac4b). One whose author does is judged with its parents, under
+    /// their lines' policies, so an unreadable record on those lines counts (finding 5d50422b9e11, G8).
+    fn read_lines(&self, integrating: &HashSet<ContributionId>) -> Option<BTreeSet<ContributionId>> {
+        let scope = self.scope.as_ref()?;
+        let unreadable: HashMap<ContributionId, ContributionId> =
+            self.unreadable.iter().filter(|u| u.kind == UnreadableKind::Decision).map(|u| (u.id, u.line)).collect();
+        let mut read = scope.lines.clone();
+        let mut seen: HashSet<ContributionId> = HashSet::new();
+        let mut stack: Vec<ContributionId> =
+            self.order.iter().filter(|id| scope.lines.contains(&self.decisions[*id].decision.line)).copied().collect();
+        while let Some(id) = stack.pop() {
+            let Some(d) = self.decisions.get(&id) else { continue };
+            if !seen.insert(id) || !integrating.contains(&id) {
+                continue;
+            }
+            read.insert(d.decision.line);
+            for p in &d.decision.parents {
+                if let Some(parent) = self.decisions.get(p) {
+                    read.insert(parent.decision.line);
+                    stack.push(*p);
+                } else if let Some(line) = unreadable.get(p) {
+                    read.insert(*line);
+                }
+            }
+        }
+        Some(read)
     }
 
     /// Each version of the chains of `starts`, with the first of `starts`, ascending, whose chain holds it.

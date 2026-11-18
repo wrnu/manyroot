@@ -355,7 +355,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
                 require_marker(&ix)?;
             }
             let lines = super::lines_for(s, &ix, &[Some(&line)]);
-            super::refuse_unreadable(&lines, "weave line policy")?;
+            super::refuse_unreadable_policy(&lines, "weave line policy")?;
             let first = resolve_line(s, &ix, &lines, Some(&line), "the line")?;
             let who = signer(s, agent)?;
             let author = lines.line(&first).expect("resolved").author;
