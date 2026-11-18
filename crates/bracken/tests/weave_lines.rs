@@ -1605,6 +1605,38 @@ fn only_a_decision_by_an_integrator_brings_another_line_into_a_judgement() {
     w.unaffected("main", "an integrator's decision on another line");
 }
 
+// Finding 0783a2caf192: an unreadable parent decision brings its line in whoever wrote it, once an integrator's
+// decision names it. Mallory supersedes her line x with a version 2 that, in a build that reads it, may name
+// bob an integrator of x; bob writes a version 2 decision on x, which this build can't tell qualifies. A
+// decision of dev's integrator naming bob's as a parent reads x, so x's unreadable version stops dev. The same
+// parent named by mallory's decision on main, which she doesn't integrate, stops nothing (finding
+// c9da29e1ac4b stays closed).
+#[test]
+fn an_unreadable_parent_brings_its_line_in_whoever_wrote_it() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    let main = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the line").to_owned();
+    w.ok(&["id", "new", "mallory"]);
+    w.ok(&["id", "new", "bob"]);
+    w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
+    let dev = w.json(&["weave", "head", "--line", "dev", "--json"])["line"].as_str().expect("the line").to_owned();
+    let out = w.ok(&["weave", "line", "create", "x", "--owner-decision", OD, "--as", "mallory"]);
+    let x = out.trim().strip_prefix("line ").and_then(|l| l.strip_suffix(" (x)")).expect("labelled").to_owned();
+    let future = w.artifact(&v2_payload(&[("name", vec![0x61, b'x'])]), LINE_MEDIA_TYPE, "mallory");
+    w.ok(&["relate", &future, "supersedes", &x, "--as", "mallory"]);
+    let bobs = w.artifact(&v2_payload(&[("line", id_bytes(&x))]), DECISION_MEDIA_TYPE, "bob");
+    let why = "payload has format version 2; this build reads version 1";
+
+    w.unaffected("dev", "a line no decision on it names");
+    w.decision_on(&main, &[&bobs], "mallory");
+    w.unaffected("main", "a non-integrator's decision naming an unreadable parent");
+    w.unaffected("dev", "a non-integrator's decision naming an unreadable parent");
+
+    w.decision_on(&dev, &[&bobs], AS);
+    w.refused_on("dev", &future, &x, why);
+    w.unaffected("main", "an integrator's decision on another line");
+}
+
 // Finding 9c0ae448ee12: only a decision of a version this build doesn't read counts. A malformed version 1,
 // which no build ever decodes, is ignored and listed by weave check, as before G8, even from an integrator.
 // A version 2 by an integrator stops the line, and its author can still change the line's policy, to remove

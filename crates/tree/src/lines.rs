@@ -209,6 +209,11 @@ pub struct Lines {
     /// order ([`Unreadable`]). Before the build knows which lines it judges, every one that would change
     /// some line.
     unreadable: Vec<Unreadable>,
+    /// The line each undecodable decision names, for every one of a newer version that names a line in a
+    /// top-level field and isn't retracted, whether its author integrates that line or not: what
+    /// [`Lines::read_lines`] follows from a parent an integrator's decision names (finding 0783a2caf192).
+    /// Emptied once the build knows which lines it reads.
+    undecoded_decisions: HashMap<ContributionId, ContributionId>,
     /// What answering the chain questions did.
     stats: Stats,
     /// Every objection, and what rules 5 and 6 read of each decision.
@@ -356,6 +361,8 @@ impl Lines {
         // supersedes a counted version of its own author's, in a relation that author signed. An undecodable
         // decision counts only where its line, in its causal past, has a policy in force among the versions
         // read here under which its author integrates: anywhere else it couldn't qualify (G8).
+        lines.undecoded_decisions =
+            undecoded.iter().filter_map(|(id, _, _, line)| line.map(|line| (*id, line))).collect();
         lines.unreadable = undecoded
             .into_iter()
             .filter_map(|(id, kind, why, line)| {
@@ -454,6 +461,7 @@ impl Lines {
         }
         let read = lines.read_lines(&integrating);
         drop(integrating);
+        lines.undecoded_decisions = HashMap::new();
         lines.count_unreadable(read);
         let mut obligations = Obligations::new(ix, &lines, &lines.order, may_qualify);
         // What answers settle is asked first, as the windows depend on it. Answers naming the line name
@@ -636,15 +644,16 @@ impl Lines {
 
     /// Every line a scoped judgement reads a policy of, given the decisions whose author integrates their
     /// line under the policy in force for them: the lines picked and, from each decision on them whose
-    /// author integrates, its line and those of its parents, decoded or [`Unreadable`], following the
+    /// author integrates, its line and those of its parents, decoded or not, following the
     /// parents that are decoded. A decision by anyone else fails rule 2 whatever its parents are, so what
     /// they are on changes nothing judged here, and a writer who integrates no line judged can't bring
     /// another line into it (finding c9da29e1ac4b). One whose author does is judged with its parents, under
-    /// their lines' policies, so an unreadable record on those lines counts (finding 5d50422b9e11, G8).
+    /// their lines' policies, so an unreadable record on those lines counts (finding 5d50422b9e11, G8). An
+    /// undecodable parent brings its line in whoever wrote it: an integrator chose it, and a build that
+    /// reads its version may find its author integrates that line under a version this one can't read
+    /// (finding 0783a2caf192).
     fn read_lines(&self, integrating: &HashSet<ContributionId>) -> Option<BTreeSet<ContributionId>> {
         let scope = self.scope.as_ref()?;
-        let unreadable: HashMap<ContributionId, ContributionId> =
-            self.unreadable.iter().filter(|u| u.kind == UnreadableKind::Decision).map(|u| (u.id, u.line)).collect();
         let mut read = scope.lines.clone();
         let mut seen: HashSet<ContributionId> = HashSet::new();
         let mut stack: Vec<ContributionId> =
@@ -659,7 +668,7 @@ impl Lines {
                 if let Some(parent) = self.decisions.get(p) {
                     read.insert(parent.decision.line);
                     stack.push(*p);
-                } else if let Some(line) = unreadable.get(p) {
+                } else if let Some(line) = self.undecoded_decisions.get(p) {
                     read.insert(*line);
                 }
             }

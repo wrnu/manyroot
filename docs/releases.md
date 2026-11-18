@@ -80,7 +80,9 @@ every existing Ground opens and reads as before; what changes is which commands 
   name, the default line, and the lines a decision on those brings in when its author integrates its line
   under the policy in force for it: its parents' lines, decoded or not, and so on through parents whose
   authors integrate theirs, such as another line's decision a line merge took in (keeping finding
-  `5d50422b9e11`'s fail-open closed). A decision by anyone else brings no line in, since it can't qualify
+  `5d50422b9e11`'s fail-open closed). A parent that doesn't decode brings its line in whoever wrote it,
+  since a build that reads it may find its author integrates that line under a policy version this one
+  can't read (finding `0783a2caf192`). A decision by anyone else brings no line in, since it can't qualify
   whatever its parents are (finding `c9da29e1ac4b`). So a writer who integrates no line a command judges
   can't stop it: another writer's line no longer stops main, unless main's integrator merges it in. Every
   command judges the default line, so one on main still stops them all.
