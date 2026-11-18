@@ -96,6 +96,32 @@ every existing Ground opens and reads as before; what changes is which commands 
   change, and in any case before a v2 record is written (weave-freeze.md section 3, step 2); never roll
   back below this release once a v2 exists.
 
+### 2026-11-17: a Weave line name reaches only the counted marker's author's lines (task b4a9456b4e88)
+
+Gap G9 of docs/design/weave-freeze.md (section 2.4). A reader change only: no format, encoding, id, golden
+vector or fixture changes, and the same records are valid and count as before. What changes is which line
+a **name** names. `--line <name>`, `--into`, `line policy <name>` and `line merge <name>` now resolve a name
+only among the current lines whose first policy version is by the counted marker's author (the root, since
+option A), the author the default-line rule already uses. Before, a name named every line of that name, so
+any writer could stop `--line main` readers by opening a second line called `main` (2.5, the duplicate
+line name).
+- **What readers see.** A line anyone else opens is reached by its id only, and isn't judged when a
+  command names its name. Two lines of one name by the marker's author still make the name refused as
+  shared. A name only others' lines carry is refused, listing their ids. With no counted marker, no name
+  reaches a line. New: `weave line list [--json]` lists every current line with its author, marking the
+  default line and each line a name doesn't reach (`reach`: `name`, `name_shared` or `id_only`).
+  `weave check` lists a line by anyone else that shares a name with one of the marker's author's lines as
+  `name_by_id_only`, so it exits 1 while one exists.
+- **`scripts/weave-gate`.** Its `taken_over` check is unchanged: it still refuses when `weave head --line
+  main` doesn't name the default line. A second `main` opened by someone else no longer makes that happen,
+  so it's no longer a stop at the gate; a second `main` by the root's key holder still is.
+- **Old and new binaries.** They agree on every Ground where each name is carried by lines of one author,
+  the marker's. A line opened by anyone else is reached by its id only on a newer binary, and by its name
+  too on an older one, which also refuses a name such a line shares with one of the marker's author's. Nothing to migrate:
+  upgrade the pinned binary and `~/bracken-weave`'s. After the upgrade, the manager checks with
+  `scripts/weave weave line list` that every line a script names by name (today only `main`) is marked
+  `name`, and that `scripts/weave weave head --line main` names the same line as `scripts/weave weave head`.
+
 ### 2026-11-11: only the Weave Ground's root's marker counts (task 8ffd4b252d9a)
 
 Option A of docs/design/weave-marker.md (owner decision `d01c83b654d1`), closing the forged-marker

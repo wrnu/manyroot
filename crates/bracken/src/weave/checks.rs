@@ -260,7 +260,7 @@ pub(crate) fn validate(s: &mut Store, agent: Option<&str>, args: ValidateArgs) -
     }
     let lines = super::lines_for(s, &ix, &[line.as_deref()]);
     super::refuse_unreadable(&lines, "validate")?;
-    let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
+    let line = resolve_line(s, &ix, &lines, line.as_deref(), "--line")?;
     let (version, policy) = current_policy(&lines, &line)?;
     let who = crate::signer(s, agent)?;
     if !policy.validators.contains(&who.agent_id()) {

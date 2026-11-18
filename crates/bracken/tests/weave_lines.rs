@@ -1420,18 +1420,18 @@ fn an_unreadable_policy_version_stops_only_the_lines_that_judge_it() {
     w.ok(&["id", "new", "mallory"]);
     let out = w.ok(&["weave", "line", "create", "evil", "--owner-decision", OD, "--as", "mallory"]);
     let evil = out.trim().strip_prefix("line ").and_then(|l| l.strip_suffix(" (evil)")).expect("labelled").to_owned();
-    w.ok(&["weave", "line", "merge", "main", "--into", "evil", "--as", "mallory"]);
+    w.ok(&["weave", "line", "merge", "main", "--into", &evil, "--as", "mallory"]);
     w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
     w.ok(&["weave", "line", "create", "quiet", "--owner-decision", OD, "--as", AS]);
     // dev takes evil's decision in, so dev's judgement reads evil's chain.
-    w.ok(&["weave", "line", "merge", "evil", "--into", "dev", "--as", AS]);
+    w.ok(&["weave", "line", "merge", &evil, "--into", "dev", "--as", AS]);
 
     // A version 2 with other fields than version 1's, superseding evil's version in mallory's own relation.
     let future = w.artifact(&v2_payload(&[("name", vec![0x64, b'e', b'v', b'i', b'l'])]), LINE_MEDIA_TYPE, "mallory");
     w.ok(&["relate", &future, "supersedes", &evil, "--as", "mallory"]);
 
     let why = "payload has format version 2; this build reads version 1";
-    w.refused_on("evil", &future, &evil, why);
+    w.refused_on(&evil, &future, &evil, why);
     w.refused_on("dev", &future, &evil, why);
     w.unaffected("main", "another writer's line");
     w.unaffected("quiet", "another writer's line");
@@ -1445,7 +1445,7 @@ fn an_unreadable_policy_version_stops_only_the_lines_that_judge_it() {
 
     // Retracted, it counts for nothing.
     w.ok(&["retract", &future, "--as", "mallory"]);
-    w.unaffected("evil", "a retracted version");
+    w.unaffected(&evil, "a retracted version");
     w.unaffected("dev", "a retracted version");
 }
 
@@ -1508,4 +1508,155 @@ fn an_unreadable_decision_stops_its_line_only_from_an_integrator() {
     w.artifact(&child.encode(), DECISION_MEDIA_TYPE, AS);
     w.refused_on("dev", &theirs, &evil, "payload has format version 2; this build reads version 1");
     w.unaffected("main", "a decision on another writer's line");
+}
+
+// G8 with G9: a line another writer opens under the name main isn't judged when a command names main, so a
+// record on it that doesn't decode stops nothing there, whether a policy version or a decision by its
+// integrator. Named by its id, that line is judged, and its commands refuse.
+#[test]
+fn an_unreadable_record_on_another_writers_main_stops_only_that_line() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    w.ok(&["id", "new", "mallory"]);
+    let theirs =
+        w.id_of(&["weave", "line", "create", "main", "--owner-decision", OD, "--as", "mallory", "--json"], "line");
+    let why = "payload has format version 2; this build reads version 1";
+
+    let future = w.artifact(&v2_payload(&[("name", vec![0x64, b'm', b'a', b'i', b'n'])]), LINE_MEDIA_TYPE, "mallory");
+    w.ok(&["relate", &future, "supersedes", &theirs, "--as", "mallory"]);
+    w.unaffected("main", "a version on another writer's main");
+    w.refused_on(&theirs, &future, &theirs, why);
+    w.commit("a.txt", b"two\n");
+    let d = w.json(&["weave", "integrate", "--line", "main", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves: {d}");
+    w.ok(&["retract", &future, "--as", "mallory"]);
+
+    let decided = w.artifact(&v2_payload(&[("line", id_bytes(&theirs))]), DECISION_MEDIA_TYPE, "mallory");
+    w.unaffected("main", "a decision on another writer's main");
+    w.refused_on(&theirs, &decided, &theirs, why);
+    w.commit("a.txt", b"three\n");
+    let d = w.json(&["weave", "integrate", "--line", "main", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves: {d}");
+}
+
+/// Gap G9 (docs/design/weave-freeze.md section 2.4): a name reaches only the lines the counted marker's
+/// author opened. Another writer's line named main no longer stops `--line main`, stays reachable by its
+/// id, and `weave line list` and `weave check` mark it.
+#[test]
+fn a_line_name_reaches_only_the_marker_authors_lines() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    let default = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the default line").to_owned();
+    w.ok(&["id", "new", "mallory"]);
+    let theirs =
+        w.id_of(&["weave", "line", "create", "main", "--owner-decision", OD, "--as", "mallory", "--json"], "line");
+    let solo =
+        w.id_of(&["weave", "line", "create", "solo", "--owner-decision", OD, "--as", "mallory", "--json"], "line");
+
+    // --line main still names the default line, for every reader that resolves it.
+    assert_eq!(w.json(&["weave", "head", "--line", "main", "--json"])["line"], default);
+    assert!(w.ok(&["weave", "log", "--line", "main"]).contains("decision "));
+    // The other line is reached by its id.
+    assert_eq!(w.json(&["weave", "head", "--line", &theirs, "--json"])["line"], theirs.as_str());
+    // A name only another writer's line has reaches nothing, and says how to reach it.
+    let err = w.fails(&["weave", "head", "--line", "solo"]);
+    assert!(
+        err.contains("no line the counted marker's author opened is named \"solo\"") && err.contains("by its id"),
+        "{err}"
+    );
+    assert!(w.fails(&["weave", "head", "--line", "nothing"]).contains("no line is named \"nothing\""));
+
+    // weave line list lists every line, marking the default and those a name doesn't reach.
+    let list = w.json(&["weave", "line", "list", "--json"]);
+    let root = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    let root: Value = serde_json::from_slice(&root.stdout).expect("JSON");
+    assert_eq!(list["marker_author"], root["root"], "{list}");
+    let row = |id: &str| -> Value {
+        list["lines"].as_array().expect("lines").iter().find(|r| r["line"] == id).cloned().expect("listed")
+    };
+    assert_eq!((row(&default)["reach"].clone(), row(&default)["default"].clone()), (json!("name"), json!(true)));
+    assert_eq!(row(&default)["by_name"], true);
+    for id in [&theirs, &solo] {
+        let r = row(id);
+        assert_eq!(
+            (r["reach"].clone(), r["by_name"].clone(), r["default"].clone()),
+            (json!("id_only"), json!(false), json!(false)),
+            "{r}"
+        );
+        assert_eq!(r["author_name"], "mallory", "{r}");
+    }
+    let text = w.ok(&["weave", "line", "list"]);
+    assert!(text.contains(&format!("line {default} (main) by {AS}, the default line\n")), "{text}");
+    assert!(
+        text.contains(&format!(
+            "line {theirs} (main) by mallory: by id only, as the counted marker's author didn't open it"
+        )),
+        "{text}"
+    );
+
+    // weave check lists the line that shares a name with the marker author's, and only that one.
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let checked: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    let rows: Vec<&Value> = checked["problems"]
+        .as_array()
+        .expect("problems")
+        .iter()
+        .filter(|p| p["problem"] == "name_by_id_only")
+        .collect();
+    assert_eq!(rows.len(), 1, "{checked}");
+    assert_eq!((rows[0]["id"].as_str(), rows[0]["named"].as_str()), (Some(theirs.as_str()), Some(default.as_str())));
+    let out = w.run_on(&w.ground, &["weave", "check"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains(&format!("line {theirs} (main) isn't by the counted marker's author")), "{text}");
+
+    // Two lines of one name by the marker's author: the name is still refused as shared.
+    let a = w.id_of(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS, "--json"], "line");
+    let b = w.id_of(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS, "--json"], "line");
+    assert!(w.fails(&["weave", "head", "--line", "dev"]).contains("2 lines are named \"dev\""));
+    let list = w.json(&["weave", "line", "list", "--json"]);
+    for id in [&a, &b] {
+        let r = list["lines"]
+            .as_array()
+            .expect("lines")
+            .iter()
+            .find(|r| r["line"] == id.as_str())
+            .cloned()
+            .expect("listed");
+        assert_eq!((r["reach"].clone(), r["by_name"].clone()), (json!("name_shared"), json!(false)), "{r}");
+    }
+    assert!(w.ok(&["weave", "line", "list"]).contains(&format!(
+        "line {a} (dev) by {AS}: by id only, as another line the counted marker's author opened shares its name"
+    )));
+
+    // Without a counted marker (here, with no root), a name reaches no line, and every line is listed as
+    // reached by id only. The default line's first version cites no owner decision, so it no longer
+    // counts, and only the other main is named.
+    fs::remove_file(w.ground.join("weave-root")).expect("remove the root");
+    let err = w.fails(&["weave", "head", "--line", "main"]);
+    assert!(
+        err.contains("no counted marker, so a name reaches no line")
+            && err.contains(&format!("named \"main\" ({})", &theirs[..12])),
+        "{err}"
+    );
+    let list = w.json(&["weave", "line", "list", "--json"]);
+    assert_eq!(list["marker_author"], Value::Null);
+    assert!(
+        list["lines"].as_array().expect("lines").iter().all(|r| r["reach"] == "id_only" && r["default"] == false),
+        "{list}"
+    );
+    // The marker author's main, citing no owner decision, now counts for nothing; the other is still
+    // reached by its id.
+    assert_eq!(w.json(&["weave", "head", "--line", &theirs, "--json"])["line"], theirs.as_str());
+}
+
+/// Gap G9: with no counted marker, the main line weave init wrote cites no owner decision, so it counts
+/// for nothing, and weave line list has no line to list.
+#[test]
+fn weave_line_list_without_a_counted_marker_lists_no_lines() {
+    let w = Weave::new();
+    assert!(w.ok(&["weave", "line", "list"]).contains("the default line"));
+    fs::remove_file(w.ground.join("weave-root")).expect("remove the root");
+    assert_eq!(w.ok(&["weave", "line", "list"]), "no lines\n");
+    assert_eq!(w.json(&["weave", "line", "list", "--json"]), json!({"marker_author": null, "lines": []}));
 }

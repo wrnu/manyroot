@@ -17,7 +17,7 @@ use anyhow::{Context, Result, bail};
 use bracken_tree::format::{Decision, Guardrails, Line, Manifest, Marker, Record, VERSION};
 use bracken_tree::ground::{Index, Problem, kind_of};
 use bracken_tree::import::{self, Exclusion, Plan, Source};
-use bracken_tree::lines::{DecisionRecord, Lines, Unqualified};
+use bracken_tree::lines::{DecisionRecord, Lines, Unqualified, Version};
 use bracken_tree::materialize::materialize;
 use bracken_tree::secrets::KnownKeys;
 use bracken_tree::{ContentHash, Entry, diff};
@@ -106,8 +106,9 @@ pub(crate) enum WeaveCommand {
         out: Output,
     },
     /// List Weave payloads that are invalid or break the ancestor rule, manifests not yet complete,
-    /// markers past the one that counts, and policy versions ignored for citing no owner decision. Exits
-    /// non-zero when it lists any.
+    /// markers past the one that counts, policy versions ignored for citing no owner decision, and lines
+    /// by anyone but the counted marker's author named as one of that author's lines, which their name
+    /// doesn't reach. Exits non-zero when it lists any.
     Check {
         #[command(flatten)]
         out: Output,
@@ -484,7 +485,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
                 (Some(at), _) => decision_manifest(s, &lines, &at, "--at")?,
                 (None, Some(manifest)) => manifest_hash(s, &ix, &manifest, "--manifest")?,
                 (None, None) => {
-                    let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
+                    let line = resolve_line(s, &ix, &lines, line.as_deref(), "--line")?;
                     lines.decision(&single_head(&lines, &line)?).expect("a head is a decision").decision.manifest
                 }
             };
@@ -510,10 +511,23 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             let ix = weave_index(s);
             let mut rows: Vec<Value> = ix.problems().iter().map(problem_json).collect();
             // Which versions count needs no line judged: only the default line is.
-            for id in lines_for(s, &ix, &[]).ignored_versions() {
+            let lines = lines_for(s, &ix, &[]);
+            for id in lines.ignored_versions() {
                 rows.push(json!({
                     "problem": "no_owner_decision", "id": id,
                     "text": format!("policy version {id} cites no owner decision, so it counts for nothing; only the main line weave init writes may"),
+                }));
+            }
+            // A line anyone but the counted marker's author opened under the name of one of theirs: the
+            // name reaches theirs alone (gap G9), so this one is reached by its id only.
+            let author = marker_author(s, &ix);
+            for v in lines.lines().filter(|v| Some(v.author) != author) {
+                let Some(theirs) = by_name(&lines, author.as_ref(), &v.policy.name).next() else { continue };
+                let name = &v.policy.name;
+                rows.push(json!({
+                    "problem": "name_by_id_only", "id": v.id, "name": name, "author": v.author.to_string(),
+                    "named": theirs.id,
+                    "text": format!("line {} ({}) isn't by the counted marker's author, so its name reaches line {} instead; it is reached by its id only", v.id, name, theirs.id),
                 }));
             }
             if out.json {
@@ -537,7 +551,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         WeaveCommand::Head { line, out } => {
             let ix = weave_index(s);
             let lines = lines_for(s, &ix, &[line.as_deref()]);
-            let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
+            let line = resolve_line(s, &ix, &lines, line.as_deref(), "--line")?;
             let name = &lines.line(&line).expect("resolved").policy.name;
             let heads: Vec<(ContributionId, ContentHash)> = lines
                 .heads(&line)
@@ -564,7 +578,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
         WeaveCommand::Log { line, limit, since, out } => {
             let ix = weave_index(s);
             let lines = lines_for(s, &ix, &[line.as_deref(), since.as_deref()]);
-            let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
+            let line = resolve_line(s, &ix, &lines, line.as_deref(), "--line")?;
             let since = since.map(|d| decision_id(s, &lines, &d, "--since")).transpose()?;
             let all = lines.log(s.graph(), &line, since.as_ref());
             let shown = &all[..all.len().min(limit)];
@@ -604,7 +618,7 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
             let at = match at {
                 Some(at) => Some(decision_id(s, &lines, &at, "--at")?),
                 None => {
-                    let line = resolve_line(s, &lines, line.as_deref(), "--line")?;
+                    let line = resolve_line(s, &ix, &lines, line.as_deref(), "--line")?;
                     match lines.heads(&line).as_slice() {
                         [] => None,
                         [one] => Some(*one),
@@ -699,7 +713,7 @@ fn integrate(
     }
     let lines = lines_for(s, &ix, &[line]);
     refuse_unreadable(&lines, "integrate")?;
-    let line = resolve_line(s, &lines, line, "--line")?;
+    let line = resolve_line(s, &ix, &lines, line, "--line")?;
     let who = super::signer(s, agent)?;
     let parents = lines.heads(&line);
     let mut template = Decision {
@@ -862,14 +876,14 @@ fn decision_json(d: &DecisionRecord, names: &super::Names) -> Value {
            "source": r.source.as_ref().map(|s| json!({"git": s.git})), "note": r.note})
 }
 
-/// A line named on the command line, by its id (or a prefix) or its name; the
-/// default line if none is given.
 /// The lines and decisions of the replica, judging only the lines `given` names and the default line
 /// ([`Lines::build_for`], task a4d1a06a1072), so a line the command doesn't name costs it nothing. Each
-/// text names the line it is the id of, every line of that name (so an ambiguous name is refused as
-/// before), or the line of the decision or proposal it is the id of. Anything else names no line; what
-/// the command resolves afterwards, on the Lines returned, is resolved as on a full build.
+/// text names the line it is the id of, every line of that name the counted marker's author opened (so
+/// an ambiguous name is refused as before, and a line of that name anyone else opened isn't judged: gap
+/// G9), or the line of the decision or proposal it is the id of. Anything else names no line; what the
+/// command resolves afterwards, on the Lines returned, is resolved as on a full build.
 pub(crate) fn lines_for(s: &Store, ix: &Index, given: &[Option<&str>]) -> Lines {
+    let author = marker_author(s, ix);
     judged_for(s, ix, |lines| {
         let mut named = Vec::new();
         for given in given.iter().flatten() {
@@ -879,7 +893,7 @@ pub(crate) fn lines_for(s: &Store, ix: &Index, given: &[Option<&str>]) -> Lines 
                     named.extend(lines.decision(&id).map(|d| d.decision.line));
                     named.extend(lines.proposal_named(&id).map(|p| p.line));
                 }
-                Err(_) => named.extend(lines.lines().filter(|v| v.policy.name == *given).map(|v| v.id)),
+                Err(_) => named.extend(by_name(lines, author.as_ref(), given).map(|v| v.id)),
             }
         }
         named
@@ -930,7 +944,23 @@ pub(crate) fn refuse_unreadable(lines: &Lines, what: &str) -> Result<()> {
     Ok(())
 }
 
-fn resolve_line(s: &Store, lines: &Lines, given: Option<&str>, what: &str) -> Result<ContributionId> {
+/// The counted marker's author: the Ground's root, when it has signed a marker that counts. A line name
+/// resolves only among the lines this author opened (gap G9, docs/design/weave-freeze.md section 2.4),
+/// the same author the default-line rule uses.
+fn marker_author(s: &Store, ix: &Index) -> Option<AgentId> {
+    ix.counted_marker().map(|m| s.graph().get(&m).expect("indexed from the graph").author())
+}
+
+/// The current lines named `name` whose first artifact is by `author`, the counted marker's author:
+/// the lines a name reaches. None without a counted marker.
+fn by_name<'a>(lines: &'a Lines, author: Option<&'a AgentId>, name: &'a str) -> impl Iterator<Item = &'a Version> {
+    lines.lines().filter(move |v| v.policy.name == name && Some(&v.author) == author)
+}
+
+/// A line named on the command line, by its id (or a prefix) or its name; the default line if none is
+/// given. A name reaches only the lines the counted marker's author opened (gap G9): a line anyone else
+/// opens, of any name, is reached by its id, so a second `main` doesn't stop `--line main`.
+fn resolve_line(s: &Store, ix: &Index, lines: &Lines, given: Option<&str>, what: &str) -> Result<ContributionId> {
     let Some(given) = given else {
         return lines
             .default_line()
@@ -946,10 +976,28 @@ fn resolve_line(s: &Store, lines: &Lines, given: Option<&str>, what: &str) -> Re
         let c = s.graph().get(&id).expect("resolved ids exist");
         bail!("{what}: {} is a {}, not a line", id.short(), kind_of(c));
     }
-    let named: Vec<ContributionId> = lines.lines().filter(|v| v.policy.name == given).map(|v| v.id).collect();
+    let author = marker_author(s, ix);
+    let named: Vec<ContributionId> = by_name(lines, author.as_ref(), given).map(|v| v.id).collect();
     match named.as_slice() {
         [one] => Ok(*one),
-        [] => bail!("{what}: no line is named {given:?}"),
+        [] => {
+            let others: Vec<String> = lines.lines().filter(|v| v.policy.name == given).map(|v| v.id.short()).collect();
+            match (others.is_empty(), author) {
+                (true, _) => bail!("{what}: no line is named {given:?}"),
+                (false, None) => bail!(
+                    "{what}: this Ground has no counted marker, so a name reaches no line; the {} line(s) named \
+                     {given:?} ({}) are reached by id only",
+                    others.len(),
+                    others.join(", ")
+                ),
+                (false, Some(_)) => bail!(
+                    "{what}: no line the counted marker's author opened is named {given:?}; {} line(s) by others \
+                     are ({}), and a name doesn't reach them: name one by its id",
+                    others.len(),
+                    others.join(", ")
+                ),
+            }
+        }
         many => {
             let ids: Vec<String> = many.iter().map(ContributionId::short).collect();
             bail!("{what}: {} lines are named {given:?} ({}); name one by its id", many.len(), ids.join(", "))
