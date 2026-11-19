@@ -7,10 +7,12 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 
+use bracken_tree::ContentHash;
 use bracken_tree::format::{
-    DECISION_MEDIA_TYPE, FormatError, Guardrails, LINE_MEDIA_TYPE, Line, Marker, Record, VERSION, to_cbor,
+    Breakage, DECISION_MEDIA_TYPE, Decision, FormatError, Guardrails, LINE_MEDIA_TYPE, Line, Marker, Record, VERSION,
+    to_cbor,
 };
-use bracken_tree::ground::Index;
+use bracken_tree::ground::{Index, Problem};
 use bracken_tree::lines::Lines;
 use manyroot::{Body, Contribution, ContributionId, Graph, GroundId, Identity, RelationKind};
 
@@ -100,12 +102,18 @@ impl World {
         id
     }
 
-    /// Lines built from this Ground, and the bytes building them allocated.
+    /// The index and lines built from this Ground, as every command builds them, and the bytes building
+    /// both allocated.
     fn lines(&self) -> (Lines, u64) {
-        let ix = Index::build(&self.g, Some(self.alice.agent_id()));
+        let ((_, lines), cost) = self.built();
+        (lines, cost)
+    }
+
+    fn built(&self) -> ((Index, Lines), u64) {
         let before = allocated();
+        let ix = Index::build(&self.g, Some(self.alice.agent_id()));
         let lines = Lines::build(&self.g, &ix);
-        (lines, allocated() - before)
+        ((ix, lines), allocated() - before)
     }
 }
 
@@ -165,4 +173,86 @@ fn a_crafted_unreadable_policy_version_costs_about_its_own_size_and_still_counts
     );
     let unreadable: Vec<_> = lines.unreadable().iter().map(|u| (u.id, u.line, u.why.clone())).collect();
     assert_eq!(unreadable, vec![(version, w.line, FormatError::Version(2))]);
+}
+
+/// A policy line for `line`'s policy in v1's field types, at version 2, its `protected` padded with `ITEMS`
+/// empty paths: the shape every field of which a typed decode builds (finding 8b99e0d6d326).
+fn typed_line(alice: &Identity) -> Vec<u8> {
+    to_cbor(&Line {
+        v: 2,
+        name: "main".into(),
+        integrators: vec![alice.agent_id()],
+        validators: vec![],
+        goal_setters: vec![],
+        checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
+        guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![String::new(); ITEMS] },
+        owner_decision: Some("decision 0123456789ab".into()),
+    })
+}
+
+/// A decision on `line` in v1's field types, at version 2, with one breakage of `ITEMS` empty paths
+/// (finding 8b99e0d6d326's counterexample).
+fn typed_decision(line: ContributionId) -> Vec<u8> {
+    to_cbor(&Decision {
+        v: 2,
+        line,
+        manifest: ContentHash::of(b""),
+        parents: vec![],
+        proposals: vec![],
+        breakage: vec![Breakage { check: String::new(), detail: String::new(), paths: vec![String::new(); ITEMS] }],
+        answers: vec![],
+        resolutions: vec![],
+        goals: vec![],
+        source: None,
+        note: String::new(),
+    })
+}
+
+/// What `weave check` would list for `id`: its invalid payload's error.
+fn invalid(ix: &Index, id: ContributionId) -> Option<FormatError> {
+    ix.problems().iter().find_map(|p| match p {
+        Problem::InvalidPayload { id: of, error, .. } if *of == id => Some(error.clone()),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_typed_unreadable_decision_costs_about_its_own_size_and_still_counts() {
+    let mut w = World::new();
+    let (_, baseline) = w.built();
+    let payload = typed_decision(w.line);
+    let decision = w.add(&w.alice.clone(), artifact("d", DECISION_MEDIA_TYPE, payload.clone()));
+    let ((ix, lines), cost) = w.built();
+    let extra = cost.saturating_sub(baseline);
+    // A typed decode built a String for each path, over 60 bytes per byte of payload; reading the head
+    // first decodes nothing of a version this build doesn't read.
+    assert!(
+        extra < payload.len() as u64 / 4,
+        "building the index and lines allocated {extra} bytes for a {}-byte payload",
+        payload.len()
+    );
+    let unreadable: Vec<_> = lines.unreadable().iter().map(|u| (u.id, u.line, u.why.clone())).collect();
+    assert_eq!(unreadable, vec![(decision, w.line, FormatError::Version(2))]);
+    assert_eq!(invalid(&ix, decision), Some(FormatError::Version(2)));
+}
+
+#[test]
+fn a_typed_unreadable_policy_version_costs_about_its_own_size_and_still_counts() {
+    let mut w = World::new();
+    let (_, baseline) = w.built();
+    let payload = typed_line(&w.alice);
+    let version = w.add(&w.alice.clone(), artifact("main", LINE_MEDIA_TYPE, payload.clone()));
+    let relation = Body::Relation { from: version, kind: RelationKind::Supersedes, to: w.line, note: String::new() };
+    w.add(&w.alice.clone(), relation);
+    let ((ix, lines), cost) = w.built();
+    let extra = cost.saturating_sub(baseline);
+    assert!(
+        extra < payload.len() as u64 / 4,
+        "building the index and lines allocated {extra} bytes for a {}-byte payload",
+        payload.len()
+    );
+    let unreadable: Vec<_> = lines.unreadable().iter().map(|u| (u.id, u.line, u.why.clone())).collect();
+    assert_eq!(unreadable, vec![(version, w.line, FormatError::Version(2))]);
+    assert_eq!(invalid(&ix, version), Some(FormatError::Version(2)));
 }

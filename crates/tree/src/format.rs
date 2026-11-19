@@ -110,6 +110,33 @@ impl PayloadHead {
     pub fn read(bytes: &[u8]) -> PayloadHead {
         ciborium::from_reader::<Head, _>(bytes).map(|h| h.0).unwrap_or_default()
     }
+
+    /// Whether the payload this is the head of may decode in this build: its `v` is one this build reads.
+    /// Only such a payload is ever valid, as [`Record::validate`] refuses every other version and a valid
+    /// payload's head always reads its `v`. So a reader that asks this before decoding a payload as its
+    /// type changes no record's validity, but pays that decode, which builds every field a payload holds at
+    /// many times its size, only for the version it reads (finding 8b99e0d6d326). A payload of another
+    /// version is refused naming it, whatever its fields (docs/design/weave-freeze.md, section 3).
+    pub fn readable(&self) -> Result<(), FormatError> {
+        match self.version {
+            Some(VERSION) => Ok(()),
+            Some(v) => Err(FormatError::Version(v)),
+            None => Err(FormatError::Malformed("the payload's top-level map holds no format version `v`".into())),
+        }
+    }
+
+    /// [`Record::decode`] of the payload this is the head of, only if it is [`PayloadHead::readable`].
+    pub fn decode<R: Record>(&self, bytes: &[u8]) -> Result<R, FormatError> {
+        self.readable()?;
+        R::decode(bytes)
+    }
+}
+
+/// [`Record::decode`], reading the payload's head first, so a payload of a version this build doesn't read
+/// costs about its own size whatever its fields ([`PayloadHead::readable`]). What any reader that decodes
+/// every Weave record of the Ground, as each command does, decodes them with.
+pub fn decode_bounded<R: Record>(bytes: &[u8]) -> Result<R, FormatError> {
+    PayloadHead::read(bytes).decode(bytes)
 }
 
 /// [`PayloadHead`], as the top-level item; anything but a map is an error, which reads as no head.
@@ -289,17 +316,6 @@ impl<'de> serde::de::Visitor<'de> for ItemVisitor {
 
         let (_, variant): (String, _) = data.variant()?;
         variant.tuple_variant(2, Tagged)
-    }
-}
-
-/// Why a payload doesn't decode, naming its version (its [`PayloadHead`]'s) whatever its fields when that
-/// isn't one this build reads: [`Record::decode`] checks canonical encoding first, so a version 2 with
-/// fields version 1 lacks would otherwise say only that it isn't canonical (docs/design/weave-freeze.md,
-/// section 3).
-pub fn undecodable_why(head: &PayloadHead, error: FormatError) -> FormatError {
-    match head.version {
-        Some(v) if v != VERSION => FormatError::Version(v),
-        _ => error,
     }
 }
 

@@ -19,8 +19,8 @@ use manyroot::{AgentId, Body, Contribution, ContributionId, Graph, RelationKind,
 use crate::ancestry::{Ancestry, Stats};
 use crate::format::{
     DECISION_MEDIA_TYPE, Decision, FILE_MEDIA_TYPE, FormatError, GOAL_TAG, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE,
-    MARKER_MEDIA_TYPE, MEDIA_TYPE_PREFIX, Manifest, Marker, PROPOSAL_MEDIA_TYPE, Proposal, RESOLUTION_MEDIA_TYPE,
-    Record, Resolution,
+    MARKER_MEDIA_TYPE, MEDIA_TYPE_PREFIX, Manifest, Marker, PROPOSAL_MEDIA_TYPE, PayloadHead, Proposal,
+    RESOLUTION_MEDIA_TYPE, Record, Resolution, decode_bounded,
 };
 use crate::hash::ContentHash;
 use crate::merge::Resolutions;
@@ -170,16 +170,17 @@ impl GoalLink {
 }
 
 /// The ContributionIds a record's payload refers to, which must be its causal
-/// ancestors (the ancestor rule).
+/// ancestors (the ancestor rule). Each is decoded only if its head says it is a version this build reads,
+/// so any writer's record costs about its own size here (findings 3832a3c04d2d, 8b99e0d6d326).
 fn references(media_type: &str, content: &[u8]) -> Result<Vec<ContributionId>, FormatError> {
     Ok(match media_type {
-        MARKER_MEDIA_TYPE => Marker::decode(content)?.in_place.into_iter().collect(),
+        MARKER_MEDIA_TYPE => decode_bounded::<Marker>(content)?.in_place.into_iter().collect(),
         LINE_MEDIA_TYPE => {
-            Line::decode(content)?;
+            decode_bounded::<Line>(content)?;
             Vec::new()
         }
         DECISION_MEDIA_TYPE => {
-            let d = Decision::decode(content)?;
+            let d = decode_bounded::<Decision>(content)?;
             let mut refs = vec![d.line];
             refs.extend(d.parents);
             refs.extend(d.proposals);
@@ -189,11 +190,11 @@ fn references(media_type: &str, content: &[u8]) -> Result<Vec<ContributionId>, F
             refs
         }
         PROPOSAL_MEDIA_TYPE => {
-            let p = Proposal::decode(content)?;
+            let p = decode_bounded::<Proposal>(content)?;
             vec![p.line, p.base]
         }
         RESOLUTION_MEDIA_TYPE => {
-            Resolution::decode(content)?;
+            decode_bounded::<Resolution>(content)?;
             Vec::new()
         }
         _ => return Err(FormatError::Malformed(format!("unknown Weave media type {media_type:?}"))),
@@ -263,7 +264,7 @@ impl Index {
                     ids.push(id);
                     continue;
                 }
-                match Manifest::decode_with(content, &mut paths) {
+                match PayloadHead::read(content).readable().and_then(|()| Manifest::decode_with(content, &mut paths)) {
                     Ok(manifest) => {
                         index.manifests.insert(hash, (vec![id], manifest));
                     }

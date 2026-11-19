@@ -22,7 +22,7 @@ use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
 use crate::ancestry::{self, Ancestry, Stats};
 use crate::format::{
     Change, DECISION_MEDIA_TYPE, Decision, Disposition, FormatError, LINE_MEDIA_TYPE, Line, PROPOSAL_MEDIA_TYPE,
-    PayloadHead, Proposal, Record, VERSION, undecodable_why,
+    PayloadHead, Proposal, VERSION, decode_bounded,
 };
 use crate::ground::Index;
 use crate::hash::ContentHash;
@@ -149,7 +149,7 @@ pub struct Unreadable {
     pub id: ContributionId,
     pub kind: UnreadableKind,
     /// Why it doesn't decode: its format version, whatever its fields, when that isn't one this build
-    /// reads ([`crate::format::undecodable_why`]).
+    /// reads ([`crate::format::PayloadHead::readable`]).
     pub why: FormatError,
     /// The line it counts against: the first artifact of a chain this build judges that holds a version it
     /// supersedes, or the line it names.
@@ -286,17 +286,17 @@ impl Lines {
             let c = g.get(id).expect("listed by the graph");
             let Body::Artifact { media_type, content, .. } = c.body() else { continue };
             match media_type.as_str() {
-                LINE_MEDIA_TYPE if !g.is_retracted(id) => match Line::decode(content) {
+                // Each record's head is read first, once, and only a version this build reads is decoded as
+                // its type, so a record of any other version costs about its own size, whatever its fields
+                // (findings 3832a3c04d2d, 8b99e0d6d326).
+                LINE_MEDIA_TYPE if !g.is_retracted(id) => match decode_bounded::<Line>(content) {
                     Ok(policy) => {
                         lines.versions.insert(*id, Version { id: *id, author: c.author(), policy });
                     }
-                    Err(e) => {
-                        let why = undecodable_why(&PayloadHead::read(content), e);
-                        undecoded.push((*id, UnreadableKind::PolicyVersion, why, None))
-                    }
+                    Err(e) => undecoded.push((*id, UnreadableKind::PolicyVersion, e, None)),
                 },
                 PROPOSAL_MEDIA_TYPE => {
-                    if let Ok(proposal) = Proposal::decode(content) {
+                    if let Ok(proposal) = decode_bounded::<Proposal>(content) {
                         if g.is_retracted(id) {
                             lines.retracted_proposals.insert(*id, proposal);
                         } else {
@@ -305,23 +305,24 @@ impl Lines {
                         }
                     }
                 }
-                DECISION_MEDIA_TYPE => match Decision::decode(content) {
-                    Ok(decision) => {
-                        lines.decisions.insert(*id, DecisionRecord { id: *id, author: c.author(), decision });
-                        lines.order.push(*id);
-                    }
-                    // One that names no line, or is retracted, would change nothing here, whatever it holds. Nor
-                    // would one of a version this build reads, a malformed version 1: no build ever decodes it,
-                    // so it is left to `weave check`, as before G8 (finding 9c0ae448ee12).
-                    // The head is read once, without building its other values (finding 3832a3c04d2d).
-                    Err(e) => {
-                        let head = PayloadHead::read(content);
-                        let newer = head.version.is_some_and(|v| v > VERSION);
-                        if let Some(line) = head.line.filter(|_| newer && !g.is_retracted(id)) {
-                            undecoded.push((*id, UnreadableKind::Decision, undecodable_why(&head, e), Some(line)));
+                DECISION_MEDIA_TYPE => {
+                    let head = PayloadHead::read(content);
+                    match head.decode::<Decision>(content) {
+                        Ok(decision) => {
+                            lines.decisions.insert(*id, DecisionRecord { id: *id, author: c.author(), decision });
+                            lines.order.push(*id);
+                        }
+                        // One that names no line, or is retracted, would change nothing here, whatever it holds. Nor
+                        // would one of a version this build reads, a malformed version 1: no build ever decodes it,
+                        // so it is left to `weave check`, as before G8 (finding 9c0ae448ee12).
+                        Err(e) => {
+                            let newer = head.version.is_some_and(|v| v > VERSION);
+                            if let Some(line) = head.line.filter(|_| newer && !g.is_retracted(id)) {
+                                undecoded.push((*id, UnreadableKind::Decision, e, Some(line)));
+                            }
                         }
                     }
-                },
+                }
                 _ => {}
             }
         }
