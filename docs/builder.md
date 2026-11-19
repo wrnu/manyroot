@@ -2,6 +2,14 @@
 
 You are a **builder**: one task, one worktree, one branch, one PR. You build and test, contribute what you learn to the Ground, and report to the manager. The full process is [process.md](../.claude/skills/agent-team-kickoff/process.md), with this repo's values in [development.md](development.md). This page is what you need day to day.
 
+## Setup
+
+Before any check, in every shell you run one from, set `PATH` so cargo, `boat` (for `scripts/test-table --remote`), `gh` and `gtimeout` are found, with rustup's cargo ahead of Homebrew's (decision `49d8003a141d`):
+
+```sh
+export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/opt/homebrew/bin:$PATH"
+```
+
 ## Who you talk to
 
 - **Only the manager**, through `t3_thread_send` to the manager's thread id (it's in your brief and in `scripts/bk log --tag manager`). Messages carry Ground ids, not content.

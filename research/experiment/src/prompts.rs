@@ -38,11 +38,41 @@ pub fn turn_message(turn: u32, turns: u32, name: &str) -> String {
         .replace("{name}", name)
 }
 
+/// The role sentence of the one integrator, after its turn message, when the run's integrator setting names one
+/// agent (task `5b2f7f4a6b7f`); the plan hashes it.
+pub const INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents propose their work and only you \
+     integrate onto main, so review their proposals, integrate what's sound, settle any conflict, and propose and \
+     integrate your own work too.";
+
+/// The role sentence of every other agent then: `{integrator}` is the integrator's name. The plan hashes it.
+pub const BUILDER_ROLE: &str = "{integrator} is the run's one integrator: propose your work, and {integrator} \
+     integrates it onto main; integrate is refused to you.";
+
+/// The sentence telling agent `name` of `agents` its role under the integrator setting `setting`: none for
+/// [`crate::weave_mode::ANY_AGENT`], where every agent integrates.
+pub fn role_message(setting: &str, name: &str, agents: usize) -> Result<Option<String>, String> {
+    Ok(crate::weave_mode::integrator_agent(setting, agents)?.map(|n| {
+        let integrator = format!("agent-{n}");
+        if name == integrator { INTEGRATOR_ROLE.to_string() } else { BUILDER_ROLE.replace("{integrator}", &integrator) }
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mode::mode_named;
     use crate::task::Task;
+
+    #[test]
+    fn one_integrator_and_its_builders_are_each_told_their_role() {
+        assert_eq!(role_message("any-agent", "agent-0", 4), Ok(None));
+        let integrator = role_message("agent-3", "agent-3", 4).expect("a setting").expect("a role");
+        assert_eq!(integrator, INTEGRATOR_ROLE);
+        let builder = role_message("agent-3", "agent-0", 4).expect("a setting").expect("a role");
+        assert!(builder.starts_with("agent-3 is the run's one integrator") && !builder.contains('{'), "{builder}");
+        assert!(role_message("agent-4", "agent-0", 4).is_err(), "no agent-4 in a run of 4");
+        assert!(role_message("someone", "agent-0", 4).is_err());
+    }
 
     #[test]
     fn every_mode_has_its_own_prompt() {

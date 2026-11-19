@@ -35,6 +35,19 @@ pub(crate) fn run(dir: &Path, program: &str, args: &[&str]) -> Output {
     command(dir, program, args).output().unwrap()
 }
 
+/// Runs git in `dir` and asserts it succeeded, failing with the command, its exit status, stdout and
+/// stderr otherwise, so a rare failure shows its cause (note 75b978139731).
+pub(crate) fn git_ok(dir: &Path, args: &[&str]) {
+    let out = run(dir, "git", args);
+    assert!(
+        out.status.success(),
+        "git {args:?} in {dir:?} failed ({}):\nstdout: {}\nstderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Writes an executable through a child `sh`, so this test process never holds it open for writing. A
 /// parallel test's fork would inherit such a descriptor until its exec, and running the file meanwhile
 /// fails with ETXTBSY, "Text file busy" (task aa2ac61f8dd4).
@@ -103,7 +116,7 @@ pub(crate) fn repo(
         &["add", "-A"],
         &["commit", "-qm", "scripts"],
     ] {
-        assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
+        git_ok(&dir, args);
     }
     (tmp, dir)
 }
@@ -157,8 +170,8 @@ pub(crate) fn put(dir: &Path, path: &str, text: &str) {
 
 /// Commits everything in `dir` as `message`.
 pub(crate) fn commit_all(dir: &Path, message: &str) {
-    assert!(run(dir, "git", &["add", "-A"]).status.success());
-    assert!(run(dir, "git", &["commit", "-qm", message]).status.success());
+    git_ok(dir, &["add", "-A"]);
+    git_ok(dir, &["commit", "-qm", message]);
 }
 
 /// Writes an artifact with `media_type` into `dir`'s Ground with the real binary, past scripts/bk's
@@ -253,7 +266,7 @@ impl Batch {
             }
             on_main(dir);
         });
-        let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
+        let git = |args: &[&str]| git_ok(&dir, args);
         bk(&dir, &["init", "--name", "batch"]);
         for who in ["builder", "val", "manager"] {
             bk(&dir, &["id", "new", who]);
@@ -449,7 +462,7 @@ impl Batch {
     pub(crate) fn main_moves(&self, path: &str) {
         put(&self.dir, path, "main moved\n");
         commit_all(&self.dir, "main moves");
-        assert!(run(&self.dir, "git", &["push", "-q", self.forge.to_str().unwrap(), "main"]).status.success());
+        git_ok(&self.dir, &["push", "-q", self.forge.to_str().unwrap(), "main"]);
     }
 }
 

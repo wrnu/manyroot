@@ -59,11 +59,15 @@ Agents are different:
 | Integration   | Periodic                        | Continuous                                        |
 | Validation    | CI and code review              | Continuous evidence, evaluated by policy          |
 
-Early observations of agent teams point the same way. Agents that open many
-PRs often see few of them merged. Teams that avoid shared files merge more
-but collaborate less. Both the agents' coordination ability and the
-structure of their environment matter, and the environment is the part we
-can design.
+Early observations of agent teams point the same way. In Anthropic's swarms
+of 10 to 80 agents building one codebase, agents opened many PRs and saw few
+of them merged, and the merge fraction fell as swarms grew. Models that
+merged well mostly did it by keeping to their own files, working together
+hardly at all ([Patterns and problems in emerging multiagent
+systems](https://www.anthropic.com/research/multiagent-systems), Anthropic
+Frontier Red Team, 13 August 2026). Both the agents' coordination ability
+and the structure of their environment matter, and the environment is the
+part we can design.
 
 Git still has a place at the boundary, producing stable releases for humans.
 It just stops being the medium through which agents think together.
@@ -276,18 +280,33 @@ These are established building blocks:
 - **Event sourcing**: immutable events as the source of truth, with state
   derived from them.
 
-The original brainstorm also cited the leads below. **None has been checked
-yet**, so verify each one before relying on it:
+Research on the problems this vision takes on, each source checked on 19
+November 2026:
 
-- Anthropic research (August 2026) on patterns and problems in emerging
-  multi-agent systems: merge rates, correlated behaviour, premature
-  consensus.
-- "Client-Driven Offline-First RDF 1.2 using OR-Sets" (ICWE 2026): CRDT
-  sync of RDF knowledge graphs edited concurrently by agents.
-- Inria research on semantic conflicts in CRDT-based knowledge graphs.
-- Martin Kleppmann's Centre for Cryptographic Trust Infrastructure: secure
-  coordination between autonomous agents.
-- A multi-agent replication survey comparing jj, Pijul and CRDTs.
+- **Anthropic, [Patterns and problems in emerging multiagent
+  systems](https://www.anthropic.com/research/multiagent-systems)** (Frontier
+  Red Team, 13 August 2026): agent swarms on a shared codebase, where merge
+  rates fall with swarm size; agents' low variance, so they choose alike and
+  one failure becomes systemic; and groups that reach premature consensus on
+  hidden-profile tasks, missing facts only one member holds.
+- **De Smet and Taelman, [Client-Driven Offline-First RDF 1.2 using
+  OR-Sets](https://doi.org/10.1007/978-3-032-29372-5_37)** (ICWE 2026, demo):
+  a state-based OR-Set over RDF 1.2 triple terms, so agents writing one RDF
+  knowledge graph concurrently converge with no extra infrastructure, its
+  bookkeeping kept in the one dataset. Constraint-aware merging is their
+  future work.
+- **Ibáñez, Skaf-Molli, Molli and Corby, [Live linked data: synchronising
+  semantic stores with commutative replicated data
+  types](https://doi.org/10.1504/IJMSO.2013.056605)** (IJMSO 8(2), 2013;
+  University of Nantes and Inria): SU-Set, a CRDT for RDF graphs updated with
+  SPARQL Update. It makes replicas converge on the same triples; it doesn't
+  detect semantic conflicts, which stay an open problem (see Hard problems).
+- **The [Centre for Cryptographic Trust
+  Infrastructure](https://martin.kleppmann.com/2026/10/07/centre-for-cryptographic-trust-infrastructure.html)**
+  (Martin Kleppmann and partners, announced 7 October 2026, funded by ARIA's
+  Scaling Trust programme): cryptographic protocols, such as zero-knowledge
+  proofs, so that mutually untrusting agents can prove facts to each other
+  without revealing private data.
 
 The likely novelty isn't any single piece. It's the combination: convergent
 data structures, agent-native semantic contributions, continuous discovery,

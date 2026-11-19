@@ -55,6 +55,8 @@ pub struct MockBackend {
     pub moves: Moves,
     /// Play agent-turns one at a time ([`Backend::lockstep`]), so a run is the same every time.
     pub lockstep: bool,
+    /// A project run's one integrator, if its integrator setting names one: the others only propose.
+    pub integrator: Option<usize>,
 }
 
 impl Default for MockBackend {
@@ -67,6 +69,7 @@ impl Default for MockBackend {
             usage: None,
             moves: Moves::RUN,
             lockstep: false,
+            integrator: None,
         }
     }
 }
@@ -314,7 +317,7 @@ impl MockBackend {
         let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
         if has("propose") {
-            return weave_turn(c, agent, turn);
+            return weave_turn(c, agent, turn, self.integrator);
         }
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
         if has("replace") && !has("pr_open") {
@@ -441,8 +444,9 @@ impl MockBackend {
     }
 }
 
-/// One Weave-mode turn of a project run (see the module's doc).
-fn weave_turn(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
+/// One Weave-mode turn of a project run (see the module's doc). With one `integrator`, any other agent only
+/// proposes, and the integrator integrates every open proposal, its own with them.
+fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>) -> Result<(), String> {
     let task = c.tool("task", json!({}))?;
     if task["spec"].as_str().is_none_or(str::is_empty) {
         return Err("the task tool showed no spec".into());
@@ -497,9 +501,25 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
     c.tool("run_tests", json!({}))?;
     let proposed = c.tool("propose", json!({"summary": format!("agent {agent}'s module of turn {turn}")}))?;
     let proposal = proposed["proposal"].as_str().ok_or("propose gave no proposal")?.to_string();
+    if integrator.is_some_and(|n| n != agent) {
+        c.tool("notes_write", json!({"text": format!("turn {turn}: proposed {module}")}))?;
+        c.tool("sync", json!({}))?;
+        return Ok(());
+    }
+    // The integrator takes every open proposal, at most the 8 one call may name, its own first.
+    let mut proposals = vec![proposal];
+    if integrator.is_some() {
+        let open = c.tool("proposals", json!({}))?;
+        let ids = open["proposals"].as_array().into_iter().flatten().filter_map(|p| p["proposal"].as_str());
+        for id in ids {
+            if proposals.len() < crate::args::MAX_TAGS && !proposals.iter().any(|p| p == id) {
+                proposals.push(id.to_string());
+            }
+        }
+    }
     // Refused if the line forked under it: the proposal stays open, for later. Any other failure is the turn's,
     // so it names its real step (task 61c34b3c2704).
-    match c.tool("integrate", json!({"proposals": [proposal], "note": format!("agent {agent}'s turn {turn}")})) {
+    match c.tool("integrate", json!({"proposals": proposals, "note": format!("agent {agent}'s turn {turn}")})) {
         Ok(_) => {
             c.tool("update", json!({}))?;
         }
