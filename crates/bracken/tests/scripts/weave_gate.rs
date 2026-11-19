@@ -9,7 +9,8 @@ use crate::support::*;
 /// `blake3:` and the sha-256 of git's tree id, so `verify` compares trees. `green --manifest` reads the
 /// results `validate` wrote, one '<check> <pass|fail> <result>' line each; `$T/weave/fail-<check>` makes
 /// that check fail, `no-<check>` leaves it out of the policy, `unrecorded-<check>` makes validate stop
-/// there, recording nothing for it, as the real one does for a check that can't run, and `extra` lists
+/// there, recording nothing for it, as the real one does for a check that can't run, `slow-<command>` makes
+/// that read hang (show, or the weave subcommand: head, green, verify), and `extra` lists
 /// more policy checks; `show` knows the ids in `proposals`. The reads weave-gate's takeover check makes
 /// (`id list`, `weave check`, `weave head`, and `show` of anything but a proposal) go to the real bracken,
 /// on the throwaway Weave Ground at `$T/weave/ground` that [`weave_ground`] builds, except that
@@ -22,6 +23,9 @@ mkdir -p "$W"
 as=''
 if [ "$1" = --as ]; then as=$2; shift 2; fi
 echo "${as:-none} $*" >>"$W/calls"
+# $T/weave/slow-<command> (show, or weave's subcommand: head, green, verify...) makes that read hang.
+k=$1; [ "$1" != weave ] || k=$2
+[ ! -e "$W/slow-$k" ] || sleep 60
 hash_of() { echo "blake3:$(git -C "$1" rev-parse "$2^{tree}" | shasum -a 256 | cut -c1-64)"; }
 opt() { local want=$1; shift; while [ $# -gt 0 ]; do [ "$1" != "$want" ] || { echo "$2"; return; }; shift; done; }
 if [ "$1" = show ] && grep -qxF "$2" "$W/proposals" 2>/dev/null; then exit 0; fi
@@ -453,9 +457,12 @@ fn a_check_validate_recorded_nothing_for_says_so_and_why() {
         // Every tool there: it says so, and still that nothing was recorded.
         let tools = b.tmp.path().join("tools");
         std::fs::create_dir_all(&tools).unwrap();
-        for t in ["cargo", "cargo-nextest", "boat", "timeout"] {
+        for t in ["cargo", "cargo-nextest", "boat"] {
             write_executable(&tools.join(t), "#!/bin/sh\nexit 0\n");
         }
+        // weave-gate runs its Weave reads under timeout, so this one runs what it's given, as the real one
+        // does within its bound.
+        write_executable(&tools.join("timeout"), "#!/bin/sh\n[ \"$1\" != -k ] || shift 2\nshift\nexec \"$@\"\n");
         let said = record(&format!("{}:{lacking}", tools.display()));
         assert!(said.contains("nothing was recorded for check table"), "{scripts}: {said}");
         assert!(said.contains("every tool the checks need is on PATH"), "{scripts}: {said}");
@@ -982,5 +989,155 @@ fn a_record_main_judges_that_doesnt_decode_is_refused() {
         // Retracted, it counts for nothing, and the gate reads the Ground again.
         on_ground(&ground, &["retract", &future, "--as", "weave-integrator"]);
         assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: honest again");
+    }
+}
+
+/// Finding 81648e74e519: weave import leaves out of the manifest every root entry whose name folds to start
+/// with .bracken (but the Ground's own .bracken/) and every submodule, and weave verify doesn't compare
+/// them, so a manifest verifies equal to a merge that holds more. Record falls back to git's counted run
+/// for a head adding .Bracken-x/hook.sh (another case), a gitlink, or a root file .brackenrc; and check
+/// refuses a pointer recorded on such a merge anyway (here by a copy of weave-gate without the fallback).
+#[test]
+fn a_merge_holding_what_weave_leaves_out_takes_gits_counted_run() {
+    for scripts in SCRIPTS {
+        let b = fixture(scripts, &|dir, n| match n {
+            1 => put(dir, ".Bracken-x/hook.sh", "echo hooked\n"),
+            2 => {
+                std::fs::create_dir_all(dir.join("vendor/sub")).unwrap();
+                let head = String::from_utf8(run(dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap();
+                let entry = format!("160000,{},vendor/sub", head.trim());
+                let out = run(dir, "git", &["update-index", "--add", "--cacheinfo", &entry]);
+                assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            }
+            _ => put(dir, ".brackenrc", "hook=1\n"),
+        });
+        b.gate("Weave gate: on");
+        let whys = ["the root entry .Bracken-x", "a submodule at vendor/sub", "the root entry .brackenrc"];
+        let claims: Vec<String> = (1..=3).map(|n| b.with_proposal(n)).collect();
+        for (n, why) in (1..=3).zip(whys) {
+            let tree = run(&b.dir, "git", &["ls-tree", "-r", &b.shas[n - 1]]);
+            assert!(text(&tree).contains(if n == 2 { "160000 commit" } else { ".bracken" }), "{scripts}: {n}");
+            let out = b.record(&claims[n - 1], n);
+            let t = text(&out);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: #{n}: {t}");
+            assert!(t.contains(why) && t.contains("run git's counted run"), "{scripts}: #{n}: {t}");
+            assert!(b.pointers(&claims[n - 1]).is_empty(), "{scripts}: #{n}: a pointer was recorded");
+        }
+
+        // A pointer recorded without the fallback, as weave-gate did before it: check refuses it.
+        let gate = std::fs::read_to_string(b.dir.join("scripts/weave-gate")).unwrap();
+        let unchecked = gate.replace("unimported() {\n", "unimported() {\n  return 1\n");
+        assert_ne!(gate, unchecked, "{scripts}");
+        write_executable(&b.dir.join("scripts/weave-gate-unchecked"), &unchecked);
+        for (n, why) in (1..=2).zip(whys) {
+            let pair = format!("{}:{}", &claims[n - 1][..12], b.shas[n - 1]);
+            let out = b.command("scripts/weave-gate-unchecked", &["record", &pair]).output().unwrap();
+            assert!(out.status.success(), "{scripts}: #{n}: {}", text(&out));
+            assert_eq!(b.pointers(&claims[n - 1]).len(), 1, "{scripts}: #{n}");
+            let out = b.merge_one(n, &claims[n - 1], true);
+            let scope = check_line(&out, "scope");
+            assert!(!out.status.success() && scope.starts_with("FAIL"), "{scripts}: #{n}: {}", text(&out));
+            assert!(scope.contains(why), "{scripts}: #{n}: {scope}");
+        }
+    }
+}
+
+/// Finding 20a7646f3579: anyone can relate a claim of theirs 'supersedes' the manager's weave-gate claim,
+/// and only they can retract that. Such a supersede doesn't turn the gate off; it's named on stderr. One by
+/// the owner, or by the manager, does.
+#[test]
+fn only_the_manager_or_the_owner_can_supersede_the_weave_gate_claim() {
+    for scripts in SCRIPTS {
+        let b = fixture(scripts, &|_, _| {});
+        let on = b.gate("Weave gate: on");
+        bk(&b.dir, &["id", "new", "hostile"]);
+        bk(&b.dir, &["id", "new", "owner"]);
+        let x = bk(&b.dir, &["claim", "Weave gate: off", "--tag", "note", "--as", "hostile"]);
+        let x = x.lines().next().unwrap();
+        bk(&b.dir, &["relate", x, "supersedes", &on, "--as", "hostile"]);
+        let out = b.state();
+        let t = text(&out);
+        assert!(out.status.success() && t.contains(&format!("on {}", &on[..12])), "{scripts}: {t}");
+        assert!(t.contains(&format!("ignored a supersede of weave-gate claim {} by hostile", &on[..12])), "{t}");
+
+        let y = bk(&b.dir, &["claim", "Gate off (owner)", "--tag", "note", "--as", "owner"]);
+        bk(&b.dir, &["relate", y.lines().next().unwrap(), "supersedes", &on, "--as", "owner"]);
+        let out = b.state();
+        assert!(
+            !out.status.success() && text(&out).contains("off: no current manager claim"),
+            "{scripts}: {}",
+            text(&out)
+        );
+    }
+}
+
+/// Report 0b5600268856 (part C, (5)): a Weave read that hangs runs out after WEAVE_GATE_TIMEOUT seconds,
+/// and record and check fail closed, naming it, rather than hang scripts/merge. Here weave green hangs, and
+/// then weave head: the read the G8 warning comes from, which alone would otherwise read as no warning.
+/// With neither timeout nor gtimeout on PATH, neither runs.
+#[test]
+fn a_weave_read_that_hangs_times_out_and_fails_closed() {
+    for scripts in SCRIPTS {
+        let (b, claim, _, _, _) = honest_pointer(scripts);
+        let w = b.weave_dir();
+        let pair = format!("{}:{}", &claim[..12], b.shas[0]);
+        for read in ["green", "head"] {
+            std::fs::write(w.join(format!("slow-{read}")), "").unwrap();
+            let started = std::time::Instant::now();
+            let out =
+                b.command("scripts/weave-gate", &["record", &pair]).env("WEAVE_GATE_TIMEOUT", "2").output().unwrap();
+            let t = text(&out);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {read}: {t}");
+            assert!(
+                t.contains(&format!("weave {read} timed out after 2s")) && t.contains("run git's counted run"),
+                "{scripts}: {t}"
+            );
+            assert_eq!(b.pointers(&claim).len(), 1, "{scripts}: {read}: a pointer was recorded");
+            let args =
+                ["1", claim.as_str(), "--validator", "manager", "--min-passes", "1", "--as", "manager", "--dry-run"];
+            let out = b.command("scripts/merge", &args).env("WEAVE_GATE_TIMEOUT", "2").output().unwrap();
+            let scope = check_line(&out, "scope");
+            assert!(!out.status.success() && scope.starts_with("FAIL"), "{scripts}: {read}: {}", text(&out));
+            assert!(text(&out).contains(&format!("weave {read} timed out after")), "{scripts}: {read}: {}", text(&out));
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(55),
+                "{scripts}: {read}: it waited out the hang"
+            );
+            std::fs::remove_file(w.join(format!("slow-{read}"))).unwrap();
+        }
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: the pointer counts again");
+
+        // A PATH holding every tool but timeout and gtimeout.
+        let tools = b.tmp.path().join("no-timeout");
+        std::fs::create_dir_all(&tools).unwrap();
+        for d in std::env::split_paths(&std::env::var_os("PATH").unwrap()) {
+            for e in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+                let name = e.file_name();
+                let to = tools.join(&name);
+                if name != "timeout" && name != "gtimeout" && !to.exists() && std::fs::symlink_metadata(&to).is_err() {
+                    std::os::unix::fs::symlink(e.path(), to).unwrap();
+                }
+            }
+        }
+        let path = format!("{}:{}", b.tmp.path().join("stubs").display(), tools.display());
+        let out = b.command("scripts/weave-gate", &["record", &pair]).env("PATH", &path).output().unwrap();
+        let t = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {t}");
+        assert!(t.contains("neither timeout nor gtimeout is on PATH") && t.contains("run git's counted run"), "{t}");
+        let (m, key, manifest, e) = {
+            let shown: serde_json::Value = serde_json::from_str(&bk(&b.dir, &["show", &claim, "--json"])).unwrap();
+            let p = shown["referrers"].as_array().unwrap().iter().find(|r| {
+                r["kind"] == "evidence"
+                    && r["body"]["method"].as_str().unwrap().starts_with("scripts/test-table --weave")
+            });
+            let p = p.unwrap();
+            let method: Vec<&str> = p["body"]["method"].as_str().unwrap().split(' ').collect();
+            (method[5].to_owned(), method[7].to_owned(), method[9].to_owned(), p["id"].as_str().unwrap().to_owned())
+        };
+        let tip = b.forge_main();
+        let args = ["check", claim.as_str(), &b.shas[0], &m, &key, &manifest, &e, &tip];
+        let out = b.command("scripts/weave-gate", &args).env("PATH", &path).output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("neither timeout nor gtimeout is on PATH"), "{scripts}: {}", text(&out));
     }
 }

@@ -1196,3 +1196,62 @@ fn merge_refuses_a_pr_whose_github_head_state_or_base_isnt_the_claims() {
         }
     }
 }
+
+/// Finding 20a7646f3579: anyone can relate a claim of theirs 'supersedes' the pr claim, an owner-review or
+/// the owner's approval, and only they can retract it. merge ignores such a supersede, naming it on a
+/// 'note  ignored' line, and still counts the claim; one by the manager (a takeover, finding 29a53011dacb)
+/// or the owner still stops it counting.
+#[test]
+fn merge_counts_another_writers_supersede_only_from_manager_or_owner() {
+    for scripts in SCRIPTS {
+        let change = |dir: &Path| put(dir, "crates/tree/src/format.rs", "a format change\n");
+        let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, |_| {}, change, |_| {}, None);
+        merge.arg("--owner-approval");
+        for who in ["owner", "reviewer", "hostile"] {
+            bk(&dir, &["id", "new", who]);
+        }
+        let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+        let claim = prs[0]["id"].as_str().unwrap().to_owned();
+        let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "pr"]).stdout).unwrap().trim().to_owned();
+        let one = |args: &[&str]| bk(&dir, args).lines().next().unwrap().to_owned();
+        let review = one(&[
+            "claim",
+            &format!("Owner-review: pr claim {claim} @ {sha}"),
+            "--tag",
+            "owner-review",
+            "--as",
+            "manager",
+        ]);
+        let approval =
+            one(&["claim", &format!("Approval (owner) of {claim}: it"), "--tag", "approval", "--as", "owner"]);
+        one(&["relate", &approval, "supports", &claim, "--as", "owner"]);
+        one(&["evidence", &claim, "pass", "--method", &format!("independent review (m) @ {sha}"), "--as", "reviewer"]);
+        let out = merge.output().unwrap();
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+
+        // The hostile writer supersedes each of the three.
+        for target in [&claim, &review, &approval] {
+            let x = one(&["claim", "superseded", "--tag", "note", "--as", "hostile"]);
+            one(&["relate", &x, "supersedes", target, "--as", "hostile"]);
+        }
+        let out = merge.output().unwrap();
+        let t = text(&out);
+        assert!(out.status.success(), "{scripts}: a hostile supersede counted: {t}");
+        for (what, id) in [("pr claim", &claim), ("owner-review", &review), ("the owner's approval", &approval)] {
+            let said = format!("note  ignored      {what} {} is superseded by ", &id[..12]);
+            assert!(t.contains(&said) && t.contains("by hostile"), "{scripts}: {what}: {t}");
+        }
+        assert!(check_line(&out, "claim").starts_with("ok"), "{scripts}");
+
+        // The manager's supersede of the pr claim, a takeover, counts; and the owner's of its approval.
+        let newer = one(&["claim", &format!("PR #1 pr @ {sha}: taken over"), "--tag", "pr", "--as", "val"]);
+        one(&["relate", &newer, "supersedes", &claim, "--as", "manager"]);
+        let x = one(&["claim", "withdrawn", "--tag", "note", "--as", "owner"]);
+        one(&["relate", &x, "supersedes", &approval, "--as", "owner"]);
+        let out = merge.output().unwrap();
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(check_line(&out, "claim").starts_with("FAIL"), "{scripts}: {}", text(&out));
+        assert!(check_line(&out, "owner").starts_with("FAIL"), "{scripts}: {}", text(&out));
+        assert!(check_line(&out, "frozen").starts_with("ok"), "{scripts}: the owner-review: {}", text(&out));
+    }
+}
