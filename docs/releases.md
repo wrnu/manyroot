@@ -24,6 +24,8 @@ The classes and the risky ones are defined in [development.md](development.md). 
 | crypto | security, independent | none |
 | protocol, storage | security, independent | the manager's go, logged as `owner-review`; a migration note below; upgrade the pinned binary afterwards |
 
+**After merging task 3b96803d923c** (`scripts/weave-propose` reads gh's JSON apart from its stderr, and `scripts/weave-gate` reads `weave green`'s the same way): no binary upgrade. Builders run the main checkout's copy, so the fix takes effect when the main checkout is on the merge. Until then, with gh 2.105.0 or later, `weave-propose` refuses every PR as a fork (gotcha `d532678d900c`): say so in the `pr` claim, and the merge falls back to the import. `weave-gate` still refuses when `weave green` warns on stderr that a record doesn't decode.
+
 ## Needs the owner's go
 
 The owner delegated everything else to the manager (decision `adcb78b88c6c`), including protocol-class merges and pinned-binary upgrades, which the manager logs as `owner-review` claims. Still the owner's go:
