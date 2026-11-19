@@ -59,15 +59,13 @@ Don't repeat what code, git log or docs say. To change your entry, `claim … --
 5. Answer each confirmed finding: a fix in a new head, a deferral proposed as a `question`, or a `contradicts` claim.
 6. Final report (claim `--tag report`, `implements` the task, id sent to the manager): PR URL, head and current `pr` claim; what changed and why; evidence ids per done-when check; what wasn't tested; tests you think wrong (with your claim's id); what you need; process ideas as separate `process` claims.
 
-**Builder checks**, each recorded:
+**Builder checks**, each recorded (experiment `4f7404d019cc`: no local nextest pass; the box runs the whole table, slow tests included):
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
-cargo nextest run -P fast --workspace
 scripts/test-table --remote
 ```
-A head changing `scripts/merge` or `scripts/verify-seq` (or their template copies) also records `cargo nextest run -P fast -p bracken --test scripts --ignore-default-filter -E 'not default()'`. Needs `cargo install --locked cargo-nextest`.
 
 **Counted run** (the manager's, on `main` merged with the exact head; GitHub Actions only observes): a head changing only `*.md` and `docs/**` gets fmt and the Ground guards, except `docs/protocol.md` and `docs/design/weave-freeze.md`, which take the full run: fmt, both clippies, `cargo test --workspace` on macOS and Linux, the Ground guards. With the Weave gate on, line main's Weave results on that merged tree can stand in (`scripts/verify-seq --weave`).
 
@@ -88,3 +86,4 @@ A head changing `scripts/merge` or `scripts/verify-seq` (or their template copie
 - **One rule in, one rule out:** an experiment that adds a rule names the rule it retires, and this file stays under 12 KB (a test checks).
 - Weekly, the manager records `scripts/metrics`' output: `scripts/bk claim "$(scripts/metrics)" --tag metrics --as <you>`.
 - Anyone proposes with a `process` claim; the manager decides.
+- Running: `4f7404d019cc` (builders record no local fast nextest pass; until 2026-12-03).
