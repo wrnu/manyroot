@@ -102,9 +102,10 @@ fn a_hidden_set_is_checked_by_digest_and_reported_in_counts() {
     assert_eq!(v["hidden"]["checked"]["groups"], 3);
 }
 
-/// These need Docker: where it isn't running, each says so and passes without checking anything. In `macos_only`
-/// though they don't need macOS, so the counted run's Mac side runs them (docs/development.md).
-mod macos_only {
+/// These need Docker, not macOS (finding d160c76dafca): where it isn't running, each says so and passes without
+/// checking anything, unless BRACKEN_TEST_REQUIRE_DOCKER is set, as in .github/workflows/research.yml's Linux
+/// job, which runs them (docs/development.md).
+mod docker {
     use super::*;
 
     /// The image these tests pin, as `python::tests` does; None, having said why, where they can't run.

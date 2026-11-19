@@ -281,18 +281,22 @@ pub fn docker_running() -> bool {
 }
 
 /// The image tests pin: [`IMAGE`], or the one `BRACKEN_TEST_PYTHON_IMAGE` names. None, having said why, where
-/// Docker isn't running, or, elsewhere than macOS, where the image isn't pulled, as in the test boxes. On macOS,
-/// where the counted run runs these tests (docs/development.md), an image not pulled fails them.
+/// Docker isn't running, or, elsewhere than macOS, where the image isn't pulled. On macOS an image not pulled
+/// fails them. With `BRACKEN_TEST_REQUIRE_DOCKER` set, as in research.yml's Linux job, which runs them
+/// (docs/development.md), neither is a skip: both fail.
 #[doc(hidden)]
 pub fn for_tests() -> Option<Python> {
+    // Where Docker must run these (research.yml's Linux job, finding d160c76dafca), a skip is a failure.
+    let required = std::env::var_os("BRACKEN_TEST_REQUIRE_DOCKER").is_some_and(|v| !v.is_empty());
     if !docker_running() {
+        assert!(!required, "BRACKEN_TEST_REQUIRE_DOCKER is set, but Docker isn't running here");
         eprintln!("skipped: Docker isn't running here, and this test runs agent code in a container");
         return None;
     }
     let image = std::env::var("BRACKEN_TEST_PYTHON_IMAGE").unwrap_or_else(|_| IMAGE.into());
     match Python::pin(&image, "3.12") {
         Ok(python) => Some(python),
-        Err(e) if !cfg!(target_os = "macos") && e.contains("isn't here") => {
+        Err(e) if !required && !cfg!(target_os = "macos") && e.contains("isn't here") => {
             eprintln!("skipped: {e}");
             None
         }

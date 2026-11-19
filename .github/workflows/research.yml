@@ -8,6 +8,18 @@
 # The research tests that run the bracken binary find it beside their own: research/.cargo/config.toml
 # builds into the root's target/, so each job builds bracken at the root first.
 #
+# Docker (finding d160c76dafca): the tests that run agent code in a container (the `docker` modules of
+# research/experiment, among them the containment checks) run in the Linux job, with the pinned image pulled
+# and BRACKEN_TEST_REQUIRE_DOCKER set, so a test that would skip there for want of Docker fails instead.
+# GitHub's macOS runners have no Docker: there they print 'skipped' and pass. The tests that need both macOS
+# and Docker (the macos_only modules of tests/grade_run.rs and tests/weave.rs) can run on no runner here;
+# docs/development.md says how to run them on the Mac.
+#
+# Every test runs somewhere, as scripts/test-table --split checks for the product workspace: each job lists
+# its tests (nextest's and the doctests', each with and without the ignored ones) and keeps them as an
+# artifact, and the lists job fails, naming it, on any test that runs on macOS but is missing or ignored on
+# Linux and isn't in a macos_only module, or any docker test that runs on macOS (skipping) but not on Linux.
+#
 # Hardened as ci.yml is: read-only token, no secrets, never pull_request_target or workflow_run,
 # third-party actions pinned by full commit sha, no `${{ }}` of event data inside a script, the cargo
 # cache saved only from main, and standard runners only.
@@ -79,6 +91,15 @@ jobs:
           echo "$NEXTEST_LINUX_SHA256  $dir/$tar" | sha256sum -c --quiet -
           tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
           echo "$dir" >>"$GITHUB_PATH"
+      # The image research/experiment/src/python.rs pins as IMAGE, pulled by its digest.
+      - name: Docker (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          image=$(sed -n 's/^pub const IMAGE: &str = "\(.*\)";$/\1/p' research/experiment/src/python.rs)
+          [ -n "$image" ] || { echo "no IMAGE in research/experiment/src/python.rs"; exit 1; }
+          docker info --format '{{.ServerVersion}}'
+          docker pull -q "$image"
+          echo "BRACKEN_TEST_REQUIRE_DOCKER=1" >>"$GITHUB_ENV"
       - name: Tools (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -120,3 +141,66 @@ jobs:
         run: |
           cargo nextest run --locked --workspace --no-fail-fast
           cargo test --locked --doc --workspace
+      # Each list is written whole to a file, cargo's own output to another, as test-table --lists does.
+      - name: Test lists
+        working-directory: research
+        run: |
+          out=$RUNNER_TEMP/lists/$RUNNER_OS
+          mkdir -p "$out"
+          cargo nextest list --locked --workspace --run-ignored all --message-format oneline >"$out/all" 2>"$out/log"
+          cargo nextest list --locked --workspace --run-ignored only --message-format oneline >"$out/ignored" 2>>"$out/log"
+          cargo test --locked --doc --workspace -- --list >"$out/doc-all" 2>>"$out/log"
+          cargo test --locked --doc --workspace -- --list --ignored >"$out/doc-ignored" 2>>"$out/log"
+          wc -l "$out"/*
+      - name: Keep the lists
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: lists-${{ runner.os }}
+          path: ${{ runner.temp }}/lists/${{ runner.os }}
+          if-no-files-found: error
+          retention-days: 7
+
+  lists:
+    name: Every research test runs somewhere
+    needs: research
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: The jobs' lists
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: lists-*
+          path: lists
+      - name: Compare
+        run: |
+          # runs <side> <kind>: the tests that run there, sorted: listed, less those listed as ignored. nextest's
+          # lines are '<binary> <test>'; the doctests' end ': test'.
+          runs() {
+            if [ "$2" = nextest ]; then
+              LC_ALL=C comm -23 <(LC_ALL=C sort -u "lists/lists-$1/all") <(LC_ALL=C sort -u "lists/lists-$1/ignored")
+            else
+              LC_ALL=C comm -23 <(grep ': test$' "lists/lists-$1/doc-all" | LC_ALL=C sort -u) \
+                <(grep ': test$' "lists/lists-$1/doc-ignored" | LC_ALL=C sort -u)
+            fi
+          }
+          bad=0
+          for kind in nextest doc; do
+            [ -s "lists/lists-Linux/all" ] && [ -s "lists/lists-macOS/all" ] || { echo "a side's list is empty"; exit 1; }
+            # On macOS but not on Linux, and not in a macos_only module.
+            missing=$(LC_ALL=C comm -23 <(runs macOS "$kind") <(runs Linux "$kind") | grep -v 'macos_only::' || true)
+            if [ -n "$missing" ]; then
+              echo "::error title=Runs on macOS only::these $kind tests run on macOS but not on Linux, and aren't in a macos_only module:"
+              printf '%s\n' "$missing"
+              bad=1
+            fi
+          done
+          # Every docker test that runs on macOS (where it skips) runs on Linux, where Docker is (finding
+          # d160c76dafca). The ones ignored on both sides are helpers another test runs with --ignored.
+          docker=$(runs macOS nextest | grep 'docker::' | LC_ALL=C comm -23 - <(runs Linux nextest) || true)
+          if [ -n "$docker" ]; then
+            echo "::error title=Docker tests not run on Linux::these docker tests don't run on Linux:"
+            printf '%s\n' "$docker"
+            bad=1
+          fi
+          echo "docker tests run on Linux: $(runs Linux nextest | grep -c 'docker::' || true)"
+          exit "$bad"

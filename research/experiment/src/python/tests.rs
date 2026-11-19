@@ -1,5 +1,6 @@
 //! These need Docker, with the pinned image pulled (`docker pull` [`IMAGE`]): where Docker isn't running, each
-//! says so and passes without checking anything. The counted run on the Mac runs them.
+//! says so and passes without checking anything, unless BRACKEN_TEST_REQUIRE_DOCKER is set, as in
+//! .github/workflows/research.yml's Linux job, which runs them.
 
 /// A plan's pin of a host interpreter, from before agent code ran in containers, is refused saying so, not as an
 /// unknown field (finding 264a0f0c8160); a pin of an image is read.
@@ -14,9 +15,10 @@ fn an_old_plans_interpreter_pin_is_refused_saying_why() {
     assert!(serde_json::from_value::<super::PythonPin>(extra).is_err(), "no other field");
 }
 
-/// In `macos_only` though they don't need macOS, so the counted run's Mac side runs them: Docker is on this Mac
-/// and not in the test boxes, where they skip (decision ac22cedd8fee, docs/development.md).
-pub(crate) mod macos_only {
+/// In `docker`, a group of their own (finding d160c76dafca): they need Docker, not macOS. research.yml's Linux
+/// job runs them with Docker and BRACKEN_TEST_REQUIRE_DOCKER set, so there a skip fails; elsewhere, where Docker
+/// isn't running, each says so and passes (decision ac22cedd8fee, docs/development.md).
+pub(crate) mod docker {
     use std::io::BufRead;
     use std::path::Path;
     use std::time::{Duration, Instant};
@@ -273,7 +275,7 @@ pub(crate) mod macos_only {
             return;
         }
         let exe = std::env::current_exe().expect("the test binary");
-        let inner = "python::tests::macos_only::runs_that_end_each_way";
+        let inner = "python::tests::docker::runs_that_end_each_way";
         let child = Command::new(exe)
             .args(["--exact", "--ignored", "--nocapture", "--test-threads", "1", inner])
             .output()
@@ -330,7 +332,7 @@ pub(crate) mod macos_only {
         let owner = Owner(Command::new("sleep").arg("600").spawn().expect("an owner"));
         let pid = owner.0.id();
         let exe = std::env::current_exe().expect("the test binary");
-        let inner = "python::tests::macos_only::holds_a_container_until_killed";
+        let inner = "python::tests::docker::holds_a_container_until_killed";
         let mut runner = Command::new(exe)
             .args(["--exact", "--ignored", "--nocapture", "--test-threads", "1", inner])
             .env(TEST_OWNER, pid.to_string())
