@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# weave-propose: Weave dogfood stage 2a (docs/design/weave.md, section 6 row 10a; docs/builder.md; task
+# weave-propose: Weave dogfood stage 2a (docs/design/weave.md, section 6 row 10a; AGENTS.md, section 4; task
 # 87a1bcba025d). After each push, a builder proposes the pushed commit to the Weave Ground, through
 # scripts/weave. Nothing is checked or merged here: after git merges the PR, the manager's scripts/weave-shadow
 # --proposal <id> merges it in Weave.

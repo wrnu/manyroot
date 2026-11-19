@@ -88,7 +88,7 @@ fn metrics_counts_the_week_and_the_experiments_and_writes_nothing() {
     }
     let state = |id: &str| {
         let all = got["experiments"].as_array().unwrap();
-        all.iter().find(|e| e["id"] == &id[..12]).unwrap_or_else(|| panic!("{id}: {got}")).clone()
+        all.iter().find(|e| e["id"] == id[..12]).unwrap_or_else(|| panic!("{id}: {got}")).clone()
     };
     assert_eq!(state(&default)["days_left"], 7, "{got}");
     assert_eq!(state(&capped)["days_left"], 21, "{got}");

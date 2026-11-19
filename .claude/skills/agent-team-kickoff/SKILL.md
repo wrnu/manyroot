@@ -96,9 +96,8 @@ Create or update these files. If a file already exists, merge into it; don't ove
 
 | File | Contents |
 |---|---|
-| `AGENTS.md` | Short; every agent reads it, and agents follow it closely, so every line costs tokens on every task. Include only what an agent can't learn from the code or README: no repository overview or directory tour. In this order: **Things that break production**; conventions; a **test command table** per package; a releases summary; a **The Ground** section (always `scripts/bk`; read `scripts/bk log --tag decision --current` at task start; the contribution conventions table from section 4.1); a **Shared knowledge** section (the rules from section 9.1); a **Working with other agents** section linking `process.md` and `docs/development.md`. If Claude Code is the harness, add a `CLAUDE.md` containing just `@AGENTS.md`: Claude Code reads `CLAUDE.md`, not `AGENTS.md`. Draft it, then have the owner cut and correct it before merging: human-written context files help, generated ones mostly add cost. |
-| `docs/builder.md` | One-page role card for builders: the builder's role, who to talk to, the brief template's fields, what to contribute to the Ground and when, the evidence rules and the final report format (section 6). Builder briefs link this, not the whole process doc. |
-| `docs/development.md` | The project profile, the tool mapping, this project's value for every `<placeholder>` in [process.md](process.md), and the PROJECT paragraph its review briefs open with (process sections 5.1 and 5.2). It links to `process.md` and never copies it, so there's one process to keep current. |
+| `AGENTS.md` | The one doc every agent follows, at most 12 KB, with a test that fails above it (one rule in, one rule out). Include only what an agent can't learn from the code or README, in six sections: **Safety and frozen boundaries** (keys, the Ground, protocol links, the owner-approval list); **Repo and code conventions**; **Ground usage** (always `scripts/bk`, the task-start reads, the tag table from process section 4.1); **Build, test and merge loop** (roles, the builder workflow and final report, the test commands, the gate); **Review standard** (risky classes, the three-layer brief, the finding format, security's checklist); **Process changes and experiments** (process section 8). If Claude Code is the harness, add a `CLAUDE.md` containing just `@AGENTS.md`. Draft it, then have the owner cut and correct it before merging: human-written context files help, generated ones mostly add cost. |
+| `docs/development.md` | Live settings only: the project profile, models, the owner-approval list, the tool mapping, team server and remote-box pointers, GitHub commands, and the PROJECT paragraph review briefs open with. Rules go in `AGENTS.md`; explanations and history in `docs/archive/`. |
 | `.claude/skills/agent-team-kickoff/` | A copy of this skill, if the repo doesn't have one, so the process is versioned with the code. Later process changes go into that copy (process section 8). |
 | `docs/releases.md` | Release stages, the release path per change class, the owner's-go list, test report format, rollback steps. For protocol changes: how an existing Ground is migrated or why it doesn't need to be. |
 | `docs/README.md` | Index of docs. Stale docs move to `docs/archive/`. |
@@ -129,8 +128,8 @@ Tick these off in the setup PR description:
 - [ ] Ground created; identities `owner`, `manager`, `reviewer`, `security`, `triage` created
 - [ ] Goal and profile decisions contributed as claims
 - [ ] After the merge: main checkout back on `main` (`git checkout -B main origin/main`), first `scripts/ground-checkpoint` committed and pushed, and `git ls-files .bracken/identities` prints nothing
-- [ ] `AGENTS.md` (breaks-production list, conventions, test table, releases summary, The Ground, Shared knowledge, Working with other agents)
-- [ ] `docs/development.md`, `docs/releases.md`, `docs/README.md`, `docs/builder.md`
+- [ ] `AGENTS.md` (the six sections, at most 12 KB, with its size test)
+- [ ] `docs/development.md`, `docs/releases.md`, `docs/README.md`
 - [ ] `AGENTS.md` trimmed and approved by the owner
 - [ ] Builder warm-build script on worktree creation
 - [ ] Default, reviewer and security models chosen and authenticated

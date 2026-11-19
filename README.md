@@ -170,8 +170,9 @@ review finding is left open. `scripts/merge` checks all of that before it merges
 Each merge also goes through Weave, as above, and with the Weave gate on,
 Weave's own green checks on the merged tree can count as that test run.
 GitHub Actions runs the test table on every push and pull request too, as
-an observer that no merge waits on yet. The process is in [process.md](.claude/skills/agent-team-kickoff/process.md),
-with this repository's values in [docs/development.md](docs/development.md).
+an observer that no merge waits on yet. What the agents follow is
+[AGENTS.md](AGENTS.md), with this repository's live settings in
+[docs/development.md](docs/development.md).
 
 ## Where it's going
 
