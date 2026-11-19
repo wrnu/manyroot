@@ -156,7 +156,7 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
   a tag named `main` first, finding `e096533fd85e`), never from a working
   tree, and checked
   against the replica's `weave-root` before anything runs; a mismatch or a
-  missing file refuses. `scripts/code-scope frozen` lists
+  missing file refuses. `scripts/tree-scope frozen` lists
   `.config/weave-root`, so a change to it takes the owner's go like any
   frozen rule (development.md, Owner approvals).
 - **How the replica's pin gets set: one exception in `scripts/weave`.**
@@ -261,7 +261,7 @@ unchanged.
   `.config/weave-root`, the replica's `weave-root` or the binary can point
   every reader on this machine at its own key (agent-keys.md 4.6). The
   committed pin is public and reviewed, so a change shows in git, and
-  `code-scope frozen` makes it a frozen-rule change. That's detection after
+  `tree-scope frozen` makes it a frozen-rule change. That's detection after
   the fact, as for every verifier here.
 - **The root can race itself.** Two concurrent markers by the root are
   still settled by id. Only the root can write them, so that's the root's
@@ -499,12 +499,12 @@ doesn't fit a v2.**
 So the fix lands before the freeze, as a change to a rule that isn't frozen
 yet. It's still protocol class: an independent review, a security review,
 the full table (it touches `crates/tree/src/`), and an `owner-review` for
-each `frozen:` line `code-scope frozen` prints (`crates/tree/src/`,
+each `frozen:` line `tree-scope frozen` prints (`crates/tree/src/`,
 `crates/tree/tests/lines.rs`, `crates/tree/tests/weave_fixture.rs`;
 development.md, *Owner approvals*). **It also needs the owner's own go,
 now, not just as a recommendation:** the build changes
 `crates/tree/tests/weave_fixture.rs`, which calls `Index::build` (704, 867)
-and must pass the root, and `code-scope`'s `owner_mode` marks that file as
+and must pass the root, and `tree-scope`'s `owner_mode` marks that file as
 needing the owner's own approval, which `scripts/merge` already enforces
 (G6, PR #29), whether or not the freeze has started. It would be asked for
 anyway: the change rewrites the rule 1.3 is about to freeze, and the
@@ -591,7 +591,7 @@ Ground must already have the fix.
    `scripts/weave-gate` check against the replica's before running. The
    only way to set or change the replica's copy through the scripts is
    `scripts/weave`'s one exception, which can only move it to the
-   committed value (option A). `code-scope frozen` lists
+   committed value (option A). `tree-scope frozen` lists
    `.config/weave-root`. *Recommended: yes.* The
    replica's copy lets `bracken weave` stand alone and travels with
    backups. The committed copy is public, reviewed and visible in git. A

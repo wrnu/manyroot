@@ -300,7 +300,6 @@ cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
 git checkout -q tested
 setup cargo fetch --locked --target "$(rustc -vV | sed -n "s/^host: //p")"'
-  local what="the table"
   # shellcheck disable=SC2016 # expanded in the box
   inner="$inner"'
 BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table'

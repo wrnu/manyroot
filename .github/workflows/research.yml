@@ -1,8 +1,8 @@
 # CI for the research workspace, research/ (owner decision c8bbb2886be3, task bfc942cd7ced): the
 # experiment runner, the demo and the query lab, which the product workspace's table no longer builds.
 # It runs only when research/ or a product crate it builds on changes, and also when what every build
-# reads changes (the root Cargo.toml, whose workspace the path dependencies inherit from, and .cargo/) or
-# this file does. Like ci.yml it only reports: it merges nothing, writes nothing to the Ground, deploys
+# reads changes (the root Cargo.toml, whose workspace the path dependencies inherit from, rustfmt.toml and
+# .cargo/) or this file does. The root Cargo.lock isn't among them: research/Cargo.lock resolves its builds. Like ci.yml it only reports: it merges nothing, writes nothing to the Ground, deploys
 # nothing, and nothing waits for it.
 #
 # The research tests that run the bracken binary find it beside their own: research/.cargo/config.toml
@@ -33,6 +33,7 @@ on:
       - "crates/tree/**"
       - "crates/bracken/**"
       - "Cargo.toml"
+      - "rustfmt.toml"
       - ".cargo/**"
       - ".github/workflows/research.yml"
   pull_request:
@@ -42,6 +43,7 @@ on:
       - "crates/tree/**"
       - "crates/bracken/**"
       - "Cargo.toml"
+      - "rustfmt.toml"
       - ".cargo/**"
       - ".github/workflows/research.yml"
   workflow_dispatch:
