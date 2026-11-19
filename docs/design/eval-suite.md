@@ -587,15 +587,19 @@ output, nor a grade (task `6a80d88373a5`).
 
 As built so far (task `e4970250b3e4`, design note `43554a820efb`, answer
 `07959d6d9bc0`): `bracken-experiment run --mode weave --project <dir>
---python <image> [--hold-change]`, and `mock-run`
+--python <image> [--hold-change] [--integrator <setting>]`, and `mock-run`
 the same way, runs a project's agents through **Weave mode**
 (`src/weave_mode.rs`). `grade-run` grades the run after it ends.
 
 - **The plan** records the project (its directory, a digest of all of it,
   each item's release share, its hidden reference and the hash of each text
   agents get), the pinned Python image, and the configuration's
-  **integrator setting**: for now `any-agent`, every agent an integrator.
-  The run refuses a project without `--python`, Weave mode without a
+  **integrator setting**: `any-agent`, every agent an integrator (the
+  default), or `agent-<n>` (`--integrator`, answer `81403ed96c96`), the run's
+  one integrator, which main's policy names alone beside the setter. Then
+  each turn message tells every agent its role: the integrator reviews and
+  integrates proposals, and every other agent proposes, as integrate is
+  refused to it. The run refuses a project without `--python`, Weave mode without a
   project, and any other mode with one. Neither the plan nor anything else
   in the run holds the private store's path.
 - **The hub** is a throwaway Weave Ground under the run directory, never
@@ -604,8 +608,8 @@ the same way, runs a project's agents through **Weave mode**
   seed as `main`'s first decision, so the seed is the run's first tree;
   states the spec and the items released at the start as claims; records
   the integrator setting as a decision claim; and, once every copy has a
-  key, writes `main`'s policy naming the setter and every agent as
-  integrators, citing that claim.
+  key, writes `main`'s policy naming the setter and every agent, or the one
+  agent the setting names, as integrators, citing that claim.
 - **An agent's copy** is a replica of the hub's Ground, synced as Bracken
   mode syncs, beside a git working tree that only the store touches. Its
   tools: `task` (the spec and the items released so far: only claims the

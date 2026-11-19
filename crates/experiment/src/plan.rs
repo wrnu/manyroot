@@ -229,6 +229,11 @@ impl Plan {
             ("turn-message".to_string(), hash(TURN_MESSAGE.as_bytes())),
         ]);
         let mut change_after = None;
+        let setting = cfg.plan.integrator.as_deref().unwrap_or(crate::weave_mode::ANY_AGENT);
+        if cfg.plan.project.is_some() && setting != crate::weave_mode::ANY_AGENT {
+            prompts.insert("role-integrator".into(), hash(crate::prompts::INTEGRATOR_ROLE.as_bytes()));
+            prompts.insert("role-builder".into(), hash(crate::prompts::BUILDER_ROLE.as_bytes()));
+        }
         if let Some(project) = &cfg.plan.project {
             // A project's texts take the task's place: those agents are given, so a held change's not.
             let held = |key: &String| {
@@ -268,14 +273,22 @@ impl Plan {
             // A project run integrates by its integrator setting alone, and has no measures yet: the task's
             // rules and definitions aren't its own.
             rules: match (&cfg.plan.project, &cfg.plan.integrator) {
-                (Some(_), integrator) => vec![(
-                    "weave-integrator".to_string(),
-                    format!(
-                        "Answer 07959d6d9bc0: {}: every agent of the run is an integrator of main, and merges proposals \
-                         onto its head, or records a tree with every head as a parent.",
-                        integrator.as_deref().unwrap_or(crate::weave_mode::ANY_AGENT)
-                    ),
-                )],
+                (Some(_), integrator) => {
+                    let setting = integrator.as_deref().unwrap_or(crate::weave_mode::ANY_AGENT);
+                    let rule = if setting == crate::weave_mode::ANY_AGENT {
+                        format!(
+                            "Answer 07959d6d9bc0: {setting}: every agent of the run is an integrator of main, and \
+                             merges proposals onto its head, or records a tree with every head as a parent."
+                        )
+                    } else {
+                        format!(
+                            "Answer 81403ed96c96: {} The integrator merges proposals onto main's head, or records a \
+                             tree with every head as a parent.",
+                            crate::weave_mode::integrator_rule(setting)
+                        )
+                    };
+                    vec![("weave-integrator".to_string(), rule)]
+                }
                 (None, _) => rules(cfg.plan.accept_rule),
             },
             definitions: if cfg.plan.project.is_some() { Vec::new() } else { pairs(DEFINITIONS) },
