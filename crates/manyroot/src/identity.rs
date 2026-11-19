@@ -105,9 +105,10 @@ impl Identity {
         let text = fs::read_to_string(path).map_err(io)?;
         let file: IdentityFile = serde_json::from_str(&text).map_err(|e| malformed(e.to_string()))?;
         validate_name(&file.name)?;
-        let expected = format!("{}.json", file.name);
-        if path.file_name().and_then(|n| n.to_str()) != Some(expected.as_str()) {
-            return Err(malformed(format!("holds identity {:?}, so its file must be named {expected}", file.name)));
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        if file_name != format!("{}.json", file.name) {
+            let stem = file_name.strip_suffix(".json").unwrap_or(file_name);
+            return Err(malformed(format!("holds identity {:?}, not {stem:?}", file.name)));
         }
         let mut secret = [0u8; 32];
         hex::decode_to_slice(&file.secret_key, &mut secret).map_err(|e| malformed(e.to_string()))?;
