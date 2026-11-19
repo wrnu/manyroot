@@ -313,6 +313,7 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             Ok(ExitCode::SUCCESS)
         }
         LineCommand::Create { name, policy, dry_run, out } => {
+            super::refuse_id_like_name(&name)?;
             let ix = super::weave_index(s);
             if !dry_run {
                 require_marker(&ix)?;
@@ -350,6 +351,9 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             Ok(ExitCode::SUCCESS)
         }
         LineCommand::Policy { line, name, from, clear, policy, dry_run, out } => {
+            if let Some(name) = &name {
+                super::refuse_id_like_name(name)?;
+            }
             let ix = super::weave_index(s);
             if !dry_run {
                 require_marker(&ix)?;

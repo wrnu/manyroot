@@ -86,38 +86,236 @@ pub fn from_cbor<T: Serialize + DeserializeOwned>(bytes: &[u8]) -> Result<T, For
     Ok(value)
 }
 
-/// A field of a payload's top-level map, read as generic CBOR whatever the payload's other fields are, so
-/// a reader can say what a record it can't decode carries (docs/design/weave-freeze.md, G8). This never
-/// makes a payload valid: [`Record::decode`] alone says that.
-fn payload_field(bytes: &[u8], key: &str) -> Option<ciborium::Value> {
-    let ciborium::Value::Map(entries) = ciborium::from_reader::<ciborium::Value, _>(bytes).ok()? else { return None };
-    entries.into_iter().find(|(k, _)| matches!(k, ciborium::Value::Text(t) if t == key)).map(|(_, v)| v)
+/// What a payload's top-level map holds under `v` and `line`, read as generic CBOR whatever its other
+/// fields are, so a reader can say what a record it can't decode carries (docs/design/weave-freeze.md, G8).
+/// This never makes a payload valid: [`Record::decode`] alone says that.
+///
+/// It reads what a generic [`ciborium::Value`] of the payload would hold (the first entry with each text
+/// key; nothing if the payload isn't one well-formed map), but builds no value for the other entries: it
+/// walks past them, so its cost is linear in the payload's bytes and its memory bounded by its longest
+/// string, never a value tree many times the payload's size (finding 3832a3c04d2d). Its bounds are
+/// ciborium's own, the same as the generic read's: 256 levels of nesting, past which the payload holds
+/// nothing here, and strings read through a 4 KiB buffer or, when longer, one buffer of their own length.
+/// So it gives the same answer as the generic read for every payload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PayloadHead {
+    /// The top-level `v`, if it is an unsigned integer.
+    pub version: Option<u64>,
+    /// The top-level `line`, if it is a byte string of an id's length.
+    pub line: Option<ContributionId>,
 }
 
-/// The format version a payload's top-level `v` holds, if it is an unsigned integer, read as generic CBOR.
-pub fn payload_version(bytes: &[u8]) -> Option<u64> {
-    match payload_field(bytes, "v")? {
-        ciborium::Value::Integer(v) => u64::try_from(v).ok(),
-        _ => None,
+impl PayloadHead {
+    /// Reads a payload's head, once: callers that need both fields keep the result.
+    pub fn read(bytes: &[u8]) -> PayloadHead {
+        ciborium::from_reader::<Head, _>(bytes).map(|h| h.0).unwrap_or_default()
+    }
+
+    /// Whether the payload this is the head of may decode in this build: its `v` is one this build reads.
+    /// Only such a payload is ever valid, as [`Record::validate`] refuses every other version and a valid
+    /// payload's head always reads its `v`. So a reader that asks this before decoding a payload as its
+    /// type changes no record's validity, but pays that decode, which builds every field a payload holds at
+    /// many times its size, only for the version it reads (finding 8b99e0d6d326). A payload of another
+    /// version is refused naming it, whatever its fields (docs/design/weave-freeze.md, section 3).
+    pub fn readable(&self) -> Result<(), FormatError> {
+        match self.version {
+            Some(VERSION) => Ok(()),
+            Some(v) => Err(FormatError::Version(v)),
+            None => Err(FormatError::Malformed("the payload's top-level map holds no format version `v`".into())),
+        }
+    }
+
+    /// [`Record::decode`] of the payload this is the head of, only if it is [`PayloadHead::readable`].
+    pub fn decode<R: Record>(&self, bytes: &[u8]) -> Result<R, FormatError> {
+        self.readable()?;
+        R::decode(bytes)
     }
 }
 
-/// The contribution a payload's top-level `line` holds, if it is a byte string of an id's length, read as
-/// generic CBOR.
-pub fn payload_line(bytes: &[u8]) -> Option<ContributionId> {
-    match payload_field(bytes, "line")? {
-        ciborium::Value::Bytes(b) => Some(ContributionId(b.try_into().ok()?)),
-        _ => None,
+/// [`Record::decode`], reading the payload's head first, so a payload of a version this build doesn't read
+/// costs about its own size whatever its fields ([`PayloadHead::readable`]). What any reader that decodes
+/// every Weave record of the Ground, as each command does, decodes them with.
+pub fn decode_bounded<R: Record>(bytes: &[u8]) -> Result<R, FormatError> {
+    PayloadHead::read(bytes).decode(bytes)
+}
+
+/// [`PayloadHead`], as the top-level item; anything but a map is an error, which reads as no head.
+struct Head(PayloadHead);
+
+impl<'de> Deserialize<'de> for Head {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(HeadVisitor)
     }
 }
 
-/// Why a payload doesn't decode, naming its version whatever its fields when that isn't one this build
-/// reads: [`Record::decode`] checks canonical encoding first, so a version 2 with fields version 1 lacks
-/// would otherwise say only that it isn't canonical (docs/design/weave-freeze.md, section 3).
-pub fn undecodable_why(bytes: &[u8], error: FormatError) -> FormatError {
-    match payload_version(bytes) {
-        Some(v) if v != VERSION => FormatError::Version(v),
-        _ => error,
+struct HeadVisitor;
+
+impl<'de> serde::de::Visitor<'de> for HeadVisitor {
+    type Value = Head;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a map")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Head, A::Error> {
+        let mut head = PayloadHead::default();
+        let (mut v, mut line) = (false, false);
+        while let Some(key) = map.next_key::<Item>()? {
+            let value: Item = map.next_value()?;
+            match key {
+                Item::V if !v => {
+                    v = true;
+                    head.version = match value {
+                        Item::Unsigned(n) => Some(n),
+                        _ => None,
+                    };
+                }
+                Item::Line if !line => {
+                    line = true;
+                    head.line = match value {
+                        Item::Id(id) => Some(id),
+                        _ => None,
+                    };
+                }
+                _ => {}
+            }
+        }
+        Ok(Head(head))
+    }
+}
+
+/// One CBOR item, kept only as far as [`PayloadHead`] needs it. Visiting one accepts exactly what a generic
+/// [`ciborium::Value`] accepts, through the same calls, and keeps nothing of arrays, maps and tags but
+/// their well-formedness.
+enum Item {
+    /// An integer a `u64` holds.
+    Unsigned(u64),
+    /// A byte string of an id's length.
+    Id(ContributionId),
+    /// The text `v`.
+    V,
+    /// The text `line`.
+    Line,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for Item {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ItemVisitor)
+    }
+}
+
+struct ItemVisitor;
+
+impl ItemVisitor {
+    fn text(s: &str) -> Item {
+        match s {
+            "v" => Item::V,
+            "line" => Item::Line,
+            _ => Item::Other,
+        }
+    }
+
+    fn bytes(b: &[u8]) -> Item {
+        b.try_into().map(|b| Item::Id(ContributionId(b))).unwrap_or(Item::Other)
+    }
+
+    fn integer<T: TryInto<u64>>(n: T) -> Item {
+        n.try_into().map(Item::Unsigned).unwrap_or(Item::Other)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ItemVisitor {
+    type Value = Item;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a valid CBOR item")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Item, E> {
+        Ok(Item::Other)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<Item, E> {
+        Ok(Self::integer(n))
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, n: i128) -> Result<Item, E> {
+        Ok(Self::integer(n))
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<Item, E> {
+        Ok(Item::Unsigned(n))
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, n: u128) -> Result<Item, E> {
+        Ok(Self::integer(n))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Item, E> {
+        Ok(Item::Other)
+    }
+
+    fn visit_char<E: serde::de::Error>(self, c: char) -> Result<Item, E> {
+        Ok(Self::text(c.encode_utf8(&mut [0; 4])))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Item, E> {
+        Ok(Self::text(s))
+    }
+
+    fn visit_bytes<E: serde::de::Error>(self, b: &[u8]) -> Result<Item, E> {
+        Ok(Self::bytes(b))
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Item, E> {
+        Ok(Item::Other)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Item, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Item, E> {
+        Ok(Item::Other)
+    }
+
+    fn visit_newtype_struct<D: Deserializer<'de>>(self, deserializer: D) -> Result<Item, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Item, A::Error> {
+        while seq.next_element::<Item>()?.is_some() {}
+        Ok(Item::Other)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Item, A::Error> {
+        while map.next_entry::<Item, Item>()?.is_some() {}
+        Ok(Item::Other)
+    }
+
+    /// A tag, as ciborium hands it to a generic value: a variant whose content is the tag and the item.
+    fn visit_enum<A: serde::de::EnumAccess<'de>>(self, data: A) -> Result<Item, A::Error> {
+        use serde::de::VariantAccess;
+
+        struct Tagged;
+
+        impl<'de> serde::de::Visitor<'de> for Tagged {
+            type Value = Item;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a tag and an item")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Item, A::Error> {
+                seq.next_element::<u64>()?.ok_or_else(|| serde::de::Error::custom("expected tag"))?;
+                seq.next_element::<Item>()?.ok_or_else(|| serde::de::Error::custom("expected val"))?;
+                Ok(Item::Other)
+            }
+        }
+
+        let (_, variant): (String, _) = data.variant()?;
+        variant.tuple_variant(2, Tagged)
     }
 }
 
@@ -717,4 +915,157 @@ pub fn parse_method(method: &str) -> Option<(&str, ContentHash)> {
         return None;
     }
     Some((name, hash.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ciborium::Value;
+
+    /// The generic read [`PayloadHead`] replaced: the payload as a whole [`Value`], then its fields.
+    fn generic(bytes: &[u8]) -> PayloadHead {
+        let Ok(Value::Map(entries)) = ciborium::from_reader::<Value, _>(bytes) else { return PayloadHead::default() };
+        let field = |key: &str| entries.iter().find(|(k, _)| matches!(k, Value::Text(t) if t == key)).map(|(_, v)| v);
+        PayloadHead {
+            version: match field("v") {
+                Some(Value::Integer(v)) => u64::try_from(*v).ok(),
+                _ => None,
+            },
+            line: match field("line") {
+                Some(Value::Bytes(b)) => b.as_slice().try_into().ok().map(ContributionId),
+                _ => None,
+            },
+        }
+    }
+
+    fn agree(bytes: &[u8]) -> PayloadHead {
+        let head = PayloadHead::read(bytes);
+        assert_eq!(head, generic(bytes), "on {bytes:02x?}");
+        head
+    }
+
+    fn map(entries: Vec<(Value, Value)>) -> Vec<u8> {
+        to_cbor(&Value::Map(entries))
+    }
+
+    fn text(s: &str) -> Value {
+        Value::Text(s.into())
+    }
+
+    /// A map of `depth` nested one-entry maps, the innermost holding `v: 2`.
+    fn nested(depth: usize) -> Vec<u8> {
+        let mut bytes = [0xa1, 0x61, b'x'].repeat(depth);
+        bytes.extend(map(vec![(text("v"), Value::Integer(2.into()))]));
+        bytes
+    }
+
+    #[test]
+    fn the_head_reads_what_the_generic_value_held() {
+        let id = Value::Bytes(vec![9; 32]);
+        let two = || Value::Integer(2.into());
+        let head = agree(&map(vec![(text("x"), Value::Array(vec![])), (text("v"), two()), (text("line"), id.clone())]));
+        assert_eq!(head, PayloadHead { version: Some(2), line: Some(ContributionId([9; 32])) });
+        let cases: Vec<Vec<u8>> = vec![
+            // The first of duplicate keys counts, whatever the others hold.
+            map(vec![(text("v"), text("2")), (text("v"), two())]),
+            map(vec![(text("v"), two()), (text("v"), Value::Integer(3.into())), (text("line"), id.clone())]),
+            // Keys that aren't plain text never match.
+            map(vec![(Value::Bytes(b"v".to_vec()), two()), (Value::Tag(1, Box::new(text("line"))), id.clone())]),
+            map(vec![(Value::Array(vec![text("v")]), two()), (Value::Map(vec![(text("v"), two())]), id.clone())]),
+            // Values of the wrong kind or size.
+            map(vec![(text("v"), Value::Integer((-2).into())), (text("line"), Value::Bytes(vec![1; 31]))]),
+            map(vec![(text("v"), Value::Float(2.0)), (text("line"), Value::Bytes(vec![1; 33]))]),
+            map(vec![(text("v"), Value::Tag(7, Box::new(two()))), (text("line"), Value::Tag(7, Box::new(id.clone())))]),
+            map(vec![(text("v"), Value::Null), (text("line"), Value::Bool(true))]),
+            map(vec![(text("v"), Value::Integer(u64::MAX.into())), (text("line"), id.clone())]),
+            // Long strings, read past the scratch buffer.
+            map(vec![(text(&"k".repeat(5000)), Value::Bytes(vec![0; 5000])), (text("v"), two())]),
+            map(vec![(text("v"), two()), (text("line"), Value::Bytes(vec![0; 70_000]))]),
+            // Anything but a map holds no head.
+            to_cbor(&Value::Array(vec![text("v"), two()])),
+            to_cbor(&Value::Tag(55799, Box::new(Value::Map(vec![(text("v"), two())])))),
+            to_cbor(&two()),
+            vec![],
+        ];
+        for bytes in cases {
+            agree(&bytes);
+        }
+        let raw: &[&[u8]] = &[
+            // A bignum v reads as its integer, as the generic value read it.
+            &[0xa1, 0x61, b'v', 0xc2, 0x41, 0x02],
+            &[0xa1, 0x61, b'v', 0xc2, 0x49, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0xa1, 0x61, b'v', 0xc3, 0x41, 0x02],
+            // Indefinite lengths, for the map, a key and the line.
+            &[0xbf, 0x61, b'v', 0x02, 0xff],
+            &[0xbf, 0x7f, 0x61, b'v', 0xff, 0x02, 0xff],
+            &[
+                0xa1, 0x64, b'l', b'i', b'n', b'e', 0x5f, 0x50, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0x50,
+                2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 0xff,
+            ],
+            // A malformed item anywhere spoils the whole head: invalid UTF-8, an unknown simple value, a stray
+            // break, a truncation.
+            &[0xa2, 0x61, b'v', 0x02, 0x61, b'x', 0x61, 0xff],
+            &[0xa2, 0x61, b'v', 0x02, 0x61, b'x', 0xf0],
+            &[0xa2, 0x61, b'v', 0x02, 0x61, b'x', 0xff],
+            &[0xa2, 0x61, b'v', 0x02, 0x61, b'x'],
+            // Trailing bytes after the map are not read, by either.
+            &[0xa1, 0x61, b'v', 0x02, 0xff, 0xff],
+        ];
+        for bytes in raw {
+            agree(bytes);
+        }
+        assert_eq!(agree(&[0xa1, 0x61, b'v', 0xc2, 0x41, 0x02]).version, Some(2));
+        assert_eq!(agree(&[0xa1, 0x61, b'v', 0x02, 0xff, 0xff]).version, Some(2));
+    }
+
+    #[test]
+    fn the_nesting_bound_is_the_generic_reads() {
+        // ciborium's 256 levels: the innermost map is the 256th at depth 255.
+        assert_eq!(agree(&nested(255)), PayloadHead::default());
+        for depth in [0, 1, 200, 250, 253, 254, 255, 256, 257, 1000] {
+            agree(&nested(depth));
+        }
+        // Past the bound, nothing is read, so the record holds no head, as before.
+        let deep = [map(vec![(text("v"), Value::Integer(2.into()))]), nested(1000)].concat();
+        let mut too_deep = vec![0xa2];
+        too_deep.extend(&deep[1..deep.len() - nested(1000).len()]);
+        too_deep.extend([0x61, b'x']);
+        too_deep.extend(nested(1000));
+        assert_eq!(agree(&too_deep), PayloadHead::default());
+        let mut shallow = vec![0xa2];
+        shallow.extend(&deep[1..deep.len() - nested(1000).len()]);
+        shallow.extend([0x61, b'x']);
+        shallow.extend(nested(100));
+        assert_eq!(agree(&shallow).version, Some(2));
+    }
+
+    #[test]
+    fn mutated_payloads_read_the_same_head_as_the_generic_value() {
+        let decision = map(vec![
+            (text("v"), Value::Integer(2.into())),
+            (text("line"), Value::Bytes((0..32).collect())),
+            (text("x"), Value::Array(vec![Value::Tag(2, Box::new(Value::Bytes(vec![1, 2]))), Value::Float(1.5)])),
+            (text("y"), Value::Map(vec![(Value::Integer(1.into()), Value::Text("é".into()))])),
+        ]);
+        // A fixed xorshift, so a failure reproduces.
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let mut bytes = decision.clone();
+            for _ in 0..1 + next() % 3 {
+                let at = (next() as usize) % bytes.len();
+                match next() % 3 {
+                    0 => bytes[at] = next() as u8,
+                    1 => bytes.truncate(at.max(1)),
+                    _ => bytes.insert(at, next() as u8),
+                }
+            }
+            agree(&bytes);
+        }
+    }
 }

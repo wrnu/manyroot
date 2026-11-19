@@ -1836,3 +1836,111 @@ fn weave_line_list_without_a_counted_marker_lists_no_lines() {
     assert_eq!(w.ok(&["weave", "line", "list"]), "no lines\n");
     assert_eq!(w.json(&["weave", "line", "list", "--json"]), json!({"marker_author": null, "lines": []}));
 }
+
+/// Finding 2bb70bcae1d2: a line name that reads as an id prefix. Another writer's line whose id starts
+/// with the name of one of the root's lines (here it comes first; a writer could also grind one) neither
+/// takes the name over nor stops it, since a name reaches the root's lines before any id is tried. New
+/// such names are refused, and `weave check` lists one already written.
+#[test]
+fn a_hex_like_line_name_is_refused_and_one_already_written_cant_be_captured_by_an_id() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    w.ok(&["id", "new", "mallory"]);
+    let feat =
+        w.id_of(&["weave", "line", "create", "feat", "--owner-decision", OD, "--as", "mallory", "--json"], "line");
+    let name = &feat[..6];
+
+    // Line create and line policy --name refuse a name of 4 or more hex digits, of either case, writing
+    // nothing; shorter or not all hex is a name.
+    let before = w.contributions();
+    let upper = name.to_ascii_uppercase();
+    for refused in [name, upper.as_str(), "0000", &feat] {
+        let err = w.fails(&["weave", "line", "create", refused, "--owner-decision", OD, "--as", AS]);
+        assert!(err.contains("reads as a contribution id prefix") && err.contains("nothing was written"), "{err}");
+    }
+    let err = w.fails(&["weave", "line", "policy", "main", "--name", name, "--owner-decision", OD, "--as", AS]);
+    assert!(err.contains("reads as a contribution id prefix"), "{err}");
+    assert_eq!(w.contributions(), before);
+    w.ok(&["weave", "line", "create", "abc", "--owner-decision", OD, "--as", AS]);
+    w.ok(&["weave", "line", "create", "feed-1", "--owner-decision", OD, "--as", AS]);
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    let checked: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    assert!(
+        !checked["problems"].as_array().expect("problems").iter().any(|p| p["problem"] == "name_reads_as_id"),
+        "{checked}"
+    );
+
+    // A line the root wrote under that name before this build refused it, as an older build allowed.
+    let ids = w.json(&["id", "list", "--json"]);
+    let root = ids.as_array().expect("identities").iter().find(|i| i["name"] == AS).expect("the root")["agent"]
+        .as_str()
+        .expect("an agent")
+        .to_owned();
+    let hexed = Line {
+        v: VERSION,
+        name: name.into(),
+        integrators: vec![root.parse().expect("a key")],
+        validators: vec![],
+        goal_setters: vec![root.parse().expect("a key")],
+        checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
+        guardrails: Guardrails { max_known: 0, max_age: 0, protected: vec![] },
+        owner_decision: Some("decision 0123456789ab".into()),
+    };
+    let ours = w.artifact(&hexed.encode(), LINE_MEDIA_TYPE, AS);
+    assert!(!ours.starts_with(name), "the test needs the root's line not to share the prefix");
+
+    // The name reaches the root's line, for head and for the commands that judge it; the other writer's
+    // line is reached by a longer prefix or its id.
+    assert_eq!(w.json(&["weave", "head", "--line", name, "--json"])["line"], ours.as_str());
+    // Names are matched exactly, so the upper case isn't the name, and reads as the id prefix it is.
+    if upper != name {
+        assert_eq!(w.json(&["weave", "head", "--line", &upper, "--json"])["line"], feat.as_str());
+    }
+    assert_eq!(w.json(&["weave", "log", "--line", name, "--json"])["line"], ours.as_str());
+    assert_eq!(w.json(&["weave", "head", "--line", &feat[..12], "--json"])["line"], feat.as_str());
+    assert_eq!(w.json(&["weave", "head", "--line", &feat, "--json"])["line"], feat.as_str());
+    let integrated = w.json(&["weave", "integrate", "--line", name, "--as", AS, "--json"]);
+    assert!(integrated["decision"].is_string(), "{integrated}");
+    assert_eq!(w.json(&["weave", "head", "--line", name, "--json"])["heads"][0]["decision"], integrated["decision"]);
+
+    // weave check lists it, and the line list still marks it reached by name.
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    assert_eq!(out.status.code(), Some(1));
+    let checked: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    let rows: Vec<&Value> = checked["problems"]
+        .as_array()
+        .expect("problems")
+        .iter()
+        .filter(|p| p["problem"] == "name_reads_as_id")
+        .collect();
+    assert_eq!(rows.len(), 1, "{checked}");
+    assert_eq!((rows[0]["id"].as_str(), rows[0]["name"].as_str()), (Some(ours.as_str()), Some(name)));
+    let text = String::from_utf8(w.run_on(&w.ground, &["weave", "check"]).stdout).expect("UTF-8");
+    assert!(
+        text.contains(&format!("line {ours} ({name}) has a name that reads as a contribution id prefix")),
+        "{text}"
+    );
+    let list = w.json(&["weave", "line", "list", "--json"]);
+    let row = list["lines"].as_array().expect("lines").iter().find(|r| r["line"] == ours.as_str()).expect("listed");
+    assert_eq!(row["reach"], "name", "{row}");
+
+    // A contribution of any other kind whose id starts with the name doesn't stop it either: a decision of
+    // the root's own, on main, named by a prefix only it and nothing else here has.
+    let decision = w.json(&["weave", "head", "--json"])["heads"][0]["decision"].as_str().expect("a head").to_owned();
+    let planted = Line { name: decision[..8].into(), ..hexed };
+    let other = w.artifact(&planted.encode(), LINE_MEDIA_TYPE, AS);
+    assert_eq!(w.json(&["weave", "head", "--line", &decision[..8], "--json"])["line"], other.as_str());
+
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    let checked: Value = serde_json::from_slice(&out.stdout).expect("JSON");
+    let listed: Vec<&str> = checked["problems"]
+        .as_array()
+        .expect("problems")
+        .iter()
+        .filter(|p| p["problem"] == "name_reads_as_id")
+        .map(|p| p["id"].as_str().expect("an id"))
+        .collect();
+    assert_eq!(listed.len(), 2, "{checked}");
+    assert!(listed.contains(&ours.as_str()) && listed.contains(&other.as_str()), "{checked}");
+}

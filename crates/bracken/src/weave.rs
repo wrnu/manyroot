@@ -23,6 +23,7 @@ use bracken_tree::secrets::KnownKeys;
 use bracken_tree::{ContentHash, Entry, diff};
 use clap::Subcommand;
 use manyroot::contribution::MAX_CONTRIBUTION_BYTES;
+use manyroot::graph::MIN_PREFIX_LEN;
 use manyroot::{AgentId, Body, Contribution, ContributionId, Identity, Store};
 use serde_json::{Value, json};
 
@@ -530,6 +531,16 @@ pub(crate) fn run(s: &mut Store, agent: Option<&str>, command: WeaveCommand) -> 
                     "text": format!("line {} ({}) isn't by the counted marker's author, so its name reaches line {} instead; it is reached by its id only", v.id, name, theirs.id),
                 }));
             }
+            // A line of theirs whose name reads as an id prefix, as line create now refuses: the name reaches
+            // it before any id, so an id it starts takes a longer prefix, but a build before finding
+            // 2bb70bcae1d2 tried the id first, so anyone could take the name over there.
+            for v in lines.lines().filter(|v| Some(v.author) == author && reads_as_id(&v.policy.name)) {
+                let name = &v.policy.name;
+                rows.push(json!({
+                    "problem": "name_reads_as_id", "id": v.id, "name": name,
+                    "text": format!("line {} ({}) has a name that reads as a contribution id prefix, which an older build reads as an id first; reach it by its id there", v.id, name),
+                }));
+            }
             if out.json {
                 print_json(
                     &json!({"ground": s.info().ground, "root": ix.root(), "marker": ix.counted_marker(), "problems": rows}),
@@ -878,22 +889,22 @@ fn decision_json(d: &DecisionRecord, names: &super::Names) -> Value {
 
 /// The lines and decisions of the replica, judging only the lines `given` names and the default line
 /// ([`Lines::build_for`], task a4d1a06a1072), so a line the command doesn't name costs it nothing. Each
-/// text names the line it is the id of, every line of that name the counted marker's author opened (so
-/// an ambiguous name is refused as before, and a line of that name anyone else opened isn't judged: gap
-/// G9), or the line of the decision or proposal it is the id of. Anything else names no line; what the
-/// command resolves afterwards, on the Lines returned, is resolved as on a full build.
+/// text names every line of that name the counted marker's author opened (so an ambiguous name is refused
+/// as before, and a line of that name anyone else opened isn't judged: gap G9), and the line it is the id
+/// of, or the line of the decision or proposal it is the id of. Both readings are judged, as a text may be
+/// a name and an id prefix at once (finding 2bb70bcae1d2), and judging a line more changes nothing about
+/// another. Anything else names no line; what the command resolves afterwards, on the Lines returned, is
+/// resolved as on a full build.
 pub(crate) fn lines_for(s: &Store, ix: &Index, given: &[Option<&str>]) -> Lines {
     let author = marker_author(s, ix);
     judged_for(s, ix, |lines| {
         let mut named = Vec::new();
         for given in given.iter().flatten() {
-            match s.graph().resolve_prefix(given) {
-                Ok(id) => {
-                    named.extend(lines.version(&id).map(|v| v.id));
-                    named.extend(lines.decision(&id).map(|d| d.decision.line));
-                    named.extend(lines.proposal_named(&id).map(|p| p.line));
-                }
-                Err(_) => named.extend(by_name(lines, author.as_ref(), given).map(|v| v.id)),
+            named.extend(by_name(lines, author.as_ref(), given).map(|v| v.id));
+            if let Ok(id) = s.graph().resolve_prefix(given) {
+                named.extend(lines.version(&id).map(|v| v.id));
+                named.extend(lines.decision(&id).map(|d| d.decision.line));
+                named.extend(lines.proposal_named(&id).map(|p| p.line));
             }
         }
         named
@@ -965,22 +976,51 @@ fn marker_author(s: &Store, ix: &Index) -> Option<AgentId> {
     ix.counted_marker().map(|m| s.graph().get(&m).expect("indexed from the graph").author())
 }
 
+/// Whether a line name could also be read as a contribution id prefix: at least [`MIN_PREFIX_LEN`] hex
+/// digits, of either case. `weave line create` and `weave line policy --name` refuse such a name, and
+/// `weave check` lists a line of the counted marker's author's that has one, so a name never depends on
+/// which ids happen to exist (finding 2bb70bcae1d2).
+pub(crate) fn reads_as_id(name: &str) -> bool {
+    name.len() >= MIN_PREFIX_LEN && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Refuses a new line name that [`reads_as_id`].
+pub(crate) fn refuse_id_like_name(name: &str) -> Result<()> {
+    if reads_as_id(name) {
+        bail!(
+            "the line name {name:?} reads as a contribution id prefix ({MIN_PREFIX_LEN} or more hex digits), so it \
+             could be confused with one; choose a name with a character that isn't a hex digit, and nothing was \
+             written"
+        );
+    }
+    Ok(())
+}
+
 /// The current lines named `name` whose first artifact is by `author`, the counted marker's author:
 /// the lines a name reaches. None without a counted marker.
 fn by_name<'a>(lines: &'a Lines, author: Option<&'a AgentId>, name: &'a str) -> impl Iterator<Item = &'a Version> {
     lines.lines().filter(move |v| v.policy.name == name && Some(&v.author) == author)
 }
 
-/// A line named on the command line, by its id (or a prefix) or its name; the default line if none is
+/// A line named on the command line, by its name or its id (or a prefix); the default line if none is
 /// given. A name reaches only the lines the counted marker's author opened (gap G9): a line anyone else
-/// opens, of any name, is reached by its id, so a second `main` doesn't stop `--line main`.
+/// opens, of any name, is reached by its id, so a second `main` doesn't stop `--line main`. The name is
+/// tried first, so a text that is both the name of one of those lines and an id prefix names the line:
+/// anyone can write a contribution whose id starts with a few given hex digits, so an id read first would
+/// let them take a hex-like name over, or stop it (finding 2bb70bcae1d2). Such a line's other
+/// contributions, and anything else whose id starts with its name, take a longer prefix.
 fn resolve_line(s: &Store, ix: &Index, lines: &Lines, given: Option<&str>, what: &str) -> Result<ContributionId> {
     let Some(given) = given else {
         return lines
             .default_line()
             .context("this Ground has no default line: no line named main by the marker's author");
     };
-    if let Ok(id) = s.graph().resolve_prefix(given) {
+    let author = marker_author(s, ix);
+    let named: Vec<ContributionId> = by_name(lines, author.as_ref(), given).map(|v| v.id).collect();
+    if let [one] = named.as_slice() {
+        return Ok(*one);
+    }
+    if let (true, Ok(id)) = (named.is_empty(), s.graph().resolve_prefix(given)) {
         if lines.line(&id).is_some() {
             return Ok(id);
         }
@@ -990,8 +1030,6 @@ fn resolve_line(s: &Store, ix: &Index, lines: &Lines, given: Option<&str>, what:
         let c = s.graph().get(&id).expect("resolved ids exist");
         bail!("{what}: {} is a {}, not a line", id.short(), kind_of(c));
     }
-    let author = marker_author(s, ix);
-    let named: Vec<ContributionId> = by_name(lines, author.as_ref(), given).map(|v| v.id).collect();
     match named.as_slice() {
         [one] => Ok(*one),
         [] => {
