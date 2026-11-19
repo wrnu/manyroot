@@ -11,7 +11,8 @@ fn date_from_now(days: i64) -> String {
 /// A throwaway Ground and main line with one of everything metrics counts, all from this week: two merged
 /// PRs (one a fix) and a revert on main; a real, a rejected and an untriaged finding; PR #1 reviewed at two
 /// heads and PR #2 at one; a misfire claim and a retracted merge-gate pass; an approval and an owner ask;
-/// and five experiments. With --today a week ahead, the week counted is this one. It counts each, lists the
+/// five experiments; and two heads whose builder's last passes came 30 and 10 minutes after their commits,
+/// a median of 20. With --today a week ahead, the week counted is this one. It counts each, lists the
 /// experiments with their days left (one with no expires line ends 14 days after it was written, one asking
 /// for more than 28 days gets 28), lapsed, or kept by the manager's decision, names what one lacks, and
 /// writes nothing to the Ground.
@@ -64,6 +65,28 @@ fn metrics_counts_the_week_and_the_experiments_and_writes_nothing() {
     bk(&dir, &["relate", &decision, "supports", &kept, "--as", "manager"]);
     let odd = claim("Experiment (manager): odd\nrule: odd\nmetric: vibes\nbaseline: 1", "experiment", "manager");
 
+    // Two heads committed 30 and 10 minutes ago, each with its builder's pass now: a median of 20 minutes.
+    // The builder's earlier pass and a reviewer's don't move it.
+    let head = |name: &str, minutes_ago: u64| {
+        put(&dir, name, name);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let date = format!("@{} +0000", now - minutes_ago * 60);
+        assert!(run(&dir, "git", &["add", "-A"]).status.success());
+        let out = command(&dir, "git", &["commit", "-qm", name]).env("GIT_COMMITTER_DATE", &date).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
+        claim(&format!("PR #4 e @ {sha}: {name}"), "pr", "builder")
+    };
+    let thirty = head("thirty", 30);
+    let ten = head("ten", 10);
+    evidence(&thirty, "pass", "cargo fmt --check @ x", "builder");
+    let gone = evidence(&ten, "pass", "late @ x", "builder");
+    bk(&dir, &["retract", &gone, "--as", "builder"]);
+    for pr in [&thirty, &ten] {
+        evidence(pr, "pass", "scripts/test-table --remote @ x", "builder");
+    }
+    evidence(&ten, "pass", "independent review (m) @ x", "reviewer");
+
     let before = bk(&dir, &["log", "--json"]);
     let today = date_from_now(7);
     let out = run(&dir, "scripts/metrics", &["--today", &today, "--json"]);
@@ -86,6 +109,8 @@ fn metrics_counts_the_week_and_the_experiments_and_writes_nothing() {
     for (key, value) in want {
         assert_eq!(got[key], value, "{key}: {got}");
     }
+    let minutes = got["builder_pass_minutes"].as_f64().unwrap_or_else(|| panic!("{got}"));
+    assert!((19.5..21.5).contains(&minutes), "builder_pass_minutes {minutes}: {got}");
     let state = |id: &str| {
         let all = got["experiments"].as_array().unwrap();
         all.iter().find(|e| e["id"] == id[..12]).unwrap_or_else(|| panic!("{id}: {got}")).clone()

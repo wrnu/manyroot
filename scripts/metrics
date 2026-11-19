@@ -28,6 +28,9 @@
 #   owner_asks_gated, owner_asks_other
 #                         claims tagged approval / owner-ask written in the week
 #   experiments_active    current experiments not yet expired on --today
+#   builder_pass_minutes  for the pr claims written in the week whose head this checkout holds, the minutes
+#                         from the head commit's committer time to the last pass its claim's author recorded
+#                         on it; the median (null when there are none)
 #
 # An experiment is a current claim tagged experiment with lines 'rule:', 'metric:' (a key above),
 # 'baseline:', 'target:' and 'expires: <YYYY-MM-DD>'. With no expires line it ends 14 days after it was
@@ -66,10 +69,15 @@ trap 'rm -r "$tmp"' EXIT
 "$here/bk" log --tag experiment --current --json >"$tmp/experiments.json" || fail "couldn't read the experiments"
 "$here/bk" log --tag decision --current --json >"$tmp/decisions.json" || fail "couldn't read the decisions"
 git -C "$repo" log "$ref" --first-parent --format='%ct%x09%s' >"$tmp/main.txt"
+# Each pr claim's head commit time, for the heads this checkout holds (others are left out).
+jq -r '.[] | select(.kind == "claim" and ((.body.tags // []) | index("pr"))) | .body.statement // ""
+  | capture("^PR #[0-9]+ [^ ]+ @ (?<sha>[0-9a-f]{40}):") | .sha' "$tmp/all.json" | sort -u |
+  git -C "$repo" cat-file --batch-check='%(objectname) %(objecttype)' | awk '$2 == "commit" { print $1 }' |
+  git -C "$repo" log --no-walk=unsorted --stdin --format='%H%x09%ct' >"$tmp/heads.txt"
 
 jq -nr --arg week "$week" --arg today "$today" --arg ref "$ref" --argjson as_json "$json" \
   --slurpfile all "$tmp/all.json" --slurpfile exps "$tmp/experiments.json" --slurpfile decs "$tmp/decisions.json" \
-  --rawfile main "$tmp/main.txt" '
+  --rawfile main "$tmp/main.txt" --rawfile heads "$tmp/heads.txt" '
 def day: . / 86400 | floor;
 def date_s: . * 86400 | todate[0:10];
 def of_date: . + "T00:00:00Z" | fromdateiso8601 | day;
@@ -102,7 +110,19 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
     and (.body.from as $f | any($decision_ids[]; . == $f))) | .body.to)) as $supported
 | ["prs_merged", "reverts", "follow_up_fixes", "findings_real", "findings_rejected", "findings_untriaged",
    "findings_real_per_pr", "findings_rejected_per_pr", "review_rounds_per_pr", "gate_misfires", "owner_asks_gated",
-   "owner_asks_other", "experiments_active"] as $keys
+   "owner_asks_other", "experiments_active", "builder_pass_minutes"] as $keys
+| ($heads | split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: (.[1] | tonumber)}) | from_entries) as $head_time
+| ([$claims[] | select(((.body.tags // []) | index("pr")) and inweek) | . as $pr
+    | ((.body.statement // "") | capture("^PR #[0-9]+ [^ ]+ @ (?<sha>[0-9a-f]{40}):") | .sha) as $sha
+    | select($head_time[$sha] != null)
+    | [$evidence[] | select(.body.target == $pr.id and .body.verdict == "pass" and .author_name == $pr.author_name
+        and (.id as $i | any($retracted[]; . == $i) | not)) | .timestamp_ms] as $passes
+    | select(($passes | length) > 0)
+    | (($passes | max) / 1000 - $head_time[$sha]) / 60] | sort) as $pass_minutes
+| (if ($pass_minutes | length) == 0 then null
+   else ($pass_minutes | length) as $l
+     | (if $l % 2 == 1 then $pass_minutes[($l - 1) / 2] else ($pass_minutes[$l / 2 - 1] + $pass_minutes[$l / 2]) / 2 end)
+     | . * 10 | round / 10 end) as $builder_pass_minutes
 | ($exps | map(select(.kind == "claim" and .retracted == false and ((.body.tags // []) | index("experiment"))))
    | map((.timestamp_ms / 1000 | day) as $start | field("expires") as $given
      | (if $given and ($given | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) then $given | of_date else $start + 14 end) as $want
@@ -126,6 +146,7 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
    owner_asks_gated: ($claims | map(select(((.body.tags // []) | index("approval")) and inweek)) | length),
    owner_asks_other: ($claims | map(select(((.body.tags // []) | index("owner-ask")) and inweek)) | length),
    experiments_active: ($experiments | map(select(.state == "active")) | length),
+   builder_pass_minutes: $builder_pass_minutes,
    experiments: $experiments}
 | .findings_real_per_pr = ratio(.findings_real; $n) | .findings_rejected_per_pr = ratio(.findings_rejected; $n)
 | if $as_json then . else
@@ -135,6 +156,7 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
     + " (per PR: \(.findings_real_per_pr | show) real, \(.findings_rejected_per_pr | show) rejected)"
     + " | review rounds per PR \(.review_rounds_per_pr | show) | gate misfires \(.gate_misfires)"
     + " | owner asks \(.owner_asks_gated) gated / \(.owner_asks_other) other"
+    + " | builder pass minutes (median) \(.builder_pass_minutes | show)"
     + " | experiments: " + (if (.experiments | length) == 0 then "none" else
         (.experiments | map("\(.id) \(.metric // "no metric") "
           + (if .state == "active" then "\(.days_left) days left" elif .state == "kept" then "kept by a decision"
