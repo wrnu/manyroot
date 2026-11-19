@@ -10,7 +10,8 @@ use crate::support::*;
 /// results `validate` wrote, one '<check> <pass|fail> <result>' line each; `$T/weave/fail-<check>` makes
 /// that check fail, `no-<check>` leaves it out of the policy, `unrecorded-<check>` makes validate stop
 /// there, recording nothing for it, as the real one does for a check that can't run, `slow-<command>` makes
-/// that read hang (show, or the weave subcommand: head, green, verify), and `extra` lists
+/// that read hang (show, or the weave subcommand: head, green, verify), `green-stderr` holds what green
+/// prints on stderr after its JSON, `green-fails` makes it fail with an error, and `extra` lists
 /// more policy checks; `show` knows the ids in `proposals`. The reads weave-gate's takeover check makes
 /// (`id list`, `weave check`, `weave head`, and `show` of anything but a proposal) go to the real bracken,
 /// on the throwaway Weave Ground at `$T/weave/ground` that [`weave_ground`] builds, except that
@@ -62,6 +63,10 @@ case "$sub" in
       shift
     done ;;
   green)
+    if [ -e "$W/green-fails" ]; then
+      echo "bracken: error: line main has no policy version" >&2
+      exit 1
+    fi
     m=$(opt --manifest "$@")
     state="$W/state-${m#blake3:}"
     checks='[]'
@@ -74,7 +79,8 @@ case "$sub" in
         fails: (if $v == "fail" then [{result: $id}] else [] end), replaced: []}]' <<<"$checks")
     done
     jq -n --arg m "$m" --argjson c "$checks" --arg v "$(cat "$W/version" 2>/dev/null || echo "$(printf '%064x' 7)")" \
-      '{line: "l", version: $v, manifest: $m, green: (($c | length) > 0 and all($c[]; .green)), checks: $c}' ;;
+      '{line: "l", version: $v, manifest: $m, green: (($c | length) > 0 and all($c[]; .green)), checks: $c}'
+    [ ! -e "$W/green-stderr" ] || cat "$W/green-stderr" >&2 ;;
   *) exit 9 ;;
 esac
 "#;
@@ -989,6 +995,41 @@ fn a_record_main_judges_that_doesnt_decode_is_refused() {
         // Retracted, it counts for nothing, and the gate reads the Ground again.
         on_ground(&ground, &["retract", &future, "--as", "weave-integrator"]);
         assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: honest again");
+    }
+}
+
+/// weave-gate reads only weave green's stdout as JSON (task 3b96803d923c, note ca79c4253ed1). A hint or
+/// other warning on its stderr no longer turns a green result into "isn't in the shape this reads"; a
+/// warning there that a record doesn't decode still refuses, as weave head's does in taken_over; and a
+/// failed green is still named by the last line of its error output.
+#[test]
+fn weave_greens_stderr_is_kept_apart_from_its_json() {
+    for scripts in SCRIPTS {
+        let (b, claim, _, _, _) = honest_pointer(scripts);
+        let w = b.weave_dir();
+        let pointers = b.pointers(&claim).len();
+        std::fs::write(w.join("green-stderr"), "hint: to follow this line's events, run\n  weave listen\n").unwrap();
+        let out = b.record(&claim, 1);
+        assert!(out.status.success(), "{scripts}: a hint on stderr: {}", text(&out));
+        assert_eq!(b.pointers(&claim).len(), pointers + 1, "{scripts}: no pointer recorded");
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: the pointer counts beside a hint");
+
+        let warning = "bracken: warning: 1 policy version(s) on line main don't decode with this build: abc";
+        std::fs::write(w.join("green-stderr"), format!("{warning}\n")).unwrap();
+        let why = "line main's judgement holds a record this binary can't read (1 policy version(s) on line main";
+        for out in [b.record(&claim, 1), b.merge_one(1, &claim, true)] {
+            assert!(!out.status.success() && text(&out).contains(why), "{scripts}: {}", text(&out));
+        }
+        assert_eq!(b.pointers(&claim).len(), pointers + 1, "{scripts}: a pointer was recorded beside the warning");
+        std::fs::remove_file(w.join("green-stderr")).unwrap();
+
+        std::fs::write(w.join("green-fails"), "").unwrap();
+        let why = "failed: bracken: error: line main has no policy version";
+        for out in [b.record(&claim, 1), b.merge_one(1, &claim, true)] {
+            assert!(!out.status.success() && text(&out).contains(why), "{scripts}: {}", text(&out));
+        }
+        std::fs::remove_file(w.join("green-fails")).unwrap();
+        assert!(b.merge_one(1, &claim, true).status.success(), "{scripts}: counts again");
     }
 }
 

@@ -255,11 +255,21 @@ merged() {
 }
 
 # green_of <manifest>: weave green --manifest's JSON, checked for shape; if it fails or isn't, prints why
-# instead and returns 1.
+# instead and returns 1. Only its stdout is read as JSON: its stderr, kept apart, gives the message, and a
+# warning there that a record doesn't decode refuses as taken_over's does (task 3b96803d923c).
 green_of() {
-  local green
-  green=$(wv weave green --line main --manifest "$1" --json 2>&1) ||
-    { echo "weave green --manifest $1 failed: $(tail -n 1 <<<"$green")"; return 1; }
+  local green err said
+  err=$(mktemp)
+  if ! green=$(wv weave green --line main --manifest "$1" --json 2>"$err"); then
+    said=$(grep -v '^[[:space:]]*$' "$err" | tail -n 1 || true)
+    rm -f "$err"
+    echo "weave green --manifest $1 failed: $said"
+    return 1
+  fi
+  said=$(grep -m 1 "don't decode with this build" "$err" || true)
+  rm -f "$err"
+  [ -z "$said" ] ||
+    { echo "line main's judgement holds a record this binary can't read (${said#bracken: warning: })"; return 1; }
   jq -e '(.checks | type) == "array" and (.version | type) == "string"
     and all(.checks[]; (.check | type) == "string" and (.green | type) == "boolean"
       and (.passes | type) == "array" and (.fails | type) == "array")' <<<"$green" >/dev/null 2>&1 ||
