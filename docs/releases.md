@@ -71,6 +71,27 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-11-19: the gate's scripts hold against another writer (task ab5acf6b2ae5)
+
+Hostile-writer fixes, PR 1, scripts only (decision `a2e0b9c241c7`): no record's bytes, validity rule, format
+or fixture changes, every Ground opens and reads as before, and the pinned binary needn't change. What
+changes is what the merge gate's scripts accept (docs/design/weave-freeze.md 2.5, the last four rows).
+- **Supersedes.** `scripts/merge` (the pr claim, a batch claim, an owner-review, the owner's approvals) and
+  `scripts/weave-gate`'s switch count another identity's supersede only when manager or owner wrote it;
+  anyone else's is ignored and named (finding `20a7646f3579`). A takeover's newer pr claim needs the
+  manager's supersede of the old one to stop it counting.
+- **What Weave leaves out.** `scripts/weave-gate` takes git's counted run when git's merge holds a submodule,
+  or a root entry other than `.bracken/` that could fold to start with `.bracken` (finding `81648e74e519`).
+- **Timeouts.** Every Weave read the gate makes runs under `timeout` or `gtimeout`, `WEAVE_GATE_TIMEOUT`
+  seconds (120 by default), and fails closed when it runs out; with neither tool on `PATH` the gate doesn't
+  run (report `0b5600268856`).
+- **Objections.** `scripts/weave-shadow` answers, once, `overridden`, discussion objections from identities
+  outside line main's policy (finding `598258717737`). It reads the policy with a new read through
+  `scripts/weave`: exactly `weave line policy <line> --dry-run` with no `--owner-decision`, given a fixed
+  all-zero placeholder that never reaches a record (answer `f47f2f255c75`).
+- **Migration:** none. A supersede of a gate claim that a non-manager wrote no longer stops a merge: the
+  manager supersedes a taken-over pr claim itself.
+
 ### 2026-11-17: an unreadable Weave record stops only the lines that judge it (task ca6338ee7701)
 
 G8 of docs/design/weave-freeze.md, a reader change shipped before any Weave v2 is written (decisions

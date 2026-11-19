@@ -207,6 +207,13 @@ fn merge_counts_a_batch_pass_only_under_every_rule() {
         assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
         assert!(text(&out).contains("isn't a current manager claim tagged batch"), "{scripts}: {}", text(&out));
         assert!(b.merge(&["1", &b.claims[0][..12], "--dry-run"]).status.success(), "{scripts}: before superseding");
+        // Finding 20a7646f3579: a supersede by anyone but its author, manager or owner is ignored, and named.
+        let x = bk(&b.dir, &["claim", "not this batch", "--tag", "note", "--as", "val"]);
+        bk(&b.dir, &["relate", x.lines().next().unwrap(), "supersedes", &batch, "--as", "val"]);
+        let out = b.merge(&["--batch", &batch[..12], "--dry-run"]);
+        assert!(out.status.success(), "{scripts}: val's supersede counted: {}", text(&out));
+        assert!(text(&out).contains(&format!("batch claim {} is superseded by", &batch[..12])), "{}", text(&out));
+        assert!(b.merge(&["1", &b.claims[0][..12], "--dry-run"]).status.success(), "{scripts}: val's supersede");
         bk(&b.dir, &["claim", "a different batch", "--tag", "batch", "--supersedes", &batch, "--as", "manager"]);
         let out = b.merge(&["--batch", &batch[..12], "--dry-run"]);
         assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
