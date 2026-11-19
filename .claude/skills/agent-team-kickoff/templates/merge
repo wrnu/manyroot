@@ -7,9 +7,15 @@
 # Only the manager merges, so it runs only as manager (a dry run defaults to it), and
 # triage and deferrals count only when manager wrote them.
 #
+# Superseded, here and in scripts/weave-gate, means superseded by its own author, or by manager or owner
+# (finding 20a7646f3579): any writer can relate a claim 'supersedes' any other, so anyone else's supersede
+# of a claim these checks read (the pr claim, a batch claim, an owner-review, the owner's approvals) is
+# ignored, and named on a 'note  ignored' line. A takeover's new pr claim stops the old one counting once
+# the manager supersedes it (finding 29a53011dacb).
+#
 # Checks, in order, and reports each:
-#   1. the pr claim is current (not retracted, and superseded by no one) and starts
-#      "PR #<n> <branch> @ <full sha>:";
+#   1. the pr claim is current (not retracted, and superseded by no one whose supersede counts: its
+#      author, manager or owner) and starts "PR #<n> <branch> @ <full sha>:";
 #   2. under the given policy, `scripts/bk show <claim>` reports it accepted;
 #   3. every finding that contradicts the claim has the manager's evidence, and
 #      every confirmed one (a pass) is deferred by the manager: a current task tagged deferred,
@@ -52,7 +58,7 @@
 #   frozen: what Weave's format freeze guards (docs/design/weave-freeze.md 2.4, G6; decision
 #      bae92c497714), as main's scripts/code-scope frozen names it for the head since main's tip. If it
 #      names anything, then for each kind of line it prints: a 'frozen:' path needs a current claim
-#      tagged owner-review, by manager, not retracted or superseded, whose first line names the pr
+#      tagged owner-review, by manager, not retracted or superseded (as in 1), whose first line names the pr
 #      claim's full id and the head's full sha; an 'owner:' path (a golden vector, a pinned fixture value,
 #      tests/fixtures/) also needs the owner's own go (question 3): a current approval the owner ran with
 #      scripts/owner-approve, not --delegated, of the pr claim's full id, that owner related supports the
@@ -62,7 +68,7 @@
 #      nothing to check; any other exit, or an exit 0 with a line that isn't '<kind>: <path> (<why>)' of
 #      those three kinds, fails the check (findings db2dc1c6120e, e3f9ae2b1820);
 #   7. with --owner-approval, for a PR whose class needs the owner's go (docs/development.md, Owner
-#      approvals): a current claim tagged approval, written by owner (scripts/owner-approve), that owner
+#      approvals): a current claim tagged approval (not superseded, as in 1), written by owner (scripts/owner-approve), that owner
 #      related supports this pr claim itself, by its full id. An approval of a task, another PR or an
 #      earlier head doesn't count (findings 9e8e0c849724, fb07d1777cf6): each head needs its own. A
 #      manager-signed quote doesn't count. In v0 keys are shared, so this checks recorded intent, not
@@ -122,18 +128,37 @@ done
 batch_member='' batch_precheck=false no_cleanup=false
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+# Who may supersede another's claim for these checks (finding 20a7646f3579): log --current already hides a
+# claim its own author superseded; one superseded by someone else stops counting only if that someone is
+# manager or owner. Anyone can relate a claim of theirs 'supersedes' any claim, and only they can retract
+# it, so a supersede by any other writer is ignored here, and reported on one line (ignored_supersedes).
+# The relation's author is superseded_by_others[].author_name, from the local agents/ names.
+live='def live: .retracted == false and (.superseded_by_others | type) == "array"
+  and ([.superseded_by_others[] | select(.author_name == "manager" or .author_name == "owner")] | length) == 0;'
+# ignored_supersedes <log --current JSON> <full id> <what>: one line naming the supersedes of <full id> that
+# don't count, if it has any; nothing otherwise.
+ignored_supersedes() {
+  local who
+  who=$(jq -r --arg id "$2" '[.[] | select(.id == $id) | .superseded_by_others[]?
+    | select(.author_name != "manager" and .author_name != "owner")
+    | "\(.id[:12]) by \(.author_name // .author[:12])"] | join(", ")' <<<"$1") || who='(unreadable)'
+  [ -z "$who" ] ||
+    printf '%-4s  %-12s %s\n' note ignored "$3 ${2:0:12} is superseded by $who: ignored, since only its author, manager or owner can supersede it here (finding 20a7646f3579)"
+}
+
 # read_batch <id>: the batch claim, if it is current, the manager's, tagged batch, and well formed. Sets
 # b_full, b_main, b_key, b_n and the arrays b_pr, b_claim, b_sha (members in the tested order, from 0);
 # otherwise returns 1 with batch_why saying why.
 read_batch() {
-  local about items item k=0
+  local about items item k=0 batches
   about=$(bk show "$1" --json 2>/dev/null) || { batch_why="no contribution $1 in the Ground"; return 1; }
   b_full=$(jq -r .id <<<"$about")
   jq -e '.kind == "claim" and .retracted == false and .author_name == "manager" and (.body.tags | index("batch"))' \
     <<<"$about" >/dev/null || { batch_why="$1 isn't a current manager claim tagged batch"; return 1; }
-  bk log --tag batch --current --json | jq -e --arg id "$b_full" \
-    'any(.[]; .id == $id and .retracted == false and (.superseded_by_others | length) == 0)' >/dev/null ||
+  batches=$(bk log --tag batch --current --json) || { batch_why="couldn't read the current batch claims"; return 1; }
+  jq -e --arg id "$b_full" "$live"' any(.[]; .id == $id and live)' <<<"$batches" >/dev/null ||
     { batch_why="batch $1 is superseded"; return 1; }
+  ignored_supersedes "$batches" "$b_full" "batch claim" >&2
   [[ $(jq -r .body.statement <<<"$about") =~ ^Batch\ of\ ([1-9][0-9]*)\ on\ main\ ([0-9a-f]{40})\ tree\ ([0-9a-f]{40,64}),\ tested\ in\ this\ order:\ (.*)$ ]] ||
     { batch_why="batch $1's statement isn't 'Batch of <n> on main <sha> tree <key>, tested in this order: ...'"; return 1; }
   b_n=${BASH_REMATCH[1]} b_main=${BASH_REMATCH[2]} b_key=${BASH_REMATCH[3]} items=${BASH_REMATCH[4]}
@@ -247,13 +272,15 @@ full=$(jq -r '.id' <<<"$shown")
 branch=${BASH_REMATCH[2]}
 sha=${BASH_REMATCH[3]}
 current=$(bk log --tag pr --current --json) || fail "couldn't read the current pr claims"
-# log --current keeps a claim someone else superseded, marked; that one isn't current either.
-if jq -e --arg id "$full" 'any(.[]; .id == $id and .retracted == false and (.superseded_by_others | length) == 0)' \
-  <<<"$current" >/dev/null; then
+# log --current keeps a claim someone else superseded, marked; that one isn't current either if the
+# manager or the owner superseded it (a takeover, finding 29a53011dacb). Anyone else's is ignored, and
+# reported (finding 20a7646f3579).
+if jq -e --arg id "$full" "$live"' any(.[]; .id == $id and live)' <<<"$current" >/dev/null; then
   check ok claim "$claim is the current pr claim for #$pr: $branch @ $sha"
 else
-  check FAIL claim "$claim isn't the current pr claim (retracted, or superseded by its author or someone else)"
+  check FAIL claim "$claim isn't the current pr claim (retracted, or superseded by its author, manager or owner)"
 fi
+ignored_supersedes "$current" "$full" "pr claim"
 
 # 2. The gate.
 status=$(jq -r '.assessment.status' <<<"$shown")
@@ -675,12 +702,13 @@ else
     named() { printf '(^|[^0-9a-f])%s([^0-9a-f]|$)' "$1"; }
     if [ -n "$frozen_paths" ]; then
       reviews=$(bk log --tag owner-review --current --json) || fail "couldn't read the current owner-review claims"
-      review=$(jq -r --arg id "$(named "$full")" --arg sha "$(named "$sha")" '[.[] | select(.kind == "claim"
-        and .author_name == "manager" and .retracted == false and (.superseded_by_others | length) == 0
+      review=$(jq -r --arg id "$(named "$full")" --arg sha "$(named "$sha")" "$live"' [.[] | select(.kind == "claim"
+        and .author_name == "manager" and live
         and (.body.tags | index("owner-review"))
         and ((.body.statement // "") | split("\n")[0] | test($id) and test($sha)))] | .[0].id // empty' <<<"$reviews")
       if [ -n "$review" ]; then
         have+=("owner-review ${review:0:12}")
+        ignored_supersedes "$reviews" "$review" "owner-review"
       else
         missing+=("$frozen_paths: no current owner-review claim by manager whose first line names pr claim $full and $sha")
       fi
@@ -692,11 +720,12 @@ else
       approval=''
       for a in $(jq -r --arg t "$full" '.referrers[] | select(.kind == "relation" and .retracted == false
         and .author_name == "owner" and .body.kind == "supports" and .body.to == $t) | .body.from' <<<"$shown"); do
-        if jq -e --arg a "$a" --arg of "of $full:" 'any(.[]; .id == $a and .author_name == "owner"
-          and .retracted == false and (.superseded_by_others | length) == 0 and (.body.tags | index("approval"))
+        if jq -e --arg a "$a" --arg of "of $full:" "$live"' any(.[]; .id == $a and .author_name == "owner"
+          and live and (.body.tags | index("approval"))
           and ((.body.tags | index("delegated")) | not) and ((.body.statement // "") | contains($of)))' \
           <<<"$approvals" >/dev/null; then
           approval=$a
+          ignored_supersedes "$approvals" "$a" "the owner's approval"
           break
         fi
       done
@@ -731,9 +760,9 @@ if $owner_approval; then
   approved=""
   for a in $(jq -r --arg t "$full" '.referrers[] | select(.kind == "relation" and .retracted == false
     and .author_name == "owner" and .body.kind == "supports" and .body.to == $t) | .body.from' <<<"$shown"); do
-    if jq -e --arg a "$a" 'any(.[]; .id == $a and .author_name == "owner" and .retracted == false
-      and (.superseded_by_others | length) == 0)' <<<"$approvals" >/dev/null; then
+    if jq -e --arg a "$a" "$live"' any(.[]; .id == $a and .author_name == "owner" and live)' <<<"$approvals" >/dev/null; then
       approved="${a:0:12} supports the pr claim"
+      ignored_supersedes "$approvals" "$a" "the owner's approval"
       ! jq -e --arg a "$a" 'any(.[]; .id == $a and (.body.tags | index("delegated")))' <<<"$approvals" >/dev/null ||
         approved="$approved, signed by the manager on the owner's delegation"
       break
