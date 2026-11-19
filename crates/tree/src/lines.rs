@@ -22,7 +22,7 @@ use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
 use crate::ancestry::{self, Ancestry, Stats};
 use crate::format::{
     Change, DECISION_MEDIA_TYPE, Decision, Disposition, FormatError, LINE_MEDIA_TYPE, Line, PROPOSAL_MEDIA_TYPE,
-    Proposal, Record, VERSION, payload_line, payload_version, undecodable_why,
+    PayloadHead, Proposal, Record, VERSION, undecodable_why,
 };
 use crate::ground::Index;
 use crate::hash::ContentHash;
@@ -290,7 +290,10 @@ impl Lines {
                     Ok(policy) => {
                         lines.versions.insert(*id, Version { id: *id, author: c.author(), policy });
                     }
-                    Err(e) => undecoded.push((*id, UnreadableKind::PolicyVersion, undecodable_why(content, e), None)),
+                    Err(e) => {
+                        let why = undecodable_why(&PayloadHead::read(content), e);
+                        undecoded.push((*id, UnreadableKind::PolicyVersion, why, None))
+                    }
                 },
                 PROPOSAL_MEDIA_TYPE => {
                     if let Ok(proposal) = Proposal::decode(content) {
@@ -310,10 +313,12 @@ impl Lines {
                     // One that names no line, or is retracted, would change nothing here, whatever it holds. Nor
                     // would one of a version this build reads, a malformed version 1: no build ever decodes it,
                     // so it is left to `weave check`, as before G8 (finding 9c0ae448ee12).
+                    // The head is read once, without building its other values (finding 3832a3c04d2d).
                     Err(e) => {
-                        let newer = payload_version(content).is_some_and(|v| v > VERSION);
-                        if let Some(line) = payload_line(content).filter(|_| newer && !g.is_retracted(id)) {
-                            undecoded.push((*id, UnreadableKind::Decision, undecodable_why(content, e), Some(line)));
+                        let head = PayloadHead::read(content);
+                        let newer = head.version.is_some_and(|v| v > VERSION);
+                        if let Some(line) = head.line.filter(|_| newer && !g.is_retracted(id)) {
+                            undecoded.push((*id, UnreadableKind::Decision, undecodable_why(&head, e), Some(line)));
                         }
                     }
                 },

@@ -69,6 +69,34 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-11-19: Weave readers bound an unreadable record's cost, and a line name never reads as an id first (task fe2c9d96a787)
+
+Two fixes from the hostile-writer review (task `ee121849975b`), accepted by the owner (decision
+`a2e0b9c241c7`). Reader changes only: no format, encoding, id, golden vector or fixture changes, and the same
+records are valid, count and are unreadable as before. Every existing Ground opens and reads as before.
+- **An unreadable record costs about its own size** (finding `3832a3c04d2d`). For a line or decision
+  artifact that doesn't decode, G8 reads its top-level `v` and `line`. It used to decode the whole payload
+  into a generic CBOR value to do so, up to three times, at about a hundred times its size, so one 16 MB
+  artifact by any writer cost every Weave command 1.68 GB and 2.5 s. Now both are read once, walking past
+  the other values without building them (`PayloadHead` in `crates/tree/src/format.rs`): time about linear
+  in its bytes, memory no more than its longest string. It reads what the generic value held, within the
+  same bounds (256 levels of nesting), so the refusals and warnings name the same records, lines and
+  versions.
+- **A line name never reads as an id first** (finding `2bb70bcae1d2`, task `3b9ab8a4a918`). `--line`,
+  `--into`, `line policy <line>` and `line merge <line>` tried a text as an id prefix before looking for a
+  line of that name, so a writer who wrote a contribution whose id starts with a hex-like name of one of
+  the root's lines could take the name over or stop it. Now a name reaches the counted marker's author's
+  lines first, and a text is read as an id prefix only when none of them has that name; an id that a
+  name of theirs shadows takes a longer prefix. `weave line create` and `weave line policy --name` refuse
+  a name of 4 or more hex digits, of either case, writing nothing. `weave check` lists a line of the
+  marker's author's with such a name as `name_reads_as_id`, so it exits 1 while one exists.
+- **Old and new binaries.** They agree wherever no line of the root's has a hex-like name, which is every
+  Ground we hold today (the finding found none), and an older binary pays the old cost for an unreadable
+  record but counts the same ones. **Migration:** none for the records; upgrade the pinned `.bracken-bin`
+  and `~/bracken-weave`'s binary after the merge, as for any CLI change. After the upgrade, the manager
+  checks that `scripts/weave weave check --json` lists no `name_reads_as_id`; if one appears, reach that
+  line by its id, since an older binary reads its name as an id first.
+
 ### 2026-11-17: an unreadable Weave record stops only the lines that judge it (task ca6338ee7701)
 
 G8 of docs/design/weave-freeze.md, a reader change shipped before any Weave v2 is written (decisions
