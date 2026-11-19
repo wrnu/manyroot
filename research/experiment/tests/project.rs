@@ -103,8 +103,8 @@ fn a_hidden_set_is_checked_by_digest_and_reported_in_counts() {
 }
 
 /// These need Docker, not macOS (finding d160c76dafca): where it isn't running, each says so and passes without
-/// checking anything, unless BRACKEN_TEST_REQUIRE_DOCKER is set, as in .github/workflows/research.yml's Linux
-/// job, which runs them (docs/development.md).
+/// checking anything, unless BRACKEN_TEST_REQUIRE_DOCKER is set, as in the manager's by-hand run on the Mac,
+/// which scripts/merge asks for on a head that changes them (docs/development.md).
 mod docker {
     use super::*;
 

@@ -282,11 +282,11 @@ pub fn docker_running() -> bool {
 
 /// The image tests pin: [`IMAGE`], or the one `BRACKEN_TEST_PYTHON_IMAGE` names. None, having said why, where
 /// Docker isn't running, or, elsewhere than macOS, where the image isn't pulled. On macOS an image not pulled
-/// fails them. With `BRACKEN_TEST_REQUIRE_DOCKER` set, as in research.yml's Linux job, which runs them
-/// (docs/development.md), neither is a skip: both fail.
+/// fails them. With `BRACKEN_TEST_REQUIRE_DOCKER` set, as in the manager's run on the Mac that scripts/merge
+/// asks for (docs/development.md), neither is a skip: both fail.
 #[doc(hidden)]
 pub fn for_tests() -> Option<Python> {
-    // Where Docker must run these (research.yml's Linux job, finding d160c76dafca), a skip is a failure.
+    // Where Docker must run these (the manager's run on the Mac, finding d160c76dafca), a skip is a failure.
     let required = std::env::var_os("BRACKEN_TEST_REQUIRE_DOCKER").is_some_and(|v| !v.is_empty());
     if !docker_running() {
         assert!(!required, "BRACKEN_TEST_REQUIRE_DOCKER is set, but Docker isn't running here");

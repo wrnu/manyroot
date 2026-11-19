@@ -63,6 +63,12 @@
 #      @ <sha>'. Each refusal names the paths and what's missing. Only frozen's exit 3 and its one line mean
 #      nothing to check; any other exit, or an exit 0 with a line that isn't '<kind>: <path> (<why>)' of
 #      those three kinds, fails the check (findings db2dc1c6120e, e3f9ae2b1820);
+#   docker: the research workspace's Docker tests run on no CI runner that has Docker (finding d160c76dafca,
+#      answer 5b3aa570643b; Linux portability is deferred task 1efdf2e34f46), so a head whose change since
+#      its merge base with main's tip touches research/experiment/src/python*, research/experiment/src/
+#      project_grader* or research/experiment/tests/project.rs (matched ASCII-lowercased) needs a current
+#      manager pass on the pr claim whose method starts 'research docker tests' and ends ' @ <sha>': the
+#      by-hand run on the Mac with Docker running (docs/development.md). Any other head passes this check;
 #   7. with --owner-approval, for a PR whose class needs the owner's go (docs/development.md, Owner
 #      approvals): a current claim tagged approval (not superseded, as in 1), written by owner (scripts/owner-approve), that owner
 #      related supports this pr claim itself, by its full id. An approval of a task, another PR or an
@@ -713,6 +719,34 @@ else
   fi
 fi
 
+# 6b. The research Docker tests (see the header): run by hand on the Mac, recorded by the manager.
+docker_case="no research Docker code changed"
+if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  check FAIL docker "$sha isn't on origin"
+elif ! docker_base=$(git -C "$main" merge-base "$tip" "$sha") ||
+  ! docker_changed=$(git -C "$main" diff --no-renames --name-only "$docker_base" "$sha"); then
+  check FAIL docker "couldn't list what $sha changed since its merge base with main ($tip)"
+else
+  docker_paths=$(while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$(printf '%s' "$f" | LC_ALL=C tr 'A-Z' 'a-z')" in
+      research/experiment/src/python* | research/experiment/src/project_grader* | research/experiment/tests/project.rs)
+        echo "$f" ;;
+    esac
+  done <<<"$docker_changed")
+  if [ -z "$docker_paths" ]; then
+    check ok docker "$docker_case"
+  elif docker_pass=$(jq -r --arg t "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
+    and .retracted == false and .author_name == "manager" and .body.target == $t and .body.verdict == "pass"
+    and (.body.method | startswith("research docker tests") and endswith(" @ " + $sha)))] | .[0].id // empty' \
+    <<<"$shown") && [ -n "$docker_pass" ]; then
+    docker_case="research Docker code changed ($(tr '\n' ' ' <<<"$docker_paths" | sed 's/ $//')), and the manager's run of its Docker tests at $sha passed (${docker_pass:0:12})"
+    check ok docker "$docker_case"
+  else
+    check FAIL docker "the head changes research's Docker-tested code ($(tr '\n' ' ' <<<"$docker_paths" | sed 's/ $//')), which no CI runner tests with Docker: run them on the Mac with Docker running (cd research && cargo nextest run -E 'test(~docker::) | binary(grade_run) | binary(weave)') and record a manager pass on pr claim $full, method 'research docker tests @ $sha' (docs/development.md)"
+  fi
+fi
+
 # 7. The owner's own approval, when the class needs it.
 owner_case="not required for this class"
 if $owner_approval; then
@@ -748,8 +782,8 @@ if $dry_run; then
   exit 0
 fi
 
-printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\ngithub head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nfrozen: %s\nowner: %s\n' \
-  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$frozen_case" "$owner_case" >"$details"
+printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\ngithub head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nfrozen: %s\ndocker: %s\nowner: %s\n' \
+  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$frozen_case" "$docker_case" "$owner_case" >"$details"
 written=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
   fail "couldn't record the merge-gate evidence; not merging"
 # The first line's last word: 'evidence <id>' (task d4e958fd6719), or a bare id from an older pinned binary.

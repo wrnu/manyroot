@@ -24,9 +24,10 @@ fn a_calls_deadline_is_the_hosts_moved_by_its_servers_start() {
     assert_eq!(super::call_deadline(host, Duration::ZERO, host + s(60)), host);
 }
 
-/// In `docker`, a group of their own (finding d160c76dafca): they need Docker, not macOS. research.yml's Linux
-/// job runs them with Docker and BRACKEN_TEST_REQUIRE_DOCKER set, so there a skip fails; elsewhere, where Docker
-/// isn't running, each says so and passes (decision ac22cedd8fee, docs/development.md).
+/// In `docker`, a group of their own (finding d160c76dafca): they need Docker, not macOS. No CI runner runs
+/// them with Docker yet (Linux portability is deferred task 1efdf2e34f46): the manager runs them by hand on the
+/// Mac, with BRACKEN_TEST_REQUIRE_DOCKER set so a skip fails, and scripts/merge asks for that run on a head that
+/// changes them (decision ac22cedd8fee, answer 5b3aa570643b, docs/development.md).
 mod docker {
     use std::path::{Path, PathBuf};
 

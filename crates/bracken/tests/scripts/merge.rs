@@ -499,6 +499,61 @@ fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
     }
 }
 
+/// The research Docker tests (finding d160c76dafca, answer 5b3aa570643b): no CI runner has Docker for them,
+/// so a head touching research/experiment/src/python*, src/project_grader* or tests/project.rs, in any letter
+/// case, fails the docker check until the manager records a pass on its pr claim whose method starts
+/// 'research docker tests' and names that head. Someone else's pass, one at another sha, or a retracted one
+/// doesn't count. A head that touches none of them passes the check with nothing recorded.
+#[test]
+fn merge_asks_for_the_research_docker_run_only_where_the_docker_code_changed() {
+    for scripts in SCRIPTS {
+        for (path, needs) in [
+            ("research/experiment/src/python.rs", true),
+            ("research/experiment/src/python/tests.rs", true),
+            ("research/experiment/src/project_grader/tests.rs", true),
+            ("research/experiment/tests/project.rs", true),
+            ("Research/Experiment/src/Python.rs", true),
+            ("research/experiment/src/plan.rs", false),
+            ("code.txt", false),
+        ] {
+            let (_tmp, dir, mut merge) =
+                merge_dry_run_command(scripts, |_| {}, |d| put(d, path, "a change\n"), |_| {}, None);
+            let docker = |merge: &mut Command| check_line(&merge.output().unwrap(), "docker");
+            let line = docker(&mut merge);
+            if !needs {
+                assert!(
+                    line.starts_with("ok ") && line.contains("no research Docker code changed"),
+                    "{scripts}: {path}: {line}"
+                );
+                continue;
+            }
+            assert!(
+                line.starts_with("FAIL ") && line.contains("research docker tests @ "),
+                "{scripts}: {path}: {line}"
+            );
+            let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "pr"]).stdout).unwrap().trim().to_owned();
+            let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
+            let claim = prs[0]["id"].as_str().unwrap().to_owned();
+            let method = |at: &str| format!("research docker tests (cargo nextest run -E 'test(~docker::)') @ {at}");
+            // Not counted: val's pass, the manager's at another sha, a retracted one, another method.
+            bk(&dir, &["evidence", &claim, "pass", "--method", &method(&sha), "--as", "val"]);
+            bk(&dir, &["evidence", &claim, "pass", "--method", &method(&"0".repeat(40)), "--as", "manager"]);
+            let gone = bk(&dir, &["evidence", &claim, "pass", "--method", &method(&sha), "--as", "manager"]);
+            bk(&dir, &["retract", &gone, "--as", "manager"]);
+            bk(&dir, &["evidence", &claim, "pass", "--method", &format!("research tests @ {sha}"), "--as", "manager"]);
+            let line = docker(&mut merge);
+            assert!(line.starts_with("FAIL "), "{scripts}: {path}: counted one that shouldn't: {line}");
+            // The manager's pass at the head counts.
+            bk(&dir, &["evidence", &claim, "pass", "--method", &method(&sha), "--as", "manager"]);
+            let line = docker(&mut merge);
+            assert!(
+                line.starts_with("ok ") && line.contains("the manager's run of its Docker tests"),
+                "{scripts}: {path}: {line}"
+            );
+        }
+    }
+}
+
 /// Finding d494f36dee9d: merge records its "merge gate" pass before it asks GitHub to merge, and a
 /// live one is what tells `log --open` a PR merged. When the merge call fails, merge asks GitHub
 /// (findings f1fc25380904, 3623855aa0e8). Merged at the head keeps the pass. Open, at any head, retracts

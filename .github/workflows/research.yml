@@ -8,17 +8,16 @@
 # The research tests that run the bracken binary find it beside their own: research/.cargo/config.toml
 # builds into the root's target/, so each job builds bracken at the root first.
 #
-# Docker (finding d160c76dafca): the tests that run agent code in a container (the `docker` modules of
-# research/experiment, among them the containment checks) run in the Linux job, with the pinned image pulled
-# and BRACKEN_TEST_REQUIRE_DOCKER set, so a test that would skip there for want of Docker fails instead.
-# GitHub's macOS runners have no Docker: there they print 'skipped' and pass. The tests that need both macOS
-# and Docker (the macos_only modules of tests/grade_run.rs and tests/weave.rs) can run on no runner here;
-# docs/development.md says how to run them on the Mac.
+# Docker (finding d160c76dafca, answer 5b3aa570643b): the tests that run agent code in a container (the
+# `docker` modules of research/experiment, among them the containment checks) run on no runner here. GitHub's
+# macOS runners have no Docker, and on Linux's the Python profile can't read its inputs yet (deferred task
+# 1efdf2e34f46), so they print 'skipped' and pass on both. The manager runs them by hand on the Mac, and
+# scripts/merge asks for that run on any head that changes their code (docs/development.md).
 #
 # Every test runs somewhere, as scripts/test-table --split checks for the product workspace: each job lists
 # its tests (nextest's and the doctests', each with and without the ignored ones) and keeps them as an
 # artifact, and the lists job fails, naming it, on any test that runs on macOS but is missing or ignored on
-# Linux and isn't in a macos_only module, or any docker test that runs on macOS (skipping) but not on Linux.
+# Linux and isn't in a macos_only module.
 #
 # Hardened as ci.yml is: read-only token, no secrets, never pull_request_target or workflow_run,
 # third-party actions pinned by full commit sha, no `${{ }}` of event data inside a script, the cargo
@@ -93,15 +92,6 @@ jobs:
           echo "$NEXTEST_LINUX_SHA256  $dir/$tar" | sha256sum -c --quiet -
           tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
           echo "$dir" >>"$GITHUB_PATH"
-      # The image research/experiment/src/python.rs pins as IMAGE, pulled by its digest.
-      - name: Docker (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          image=$(sed -n 's/^pub const IMAGE: &str = "\(.*\)";$/\1/p' research/experiment/src/python.rs)
-          [ -n "$image" ] || { echo "no IMAGE in research/experiment/src/python.rs"; exit 1; }
-          docker info --format '{{.ServerVersion}}'
-          docker pull -q "$image"
-          echo "BRACKEN_TEST_REQUIRE_DOCKER=1" >>"$GITHUB_ENV"
       - name: Tools (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -196,13 +186,6 @@ jobs:
               bad=1
             fi
           done
-          # Every docker test that runs on macOS (where it skips) runs on Linux, where Docker is (finding
-          # d160c76dafca). The ones ignored on both sides are helpers another test runs with --ignored.
-          docker=$(runs macOS nextest | grep 'docker::' | LC_ALL=C comm -23 - <(runs Linux nextest) || true)
-          if [ -n "$docker" ]; then
-            echo "::error title=Docker tests not run on Linux::these docker tests don't run on Linux:"
-            printf '%s\n' "$docker"
-            bad=1
-          fi
-          echo "docker tests run on Linux: $(runs Linux nextest | grep -c 'docker::' || true)"
+          # The docker tests skip on both runners: the manager runs them on the Mac (scripts/merge's docker check).
+          echo "docker tests, run by hand on the Mac: $(runs Linux nextest | grep -c 'docker::' || true)"
           exit "$bad"

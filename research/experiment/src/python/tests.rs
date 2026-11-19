@@ -1,6 +1,6 @@
 //! These need Docker, with the pinned image pulled (`docker pull` [`IMAGE`]): where Docker isn't running, each
-//! says so and passes without checking anything, unless BRACKEN_TEST_REQUIRE_DOCKER is set, as in
-//! .github/workflows/research.yml's Linux job, which runs them.
+//! says so and passes without checking anything, unless BRACKEN_TEST_REQUIRE_DOCKER is set, as in the
+//! manager's by-hand run on the Mac that scripts/merge asks for (docs/development.md).
 
 /// A plan's pin of a host interpreter, from before agent code ran in containers, is refused saying so, not as an
 /// unknown field (finding 264a0f0c8160); a pin of an image is read.
@@ -15,9 +15,10 @@ fn an_old_plans_interpreter_pin_is_refused_saying_why() {
     assert!(serde_json::from_value::<super::PythonPin>(extra).is_err(), "no other field");
 }
 
-/// In `docker`, a group of their own (finding d160c76dafca): they need Docker, not macOS. research.yml's Linux
-/// job runs them with Docker and BRACKEN_TEST_REQUIRE_DOCKER set, so there a skip fails; elsewhere, where Docker
-/// isn't running, each says so and passes (decision ac22cedd8fee, docs/development.md).
+/// In `docker`, a group of their own (finding d160c76dafca): they need Docker, not macOS. No CI runner runs
+/// them with Docker yet (Linux portability is deferred task 1efdf2e34f46): the manager runs them by hand on the
+/// Mac, with BRACKEN_TEST_REQUIRE_DOCKER set so a skip fails, and scripts/merge asks for that run on a head that
+/// changes them (decision ac22cedd8fee, answer 5b3aa570643b, docs/development.md).
 pub(crate) mod docker {
     use std::io::BufRead;
     use std::path::Path;
