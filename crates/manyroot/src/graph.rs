@@ -149,7 +149,7 @@ impl Graph {
         if content.ground != self.ground {
             return Err(RuleViolation::WrongGround { expected: self.ground, found: content.ground });
         }
-        let size = c.encode().len();
+        let size = c.encoded_len();
         if size > MAX_CONTRIBUTION_BYTES {
             return Err(RuleViolation::TooLarge(size));
         }

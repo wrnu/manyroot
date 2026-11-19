@@ -19,7 +19,7 @@
 //! any number of agent processes can write to one replica without locking:
 //! two processes writing concurrently just produce concurrent contributions.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -107,7 +107,12 @@ impl Store {
             fs::create_dir_all(&p).map_err(io(&p))?;
         }
         let json = serde_json::to_string_pretty(&info).expect("ground info serializes") + "\n";
-        fs::write(&manifest, json).map_err(io(&manifest))?;
+        match write_new(&manifest, json.as_bytes()) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(StoreError::AlreadyExists(dir.to_owned()));
+            }
+            other => other.map_err(io(&manifest))?,
+        }
         Ok(Store { dir: dir.to_owned(), graph: Graph::new(info.ground), info })
     }
 
@@ -141,8 +146,8 @@ impl Store {
         let mut graph = Graph::new(info.ground);
         let mut batch = Vec::new();
         if trusted.is_empty() {
-            for (path, _) in files {
-                batch.push(read_object(dir, path)?);
+            for (path, regular) in files {
+                batch.push(read_regular_object(dir, path, regular)?);
             }
         } else {
             // Name every object by the id its file name spells, only in its canonical (lowercase)
@@ -180,10 +185,11 @@ impl Store {
                 seen.insert(id);
                 pool.insert(id, (c, true));
             }
-            let mut rest: Vec<(ContributionId, PathBuf)> = on_disk.into_iter().map(|(id, (p, _))| (id, p)).collect();
+            let mut rest: Vec<(ContributionId, PathBuf, bool)> =
+                on_disk.into_iter().map(|(id, (p, regular))| (id, p, regular)).collect();
             rest.sort();
-            for (_, path) in rest {
-                let c = read_object(dir, path)?;
+            for (_, path, regular) in rest {
+                let c = read_regular_object(dir, path, regular)?;
                 pool.insert(c.id(), (c, false));
             }
             // `Graph::import_with`'s walk, Kahn's algorithm with ready ids taken smallest first, over the
@@ -319,7 +325,15 @@ impl Store {
         identity.save(&key_path)?;
         let entry = AgentEntry { name: name.to_owned(), agent: identity.agent_id() };
         let json = serde_json::to_string_pretty(&entry).expect("agent entry serializes") + "\n";
-        fs::write(&entry_path, json).map_err(io(&entry_path))?;
+        let written = match write_new(&entry_path, json.as_bytes()) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(StoreError::NameTaken(name.to_owned())),
+            other => other.map_err(io(&entry_path)),
+        };
+        if written.is_err() {
+            // The key was made just now, for this entry alone.
+            let _ = fs::remove_file(&key_path);
+        }
+        written?;
         Ok(identity)
     }
 
@@ -342,8 +356,13 @@ impl Store {
             Err(e) => return Err(io(&dir)(e)),
         };
         for entry in entries {
-            let path = entry.map_err(io(&dir))?.path();
+            let entry = entry.map_err(io(&dir))?;
+            let path = entry.path();
             if path.extension().is_some_and(|e| e == "json") {
+                if !entry.file_type().map_err(io(&path))?.is_file() {
+                    return Err(StoreError::Corrupt { path, reason: "not a regular file (or a symlink)".into() });
+                }
+                // Checks the name, and that it's the file's.
                 out.push(Identity::load(&path)?);
             }
         }
@@ -351,38 +370,72 @@ impl Store {
         Ok(out)
     }
 
-    /// Every agent with a known name: the public directory plus local
-    /// identities, sorted by name.
+    /// Every agent with a known name: the public directory plus local identities, sorted by name.
+    ///
+    /// Fails closed, as [`StoreError::Corrupt`], on a directory that could misname an agent: an entry
+    /// in `agents/` that isn't a regular file named `<name>.json` for a valid name, one whose `name`
+    /// isn't its file's, two entries with one name or one key, or a local identity whose key the
+    /// directory lists under another name, or whose name it lists with another key. Names starting with
+    /// a dot are skipped, as another process's write in flight. [`Store::open`] doesn't read `agents/`,
+    /// so call this to check it.
     pub fn agents(&self) -> Result<Vec<AgentEntry>, StoreError> {
-        let mut by_name = std::collections::BTreeMap::new();
+        let mut by_name: BTreeMap<String, AgentEntry> = BTreeMap::new();
+        let mut by_key: HashMap<AgentId, String> = HashMap::new();
         let dir = self.agents_dir();
-        match fs::read_dir(&dir) {
-            Ok(entries) => {
-                for entry in entries {
-                    let path = entry.map_err(io(&dir))?.path();
-                    if path.extension().is_none_or(|e| e != "json") {
-                        continue;
-                    }
-                    let text = fs::read_to_string(&path).map_err(io(&path))?;
-                    let entry: AgentEntry = serde_json::from_str(&text)
-                        .map_err(|e| StoreError::Corrupt { path: path.clone(), reason: e.to_string() })?;
-                    by_name.insert(entry.name.clone(), entry);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries.collect::<Vec<_>>(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
             Err(e) => return Err(io(&dir)(e)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(io(&dir))?;
+            let path = entry.path();
+            let corrupt = |reason: String| StoreError::Corrupt { path: path.clone(), reason };
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                return Err(corrupt("not named <name>.json".into()));
+            };
+            if file_name.starts_with('.') {
+                continue; // in-flight write from another process
+            }
+            let Some(stem) = file_name.strip_suffix(".json").filter(|n| identity::validate_name(n).is_ok()) else {
+                return Err(corrupt("not named <name>.json for a valid name".into()));
+            };
+            if !entry.file_type().map_err(io(&path))?.is_file() {
+                return Err(corrupt("not a regular file (or a symlink)".into()));
+            }
+            let text = fs::read_to_string(&path).map_err(io(&path))?;
+            let listed: AgentEntry = serde_json::from_str(&text).map_err(|e| corrupt(e.to_string()))?;
+            if listed.name != stem {
+                return Err(corrupt(format!("names {:?}, not {stem:?}", listed.name)));
+            }
+            if by_name.contains_key(&listed.name) {
+                return Err(corrupt(format!("a second entry named {:?}", listed.name)));
+            }
+            if let Some(other) = by_key.insert(listed.agent, listed.name.clone()) {
+                return Err(corrupt(format!("lists the key of {other:?} under another name")));
+            }
+            by_name.insert(listed.name.clone(), listed);
         }
         for identity in self.identities()? {
             let local = AgentEntry { name: identity.name().to_owned(), agent: identity.agent_id() };
-            match by_name.get(&local.name) {
-                Some(listed) if listed.agent != local.agent => {
+            let entry_path = self.agents_dir().join(format!("{}.json", local.name));
+            match (by_name.get(&local.name), by_key.get(&local.agent)) {
+                (Some(listed), _) if listed.agent != local.agent => {
                     return Err(StoreError::Corrupt {
-                        path: self.agents_dir().join(format!("{}.json", local.name)),
+                        path: entry_path,
                         reason: format!("lists a different key than local identity {:?}", local.name),
                     });
                 }
-                Some(_) => {}
-                None => {
+                (_, Some(other)) if *other != local.name => {
+                    return Err(StoreError::Corrupt {
+                        path: self.agents_dir().join(format!("{other}.json")),
+                        reason: format!("lists local identity {:?}'s key under another name", local.name),
+                    });
+                }
+                (Some(_), _) => {}
+                (None, _) => {
+                    by_key.insert(local.agent, local.name.clone());
                     by_name.insert(local.name.clone(), local);
                 }
             }
@@ -448,8 +501,10 @@ fn read_info(dir: &Path) -> Result<GroundInfo, StoreError> {
 }
 
 /// Every object file's path, and whether the listing says it's a regular file (never following a link):
-/// each entry in a directory under `objects/`, but those whose names start with a dot (another
-/// process's write in flight) or aren't UTF-8.
+/// each entry in a shard directory under `objects/`, but those whose names start with a dot (another
+/// process's write in flight) or aren't UTF-8. Every entry of `objects/` not named with a dot must be a
+/// real directory, by the listing's own file type: a symlinked shard, or a stray file, is
+/// [`StoreError::Corrupt`].
 fn object_files(dir: &Path) -> Result<Vec<(PathBuf, bool)>, StoreError> {
     let mut out = Vec::new();
     let objects = dir.join("objects");
@@ -459,10 +514,15 @@ fn object_files(dir: &Path) -> Result<Vec<(PathBuf, bool)>, StoreError> {
         Err(e) => return Err(io(&objects)(e)),
     };
     for shard in shards {
-        let shard = shard.map_err(io(&objects))?.path();
-        if !shard.is_dir() {
+        let shard = shard.map_err(io(&objects))?;
+        let path = shard.path();
+        if shard.file_name().to_str().is_some_and(|n| n.starts_with('.')) {
             continue;
         }
+        if !shard.file_type().map_err(io(&path))?.is_dir() {
+            return Err(StoreError::Corrupt { path, reason: "not a shard directory (or a symlink)".into() });
+        }
+        let shard = path;
         for entry in fs::read_dir(&shard).map_err(io(&shard))? {
             let entry = entry.map_err(io(&shard))?;
             let path = entry.path();
@@ -475,6 +535,15 @@ fn object_files(dir: &Path) -> Result<Vec<(PathBuf, bool)>, StoreError> {
         }
     }
     Ok(out)
+}
+
+/// [`read_object`], refusing first an object the listing says isn't a regular file (`regular`), so a
+/// symlink is never followed.
+fn read_regular_object(dir: &Path, path: PathBuf, regular: bool) -> Result<Contribution, StoreError> {
+    if !regular {
+        return Err(StoreError::Corrupt { path, reason: "not a regular file (or a symlink)".into() });
+    }
+    read_object(dir, path)
 }
 
 /// Reads and decodes one object, refusing it unless its path is its id's.
@@ -494,20 +563,50 @@ fn object_path(dir: &Path, id: &ContributionId) -> PathBuf {
 }
 
 /// Writes one object without following a symlink out of the Ground: `objects/` and the shard
-/// must be real directories (created here if missing), and the temporary file is created new, so
-/// an existing file or symlink in its place fails the write. The rename replaces whatever is at
-/// the object's path, a symlink included, rather than writing through it.
+/// must be real directories (created here if missing), and the temporary file is created new, under
+/// a random name, so an existing file or symlink in its place fails the write. The file is synced
+/// before the rename, which replaces whatever is at the object's path, a symlink included, rather
+/// than writing through it. A failed write leaves no temporary file behind.
 fn write_object(dir: &Path, c: &Contribution) -> Result<(), StoreError> {
     let path = object_path(dir, &c.id());
     let shard = path.parent().expect("object path has a shard dir");
     for d in [&dir.join("objects"), shard] {
         real_dir(d)?;
     }
-    let tmp = shard.join(format!(".tmp-{}-{}", std::process::id(), c.id().short()));
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(io(&tmp))?;
-    std::io::Write::write_all(&mut file, &c.encode()).map_err(io(&tmp))?;
-    drop(file);
-    fs::rename(&tmp, &path).map_err(io(&path))
+    let (tmp, file) = temp_file(shard, &c.id().short()).map_err(io(shard))?;
+    let written = write_synced(file, &c.encode()).map_err(io(&tmp));
+    let done = written.and_then(|()| fs::rename(&tmp, &path).map_err(io(&path)));
+    if done.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    done
+}
+
+/// Creates a new file in `dir` named `.tmp-<pid>-<tag>-<random>`, never opening one that exists.
+fn temp_file(dir: &Path, tag: &str) -> std::io::Result<(PathBuf, fs::File)> {
+    let mut nonce = [0u8; 8];
+    getrandom::fill(&mut nonce)
+        .map_err(|e| std::io::Error::other(format!("no randomness for a temporary name: {e}")))?;
+    let tmp = dir.join(format!(".tmp-{}-{tag}-{}", std::process::id(), hex::encode(nonce)));
+    let file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    Ok((tmp, file))
+}
+
+fn write_synced(mut file: fs::File, bytes: &[u8]) -> std::io::Result<()> {
+    std::io::Write::write_all(&mut file, bytes)?;
+    file.sync_all()
+}
+
+/// Writes a new file at `path` whole or not at all: the bytes go to a synced temporary file beside
+/// it, which is then linked in place. The link never replaces what's at `path`, nor follows a symlink
+/// there, a dangling one included: either gives [`std::io::ErrorKind::AlreadyExists`]. The temporary
+/// file is always removed.
+fn write_new(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().expect("a file has a directory");
+    let (tmp, file) = temp_file(dir, "new")?;
+    let done = write_synced(file, bytes).and_then(|()| fs::hard_link(&tmp, path));
+    let removed = fs::remove_file(&tmp);
+    done.and(removed)
 }
 
 /// Creates `d` if it doesn't exist, and refuses it if it is anything but a directory, a symlink

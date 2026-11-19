@@ -445,7 +445,7 @@ impl Session {
         let mut batch = Vec::new();
         while let Some(id) = self.queue.front() {
             let c = graph.get(id).expect("offered and planned contributions are in the graph");
-            let entry = (BUNDLE_ENTRY + c.encode().len()) as u64;
+            let entry = (BUNDLE_ENTRY + c.encoded_len()) as u64;
             if size + entry > limit {
                 if batch.is_empty() && self.limits.batch_bytes < peer {
                     return Err(SyncError::TooLargeForOwnLimit(*id));

@@ -93,11 +93,22 @@ impl Identity {
         Signature(self.key.sign(&signing_message(id)).to_bytes())
     }
 
+    /// Reads an identity file, `<name>.json` for the identity it holds. Refuses anything but a regular
+    /// file (a symlink included), a name [`validate_name`] refuses, or a file named for another identity.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
         let p = path.display().to_string();
-        let text = fs::read_to_string(path).map_err(|source| IdentityError::Io { path: p.clone(), source })?;
+        let io = |source| IdentityError::Io { path: p.clone(), source };
         let malformed = |reason: String| IdentityError::Malformed { path: p.clone(), reason };
+        if !fs::symlink_metadata(path).map_err(io)?.is_file() {
+            return Err(malformed("not a regular file (or a symlink)".into()));
+        }
+        let text = fs::read_to_string(path).map_err(io)?;
         let file: IdentityFile = serde_json::from_str(&text).map_err(|e| malformed(e.to_string()))?;
+        validate_name(&file.name)?;
+        let expected = format!("{}.json", file.name);
+        if path.file_name().and_then(|n| n.to_str()) != Some(expected.as_str()) {
+            return Err(malformed(format!("holds identity {:?}, so its file must be named {expected}", file.name)));
+        }
         let mut secret = [0u8; 32];
         hex::decode_to_slice(&file.secret_key, &mut secret).map_err(|e| malformed(e.to_string()))?;
         let identity = Self { name: file.name, key: SigningKey::from_bytes(&secret) };
