@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# metrics: the week's process metrics, and every experiment's state, from the Ground and git (task
+# 9b65c13e9d66, decision 9be9ab6b1b1f; AGENTS.md, Process changes and experiments).
+#
+#   metrics [--week <Monday, YYYY-MM-DD>] [--today <YYYY-MM-DD>] [--ref <git ref>] [--json]
+#
+# Read-only: it reads `scripts/bk log --json` and `git log <ref> --first-parent`, fetches nothing and writes
+# nothing. It prints one claim statement, which the manager records:
+#
+#   scripts/bk claim "$(scripts/metrics)" --tag metrics --as <you>
+#
+# --week is the Monday (UTC) the week starts; by default the last complete week before --today (by default,
+# today). --ref is the main line (origin/main, or main where there's no origin/main). --json prints the
+# numbers as an object instead, keyed as an experiment's 'metric:' names them:
+#
+#   prs_merged            first-parent commits in the week whose subject ends '(#<n>)'
+#   reverts               first-parent commits in the week whose subject starts 'Revert'
+#   follow_up_fixes       merged PRs in the week whose title says fix or follow-up (a heuristic)
+#   findings_real, findings_rejected, findings_untriaged
+#                         finding claims written in the week, by the manager's latest evidence on each:
+#                         pass (real), fail (rejected), none
+#   findings_real_per_pr, findings_rejected_per_pr
+#                         those over prs_merged (null when nothing merged)
+#   review_rounds_per_pr  for the PRs merged in the week, the mean count of their pr claims (heads) that
+#                         reviewer or security gave evidence on (null when nothing merged)
+#   gate_misfires         claims tagged misfire written in the week (the gate refused a good head or let
+#                         a bad one through), plus merge-gate passes retracted in the week
+#   owner_asks_gated, owner_asks_other
+#                         claims tagged approval / owner-ask written in the week
+#   experiments_active    current experiments not yet expired on --today
+#
+# An experiment is a current claim tagged experiment with lines 'rule:', 'metric:' (a key above),
+# 'baseline:', 'target:' and 'expires: <YYYY-MM-DD>'. With no expires line it ends 14 days after it was
+# written, and never later than 28 days after. Past its end it has lapsed, unless a current manager
+# decision supports it (scripts/merge names the lapsed ones too). Each is listed with its days left, or
+# lapsed or kept, and any field it lacks.
+set -euo pipefail
+
+usage() { echo 'usage: metrics [--week <YYYY-MM-DD>] [--today <YYYY-MM-DD>] [--ref <git ref>] [--json]' >&2; exit 2; }
+fail() { echo "metrics: $*" >&2; exit 1; }
+
+week='' today='' ref='' json=false
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --week) [ $# -ge 2 ] || usage; week=$2; shift 2 ;;
+    --today) [ $# -ge 2 ] || usage; today=$2; shift 2 ;;
+    --ref) [ $# -ge 2 ] || usage; ref=$2; shift 2 ;;
+    --json) json=true; shift ;;
+    *) usage ;;
+  esac
+done
+for d in "$week" "$today"; do
+  [ -z "$d" ] || [[ $d =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "'$d' isn't a date (YYYY-MM-DD)"
+done
+command -v jq >/dev/null || fail "needs jq"
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+repo=$(git -C "$here" rev-parse --show-toplevel) || fail "not in a git checkout"
+if [ -z "$ref" ]; then
+  if git -C "$repo" rev-parse -q --verify origin/main >/dev/null; then ref=origin/main; else ref=main; fi
+fi
+git -C "$repo" rev-parse -q --verify "$ref^{commit}" >/dev/null || fail "no commit '$ref'"
+
+tmp=$(mktemp -d)
+trap 'rm -r "$tmp"' EXIT
+"$here/bk" log --json >"$tmp/all.json" || fail "couldn't read the Ground"
+"$here/bk" log --tag experiment --current --json >"$tmp/experiments.json" || fail "couldn't read the experiments"
+"$here/bk" log --tag decision --current --json >"$tmp/decisions.json" || fail "couldn't read the decisions"
+git -C "$repo" log "$ref" --first-parent --format='%ct%x09%s' >"$tmp/main.txt"
+
+jq -nr --arg week "$week" --arg today "$today" --arg ref "$ref" --argjson as_json "$json" \
+  --slurpfile all "$tmp/all.json" --slurpfile exps "$tmp/experiments.json" --slurpfile decs "$tmp/decisions.json" \
+  --rawfile main "$tmp/main.txt" '
+def day: . / 86400 | floor;
+def date_s: . * 86400 | todate[0:10];
+def of_date: . + "T00:00:00Z" | fromdateiso8601 | day;
+def ratio($n; $d): if $d == 0 then null else ($n / $d * 10 | round / 10) end;
+def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \\t]*$") | .captures[0].string] | first // null;
+($all[0]) as $all | ($exps[0]) as $exps | ($decs[0]) as $decs
+| (if $today == "" then now | day else $today | of_date end) as $t
+| (if $week == "" then $t - (($t + 3) % 7) - 7 else $week | of_date end) as $w
+| if (($w + 3) % 7) != 0 then error("--week \($w | date_s) isn'"'"'t a Monday") else . end
+| ($w + 7) as $e
+| def inweek: (.timestamp_ms / 1000 | day) as $d | $d >= $w and $d < $e;
+  ($main | split("\n") | map(select(length > 0) | split("\t") | {d: (.[0] | tonumber | day), s: (.[1:] | join("\t"))})
+    | map(select(.d >= $w and .d < $e))) as $commits
+| ($commits | map(select(.s | test("\\(#[0-9]+\\)$")))) as $merged
+| ($merged | map(.s | capture("\\(#(?<n>[0-9]+)\\)$").n)) as $numbers
+| ($all | map(select(.kind == "claim"))) as $claims
+| ($all | map(select(.kind == "evidence"))) as $evidence
+| ($all | map(select(.kind == "retract") | .body.target)) as $retracted
+| ($evidence | map(select(.author_name == "manager")) | group_by(.body.target)
+    | map({key: .[0].body.target, value: (max_by(.timestamp_ms).body.verdict)}) | from_entries) as $triage
+| ($claims | map(select((.body.tags // []) | index("finding")) | select(inweek) | $triage[.id] // "untriaged")) as $findings
+| ($merged | length) as $n
+| ([$numbers[] as $num
+    | [$claims[] | select((.body.tags // []) | index("pr")) | select((.body.statement // "") | startswith("PR #\($num) "))
+        | .id as $id | select(any($evidence[]; .body.target == $id and (.author_name == "reviewer" or .author_name == "security")))]
+    | length] | add // 0) as $rounds
+| ($decs | map(select(.kind == "claim" and .author_name == "manager" and .retracted == false) | .id)) as $decision_ids
+| ($all | map(select(.kind == "relation" and .body.kind == "supports" and .author_name == "manager"
+    and (.id as $r | any($retracted[]; . == $r) | not)
+    and (.body.from as $f | any($decision_ids[]; . == $f))) | .body.to)) as $supported
+| ["prs_merged", "reverts", "follow_up_fixes", "findings_real", "findings_rejected", "findings_untriaged",
+   "findings_real_per_pr", "findings_rejected_per_pr", "review_rounds_per_pr", "gate_misfires", "owner_asks_gated",
+   "owner_asks_other", "experiments_active"] as $keys
+| ($exps | map(select(.kind == "claim" and .retracted == false and ((.body.tags // []) | index("experiment"))))
+   | map((.timestamp_ms / 1000 | day) as $start | field("expires") as $given
+     | (if $given and ($given | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) then $given | of_date else $start + 14 end) as $want
+     | ([$want, $start + 28] | min) as $ends
+     | {id: .id[:12], metric: field("metric"), ends: ($ends | date_s), days_left: ($ends - $t),
+        state: (if $ends >= $t then "active" elif (.id as $i | any($supported[]; . == $i)) then "kept" else "lapsed" end),
+        missing: ([("rule", "metric", "baseline", "target") as $k | select((field($k) // "") == "") | $k]
+          + (if (field("metric") // "") as $m | $m != "" and ($keys | index($m) | not) then ["a known metric"] else [] end))})) as $experiments
+| {week: ($w | date_s),
+   prs_merged: $n,
+   reverts: ($commits | map(select(.s | test("^Revert"; "i"))) | length),
+   follow_up_fixes: ($merged | map(select(.s | test("\\b(fix|fixes|fixed|follow-?up)\\b"; "i"))) | length),
+   findings_real: ($findings | map(select(. == "pass")) | length),
+   findings_rejected: ($findings | map(select(. == "fail")) | length),
+   findings_untriaged: ($findings | map(select(. == "untriaged")) | length),
+   review_rounds_per_pr: ratio($rounds; $n),
+   gate_misfires: (($claims | map(select(((.body.tags // []) | index("misfire")) and inweek)) | length)
+     + ($all | map(select(.kind == "retract" and inweek) | .body.target) as $gone
+        | $evidence | map(select((.body.method // "") | startswith("merge gate @")) | select(.id as $i | any($gone[]; . == $i)))
+        | length)),
+   owner_asks_gated: ($claims | map(select(((.body.tags // []) | index("approval")) and inweek)) | length),
+   owner_asks_other: ($claims | map(select(((.body.tags // []) | index("owner-ask")) and inweek)) | length),
+   experiments_active: ($experiments | map(select(.state == "active")) | length),
+   experiments: $experiments}
+| .findings_real_per_pr = ratio(.findings_real; $n) | .findings_rejected_per_pr = ratio(.findings_rejected; $n)
+| if $as_json then . else
+    def show: if . == null then "n/a" else tostring end;
+    "Metrics, week of \(.week): | PRs merged \(.prs_merged) | reverts \(.reverts) / follow-up fixes \(.follow_up_fixes)"
+    + " | findings \(.findings_real) real / \(.findings_rejected) rejected / \(.findings_untriaged) untriaged"
+    + " (per PR: \(.findings_real_per_pr | show) real, \(.findings_rejected_per_pr | show) rejected)"
+    + " | review rounds per PR \(.review_rounds_per_pr | show) | gate misfires \(.gate_misfires)"
+    + " | owner asks \(.owner_asks_gated) gated / \(.owner_asks_other) other"
+    + " | experiments: " + (if (.experiments | length) == 0 then "none" else
+        (.experiments | map("\(.id) \(.metric // "no metric") "
+          + (if .state == "active" then "\(.days_left) days left" elif .state == "kept" then "kept by a decision"
+             else "lapsed \(.ends)" end)
+          + (if (.missing | length) > 0 then " (lacks \(.missing | join(", ")))" else "" end)) | join("; ")) end)
+    + " | Method: scripts/metrics (task 9b65c13e9d66), weeks from Monday UTC, \($ref)."
+  end'

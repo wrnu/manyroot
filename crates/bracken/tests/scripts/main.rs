@@ -15,6 +15,7 @@ mod cleanup;
 mod ground_checkpoint;
 mod ground_guards;
 mod merge;
+mod metrics;
 mod nextest_profile;
 mod owner_approve;
 mod pi_prefix;
