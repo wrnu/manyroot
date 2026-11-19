@@ -1640,9 +1640,10 @@ fn an_unreadable_parent_brings_its_line_in_whoever_wrote_it() {
 // Finding 9c0ae448ee12: only a decision of a version this build doesn't read counts. A malformed version 1,
 // which no build ever decodes, is ignored and listed by weave check, as before G8, even from an integrator.
 // A version 2 by an integrator stops the line, and its author can still change the line's policy, to remove
-// that integrator: weave line policy reads only the policy chain. The decision's past still names its
-// author as an integrator, so the line stays stopped until bracken reads version 2 (or its author retracts
-// it).
+// that integrator: weave line policy reads only the policy chain. Since weave-authority.md A5 (decision
+// 51815720d632, finding 39cb855d11d0), the decision counts only while its author also integrates under the
+// line's current policy, so removing them ends the stop, though the decision's own past still names them,
+// and adding them back restores it. This inverts what the test asserted before A5, on purpose.
 #[test]
 fn only_a_newer_decision_counts_and_line_policy_still_runs() {
     let w = Weave::new();
@@ -1680,10 +1681,133 @@ fn only_a_newer_decision_counts_and_line_policy_still_runs() {
         "--as",
         AS,
     ]);
-    let (stopped, stderr) = w.says_unreadable(&["weave", "integrate", "--as", AS]);
-    assert!(stopped, "her decision's past still names her: {stderr}");
+    w.unaffected("main", "a version 2 decision by an integrator since removed");
+    w.commit("a.txt", b"three\n");
+    let d = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves once she's removed: {d}");
+
+    // Back in the current policy, she integrates again, and her decision counts again.
+    w.ok(&["weave", "line", "policy", "main", "--integrator", "mallory", "--owner-decision", OD, "--as", AS]);
+    w.refused_on_decision("main", &future, &main, "payload has format version 2; this build reads version 1");
     w.ok(&["retract", &future, "--as", "mallory"]);
     w.unaffected("main", "a retracted decision");
+}
+
+impl Weave {
+    /// A copy of this Weave Ground, as a writer who kept their replica holds it: later writes here don't
+    /// reach it until synced.
+    fn stale_copy(&self, name: &str) -> PathBuf {
+        let to = self.tmp.path().join(name);
+        let out = Command::new("cp").arg("-R").arg(&self.ground).arg(&to).output().expect("cp runs");
+        assert!(out.status.success(), "cp: {}", String::from_utf8_lossy(&out.stderr));
+        to
+    }
+
+    /// An artifact of `media_type` holding `bytes`, written on `ground` by `who`, its parents that
+    /// replica's heads: its id.
+    fn artifact_on(&self, ground: &Path, bytes: &[u8], media_type: &str, who: &str) -> String {
+        let file = self.tmp.path().join("payload-on.cbor");
+        fs::write(&file, bytes).expect("write");
+        let out =
+            self.ok_on(ground, &["artifact", file.to_str().expect("UTF-8"), "--media-type", media_type, "--as", who]);
+        out.trim().strip_prefix("artifact ").expect("labelled").to_owned()
+    }
+}
+
+// weave-authority.md A5 (finding 39cb855d11d0): an integrator removed from main keeps a copy of their replica,
+// whose past holds no removal. Before A5, a version 2 decision they wrote there after the removal counted,
+// judged under the policy in its own past, and stopped main and so every line, again after every retraction.
+// Now it counts only if its author also integrates under main's current policy, so it stops nothing.
+#[test]
+fn a_removed_integrator_cant_stop_main_from_a_stale_replica() {
+    let w = Weave::new();
+    w.ok(&["weave", "integrate", "--as", AS]);
+    let main = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the line").to_owned();
+    w.ok(&["id", "new", "mallory"]);
+    w.ok(&["weave", "line", "policy", "main", "--integrator", "mallory", "--owner-decision", OD, "--as", AS]);
+    let stale = w.stale_copy("stale");
+    w.ok(&[
+        "weave",
+        "line",
+        "policy",
+        "main",
+        "--clear",
+        "integrators",
+        "--integrator",
+        AS,
+        "--owner-decision",
+        OD,
+        "--as",
+        AS,
+    ]);
+
+    let future = w.artifact_on(&stale, &v2_payload(&[("line", id_bytes(&main))]), DECISION_MEDIA_TYPE, "mallory");
+    w.sync(&stale, &w.ground);
+    w.unaffected("main", "a removed integrator's version 2 decision from a stale past");
+    w.commit("a.txt", b"two\n");
+    let d = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves: {d}");
+    // It's still listed, and the stale replica, which doesn't hold her removal, still refuses.
+    let out = w.run_on(&w.ground, &["weave", "check", "--json"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&future), "weave check doesn't list {future}");
+    let out = w.run_on(&stale, &["weave", "integrate", "--as", AS]);
+    assert!(!out.status.success(), "the stale replica, which doesn't hold the removal, went ahead");
+}
+
+// weave-authority.md 1.2 and A5: from the same stale past, the removed integrator opens a line of her own and
+// writes a version 2 decision on it, then a version 1 decision on main naming it as a parent. Before A5 her
+// v1 decision counted as integrating main, judged under the policy in its own past, so main's judgement read
+// her line and the unreadable decision there stopped main. Now a decision brings a line in only if its author
+// integrates under its line's current policy too.
+#[test]
+fn a_removed_integrator_cant_bring_a_line_of_hers_into_mains_judgement() {
+    let w = Weave::new();
+    let first = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    let manifest = first["manifest"].as_str().expect("a hash").to_owned();
+    let main = w.json(&["weave", "head", "--json"])["line"].as_str().expect("the line").to_owned();
+    w.ok(&["id", "new", "mallory"]);
+    w.ok(&["weave", "line", "policy", "main", "--integrator", "mallory", "--owner-decision", OD, "--as", AS]);
+    let stale = w.stale_copy("stale");
+    w.ok(&[
+        "weave",
+        "line",
+        "policy",
+        "main",
+        "--clear",
+        "integrators",
+        "--integrator",
+        AS,
+        "--owner-decision",
+        OD,
+        "--as",
+        AS,
+    ]);
+
+    let out = w.ok_on(&stale, &["weave", "line", "create", "x", "--owner-decision", OD, "--as", "mallory"]);
+    let x = out.trim().strip_prefix("line ").and_then(|l| l.strip_suffix(" (x)")).expect("labelled").to_owned();
+    let on_x = w.artifact_on(&stale, &v2_payload(&[("line", id_bytes(&x))]), DECISION_MEDIA_TYPE, "mallory");
+    let decision = Decision {
+        v: VERSION,
+        line: main.parse().expect("an id"),
+        manifest: manifest.parse().expect("a hash"),
+        parents: vec![on_x.parse().expect("an id")],
+        proposals: vec![],
+        breakage: vec![],
+        answers: vec![],
+        resolutions: vec![],
+        goals: vec![],
+        source: None,
+        note: "stale".to_owned(),
+    };
+    let on_main = w.artifact_on(&stale, &decision.encode(), DECISION_MEDIA_TYPE, "mallory");
+    w.sync(&stale, &w.ground);
+    w.unaffected("main", "a removed integrator's decision on main whose parent doesn't decode");
+    w.commit("a.txt", b"two\n");
+    let d = w.json(&["weave", "integrate", "--as", AS, "--json"]);
+    assert!(d["decision"].is_string(), "main moves past {on_main}: {d}");
+    // Her own line, which she still integrates, is stopped.
+    let (stopped, stderr) = w.says_unreadable(&["weave", "head", "--line", &x, "--json"]);
+    assert!(stopped && stderr.contains(&on_x), "her own line isn't judged to hold {on_x}: {stderr}");
 }
 
 // G8 with G9: a line another writer opens under the name main isn't judged when a command names main, so a

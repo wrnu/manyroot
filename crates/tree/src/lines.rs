@@ -366,7 +366,9 @@ impl Lines {
         // An undecodable line artifact counts only where it would displace a version, by the rule above: it
         // supersedes a counted version of its own author's, in a relation that author signed. An undecodable
         // decision counts only where its line, in its causal past, has a policy in force among the versions
-        // read here under which its author integrates: anywhere else it couldn't qualify (G8).
+        // read here under which its author integrates: anywhere else it couldn't qualify (G8). Its author must
+        // integrate under the line's current policy too, so removing them ends the stop, which a stale past
+        // they chose would otherwise keep (finding 39cb855d11d0, weave-authority.md A5).
         lines.undecoded_decisions =
             undecoded.iter().filter_map(|(id, _, _, line)| line.map(|line| (*id, line))).collect();
         lines.unreadable = undecoded
@@ -401,7 +403,8 @@ impl Lines {
                             && lines
                                 .newest(&line, &before)
                                 .iter()
-                                .any(|v| lines.versions[v].policy.integrators.contains(&author));
+                                .any(|v| lines.versions[v].policy.integrators.contains(&author))
+                            && lines.integrates_now(&line, &author);
                         if integrates { vec![line] } else { vec![] }
                     }
                 };
@@ -436,9 +439,13 @@ impl Lines {
         // 3 whatever it must answer, and so does every descendant (finding e4f57cd207b6). Those rules
         // are judged as before; this only leaves out what they make moot.
         let mut may_qualify: HashSet<ContributionId> = HashSet::new();
-        // Those whose author integrates under the policy in force for them, whatever their parents: only
-        // they bring other lines into a scoped judgement ([`Lines::read_lines`]).
+        // Those whose author integrates under the policy in force for them, whatever their parents, and
+        // under their line's current policy: only they bring other lines into a scoped judgement
+        // ([`Lines::read_lines`]). The second test changes no verdict, only what a refusal reads, so a
+        // removed integrator can't bring a line of theirs in through a past of their choosing (finding
+        // 39cb855d11d0, weave-authority.md A5).
         let mut integrating: HashSet<ContributionId> = HashSet::new();
+        let mut current: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
         for id in &lines.order {
             let record = &lines.decisions[id];
             let d = &record.decision;
@@ -458,7 +465,13 @@ impl Lines {
                 Some(Err(_)) => false,
                 None => true,
             };
-            if integrates {
+            if integrates
+                && current
+                    .entry(d.line)
+                    .or_insert_with(|| lines.current_versions(&d.line))
+                    .iter()
+                    .any(|v| lines.versions[v].policy.integrators.contains(&record.author))
+            {
                 integrating.insert(*id);
             }
             if integrates && d.parents.iter().all(|p| may_qualify.contains(p)) {
@@ -470,6 +483,7 @@ impl Lines {
         lines.undecoded_decisions = HashMap::new();
         lines.count_unreadable(read);
         let mut obligations = Obligations::new(ix, &lines, &lines.order, may_qualify);
+        obligations.index_siblings(g, walking);
         // What answers settle is asked first, as the windows depend on it. Answers naming the line name
         // the window, so settling then takes two passes: the first leaves them out, and its windows, which
         // hold the second's, give what they ask (decision 4afee4855944).
@@ -994,6 +1008,26 @@ impl Lines {
         Some(self.obligations.open(self, retractions, &line, policy, &candidates, None, &mut in_epoch))
     }
 
+    /// The objections to manifest `hash` that a decision on `line` using that tree unchanged would have to
+    /// answer, that no decision on the line has answered as their basis allows, under the line's current
+    /// policy over the whole replica, any validator's results counting (weave-authority.md B6). `None` if
+    /// the line has no current policy.
+    pub fn manifest_objections(
+        &self,
+        g: &Graph,
+        ix: &Index,
+        line: &ContributionId,
+        hash: &ContentHash,
+    ) -> Option<Vec<Open>> {
+        let [version] = self.current_versions(line)[..] else { return None };
+        let policy = &self.versions[&version].policy;
+        let candidates = self.obligations.of_manifest(line, hash, &self.heads(line));
+        let epochs = self.epochs(g, &candidates, &version);
+        let missed = Cell::new(0);
+        let mut in_epoch = |r: &ContributionId| answer(&epochs, &missed, g, &version, r);
+        Some(self.obligations.open(self, ix.retractions(), line, policy, &candidates, None, &mut in_epoch))
+    }
+
     /// Every objection in the replica whose target resolves.
     pub fn objections(&self) -> &Obligations {
         &self.obligations
@@ -1050,6 +1084,12 @@ impl Lines {
             true => self.newest(line, &|_: &ContributionId| true),
             false => vec![],
         }
+    }
+
+    /// Whether `author` integrates `line` under its current policy: under any current version, if the
+    /// chain diverged, which only the line's author can make it do (weave-authority.md A5).
+    fn integrates_now(&self, line: &ContributionId, author: &AgentId) -> bool {
+        self.current_versions(line).iter().any(|v| self.versions[v].policy.integrators.contains(author))
     }
 
     /// The current line named `main` by the counted marker's author, with the smallest id.
