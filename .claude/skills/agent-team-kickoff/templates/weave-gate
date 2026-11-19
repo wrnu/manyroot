@@ -9,7 +9,8 @@
 #   weave-gate check <pr claim> <sha> <main sha> <key> <manifest> <pointer evidence> <main's tip>
 #
 # state: the switch. It's on only if exactly one current claim tagged weave-gate, written by the manager,
-# exists, and its statement's first line is exactly 'Weave gate: on', nothing after it: 'Weave gate: on
+# exists (current: not retracted, and not superseded by its author, manager or owner; anyone else's
+# supersede is ignored and named on stderr, finding 20a7646f3579), and its statement's first line is exactly 'Weave gate: on', nothing after it: 'Weave gate: on
 # hold' and 'on-hold' are off (findings 307d5bd13ec5, 840e29c4202c). Reasons go on later lines. With
 # none, an 'off' one, or several, it's off: so it
 # stays off until the manager writes 'Weave gate: on', and one claim superseding it turns it off again at
@@ -33,7 +34,10 @@
 #   - the pr claim names no 'Weave proposal <64 hex>' that the Weave Ground holds (weave-shadow --proposal
 #     needs it after the merge: it checks Weave's own merge against git's);
 #   - the head changes scripts/test-table, its template copy, or Cargo.lock: the policy pins main's
-#     test-table, so the head's own copy would be untested, and the vendor directory is main's.
+#     test-table, so the head's own copy would be untested, and the vendor directory is main's;
+#   - git's merge holds what weave import leaves out and weave verify doesn't compare (finding
+#     81648e74e519): a submodule anywhere, or a root entry other than the directory .bracken whose name
+#     could fold to start with .bracken (unimported, below). The manifest would verify equal without it.
 #
 # check (scripts/merge, for each pointer on the claim): exits 0 only if, each read afresh and none taken
 # from the pointer, the switch is on; the pointer is a current manager pass on the claim with that method;
@@ -41,7 +45,7 @@
 # 76c500f0c75d: a merge with a commit off main would test another tree; scripts/merge also requires main
 # to have moved since only in .bracken/ and docs the head doesn't touch, its check-5 rule);
 # the head is none of the fallbacks above against <main sha>; git's merge of <main sha> with the head has
-# key <key>; weave verify --git <that merge> --manifest <manifest> says equal; and weave green --manifest
+# key <key> and holds nothing Weave leaves out; weave verify --git <that merge> --manifest <manifest> says equal; and weave green --manifest
 # gives fmt, clippy, table and mac green under line main's current policy, with exactly the result ids the
 # pointer's details name (a later re-run or fail makes the pointer stale). Otherwise it prints why on one
 # line and exits 1.
@@ -57,6 +61,10 @@
 # counted run, and check exits 1 with the reason; if any of these reads fails, it refuses the same way.
 #
 # Results are read only through weave green --manifest, by scripts/weave (decision bbbf898cbcfe).
+#
+# Every Weave read record and check make runs under timeout or gtimeout, WEAVE_GATE_TIMEOUT seconds (120 by
+# default): one that runs out fails closed, record saying to run git's counted run and check failing,
+# naming the read (report 0b5600268856). With neither tool on PATH, neither runs.
 set -euo pipefail
 
 here=$(cd "${BASH_SOURCE[0]%/*}" && pwd)
@@ -71,6 +79,13 @@ integrator=weave-integrator
 runner_paths=(scripts/test-table .claude/skills/agent-team-kickoff/templates/test-table Cargo.lock)
 
 fail() { echo "weave-gate: $*" >&2; exit 2; }
+# Every Weave read here, scripts/weave-pin check's included, runs under a bound, so a slow or stuck read
+# fails closed rather than hang scripts/merge (report 0b5600268856, part C (5)): WEAVE_GATE_TIMEOUT seconds,
+# 120 by default. A read that runs out counts as failed, and record or check then fails, whatever else it
+# read, naming the read on its last line. weave import and weave validate (record only) are writes, which
+# take as long as the tree or the checks do, and aren't bounded.
+bound=${WEAVE_GATE_TIMEOUT:-120}
+timeouts=''
 usage() {
   echo "usage: weave-gate state | [ON=<main>] weave-gate record <pr claim>:<sha> | weave-gate check <pr claim> <sha> <main sha> <key> <manifest> <evidence> <tip>" >&2
   exit 2
@@ -79,10 +94,68 @@ command -v jq >/dev/null || fail "needs jq"
 # The gate's Ground reads pull first and are full checks, as scripts/merge's are.
 bk() { BK_PULL=required BRACKEN_FULL_CHECK=1 BRACKEN_AGENT=manager "$here/bk" "$@"; }
 
-# The current manager claims tagged weave-gate, as a JSON array.
+# bounded <label> <command>...: the command under timeout (or gtimeout), killed 10 s after the bound if it
+# ignores TERM. One that runs out is noted in $timeouts, which outlives the command substitutions most reads
+# run in, and returns non-zero like any failed read.
+bounded() {
+  local label=$1 rc=0
+  shift
+  "$timeout_bin" -k 10 "$bound" "$@" || rc=$?
+  if [ "$rc" -eq 124 ] || [ "$rc" -eq 137 ]; then
+    echo "$label timed out after ${bound}s (WEAVE_GATE_TIMEOUT)" >>"$timeouts"
+  fi
+  return "$rc"
+}
+# wv <args>: a Weave read, bounded.
+wv() { if [ "$1" = weave ]; then bounded "weave $2" "$weave" "$@"; else bounded "weave $1" "$weave" "$@"; fi; }
+timed_out() { [ -n "$timeouts" ] && [ -s "$timeouts" ]; }
+# bounds <mode>: sets up the bound for record or check, or refuses: with no timeout or gtimeout on PATH, a
+# read could hang, so neither runs. The exit trap names a read that ran out, last, as the reason.
+bounds() {
+  [[ $bound =~ ^[1-9][0-9]{0,5}$ ]] || fail "WEAVE_GATE_TIMEOUT must be a whole number of seconds, not '$bound'"
+  if command -v timeout >/dev/null; then
+    timeout_bin=timeout
+  elif command -v gtimeout >/dev/null; then
+    timeout_bin=gtimeout
+  elif [ "$1" = record ]; then
+    echo "weave-gate: neither timeout nor gtimeout is on PATH, so the Weave reads can't be bounded; run git's counted run" >&2
+    exit 1
+  else
+    echo "neither timeout nor gtimeout is on PATH, so the Weave reads can't be bounded"
+    exit 1
+  fi
+  timeouts=$(mktemp)
+  mode=$1
+  trap on_exit EXIT
+}
+on_exit() {
+  local rc=$?
+  if [ "$rc" -ne 0 ] && timed_out; then
+    rc=1
+    if [ "$mode" = record ]; then
+      echo "weave-gate: $(head -n 1 "$timeouts"), so nothing from the Weave Ground counts; run git's counted run" >&2
+    else
+      echo "$(head -n 1 "$timeouts"), so nothing from the Weave Ground counts"
+    fi
+  fi
+  rm -f "$timeouts" "${errors:-}" "${details:-}"
+  exit "$rc"
+}
+
+# The current manager claims tagged weave-gate, as a JSON array. A claim superseded by another identity
+# stops counting only if that identity is manager or owner (finding 20a7646f3579, as in scripts/merge): any
+# writer can relate a claim 'supersedes' this one, so anyone else's is ignored, and named on stderr.
 gate_claims() {
-  bk log --tag weave-gate --current --json | jq '[.[] | select(.kind == "claim" and .retracted == false
-    and .author_name == "manager" and (.superseded_by_others | length) == 0)]'
+  local all ignored
+  all=$(bk log --tag weave-gate --current --json) || return 1
+  ignored=$(jq -r '[.[] | select(.kind == "claim" and .author_name == "manager") | .id[:12] as $c
+    | .superseded_by_others[]? | select(.author_name != "manager" and .author_name != "owner")
+    | "\($c) by \(.author_name // .author[:12]) (\(.id[:12]))"] | join(", ")' <<<"$all") || return 1
+  [ -z "$ignored" ] ||
+    echo "weave-gate: ignored a supersede of weave-gate claim $ignored: only its author, manager or owner can supersede it here (finding 20a7646f3579)" >&2
+  jq '[.[] | select(.kind == "claim" and .retracted == false and .author_name == "manager"
+    and (.superseded_by_others | type) == "array"
+    and ([.superseded_by_others[] | select(.author_name == "manager" or .author_name == "owner")] | length) == 0)]' <<<"$all"
 }
 
 # switch: sets why; returns 0 if on.
@@ -115,7 +188,27 @@ fallback() {
   done
   [[ $3 =~ Weave\ proposal\ ([0-9a-f]{64}) ]] || { why="the pr claim names no 'Weave proposal <64 hex>'"; return 0; }
   proposal=${BASH_REMATCH[1]}
-  "$weave" show "$proposal" --json >/dev/null 2>&1 || { why="the Weave Ground holds no proposal ${proposal:0:12}"; return 0; }
+  wv show "$proposal" --json >/dev/null 2>&1 || { why="the Weave Ground holds no proposal ${proposal:0:12}"; return 0; }
+  return 1
+}
+
+# unimported <commit>: sets why and returns 0 if git's tree at <commit> holds what weave import leaves out
+# and weave verify doesn't compare (finding 81648e74e519), so a manifest can verify equal to it without
+# holding it: a submodule (mode 160000) anywhere, or a root entry, other than the directory .bracken itself,
+# whose name Weave's path fold could start with .bracken. That fold is Unicode's (crates/tree/src/path.rs),
+# so here a root name counts if, lowercased, it starts with .bracken, or if git quotes it (a byte outside
+# ASCII, or a control character): a wider net than the fold's, which only ever means git's counted run.
+# Returns 1 if the tree holds none; a git read that fails counts as holding one.
+unimported() {
+  local listing name
+  listing=$(git -C "$main" -c core.quotePath=true ls-tree -r --full-tree "$1") || { why="git ls-tree $1 failed"; return 0; }
+  name=$(awk -F '\t' '$1 ~ /^160000 / { print $2; exit }' <<<"$listing")
+  [ -z "$name" ] || { why="git's merge $1 has a submodule at $name, which Weave leaves out of the manifest"; return 0; }
+  listing=$(git -C "$main" -c core.quotePath=true ls-tree --full-tree "$1") || { why="git ls-tree $1 failed"; return 0; }
+  name=$(awk -F '\t' '$1 ~ /^040000 tree / && $2 == ".bracken" { next }
+    { n = tolower($2) } substr(n, 1, 1) == "\"" || substr(n, 1, 8) == ".bracken" { print $2; exit }' <<<"$listing")
+  [ -z "$name" ] ||
+    { why="git's merge $1 has the root entry $name, which Weave could leave out of the manifest (only the directory .bracken may start so)"; return 0; }
   return 1
 }
 
@@ -124,30 +217,32 @@ fallback() {
 # naming the default line, and no record on the lines main's judgement reads that this binary can't decode.
 taken_over() {
   local pin root checked marker author default named said
-  pin=$("$here/weave-pin" check 2>&1) || { why=$(tail -n 1 <<<"$pin"); why=${why#weave-pin: }; return 0; }
+  pin=$(bounded "weave-pin check" "$here/weave-pin" check 2>&1) || { why=$(tail -n 1 <<<"$pin"); why=${why#weave-pin: }; return 0; }
   root=${pin#* }
   # weave check exits 1 whenever it lists a problem, so its JSON is read whatever its exit code.
-  checked=$("$weave" weave check --json 2>/dev/null) || true
+  checked=$(wv weave check --json 2>/dev/null) || true
   marker=$(jq -r '.marker // empty' <<<"$checked" 2>/dev/null) || marker=''
   [ -n "$marker" ] || { why="the Weave Ground has no counted marker by its root ${root:0:12}"; return 0; }
-  author=$("$weave" show "$marker" --json 2>/dev/null | jq -r '.author // empty' 2>/dev/null) || author=''
+  author=$(wv show "$marker" --json 2>/dev/null | jq -r '.author // empty' 2>/dev/null) || author=''
   [ "$author" = "$root" ] ||
     { why="the counted marker ${marker:0:12} is by ${author:0:12}, not the pinned root ${root:0:12}"; return 0; }
-  default=$("$weave" weave head --json 2>/dev/null | jq -r '.line // empty' 2>/dev/null) || default=''
+  default=$(wv weave head --json 2>/dev/null | jq -r '.line // empty' 2>/dev/null) || default=''
   [ -n "$default" ] || { why="weave head names no default line"; return 0; }
-  named=$("$weave" weave head --line main --json 2>/dev/null | jq -r '.line // empty' 2>/dev/null) || named=''
+  named=$(wv weave head --line main --json 2>/dev/null | jq -r '.line // empty' 2>/dev/null) || named=''
   [ "$named" = "$default" ] ||
     { why="--line main names ${named:-no single line}, not the default line ${default:0:12}"; return 0; }
   # A policy version or decision the pinned binary can't decode would have main judged without it, under an
   # older policy, so its results can't be counted (docs/design/weave-freeze.md G8). weave head warns of one
   # on the lines it judges, in words an older binary's Ground-wide warning shares, so this refuses with
   # either; weave green refuses outright from G8's release on.
-  said=$("$weave" weave head --line main --json 2>&1 >/dev/null) || true
+  said=$(wv weave head --line main --json 2>&1 >/dev/null) || true
   if grep -q "don't decode with this build" <<<"$said"; then
     said=$(grep -m 1 "don't decode with this build" <<<"$said")
     why="line main's judgement holds a record this binary can't read (${said#bracken: warning: })"
     return 0
   fi
+  # A read that ran out read nothing, the warning above included.
+  if timed_out; then why=$(head -n 1 "$timeouts"); return 0; fi
   return 1
 }
 
@@ -163,7 +258,7 @@ merged() {
 # instead and returns 1.
 green_of() {
   local green
-  green=$("$weave" weave green --line main --manifest "$1" --json 2>&1) ||
+  green=$(wv weave green --line main --manifest "$1" --json 2>&1) ||
     { echo "weave green --manifest $1 failed: $(tail -n 1 <<<"$green")"; return 1; }
   jq -e '(.checks | type) == "array" and (.version | type) == "string"
     and all(.checks[]; (.check | type) == "string" and (.green | type) == "boolean"
@@ -232,6 +327,7 @@ case "${1:-}" in
   record)
     [ $# -eq 2 ] && [[ $2 =~ ^([0-9a-f]{12,64}):([0-9a-f]{40})$ ]] || usage
     claim=${BASH_REMATCH[1]} sha=${BASH_REMATCH[2]}
+    bounds record
     switch || { echo "weave-gate: the Weave gate is $why; run git's counted run" >&2; exit 1; }
     if taken_over; then
       echo "weave-gate: refused: $why; nothing is counted from this Weave Ground until that's looked into: run git's counted run" >&2
@@ -254,16 +350,19 @@ case "${1:-}" in
     m=$(merged "$tip" "$sha") ||
       { echo "weave-gate: PR #$pr @ ${sha:0:12} doesn't merge cleanly onto main $tip; run git's counted run" >&2; exit 1; }
     commit=${m% *} key=${m#* }
+    if unimported "$commit"; then
+      echo "weave-gate: PR #$pr @ ${sha:0:12}: $why; run git's counted run" >&2
+      exit 1
+    fi
     imported=$("$weave" weave import --repo "$main" --from-git "$commit" --as "$integrator" --json) ||
       fail "weave import of the merge $commit failed"
     manifest=$(jq -r '.manifest // empty' <<<"$imported")
     [[ $manifest =~ ^blake3:[0-9a-f]{64}$ ]] || fail "weave import gave no manifest"
-    "$weave" weave verify --repo "$main" --git "$commit" --manifest "$manifest" >/dev/null ||
+    wv weave verify --repo "$main" --git "$commit" --manifest "$manifest" >/dev/null ||
       { echo "weave-gate: $manifest doesn't verify equal to git's merge $commit; run git's counted run" >&2; exit 1; }
     echo "weave-gate: PR #$pr @ ${sha:0:12} merged with main ${tip:0:12} is $commit (key $key), manifest $manifest"
     todo=$(pending "$manifest") || fail "$todo"
     validated='' errors=$(mktemp)
-    trap 'rm -f "$errors" "${details:-}"' EXIT
     if [ -n "$todo" ]; then
       args=()
       while IFS= read -r c; do args+=(--check "$c"); done <<<"$todo"
@@ -283,6 +382,8 @@ case "${1:-}" in
       echo "weave-gate: PR #$pr @ ${sha:0:12}: $counted; run git's counted run" >&2
       exit 1
     fi
+    # Nothing is recorded if any Weave read ran out, whatever the others said.
+    ! timed_out || exit 1
     details=$(mktemp)
     {
       echo "manifest $manifest"
@@ -301,6 +402,7 @@ case "${1:-}" in
   check)
     [ $# -eq 8 ] || usage
     claim=$2 sha=$3 on=$4 key=$5 manifest=$6 pointer=$7 tip=$8
+    bounds check
     switch || { echo "the Weave gate is $why"; exit 1; }
     if taken_over; then echo "refused: $why"; exit 1; fi
     git -C "$main" merge-base --is-ancestor "$on" "$tip" 2>/dev/null ||
@@ -321,12 +423,14 @@ case "${1:-}" in
     commit=${m% *}
     [ "${m#* }" = "$key" ] ||
       { echo "git's merge of main ${on:0:12} with ${sha:0:12} has key ${m#* }, not the pointer's $key"; exit 1; }
-    "$weave" weave verify --repo "$main" --git "$commit" --manifest "$manifest" >/dev/null 2>&1 ||
+    if unimported "$commit"; then echo "$why"; exit 1; fi
+    wv weave verify --repo "$main" --git "$commit" --manifest "$manifest" >/dev/null 2>&1 ||
       { echo "$manifest doesn't verify equal to git's merge of main ${on:0:12} with ${sha:0:12}"; exit 1; }
     counted=$(results "$manifest") || { echo "$counted"; exit 1; }
     named=$(jq -r '.body.details // ""' <<<"$about" | sed -n 's/^result //p' | sort)
     [ "$named" = "$(sed '/^version /d' <<<"$counted")" ] ||
       { echo "the pointer's results aren't the ones counted on $manifest now (stale, or not these): verify again"; exit 1; }
+    ! timed_out || exit 1
     echo "line main's Weave results on $manifest, git's merge of main ${on:0:12} with this head, all green ($(sed '/^version /d; s/ .*//' <<<"$counted" | tr '\n' ' ' | sed 's/ $//'))"
     ;;
 

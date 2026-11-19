@@ -19,7 +19,8 @@
 #     propose (scripts/weave-propose), and only the integrator merges (stage 2a, task 87a1bcba025d);
 #   - weave validate for an identity that isn't one of the line's validators, read from the pinned binary's
 #     own plan (weave validate --dry-run --json) before anything runs, and weave validate with a '--';
-#   - a line write (weave line create or weave line policy) whose --owner-decision isn't a claim tagged
+#   - a line write (weave line create or weave line policy, but for the policy read below) whose
+#     --owner-decision isn't a claim tagged
 #     decision, or tagged approval and signed by owner (scripts/owner-approve, as scripts/weave-shadow
 #     --init requires), not retracted, in the coordination Ground (read with the main checkout's scripts/bk): a
 #     policy is code this machine runs, so each version cites the owner's decision (weave.md section 1,
@@ -30,6 +31,11 @@
 #     56dadb600ba2);
 #   - --runner, and a '--', on weave validate and a line write: it gives them --runner <the main checkout>
 #     itself, the directory a box or mac check's pinned runner script is in (plan cc496dcee0e3).
+#
+# One read goes as a line write: exactly 'weave line policy <line> --dry-run' (--json or not, and --as),
+# with no --owner-decision, prints the line's current policy; it gets a fixed all-zero placeholder
+# --owner-decision from here, since the binary requires one, which never reaches a record: a dry run
+# writes nothing (answer f47f2f255c75).
 #
 # The committed pin (docs/design/weave-marker.md, option A; decision d01c83b654d1): for anything but weave
 # init, the Ground's id in ground.json and its replica's root, the weave-root file beside it, must be the
@@ -112,7 +118,28 @@ if [ "$sub" = integrate ] || { [ "$sub" = line ] && [ "$subsub" = merge ]; }; th
   [ "$who" = weave-integrator ] ||
     fail "weave integrate and weave line merge move a line, so they're only --as weave-integrator: builders propose (scripts/weave-propose)"
 fi
-if [ "$sub" = line ] && [[ $subsub == create || $subsub == policy ]]; then
+# A policy read: exactly 'weave line policy <line> --dry-run', with --json or not, and --as, and no
+# --owner-decision. A dry run writes nothing and cites nothing, so this gives the binary, which requires one,
+# a fixed all-zero placeholder: it never reaches a record (answer f47f2f255c75; weave-shadow reads line main's
+# policy members this way). Any other line write, a dry run with any other option included, still needs a
+# real --owner-decision, checked as below.
+placeholder=()
+if [ "$sub" = line ] && [ "$subsub" = policy ] && [ -z "$owner_decision" ]; then
+  rest=() dry=false
+  for ((i = 1; i <= $#; i++)); do
+    case "${!i}" in
+      --as) i=$((i + 1)) ;;
+      --as=*) ;;
+      --dry-run) dry=true ;;
+      --json) ;;
+      *) rest+=("${!i}") ;;
+    esac
+  done
+  if $dry && [ ${#rest[@]} -eq 4 ] && [ "${rest[0]} ${rest[1]} ${rest[2]}" = "weave line policy" ] && [[ ${rest[3]} != -* ]]; then
+    placeholder=(--owner-decision "$(printf '0%.0s' {1..64})")
+  fi
+fi
+if [ "$sub" = line ] && [[ $subsub == create || $subsub == policy ]] && [ ${#placeholder[@]} -eq 0 ]; then
   [ -n "$owner_decision" ] ||
     fail "weave line $subsub needs --owner-decision <id>: the id of the owner's decision, in the coordination Ground, that allows this policy"
   [[ $owner_decision =~ ^[0-9a-f]{12,64}$ ]] ||
@@ -223,4 +250,4 @@ if [ "$sub" = validate ]; then
   jq -e '.signer as $s | (.validators | index($s)) != null' <<<"$shown" >/dev/null 2>&1 ||
     fail "the signer isn't one of the line's validators, so weave validate runs nothing for it"
 fi
-exec "$bin" "$@" ${runner[@]+"${runner[@]}"}
+exec "$bin" "$@" ${runner[@]+"${runner[@]}"} ${placeholder[@]+"${placeholder[@]}"}

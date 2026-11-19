@@ -43,6 +43,13 @@
 #           no proposal (and for which PRs).
 #       Every decision's note says which, and each run ends by counting them on line main since stage 2a
 #       began.
+#       Any writer can object to a decision, a manifest or a proposal, and rule 5 makes the next move answer
+#       it (finding 598258717737). When weave integrate (either form) refuses for a discussion objection, and
+#       every objection the move must answer is a discussion objection, by an identity outside line main's
+#       current policy (no integrator, validator or goal setter), it runs once more, answering each of them
+#       overridden, by id, with a reason naming it and its author (weave.md section 2 allows this in bulk).
+#       An evidence- or goal-backed objection, or any by a policy member, still stops it, as does anything
+#       that refuses that second run. It reads the policy with scripts/weave's policy read, a dry run.
 #
 # Every run but --init first checks the committed pin, .config/weave-root on main (scripts/weave-pin
 # check), and refuses unless the Weave Ground and its replica's root match it.
@@ -62,6 +69,56 @@ main=$(dirname "$common")
 weave="$here/weave"
 fail() { echo "weave-shadow: $*" >&2; exit 1; }
 usage() { sed -n '2,/^set -euo/{/^#/s/^# \{0,1\}//p;}' "${BASH_SOURCE[0]}"; }
+
+# overridable <integrate's error output> <the proposals it used>...: if weave integrate refused for rule 5,
+# naming a discussion objection, and every objection the move must answer (line main's open ones, those to
+# the proposals it uses, and the one it named) is a discussion objection that may be answered overridden,
+# by an identity outside line main's current policy (no integrator, validator or goal setter), prints one
+# '<objection>=overridden:<reason>' per objection, for --answer, and returns 0. Otherwise returns 1: any
+# other objection, or one by a policy member, still stops it (finding 598258717737, decision a2e0b9c241c7).
+# Each answer names its objection, never the line, so it can't answer one this didn't read.
+overridable() {
+  local err=$1 first line policy review shown
+  shift
+  first=$(grep -oE "doesn't answer the discussion objection [0-9a-f]{64}" "$err" | head -n 1) || return 1
+  first=${first##* }
+  line=$("$weave" weave head --json 2>/dev/null | jq -r '.line // empty' 2>/dev/null) || return 1
+  [ -n "$line" ] || return 1
+  # The line's current policy, through scripts/weave's policy read (a dry run, answer f47f2f255c75).
+  policy=$("$weave" weave line policy "$line" --dry-run --json --as weave-integrator 2>/dev/null) || return 1
+  review=$("$weave" weave review --line "$line" --json 2>/dev/null) || return 1
+  shown=$("$weave" show "$first" --json 2>/dev/null) || return 1
+  jq -er --argjson p "$policy" --argjson s "$shown" --arg first "$first" '
+    def name: (.author_name // "" | gsub("[^A-Za-z0-9_-]"; "")) as $n | .author[:12] + (if $n == "" then "" else " (\($n))" end);
+    ($p.integrators + $p.validators + $p.goal_setters) as $members
+    | if (.open | type) != "array" then error("line main'"'"'s policy has diverged") else . end
+    | [.open[], (.proposals[] | select(.proposal | IN($ARGS.positional[])) | .must_answer[])] as $listed
+    | ($listed + (if any($listed[]; .objection == $first) then []
+        else [{objection: $first, author: $s.author, author_name: $s.author_name, basis: {kind: "discussion"},
+               allowed: ["overridden"]}] end)) as $all
+    | ($all | unique_by(.objection)) as $all
+    | if all($all[]; .basis.kind == "discussion" and ((.allowed // []) | index("overridden")) != null
+          and (.author | type) == "string" and (.author | test("^[0-9a-f]{64}$")) and (.author | IN($members[]) | not))
+      then $all[] | "\(.objection)=overridden:weave-shadow: discussion objection \(.objection[:12]) by \(name), outside line main'"'"'s policy (no integrator, validator or goal setter); finding 598258717737"
+      else error("not every objection is overridable") end' --args "$@" <<<"$review" 2>/dev/null
+}
+
+# integrate <args>...: weave integrate <args> --as weave-integrator --json, its JSON in out and its error
+# output in $err; returns its exit code. If it refuses only for discussion objections by identities outside
+# line main's policy (overridable, given the proposals in used), it says so and runs once more answering
+# each of them overridden; anything that refuses the second run stands.
+integrate() {
+  local rc=0 answers a args=()
+  out=$("$weave" weave integrate "$@" --as weave-integrator --json 2>"$err") || rc=$?
+  [ "$rc" -ne 0 ] || return 0
+  answers=$(overridable "$err" ${used[@]+"${used[@]}"}) || return "$rc"
+  while IFS= read -r a; do args+=(--answer "$a"); done <<<"$answers"
+  echo "weave-shadow: weave integrate refused for discussion objections from outside line main's policy; answering them overridden:" >&2
+  sed 's/^/  /; s/=overridden:.*//' <<<"$answers" >&2
+  rc=0
+  out=$("$weave" weave integrate "$@" "${args[@]}" --as weave-integrator --json 2>"$err") || rc=$?
+  return "$rc"
+}
 
 init='' owner='' repo=$main rev='' proposals=() mismatched=''
 while [ $# -gt 0 ]; do
@@ -324,9 +381,8 @@ else
   word=proposal
   [ ${#ordered[@]} -le 1 ] || word=proposals
   if [ ${#proposals[@]} -gt 0 ] && [ ${#missing[@]} -eq 0 ]; then
-    err=$(mktemp)
-    if out=$("$weave" weave integrate --proposals "${ordered[@]}" --mirrors "$sha" --repo "$repo" \
-      --note "shadow of $sha: merged $word $list" --as weave-integrator --json 2>"$err"); then
+    err=$(mktemp) used=("${ordered[@]}")
+    if integrate --proposals "${ordered[@]}" --mirrors "$sha" --repo "$repo" --note "shadow of $sha: merged $word $list"; then
       [ -z "$mismatched" ] || { rm -f -- "$err"; fail "the $word merged equal to $sha after all, so --mismatched recorded it as merged"; }
       how=merged
     elif paths=$(jq -er '[.conflicts[]?.path] | select(length > 0) | join(", ")' <<<"$out" 2>/dev/null); then
@@ -363,7 +419,13 @@ else
   esac
   if [ "$how" != merged ]; then
     "$weave" weave import --from-git "$sha" --repo "$repo" --as weave-integrator
-    out=$("$weave" weave integrate --from-git "$sha" --repo "$repo" --note "$note" --as weave-integrator --json)
+    err=$(mktemp) used=()
+    if ! integrate --from-git "$sha" --repo "$repo" --note "$note"; then
+      cat -- "$err" >&2
+      rm -f -- "$err"
+      fail "weave integrate --from-git $sha failed, so nothing was recorded"
+    fi
+    rm -f -- "$err"
   fi
   decision=$(jq -r '.decision // empty' <<<"$out")
   [ -n "$decision" ] || fail "weave integrate recorded no decision for $sha: $out"

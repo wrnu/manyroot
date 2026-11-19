@@ -1181,6 +1181,56 @@ fn weave_needs_an_owner_decision_for_line_writes() {
     }
 }
 
+/// Answer f47f2f255c75: exactly 'weave line policy <line> --dry-run' (with --json or not, and --as) runs with
+/// no --owner-decision, scripts/weave giving the binary a fixed all-zero placeholder, since a dry run writes
+/// nothing; weave-shadow reads line main's policy members so. Without --dry-run, or with any other option,
+/// it still needs one, and one given on a dry run is still checked as before.
+#[test]
+fn weave_lets_a_policy_dry_run_through_without_an_owner_decision() {
+    let (_tmp, dir, home, stub) = weave_repo();
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let out = weave(&dir, "scripts/weave", &home, None, &["weave", "init", "--as", "weave-integrator"]);
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    pin(&dir, &home);
+    let decision = owner_decision(&dir);
+    let run_with = |args: &[&str]| weave(&dir, "scripts/weave", &home, Some(&stub), args);
+    let zeros = format!("--owner-decision {}", "0".repeat(64));
+    for args in [
+        &["weave", "line", "policy", "x", "--dry-run"][..],
+        &["--as", "a", "weave", "line", "policy", "x", "--dry-run", "--json"],
+        &["weave", "line", "policy", "--json", "x", "--dry-run", "--as=a"],
+    ] {
+        let out = run_with(args);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(stdout.contains(&zeros), "{args:?}: no placeholder: {stdout}");
+    }
+    for (args, expected) in [
+        (&["weave", "line", "policy", "x"][..], "needs --owner-decision"),
+        (&["weave", "line", "policy", "x", "--json", "--as", "a"], "needs --owner-decision"),
+        (&["weave", "line", "policy", "x", "--dry-run", "--integrator", "y"], "needs --owner-decision"),
+        (&["weave", "line", "policy", "x", "y", "--dry-run"], "needs --owner-decision"),
+        (&["weave", "line", "create", "main", "--dry-run"], "needs --owner-decision"),
+        (&["weave", "line", "policy", "x", "--dry-run", "--owner-decision", "TODO"], "12 to 64 lowercase hex"),
+        (
+            &["weave", "line", "policy", "x", "--dry-run", "--owner-decision", "0123456789ab"],
+            "has no such contribution",
+        ),
+        (
+            &["weave", "line", "policy", "x", "--dry-run", "--owner-decision", &"0".repeat(64)],
+            "has no such contribution",
+        ),
+    ] {
+        let out = run_with(args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr}");
+    }
+    let out = run_with(&["weave", "line", "policy", "x", "--dry-run", "--owner-decision", &decision]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!String::from_utf8_lossy(&out.stdout).contains(&zeros), "a placeholder beside the given decision");
+}
+
 /// scripts/weave refuses what would make a line version or a supersedes relation by hand: artifact with a
 /// Weave media type, in any case, and relate ... supersedes. line create and line policy still work through
 /// it (answer 12000ab70ae5).
@@ -1604,4 +1654,111 @@ fn weave_runs_only_on_the_pinned_ground_and_root_set_moves_only_to_the_pin() {
     refused(&["weave", "head"], &format!("this replica's root is {forger}, not the committed pin's {root}"));
     ok(&["weave", "root", "set", &root, "--replace", &forger]);
     assert_eq!(std::fs::read_to_string(ground.join("weave-root")).unwrap(), format!("{root}\n"));
+}
+
+/// Finding 598258717737 (decision a2e0b9c241c7): any writer can object to line main's head, and rule 5 makes
+/// the next move answer it, which stopped weave-shadow. Now an objection by an identity outside line main's
+/// policy is answered overridden, by id, with a reason naming it and its author, and the merge is recorded;
+/// one by a policy member (weave-runner, a validator) still stops it, unanswered. Never the real
+/// ~/bracken-weave: HOME is under $TMPDIR.
+#[test]
+fn weave_shadow_overrides_discussion_objections_only_from_outside_main_policy() {
+    let shadow = repo_root().join("scripts/weave-shadow");
+    let (tmp, dir, home, _) = weave_repo_with(&[("scripts/weave-shadow", &shadow)]);
+    let approval = owner_approval(&dir);
+    let run_with = |args: &[&str]| command(&dir, "scripts/weave-shadow", args).env("HOME", &home).output().unwrap();
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    git_out(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let out = run_with(&["--init", "--owner-decision", &approval]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no committed pin"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    pin(&dir, &home);
+    git_out(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let out = run_with(&["--init", "--owner-decision", &approval]);
+    assert!(out.status.success(), "--init: {}", String::from_utf8_lossy(&out.stderr));
+    let weave = |args: &[&str]| {
+        let out = command(&dir, "scripts/weave", args).env("HOME", &home).output().unwrap();
+        assert!(out.status.success(), "weave {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned())
+    };
+    let head = || {
+        let h: serde_json::Value = serde_json::from_str(&weave(&["weave", "head", "--json"])).unwrap();
+        h["heads"][0]["decision"].as_str().unwrap().to_owned()
+    };
+
+    // A small repository, three commits on main.
+    let small = tmp.path().join("small");
+    std::fs::create_dir_all(&small).unwrap();
+    for args in
+        [&["init", "-q", "-b", "main"][..], &["config", "user.name", "t"], &["config", "user.email", "t@x.invalid"]]
+    {
+        git_out(&small, args);
+    }
+    let mut commits = Vec::new();
+    for i in 1..=3 {
+        std::fs::write(small.join(format!("f{i}.txt")), format!("{i}\n")).unwrap();
+        git_out(&small, &["add", "-A"]);
+        git_out(&small, &["commit", "-qm", &format!("commit {i}")]);
+        commits.push(git_out(&small, &["rev-parse", "HEAD"]));
+    }
+    git_out(&small, &["update-ref", "refs/remotes/origin/main", &commits[2]]);
+    let shadow_of = |sha: &str| run_with(&["--repo", small.to_str().unwrap(), sha]);
+    let out = shadow_of(&commits[0]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // mallory, outside the policy, objects to the head.
+    weave(&["id", "new", "mallory"]);
+    let objection_to = |who: &str, target: &str| {
+        let claim = weave(&["claim", "no", "--as", who]);
+        let relation = weave(&["relate", claim.lines().next().unwrap(), "contradicts", target, "--as", who]);
+        relation.lines().next().unwrap().to_owned()
+    };
+    let spam = objection_to("mallory", &head());
+    let out = shadow_of(&commits[1]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("answering them overridden") && stderr.contains(&spam), "{stderr}");
+    let log: serde_json::Value = serde_json::from_str(&weave(&["weave", "log", "--json"])).unwrap();
+    let answers =
+        &log["decisions"].as_array().unwrap().iter().find(|d| d["decision"] == head().as_str()).unwrap()["answers"];
+    assert_eq!(answers.as_array().unwrap().len(), 1, "{answers}");
+    assert_eq!(answers[0]["objection"], spam.as_str(), "{answers}");
+    assert_eq!(answers[0]["disposition"], "overridden", "{answers}");
+    let reason = answers[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains(&spam[..12]) && reason.contains("(mallory)") && reason.contains("598258717737"),
+        "{reason}"
+    );
+
+    // weave-runner, the line's validator, objects: that still stops it, and nothing is overridden.
+    let ground = home.join("bracken-weave/manyroot");
+    let real = |args: &[&str]| {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_bracken"))
+            .arg("--dir")
+            .arg(&ground)
+            .args(args)
+            .env_remove("BRACKEN_DIR")
+            .env_remove("BRACKEN_AGENT")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "bracken {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned())
+    };
+    let claim = real(&["claim", "the runner objects", "--as", "weave-runner"]);
+    let member = real(&["relate", claim.lines().next().unwrap(), "contradicts", &head(), "--as", "weave-runner"]);
+    let member = member.lines().next().unwrap();
+    objection_to("mallory", &head());
+    let before = head();
+    let out = shadow_of(&commits[2]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("doesn't answer the discussion objection") && !stderr.contains("answering them"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("failed, so nothing was recorded"), "{stderr}");
+    assert_eq!(head(), before, "a decision was recorded over {member}");
 }
