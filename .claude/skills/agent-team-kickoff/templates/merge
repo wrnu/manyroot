@@ -65,8 +65,9 @@
 #      those three kinds, fails the check (findings db2dc1c6120e, e3f9ae2b1820);
 #   docker: the research workspace's Docker tests run on no CI runner that has Docker (finding d160c76dafca,
 #      answer 5b3aa570643b; Linux portability is deferred task 1efdf2e34f46), so a head whose change since
-#      its merge base with main's tip touches research/experiment/src/python*, research/experiment/src/
-#      project_grader* or research/experiment/tests/project.rs (matched ASCII-lowercased) needs a current
+#      its merge base with main's tip, or whose merge with it changes, anything under research/experiment/ or
+#      the old crates/experiment/ (matched ASCII-lowercased, read NUL-separated; a rename counts as a deletion
+#      and an addition, so one out of it counts too; a head that doesn't merge cleanly fails) needs a current
 #      manager pass on the pr claim whose method starts 'research docker tests' and ends ' @ <sha>': the
 #      by-hand run on the Mac with Docker running (docs/development.md). Any other head passes this check;
 #   7. with --owner-approval, for a PR whose class needs the owner's go (docs/development.md, Owner
@@ -724,26 +725,39 @@ docker_case="no research Docker code changed"
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
   check FAIL docker "$sha isn't on origin"
 elif ! docker_base=$(git -C "$main" merge-base "$tip" "$sha") ||
-  ! docker_changed=$(git -C "$main" diff --no-renames --name-only "$docker_base" "$sha"); then
-  check FAIL docker "couldn't list what $sha changed since its merge base with main ($tip)"
+  ! docker_merged=$(git -C "$main" merge-tree --write-tree --no-messages "$tip" "$sha" 2>/dev/null | head -n 1) ||
+  [ -z "$docker_merged" ] ||
+  ! docker_list=$(mktemp) ||
+  ! { git -C "$main" diff --no-renames --name-only -z "$docker_base" "$sha" &&
+    git -C "$main" diff --no-renames --name-only -z "$tip" "$docker_merged"; } >"$docker_list"; then
+  # Fails closed: a head that doesn't merge cleanly, or a diff that fails, can't be judged.
+  check FAIL docker "couldn't list what $sha changes since its merge base with main ($tip), or what merging it changes"
 else
-  docker_paths=$(while IFS= read -r f; do
-    [ -n "$f" ] || continue
+  # As tree-scope's changed_paths reads them (finding b791a20398d9): NUL-separated, so a name holding a
+  # quote, a backslash or a newline is read as it is; what the head changed since the merge base, and every
+  # path that differs between main's tip and the merged tree, since the merge carries a head's edit onto a
+  # path main renamed. Renames count as a deletion and an addition.
+  docker_found=()
+  while IFS= read -r -d '' f; do
     case "$(printf '%s' "$f" | LC_ALL=C tr 'A-Z' 'a-z')" in
-      research/experiment/src/python* | research/experiment/src/project_grader* | research/experiment/tests/project.rs)
-        echo "$f" ;;
+      # The whole crate (finding d20fc8dd320c): the Docker tests live in src/ and tests/ alike, and exercise
+      # most of its code. crates/experiment/ is where it lived before task bfc942cd7ced moved it.
+      research/experiment/* | crates/experiment/*) docker_found+=("$f") ;;
     esac
-  done <<<"$docker_changed")
+  done < <(LC_ALL=C sort -uz "$docker_list")
+  rm -f "$docker_list"
+  docker_paths=''
+  [ ${#docker_found[@]} -eq 0 ] || docker_paths=$(printf '%q ' "${docker_found[@]}" | sed 's/ $//')
   if [ -z "$docker_paths" ]; then
     check ok docker "$docker_case"
   elif docker_pass=$(jq -r --arg t "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
     and .retracted == false and .author_name == "manager" and .body.target == $t and .body.verdict == "pass"
     and (.body.method | startswith("research docker tests") and endswith(" @ " + $sha)))] | .[0].id // empty' \
     <<<"$shown") && [ -n "$docker_pass" ]; then
-    docker_case="research Docker code changed ($(tr '\n' ' ' <<<"$docker_paths" | sed 's/ $//')), and the manager's run of its Docker tests at $sha passed (${docker_pass:0:12})"
+    docker_case="research Docker code changed ($docker_paths), and the manager's run of its Docker tests at $sha passed (${docker_pass:0:12})"
     check ok docker "$docker_case"
   else
-    check FAIL docker "the head changes research's Docker-tested code ($(tr '\n' ' ' <<<"$docker_paths" | sed 's/ $//')), which no CI runner tests with Docker: run them on the Mac with Docker running (cd research && cargo nextest run -E 'test(~docker::) | binary(grade_run) | binary(weave)') and record a manager pass on pr claim $full, method 'research docker tests @ $sha' (docs/development.md)"
+    check FAIL docker "the head changes research's Docker-tested code ($docker_paths), which no CI runner tests with Docker: run them on the Mac with Docker running (cd research && cargo nextest run -E 'test(~docker::) | binary(grade_run) | binary(weave)') and record a manager pass on pr claim $full, method 'research docker tests @ $sha' (docs/development.md)"
   fi
 fi
 

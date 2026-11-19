@@ -500,8 +500,9 @@ fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
 }
 
 /// The research Docker tests (finding d160c76dafca, answer 5b3aa570643b): no CI runner has Docker for them,
-/// so a head touching research/experiment/src/python*, src/project_grader* or tests/project.rs, in any letter
-/// case, fails the docker check until the manager records a pass on its pr claim whose method starts
+/// so a head touching anything under research/experiment/ or the old crates/experiment/ (finding
+/// d20fc8dd320c), in any letter case, renaming a file out of it, editing a file main has since moved into it,
+/// or adding a name git would quote (finding b791a20398d9), fails the docker check until the manager records a pass on its pr claim whose method starts
 /// 'research docker tests' and names that head. Someone else's pass, one at another sha, or a retracted one
 /// doesn't count. A head that touches none of them passes the check with nothing recorded.
 #[test]
@@ -512,8 +513,13 @@ fn merge_asks_for_the_research_docker_run_only_where_the_docker_code_changed() {
             ("research/experiment/src/python/tests.rs", true),
             ("research/experiment/src/project_grader/tests.rs", true),
             ("research/experiment/tests/project.rs", true),
+            ("research/experiment/tests/weave.rs", true),
+            ("research/experiment/tests/grade_run.rs", true),
+            ("research/experiment/src/driver.rs", true),
+            ("research/experiment/Cargo.toml", true),
             ("Research/Experiment/src/Python.rs", true),
-            ("research/experiment/src/plan.rs", false),
+            ("research/demo/src/main.rs", false),
+            ("research/experimental.md", false),
             ("code.txt", false),
         ] {
             let (_tmp, dir, mut merge) =
@@ -550,6 +556,47 @@ fn merge_asks_for_the_research_docker_run_only_where_the_docker_code_changed() {
                 line.starts_with("ok ") && line.contains("the manager's run of its Docker tests"),
                 "{scripts}: {path}: {line}"
             );
+        }
+        // A rename out of research/experiment/ counts as a deletion there.
+        let at_base = |d: &Path| put(d, "research/experiment/src/old.rs", "old\n");
+        let move_out = |d: &Path| {
+            assert!(run(d, "git", &["mv", "research/experiment/src/old.rs", "elsewhere.rs"]).status.success())
+        };
+        let (_tmp, _dir, mut merge) = merge_dry_run_command(scripts, at_base, move_out, |_| {}, None);
+        let line = check_line(&merge.output().unwrap(), "docker");
+        assert!(
+            line.starts_with("FAIL ") && line.contains("research/experiment/src/old.rs"),
+            "{scripts}: a rename out: {line}"
+        );
+
+        // Finding b791a20398d9: the changed paths also come from the merge with main. A head from before main
+        // moved lib/x.rs into research/experiment/ edits it there; its own diff names only lib/x.rs.
+        let body: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+        let at_base = |d: &Path| put(d, "lib/x.rs", &body);
+        let edit = |d: &Path| put(d, "lib/x.rs", &body.replace("line 40\n", "changed\n"));
+        let moved = |d: &Path| {
+            std::fs::create_dir_all(d.join("research/experiment/src")).unwrap();
+            assert!(run(d, "git", &["mv", "lib/x.rs", "research/experiment/src/x.rs"]).status.success());
+        };
+        let (_tmp, _dir, mut merge) = merge_dry_run_command(scripts, at_base, edit, moved, None);
+        let line = check_line(&merge.output().unwrap(), "docker");
+        assert!(
+            line.starts_with("FAIL ") && line.contains("research/experiment/src/x.rs"),
+            "{scripts}: main's move: {line}"
+        );
+        // The crate's old place, crates/experiment/, counts too (a branch from before task bfc942cd7ced).
+        let (_tmp, _dir, mut merge) =
+            merge_dry_run_command(scripts, |_| {}, |d| put(d, "crates/experiment/src/python.rs", "x\n"), |_| {}, None);
+        let line = check_line(&merge.output().unwrap(), "docker");
+        assert!(
+            line.starts_with("FAIL ") && line.contains("crates/experiment/src/python.rs"),
+            "{scripts}: old place: {line}"
+        );
+        // A name git would quote without -z: a double quote, and a backslash.
+        for name in ["research/experiment/src/a\"b.rs", "research/experiment/src/a\\b.rs"] {
+            let (_tmp, _dir, mut merge) = merge_dry_run_command(scripts, |_| {}, |d| put(d, name, "x\n"), |_| {}, None);
+            let line = check_line(&merge.output().unwrap(), "docker");
+            assert!(line.starts_with("FAIL ") && line.contains("Docker-tested code"), "{scripts}: {name:?}: {line}");
         }
     }
 }
