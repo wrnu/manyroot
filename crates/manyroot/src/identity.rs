@@ -2,14 +2,13 @@
 //!
 //! The name never leaves this machine; other replicas see only the public key.
 
-use std::fs;
-use std::io::Write;
 use std::path::Path;
 
 use ed25519_dalek::{Signer as _, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 use crate::contribution::ContributionContent;
+use crate::fsx::{self, Dir};
 use crate::id::{AgentId, ContributionId, Signature};
 
 /// Domain-separation prefix for contribution signatures.
@@ -94,16 +93,25 @@ impl Identity {
     }
 
     /// Reads an identity file, `<name>.json` for the identity it holds. Refuses anything but a regular
-    /// file (a symlink included), a name [`validate_name`] refuses, or a file named for another identity.
+    /// file (a symlink included, opened without following it), a name [`validate_name`] refuses, or a
+    /// file named for another identity.
     pub fn load(path: &Path) -> Result<Self, IdentityError> {
         let p = path.display().to_string();
-        let io = |source| IdentityError::Io { path: p.clone(), source };
+        let parent = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let bytes =
+            Dir::open(parent).and_then(|d| d.read(name, 1 << 20)).map_err(|source| match fsx::refusal(&source) {
+                Some(reason) => IdentityError::Malformed { path: p.clone(), reason },
+                None => IdentityError::Io { path: p.clone(), source },
+            })?;
+        Self::parse(path, &bytes)
+    }
+
+    /// An identity from the bytes of its file at `path`, checking the name as [`Identity::load`] does.
+    pub(crate) fn parse(path: &Path, bytes: &[u8]) -> Result<Self, IdentityError> {
+        let p = path.display().to_string();
         let malformed = |reason: String| IdentityError::Malformed { path: p.clone(), reason };
-        if !fs::symlink_metadata(path).map_err(io)?.is_file() {
-            return Err(malformed("not a regular file (or a symlink)".into()));
-        }
-        let text = fs::read_to_string(path).map_err(io)?;
-        let file: IdentityFile = serde_json::from_str(&text).map_err(|e| malformed(e.to_string()))?;
+        let file: IdentityFile = serde_json::from_slice(bytes).map_err(|e| malformed(e.to_string()))?;
         validate_name(&file.name)?;
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         if file_name != format!("{}.json", file.name) {
@@ -128,23 +136,26 @@ impl Identity {
         lower.windows(hex.len()).any(|w| w == hex.as_bytes()) || bytes.windows(raw.len()).any(|w| w == raw)
     }
 
-    /// Writes the identity file, refusing to overwrite an existing one.
+    /// Writes the identity file, refusing to overwrite an existing one. It is written whole or not at
+    /// all: to a 0600 temporary file in the same directory (a dot name without `.json`, so no listing
+    /// reads it), synced, then linked into place, never through a symlink at `path`.
     pub fn save(&self, path: &Path) -> Result<(), IdentityError> {
         let io = |source| IdentityError::Io { path: path.display().to_string(), source };
+        let parent = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        self.save_in(&Dir::open(parent).map_err(io)?, name)
+    }
+
+    /// [`Identity::save`] into the open directory `dir`, as `name`.
+    pub(crate) fn save_in(&self, dir: &Dir, name: &str) -> Result<(), IdentityError> {
         let file = IdentityFile {
             name: self.name.clone(),
             public_key: self.agent_id(),
             secret_key: hex::encode(self.key.to_bytes()),
         };
-        let json = serde_json::to_string_pretty(&file).expect("identity serializes");
-
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut f = options.open(path).map_err(io)?;
-        f.write_all(json.as_bytes()).map_err(io)?;
-        f.write_all(b"\n").map_err(io)
+        let json = serde_json::to_string_pretty(&file).expect("identity serializes") + "\n";
+        dir.write_new(name, json.as_bytes(), 0o600)
+            .map_err(|source| IdentityError::Io { path: dir.join(name).display().to_string(), source })
     }
 }
 

@@ -93,6 +93,16 @@ contribution keeps its encoded length (`Contribution::encoded_len`), which `Grap
   entry there not named with a dot, and an object file that isn't a regular file, in `Store::open` and in the
   untrusted objects of `Store::open_trusting`. Before, a symlinked shard or object was followed and stray files
   were skipped.
+- **No symlink is followed inside a replica** (round 2, findings `58b9903c1820`, `99f862b78057`,
+  `23253fd20e5b`). `agents/`, `identities/`, `objects/`, every shard, `ground.json` and a `--key-dir` that is a
+  symlink are refused on every read and write (`Corrupt`); only the replica's own directory is followed. Every
+  directory under it is opened with `O_DIRECTORY | O_NOFOLLOW` and every file with `O_NOFOLLOW | O_NONBLOCK`,
+  relative to its directory's descriptor, and a file's type is checked on the open descriptor, so a link or a
+  FIFO swapped in after a listing is refused rather than followed or blocked on (`crates/manyroot/src/fsx.rs`,
+  through `rustix`, which `crates/tree` already used). `Identity::save` writes a 0600 dot-named temporary file
+  (no `.json`), synced, then hard-links it in place, so a key is never seen half-written. None of this
+  repository's setups (the main Ground, `~/bracken-weave/manyroot`, the team server's `ground/` and `keys/`,
+  worktree copies) uses a symlinked directory or `ground.json`.
 - **Existing Grounds open unchanged** if they hold none of these. This repository's own `agents/`,
   `identities/` names and `objects/` were checked against a copy before the merge and pass. A replica that
   holds one now fails with an error naming the path: fix or remove that entry.

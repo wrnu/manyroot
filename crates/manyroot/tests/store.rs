@@ -376,3 +376,167 @@ fn the_directory_alone_never_reads_identities_but_checks_agents_as_agents_does()
     write_entry(s.dir(), "zzz.json", "zzz", alice);
     corrupt(s.directory(), "under another name");
 }
+
+// Round 2 (findings 58b9903c1820, 99f862b78057, 23253fd20e5b).
+
+/// A Ground whose subdirectory `sub` is a symlink to `outside`, an empty directory elsewhere.
+fn with_linked(tmp: &std::path::Path, sub: &str) -> (Store, std::path::PathBuf) {
+    let s = Store::init(&tmp.join("g"), "g").unwrap();
+    let outside = tmp.join(format!("outside-{sub}"));
+    std::fs::create_dir(&outside).unwrap();
+    let _ = std::fs::remove_dir(s.dir().join(sub));
+    symlink(&outside, s.dir().join(sub)).unwrap();
+    (s, outside)
+}
+
+#[test]
+fn a_symlinked_agents_directory_is_refused_on_write_and_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (s, outside) = with_linked(tmp.path(), "agents");
+    assert!(matches!(s.create_identity("alice"), Err(StoreError::Corrupt { .. })));
+    assert_eq!(files_in(&outside), 0, "no entry written through the link");
+    assert!(!s.identities_dir().join("alice.json").exists(), "nor a key left behind");
+    let key = Identity::generate("bob").unwrap().agent_id();
+    std::fs::write(outside.join("bob.json"), serde_json::json!({ "name": "bob", "agent": key }).to_string()).unwrap();
+    corrupt(s.directory(), "symlink");
+    corrupt(s.agents(), "symlink");
+}
+
+#[test]
+fn a_symlinked_identities_directory_is_refused_on_write_and_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (s, outside) = with_linked(tmp.path(), "identities");
+    assert!(matches!(s.create_identity("bob"), Err(StoreError::Corrupt { .. })));
+    assert_eq!(files_in(&outside), 0, "no private key written through the link");
+    Identity::generate("carol").unwrap().save(&outside.join("carol.json")).unwrap();
+    assert!(matches!(s.identities(), Err(StoreError::Corrupt { .. })));
+    assert!(matches!(s.identity("carol"), Err(StoreError::Corrupt { .. })));
+}
+
+#[test]
+fn a_symlinked_key_directory_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::init(&tmp.path().join("g"), "g").unwrap();
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    symlink(&outside, tmp.path().join("keys")).unwrap();
+    assert!(matches!(s.create_identity_in("dave", &tmp.path().join("keys")), Err(StoreError::Corrupt { .. })));
+    assert_eq!(files_in(&outside), 0);
+}
+
+#[test]
+fn a_symlinked_objects_directory_or_ground_json_is_refused_on_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut s = Store::init(&tmp.path().join("g"), "g").unwrap();
+    let (c, _) = one(s.info().ground);
+    s.import([c.clone()]).unwrap();
+    let dir = s.dir().to_owned();
+    std::fs::rename(dir.join("objects"), tmp.path().join("objects-elsewhere")).unwrap();
+    symlink(tmp.path().join("objects-elsewhere"), dir.join("objects")).unwrap();
+    open_corrupt(Store::open(&dir), "symlink");
+    open_corrupt(Store::open_trusting(&dir, vec![c]), "symlink");
+    std::fs::remove_file(dir.join("objects")).unwrap();
+    std::fs::rename(tmp.path().join("objects-elsewhere"), dir.join("objects")).unwrap();
+    Store::open(&dir).unwrap();
+
+    std::fs::rename(dir.join("ground.json"), tmp.path().join("ground.json")).unwrap();
+    symlink(tmp.path().join("ground.json"), dir.join("ground.json")).unwrap();
+    open_corrupt(Store::open(&dir), "symlink");
+}
+
+#[test]
+fn a_fifo_in_place_of_a_file_is_refused_without_blocking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::init(&tmp.path().join("g"), "g").unwrap();
+    let fifo = tmp.path().join("g/identities/erin.json");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success());
+    // Opened by path, with no listing first: the open itself must not block, and refuse it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = fifo.clone();
+    std::thread::spawn(move || tx.send(Identity::load(&path).is_err()).unwrap());
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(true), "refused, and didn't block");
+    assert!(matches!(s.identity("erin"), Err(StoreError::Corrupt { .. })));
+}
+
+/// Swaps `path` between a regular file holding `inside` and a symlink to a file holding `outside`
+/// until `stop`, as a writer racing a reader would.
+fn swap_until(
+    path: std::path::PathBuf,
+    inside: Vec<u8>,
+    outside: std::path::PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        let tmp_file = path.with_file_name(".swap-file");
+        let tmp_link = path.with_file_name(".swap-link");
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            std::fs::write(&tmp_file, &inside).unwrap();
+            std::fs::rename(&tmp_file, &path).unwrap();
+            let _ = std::fs::remove_file(&tmp_link);
+            symlink(&outside, &tmp_link).unwrap();
+            std::fs::rename(&tmp_link, &path).unwrap();
+        }
+    })
+}
+
+#[test]
+fn a_symlink_swapped_in_after_the_listing_is_never_followed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::init(&tmp.path().join("g"), "g").unwrap();
+    let real = Identity::generate("bob").unwrap().agent_id();
+    let forged = Identity::generate("bob").unwrap().agent_id();
+    let entry = |key: AgentId| serde_json::json!({ "name": "bob", "agent": key }).to_string().into_bytes();
+    let outside = tmp.path().join("forged.json");
+    std::fs::write(&outside, entry(forged)).unwrap();
+    std::fs::create_dir_all(s.agents_dir()).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let swapper = swap_until(s.agents_dir().join("bob.json"), entry(real), outside, stop.clone());
+    let mut followed = 0;
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(3) {
+        if let Ok(entries) = s.directory() {
+            followed += entries.iter().filter(|e| e.agent == forged).count();
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    swapper.join().unwrap();
+    assert_eq!(followed, 0, "a read followed the link swapped in after the listing");
+}
+
+#[test]
+fn a_key_being_saved_is_never_seen_half_written() {
+    // A reader polls the exact path each key is saved to: it must see no file, or the whole file.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("keys");
+    std::fs::create_dir(&dir).unwrap();
+    const KEYS: usize = 500;
+    let reader_dir = dir.clone();
+    let reader = std::thread::spawn(move || {
+        let mut partial = Vec::new();
+        for n in 0..KEYS {
+            let path = reader_dir.join(format!("agent-{n}.json"));
+            loop {
+                match Identity::load(&path) {
+                    Ok(_) => break,
+                    Err(IdentityError::Io { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        partial.push(e.to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        partial
+    });
+    for n in 0..KEYS {
+        Identity::generate(&format!("agent-{n}")).unwrap().save(&dir.join(format!("agent-{n}.json"))).unwrap();
+    }
+    let partial = reader.join().unwrap();
+    assert!(partial.is_empty(), "{} reads saw a partial key, first: {}", partial.len(), partial[0]);
+    let mode =
+        std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(dir.join("agent-0.json")).unwrap().permissions());
+    assert_eq!(mode & 0o777, 0o600);
+    let names = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
+    assert!(names.into_iter().all(|n| n.ends_with(".json")), "no temporary file left");
+}

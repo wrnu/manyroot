@@ -19,6 +19,7 @@
 
 pub mod bundle;
 pub mod contribution;
+mod fsx;
 pub mod graph;
 pub mod id;
 pub mod identity;
