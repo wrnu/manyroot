@@ -87,6 +87,10 @@ enum Cmd {
         /// A project run: hold the project's change back, so only the items released at the start go out.
         #[arg(long, requires = "project")]
         hold_change: bool,
+        /// A project run: who integrates onto main, `any-agent` (every agent, the default) or `agent-<n>`, the
+        /// run's one integrator, while every other agent proposes.
+        #[arg(long, requires = "project")]
+        integrator: Option<String>,
         #[arg(long, default_value_t = 8)]
         turns: u32,
         // No clap default: with one, an unset `--claude` would pass `required_if_eq`.
@@ -168,6 +172,10 @@ enum Cmd {
         /// A project run: hold the project's change back, so only the items released at the start go out.
         #[arg(long, requires = "project")]
         hold_change: bool,
+        /// A project run: who integrates onto main, `any-agent` (every agent, the default) or `agent-<n>`, the
+        /// run's one integrator, while every other agent proposes.
+        #[arg(long, requires = "project")]
+        integrator: Option<String>,
         #[arg(long, default_value_t = 5)]
         turns: u32,
         #[arg(long, default_value_t = 1)]
@@ -256,6 +264,7 @@ fn main() {
             project,
             python,
             hold_change,
+            integrator,
             turns,
             harness,
             claude,
@@ -275,7 +284,7 @@ fn main() {
             agent_token_cap,
             agent_output_cap,
         } => agent_run(AgentRun {
-            project: project_inputs(project.as_deref(), python.as_deref(), hold_change)
+            project: project_inputs(project.as_deref(), python.as_deref(), hold_change, integrator.as_deref(), agents)
                 .unwrap_or_else(|e| refuse_run(&e)),
             // Refused here, before anything runs, like the other options.
             caps: Caps::for_mode(&mode, &mode_token_cap)
@@ -311,6 +320,7 @@ fn main() {
             project,
             python,
             hold_change,
+            integrator,
             turns,
             seed,
             task,
@@ -319,13 +329,15 @@ fn main() {
             accept_rule,
         } => {
             let accept_rule = AcceptRule::named(&accept_rule).expect("clap checked the name");
-            let inputs = match project_inputs(project.as_deref(), python.as_deref(), hold_change) {
-                Ok(inputs) => inputs,
-                Err(e) => {
-                    eprintln!("bracken-experiment: {e}");
-                    std::process::exit(1);
-                }
-            };
+            let inputs =
+                match project_inputs(project.as_deref(), python.as_deref(), hold_change, integrator.as_deref(), agents)
+                {
+                    Ok(inputs) => inputs,
+                    Err(e) => {
+                        eprintln!("bracken-experiment: {e}");
+                        std::process::exit(1);
+                    }
+                };
             let plan = PlanInputs {
                 task: task_named(&task),
                 backend_seed: seed,
@@ -362,14 +374,16 @@ fn main() {
     }
 }
 
-/// A project run's plan inputs, from `--project`, `--python` and `--hold-change`: the project
-/// as the plan records it, the image pinned, the configuration's integrator setting and whether the change
+/// A project run's plan inputs, from `--project`, `--python`, `--hold-change` and `--integrator` (checked against
+/// the run's `agents`): the project as the plan records it, the image pinned, the integrator setting and whether the change
 /// is held back. None of them without a project; a project without `--python` is refused (answer
 /// `5e40cacdbfb4`), and so is holding back a change a project hasn't.
 fn project_inputs(
     project: Option<&std::path::Path>,
     python: Option<&str>,
     hold_change: bool,
+    integrator: Option<&str>,
+    agents: usize,
 ) -> Result<ProjectInputs, String> {
     let Some(dir) = project else { return Ok(ProjectInputs::default()) };
     let project = bracken_experiment::project::Project::load(dir)?;
@@ -377,11 +391,13 @@ fn project_inputs(
     if hold_change && project.first_change().is_none() {
         return Err(format!("--hold-change: project {} has no change to hold back", project.name));
     }
+    let integrator = integrator.unwrap_or(bracken_experiment::weave_mode::ANY_AGENT);
+    bracken_experiment::weave_mode::integrator_agent(integrator, agents).map_err(|e| format!("--integrator: {e}"))?;
     let pin = bracken_experiment::python::Python::pin(python, &project.python)?.plan_pin();
     Ok(ProjectInputs {
         project: Some(ProjectPlan::of(&project)?),
         python: Some(pin),
-        integrator: Some(bracken_experiment::weave_mode::ANY_AGENT.to_string()),
+        integrator: Some(integrator.to_string()),
         hold_change,
     })
 }
@@ -568,6 +584,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
         usage: std::path::absolute(backend_dir.join("usage.jsonl")).map_err(|e| e.to_string())?.display().to_string(),
         ..a.project.into_plan(PlanInputs::default())
     };
+    let setting = plan.integrator.clone();
     let cfg = |plan: PlanInputs| -> Result<RunConfig, String> {
         Ok(RunConfig {
             root: a.dir.join("run"),
@@ -586,7 +603,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
     };
     let outcome = match &a.harness {
         HarnessArgs::Claude { binary, version, settings } => {
-            let backend = ClaudeBackend::new(ClaudeConfig {
+            let mut backend = ClaudeBackend::new(ClaudeConfig {
                 pin: Pin::of(binary, version)?,
                 expect,
                 caps,
@@ -598,6 +615,9 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
                 tools,
                 upstream: None,
             })?;
+            if let Some(setting) = &setting {
+                backend.set_integrator(setting, a.agents)?;
+            }
             run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
         }
         HarnessArgs::Pi { prefix, version, provider, .. } => {
@@ -609,7 +629,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
                     PiCredential::openrouter(auth, until)?
                 }
             };
-            let backend = PiBackend::new(PiConfig {
+            let mut backend = PiBackend::new(PiConfig {
                 prefix: prefix.clone(),
                 version: version.clone(),
                 expect: PiExpect { provider: credential.provider().into(), model: expect.model, thinking: effort },
@@ -622,6 +642,9 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
                 tools,
                 upstream: None,
             })?;
+            if let Some(setting) = &setting {
+                backend.set_integrator(setting, a.agents)?;
+            }
             run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
         }
     };
@@ -662,6 +685,10 @@ fn mock_run(
     };
     let (seed, task) = (cfg.plan.backend_seed, cfg.plan.task);
     let usage = Some(cfg.root.join("usage.jsonl"));
+    let integrator = match &cfg.plan.integrator {
+        Some(setting) => bracken_experiment::weave_mode::integrator_agent(setting, agents)?,
+        None => None,
+    };
     // Through the shim, as Claude Code reaches the driver.
     let mock = MockBackend {
         task,
@@ -669,6 +696,7 @@ fn mock_run(
         wrong_rate: 0.15,
         shim: Some(cfg.worker_bin.clone()),
         usage,
+        integrator,
         ..MockBackend::default()
     };
     let outcome = run(&cfg, &mock)?;

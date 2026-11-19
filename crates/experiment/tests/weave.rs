@@ -45,6 +45,11 @@ struct Stores {
 
 impl Stores {
     fn new(names: &[&str]) -> Stores {
+        Stores::with(names, ANY_AGENT)
+    }
+
+    /// The same, under the integrator setting `setting`.
+    fn with(names: &[&str], setting: &str) -> Stores {
         let dir = tempfile::tempdir().expect("a temp dir");
         let config = |sub: &str, identity: &str| StoreConfig {
             dir: dir.path().join(sub),
@@ -60,7 +65,7 @@ impl Stores {
         std::fs::create_dir(&sockets).expect("sockets");
         let project = Project::load(&tiny()).expect("the fixture");
         let mut hub = Worker::spawn(&bin(), "weave", &config("hub", "setter")).expect("hub");
-        hub.ok(&request("project", hub_data(&project, ANY_AGENT, false).expect("the data"))).expect("the project");
+        hub.ok(&request("project", hub_data(&project, setting, false).expect("the data"))).expect("the project");
         let setup = hub.ok(&request("setup", Value::Null)).expect("hub setup");
         assert_eq!(setup.result["released"], json!(["sum", "mean-empty"]), "the items released at the start");
         let seed = Worker::bytes(&hub.ok(&request("export", Value::Null)).expect("export")).expect("bytes");
@@ -617,6 +622,36 @@ fn integrating_a_proposal_on_a_forked_line_is_refused_as_forked() {
     assert!(err.contains("is forked"), "{err}");
 }
 
+/// With one integrator (answer `81403ed96c96`), main's policy names it alone, beside the setter: another agent's
+/// integrate is refused, with its tree or a proposal, and its proposal reaches the line through the integrator.
+#[test]
+fn one_integrator_alone_integrates_and_the_others_propose() {
+    let mut s = Stores::with(&["agent-0", "agent-1"], "agent-1");
+    s.ok(0, "write_file", json!({"path": "tiny/zero.py", "text": "NAME = 'zero'\n"}));
+    let err = s.tool(0, "integrate", json!({"note": "a builder's tree"})).expect_err("not an integrator");
+    assert!(!err.is_empty());
+    let p = s.ok(0, "propose", json!({"summary": "zero"}));
+    let proposal = p["proposal"].as_str().expect("a proposal").to_string();
+    let err = s.tool(0, "integrate", json!({"proposals": [&proposal], "note": "its own"})).expect_err("refused");
+    assert!(!err.is_empty());
+    s.sync(0);
+    s.sync(1);
+    s.ok(1, "integrate", json!({"proposals": [&proposal], "note": "the integrator takes it"}));
+    s.sync(1);
+    assert!(s.integrated().iter().any(|(p, _)| p == "tiny/zero.py"), "the builder's work is on the line");
+}
+
+#[test]
+fn an_integrator_setting_names_any_agent_or_one_of_the_runs() {
+    use bracken_experiment::weave_mode::integrator_agent;
+    assert_eq!(integrator_agent(ANY_AGENT, 4), Ok(None));
+    assert_eq!(integrator_agent("agent-0", 4), Ok(Some(0)));
+    assert_eq!(integrator_agent("agent-3", 4), Ok(Some(3)));
+    for bad in ["agent-4", "agent-", "agent-01", "agent--1", "agent-x", "Agent-1", "", "all"] {
+        assert!(integrator_agent(bad, 4).is_err(), "{bad} is refused");
+    }
+}
+
 /// A project run is Weave mode's, and needs the Python pin; Weave mode needs a project. Each is refused before
 /// the run directory is made.
 #[test]
@@ -815,6 +850,54 @@ mod macos_only {
     /// The tiny project, 2 agents x 3 turns, every worker sandboxed as in a real run: the seed is the first
     /// tree, the change goes out once half the agent-turns are used, a checkpoint follows every turn, the
     /// public tests run on each agent's tree through the driver, and every agent's module reaches the line.
+    /// A mock run with one integrator: no turn errs, only the integrator integrates, and every agent's work
+    /// reaches the line.
+    #[test]
+    fn a_mock_run_with_one_integrator_puts_every_agents_work_on_the_line() {
+        let Some(pin) = pin() else { return };
+        let project = ProjectPlan::of(&Project::load(&tiny()).expect("the fixture")).expect("its plan");
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let cfg = RunConfig {
+            root: dir.path().join("run"),
+            mode: "weave",
+            agents: 3,
+            turns: 2,
+            worker_bin: bin(),
+            bracken: bracken(),
+            git: git_binary().expect("git"),
+            trace: false,
+            calls_per_turn: CALLS_PER_TURN,
+            turn_limit: TURN_LIMIT,
+            plan: PlanInputs {
+                project: Some(project),
+                python: Some(pin),
+                integrator: Some("agent-2".into()),
+                ..PlanInputs::default()
+            },
+            sandbox: false,
+        };
+        let mock =
+            MockBackend { seed: 1, shim: Some(bin()), lockstep: true, integrator: Some(2), ..MockBackend::default() };
+        let outcome = run(&cfg, &mock).expect("the run");
+        let log = events(&outcome.events);
+        assert!(log.iter().all(|e| e["event"] != "turn_error"), "no turn erred");
+        let integrations: Vec<&Value> =
+            log.iter().filter(|e| e["event"] == "tool_result" && e["data"]["tool"] == "`integrate`").collect();
+        assert!(!integrations.is_empty());
+        assert!(integrations.iter().all(|e| e["agent"] == "agent-2" && e["data"]["ok"] == true), "{integrations:?}");
+        let plan: Value =
+            serde_json::from_slice(&std::fs::read(cfg.root.join("plan.json")).expect("the plan")).expect("JSON");
+        assert_eq!(plan["inputs"]["integrator"], "agent-2");
+        let rule = plan["rules"][0][1].as_str().expect("the integrator rule");
+        assert!(rule.contains("agent-2 is the run's one integrator of main"), "{rule}");
+        assert!(plan["prompts"]["role-builder"].is_string() && plan["prompts"]["role-integrator"].is_string());
+        // Turn 2's integration takes the builders' turn-1 proposals, and the end takes the rest.
+        let paths: Vec<String> = outcome.modules.iter().map(|(p, _)| p.clone()).collect();
+        for agent in 0..3 {
+            assert!(paths.iter().any(|p| p.contains(&format!("by_agent_{agent}_turn_1"))), "agent {agent}: {paths:?}");
+        }
+    }
+
     #[test]
     fn a_weave_mock_run_goes_end_to_end_sandboxed() {
         let Some(pin) = pin() else { return };

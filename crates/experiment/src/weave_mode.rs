@@ -3,8 +3,9 @@
 //!
 //! The hub is a throwaway Weave Ground under the run directory, never `~/bracken-weave`. The setter imports
 //! the project's seed as `main`'s first decision, so the seed is the run's first tree, states the spec and the
-//! items released at the start as claims, and names every agent an integrator: the configuration's
-//! integrator setting, any agent (answer `07959d6d9bc0`), recorded as a decision claim the line's policy cites.
+//! items released at the start as claims, and names the integrators of the configuration's integrator setting:
+//! every agent ([`ANY_AGENT`], answer `07959d6d9bc0`) or one (`agent-<n>`, answer `81403ed96c96`), recorded as a
+//! decision claim the line's policy cites.
 //! Each agent's copy is a replica of the hub's Ground, synced as Bracken mode syncs, beside a git working
 //! tree that only the store touches: Weave reads git's view of a tree. An agent edits files there, runs the
 //! public tests (the driver runs them, under the Python profile), proposes its tree against the decision it
@@ -24,6 +25,36 @@ use crate::task::Task;
 
 /// The integrator setting of this first configuration: any agent may integrate.
 pub const ANY_AGENT: &str = "any-agent";
+
+/// The agent an integrator setting names as the run's one integrator: `agent-<n>` names agent `n`, and
+/// [`ANY_AGENT`] none (task `5b2f7f4a6b7f`, answer `81403ed96c96`). Any other setting is refused, and so is an
+/// agent the run hasn't: `agents` is how many it has.
+pub fn integrator_agent(setting: &str, agents: usize) -> Result<Option<usize>, String> {
+    if setting == ANY_AGENT {
+        return Ok(None);
+    }
+    let n = setting
+        .strip_prefix("agent-")
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) && (n.len() == 1 || !n.starts_with('0')))
+        .and_then(|n| n.parse::<usize>().ok())
+        .ok_or_else(|| format!("the integrator setting {} is neither {ANY_AGENT} nor agent-<n>", short(setting)))?;
+    if n >= agents {
+        return Err(format!("the integrator setting names agent-{n}, but the run has {agents} agents"));
+    }
+    Ok(Some(n))
+}
+
+/// What the run's configuration decision says the integrator setting means.
+pub fn integrator_rule(setting: &str) -> String {
+    if setting == ANY_AGENT {
+        format!("the integrator setting is {ANY_AGENT}: every agent of the run is an integrator of main.")
+    } else {
+        format!(
+            "the integrator setting is {setting}: {setting} is the run's one integrator of main, and every other \
+             agent proposes its work for {setting} to integrate."
+        )
+    }
+}
 
 /// The largest file an agent may write, in bytes.
 pub const MAX_FILE_BYTES: usize = 256 * 1024;
@@ -1048,8 +1079,7 @@ impl WeaveStore {
         ])?;
         let spec = self.claim("spec", data["spec"].as_str().ok_or("the project data has no spec")?)?;
         let integrator = data["integrator"].as_str().unwrap_or(ANY_AGENT).to_string();
-        let decision =
-            self.claim("decision", &format!("Run configuration: the integrator setting is {integrator}: every agent of the run is an integrator of main."))?;
+        let decision = self.claim("decision", &format!("Run configuration: {}", integrator_rule(&integrator)))?;
         self.save("configuration.txt", &decision)?;
         let released = self.state_items(&data, false)?;
         Ok(
@@ -1673,13 +1703,21 @@ impl Store for WeaveStore {
     fn peers(&mut self, keys: &[String]) -> Result<Value, String> {
         let me = self.config.identity.clone();
         let decision = self.saved("configuration.txt")?;
+        let data: Value = serde_json::from_str(&self.saved("project.json")?)
+            .map_err(|e| format!("the saved project data isn't JSON: {e}"))?;
+        let setting = data["integrator"].as_str().unwrap_or(ANY_AGENT);
+        // The setter, and every agent or the one the setting names.
+        let named: Vec<&String> = match integrator_agent(setting, keys.len())? {
+            None => keys.iter().collect(),
+            Some(n) => vec![&keys[n]],
+        };
         let mut argv = vec!["weave".to_string(), "line".into(), "policy".into(), "main".into()];
         argv.push(format!("--integrator={}", self.saved("key.txt")?));
-        argv.extend(keys.iter().map(|k| format!("--integrator={k}")));
+        argv.extend(named.iter().map(|k| format!("--integrator={k}")));
         argv.extend([format!("--owner-decision={decision}"), format!("--as={me}"), "--json".into()]);
         let out = self.bracken(&argv)?;
         let v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
-        Ok(json!({"policy": v["line"], "integrators": keys.len() + 1}))
+        Ok(json!({"policy": v["line"], "integrators": named.len() + 1}))
     }
 
     /// One release after the start if the project has a change, else none.

@@ -558,9 +558,25 @@ pub struct HarnessBackend<H> {
     halt: Mutex<Option<String>>,
     usage: Mutex<File>,
     started: Instant,
+    /// Each agent's role sentence, after its turn message: none unless [`HarnessBackend::set_integrator`] names
+    /// one integrator.
+    roles: BTreeMap<String, String>,
 }
 
 impl<H: Harness> HarnessBackend<H> {
+    /// Tells each of the run's `agents` its role under the integrator setting `setting`
+    /// ([`crate::prompts::role_message`]): nothing for [`crate::weave_mode::ANY_AGENT`].
+    pub fn set_integrator(&mut self, setting: &str, agents: usize) -> Result<(), String> {
+        self.roles.clear();
+        for i in 0..agents {
+            let name = format!("agent-{i}");
+            if let Some(role) = crate::prompts::role_message(setting, &name, agents)? {
+                self.roles.insert(name, role);
+            }
+        }
+        Ok(())
+    }
+
     /// Checks what the harness declares, makes the backend's directory, checks the pin and starts the
     /// forwarding proxy.
     pub fn start(harness: H, cfg: BackendConfig) -> Result<HarnessBackend<H>, String> {
@@ -605,6 +621,7 @@ impl<H: Harness> HarnessBackend<H> {
             halt: Mutex::new(None),
             usage: Mutex::new(usage),
             started: Instant::now(),
+            roles: BTreeMap::new(),
         };
         backend.record(backend.record.clone());
         Ok(backend)
@@ -665,7 +682,10 @@ impl<H: Harness> HarnessBackend<H> {
         let config = self.cfg.dir.join("turn").join(name);
         let h = &self.harness;
         self.pin.check(h.name()).and_then(|()| self.turn_config(&config, name, socket)).map_err(|e| self.halting(e))?;
-        let message = crate::prompts::turn_message(turn, self.cfg.turns, name);
+        let mut message = crate::prompts::turn_message(turn, self.cfg.turns, name);
+        if let Some(role) = self.roles.get(name) {
+            message = format!("{message} {role}");
+        }
         let own = self.cfg.dir.join("agents").join(name);
         let (home, tmp) = (own.join("home"), own.join("tmp"));
         for d in [&own, &home, &tmp] {
