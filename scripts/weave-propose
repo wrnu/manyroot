@@ -54,10 +54,14 @@ origin=$(git -C "$repo" config --get remote.origin.url) || fail "no remote origi
 [[ $origin =~ ^https://([^/@]+)/([^/]+)/([^/]+)$ ]] ||
   fail "origin's URL isn't https://<host>/<owner>/<repo>, with no user or password in it"
 on="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}/${BASH_REMATCH[3]%.git}"
+# Only gh's stdout is its JSON. Its stderr is kept apart for the message: gh 2.105.0 prints a hint there even
+# when it succeeds (gotcha d532678d900c), and its error comes first, before any such hint.
+said=$(mktemp)
+trap 'rm -f "$said"' EXIT
 view=$(env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN -u GITHUB_ENTERPRISE_TOKEN -u GH_DEBUG -u DEBUG \
   -u GH_HOST -u GH_REPO GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 \
-  gh pr view "$pr" --repo "$on" --json state,headRefName,headRefOid,isCrossRepository 2>&1) ||
-  fail "can't read PR #$pr on $on with gh, so nothing was proposed: ${view##*$'\n'}"
+  gh pr view "$pr" --repo "$on" --json state,headRefName,headRefOid,isCrossRepository 2>"$said") ||
+  fail "can't read PR #$pr on $on with gh, so nothing was proposed: $(grep -m 1 . "$said" || echo 'gh said nothing on stderr')"
 field() { jq -er --arg f "$1" '.[$f] | strings' <<<"$view" 2>/dev/null || echo '?'; }
 state=$(field state) head_ref=$(field headRefName) head_oid=$(field headRefOid)
 cross=$(jq -r '.isCrossRepository | if . == false then "no" elif . == true then "yes" else "?" end' <<<"$view" 2>/dev/null ||
