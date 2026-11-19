@@ -379,6 +379,40 @@ impl Store {
     /// a dot are skipped, as another process's write in flight. [`Store::open`] doesn't read `agents/`,
     /// so call this to check it.
     pub fn agents(&self) -> Result<Vec<AgentEntry>, StoreError> {
+        let mut by_name: BTreeMap<String, AgentEntry> =
+            self.directory()?.into_iter().map(|e| (e.name.clone(), e)).collect();
+        let mut by_key: HashMap<AgentId, String> = by_name.values().map(|e| (e.agent, e.name.clone())).collect();
+        for identity in self.identities()? {
+            let local = AgentEntry { name: identity.name().to_owned(), agent: identity.agent_id() };
+            let entry_path = self.agents_dir().join(format!("{}.json", local.name));
+            match (by_name.get(&local.name), by_key.get(&local.agent)) {
+                (Some(listed), _) if listed.agent != local.agent => {
+                    return Err(StoreError::Corrupt {
+                        path: entry_path,
+                        reason: format!("lists a different key than local identity {:?}", local.name),
+                    });
+                }
+                (_, Some(other)) if *other != local.name => {
+                    return Err(StoreError::Corrupt {
+                        path: self.agents_dir().join(format!("{other}.json")),
+                        reason: format!("lists local identity {:?}'s key under another name", local.name),
+                    });
+                }
+                (Some(_), _) => {}
+                (None, _) => {
+                    by_key.insert(local.agent, local.name.clone());
+                    by_name.insert(local.name.clone(), local);
+                }
+            }
+        }
+        Ok(by_name.into_values().collect())
+    }
+
+    /// The public directory alone, `agents/`, sorted by name, never reading `identities/`: what
+    /// [`Store::agents`] reads from it, with the same checks, failing closed as it does on an entry that
+    /// isn't a regular file named `<name>.json` for a valid name, whose `name` isn't its file's, or a
+    /// second entry for a name or a key.
+    pub fn directory(&self) -> Result<Vec<AgentEntry>, StoreError> {
         let mut by_name: BTreeMap<String, AgentEntry> = BTreeMap::new();
         let mut by_key: HashMap<AgentId, String> = HashMap::new();
         let dir = self.agents_dir();
@@ -416,29 +450,6 @@ impl Store {
                 return Err(corrupt(format!("lists the key of {other:?} under another name")));
             }
             by_name.insert(listed.name.clone(), listed);
-        }
-        for identity in self.identities()? {
-            let local = AgentEntry { name: identity.name().to_owned(), agent: identity.agent_id() };
-            let entry_path = self.agents_dir().join(format!("{}.json", local.name));
-            match (by_name.get(&local.name), by_key.get(&local.agent)) {
-                (Some(listed), _) if listed.agent != local.agent => {
-                    return Err(StoreError::Corrupt {
-                        path: entry_path,
-                        reason: format!("lists a different key than local identity {:?}", local.name),
-                    });
-                }
-                (_, Some(other)) if *other != local.name => {
-                    return Err(StoreError::Corrupt {
-                        path: self.agents_dir().join(format!("{other}.json")),
-                        reason: format!("lists local identity {:?}'s key under another name", local.name),
-                    });
-                }
-                (Some(_), _) => {}
-                (None, _) => {
-                    by_key.insert(local.agent, local.name.clone());
-                    by_name.insert(local.name.clone(), local);
-                }
-            }
         }
         Ok(by_name.into_values().collect())
     }

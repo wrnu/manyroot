@@ -363,3 +363,16 @@ fn object(dir: &std::path::Path, id: &ContributionId) -> std::path::PathBuf {
     let hex = id.to_hex();
     dir.join("objects").join(&hex[..2]).join(&hex[2..])
 }
+
+#[test]
+fn the_directory_alone_never_reads_identities_but_checks_agents_as_agents_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let s = Store::init(&tmp.path().join("g"), "g").unwrap();
+    let alice = s.create_identity("alice").unwrap().agent_id();
+    // A broken identity file: agents() reads identities/ and fails; directory() doesn't read it.
+    std::fs::write(s.identities_dir().join("bob.json"), "not an identity").unwrap();
+    assert!(s.agents().is_err());
+    assert_eq!(s.directory().unwrap(), vec![AgentEntry { name: "alice".into(), agent: alice }]);
+    write_entry(s.dir(), "zzz.json", "zzz", alice);
+    corrupt(s.directory(), "under another name");
+}

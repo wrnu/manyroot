@@ -82,6 +82,8 @@ contribution keeps its encoded length (`Contribution::encoded_len`), which `Grap
   named `<name>.json` for a valid name, whose `name` isn't its file's, a second entry for a name or a key, or a
   local identity whose key the directory lists under another name. Names starting with a dot are skipped.
   Every command that shows names reads it, and `bracken verify` now does too. `Store::open` still doesn't.
+  `bracken view` reads the directory alone through `Store::directory`, with the same rules and without
+  `identities/`, so it refuses such a directory as the CLI does where it used to pick or drop a name.
 - **Identity files** (`Identity::load`, `Store::identities`) must be regular files named `<name>.json` for the
   valid name they hold.
 - **Writes**: an object's temporary file has a random name, is synced before the rename and is removed if the
