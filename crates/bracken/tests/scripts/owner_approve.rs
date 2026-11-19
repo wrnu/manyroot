@@ -32,9 +32,8 @@ sys.exit(os.waitstatus_to_exitcode(status))
 
 /// Task ec880b9c2c86: owner-approve signs, as owner and only on a terminal where the owner types
 /// `approve`, an approval claim naming the full id, related supports it, and prints its id and no key.
-/// As anyone else, without a terminal, for an unknown id, or without `approve`, it writes nothing. With
-/// --delegated it asks nothing and the approval says it was signed on the owner's delegation, quoting
-/// the yes; the same yes can't sign a second approval.
+/// As anyone else, without a terminal, for an unknown id, or without `approve`, it writes nothing, and
+/// --delegated, which let the manager sign on the owner's delegation, is refused (task 9b65c13e9d66).
 #[test]
 fn owner_approve_signs_as_owner_only_on_a_terminal_and_never_prints_a_key() {
     for scripts in SCRIPTS {
@@ -88,44 +87,24 @@ fn owner_approve_signs_as_owner_only_on_a_terminal_and_never_prints_a_key() {
             assert!(!text.contains(run), "{scripts}: printed part of the owner's identity file");
         }
 
-        // Delegated: the manager, as owner, with no terminal; the approval quotes the owner's yes.
-        let yes = "yes, run replicate 2";
-        let delegated = |args: &[&str]| {
-            let mut all = vec![&task[..12], words, "--delegated", yes];
-            all.extend(args);
-            let mut c = command(&dir, "scripts/owner-approve", &all);
-            c.env("BRACKEN_AGENT", "manager").stdin(std::process::Stdio::null()).output().unwrap()
-        };
+        // --delegated is gone (task 9b65c13e9d66): refused, as the manager or as owner, writing nothing.
         let count = || serde_json::from_str::<serde_json::Value>(&approvals()).unwrap().as_array().unwrap().len();
-        let out = delegated(&[]);
-        assert_eq!(out.status.code(), Some(1), "{scripts}: signed as manager");
-        assert_eq!(count(), 1, "{scripts}");
-        let out = delegated(&["--as", "owner"]);
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(out.status.success(), "{scripts}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
-        let shown: serde_json::Value = serde_json::from_str(&bk(&dir, &["show", stdout.trim(), "--json"])).unwrap();
-        assert_eq!(shown["author_name"], "owner", "{scripts}");
-        assert_eq!(shown["body"]["tags"], serde_json::json!(["approval", "delegated"]), "{scripts}");
-        let statement = shown["body"]["statement"].as_str().unwrap();
-        let says = format!(
-            "signed by the manager on the owner's delegation for this approval only; the owner said: '{yes}') of {task}: {words}"
-        );
-        assert!(statement.contains(&says), "{scripts}: {statement}");
-        let again = delegated(&["--as", "owner"]);
-        let stderr = String::from_utf8_lossy(&again.stderr);
-        assert!(again.status.code() == Some(1) && stderr.contains("its own yes"), "{scripts}: {stderr}");
-        assert_eq!(count(), 2, "{scripts}: the same yes signed twice");
-        // Retracting the approval doesn't free its yes (finding 8d9cc19d0568).
-        bk(&dir, &["retract", stdout.trim(), "--as", "owner"]);
-        let again = delegated(&["--as", "owner"]);
-        let stderr = String::from_utf8_lossy(&again.stderr);
-        assert!(again.status.code() == Some(1) && stderr.contains("its own yes"), "{scripts}: reused: {stderr}");
-        assert_eq!(count(), 2, "{scripts}: a retracted approval's yes signed again");
+        let args = [&task[..12], words, "--delegated", "yes, run replicate 2", "--as", "owner"];
+        for who in ["manager", "owner"] {
+            let mut c = command(&dir, "scripts/owner-approve", &args);
+            let out = c.env("BRACKEN_AGENT", who).stdin(std::process::Stdio::null()).output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.code() == Some(1) && stderr.contains("--delegated is gone"), "{scripts}: {stderr}");
+            assert_eq!(count(), 1, "{scripts}: --delegated as {who} wrote an approval");
+        }
+        let out = on_a_terminal("approve", &args);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: --delegated on a terminal");
+        assert_eq!(count(), 1, "{scripts}: --delegated on a terminal wrote an approval");
     }
 }
 
 /// Task 8b650f99aacd: scripts/bk exits 1 after a local write the team server didn't confirm. A stub bk
-/// does that for one command ($UNCONFIRMED): owner-approve then says the approval (and, for relate, its
+/// does that for one command ($UNCONFIRMED): owner-approve, run on a terminal, then says the approval (and, for relate, its
 /// supports relation) is written locally but not confirmed, names it, and prints the commands to
 /// finish, never that it wasn't written.
 #[test]
@@ -145,17 +124,19 @@ fn owner_approve_names_a_write_the_team_server_didnt_confirm() {
                 );
             },
         );
-        let _ = &tmp;
         bk(&dir, &["init", "--name", "unconfirmed"]);
         bk(&dir, &["id", "new", "owner"]);
         bk(&dir, &["id", "new", "manager"]);
         let task = bk(&dir, &["claim", "Task: a model run", "--tag", "task", "--as", "manager"]);
-        let approve = |unconfirmed: &str, yes: &str| {
-            let args = [&task[..12], "run it", "--delegated", yes, "--as", "owner"];
-            let mut c = command(&dir, "scripts/owner-approve", &args);
-            let out = c.env("UNCONFIRMED", unconfirmed).stdin(std::process::Stdio::null()).output().unwrap();
-            assert_eq!(out.status.code(), Some(1), "{scripts}: {}", String::from_utf8_lossy(&out.stdout));
-            String::from_utf8_lossy(&out.stderr).into_owned()
+        let helper = tmp.path().join("on-a-terminal.py");
+        std::fs::write(&helper, ON_A_TERMINAL).unwrap();
+        let approve = |unconfirmed: &str, words: &str| {
+            let args = ["-I", helper.to_str().unwrap(), "approve", "scripts/owner-approve", &task[..12], words];
+            let out = command(&dir, "python3", &args).env("UNCONFIRMED", unconfirmed).output().unwrap();
+            // On the pseudo-terminal, the script's stderr reaches the helper's stdout.
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            assert_eq!(out.status.code(), Some(1), "{scripts}: {text}");
+            text
         };
         let approvals = || -> Vec<serde_json::Value> {
             serde_json::from_str::<serde_json::Value>(&bk(&dir, &["log", "--tag", "approval", "--json"]))
