@@ -79,8 +79,8 @@ fn merge_dry_run_command(
     tested: Option<Tested>,
 ) -> (tempfile::TempDir, PathBuf, Command) {
     let file = |name: &str| repo_root().join(scripts).join(name);
-    let (merge, guards, scope) = (file("merge"), file("ground-guards"), file("code-scope"));
-    let files = [("scripts/merge", &merge), ("scripts/ground-guards", &guards), ("scripts/code-scope", &scope)];
+    let (merge, guards, scope) = (file("merge"), file("ground-guards"), file("tree-scope"));
+    let files = [("scripts/merge", &merge), ("scripts/ground-guards", &guards), ("scripts/tree-scope", &scope)];
     let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
     let (tmp, dir) = repo(&files, ".bracken/identities/\n", |_| {});
     let git = |args: &[&str]| assert!(run(&dir, "git", args).status.success(), "git {args:?} failed");
@@ -132,7 +132,6 @@ fn merge_dry_run_command(
     let mut merge =
         command(&dir, "scripts/merge", &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"]);
     merge.env("PATH", format!("{}:{path}", tmp.path().join("stubs").display())).env("GIT_CONFIG_NOSYSTEM", "1");
-    merge.env("CODE_SCOPE_TOKENS", affected_stub(&tmp.path().join("stubs/bracken-scope")));
     (tmp, dir, merge)
 }
 
@@ -359,7 +358,7 @@ fn merge_clears_the_attributes_checked_variable_for_ground_guards() {
     }
 }
 
-/// merge checks the two shortcuts with main's code-scope: a manager pass labelled docs-only counts only
+/// merge checks the two shortcuts with main's tree-scope: a manager pass labelled docs-only counts only
 /// on a docs-only head, and one that reuses an earlier pass only when that pass is the manager's, of the
 /// whole table, on this PR, with the same key. Either fails the scope check otherwise.
 /// One test per copy (decision 4bf44934cb67 (5)), so nextest runs the two at once.
@@ -472,192 +471,11 @@ fn merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_the_kickoff_te
     merge_counts_a_docs_only_or_reused_pass_only_where_it_holds(SCRIPTS[1]);
 }
 
-/// A light pass (`scripts/test-table --split -p … @ <sha> on <main> tree <key>`, decision `464d3ccca45e`,
-/// answer `10cf8a5053a3`) counts as the merged-tree form does when main is ahead in code, but fails the
-/// scope check for a head that scripts/code-scope full names, each kind of path in its list; for one
-/// whose packages, from code-scope packages, it leaves out, or that has none (findings 0095e19fcdb7,
-/// 4825c59b07e9); and unless the pr claim's author has the five passes on the exact sha (finding
-/// 013ac6db02d9). A failing code-scope fails it too. Without the merged tree, with main since moved in
-/// code, without packages, in the old --light form, or written by anyone but the manager, it doesn't
-/// count.
-fn merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed(scripts: &str) {
-    let lib = |dir: &Path| put(dir, "lib.rs", "main's code\n");
-    let case = |what: &str| format!("{scripts}: {what}");
-    let key = "1".repeat(40);
-    let scope = "-p bracken -p bracken-tree";
-    let five = |scope: &str| {
-        [
-            "cargo fmt --check".to_owned(),
-            "cargo clippy --all-targets -- -D warnings".to_owned(),
-            "cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings".to_owned(),
-            format!("cargo nextest run -P fast {scope}"),
-            format!("scripts/test-table --remote {scope}"),
-        ]
-    };
-    // How a case differs from the light pass that counts: what the branch changes, the manager's method
-    // ({head} and {tip} filled in), and the builder's passes, with the sha they name.
-    struct Light<'a> {
-        path: &'a str,
-        method: &'a str,
-        who: &'a str,
-        passes: Vec<String>,
-        passes_by: &'a str,
-        passes_on_head: bool,
-        failing_full: bool,
-    }
-    let ok_method = "scripts/test-table --split -p bracken -p bracken-tree @ {head} on {tip} tree {key}";
-    let base = || Light {
-        path: "code.txt",
-        method: ok_method,
-        who: "manager",
-        passes: five(scope).to_vec(),
-        passes_by: "builder",
-        passes_on_head: true,
-        failing_full: false,
-    };
-    let merge = |l: Light| {
-        let (_tmp, dir, mut merge) =
-            merge_dry_run_command(scripts, |_| {}, |dir| put(dir, l.path, "a change\n"), lib, None);
-        let rev = |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
-        let (head, tip, before) = (rev("pr"), rev("main"), rev("main~1"));
-        let prs: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--tag", "pr", "--json"])).unwrap();
-        let claim = prs[0]["id"].as_str().unwrap().to_owned();
-        let on = if l.passes_on_head { head.clone() } else { tip.clone() };
-        for p in &l.passes {
-            bk(&dir, &["evidence", &claim, "pass", "--method", &format!("{p} @ {on}"), "--as", l.passes_by]);
-        }
-        let method = l
-            .method
-            .replace("{head}", &head)
-            .replace("{tip}", &tip)
-            .replace("{before}", &before)
-            .replace("{key}", &key);
-        bk(&dir, &["evidence", &claim, "pass", "--method", &method, "--as", l.who]);
-        if l.failing_full {
-            let real = dir.join("scripts/code-scope");
-            std::fs::rename(&real, dir.join("scripts/code-scope.real")).unwrap();
-            write_executable(
-                &real,
-                "#!/bin/sh\nif [ \"$1\" = full ]; then echo 'code-scope: no such commit' >&2; exit 2; fi\n\
-                 exec \"$(dirname \"$0\")/code-scope.real\" \"$@\"\n",
-            );
-        }
-        merge.output().unwrap()
-    };
-    let refused = |what: &str, check: &str, l: Light, says: &[&str]| {
-        let out = merge(l);
-        let line = check_line(&out, check);
-        assert_eq!(out.status.code(), Some(1), "{}: {line}", case(what));
-        assert!(line.starts_with("FAIL"), "{}: {line}", case(what));
-        for s in says {
-            assert!(line.contains(s), "{}: expected {s:?}: {line}", case(what));
-        }
-    };
-
-    let out = merge(base());
-    assert!(out.status.success(), "{}: {}", case("a light pass"), String::from_utf8_lossy(&out.stdout));
-    assert!(check_line(&out, "scope").starts_with("ok "), "{}", case("a light pass"));
-    assert!(check_line(&out, "main").contains("tested"), "{}", case("a light pass"));
-    // A wider scope than the head needs counts too.
-    let wider = "scripts/test-table --split -p bracken -p bracken-demo -p bracken-tree @ {head} on {tip} tree {key}";
-    let out = merge(Light { method: wider, ..base() });
-    assert!(out.status.success(), "{}: {}", case("a wider light pass"), String::from_utf8_lossy(&out.stdout));
-
-    for path in [
-        "crates/manyroot/src/graph.rs",
-        "Cargo.toml",
-        "Cargo.lock",
-        "docs/protocol.md",
-        "crates/tree/src/lib.rs",
-        "crates/tree/src/check.rs",
-        "crates/tree/Cargo.toml",
-        "crates/tree/tests/fixtures/weave-v1/ground.json",
-        ".cargo/config.toml",
-        "rust-toolchain.toml",
-    ] {
-        refused(path, "scope", Light { path, ..base() }, &["needs the whole table", path]);
-    }
-
-    // The scope comes from the changed files: crates/demo's row needs three packages.
-    refused(
-        "a scope narrower than the head's",
-        "scope",
-        Light { path: "crates/demo/src/main.rs", ..base() },
-        &["leaves out bracken-demo bracken-experiment"],
-    );
-    refused(
-        "a head with no package to test",
-        "scope",
-        Light { path: "rustfmt.toml", ..base() },
-        &["no package to test"],
-    );
-
-    // The builder's five passes, on the exact sha, by the pr claim's author.
-    refused("no builder passes", "scope", Light { passes: vec![], ..base() }, &["pr claim's author has no pass on"]);
-    refused(
-        "the builder's passes on another sha",
-        "scope",
-        Light { passes_on_head: false, ..base() },
-        &["cargo fmt --check", "cargo nextest run -P fast -p bracken -p bracken-tree"],
-    );
-    refused("val's passes, not the author's", "scope", Light { passes_by: "val", ..base() }, &["no pass on"]);
-    let mut no_clippy = five(scope).to_vec();
-    no_clippy.remove(1);
-    refused(
-        "the builder's passes without clippy",
-        "scope",
-        Light { passes: no_clippy, ..base() },
-        &["of: cargo clippy --all-targets -- -D warnings"],
-    );
-    let mut workspace = five(scope).to_vec();
-    workspace[3] = "cargo nextest run -P fast --workspace".to_owned();
-    refused(
-        "a --workspace fast run",
-        "scope",
-        Light { passes: workspace, ..base() },
-        &["cargo nextest run -P fast -p bracken -p bracken-tree"],
-    );
-    refused("code-scope full failing", "scope", Light { failing_full: true, ..base() }, &["code-scope full failed"]);
-
-    // Main moved in code since the light pass's main: it doesn't count in 5.
-    let before = "scripts/test-table --split -p bracken -p bracken-tree @ {head} on {before} tree {key}";
-    refused("main moved in code since the light pass", "main", Light { method: before, ..base() }, &[]);
-    for (what, l) in [
-        (
-            "a light pass of the bare head",
-            Light { method: "scripts/test-table --split -p bracken -p bracken-tree @ {head}", ..base() },
-        ),
-        ("val's light pass", Light { who: "val", ..base() }),
-        (
-            "a split pass without the merged tree's key",
-            Light { method: "scripts/test-table --split -p bracken @ {head} on {tip}", ..base() },
-        ),
-        (
-            "the old --light form",
-            Light {
-                method: "scripts/test-table --light -p bracken -p bracken-tree @ {head} on {tip} tree {key}",
-                ..base()
-            },
-        ),
-    ] {
-        refused(what, "main", l, &[]);
-    }
-}
-
-#[test]
-fn merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed_in_scripts() {
-    merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed(SCRIPTS[0]);
-}
-
-#[test]
-fn merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed_in_the_kickoff_templates() {
-    merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed(SCRIPTS[1]);
-}
-
 /// The split counted run counts as the whole table: merge takes a manager pass of
 /// `scripts/test-table --split` on the merge, main ahead in code, as it takes `scripts/test-table`'s;
 /// a pass of `--remote` alone doesn't count, nor one of `--remote -p`, a builder's scoped tests in a box
-/// (finding 4a25ddba5d49).
+/// (finding 4a25ddba5d49). Nor does the retired light pass, `--split -p` on the merged tree, or the older
+/// `--light` form (owner decision c8bbb2886be3): no counted run is light any more.
 #[test]
 fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
     let code = |dir: &Path| put(dir, "code.txt", "a change\n");
@@ -670,6 +488,8 @@ fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
             ("scripts/test-table --remote", tree, false),
             ("scripts/test-table --remote -p bracken", tree, false),
             ("scripts/test-table --remote -p bracken", "", false),
+            ("scripts/test-table --split -p bracken -p bracken-tree", tree, false),
+            ("scripts/test-table --light -p bracken -p bracken-tree", tree, false),
         ] {
             let pass = Tested { command, suffix, ..tested("manager", "main") };
             let out = merge_dry_run_on(scripts, |_| {}, code, lib, Some(pass));
@@ -850,14 +670,14 @@ fn merge_with_owner_approval_needs_an_owner_signed_approval_of_the_pr_claim_itse
 }
 
 /// Weave's format freeze, G6 (docs/design/weave-freeze.md 2.4, task e1d2cb38d478): merge's frozen check,
-/// through main's code-scope frozen. A head that changes nothing it names passes. One that changes
+/// through main's tree-scope frozen. A head that changes nothing it names passes. One that changes
 /// crates/tree's source, the format guard and Weave's CLI is refused, naming each path and what's missing,
 /// until it has: a current owner-review claim by manager whose first line names the pr claim's full id and
 /// the head's sha (not one by another author, naming a short id or only the sha, naming them only below
 /// the first line, retracted, or superseded); an approval the owner ran of the pr claim, which owner
 /// related supports it (not a delegated one, a manager's, one of another claim, or one with no supports
 /// relation); and a reviewer's independent review pass at the head (not the security review's, a fail, one
-/// at another sha, or a retracted one). The check fails closed: a code-scope frozen that fails, exits 1,
+/// at another sha, or a retracted one). The check fails closed: a tree-scope frozen that fails, exits 1,
 /// or prints a line it can't read, a path with a newline split over two included, refuses it too, and
 /// only exit 3 with its one line is nothing to check (findings db2dc1c6120e, e3f9ae2b1820).
 fn merge_refuses_a_frozen_change_without_the_freezes_review(scripts: &str) {
@@ -966,14 +786,14 @@ fn merge_refuses_a_frozen_change_without_the_freezes_review(scripts: &str) {
     assert_eq!(code, Some(0), "{scripts}: {line}");
     assert!(line.starts_with("ok ") && line.contains("the freeze's review is there"), "{scripts}: {line}");
 
-    // The check fails closed (findings db2dc1c6120e, e3f9ae2b1820): with every review there, a code-scope
+    // The check fails closed (findings db2dc1c6120e, e3f9ae2b1820): with every review there, a tree-scope
     // frozen standing in for main's that fails, exits 1 (as set -e does), or prints what the check can't
     // read decides nothing. Only exit 3 with exactly its one line is nothing to check.
-    let real = dir.join("../code-scope.real");
-    copy_executable(&dir.join("scripts/code-scope"), &real);
+    let real = dir.join("../tree-scope.real");
+    copy_executable(&dir.join("scripts/tree-scope"), &real);
     let (out, exit) = (dir.join("../frozen.out"), dir.join("../frozen.exit"));
     write_executable(
-        &dir.join("scripts/code-scope"),
+        &dir.join("scripts/tree-scope"),
         &format!(
             "#!/usr/bin/env bash\n[ \"$1\" != frozen ] || {{ cat {}; echo 'a message' >&2; exit \"$(cat {})\"; }}\nexec {} \"$@\"\n",
             out.display(),
@@ -981,13 +801,13 @@ fn merge_refuses_a_frozen_change_without_the_freezes_review(scripts: &str) {
             real.display()
         ),
     );
-    let nothing = format!("code-scope: nothing since {sha} is frozen or holds the freeze's refusals\n");
-    let line_of = |kind: &str, path: &str| format!("code-scope: {kind}: {path} (why)\n");
+    let nothing = format!("tree-scope: nothing since {sha} is frozen or holds the freeze's refusals\n");
+    let line_of = |kind: &str, path: &str| format!("tree-scope: {kind}: {path} (why)\n");
     for (prints, code, says) in [
-        (String::new(), 2, "code-scope frozen failed (exit 2), so the freeze check can't decide: a message"),
-        (nothing.clone(), 1, "code-scope frozen failed (exit 1)"),
+        (String::new(), 2, "tree-scope frozen failed (exit 2), so the freeze check can't decide: a message"),
+        (nothing.clone(), 1, "tree-scope frozen failed (exit 1)"),
         (
-            "code-scope: all good\n".to_owned(),
+            "tree-scope: all good\n".to_owned(),
             3,
             "exited 3 with an answer for nothing to check that isn't its one line",
         ),
@@ -995,8 +815,8 @@ fn merge_refuses_a_frozen_change_without_the_freezes_review(scripts: &str) {
         (String::new(), 0, "exited 0 with no line at all"),
         (line_of("unknown", src), 0, "exited 0 with a line it can't read: "),
         // A newline in a path, split over two lines, after a line that reads.
-        (format!("{}code-scope: frozen: crates/tree/src/a\nb.rs (why)\n", line_of("frozen", src)), 0, "can't read"),
-        (format!("code-scope: security: {cli}\n"), 0, "a line it can't read"),
+        (format!("{}tree-scope: frozen: crates/tree/src/a\nb.rs (why)\n", line_of("frozen", src)), 0, "can't read"),
+        (format!("tree-scope: security: {cli}\n"), 0, "a line it can't read"),
     ] {
         std::fs::write(&out, &prints).unwrap();
         std::fs::write(&exit, code.to_string()).unwrap();
@@ -1011,7 +831,7 @@ fn merge_refuses_a_frozen_change_without_the_freezes_review(scripts: &str) {
     assert_eq!(status, Some(0), "{scripts}: {line}");
     assert!(line.starts_with("ok ") && line.contains("nothing frozen: nothing since"), "{scripts}: {line}");
 
-    // End to end, main's real code-scope refuses a head adding a file with a newline in its name.
+    // End to end, main's real tree-scope refuses a head adding a file with a newline in its name.
     let newline = |dir: &Path| put(dir, "crates/tree/tests/fixtures/a\nb", "a fixture\n");
     let out = merge_dry_run(scripts, newline, |_| {});
     let line = check_line(&out, "frozen");

@@ -2,10 +2,10 @@
 # pi-prefix: builds the Pi install a Pi run pins (task 68675575fd58; notes e19ff6fc8285, cc34f6275877).
 #
 #   pi-prefix <dir>     build it in <dir>, which must not exist yet
-#   pi-prefix --lock    rewrite crates/experiment/pi/package-lock.json from package.json
+#   pi-prefix --lock    rewrite research/experiment/pi/package-lock.json from package.json
 #
 # The prefix is nodejs.org's node at a pinned version, its tarball checked against the sha256 below
-# before it's unpacked, and Pi's packages exactly as crates/experiment/pi/package-lock.json has them,
+# before it's unpacked, and Pi's packages exactly as research/experiment/pi/package-lock.json has them,
 # installed by that node's own npm with 'npm ci'. Never the owner's node, npm or pi, and none of
 # their configuration: npm runs with a cleared environment, no user or global npmrc, a cache of its
 # own and the public registry. Install scripts are off ('--ignore-scripts' and the matching setting);
@@ -30,7 +30,7 @@ cli=pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js
 fail() { echo "pi-prefix: $*" >&2; exit 1; }
 
 top=$(cd "$(dirname "$0")/.." && pwd -P)
-pi="$top/crates/experiment/pi"
+pi="$top/research/experiment/pi"
 [ "$(uname -s) $(uname -m)" = "Darwin arm64" ] || fail "builds for macOS on arm64 only"
 case "${1:-}" in
   --lock) mode=lock ;;

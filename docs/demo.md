@@ -10,8 +10,11 @@ report. It's the first step toward the Phase 1 experiment in
 
 ```sh
 cargo build -p bracken            # the demo drives this binary
-cargo run -p bracken-demo -- --agents 4 --rounds 5 --seed 1
+(cd research && cargo run -p bracken-demo -- --agents 4 --rounds 5 --seed 1)
 ```
+
+The demo lives in the research workspace, `research/`, which builds into the
+root's `target/` (research/.cargo/config.toml).
 
 The demo uses the `bracken` that cargo built next to it (`target/<profile>/`),
 or the one you pass with `--bracken <path>`. That path is resolved once, to an
@@ -85,7 +88,7 @@ To look around a run's Ground afterwards, keep it outside any repository and
 point bracken at a replica:
 
 ```sh
-cargo run -p bracken-demo -- --keep /tmp/demo
+(cd research && cargo run -p bracken-demo -- --keep /tmp/demo)
 target/debug/bracken --dir /tmp/demo/agent-0/.bracken log
 target/debug/bracken --dir /tmp/demo/agent-0/.bracken conflicts
 ```
@@ -276,7 +279,7 @@ them. The vision's answer is visible claims of work in progress, so this
 experiment adds them (`--wip`) and compares runs with and without:
 
 ```sh
-cargo build --release -p bracken -p bracken-demo
+cargo build --release -p bracken && (cd research && cargo build --release -p bracken-demo)
 target/release/bracken-demo compare --stale-rules claim-round   # seeds 1..10, ring and gossip, W = 1 and 2, all schedules
 ```
 

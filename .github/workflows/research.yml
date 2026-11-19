@@ -1,0 +1,122 @@
+# CI for the research workspace, research/ (owner decision c8bbb2886be3, task bfc942cd7ced): the
+# experiment runner, the demo and the query lab, which the product workspace's table no longer builds.
+# It runs only when research/ or a product crate it builds on changes, and also when what every build
+# reads changes (the root Cargo.toml, whose workspace the path dependencies inherit from, and .cargo/) or
+# this file does. Like ci.yml it only reports: it merges nothing, writes nothing to the Ground, deploys
+# nothing, and nothing waits for it.
+#
+# The research tests that run the bracken binary find it beside their own: research/.cargo/config.toml
+# builds into the root's target/, so each job builds bracken at the root first.
+#
+# Hardened as ci.yml is: read-only token, no secrets, never pull_request_target or workflow_run,
+# third-party actions pinned by full commit sha, no `${{ }}` of event data inside a script, the cargo
+# cache saved only from main, and standard runners only.
+name: Research
+
+on:
+  push:
+    paths:
+      - "research/**"
+      - "crates/manyroot/**"
+      - "crates/tree/**"
+      - "crates/bracken/**"
+      - "Cargo.toml"
+      - ".cargo/**"
+      - ".github/workflows/research.yml"
+  pull_request:
+    paths:
+      - "research/**"
+      - "crates/manyroot/**"
+      - "crates/tree/**"
+      - "crates/bracken/**"
+      - "Cargo.toml"
+      - ".cargo/**"
+      - ".github/workflows/research.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: research-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # ci.yml's toolchain and nextest pins.
+  RUST_VERSION: "1.98.1"
+  NEXTEST_VERSION: "0.9.150"
+  NEXTEST_LINUX_SHA256: b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
+  NEXTEST_MAC_SHA256: 82a759b4d218d38359424196ab244c470e8f7c7d149c814fbbeef4d67c3c301a
+  CARGO_TERM_COLOR: never
+
+jobs:
+  research:
+    name: Research workspace (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --component clippy,rustfmt
+          rustup default "$RUST_VERSION"
+          cargo --version
+      - name: Tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # The experiment's git-mode tests need git 2.46 or later.
+          git --version
+          tar=cargo-nextest-$NEXTEST_VERSION-x86_64-unknown-linux-gnu.tar.gz
+          dir=$(mktemp -d)
+          curl -fsSL -o "$dir/$tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/$tar"
+          echo "$NEXTEST_LINUX_SHA256  $dir/$tar" | sha256sum -c --quiet -
+          tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
+          echo "$dir" >>"$GITHUB_PATH"
+      - name: Tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          tar=cargo-nextest-$NEXTEST_VERSION-universal-apple-darwin.tar.gz
+          dir=$(mktemp -d)
+          curl -fsSL -o "$dir/$tar" "https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-$NEXTEST_VERSION/$tar"
+          echo "$NEXTEST_MAC_SHA256  $dir/$tar" | shasum -a 256 -c --quiet -
+          tar -xzf "$dir/$tar" -C "$dir" cargo-nextest
+          echo "$dir" >>"$GITHUB_PATH"
+          # Apple's git, as on the team's Mac, ahead of the runner's Homebrew git: the experiment's
+          # sandbox lets a worker run git's binary and exec path but not Homebrew's libraries, so
+          # Homebrew's git fails to load there (dyld). The git-mode tests need git 2.46 or later.
+          git_dir=$(mktemp -d)
+          ln -s /usr/bin/git "$git_dir/git"
+          "$git_dir/git" --version
+          "$git_dir/git" --version | awk '{split($3, v, "."); exit !(v[1] > 2 || (v[1] == 2 && v[2] >= 46))}' ||
+            { echo "Apple's git is older than 2.46, which the experiment's git-mode tests need"; exit 1; }
+          echo "$git_dir" >>"$GITHUB_PATH"
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            research -> ../target
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Format
+        working-directory: research
+        run: cargo fmt --check
+      - name: Clippy
+        working-directory: research
+        run: cargo clippy --locked --all-targets -- -D warnings
+      # The bracken the tests run, built at the root into the target/ the research workspace shares.
+      - name: Build bracken
+        run: cargo build --locked -p bracken --bin bracken
+      # Every test, the macOS-only ones on the Mac (the Docker-backed ones skip, printing why: these runners
+      # have no Docker), then the doctests, which nextest doesn't run.
+      - name: Tests
+        working-directory: research
+        run: |
+          cargo nextest run --locked --workspace --no-fail-fast
+          cargo test --locked --doc --workspace

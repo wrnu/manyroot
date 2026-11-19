@@ -254,15 +254,14 @@ The protocol is specified in [docs/protocol.md](docs/protocol.md).
 | [`manyroot`](crates/manyroot)             | The protocol library: contributions, the causal graph, validation, storage and sync. It assumes nothing about code. |
 | [`bracken`](crates/bracken)               | The `bracken` CLI, for agents and humans: recording and reading work, sync, the web view, `bracken watch` and `bracken weave`. |
 | [`bracken-tree`](crates/tree)             | Bracken's code layer on Weave: payload formats, import from git, lines and decisions, proposals and merges, line-by-line text merge, checks run in a sandbox ([spec](docs/design/weave.md)). |
-| [`bracken-experiment`](crates/experiment) | The experiment runner: one task under Bracken, Git, CRDT or Weave mode, measured and graded the same way, with Claude Code and Pi as harnesses ([design](docs/design/phase1-experiment.md)). Holds the `ledger` project. |
-| [`bracken-demo`](crates/demo)             | Agents on a toy task through `bracken`, with a measured report ([docs/demo.md](docs/demo.md)). |
-| [`bracken-scope`](crates/scope)           | Which packages a change affects, and which Rust files it touched only in comments, for the team's test scoping. |
-| [`bracken-query-lab`](crates/query-lab)   | A research prototype: a Datalog query language over a Ground. Nothing depends on it. |
+| [`bracken-experiment`](research/experiment) | In the research workspace, `research/`, with the demo and the query lab. The experiment runner: one task under Bracken, Git, CRDT or Weave mode, measured and graded the same way, with Claude Code and Pi as harnesses ([design](docs/design/phase1-experiment.md)). Holds the `ledger` project. |
+| [`bracken-demo`](research/demo)             | Agents on a toy task through `bracken`, with a measured report ([docs/demo.md](docs/demo.md)). |
+| [`bracken-query-lab`](research/query-lab)   | A research prototype: a Datalog query language over a Ground. Nothing depends on it. |
 
 | Directory | What it holds |
 | --- | --- |
 | [`docs/`](docs/README.md) | The vision, the protocol, the CLI reference, the team's process values, and design notes and results under `docs/design/` |
-| [`scripts/`](scripts) | The team's tools: `bk` (the pinned `bracken` on the team's Ground), `bk-evidence` (record a check's real result), `merge` and `verify-seq` (the merge gate and counted runs), `test-table`, `ci-result` (record a head's Actions result), `code-scope`, `weave`, `weave-propose`, `weave-shadow` and `weave-gate` (the Weave dogfood), `owner-approve`, and housekeeping |
+| [`scripts/`](scripts) | The team's tools: `bk` (the pinned `bracken` on the team's Ground), `bk-evidence` (record a check's real result), `merge` and `verify-seq` (the merge gate and counted runs), `test-table`, `ci-result` (record a head's Actions result), `tree-scope`, `weave`, `weave-propose`, `weave-shadow` and `weave-gate` (the Weave dogfood), `owner-approve`, and housekeeping |
 | [`.bracken/`](.bracken) | This repository's own Ground: every task, decision, finding, test run and report |
 | [`.claude/skills/agent-team-kickoff`](.claude/skills/agent-team-kickoff) | The agent-team process, as a skill that sets it up in a repository |
 

@@ -49,7 +49,7 @@
 # without --replace, with no hand edit. It runs that, reads the replica's weave-root back, and fails unless
 # it now holds exactly the pinned root. So the one way to set or move a replica's root through the scripts
 # is to the committed value; weave root set is refused once the replica matches. Changing which root is
-# right is a change to .config/weave-root, which scripts/code-scope frozen lists.
+# right is a change to .config/weave-root, which scripts/tree-scope frozen lists.
 # Creating the Weave Ground (weave init) waits for the owner's go.
 set -euo pipefail
 

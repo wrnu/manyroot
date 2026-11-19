@@ -61,16 +61,16 @@ pub(crate) fn bk(dir: &Path, args: &[&str]) -> String {
     common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned())
 }
 
-/// A git repository holding `scripts/bk`, the given `bk-evidence` and the `code-scope` beside it, with a
+/// A git repository holding `scripts/bk`, the given `bk-evidence` and the `tree-scope` beside it, with a
 /// Ground and identity `val`.
 ///
 /// `scripts/bk` runs bracken through a pipe that fails when its reader stops early, as an
 /// older bracken or a `printf | grep -q` did: the scripts must not depend on how the writer
 /// takes a closed pipe.
 pub(crate) fn workspace(bk_evidence: &Path) -> (tempfile::TempDir, PathBuf, String) {
-    let scope = bk_evidence.with_file_name("code-scope");
+    let scope = bk_evidence.with_file_name("tree-scope");
     let (tmp, dir) =
-        repo(&[("scripts/bk-evidence", bk_evidence), ("scripts/code-scope", &scope)], ".bracken/\n", |_| {});
+        repo(&[("scripts/bk-evidence", bk_evidence), ("scripts/tree-scope", &scope)], ".bracken/\n", |_| {});
     let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
     bk(&dir, &["init", "--name", "scripts"]);
     bk(&dir, &["id", "new", "val"]);
@@ -155,39 +155,6 @@ pub(crate) fn put(dir: &Path, path: &str, text: &str) {
     std::fs::write(file, text).unwrap();
 }
 
-/// A stand-in for crates/scope's bracken-scope, which code-scope runs through CODE_SCOPE_TOKENS: these
-/// repositories have no Cargo workspace for it to read. comment-only says no to every file. packages logs
-/// its arguments, and the paths it was given, to $AFFECTED_LOG if set; prints every package for --all;
-/// fails with $AFFECTED_FAIL; and otherwise maps each path as the old hand-written rows did, enough for
-/// these tests. The real tool is tested in crates/scope.
-pub(crate) const AFFECTED_STUB: &str = r#"#!/usr/bin/env bash
-[ "$1" != comment-only ] || { echo 'no: the stub'; exit 1; }
-shift
-if [ "$1" = --all ]; then
-  echo "$*" >>"${AFFECTED_LOG:-/dev/null}"
-  printf '%s\n' bracken bracken-demo bracken-experiment bracken-scope bracken-tree manyroot
-  exit 0
-fi
-mapfile -d '' -t paths
-echo "$* <${paths[*]}>" >>"${AFFECTED_LOG:-/dev/null}"
-[ -z "${AFFECTED_FAIL:-}" ] || { echo 'cargo metadata failed' >&2; exit 3; }
-for p in "${paths[@]}"; do
-  case "$p" in
-    rustfmt.toml) ;;
-    crates/tree/*) printf '%s\n' bracken bracken-tree ;;
-    crates/bracken/* | crates/demo/* | crates/experiment/*) printf '%s\n' bracken bracken-demo bracken-experiment ;;
-    scripts/* | .claude/skills/*) echo bracken ;;
-    *) printf '%s\n' bracken bracken-tree ;;
-  esac
-done | LC_ALL=C sort -u
-"#;
-
-/// Writes [`AFFECTED_STUB`] at `path`, returning it.
-pub(crate) fn affected_stub(path: &Path) -> PathBuf {
-    write_executable(path, AFFECTED_STUB);
-    path.to_owned()
-}
-
 /// Commits everything in `dir` as `message`.
 pub(crate) fn commit_all(dir: &Path, message: &str) {
     assert!(run(dir, "git", &["add", "-A"]).status.success());
@@ -223,7 +190,7 @@ pub(crate) fn weave(dir: &Path, script: &str, home: &Path, bin: Option<&Path>, a
 }
 
 /// A batch (decision db6f7705c0a4), end to end: a repository with the real merge, verify-seq, bk-evidence,
-/// code-scope and ground-guards, a committed stub scripts/test-table that fails when the tree holds a
+/// tree-scope and ground-guards, a committed stub scripts/test-table that fails when the tree holds a
 /// file named `broken`, and a local stand-in for GitHub: a bare repository behind origin's URL and a `gh`
 /// stub that answers GET pulls/<n> and does PUT pulls/<n>/merge as a squash merge (git merge-tree onto
 /// main) of the body's sha, answering 409 if that isn't the PR's head, as GitHub does; with no sha, it
@@ -266,7 +233,7 @@ impl Batch {
         extra: &dyn Fn(&Path, usize),
     ) -> Batch {
         let file = |name: &str| repo_root().join(scripts).join(name);
-        let names = ["merge", "ground-guards", "code-scope", "verify-seq", "bk-evidence"];
+        let names = ["merge", "ground-guards", "tree-scope", "verify-seq", "bk-evidence"];
         let paths: Vec<(String, PathBuf)> = names.iter().map(|n| (format!("scripts/{n}"), file(n))).collect();
         let files: Vec<(&str, &Path)> = paths.iter().map(|(to, from)| (to.as_str(), from.as_path())).collect();
         let (tmp, dir) = repo(&files, ".bracken/identities/\n", |dir| {

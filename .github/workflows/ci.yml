@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      # Full history, for the Ground guards' append-only check and scripts/code-scope against main.
+      # Full history, for the Ground guards' append-only check and scripts/tree-scope against main.
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

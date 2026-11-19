@@ -1,4 +1,4 @@
-"""The Python profile's supervisor (crates/experiment/src/python.rs): the container's first process under its init.
+"""The Python profile's supervisor (research/experiment/src/python.rs): the container's first process under its init.
 
 It copies the run's inputs into the scratch directory and starts the code, each as the code's user, then becomes
 a user of its own, which the code can't signal, trace or read the memory of. It relays the code's output to the

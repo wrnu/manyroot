@@ -2,7 +2,7 @@
 
 use crate::support::*;
 
-/// A repository with ci-result, bk-evidence and code-scope, a Ground with identity `val`, origin on a
+/// A repository with ci-result, bk-evidence and tree-scope, a Ground with identity `val`, origin on a
 /// GitHub URL, and a `gh` stub that answers the runs query from `$T/runs.json`, the jobs query from
 /// `$T/jobs.json` and the pull requests query from `$T/pulls.json` (failing without it), logging each
 /// call and any token variable it sees to `$T/gh.log`.

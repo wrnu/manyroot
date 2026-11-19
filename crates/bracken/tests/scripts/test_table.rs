@@ -10,8 +10,8 @@ use crate::support::*;
 fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
     for scripts in SCRIPTS {
         let (table, scope) =
-            (repo_root().join(scripts).join("test-table"), repo_root().join(scripts).join("code-scope"));
-        let files = [("scripts/test-table", table.as_path()), ("scripts/code-scope", scope.as_path())];
+            (repo_root().join(scripts).join("test-table"), repo_root().join(scripts).join("tree-scope"));
+        let files = [("scripts/test-table", table.as_path()), ("scripts/tree-scope", scope.as_path())];
         let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
             write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\necho \"ground-guards $*\" >>\"$LOG\"\n");
             std::fs::create_dir_all(dir.join("sub")).unwrap();
@@ -81,17 +81,19 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
     }
 }
 
-/// `test-table --light -p <package>...` (decision `464d3ccca45e`), with a `cargo` stub that logs each call and
-/// knows two packages, one with a library: fmt, both clippies, nextest of exactly those packages, the
-/// doctests of those with a library only, then the Ground guards. With TEST_TABLE_MODE set it ends with
-/// the counted run's mode, on a pass and on a failing step. A package the workspace lacks is refused
-/// before any check runs.
+/// The light table, `--light -p <package>...`, runs only in Weave's box (`--in-tree --light`, for
+/// `--weave-box -p`): no counted run is light (owner decision c8bbb2886be3), so without --in-tree it's
+/// refused before anything runs. With a `cargo` stub that logs each call and knows two packages, one with
+/// a library: fmt, both clippies, nextest of exactly those packages, and the doctests of those with a
+/// library only; the Ground guards are skipped, as in any Weave box. With TEST_TABLE_MODE set it ends
+/// with the mode, on a pass and on a failing step. A package the workspace lacks is refused before any
+/// check runs.
 #[test]
-fn test_table_light_runs_the_named_packages_and_the_guards() {
+fn test_table_light_runs_the_named_packages_only_in_weaves_box() {
     for scripts in SCRIPTS {
         let (table, scope) =
-            (repo_root().join(scripts).join("test-table"), repo_root().join(scripts).join("code-scope"));
-        let files = [("scripts/test-table", table.as_path()), ("scripts/code-scope", scope.as_path())];
+            (repo_root().join(scripts).join("test-table"), repo_root().join(scripts).join("tree-scope"));
+        let files = [("scripts/test-table", table.as_path()), ("scripts/tree-scope", scope.as_path())];
         let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
             write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\necho \"ground-guards $*\" >>\"$LOG\"\n");
         });
@@ -109,13 +111,13 @@ fn test_table_light_runs_the_named_packages_and_the_guards() {
         let light = |args: &[&str], fail_on: &str| {
             let _ = std::fs::remove_file(&log);
             let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
-            let mut all = vec!["--light"];
+            let mut all = vec!["--in-tree", "--light"];
             all.extend_from_slice(args);
             let out = command(&dir, "scripts/test-table", &all)
                 .env("PATH", path)
                 .env("LOG", &log)
                 .env("FAIL_ON", fail_on)
-                .env("TEST_TABLE_MODE", "light: the builder's passes")
+                .env("TEST_TABLE_MODE", "light: weave's box")
                 .output()
                 .unwrap();
             (out, std::fs::read_to_string(&log).unwrap_or_default())
@@ -131,7 +133,7 @@ fn test_table_light_runs_the_named_packages_and_the_guards() {
             calls,
             format!(
                 "{start}{checks}cargo nextest run --locked --no-fail-fast -p lib-a -p bin-b\n\
-                 cargo test --locked --doc -p lib-a\nground-guards origin/main HEAD\n"
+                 cargo test --locked --doc -p lib-a\n"
             ),
             "{scripts}"
         );
@@ -141,7 +143,8 @@ fn test_table_light_runs_the_named_packages_and_the_guards() {
             "{scripts}: {stdout}"
         );
         assert!(
-            stdout.trim_end().ends_with("test-table: counted run mode: light: the builder's passes"),
+            stdout.contains("in Weave's box: skipped the Ground guards")
+                && stdout.trim_end().ends_with("test-table: counted run mode: light: weave's box"),
             "{scripts}: {stdout}"
         );
 
@@ -166,6 +169,19 @@ fn test_table_light_runs_the_named_packages_and_the_guards() {
             let (out, calls) = light(args, "");
             assert!(!out.status.success() && calls.is_empty(), "{scripts}: {args:?} ran: {calls}");
         }
+
+        // Outside Weave's box, --light is refused before anything runs.
+        let _ = std::fs::remove_file(&log);
+        let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+        let out = command(&dir, "scripts/test-table", &["--light", "-p", "lib-a"])
+            .env("PATH", path)
+            .env("LOG", &log)
+            .env("FAIL_ON", "")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && stderr.contains("no light counted run"), "{scripts}: {stderr}");
+        assert!(std::fs::read_to_string(&log).unwrap_or_default().is_empty(), "{scripts}: --light ran outside the box");
     }
 }
 
@@ -268,12 +284,12 @@ fn test_table_remote_runs_one_box_and_leaves_none_behind() {
     }
 }
 
-/// `test-table --remote -p <package>...` (task `57c9181daa96`, decision `2a9e444218d6`), with a stub `boat`:
-/// the box gets the same setup but runs only `cargo test --locked -p ...` for the packages named, never the
-/// table, and says it wasn't the whole table. A name that isn't a package name, a `-p` without one, or
-/// anything else after `--remote` is refused before any box.
+/// `test-table --remote` takes no `-p` (owner decision c8bbb2886be3: builders run the whole table in the box,
+/// where `--remote -p` once ran only their packages' tests): with a stub `boat`, the box fetches every crate
+/// the host's graph needs and runs the table, and `-p`, with a package or anything else, is refused before
+/// any box.
 #[test]
-fn test_table_remote_p_runs_only_the_named_packages_tests() {
+fn test_table_remote_takes_no_packages_and_runs_the_table() {
     for scripts in SCRIPTS {
         let table = repo_root().join(scripts).join("test-table");
         let (tmp, dir) = repo(&[("scripts/test-table", &table)], ".bracken/\n", |_| {});
@@ -299,26 +315,21 @@ fn test_table_remote_p_runs_only_the_named_packages_tests() {
         };
         let inner = || std::fs::read_to_string(tmp.path().join("inner")).unwrap_or_default();
 
-        let out = remote(&["--remote", "-p", "bracken", "-p", "bracken-tree"]);
-        let stdout = String::from_utf8_lossy(&out.stdout);
+        let out = remote(&["--remote"]);
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
         let script = inner();
-        assert!(script.ends_with("\ncargo test --locked -p bracken -p bracken-tree"), "{scripts}: {script}");
-        assert!(script.contains("git checkout -q tested"), "{scripts}: the same setup: {script}");
+        assert!(
+            script.ends_with("\nBRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table"),
+            "{scripts}: {script}"
+        );
+        assert!(script.contains("git checkout -q tested"), "{scripts}: the setup: {script}");
         // Every crate the host's graph needs, before any test (task 53efd11c6e4a).
         let fetch = "setup cargo fetch --locked --target \"$(rustc -vV | sed -n \"s/^host: //p\")\"";
         assert!(script.lines().any(|l| l == fetch), "{scripts}: the box doesn't fetch first: {script}");
-        assert!(!script.contains("scripts/test-table"), "{scripts}: the box ran the table: {script}");
-        assert!(stdout.contains("cargo test --locked -p bracken -p bracken-tree passed at "), "{scripts}: {stdout}");
-        assert!(stdout.contains("in a box; not the whole table"), "{scripts}: {stdout}");
-
-        // Without -p, the box runs the table as before.
-        let out = remote(&["--remote"]);
-        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
-        assert!(inner().ends_with("\nBRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table"), "{scripts}");
 
         for bad in [
-            &["--remote", "-p", "bracken; touch $T/ran"][..],
+            &["--remote", "-p", "bracken", "-p", "bracken-tree"][..],
+            &["--remote", "-p", "bracken; touch $T/ran"],
             &["--remote", "-p", "-p"],
             &["--remote", "-p"],
             &["--remote", "bracken"],
@@ -512,10 +523,10 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
 }
 
 /// Finding b8b6193329db: the git version test-table's box needs is the experiment's MIN_GIT, the one
-/// number in crates/experiment/src/git_mode.rs, and the box script's comparison reads only `need_git`.
+/// number in research/experiment/src/git_mode.rs, and the box script's comparison reads only `need_git`.
 #[test]
 fn test_table_box_needs_the_experiments_min_git() {
-    let source = std::fs::read_to_string(repo_root().join("crates/experiment/src/git_mode.rs")).unwrap();
+    let source = std::fs::read_to_string(repo_root().join("research/experiment/src/git_mode.rs")).unwrap();
     let line = source.lines().find(|l| l.starts_with("pub const MIN_GIT: (u32, u32) = (")).expect("MIN_GIT");
     let pair = line.trim_start_matches("pub const MIN_GIT: (u32, u32) = (").trim_end_matches(");");
     let (major, minor) = pair.split_once(", ").expect("two numbers");
@@ -532,9 +543,11 @@ fn test_table_box_needs_the_experiments_min_git() {
 }
 
 /// test-table on a docs-only change (owner decision 642a47c04a10): when everything the head changed since
-/// it left origin/main is *.md outside crates/, only fmt and the Ground guards run, and it says so. A change
-/// that also touches code, renames or deletes a file that isn't docs, touches a .md under crates/ (the
-/// code compiles some in), or changes nothing runs the whole table.
+/// it left origin/main is *.md or under docs/, outside crates/ and research/, only fmt and the Ground
+/// guards run, and it says so. A change that also touches code, renames or deletes a file that isn't docs,
+/// touches a .md under crates/ or research/ (the code compiles some in), touches docs/protocol.md or
+/// docs/design/weave-freeze.md (owner decision c8bbb2886be3: the protocol and the freeze take the full
+/// run), or changes nothing runs the whole table.
 #[test]
 fn test_table_skips_clippy_and_cargo_test_only_for_a_docs_only_change() {
     let full = "cargo nextest --version\n\
@@ -547,9 +560,21 @@ fn test_table_skips_clippy_and_cargo_test_only_for_a_docs_only_change() {
     let docs = "cargo fmt --check\nground-guards origin/main HEAD\n";
     let git = |dir: &Path, args: &[&str]| assert!(run(dir, "git", args).status.success(), "git {args:?}");
     type Change = fn(&Path);
-    let cases: [(&str, Change, &str); 7] = [
+    let cases: [(&str, Change, &str); 12] = [
         ("a doc", |d| put(d, "docs/guide.md", "more\n"), docs),
         ("a new top-level doc", |d| put(d, "NOTES.md", "new\n"), docs),
+        ("a stylesheet under docs/", |d| put(d, "docs/design/v/x.css", "a {}\n"), docs),
+        ("docs/protocol.md", |d| put(d, "docs/protocol.md", "a protocol change\n"), full),
+        (
+            "a doc and docs/protocol.md",
+            |d| {
+                put(d, "docs/guide.md", "more\n");
+                put(d, "docs/protocol.md", "a protocol change\n")
+            },
+            full,
+        ),
+        ("docs/design/weave-freeze.md", |d| put(d, "docs/design/weave-freeze.md", "a freeze change\n"), full),
+        ("a .md under research/", |d| put(d, "research/p/prompt.md", "changed\n"), full),
         (
             "a doc and code",
             |d| {
@@ -565,9 +590,9 @@ fn test_table_skips_clippy_and_cargo_test_only_for_a_docs_only_change() {
     ];
     for scripts in SCRIPTS {
         let file = |name: &str| repo_root().join(scripts).join(name);
-        let (table, scope) = (file("test-table"), file("code-scope"));
+        let (table, scope) = (file("test-table"), file("tree-scope"));
         for (case, change, want) in cases {
-            let files = [("scripts/test-table", table.as_path()), ("scripts/code-scope", scope.as_path())];
+            let files = [("scripts/test-table", table.as_path()), ("scripts/tree-scope", scope.as_path())];
             let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
                 write_executable(
                     &dir.join("scripts/ground-guards"),
@@ -576,6 +601,8 @@ fn test_table_skips_clippy_and_cargo_test_only_for_a_docs_only_change() {
                 put(dir, "code.txt", "code\n");
                 put(dir, "docs/guide.md", "a guide\n");
                 put(dir, "crates/p/prompt.md", "a prompt\n");
+                put(dir, "docs/protocol.md", "the protocol\n");
+                put(dir, "docs/design/weave-freeze.md", "the freeze\n");
             });
             git(&dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
             git(&dir, &["switch", "-qc", "pr"]);
@@ -608,15 +635,14 @@ fn test_table_skips_clippy_and_cargo_test_only_for_a_docs_only_change() {
 /// cargo that writes its own lines on standard error in the middle of its list's lines, as cargo nextest
 /// list's build output can land (task 06d7b4ef2c75): they arrive whole, and a list damaged on the way
 /// fails as damaged.
-/// A failure here stops the box and deletes it; a docs-only head uses no box. With -p <package>... (the
-/// light counted run, finding 94e07ed7dd6b) the box runs test-table --light and --lists for those packages,
-/// and here only their macOS-only tests and lists, the doctests' for those with a library.
+/// A failure here stops the box and deletes it; a docs-only head uses no box. -p, the retired light counted
+/// run, is refused before any box.
 #[test]
 fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
     for scripts in SCRIPTS {
         let file = |name: &str| repo_root().join(scripts).join(name);
-        let (table, scope) = (file("test-table"), file("code-scope"));
-        let files = [("scripts/test-table", table.as_path()), ("scripts/code-scope", scope.as_path())];
+        let (table, scope) = (file("test-table"), file("tree-scope"));
+        let files = [("scripts/test-table", table.as_path()), ("scripts/tree-scope", scope.as_path())];
         let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
             write_executable(&dir.join("scripts/ground-guards"), "#!/bin/sh\necho \"ground-guards $*\" >>\"$LOG\"\n");
             put(dir, "code.txt", "code\n");
@@ -809,49 +835,16 @@ fn test_table_split_runs_the_table_in_a_box_and_the_macos_tests_here() {
             String::from_utf8_lossy(&out.stdout).contains("the whole table in a box, and the macOS-only tests here")
         );
 
-        // --split -p: the box runs the light table and the lists for the packages; here, their macOS-only
-        // tests (none is no failure) and lists, and the doctests' list only for the one with a library.
-        let _ = std::fs::remove_file(&log);
+        // --split -p, the retired light counted run (owner decision c8bbb2886be3): refused, no box.
         let _ = std::fs::remove_file(t("args"));
-        let mut c = command(&dir, "scripts/test-table", &["--split", "-p", "demo", "-p", "agent"]);
-        c.env("PATH", &path).env("T", tmp.path()).env("LOG", &log).env("EXIT", "0").env("SLEEP", "0");
-        c.env("FAIL_HERE", "").env("TEST_TABLE_HERE_LIMIT", "3").env("TEST_TABLE_MODE", "light: the scope");
-        for name in ["HANG", "HANG_LIST", "SURVIVE", "IGNORE_TERM", "NO_NEXTEST", "BOX_PATH", "REPO"] {
-            c.env(name, "");
-        }
-        let out = c.output().unwrap();
-        assert!(out.status.success(), "{scripts}: --split -p: {}", text(&out));
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            stdout.contains("light run passed at")
-                && stdout.contains("-p demo -p agent, in a box, and their macOS-only tests here; not the whole table"),
-            "{scripts}: {stdout}"
-        );
-        assert!(stdout.trim_end().ends_with("test-table: counted run mode: light: the scope"), "{scripts}: {stdout}");
-        let inner = read("args");
-        for line in [
-            "  setup $sudo apt-get install -y -qq -o Acquire::Retries=3 git b3sum curl jq lsof",
-            "setup cargo fetch --locked --target \"$(rustc -vV | sed -n \"s/^host: //p\")\"",
-            "cargo build --locked -q -p bracken --bin bracken",
-            "BRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table --light -p demo -p agent",
-            "scripts/test-table --lists -p demo -p agent",
-        ] {
-            assert!(inner.lines().any(|l| l == line), "{scripts}: the box's script lacks {line:?}: {inner}");
-        }
-        assert!(
-            !inner.lines().any(|l| l == "BRACKEN_BIN=\"$PWD/target/debug/bracken\" scripts/test-table"),
-            "{scripts}"
-        );
-        let calls = std::fs::read_to_string(&log).unwrap();
-        for call in [
-            "cargo nextest run --locked -p demo -p agent --no-fail-fast --no-tests=pass -E test(~macos_only::)",
-            "cargo nextest list --locked -p demo -p agent --run-ignored all --message-format oneline",
-            "cargo test --locked --doc -p demo -- --list",
-            "cargo test --locked --doc -p demo -- --list --ignored",
-        ] {
-            assert!(calls.lines().any(|l| l == call), "{scripts}: no {call:?} in {calls}");
-        }
-        assert!(!calls.contains("--workspace"), "{scripts}: {calls}");
+        let out = command(&dir, "scripts/test-table", &["--split", "-p", "demo", "-p", "agent"])
+            .env("PATH", &path)
+            .env("T", tmp.path())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{scripts}: --split -p: {}", text(&out));
+        assert!(String::from_utf8_lossy(&out.stderr).contains("no light counted run"), "{scripts}: {}", text(&out));
+        assert!(read("args").is_empty(), "{scripts}: --split -p started a box");
 
         // --lists -p in the box: a binary-only package has no doctests' list.
         let mut c = command(&dir, "scripts/test-table", &["--lists", "-p", "agent"]);

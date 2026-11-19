@@ -1,7 +1,7 @@
 //! What agents are told (design section 3, Prompts; decision `4cf00e1d701d`):
 //! one base prompt for every mode, a short "Where things are" section per
 //! mode, of the same shape in each, and the mode's tool descriptions. The
-//! files are in `crates/experiment/prompts/`, built into the binary, and
+//! files are in `research/experiment/prompts/`, built into the binary, and
 //! hashed for the run's plan, so a run's prompts can't drift from what was
 //! reviewed.
 

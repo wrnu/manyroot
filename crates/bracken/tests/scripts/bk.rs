@@ -503,7 +503,7 @@ fn team_server_holds_new_identities_keys_and_signs_for_them() {
             ("scripts/bk", copy("bk")),
             ("scripts/team-server", copy("team-server")),
             ("scripts/bk-evidence", copy("bk-evidence")),
-            ("scripts/code-scope", copy("code-scope")),
+            ("scripts/tree-scope", copy("tree-scope")),
         ];
         let files: Vec<(&str, &Path)> = files.iter().map(|(to, from)| (*to, from.as_path())).collect();
         let (tmp, a) = repo(&files, ".bracken/\n.bracken-team\n", |_| {});

@@ -1,9 +1,9 @@
 # cargo-nextest's profiles (decision 4bf44934cb67, from note 7c232382f2d1).
 #
-# Plain `cargo nextest run` and `cargo test` run every test. The `fast` profile, for a builder's scoped
-# run (`cargo nextest run -P fast -p <crate>...`, then `cargo test --doc -p <crate>...`, AGENTS.md's
-# Tests), leaves out the slow set: the tests at 30 s or over in one measured run of the workspace. The
-# manager's counted run runs every test, these included.
+# Plain `cargo nextest run` and `cargo test` run every test. The `fast` profile, for a builder's run
+# (`cargo nextest run -P fast --workspace`, AGENTS.md's Tests), leaves out the slow set: the tests at
+# 30 s or over in one measured run of the workspace. The manager's counted run runs every test, these
+# included.
 #
 # Each is named exactly, by its test binary and its name, so a renamed or moved test falls back into
 # the fast tier rather than out of every run.
@@ -11,7 +11,8 @@
 # The fast profile also runs 4 tests at a time (task c29555cbb440): builders share one Mac, and under
 # that load a run at the default, one test per CPU, failed on load alone. An explicit `-j <n>` or
 # `--test-threads <n>` still overrides it. Only this profile is set: the default profile, which
-# scripts/test-table, the counted run and CI use, keeps nextest's default.
+# scripts/test-table, the counted run and CI use, keeps nextest's default. The research workspace has its
+# own, research/.config/nextest.toml.
 
 [profile.fast]
 test-threads = 4
@@ -23,27 +24,9 @@ not (
         | test(=verify_seq::verify_seq_sigterm_with_sigint_ignored_still_stops_both_runs)
         | test(=merge::merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_scripts)
         | test(=merge::merge_counts_a_docs_only_or_reused_pass_only_where_it_holds_in_the_kickoff_templates)
-        | test(=merge::merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed_in_scripts)
-        | test(=merge::merge_counts_a_light_pass_only_where_the_whole_table_isnt_needed_in_the_kickoff_templates)
         | test(=merge::merge_lets_main_be_ahead_only_in_skill_docs_the_branch_leaves_alone)
         | test(=ground_checkpoint::ground_checkpoint_refuses_more_than_a_pipe_of_unexpected_staged_lines)
         | test(=ground_guards::ground_guards_refuse_each_way_a_head_can_hide_or_break_the_ground)
-    ))
-    | (binary_id(=bracken-experiment) & (
-        test(=metrics::tests::checkpoints_rank_every_mode_alike_from_its_shared_library)
-        | test(=bracken_mode::tests::concurrent_work_across_pages_is_listed_once)
-        | test(=metrics::tests::every_contract_case_is_judged_by_the_agents_working_copy_in_every_mode)
-        | test(=python::tests::macos_only::the_parent_never_acts_on_a_path_the_code_can_swap)
-        | test(=project_grader::tests::macos_only::agent_code_reads_no_hidden_test_imported_or_as_a_command)
-    ))
-    | (binary_id(=bracken-experiment::report) & (
-        test(=scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode)
-        | test(=a_phase_two_mock_run_of_each_mode_is_graded_as_phase_two_and_releases_both_waves)
-    ))
-    | (binary_id(=bracken-experiment::core) & test(=a_git_mode_mock_run_goes_end_to_end_through_the_shim))
-    | (binary_id(=bracken-demo::adversary) & (
-        test(=crafted_rounds_in_wip_claims_count_as_the_round_they_arrive)
-        | test(=an_adversary_cannot_hide_others_fresh_wip_claims)
     ))
 )
 """

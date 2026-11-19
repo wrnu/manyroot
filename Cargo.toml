@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/manyroot", "crates/bracken", "crates/demo", "crates/experiment", "crates/scope", "crates/tree", "crates/query-lab"]
+members = ["crates/manyroot", "crates/bracken", "crates/tree"]
+# The research crates are a sibling workspace of their own (research/Cargo.toml; owner decision c8bbb2886be3).
+exclude = ["research"]
 
 [workspace.package]
 version = "0.1.0"

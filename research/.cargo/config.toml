@@ -1,0 +1,6 @@
+# The research workspace builds into the root's target directory, so its tests find the `bracken`
+# binary the root workspace built beside their own (research/Cargo.toml). Cargo resolves this path from
+# research/, the directory holding .cargo/. CARGO_TARGET_DIR, where set, overrides it for both
+# workspaces alike. The root's .cargo/config.toml (sccache through scripts/rustc-wrapper) applies here too.
+[build]
+target-dir = "../target"

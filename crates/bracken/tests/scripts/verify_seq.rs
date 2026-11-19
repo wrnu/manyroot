@@ -47,22 +47,17 @@ fn verify_seq_runs_each_head_in_its_own_worktree_and_reuses_only_with_on() {
     }
 }
 
-/// verify-seq --light (decision `464d3ccca45e`, answer `10cf8a5053a3`), with a stub bk-evidence that logs its
-/// arguments and the run's mode. Its scope is what scripts/code-scope packages computes from the head's
-/// changed files (findings 0095e19fcdb7, 4825c59b07e9), whatever the builder ran. For each head it
-/// refuses, recording nothing, until the pr claim's author (not anyone else) has passes on that exact head
-/// (not another sha) of fmt, both clippies (neither alone is enough), a fast run and a --remote run each
-/// naming every package in the scope (a --workspace fast run doesn't), and it refuses a head
-/// scripts/code-scope full names, or with no package to test. Then it runs scripts/test-table --split -p
-/// <the scope> on the merge with origin/main, without --reuse (finding 94e07ed7dd6b), the mode in
-/// TEST_TABLE_MODE. Without --light, the full run's mode names what needs the whole table, and --reason.
-/// Batches, --split, --speculative and -j refuse --light.
+/// verify-seq has no light run (owner decision c8bbb2886be3, task bfc942cd7ced, superseding decisions
+/// 464d3ccca45e and 73f2ba4c08e5): --light is refused as an unknown option, recording nothing, alone or
+/// with any other mode. Every run is the whole table, its mode in TEST_TABLE_MODE saying why: --reason, or
+/// the default, whatever the head changed (a Cargo.lock head included), and an empty --reason is refused.
+/// A stub bk-evidence logs its arguments and the mode.
 #[test]
-fn verify_seq_light_counts_only_on_the_builders_passes_and_where_the_full_table_isnt_needed() {
+fn verify_seq_runs_only_the_full_table_and_says_why() {
     for scripts in SCRIPTS {
         let file = |name: &str| repo_root().join(scripts).join(name);
-        let (seq, scope) = (file("verify-seq"), file("code-scope"));
-        let files = [("scripts/verify-seq", seq.as_path()), ("scripts/code-scope", scope.as_path())];
+        let (seq, scope) = (file("verify-seq"), file("tree-scope"));
+        let files = [("scripts/verify-seq", seq.as_path()), ("scripts/tree-scope", scope.as_path())];
         let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
             write_executable(
                 &dir.join("scripts/bk-evidence"),
@@ -73,42 +68,22 @@ fn verify_seq_light_counts_only_on_the_builders_passes_and_where_the_full_table_
         let rev = |r: &str| String::from_utf8(run(&dir, "git", &["rev-parse", r]).stdout).unwrap().trim().to_owned();
         git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
         bk(&dir, &["init", "--name", "seq"]);
-        for id in ["builder", "val", "manager"] {
+        for id in ["builder", "manager"] {
             bk(&dir, &["id", "new", id]);
         }
-        // Heads off main, each changing one path; each claim's text is its own.
         let claims = std::cell::Cell::new(0);
-        let claim_on = |branch: &str, sha: &str| {
-            claims.set(claims.get() + 1);
-            let text = format!("PR #{} {branch} @ {sha}: x", claims.get());
-            bk(&dir, &["claim", &text, "--tag", "pr", "--as", "builder"])
-        };
         let head = |branch: &str, path: &str| {
             git(&["switch", "-qc", branch, "main"]);
             put(&dir, path, "a change\n");
             commit_all(&dir, branch);
             let sha = rev("HEAD");
             git(&["switch", "-q", "main"]);
-            (claim_on(branch, &sha), sha)
+            claims.set(claims.get() + 1);
+            let text = format!("PR #{} {branch} @ {sha}: x", claims.get());
+            format!("{}:{sha}", bk(&dir, &["claim", &text, "--tag", "pr", "--as", "builder"]))
         };
-        let (claim, sha) = head("code", "code.txt");
-        let (lock_claim, lock_sha) = head("lock", "Cargo.lock");
-        let (fmt_claim, fmt_sha) = head("fmt", "rustfmt.toml");
-        let scope = "-p bracken -p bracken-tree";
-        let five = |scope: &str| {
-            vec![
-                "cargo fmt --check".to_owned(),
-                "cargo clippy --all-targets -- -D warnings".to_owned(),
-                "cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings".to_owned(),
-                format!("cargo nextest run -P fast {scope}"),
-                format!("scripts/test-table --remote {scope}"),
-            ]
-        };
-        let record = |claim: &str, sha: &str, who: &str, methods: &[String]| {
-            for method in methods {
-                bk(&dir, &["evidence", claim, "pass", "--method", &format!("{method} @ {sha}"), "--as", who]);
-            }
-        };
+        let pair = head("code", "code.txt");
+        let lock = head("lock", "Cargo.lock");
         let log = tmp.path().join("log");
         let scratch = tmp.path().join("scratch");
         std::fs::create_dir_all(&scratch).unwrap();
@@ -119,98 +94,29 @@ fn verify_seq_light_counts_only_on_the_builders_passes_and_where_the_full_table_
                 .env("LOG", &log)
                 .env("TMPDIR", &scratch)
                 .env("BRACKEN_BIN", tmp.path().join("bracken"))
-                .env("CODE_SCOPE_TOKENS", affected_stub(&tmp.path().join("bracken-scope")))
                 .env_remove("ON")
                 .output()
                 .unwrap();
             (out, std::fs::read_to_string(&log).unwrap_or_default())
         };
-        let pair = format!("{claim}:{sha}");
-        let refused = |args: &[&str], expected: &str| {
-            let (out, logged) = seq(args);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            assert_eq!(out.status.code(), Some(1), "{scripts}: {args:?}: {stdout}");
-            assert!(
-                stdout.contains("light refused") && stdout.contains(expected),
-                "{scripts}: expected {expected:?}: {stdout}"
-            );
-            assert!(logged.is_empty(), "{scripts}: ran bk-evidence: {logged}");
-        };
-        // A fresh claim on the code head with these passes by the builder, refused for `expected`.
-        let refused_with = |methods: &[String], on: &str, expected: &str| {
-            let c = claim_on("code", &sha);
-            record(&c, on, "builder", methods);
-            refused(&["--light", &format!("{c}:{sha}")], expected);
-        };
 
-        // No builder pass, then val's passes only, then the builder's with a --remote run of too little.
-        refused(&["--light", &pair], "cargo fmt --check");
-        record(&claim, &sha, "val", &five(scope));
-        refused(&["--light", &pair], "builder has no pass");
-        let mut narrow = five(scope);
-        narrow[4] = "scripts/test-table --remote -p bracken".to_owned();
-        record(&claim, &sha, "builder", &narrow);
-        refused(&["--light", &pair], "scripts/test-table --remote -p bracken -p bracken-tree");
-
-        // Passes on another sha; one clippy missing; a --workspace fast run; a fast run narrower than the
-        // scope the changed files need, which the builder chose.
-        refused_with(&five(scope), &lock_sha, "cargo fmt --check; cargo clippy --all-targets -- -D warnings");
-        let mut no_clippy = five(scope);
-        no_clippy.remove(2);
-        refused_with(
-            &no_clippy,
-            &sha,
-            "of: cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings (on",
-        );
-        let mut workspace = five(scope);
-        workspace[3] = "cargo nextest run -P fast --workspace".to_owned();
-        refused_with(&workspace, &sha, "of: cargo nextest run -P fast -p bracken -p bracken-tree (on");
-        refused_with(&five("-p bracken"), &sha, "cargo nextest run -P fast -p bracken -p bracken-tree");
-
-        // All five: the scope's split table on the merge, and the mode.
-        record(&claim, &sha, "builder", &five("-p bracken-tree -p bracken"));
-        let (out, logged) = seq(&["--light", "--reason", "a scripts-only change", &pair]);
-        assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stdout));
-        let (args, mode) = logged.trim_end().split_once('|').unwrap();
-        assert_eq!(
-            args,
-            format!("{claim} --as manager --on origin/main -- scripts/test-table --split -p bracken -p bracken-tree"),
-            "{scripts}"
-        );
-        assert!(
-            mode.starts_with("light: a scripts-only change; the scope -p bracken -p bracken-tree, from the changed files; builder's passes on ")
-                && mode.contains("--remote"),
-            "{scripts}: {mode}"
-        );
-
-        // A head touching Cargo.lock, with all five passes: refused, naming it. One with no package to test.
-        record(
-            &lock_claim,
-            &lock_sha,
-            "builder",
-            &five("-p bracken -p bracken-demo -p bracken-experiment -p bracken-scope -p bracken-tree -p manyroot"),
-        );
-        refused(&["--light", &format!("{lock_claim}:{lock_sha}")], "Cargo.lock");
-        record(&fmt_claim, &fmt_sha, "builder", &five(scope));
-        refused(&["--light", &format!("{fmt_claim}:{fmt_sha}")], "no package to test");
-
-        // The full run says why: what needs the whole table, and --reason, or the default.
-        let (out, logged) = seq(&["--reason", "the manager's call", &format!("{lock_claim}:{lock_sha}")]);
+        let (out, logged) = seq(&["--reason", "the manager's call", &lock]);
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
-        assert!(
-            logged.trim_end().ends_with("|full: required: Cargo.lock (the workspace's Cargo.lock); the manager's call"),
-            "{scripts}: {logged}"
+        let claim = lock.split(':').next().unwrap();
+        assert_eq!(
+            logged.trim_end(),
+            format!("{claim} --as manager -- scripts/test-table|full: the manager's call"),
+            "{scripts}"
         );
         let (_, logged) = seq(&[&pair]);
         assert!(logged.trim_end().ends_with("-- scripts/test-table|full: the default"), "{scripts}: {logged}");
 
         for args in [
-            &["--light", "--split", &pair][..],
+            &["--light", &pair][..],
+            &["--light", "--reason", "a scripts-only change", &pair],
+            &["--light", "--split", &pair],
             &["--light", "--batch", &pair],
-            &["--light", "--split", "--speculative", &pair],
-            &["--light", "--speculative", &pair],
-            &["--light", "-j", "2", &pair],
-            &["--light", "-j", "1", &pair],
+            &["--split", "--light", "--speculative", &pair],
             &["--reason", "", &pair],
         ] {
             let (out, logged) = seq(args);
@@ -416,7 +322,7 @@ impl Drop for Stopped {
 fn verify_seq_interrupted(term: bool) {
     for scripts in SCRIPTS {
         let file = |name: &str| repo_root().join(scripts).join(name);
-        let names = ["verify-seq", "bk-evidence", "test-table", "code-scope"];
+        let names = ["verify-seq", "bk-evidence", "test-table", "tree-scope"];
         let copies: Vec<(String, PathBuf)> = names.iter().map(|n| (format!("scripts/{n}"), file(n))).collect();
         let files: Vec<(&str, &Path)> = copies.iter().map(|(to, from)| (to.as_str(), from.as_path())).collect();
         let (tmp, dir) = repo(&files, ".bracken/\n", |dir| {
