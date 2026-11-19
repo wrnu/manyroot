@@ -34,7 +34,11 @@ items here is note `6ce8a8d82af5`, points (3) and (4).
   and it changes no qualification verdict. It needs no v2, no cutover and
   no readers-first rollout. Once a reader holds the removal, removing an
   integrator ends any stop they started, and they can't start another.
-  What's left is question 7's accepted fork. Option A3, a removal cut that
+  The exception is a line they author or still integrate that an honest
+  integrator has merged into main. That's the route decision
+  `a2e0b9c241c7` already accepted. This assumes every reader upgrades
+  before any v2 decision is written. Also left is question 7's accepted
+  fork. Option A3, a removal cut that
   also ends the fork, is set out but not recommended now. It's the
   line-local form of part B's revocation cut (agent-keys.md 4.4), and the
   two should be designed once, together (question 3).
@@ -47,9 +51,11 @@ items here is note `6ce8a8d82af5`, points (3) and (4).
   unchanged under `max_known` 0. Under a higher `max_known` it can be
   integrated, but never green. The tree itself is the only casualty: any
   other tree gets past it (note `6ce8a8d82af5` (3)).
-- **B: recommended, option B4.** A replaced fail still backs an
-  evidence-backed objection, but that objection may also be answered
-  `overridden`. This widens rule 5's table and narrows nothing, so no
+- **B: recommended, option B4.** A fail that a pass replaced still backs
+  an evidence-backed objection, but that objection may also be answered
+  `overridden`. A pass replaced it when the validator's latest results for
+  that manifest and method, in the decision's past, hold no fail. A fail
+  replaced by another fail stays binding. This widens rule 5's table and narrows nothing, so no
   decision that qualifies today stops qualifying. It's pinned, not frozen.
   It needs readers upgraded before any integrator relies on it, a matching
   change to `scripts/weave-shadow`, and `weave review` to show such
@@ -116,7 +122,8 @@ A v1 decision by mallory from the same stale past qualifies, by rule 2. Its
 parents are old decisions on main, so it becomes a second head: main forks,
 and `weave head` shows the fork. Green drops back to the last green before
 the fork (weave.md section 2, *Green*). The next honest `integrate` lists
-every head as a parent (`crates/bracken/src/weave.rs` 613-615), which
+every head of the line as a parent (`lines.heads(&line)`,
+`crates/bracken/src/weave.rs` 729), which
 adopts her tree without saying so. The tree still has to pass the line's
 checks to go green, and her decision still has to answer every objection
 in its window, but she chooses the tree.
@@ -206,8 +213,9 @@ Heads change on a Ground where an integrator was removed while they had a
 concurrent decision, so this needs readers-first.
 
 **Costs.** The index has to answer "is `E` an ancestor of `V`" for each
-decision by an author some version drops (`Ancestry` asks, `lines.rs` 415,
-514). That's few in practice. Rule 2 stops being a function of `E`'s past
+decision by an author some version drops: more questions for the
+`Ancestry` indexes `Lines::build` already builds (`ask_chains`, `lines.rs`
+783, and the rule-5 pasts, 514). That's few in practice. Rule 2 stops being a function of `E`'s past
 alone, in this one case. A removal that arrives on a replica unqualifies
 the removed integrator's concurrent decisions, and every descendant of
 them (rule 3). That includes an honest integrator's merge that adopted
@@ -223,10 +231,12 @@ was removed (see above). It doesn't interact with per-agent keys, but part
 B would replace it with its own cut, and two cut rules, one per line and
 one per key, would have to agree.
 
-**Residual.** Without more, a v2 decision mallory wrote *before* her removal
-and withheld is inside the cut if the removal's author held it. It still
-stops main until a build reads v2, and only she can retract it. A3 ends the
-power to start a stop, but not a stop already started. Pairing A3 with
+**Residual.** A v2 decision mallory wrote *before* her removal, and that
+the removal's author already held, is inside the cut: it's in the
+removal's past. It still stops main until a build reads v2, and only she
+can retract it. (One she withheld until after the removal falls outside the
+cut, so A3 ignores it.) A3 ends the power to start a stop, but not a stop
+already started and seen. Pairing A3 with
 A5's test for the unreadable decision itself ends both.
 
 #### A4. Revoke the key at the team server (part A)
@@ -260,8 +270,9 @@ It's worth doing at the join anyway.
 **What it refuses.** Once a reader holds the removal, nothing a removed
 integrator writes, before or after the removal, stops a line through G8. Not
 a v2 decision on the line, and not a v1 decision whose parent is a v2
-decision on a line of their own (1.2). Re-adding them restores their power,
-as it should. A current integrator can still stop the line. They're trusted,
+decision on a line of their own (1.2). The one exception is a line of
+theirs that an honest integrator has already merged into main (see
+*Residual*). Re-adding them restores their power, as it should. A current integrator can still stop the line. They're trusted,
 and removing them now ends the stop, which is what docs/releases.md's
 reader would expect.
 
@@ -279,23 +290,60 @@ v2.
 **Costs.** Small: one more test in the undecodable-decision branch (393-405)
 and in the `integrating` loop (456-460), against a current policy that is
 computed once per line. Tests: the G8 tests named in weave-freeze.md 2.2,
-plus the counterexample above as a test that fails before and passes after.
-Protocol class: full table, `owner-review`, independent and security
-review. Its tests go in `crates/tree/tests/` beside G8's, and no golden
+plus the counterexample above as a test that fails before and passes after,
+and the 1.2 route (a stale v1 decision whose parent is a v2 decision on a
+line of hers). One existing test is inverted rather than kept:
+`only_a_newer_decision_counts_and_line_policy_still_runs`
+(`crates/bracken/tests/weave_lines.rs` 1647) asserts that main stays
+stopped after the decision's author is removed. Under A5 it must assert
+that the removal ends the stop. That's a deliberate change of pinned
+behaviour, for the reviews to see. Protocol class: full table, `owner-review`, independent and security
+review. Its tests go beside G8's (`crates/bracken/tests/weave_lines.rs`,
+`crates/tree/tests/`), and no golden
 vector or fixture changes, so it doesn't need the owner's own approval
 (development.md, *Owner approvals*).
 
-**Breaks.** Nothing honest. What G8 exists for is that a stale binary
-mustn't act without a decision a newer build would count. A5 lets a v1
-reader act without a v2 decision by someone the line's author has removed.
-Readers-first means no v2 decision exists while v1 readers do. So a v2
-decision that a v1 reader sees is already outside the rules, and ignoring it
-once its author has been removed is the owner's removal taking effect.
+**Breaks.** Nothing honest, **provided every reader upgrades before any v2
+decision is written**, as weave-freeze.md section 3's readers-first rule
+requires. G8 exists so that a stale binary doesn't act without a decision a
+newer build would count. A5 lets a v1 reader act without a v2 decision by
+someone the line's author has removed. While readers-first holds, no v2
+decision exists while v1 readers do. So a v2 decision that a v1 reader sees
+is already outside the rules, and ignoring it once its author has been
+removed is the owner's removal taking effect.
+
+**If a v1 reader misses the upgrade**, here is what it does differently.
+Take a legitimate v2 decision, written by an integrator who was later
+removed, whose past names them. A v2 reader counts it by rule 2. A v1 reader
+with A5 ignores it instead of refusing, and computes main's heads without
+it. Today's v1 reader refuses. So the straggler's view diverges from the v2
+readers' where today it fails closed: it can report a different head or
+green, and integrate on it. That's the same kind of divergence question 7
+accepts, a decision judged under a past the reader doesn't share, and it
+lasts only until the straggler upgrades. The gate's readers are the pinned
+binary and `~/bracken-weave`'s binary, both upgraded by the release step.
 Stale replicas, offline writers and existing Grounds are unaffected: no
 build has ever written a record with `v` above 1. Per-agent keys don't
 interact with it.
 
-**Residual.** Question 7's fork (1.2) stays: mallory's stale-past v1
+**Residual: the merge route.** A5 narrows only decisions by the removed
+author. Suppose an honest, current integrator of main has merged one of
+mallory's lines into main. That merge decision is still integrating, so
+`read_lines` still brings her line into main's judgement. An unreadable
+policy version on that line still counts, and only she can write one,
+since she's the line's author and nobody can remove her from her own line.
+The same holds for an unreadable decision on a line she still integrates.
+So a stop by her continues after her removal from main, A5 or not.
+Removal from main ends her power to stop it only if no line she authors,
+or still integrates, has been merged into main.
+`an_unreadable_policy_version_stops_only_the_lines_that_judge_it`
+(`crates/bracken/tests/weave_lines.rs` 1435-1468) shows this for another
+line, and main follows the same code (finding `aa1d71de6af9`). The owner
+has already accepted this route: "main's integrator merging a hostile line
+that can then stop main" (decision `a2e0b9c241c7`). A5 doesn't change it,
+and neither would A3.
+
+**Residual: the fork.** Question 7's fork (1.2) stays: mallory's stale-past v1
 decision still qualifies. One corner comes with it. Suppose her stale v1
 decision names a parent on a line of hers that has an unreadable *policy*
 version. A5 no longer brings that line in. So a v1 reader judges the parent
@@ -418,11 +466,14 @@ binding one.
 
 #### B1. The latest-result rule for an objection's basis
 
-**Rule.** A fail backs an evidence-backed objection only if, in `E`'s past,
-it's its validator's latest eligible result for that manifest and method.
-That's the same latest-result rule green uses, but judged within `E`'s
-past. Several concurrent latest results count as one fail, as they do
-today. Otherwise the objection is discussion.
+**Rule.** A fail stops backing an evidence-backed objection only when it
+has been *replaced by a pass*. That means: in `E`'s past, the validator has
+eligible results for that manifest and method that are later than it, and
+its latest ones among them hold no fail. This is green's latest-result
+rule, judged within `E`'s past, so several concurrent latest results that
+include a fail count as one fail. A fail replaced by another fail (the check
+really fails again) stays binding. So does a fail beside a concurrent pass.
+Only an objection from a fail a pass replaced becomes discussion.
 
 **Changes.** The basis rule (pinned; weave.md 575-582, `objections.rs`
 basis). No v2, no cutover. Readers-first, since heads can change.
@@ -434,8 +485,8 @@ Ground holds one would have to be checked. B4 avoids this. It also adds an
 ancestry question per objection's result (is there a later result by the
 same validator, in `E`'s past?) to the asks the index builds.
 
-**Residual.** None from replay. A fail that is still a validator's latest is
-a tree that really fails for that validator. That tree isn't green anyway,
+**Residual.** None from replay. A fail that wasn't replaced by a pass marks a
+tree that really fails for that validator. That tree isn't green anyway,
 so an objection from it adds no new stop.
 
 #### B2. Count it as evidence only when a policy member objects
@@ -469,15 +520,21 @@ little.
 
 #### B4. A replaced fail also allows `overridden` (recommended)
 
-**Rule.** The basis stays evidence-backed. When, in `E`'s past, the
-failing result isn't its validator's latest for that manifest and method,
-the objection allows `overridden` **as well**. Its allowed set becomes
+**Rule.** The basis stays evidence-backed. The objection allows
+`overridden` **as well** only when, in `E`'s past, a pass replaced the
+failing result. That is: the validator has later eligible results for that
+manifest and method, and its latest ones hold no fail. This matches green's
+rule that concurrent latest results count as a fail (finding
+`32833dfc442b`). A fail replaced by another fail, or standing beside a
+concurrent latest fail, stays binding exactly as today: `accepted_breakage`
+is its only answer for a tree used unchanged. When B4 applies, the
+objection's Its allowed set becomes
 `fixed`, `fell_back` (in the window), `accepted_breakage` and `overridden`.
 The answer's `reason` is still required, and stays on record.
 
 **Changes.** Rule 5's table (pinned; weave.md 575-593, `Basis::allows` and
 `allowed`, `objections.rs` 57-65, 650-680). It needs to know whether the
-result was replaced, the same question as B1. No v2, no cutover.
+result was replaced by a pass, the same question as B1. No v2, no cutover.
 
 **Costs.** As B1's ancestry question. `scripts/weave-shadow`'s
 `overridable` must also accept such an objection by a non-member, so the
@@ -486,7 +543,11 @@ shadow's mirror moves on as it does for discussion. `weave review`'s and
 
 **Breaks.** Nothing that qualifies today. B4 only adds an allowed answer,
 so every decision that qualifies under today's rule qualifies under B4 (it
-widens and never narrows). An old reader judges a decision that answers
+widens and never narrows). Nor does it widen what an integrator can wave
+through past a tree that fails: where the validator's latest results in
+`E`'s past still hold a fail, nothing changes. The counterexample in
+finding `32833dfc442b` (a fail, `--again`, a second fail, an honest
+reviewer objecting from the first) stays binding. An old reader judges a decision that answers
 `overridden` this way as unqualified, so heads differ between binaries.
 Readers must be upgraded before an integrator uses it, which here means the
 pinned `.bracken-bin` and `~/bracken-weave`'s binary. Stale replicas,
@@ -519,12 +580,16 @@ fixes nothing alone, but today the integrator gets no warning.
 
 ### 2.4 Comparison
 
+"Replaced" here means replaced by a pass: the validator's latest results
+for that manifest and method, in `E`'s past, hold no fail. A fail replaced
+by another fail stays binding under every option.
+
 | Option | A replaced fail blocks a tree | Honest objections kept | Tier | Existing decisions | Main cost or residual |
 |---|---|---|---|---|---|
 | B1, latest result | no | yes | pinned | an `accepted_breakage` answer to one may unqualify | readers-first; one ancestry question per result |
 | B2, members only | by members | no: a reviewer's evidence becomes discussion | pinned | as B1 | a new author rule |
 | B3, B1 unless its validator objects | by its validator | yes | pinned | as B1 | one more rule, little gained |
-| **B4, also allow `overridden`** | **no** | **yes** | **pinned** | **unchanged (it only widens)** | readers-first; `weave-shadow` follows |
+| **B4, also allow `overridden`, after a pass** | **no** | **yes: a fail still latest stays binding** | **pinned** | **unchanged (it only widens)** | readers-first; `weave-shadow` follows |
 | B5, accept | yes | yes | neither | unchanged | any writer, any flaked tree |
 | B6, show it | yes, but visible | yes | neither | unchanged | complements the others |
 
@@ -572,8 +637,16 @@ ones. B4 needs readers-first, and A5 doesn't.
    own past. *Recommended: yes, before the join.* Removing an integrator
    then ends any stop they started and takes away the power to start one,
    for every reader that holds the removal. It changes no verdict and no
-   frozen rule, and needs no v2 or special rollout. What's left is question
-   7's accepted fork, and the corner in 1.3, A5.
+   frozen rule, and needs no v2 or special rollout. **One exception:** if an
+   honest integrator has merged into main a line the removed integrator
+   authors, or still integrates, an unreadable version on that line still
+   stops main. Removal from main ends their power to stop it only if no such
+   line has been merged in. That's the route you already accepted, "main's
+   integrator merging a hostile line that can then stop main" (decision
+   `a2e0b9c241c7`). Also left: question 7's accepted fork, and the corner in
+   1.3, A5. And it assumes every reader upgrades before any v2 decision is
+   written. A v1 reader that missed the upgrade would ignore a v2 decision
+   by a since-removed integrator rather than refuse.
 2. **A: revoke a removed integrator's token at the team server (A4)?**
    *Recommended: yes, from the join, as a step in removing a Weave
    integrator.* It narrows what a removed integrator can still sign to what
@@ -587,10 +660,13 @@ ones. B4 needs readers-first, and A5 doesn't.
    accepted. It's the first case where a later policy change unqualifies a
    decision, and a second cut rule beside part B's would have to agree with
    it.
-4. **B: let a replaced fail's objection be answered `overridden` (B4), and
-   show it (B6)?** *Recommended: yes, before the join, with
-   `scripts/weave-shadow` following.* It ends the replay without moving any
-   existing verdict, and it keeps honest evidence objections binding. A
+4. **B: let an objection be answered `overridden` when its fail was
+   replaced by a pass (B4), and show it (B6)?** That means the validator's
+   latest results for that manifest and method, in the decision's past,
+   hold no fail. A fail replaced by another fail stays binding.
+   *Recommended: yes, before the join, with `scripts/weave-shadow`
+   following.* It ends the replay without moving any existing verdict, and
+   it keeps honest evidence objections binding while the tree still fails. A
    validator who thinks its pass was wrong records a new fail, which is its
    latest.
 5. **One PR or two?** A5 and B4 are both pinned rule changes in
