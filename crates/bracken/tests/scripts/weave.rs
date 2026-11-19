@@ -1136,6 +1136,59 @@ echo \"$* token=${GH_TOKEN:-none}\" >>\"$PRS/gh.log\"
     );
 }
 
+/// weave-propose reads only gh's stdout as JSON. gh 2.105.0 prints a hint on stderr even when it succeeds,
+/// and merged into the JSON it made every PR read as a fork with fields '?', so nothing was proposed (gotcha
+/// d532678d900c, task 3b96803d923c). gh's error, which it prints before any hint, still names why it failed.
+#[test]
+fn weave_propose_reads_ghs_json_apart_from_its_stderr() {
+    let propose = repo_root().join("scripts/weave-propose");
+    let (tmp, dir) = repo(&[("scripts/weave-propose", &propose)], "", |_| {});
+    let git = |args: &[&str]| git_out(&dir, args);
+    git(&["switch", "-q", "-c", "f1"]);
+    git(&["update-ref", "refs/remotes/origin/f1", "HEAD"]);
+    git(&["remote", "add", "origin", "https://github.example/team/repo.git"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    // A stand-in gh, as gh 2.105.0 answers: the JSON in $ANSWER on stdout, then a hint on stderr, or with
+    // $ANSWER empty, an error and the hint, failing. Never the real gh.
+    let stubs = tmp.path().join("gh-stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    let hint = "hint: to follow this pull request, run\\n  gh event listen\\n";
+    write_executable(
+        &stubs.join("gh"),
+        &format!(
+            "#!/bin/sh\n[ -n \"$ANSWER\" ] || {{ echo 'GraphQL: Could not resolve to a PullRequest' >&2; printf '{hint}' >&2; exit 1; }}\n\
+             printf '%s\\n' \"$ANSWER\"\nprintf '{hint}' >&2\n"
+        ),
+    );
+    let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
+    let propose = |answer: &str| -> String {
+        let out = command(&dir, "scripts/weave-propose", &["--pr", "7", "--as", "alice"])
+            .env("PATH", &path)
+            .env("ANSWER", answer)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(1), "{stderr}{}", String::from_utf8_lossy(&out.stdout));
+        stderr
+    };
+    let answer = |state: &str| {
+        format!(
+            "{{\"state\":\"{state}\",\"headRefName\":\"f1\",\"headRefOid\":\"{head}\",\"isCrossRepository\":false}}"
+        )
+    };
+    // Each field is read: the PR is merged, and nothing else differs.
+    let merged = propose(&answer("MERGED"));
+    assert!(merged.contains("isn't this branch's open PR at HEAD: it is MERGED, not open. Nothing"), "{merged}");
+    // An open PR at HEAD passes the check: the next step finds no origin/main.
+    let open = propose(&answer("OPEN"));
+    assert!(open.contains("no refs/remotes/origin/main"), "{open}");
+    let failed = propose("");
+    assert!(
+        failed.contains("can't read PR #7 on github.example/team/repo with gh, so nothing was proposed: GraphQL: Could not resolve to a PullRequest\n"),
+        "{failed}"
+    );
+}
+
 /// scripts/weave refuses a line write unless --owner-decision names a claim tagged decision, or an
 /// approval signed by owner (what scripts/weave-shadow --init passes), not retracted, in the coordination
 /// Ground (answer 2a620fd0b0dc, finding 3cd6cd19f9a0).
