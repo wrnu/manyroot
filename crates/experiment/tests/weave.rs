@@ -629,11 +629,11 @@ fn one_integrator_alone_integrates_and_the_others_propose() {
     let mut s = Stores::with(&["agent-0", "agent-1"], "agent-1");
     s.ok(0, "write_file", json!({"path": "tiny/zero.py", "text": "NAME = 'zero'\n"}));
     let err = s.tool(0, "integrate", json!({"note": "a builder's tree"})).expect_err("not an integrator");
-    assert!(!err.is_empty());
+    assert!(err.contains("wouldn't qualify"), "refused by main's policy: {err}");
     let p = s.ok(0, "propose", json!({"summary": "zero"}));
     let proposal = p["proposal"].as_str().expect("a proposal").to_string();
     let err = s.tool(0, "integrate", json!({"proposals": [&proposal], "note": "its own"})).expect_err("refused");
-    assert!(!err.is_empty());
+    assert!(err.contains("wouldn't qualify"), "refused by main's policy: {err}");
     s.sync(0);
     s.sync(1);
     s.ok(1, "integrate", json!({"proposals": [&proposal], "note": "the integrator takes it"}));
@@ -847,9 +847,6 @@ mod macos_only {
         }
     }
 
-    /// The tiny project, 2 agents x 3 turns, every worker sandboxed as in a real run: the seed is the first
-    /// tree, the change goes out once half the agent-turns are used, a checkpoint follows every turn, the
-    /// public tests run on each agent's tree through the driver, and every agent's module reaches the line.
     /// A mock run with one integrator: no turn errs, only the integrator integrates, and every agent's work
     /// reaches the line.
     #[test]
@@ -898,6 +895,9 @@ mod macos_only {
         }
     }
 
+    /// The tiny project, 2 agents x 3 turns, every worker sandboxed as in a real run: the seed is the first
+    /// tree, the change goes out once half the agent-turns are used, a checkpoint follows every turn, the
+    /// public tests run on each agent's tree through the driver, and every agent's module reaches the line.
     #[test]
     fn a_weave_mock_run_goes_end_to_end_sandboxed() {
         let Some(pin) = pin() else { return };
