@@ -65,8 +65,9 @@
 #      those three kinds, fails the check (findings db2dc1c6120e, e3f9ae2b1820);
 #   docker: the research workspace's Docker tests run on no CI runner that has Docker (finding d160c76dafca,
 #      answer 5b3aa570643b; Linux portability is deferred task 1efdf2e34f46), so a head whose change since
-#      its merge base with main's tip, or whose merge with it changes, anything under research/experiment/ or
-#      the old crates/experiment/ (matched ASCII-lowercased, read NUL-separated; a rename counts as a deletion
+#      its merge base with main's tip, or whose merge with it changes, anything under research/ or the old
+#      crates/experiment/ and crates/demo/ (decision 07dd5c4f; the product crates the research tests build on
+#      are left out, and the manager runs the research Docker tests on main weekly instead) (matched ASCII-lowercased, read NUL-separated; a rename counts as a deletion
 #      and an addition, so one out of it counts too; a head that doesn't merge cleanly fails) needs a current
 #      manager pass on the pr claim whose method starts 'research docker tests' and ends ' @ <sha>': the
 #      by-hand run on the Mac with Docker running (docs/development.md). Any other head passes this check;
@@ -740,9 +741,10 @@ else
   docker_found=()
   while IFS= read -r -d '' f; do
     case "$(printf '%s' "$f" | LC_ALL=C tr 'A-Z' 'a-z')" in
-      # The whole crate (finding d20fc8dd320c): the Docker tests live in src/ and tests/ alike, and exercise
-      # most of its code. crates/experiment/ is where it lived before task bfc942cd7ced moved it.
-      research/experiment/* | crates/experiment/*) docker_found+=("$f") ;;
+      # The whole research workspace (findings d20fc8dd320c, 0d91699b857e): the Docker tests exercise most of
+      # the experiment, the demo it depends on, and the workspace's own Cargo.toml and Cargo.lock.
+      # crates/experiment/ and crates/demo/ are where they lived before task bfc942cd7ced moved them.
+      research/* | crates/experiment/* | crates/demo/*) docker_found+=("$f") ;;
     esac
   done < <(LC_ALL=C sort -uz "$docker_list")
   rm -f "$docker_list"

@@ -500,8 +500,8 @@ fn merge_counts_a_split_run_as_the_whole_table_and_remote_alone_not() {
 }
 
 /// The research Docker tests (finding d160c76dafca, answer 5b3aa570643b): no CI runner has Docker for them,
-/// so a head touching anything under research/experiment/ or the old crates/experiment/ (finding
-/// d20fc8dd320c), in any letter case, renaming a file out of it, editing a file main has since moved into it,
+/// so a head touching anything under research/ or the old crates/experiment/ and crates/demo/ (findings
+/// d20fc8dd320c, 0d91699b857e; decision 07dd5c4f leaves the product crates out), in any letter case, renaming a file out of it, editing a file main has since moved into it,
 /// or adding a name git would quote (finding b791a20398d9), fails the docker check until the manager records a pass on its pr claim whose method starts
 /// 'research docker tests' and names that head. Someone else's pass, one at another sha, or a retracted one
 /// doesn't count. A head that touches none of them passes the check with nothing recorded.
@@ -518,8 +518,12 @@ fn merge_asks_for_the_research_docker_run_only_where_the_docker_code_changed() {
             ("research/experiment/src/driver.rs", true),
             ("research/experiment/Cargo.toml", true),
             ("Research/Experiment/src/Python.rs", true),
-            ("research/demo/src/main.rs", false),
-            ("research/experimental.md", false),
+            ("research/demo/src/main.rs", true),
+            ("research/Cargo.lock", true),
+            ("research/Cargo.toml", true),
+            ("crates/demo/src/main.rs", true),
+            ("researcher.md", false),
+            ("crates/bracken/src/main.rs", false),
             ("code.txt", false),
         ] {
             let (_tmp, dir, mut merge) =
