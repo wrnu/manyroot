@@ -192,7 +192,7 @@ fn allowed(name: &str) -> &'static [&'static str] {
 
 /// Options on every git command: nothing in a repository, a working copy or the
 /// environment can make git run a program, and every object fetched is checked.
-const FIXED: [&str; 18] = [
+pub(crate) const FIXED: [&str; 18] = [
     "core.fsmonitor=false",
     "core.symlinks=false",
     "core.attributesFile=/dev/null",
@@ -328,6 +328,11 @@ impl GitStore {
             .env("HOME", &self.config.dir)
             .current_dir(dir)
             .envs(vars.iter().copied());
+        if self.rule == TreeRule::Project {
+            // A path an agent names is a path, never pathspec magic such as :(glob) (review note 5 of
+            // f218ba241bb4).
+            cmd.env("GIT_LITERAL_PATHSPECS", "1");
+        }
         if self.config.trace {
             cmd.env("GIT_TRACE", self.config.dir.join("git-trace.log"));
         }

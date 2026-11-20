@@ -100,8 +100,8 @@ impl Mode for GitProjectMode {
             ),
             tool(
                 "diff",
-                "Your working tree, committed or not, against `against` (your branch's last commit if not given): each file changed, and the diff; with `path`, that file's alone. A diff too large for one result comes in pages: files says the page each file's diff is on, and `page` (from 1) picks one",
-                json!({"against": reference, "path": path, "page": page}),
+                "Your working tree, committed or not, against `against` (your branch's last commit if not given); or, with `to`, what branch `to` changed since it parted from `against`, as git diff against...to does: give against origin/main and to a requested branch to see what it brings to main. Each file changed, and the diff; with `path`, that file's alone. Changes nothing. A diff too large for one result comes in pages: files says the page each file's diff is on, and `page` (from 1) picks one",
+                json!({"against": reference, "to": reference, "path": path, "page": page}),
                 &[],
             ),
             tool(
@@ -133,6 +133,27 @@ impl Mode for GitProjectMode {
     fn open(&self, config: StoreConfig) -> Box<dyn Store> {
         Box::new(GitProjectStore { git: GitStore::with_rule(config, TreeRule::Project) })
     }
+}
+
+/// The mode a run of `mode` is, with a project or not: git with a project is git project mode, git and branches
+/// on a project's tree; every other mode is itself.
+pub fn project_mode(mode: &str, project: bool) -> &str {
+    if mode == "git" && project { NAME } else { mode }
+}
+
+/// The run's caps from `--mode-token-cap`, for `mode` with a project or not. A git project run takes a cap given
+/// for git or for git-project alike, but not both (review note 1 of `f218ba241bb4`): neither is ignored.
+pub fn caps_for(
+    mode: &str,
+    project: bool,
+    given: &[crate::backend::ModeTokenCap],
+) -> Result<crate::backend::Caps, String> {
+    let run_mode = project_mode(mode, project);
+    let named = |c: &crate::backend::ModeTokenCap| crate::backend::ModeTokenCap {
+        mode: if c.mode == mode { run_mode.to_string() } else { c.mode.clone() },
+        tokens: c.tokens,
+    };
+    crate::backend::Caps::for_mode(run_mode, &given.iter().map(named).collect::<Vec<_>>())
 }
 
 /// Whether agent `name` may update main under the integrator setting `setting`: every agent under
@@ -223,7 +244,9 @@ fn entries(listing: &[u8]) -> Result<Vec<(String, String)>, String> {
 
 /// The files of commit or tree `rev` in the repository `repo`, each checked as [`trees_problem`] says, read
 /// with the git binary `git` under the same fixed options as every store's: the hub's integrated tree, and a
-/// run's trees for `grade-run`. Nothing is checked out: git only lists and prints objects.
+/// run's trees for `grade-run`. Nothing is checked out: git only lists and prints objects. git runs as every
+/// store runs it ([`crate::git_mode::FIXED`], no hooks, cleared environment), as security note 1 of
+/// `fad734d6b26e` asked.
 pub fn tree_at(git: &Path, repo: &Path, rev: &str) -> Result<Vec<(String, Vec<u8>)>, String> {
     if !is_commit(rev) && rev != MAIN {
         return Err(format!("{} is neither main nor a commit or tree id", short(rev)));
@@ -234,7 +257,9 @@ pub fn tree_at(git: &Path, repo: &Path, rev: &str) -> Result<Vec<(String, Vec<u8
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_ATTR_NOSYSTEM", "1")
-            .args(["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "credential.helper="])
+            .env("GIT_LITERAL_PATHSPECS", "1")
+            .args(["-c", "core.hooksPath=/dev/null"])
+            .args(crate::git_mode::FIXED.iter().flat_map(|o| ["-c", o]))
             .arg(format!("--git-dir={}", repo.display()))
             .args(argv)
             .stdin(if stdin.is_some() { std::process::Stdio::piped() } else { std::process::Stdio::null() })
@@ -256,7 +281,8 @@ pub fn tree_at(git: &Path, repo: &Path, rev: &str) -> Result<Vec<(String, Vec<u8
     let mut out = Vec::new();
     let mut at = 0;
     for (path, sha) in files {
-        let end = raw[at..].iter().position(|&b| b == b'\n').ok_or("a cut cat-file header")? + at;
+        let rest = raw.get(at..).ok_or("a cut cat-file output")?;
+        let end = rest.iter().position(|&b| b == b'\n').ok_or("a cut cat-file header")? + at;
         let header = String::from_utf8_lossy(&raw[at..end]).into_owned();
         let size: usize = match header.split(' ').collect::<Vec<_>>()[..] {
             [id, "blob", size] if id == sha => size.parse().map_err(|_| "a bad cat-file size")?,
@@ -486,18 +512,21 @@ impl GitProjectStore {
         let merged =
             self.git.git(&["for-each-ref", "--merged=refs/heads/main", "--format=%(refname)", "refs/agents"], None)?;
         let merged: std::collections::BTreeSet<&str> = merged.lines().collect();
-        let mut open = Vec::new();
+        let (mut open, mut kept) = (Vec::new(), Vec::new());
         for r in all.as_array().into_iter().flatten() {
             let (agent, branch) = (r["agent"].as_str().unwrap_or_default(), r["branch"].as_str().unwrap_or_default());
             let key = format!("{agent}/{branch}");
             let Some(commit) = heads.get(&key) else { continue };
             if merged.contains(format!("refs/agents/{key}").as_str()) {
+                // Closed for good: later commits on the branch don't reopen it, only a new request does.
                 continue;
             }
+            kept.push(r.clone());
             open.push(
                 json!({"from": agent, "branch": format!("origin/{key}"), "commit": commit, "summary": r["summary"]}),
             );
         }
+        self.save("requests.json", &json!(kept))?;
         Ok(open)
     }
 
@@ -560,6 +589,9 @@ impl GitProjectStore {
             };
             if self.git.rev(&full)?.is_some() {
                 return Err(format!("you already have a branch {}: switch to it without create", short(name)));
+            }
+            if self.refs_under("refs/heads")?.len() >= MAX_BRANCHES {
+                return Err(format!("you have {MAX_BRANCHES} branches, the most a copy may have"));
             }
             self.wt(
                 &["switch", "--quiet", "--no-track", &format!("--create={name}"), "--end-of-options", &start],
@@ -629,17 +661,61 @@ impl GitProjectStore {
 
     /// The working tree, committed or not, against `against`, through an index of the store's own, so the
     /// agent's index and any merge in progress are untouched.
-    fn diff(&mut self, against: &str, path: &str, page: usize) -> Result<Value, String> {
+    /// The working tree against `against`; or, given `to`, what `to` changed since it parted from `against`
+    /// (`against...to`), so an integrator reviews a requested branch's own changes without switching to it, not
+    /// mixed with main's since (finding `a236e7206344`). Nothing of the working tree, its index or a merge changes.
+    fn diff(&mut self, against: &str, to: &str, path: &str, page: usize) -> Result<Value, String> {
         let base = if against.is_empty() { "HEAD".to_string() } else { self.resolve(against)? };
+        let target = if to.is_empty() { None } else { Some(self.resolve(to)?) };
         if !path.is_empty() {
             plain_path(path)?;
+        }
+        let shown = if against.is_empty() { "your branch's last commit" } else { against };
+        let to_shown = if to.is_empty() { "your working tree" } else { to };
+        let extra = json!({"against": shown, "to": to_shown});
+        if let Some(target) = target {
+            let files = self.diff_refs(None, &[&format!("{base}...{target}")], path)?;
+            return crate::weave_mode::diff_page(&files, page, extra);
         }
         let index = self.dir().join("diff.index");
         let _ = std::fs::remove_file(&index);
         let files = self.diff_files(&index, &base, path);
         let _ = std::fs::remove_file(&index);
-        let shown = if against.is_empty() { "your branch's last commit" } else { against };
-        crate::weave_mode::diff_page(&files?, page, json!({"against": shown}))
+        crate::weave_mode::diff_page(&files?, page, extra)
+    }
+
+    /// `git diff <revs> -- <path>` per file, with `--cached` and the index at `index` if given.
+    fn diff_refs(
+        &mut self,
+        index: Option<&Path>,
+        revs: &[&str],
+        path: &str,
+    ) -> Result<Vec<crate::weave_mode::FileDiff>, String> {
+        let work = self.work();
+        let vars: Vec<(&str, &Path)> = index.map(|i| ("GIT_INDEX_FILE", i)).into_iter().collect();
+        let mut run = |argv: &[String]| -> Result<String, String> {
+            let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+            let out = self.git.git_in_env(&work, &argv, None, &vars)?;
+            if out.ok { Ok(out.stdout) } else { Err(format!("git diff: {}", short(out.stderr.trim()))) }
+        };
+        let argv = |how: &[&str]| -> Vec<String> {
+            let mut a: Vec<String> = ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            if index.is_some() {
+                a.push("--cached".into());
+            }
+            a.extend(how.iter().map(|s| s.to_string()));
+            a.push("--end-of-options".into());
+            a.extend(revs.iter().map(|r| r.to_string()));
+            a.push("--".into());
+            a.extend([path].into_iter().filter(|p| !p.is_empty()).map(str::to_string));
+            a
+        };
+        let status = run(&argv(&["--name-status", "-z"]))?;
+        let patch = run(&argv(&[]))?;
+        Ok(crate::weave_mode::split_diff(&status, &patch))
     }
 
     /// [`GitProjectStore::diff`]'s files, its index at `index`.
@@ -651,19 +727,7 @@ impl GitProjectStore {
         };
         run(&["read-tree", "HEAD"])?;
         run(&["add", "--all"])?;
-        let diff = |how: &[&'static str]| -> Vec<String> {
-            let fixed = ["diff", "--cached", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames"];
-            let mut argv: Vec<String> = fixed.iter().chain(how).map(|a| a.to_string()).collect();
-            argv.extend(["--end-of-options".into(), base.into(), "--".into()]);
-            argv.extend([path].into_iter().filter(|p| !p.is_empty()).map(str::to_string));
-            argv
-        };
-        fn as_strs(v: &[String]) -> Vec<&str> {
-            v.iter().map(String::as_str).collect()
-        }
-        let status = run(&as_strs(&diff(&["--name-status", "-z"])))?;
-        let patch = run(&as_strs(&diff(&[])))?;
-        Ok(crate::weave_mode::split_diff(&status, &patch))
+        self.diff_refs(Some(index), &[base], path)
     }
 
     fn log(&mut self, args: &Args) -> Result<Value, String> {
@@ -767,8 +831,11 @@ impl Store for GitProjectStore {
     /// Every local branch of this copy, as a bundle without what the hub has sent it, their tips, and the
     /// integration requests made since the last sync.
     fn push(&mut self) -> Result<Transfer, String> {
+        // switch makes at most MAX_BRANCHES; main is always among those pushed, whatever else is (review note 4).
+        let mut all = self.refs_under("refs/heads")?;
+        all.sort_by_key(|(b, _)| b != "main");
         let branches: serde_json::Map<String, Value> =
-            self.refs_under("refs/heads")?.into_iter().take(MAX_BRANCHES).map(|(b, s)| (b, json!(s))).collect();
+            all.into_iter().take(MAX_BRANCHES).map(|(b, s)| (b, json!(s))).collect();
         let refs: Vec<String> = branches.keys().map(|b| format!("refs/heads/{b}")).collect();
         let bytes = self.git.make_bundle(&refs, &["--remotes=origin".to_string()])?;
         let have = self.git.git(&["for-each-ref", "--format=%(objectname)", "refs/remotes/origin"], None)?;
@@ -934,9 +1001,9 @@ impl Store for GitProjectStore {
             "commit" => self.commit(Args::new(args, &["message"])?.text_up_to("message", MAX_MESSAGE)?),
             "merge" => self.merge(&Args::new(args, &["ref", "abort"])?),
             "diff" => {
-                let a = Args::new(args, &["against", "path", "page"])?;
+                let a = Args::new(args, &["against", "to", "path", "page"])?;
                 let page = a.int_opt("page", 1..=100_000)?.unwrap_or(1) as usize;
-                self.diff(a.text_opt("against")?, a.text_opt("path")?, page)
+                self.diff(a.text_opt("against")?, a.text_opt("to")?, a.text_opt("path")?, page)
             }
             "log" => self.log(&Args::new(args, &["ref", "count"])?),
             "request_integration" => {

@@ -59,3 +59,18 @@ fn tree_at_takes_only_main_or_an_id() {
         assert!(tree_at(&git, dir.path(), rev).is_err_and(|e| e.contains("neither")), "{rev}");
     }
 }
+
+/// A token cap given for git or for git-project is the git project run's, never silently dropped.
+#[test]
+fn a_git_project_runs_token_cap_may_be_named_either_way() {
+    let cap = |s: &str| s.parse::<crate::backend::ModeTokenCap>().expect("a cap");
+    let pilot = crate::backend::Caps::pilot().run_tokens;
+    for given in ["git=24000000", "git-project=24000000"] {
+        assert_eq!(caps_for("git", true, &[cap(given)]).expect("caps").run_tokens, 24_000_000, "{given}");
+    }
+    assert!(caps_for("git", true, &[cap("git=1"), cap("git-project=2")]).is_err(), "not both");
+    assert_eq!(caps_for("git", false, &[cap("git-project=5")]).expect("caps").run_tokens, pilot, "Phase 1's git");
+    assert_eq!(caps_for("weave", true, &[cap("git=5")]).expect("caps").run_tokens, pilot);
+    assert_eq!(project_mode("git", true), NAME);
+    assert_eq!((project_mode("git", false), project_mode("weave", true)), ("git", "weave"));
+}

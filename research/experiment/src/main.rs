@@ -21,6 +21,7 @@ use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routi
 use bracken_experiment::driver::{
     CALLS_PER_TURN, ResultLimit, RunConfig, TURN_LIMIT, check_socket_room, core_tools, git_binary, run,
 };
+use bracken_experiment::git_project::project_mode;
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_under};
 use bracken_experiment::pi::{PiBackend, PiConfig, PiCredential, PiExpect};
@@ -289,7 +290,7 @@ fn main() {
             project: project_inputs(project.as_deref(), python.as_deref(), hold_change, integrator.as_deref(), agents)
                 .unwrap_or_else(|e| refuse_run(&e)),
             // Refused here, before anything runs, like the other options.
-            caps: Caps::for_mode(&mode, &mode_token_cap)
+            caps: bracken_experiment::git_project::caps_for(&mode, project.is_some(), &mode_token_cap)
                 .and_then(|c| c.with_agent_caps(agent_token_cap, agent_output_cap))
                 .unwrap_or_else(|e| refuse_run(&e)),
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
@@ -402,12 +403,6 @@ fn project_inputs(
         integrator: Some(integrator.to_string()),
         hold_change,
     })
-}
-
-/// The mode a run of `mode` is, with a project or not: git with a project is git project mode, git and branches
-/// on a project's tree (task `6bd13d994a03`); every other mode is itself.
-fn project_mode(mode: &str, project: bool) -> &str {
-    if mode == "git" && project { bracken_experiment::git_project::NAME } else { mode }
 }
 
 /// The tasks `--task` takes.

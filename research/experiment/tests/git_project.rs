@@ -179,6 +179,45 @@ fn a_builders_branch_reaches_main_through_the_integrator() {
     assert!(head["manifest"].as_str().is_some_and(|t| t.len() == 40 && t != head["decision"]), "{line}");
 }
 
+/// The integrator reviews a requested branch without switching to it (finding `a236e7206344`): a diff of two
+/// refs shows what the branch brings to main, not inverted and not mixed with the integrator's own main, and
+/// changes nothing. A request closed by its merge stays closed when the branch gets later commits.
+#[test]
+fn an_integrator_reviews_a_requested_branch_and_a_merged_request_stays_closed() {
+    let mut s = Stores::new(2, "agent-1");
+    s.ok(0, "switch", json!({"branch": "feat/zero", "create": true}));
+    s.commit_file(0, "tiny/zero.py", "NAME = 'zero'\n");
+    s.ok(0, "request_integration", json!({"branch": "feat/zero", "summary": "adds zero"}));
+    s.sync(0);
+    // The integrator has its own uncommitted and committed work on main.
+    s.commit_file(1, "tiny/one.py", "NAME = 'one'\n");
+    s.ok(1, "write_file", json!({"path": "tiny/draft.py", "text": "x = 1\n"}));
+    s.sync(1);
+    let review = s.ok(1, "diff", json!({"against": "origin/main", "to": "origin/agent-0/feat/zero"}));
+    let paths: Vec<&Value> = review["files"].as_array().expect("files").iter().map(|f| &f["path"]).collect();
+    assert_eq!(paths, [&json!("tiny/zero.py")], "only what the branch brings: {review}");
+    assert_eq!(review["files"][0]["change"], "A", "{review}");
+    assert!(review["diff"].as_str().is_some_and(|d| d.contains("+NAME = 'zero'")), "{review}");
+    let one = s.ok(1, "diff", json!({"to": "origin/agent-0/feat/zero", "path": "tiny/zero.py"}));
+    assert_eq!(one["files"].as_array().map(Vec::len), Some(1), "{one}");
+    assert!(s.trees[1].join("tiny/draft.py").exists(), "the review changed nothing");
+    assert_eq!(s.ok(1, "status", json!({}))["uncommitted"].as_array().map(Vec::len), Some(1));
+    s.ok(1, "delete_file", json!({"path": "tiny/draft.py"}));
+    s.ok(1, "merge", json!({"ref": "origin/agent-0/feat/zero"}));
+    assert_eq!(s.sync(1)["main"], "updated");
+    s.sync(0);
+    assert_eq!(s.ok(0, "requests", json!({}))["requests"], json!([]));
+    // A later commit on the merged branch doesn't reopen its request; a new request does.
+    s.commit_file(0, "tiny/zero2.py", "NAME = 'zero2'\n");
+    s.sync(0);
+    s.sync(1);
+    assert_eq!(s.ok(1, "requests", json!({}))["requests"], json!([]), "closed for good");
+    s.ok(0, "request_integration", json!({"branch": "feat/zero", "summary": "adds zero2"}));
+    s.sync(0);
+    s.sync(1);
+    assert_eq!(s.ok(1, "requests", json!({}))["requests"][0]["summary"], "adds zero2");
+}
+
 /// Only the agent the setting names updates main, and only by a fast-forward: the hub refuses the rest and says
 /// why, whatever the agent's prompt told it; a refused main changes nothing at the hub.
 #[test]
@@ -262,6 +301,7 @@ fn every_path_and_ref_an_agent_names_is_checked() {
     for r in ["--all", "origin/../main", "origin/agent-x/b", "origin/agent-0", "HEAD~1", "main@{1}", "-n"] {
         assert!(s.tool(0, "merge", json!({"ref": r})).is_err(), "{r:?}");
         assert!(s.tool(0, "diff", json!({"against": r})).is_err(), "{r:?}");
+        assert!(s.tool(0, "diff", json!({"to": r})).is_err(), "{r:?}");
         assert!(s.tool(0, "log", json!({"ref": r})).is_err(), "{r:?}");
     }
     assert!(s.tool(0, "switch", json!({"branch": "fix/a", "create": true, "start": "nope"})).is_err());

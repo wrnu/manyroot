@@ -536,6 +536,12 @@ fn git_project_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<
     if integrator.is_some() {
         let open = c.tool("requests", json!({}))?;
         for r in open["requests"].as_array().into_iter().flatten() {
+            // Looks at what the branch brings to main first, as the prompt asks (finding a236e7206344).
+            let review = c.tool("diff", json!({"against": "origin/main", "to": r["branch"]}))?;
+            let files = review["files"].as_array().map_or(0, Vec::len);
+            if files == 0 || review["diff"].as_str().is_some_and(|d| d.contains("\n-VALUE")) {
+                return Err(format!("the review of {} shows no change, or it inverted: {review}", r["branch"]));
+            }
             // Each agent writes its own files, so no merge conflicts.
             let merged = c.tool("merge", json!({"ref": r["branch"]}))?;
             if merged["merged"] != true {
