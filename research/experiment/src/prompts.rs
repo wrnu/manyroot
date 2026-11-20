@@ -62,23 +62,29 @@ pub fn turn_message(turn: u32, turns: u32, name: &str) -> String {
 /// agent (task `5b2f7f4a6b7f`); the plan hashes it.
 pub const INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents take the items and propose their \
      work, and only you integrate onto main, so review their proposals, integrate what's sound and settle any \
-     conflict. You take no items yourself. Your last turn starts only once every other agent's last turn has ended, \
-     so in it integrate every proposal still open.";
+     conflict. You take no items yourself. Nor do you write any item's code. Each of your turns starts once every \
+     other agent has ended that turn, so in each integrate every proposal open then, and end the turn when none is \
+     left. Your last turn starts only once every other agent's last turn has ended, so in it integrate every \
+     proposal still open.";
 
 /// The role sentence of every other agent then: `{integrator}` is the integrator's name. The plan hashes it.
 pub const BUILDER_ROLE: &str = "{integrator} is the run's one integrator: propose your work, and {integrator} \
-     integrates it onto main; integrate is refused to you. {integrator}'s last turn comes after your last, so propose \
-     all your work by the end of your last turn.";
+     integrates it onto main; integrate is refused to you. {integrator} integrates after each of your turns, so \
+     propose each item's work as soon as it is done. {integrator}'s last turn comes after your last, so propose all \
+     your work by the end of your last turn.";
 
 /// Git project mode's [`INTEGRATOR_ROLE`], in git's words (task `6bd13d994a03`). The plan hashes it.
 pub const GIT_INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents take the items, push their \
      work on branches and ask for its integration, and only you update main, so review their requests, merge what's \
-     sound into your main, settle any conflict, and sync. You take no items yourself. Your last turn starts only once \
-     every other agent's last turn has ended, so in it merge every request still open.";
+     sound into your main, settle any conflict, and sync. You take no items yourself. Nor do you write any item's \
+     code. Each of your turns starts once every other agent has ended that turn, so in each merge every request \
+     open then, sync, and end the turn when none is left. Your last turn starts only once every other agent's last \
+     turn has ended, so in it merge every request still open.";
 
 /// Git project mode's [`BUILDER_ROLE`], in git's words. The plan hashes it.
 pub const GIT_BUILDER_ROLE: &str = "{integrator} is the run's one integrator: push your work on a branch of your own \
      and ask for its integration, and {integrator} merges it into main; updating main is refused to you. \
+     {integrator} merges after each of your turns, so ask for each item's integration as soon as its work is done. \
      {integrator}'s last turn comes after your last, so ask for the integration of all your work by the end of your \
      last turn.";
 
@@ -263,6 +269,10 @@ mod tests {
             assert!(integrator.contains("You take no items yourself."), "{mode}");
             assert!(integrator.contains("Your last turn starts only once every other agent's last turn has ended"));
             assert!(builder.contains("{integrator}'s last turn comes after your last"), "{mode}");
+            // Integration as work arrives, not only in the last turn (task 61911c91247f).
+            assert!(integrator.contains("Each of your turns starts once every other agent has ended that turn"));
+            assert!(integrator.contains("Nor do you write any item's code."), "{mode}");
+            assert!(builder.contains("after each of your turns") && builder.contains("as soon as"), "{mode}");
         }
     }
 

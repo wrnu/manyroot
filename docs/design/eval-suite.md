@@ -744,6 +744,40 @@ turns ending before the builders' (notes `950a7e400f1f`, `63ca18dbfdf7`).
 - The plan records both rules (`take-items`, `integrator-last`) and the
   tool's description among the hashed tools.
 
+Stage 4 (task `61911c91247f`) changes three things, identically in both
+modes. In stage 3, main took builders' work only in the integrator's held
+last turn, and that turn hit the 50-call cap in all three complete runs;
+in e3gc it stopped mid-merge and lost one builder's four items (note
+`3dbc98125511`).
+
+- **The integrator integrates every turn:** each of its turns starts only
+  once every other agent has ended that turn (or stopped), so it integrates
+  their turn-t proposals while they play turn t+1, and its last turn still
+  waits for every other agent's last. A held turn is a `turn_held` event,
+  the last one `last_turn_held`, and the plan adds the rule
+  `integrator-each-turn`. The role sentences ask builders to propose each
+  item as soon as it is done, and the integrator to integrate what is open
+  in each turn and to write no item's code. Wall time: the integrator's
+  first turn now starts after the slowest builder's first instead of at
+  once, and its last can start later if its third is still running when
+  builders end; the run otherwise ends, as in stage 3, one integrator turn
+  after the slowest builder's last.
+- **Unknown tool calls are refused, not halted** (process `dc2dd9647315`,
+  answer `98c18ce63bfc`): in Pi, a call to a name the shim doesn't offer
+  gets Pi's own failed result (`Tool <name> not found`) and the run goes on;
+  the backend counts it (a `usage.jsonl` row, an `unknown_calls` event with
+  the run's count, a line in the run's output), and the driver adds one
+  block naming the offered tools to the agent's next tool result, or, when
+  its turn ended first, to the start of its next turn's message. Such calls
+  count toward the turn's tool-call cap, in the backend's count and the
+  driver's (finding `a4ff1a0dac7b`). A call to one of Pi's own tools, in
+  any case, still stops the run. Claude Code's backend is
+  unchanged: Claude Code refuses an unknown name itself and has no per-call
+  check that halts.
+- **Refusals name their way out:** each `take_item` refusal names the tool
+  call that resolves it (the share refusal: `take_item` with `give_up` set
+  to true).
+
 ## Cost estimate
 
 From Phase 1 and 2's measured use, and Candidate B's estimates for Python

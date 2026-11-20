@@ -652,6 +652,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
             run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
         }
     };
+    println!("calls to tools not offered, refused: {}", outcome.unknown_calls);
     println!("events: {}", outcome.events.display());
     Ok(())
 }

@@ -148,12 +148,14 @@ struct Stub {
 }
 
 impl Stub {
-    fn start(prefix: &Path, dir: &Path) -> Stub {
+    /// The stub, whose first chat completion calls `call` by name, if given.
+    fn calling(prefix: &Path, dir: &Path, call: Option<&str>) -> Stub {
         let (cert, key, log) = (dir.join("server.pem"), dir.join("server.key"), dir.join("stub.jsonl"));
         let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pi-stub.mjs");
         let mut child = Command::new(prefix.join("bin/node"))
             .args([&script, &cert, &key, &log])
             .arg(FAKE_AUTH)
+            .args(call)
             .env_clear()
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -243,15 +245,74 @@ fn a_pi_turn_through_openrouter_runs_through_the_proxy_to_a_stub_provider() {
     stub_turn(credential, "deepseek/deepseek-v4.1-flash", "high", "/api/v1/chat/completions");
 }
 
+/// A Pi turn's run to the stub: what it left, and the stub.
+struct StubRun {
+    _tmp: tempfile::TempDir,
+    root: PathBuf,
+    stub: Stub,
+    backend: PiBackend,
+    ran: Result<bracken_experiment::driver::Outcome, String>,
+}
+
+impl StubRun {
+    fn usage(&self) -> Vec<Value> {
+        let text = std::fs::read_to_string(self.root.join("pi/usage.jsonl")).expect("usage.jsonl");
+        text.lines().map(|l| serde_json::from_str(l).expect("JSON")).collect()
+    }
+
+    /// The turn's transcript and Pi's standard error, to show on a failure.
+    fn shown(&self) -> String {
+        let read = |f: &str| std::fs::read_to_string(self.root.join("pi/transcripts").join(f)).unwrap_or_default();
+        format!("transcript:\n{}\nstderr:\n{}", read("agent-0-1.jsonl"), read("agent-0-1.stderr"))
+    }
+}
+
+/// A Pi turn through Pi's OpenRouter provider to a stub whose first answer calls `call` by name (process
+/// dc2dd9647315 (1)): a name the shim doesn't offer, Pi refuses with a failed result and the run goes on,
+/// counting it; one of Pi's own tools still stops the run.
+#[test]
+#[ignore = "runs the Pi prefix; set EXPERIMENT_PI_PREFIX"]
+fn a_call_to_a_name_the_shim_doesnt_offer_is_refused_and_counted_and_pis_own_tool_still_stops_the_run() {
+    let credential =
+        || PiCredential::new("openrouter", &format!("https://{HOST}/api/v1"), FAKE_AUTH.into()).expect("a credential");
+    let model = "deepseek/deepseek-v4.1-flash";
+    let r = stub_run(credential(), model, "high", Some("write_file"));
+    let outcome = r.ran.as_ref().unwrap_or_else(|e| panic!("the run goes on: {e}\n{}", r.shown()));
+    assert_eq!(outcome.unknown_calls, 1, "{}", r.shown());
+    let usage = r.usage();
+    assert!(usage.iter().any(|row| row["unknown_tool"] == "`write_file`"), "counted: {usage:#?}");
+    let requests: Vec<Value> = r.stub.requests().into_iter().filter(|q| q["path"].is_string()).collect();
+    assert_eq!(requests.len(), 2, "the model is asked again after the refusal: {requests:#?}");
+    let refused = requests[1]["tool_results"].to_string();
+    assert!(refused.contains("Tool write_file not found"), "Pi's own failed result: {refused}");
+    let log = std::fs::read_to_string(r.root.join("run/events.jsonl")).expect("the events");
+    assert!(log.contains(r#""event":"unknown_calls""#) && !log.contains(r#""event":"run_stopped""#), "{log}");
+
+    let r = stub_run(credential(), model, "high", Some("bash"));
+    let e = r.ran.as_ref().err().unwrap_or_else(|| panic!("a call to bash stops the run\n{}", r.shown()));
+    assert!(e.contains("one of Pi's own tools"), "{e}");
+}
+
 /// One Pi turn with `credential` to the stub, as `model` at `thinking`; the model call goes to `path`.
 fn stub_turn(credential: PiCredential, model: &str, thinking: &str, path: &str) {
+    let provider = credential.provider().to_string();
+    let StubRun { root, stub, backend, ran, _tmp } = stub_run(credential, model, thinking, None);
+    let prefix = prefix();
+    let transcript = std::fs::read_to_string(root.join("pi/transcripts/agent-0-1.jsonl")).unwrap_or_default();
+    let stderr = std::fs::read_to_string(root.join("pi/transcripts/agent-0-1.stderr")).unwrap_or_default();
+    ran.unwrap_or_else(|e| panic!("the run: {e}\ntranscript:\n{transcript}\nstderr:\n{stderr}"));
+    check_turn(&root, &stub, &backend, (&provider, model), path, &prefix, (&transcript, &stderr));
+}
+
+/// One Pi turn with `credential` to the stub, as `model` at `thinking`, the stub calling `call` first if given.
+fn stub_run(credential: PiCredential, model: &str, thinking: &str, call: Option<&str>) -> StubRun {
     let prefix = prefix();
     let tmp = tempfile::tempdir().expect("a temp dir");
     let root = resolved(tmp.path()).expect("resolved");
     let certs = root.join("certs");
     std::fs::create_dir(&certs).expect("certs");
     let ca = certificates(&certs);
-    let stub = Stub::start(&prefix, &certs);
+    let stub = Stub::calling(&prefix, &certs, call);
     let provider = credential.provider().to_string();
     let backend = PiBackend::with_test_ca(
         PiConfig {
@@ -285,10 +346,19 @@ fn stub_turn(credential: PiCredential, model: &str, thinking: &str, path: &str) 
         sandbox: true,
     };
     let ran = run(&cfg, &backend);
-    let transcript = std::fs::read_to_string(root.join("pi/transcripts/agent-0-1.jsonl")).unwrap_or_default();
-    let stderr = std::fs::read_to_string(root.join("pi/transcripts/agent-0-1.stderr")).unwrap_or_default();
-    ran.unwrap_or_else(|e| panic!("the run: {e}\ntranscript:\n{transcript}\nstderr:\n{stderr}"));
+    StubRun { _tmp: tmp, root, stub, backend, ran }
+}
 
+/// What one plain Pi turn to the stub must show.
+fn check_turn(
+    root: &Path,
+    stub: &Stub,
+    backend: &PiBackend,
+    (provider, model): (&str, &str),
+    path: &str,
+    prefix: &Path,
+    (transcript, stderr): (&str, &str),
+) {
     let usage: Vec<Value> = std::fs::read_to_string(root.join("pi/usage.jsonl"))
         .expect("usage.jsonl")
         .lines()

@@ -96,31 +96,43 @@ impl Taken {
     /// whether anything changed (taking one's own item again changes nothing).
     pub fn take(&mut self, agent: usize, item: &str, give_up: bool) -> Result<(Value, bool), String> {
         if !self.released.iter().any(|i| i == item) {
-            return Err(format!("no released item {}: the task's index lists those released", short(item)));
+            return Err(format!(
+                "no released item {}: call task for the index, which lists those released, then take_item with one of \
+                 its ids",
+                short(item)
+            ));
         }
         let holder = self.by.get(item).copied();
         if give_up {
             if holder != Some(agent) {
-                return Err(format!("you haven't taken {item}, so there is nothing to give up"));
+                return Err(format!(
+                    "you haven't taken {item}, so there is nothing to give up: call task for the index, which shows \
+                     the items you hold as taken_by you"
+                ));
             }
             self.by.remove(item);
             return Ok((json!({"item": item, "given_up": true, "yours": self.held(agent)}), true));
         }
         if self.integrator == Some(agent) {
             return Err("you are the run's one integrator: the other agents take the items, and you integrate their \
-                        work, so you take none"
+                        work, so you take none; call task for the index, which shows who has taken each item"
                 .into());
         }
         let changed = match holder {
             Some(a) if a == agent => false,
-            Some(a) => return Err(format!("{item} is taken by agent-{a}: leave it to them, and take another")),
+            Some(a) => {
+                return Err(format!(
+                    "{item} is taken by agent-{a}: leave it to them, and take another with take_item; call task for \
+                     the index, which shows the items no one has taken"
+                ));
+            }
             None => {
                 // A change handed on at its release can put an agent past its share: say what it holds.
                 let (share, held) = (self.share(), self.held(agent).len());
                 if held >= share {
                     return Err(format!(
-                        "you hold {held} items, and one agent may hold {share} now: finish them, or give one up to \
-                         take another"
+                        "you hold {held} items, and one agent may hold {share} now: finish them, or give one up with \
+                         take_item, give_up set to true, to take another"
                     ));
                 }
                 self.by.insert(item.to_string(), agent);
@@ -217,6 +229,37 @@ mod tests {
         assert_eq!((given["yours"].clone(), changed), (json!(["a"]), true));
         t.take(1, "b", false).expect("free again");
         assert_eq!(t.names(), BTreeMap::from([("a".into(), "agent-0".into()), ("b".into(), "agent-1".into())]));
+    }
+
+    /// Every refusal of take_item names a tool call that resolves it, by a tool the shim offers in both project
+    /// modes, and the share refusal names the give-up call itself (process `dc2dd9647315` (2): e3wb invented
+    /// `give_up_item` from "give one up").
+    #[test]
+    fn every_refusal_names_a_tool_the_shim_offers() {
+        let mut t = Taken::new(&five(), 4, Some(3));
+        t.take(0, "a", false).expect("free");
+        t.take(0, "b", false).expect("free");
+        let refusals = [
+            t.take(0, "nope", false).expect_err("not released"),
+            t.take(1, "a", true).expect_err("not its own"),
+            t.take(3, "c", false).expect_err("the integrator"),
+            t.take(1, "a", false).expect_err("taken"),
+            t.take(0, "c", false).expect_err("over its share"),
+        ];
+        let words = |text: &str| -> Vec<String> {
+            text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).map(str::to_string).collect()
+        };
+        for mode in ["weave", crate::git_project::NAME] {
+            let mode = crate::mode::mode_named(mode).expect("a mode");
+            let offered: Vec<&str> =
+                crate::driver::run_tools(mode, crate::task::Task::Phase1, true).iter().map(|t| t.name).collect();
+            for refusal in &refusals {
+                let named = words(refusal);
+                assert!(offered.iter().any(|tool| named.iter().any(|w| w == tool)), "names no offered tool: {refusal}");
+            }
+        }
+        let share = &refusals[4];
+        assert!(share.contains("take_item, give_up set to true"), "{share}");
     }
 
     #[test]

@@ -269,7 +269,9 @@ impl ClaudeCode {
             })
             .collect();
         let tools = tools.ok_or("a tool call without an id")?;
-        Ok(Event::Message { id: id.to_string(), model: m["model"].clone(), usage, tools })
+        // Claude Code refuses a name it doesn't hold itself; nothing here halts on one, as before (answer
+        // `98c18ce63bfc`).
+        Ok(Event::Message { id: id.to_string(), model: m["model"].clone(), usage, tools, unknown: Vec::new() })
     }
 
     /// The result event: the larger of its `usage` and its `modelUsage`, both required.

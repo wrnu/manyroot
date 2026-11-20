@@ -450,15 +450,32 @@ mod macos_only {
     /// the integrator none; the change goes to the builder holding the item it revises. The integrator's last turn
     /// starts only once every builder's last turn has ended, so every builder's turn-2 work, finished at the run's
     /// end, is on main at the end.
+    ///
+    /// Stage 4 (task `61911c91247f`): each of the integrator's turns starts only once every builder has ended that
+    /// turn, so the builders' turn-1 work is on main at checkpoint 1, not only at the end. And a call to a name the
+    /// shim doesn't offer, refused by the harness, doesn't stop the run: it is counted, and the agent is told its
+    /// tools on its next result (agent-1, turn 1) or, when its turn ended first, as its next turn opens (agent-2).
     fn a_run_divides_the_items_and_its_integrator_plays_last(mode: &'static str) {
         let Some(python) = pin() else { return };
         let tmp = tempfile::tempdir().expect("a temp dir");
         let root = std::fs::canonicalize(tmp.path()).expect("resolved");
         let (project, store) = project_and_store(&root);
         let cfg = config_of(mode, "agent-0", python, root.join("run"), 4, 2, &project, false, true);
-        let mock =
-            MockBackend { seed: 1, shim: Some(bin()), lockstep: false, integrator: Some(0), ..MockBackend::default() };
-        let outcome = run(&cfg, &mock).expect("the run");
+        let offered = bracken_experiment::driver::harness_tools(
+            bracken_experiment::mode::mode_named(mode).expect("a mode"),
+            bracken_experiment::task::Task::Phase1,
+            true,
+        );
+        let mock = MockBackend {
+            seed: 1,
+            shim: Some(bin()),
+            lockstep: false,
+            integrator: Some(0),
+            unknown_at: vec![(1, 1, true), (2, 1, false)],
+            unknown: bracken_experiment::backend::UnknownCalls::new(offered),
+            ..MockBackend::default()
+        };
+        let outcome = run(&cfg, &mock).expect("the run goes on past the unknown calls");
         let text = std::fs::read_to_string(cfg.root.join("events.jsonl")).expect("the events");
         let log: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).expect("an event")).collect();
         assert!(!text.contains("\"turn_error\""), "no turn erred: {mode}");
@@ -490,10 +507,42 @@ mod macos_only {
             assert!(seq(e) < seq(last), "{mode}: {e} ended after the integrator's last turn started");
         }
         assert_eq!(of("last_turn_held").count(), 1, "{mode}");
+
+        // Each integrator turn after every builder's same turn, and main holds the builders' turn-1 work from
+        // checkpoint 1 (task 61911c91247f).
+        for turn in [1, 2] {
+            let start = of("turn_start").find(|e| e["agent"] == "agent-0" && e["data"]["turn"] == turn).expect("one");
+            for e in of("turn_end").filter(|e| e["agent"] != "agent-0" && e["data"]["turn"] == turn) {
+                assert!(seq(e) < seq(start), "{mode}: {e} ended after the integrator's turn {turn} started");
+            }
+        }
+        let held: Vec<&Value> = of("turn_held").map(|e| &e["data"]["turn"]).collect();
+        assert_eq!(held, [&json!(1)], "{mode}");
+        let first = of("checkpoint").find(|e| e["data"]["turn"] == 1).expect("checkpoint 1");
+        let at_first: Vec<&str> =
+            first["data"]["modules"].as_array().expect("modules").iter().filter_map(|m| m[0].as_str()).collect();
+        for agent in 1..4 {
+            let module = format!("tiny/by_agent_{agent}_turn_1.py");
+            assert!(at_first.contains(&module.as_str()), "{mode}: {module} on main at checkpoint 1: {at_first:?}");
+        }
+
+        // The unknown calls: counted, no halt, each named back once with the offered tools.
+        assert_eq!(outcome.unknown_calls, 2, "{mode}");
+        let counted: Vec<&Value> = of("unknown_calls").map(|e| &e["data"]["count"]).collect();
+        assert_eq!(counted, [&json!(2)], "{mode}");
+        let on_results: Vec<&Value> = of("unknown_hint").map(|e| &e["agent"]).collect();
+        assert_eq!(on_results, [&json!("agent-1")], "{mode}: one hint on a result");
+        let hinted = mock.hinted.lock().expect("the hints").clone();
+        let whom: Vec<(usize, u32)> = hinted.iter().map(|(a, t, _)| (*a, *t)).collect();
+        assert_eq!(whom, [(1, 1), (2, 2)], "{mode}: agent-1's on its result, agent-2's opening its turn 2");
+        for (_, _, hint) in &hinted {
+            assert!(hint.starts_with("`mcp__experiment__give_up_item` isn't among your tools"), "{mode}: {hint}");
+            assert!(hint.contains("take_item") && hint.contains("notes_write"), "{mode}: names the tools: {hint}");
+        }
         let plan: Value =
             serde_json::from_slice(&std::fs::read(cfg.root.join("plan.json")).expect("the plan")).expect("JSON");
         let rules: Vec<&str> = plan["rules"].as_array().expect("rules").iter().filter_map(|r| r[0].as_str()).collect();
-        assert!(rules.ends_with(&["take-items", "integrator-last"]), "{mode}: {rules:?}");
+        assert!(rules.ends_with(&["take-items", "integrator-last", "integrator-each-turn"]), "{mode}: {rules:?}");
 
         // Every agent's turn-2 module is on main at the end.
         let paths: Vec<&str> = outcome.modules.iter().map(|(p, _)| p.as_str()).collect();

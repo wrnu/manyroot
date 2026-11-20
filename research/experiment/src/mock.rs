@@ -66,7 +66,20 @@ pub struct MockBackend {
     pub lockstep: bool,
     /// A project run's one integrator, if its integrator setting names one: the others only propose.
     pub integrator: Option<usize>,
+    /// Where the mock's harness, as Pi does, refuses a call to a name the shim doesn't offer (process
+    /// `dc2dd9647315` (1)): `(agent, turn, first)`, before the turn's first tool call if `first`, so that call's
+    /// result names the tools, else after its last, so the hint opens the agent's next turn.
+    pub unknown_at: Vec<(usize, u32, bool)>,
+    /// How many calls each place in `unknown_at` makes.
+    pub unknown_each: u32,
+    /// Those calls, counted, and their hints not yet given.
+    pub unknown: crate::backend::UnknownCalls,
+    /// Each hint an agent was given: `(agent, turn, hint)`, on a tool result or opening its turn.
+    pub hinted: std::sync::Mutex<Vec<(usize, u32, String)>>,
 }
+
+/// The name the mock's agents call that the shim doesn't offer: the one e3wb's agent made up.
+pub const UNKNOWN_TOOL: &str = "mcp__experiment__give_up_item";
 
 impl Default for MockBackend {
     fn default() -> MockBackend {
@@ -79,6 +92,10 @@ impl Default for MockBackend {
             moves: Moves::RUN,
             lockstep: false,
             integrator: None,
+            unknown_at: Vec::new(),
+            unknown_each: 1,
+            unknown: crate::backend::UnknownCalls::default(),
+            hinted: std::sync::Mutex::new(Vec::new()),
         }
     }
 }
@@ -114,6 +131,8 @@ pub struct Client {
     pub calls: u32,
     /// Each call's tool and the size of its arguments.
     pub asked: Vec<(String, usize)>,
+    /// Text a result carried beyond its first block: a hint naming the tools.
+    pub hints: Vec<String>,
     _child: Option<std::process::Child>,
 }
 
@@ -140,8 +159,15 @@ impl Client {
                 (Box::new(r), Box::new(w), Some(child))
             }
         };
-        let mut c =
-            Client { reader: BufReader::new(reader), writer, next: 1, calls: 0, asked: Vec::new(), _child: child };
+        let mut c = Client {
+            reader: BufReader::new(reader),
+            writer,
+            next: 1,
+            calls: 0,
+            asked: Vec::new(),
+            hints: Vec::new(),
+            _child: child,
+        };
         c.request(
             "initialize",
             json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "mock"}}),
@@ -176,6 +202,8 @@ impl Client {
         self.asked.push((name.to_string(), args.to_string().len()));
         let r = self.request("tools/call", json!({"name": name, "arguments": args}))?;
         let text = r["content"][0]["text"].as_str().unwrap_or_default().to_string();
+        let more = r["content"].as_array().into_iter().flatten().skip(1);
+        self.hints.extend(more.filter_map(|b| b["text"].as_str().map(str::to_string)));
         if r["isError"].as_bool().unwrap_or(true) {
             return Err(text);
         }
@@ -279,9 +307,38 @@ impl Backend for MockBackend {
         self.lockstep
     }
 
+    fn unknown_hint(&self, agent: &str) -> Option<String> {
+        self.unknown.take_hint(agent)
+    }
+
+    fn unknown_calls(&self) -> u64 {
+        self.unknown.total()
+    }
+
+    fn unknown_since(&self, agent: &str) -> u32 {
+        self.unknown.take_count(agent)
+    }
+
     fn turn(&self, agent: usize, name: &str, turn: u32, socket: &Path) -> Result<(), String> {
+        let hinted = |hint: &str| {
+            self.hinted.lock().unwrap_or_else(|e| e.into_inner()).push((agent, turn, hint.trim().to_string()));
+        };
+        // A hint the last turn ended before giving opens this one, as a harness backend's turn message.
+        let opened = self.unknown.turn_message(name, "");
+        if !opened.is_empty() {
+            hinted(&opened);
+        }
+        if self.unknown_at.contains(&(agent, turn, true)) {
+            (0..self.unknown_each).for_each(|_| self.unknown.note(name, UNKNOWN_TOOL));
+        }
         let mut c = Client::connect(socket, self.shim.as_deref())?;
         let played = self.play(&mut c, agent, name, turn);
+        for hint in &c.hints {
+            hinted(hint);
+        }
+        if self.unknown_at.contains(&(agent, turn, false)) {
+            (0..self.unknown_each).for_each(|_| self.unknown.note(name, UNKNOWN_TOOL));
+        }
         match &self.usage {
             Some(path) => usage(path, name, turn, &c.asked).and(played),
             None => played,
