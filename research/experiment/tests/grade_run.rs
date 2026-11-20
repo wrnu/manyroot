@@ -444,4 +444,130 @@ mod macos_only {
             assert_eq!(indexes, [&json!(0), &json!(3)], "the before-change side, always: {p}");
         }
     }
+
+    /// Stage 3 (task `cb6a40559593`), in each project mode: the tiny project, 4 agents x 2 turns, agent-0 the one
+    /// integrator, agents playing at once, sandboxed, then graded. Builders take items, never one another's, and
+    /// the integrator none; the change goes to the builder holding the item it revises. The integrator's last turn
+    /// starts only once every builder's last turn has ended, so every builder's turn-2 work, finished at the run's
+    /// end, is on main at the end.
+    fn a_run_divides_the_items_and_its_integrator_plays_last(mode: &'static str) {
+        let Some(python) = pin() else { return };
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+        let (project, store) = project_and_store(&root);
+        let cfg = config_of(mode, "agent-0", python, root.join("run"), 4, 2, &project, false, true);
+        let mock =
+            MockBackend { seed: 1, shim: Some(bin()), lockstep: false, integrator: Some(0), ..MockBackend::default() };
+        let outcome = run(&cfg, &mock).expect("the run");
+        let text = std::fs::read_to_string(cfg.root.join("events.jsonl")).expect("the events");
+        let log: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).expect("an event")).collect();
+        assert!(!text.contains("\"turn_error\""), "no turn erred: {mode}");
+        let of = |event: &'static str| log.iter().filter(move |e| e["event"] == event);
+
+        // Disjoint items: each taken once, never by the integrator; the change by its revised item's taker.
+        let takes: Vec<(String, String, String)> = of("item_taken")
+            .map(|e| {
+                let s = |v: &Value| v.as_str().expect("a string").to_string();
+                (s(&e["data"]["item"]), s(&e["agent"]), s(&e["data"]["by"]))
+            })
+            .collect();
+        let mut items: Vec<&str> = takes.iter().map(|(i, _, _)| i.as_str()).collect();
+        items.sort();
+        let before = items.len();
+        items.dedup();
+        assert_eq!(items.len(), before, "{mode}: no item taken twice: {takes:?}");
+        assert!(takes.iter().all(|(_, a, _)| a != "agent-0"), "{mode}: the integrator takes none: {takes:?}");
+        let sum = takes.iter().find(|(i, _, _)| i == "sum").expect("sum is taken in turn 1");
+        assert_eq!(sum.2, "agent");
+        let decimals = takes.iter().find(|(i, _, _)| i == "decimals").expect("the change is handed on");
+        assert_eq!((&decimals.1, decimals.2.as_str()), (&sum.1, "release"), "{mode}: {takes:?}");
+        assert_eq!(of("item_given_up").count(), 0);
+
+        // The integrator's last turn after every builder's last.
+        let seq = |e: &Value| e["seq"].as_u64().expect("a seq");
+        let last = of("turn_start").find(|e| e["agent"] == "agent-0" && e["data"]["turn"] == 2).expect("its turn 2");
+        for e in of("turn_end").filter(|e| e["agent"] != "agent-0") {
+            assert!(seq(e) < seq(last), "{mode}: {e} ended after the integrator's last turn started");
+        }
+        assert_eq!(of("last_turn_held").count(), 1, "{mode}");
+        let plan: Value =
+            serde_json::from_slice(&std::fs::read(cfg.root.join("plan.json")).expect("the plan")).expect("JSON");
+        let rules: Vec<&str> = plan["rules"].as_array().expect("rules").iter().filter_map(|r| r[0].as_str()).collect();
+        assert!(rules.ends_with(&["take-items", "integrator-last"]), "{mode}: {rules:?}");
+
+        // Every agent's turn-2 module is on main at the end.
+        let paths: Vec<&str> = outcome.modules.iter().map(|(p, _)| p.as_str()).collect();
+        for agent in 0..4 {
+            let module = format!("tiny/by_agent_{agent}_turn_2.py");
+            assert!(paths.contains(&module.as_str()), "{mode}: {module} at the end: {paths:?}");
+        }
+
+        let grades = root.join("grades.jsonl");
+        let summary =
+            bracken_experiment::grade_run::grade_run(&cfg.root, &store, &grades, &bracken(), None).expect("graded");
+        assert_eq!((summary.points, summary.errors), (3, 0), "{mode}: {summary:?}");
+        let points: Vec<Value> = std::fs::read_to_string(&grades)
+            .expect("the grades")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("a JSON line"))
+            .collect();
+        let end = points.last().expect("the end");
+        assert_eq!(end["at"], "end");
+        let turn = end["grade"]["groups"].as_array().expect("groups").iter().find(|g| g["index"] == 3).expect("3");
+        assert_eq!(turn["outcomes"], json!(["pass"]), "{mode}: the integrator's own last work is on main: {end}");
+    }
+
+    #[test]
+    fn a_weave_run_divides_the_items_and_its_integrator_plays_last() {
+        a_run_divides_the_items_and_its_integrator_plays_last("weave");
+    }
+
+    #[test]
+    fn a_git_project_run_divides_the_items_and_its_integrator_plays_last() {
+        a_run_divides_the_items_and_its_integrator_plays_last(bracken_experiment::git_project::NAME);
+    }
+
+    /// What a real run's harness allows (`harness_tools`, which `agent_run` gives Pi and Claude Code) is exactly
+    /// what the shim advertises in a project run, in both modes, `take_item` included (finding `8fb431e50a6b`: at
+    /// d7f8e0a3 the allow-list left it out, so a real run halted on the first `take_item`).
+    #[test]
+    fn a_project_runs_harness_allows_exactly_the_tools_the_shim_advertises() {
+        use bracken_experiment::driver::{Backend, harness_tools};
+        use bracken_experiment::mock::Client;
+        use std::sync::Mutex;
+
+        /// Asks `tools/list` through the shim, as a harness would, and keeps the names.
+        struct Lister(Mutex<Vec<Vec<String>>>);
+        impl Backend for Lister {
+            fn turn(&self, _: usize, _: &str, _: u32, socket: &Path) -> Result<(), String> {
+                let mut c = Client::connect(socket, Some(&bin()))?;
+                let listed = c.request("tools/list", json!({}))?;
+                let names = listed["tools"].as_array().ok_or("no tools")?.iter();
+                let names = names.filter_map(|t| t["name"].as_str().map(str::to_string)).collect();
+                self.0.lock().expect("the list").push(names);
+                Ok(())
+            }
+            fn lockstep(&self) -> bool {
+                true
+            }
+        }
+
+        let Some(python) = pin() else { return };
+        for mode in ["weave", bracken_experiment::git_project::NAME] {
+            let tmp = tempfile::tempdir().expect("a temp dir");
+            let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+            let (project, _) = project_and_store(&root);
+            let cfg = config_of(mode, "agent-1", python.clone(), root.join("run"), 2, 1, &project, false, false);
+            let lister = Lister(Mutex::new(Vec::new()));
+            run(&cfg, &lister).expect("the run");
+            let m = bracken_experiment::mode::mode_named(mode).expect("the mode");
+            let allowed = harness_tools(m, cfg.plan.task, true);
+            assert!(allowed.iter().any(|t| t == "take_item"), "{mode}: {allowed:?}");
+            let listed = lister.0.into_inner().expect("the list");
+            assert_eq!(listed.len(), 2, "{mode}: one turn each");
+            for names in listed {
+                assert_eq!(names, allowed, "{mode}: the shim advertises what the harness allows");
+            }
+        }
+    }
 }

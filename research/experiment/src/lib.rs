@@ -45,6 +45,7 @@ pub mod proxy;
 pub mod python;
 pub mod sandbox;
 pub mod shim;
+pub mod taken;
 pub mod task;
 pub mod weave_mode;
 pub mod worker;

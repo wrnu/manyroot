@@ -19,7 +19,7 @@ use bracken_experiment::backend::{Caps, ModeTokenCap, RUN_TIME_CAP, RUN_TOKEN_CA
 use bracken_experiment::bracken_mode::AcceptRule;
 use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routing};
 use bracken_experiment::driver::{
-    CALLS_PER_TURN, ResultLimit, RunConfig, TURN_LIMIT, check_socket_room, core_tools, git_binary, run,
+    CALLS_PER_TURN, ResultLimit, RunConfig, TURN_LIMIT, check_socket_room, git_binary, harness_tools, run,
 };
 use bracken_experiment::git_project::project_mode;
 use bracken_experiment::mock::MockBackend;
@@ -546,7 +546,8 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
     // Before the backend makes its own directory: `run` checks again before making the run's.
     check_socket_room(&a.dir.join("run"), a.agents)?;
     let mode = mode_under(&a.mode, a.accept_rule).ok_or("no such mode")?;
-    let tools = mode.tools(a.task).into_iter().chain(core_tools()).map(|t| t.name.to_string()).collect();
+    // The harness allows exactly what the shim advertises (finding 8fb431e50a6b).
+    let tools = harness_tools(mode, a.task, a.project.project.is_some());
     let prompt = match &a.prompt_file {
         Some(file) => std::fs::read_to_string(file).map_err(|e| format!("reading the prompt: {e}"))?,
         None => bracken_experiment::prompts::system_prompt(mode.name())?,

@@ -60,22 +60,27 @@ pub fn turn_message(turn: u32, turns: u32, name: &str) -> String {
 
 /// The role sentence of the one integrator, after its turn message, when the run's integrator setting names one
 /// agent (task `5b2f7f4a6b7f`); the plan hashes it.
-pub const INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents propose their work and only you \
-     integrate onto main, so review their proposals, integrate what's sound, settle any conflict, and propose and \
-     integrate your own work too.";
+pub const INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents take the items and propose their \
+     work, and only you integrate onto main, so review their proposals, integrate what's sound and settle any \
+     conflict. You take no items yourself. Your last turn starts only once every other agent's last turn has ended, \
+     so in it integrate every proposal still open.";
 
 /// The role sentence of every other agent then: `{integrator}` is the integrator's name. The plan hashes it.
 pub const BUILDER_ROLE: &str = "{integrator} is the run's one integrator: propose your work, and {integrator} \
-     integrates it onto main; integrate is refused to you.";
+     integrates it onto main; integrate is refused to you. {integrator}'s last turn comes after your last, so propose \
+     all your work by the end of your last turn.";
 
 /// Git project mode's [`INTEGRATOR_ROLE`], in git's words (task `6bd13d994a03`). The plan hashes it.
-pub const GIT_INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents push their work on branches \
-     and ask for its integration, and only you update main, so review their requests, merge what's sound into your \
-     main, settle any conflict, sync, and integrate your own work too.";
+pub const GIT_INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents take the items, push their \
+     work on branches and ask for its integration, and only you update main, so review their requests, merge what's \
+     sound into your main, settle any conflict, and sync. You take no items yourself. Your last turn starts only once \
+     every other agent's last turn has ended, so in it merge every request still open.";
 
 /// Git project mode's [`BUILDER_ROLE`], in git's words. The plan hashes it.
 pub const GIT_BUILDER_ROLE: &str = "{integrator} is the run's one integrator: push your work on a branch of your own \
-     and ask for its integration, and {integrator} merges it into main; updating main is refused to you.";
+     and ask for its integration, and {integrator} merges it into main; updating main is refused to you. \
+     {integrator}'s last turn comes after your last, so ask for the integration of all your work by the end of your \
+     last turn.";
 
 /// The integrator's and the builders' role sentences in `mode`.
 pub fn roles(mode: &str) -> (&'static str, &'static str) {
@@ -231,8 +236,10 @@ mod tests {
             assert!(git.contains(theirs) && !git.contains(weave), "{theirs}");
         }
         let section = section(crate::git_project::NAME).expect("a section");
+        let take = serde_json::to_string(&crate::taken::take_tool()).expect("JSON");
         for word in ["propose", "proposal", "decision", "claim", "line", "Weave", "manifest"] {
             assert!(!git.contains(word) && !section.contains(word), "{word}");
+            assert!(!take.contains(word), "the take tool is in neither mode's words: {word}");
             assert!(!GIT_INTEGRATOR_ROLE.contains(word) && !GIT_BUILDER_ROLE.contains(word), "{word}");
         }
         let tools = crate::mode::mode_named(crate::git_project::NAME).expect("the mode").tools(Task::Phase1);
@@ -240,6 +247,22 @@ mod tests {
         for t in tools.iter().filter(|t| crate::git_project::SHARED.contains(&t.name)) {
             let w = weave.iter().find(|w| w.name == t.name).expect("the same tool");
             assert_eq!((t.description, &t.input_schema), (w.description, &w.input_schema), "{} is Weave's", t.name);
+        }
+    }
+
+    /// Both project modes' prompts say, in the same words, to take an item before working on it and never to work
+    /// on another's; and in each mode the integrator is told it takes none and plays last, and builders that it
+    /// plays after them (task `cb6a40559593`).
+    #[test]
+    fn both_project_modes_divide_the_work_alike() {
+        let rule = "Before you work on an item, take it with take_item: the task's index shows who has taken each \
+                    item, and you never work on an item another agent has taken.";
+        for mode in ["weave", crate::git_project::NAME] {
+            assert_eq!(system_prompt(mode).expect("a prompt").matches(rule).count(), 1, "{mode}");
+            let (integrator, builder) = roles(mode);
+            assert!(integrator.contains("You take no items yourself."), "{mode}");
+            assert!(integrator.contains("Your last turn starts only once every other agent's last turn has ended"));
+            assert!(builder.contains("{integrator}'s last turn comes after your last"), "{mode}");
         }
     }
 
@@ -254,6 +277,7 @@ mod tests {
             let mode = mode_named(name).expect("a mode");
             texts.push(serde_json::to_string(&mode.tools(Task::Phase1)).expect("JSON"));
         }
+        texts.push(serde_json::to_string(&crate::taken::take_tool()).expect("JSON"));
         let all = texts.join("\n").to_lowercase();
         for word in ["experiment", "metric", "measure", "token", "score", "grader", "hidden", "mode", "crdt", "bracken"]
         {

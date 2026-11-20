@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::backend::TURN_MESSAGE;
 use crate::bracken_mode::AcceptRule;
-use crate::driver::{RELEASE_AT, RunConfig, core_tools};
+use crate::driver::{RELEASE_AT, RunConfig};
 use crate::grader::HiddenCases;
 use crate::metrics::{DEFINITIONS, Measures, Records, incomplete, measure};
 use crate::mode::Mode;
@@ -221,8 +221,7 @@ impl Plan {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         let task = cfg.plan.task;
-        let mut tools = mode.tools(task);
-        tools.extend(core_tools());
+        let tools = crate::driver::run_tools(mode, task, cfg.plan.project.is_some());
         let tools = serde_json::to_vec(&tools).expect("tool specs are plain JSON");
         let mut prompts = BTreeMap::from([
             ("tools".to_string(), hash(&tools)),
@@ -288,7 +287,7 @@ impl Plan {
                             crate::weave_mode::integrator_rule(setting)
                         )
                     };
-                    if mode.name() == crate::git_project::NAME {
+                    let mut rules = if mode.name() == crate::git_project::NAME {
                         let rule = format!(
                             "Task 6bd13d994a03: {} The hub makes an agent's own main its main only if that agent may \
                              update main and it is a fast-forward of the hub's main.",
@@ -297,7 +296,9 @@ impl Plan {
                         vec![("git-integrator".to_string(), rule)]
                     } else {
                         vec![("weave-integrator".to_string(), rule)]
-                    }
+                    };
+                    rules.extend(project_rules(setting));
+                    rules
                 }
                 (None, _) => rules(cfg.plan.accept_rule),
             },
@@ -309,6 +310,30 @@ impl Plan {
     pub fn bytes(&self) -> Vec<u8> {
         serde_json::to_vec_pretty(self).expect("a plan is plain JSON")
     }
+}
+
+/// A project run's rules on dividing the work and on the integrator's last turn (task `cb6a40559593`), the
+/// same in every mode, under the integrator setting `setting`.
+fn project_rules(setting: &str) -> Vec<(String, String)> {
+    let mut rules = vec![(
+        "take-items".to_string(),
+        "Task cb6a40559593: the runner holds who has taken each work item, and the task tool shows each item's \
+         taker. An agent takes only a released item, one no other agent holds, and at most the released items over \
+         the agents that may take items, rounded up; a run's one integrator takes none. An item stays taken until \
+         its taker gives it up. When the change goes out, a change whose revised items one agent holds, all of \
+         them, is taken for that agent; otherwise it is free to take."
+            .to_string(),
+    )];
+    if setting != crate::weave_mode::ANY_AGENT {
+        rules.push((
+            "integrator-last".to_string(),
+            format!(
+                "Task cb6a40559593: {setting}, the one integrator, starts its last turn only once every other agent \
+                 has ended its last turn."
+            ),
+        ));
+    }
+    rules
 }
 
 /// One run's report: its plan's hash and its measures.

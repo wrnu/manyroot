@@ -314,11 +314,12 @@ pub fn task_view(spec: Option<&str>, items: &[String], item: Option<&str>, page:
             .ok_or_else(|| format!("no released item {}: task with no item lists those released", short(id)));
     }
     let mut index: Vec<Value> = items.iter().map(|s| item_entry(s)).collect();
-    // Each item on the page it fits, in order. Page numbers are sized at their widest, and the index's
-    // `"page":N,` at 16 bytes an item.
+    // Each item on the page it fits, in order. Page numbers are sized at their widest, the index's
+    // `"page":N,` at 16 bytes an item, and its taker, which the runner adds ([`crate::taken::show_taken`]), at
+    // [`crate::taken::TAKEN_ROOM`].
     let first =
         json_len(&json!({"spec": spec, "items": index, "texts": [], "page": 99_999, "pages": 99_999, "note": NOTE}))
-            + 16 * index.len();
+            + (16 + crate::taken::TAKEN_ROOM) * index.len();
     let rest = json_len(&json!({"texts": [], "page": 99_999, "pages": 99_999, "note": NOTE}));
     let (mut pages, mut size): (Vec<Vec<usize>>, usize) = (vec![Vec::new()], first);
     for (i, text) in items.iter().enumerate() {
@@ -355,18 +356,25 @@ const NOTE: &str = "The task comes in pages: texts holds the full text of the it
                     the index says its page. Call task with page set to read each other page.";
 
 /// Every result the task tool could give for `project` once all its items are out, as the driver sends it
-/// (JSON text): each page of the task, and each item in full, by what it is.
+/// (JSON text): each page of the task, and each item in full, by what it is, with every item taken by an agent
+/// of the longest name a run has ([`crate::taken::show_taken`]).
 pub fn task_outputs(project: &Project) -> Result<Vec<(String, String)>, String> {
     let data = hub_data(project, ANY_AGENT, false)?;
     let items: Vec<String> = data["items"].as_array().into_iter().flatten().map(item_statement).collect();
     let spec = data["spec"].as_str();
+    let taken = project.items.iter().map(|i| (i.id.clone(), "agent-999".to_string())).collect();
+    let shown = |mut v: Value| {
+        crate::taken::show_taken(&mut v, &taken);
+        v.to_string()
+    };
     let first = task_view(spec, &items, None, 1)?;
-    let mut out = vec![("page 1 of the task".to_string(), first.to_string())];
-    for page in 2..=first["pages"].as_u64().unwrap_or(1) as usize {
-        out.push((format!("page {page} of the task"), task_view(spec, &items, None, page)?.to_string()));
+    let pages = first["pages"].as_u64().unwrap_or(1) as usize;
+    let mut out = vec![("page 1 of the task".to_string(), shown(first))];
+    for page in 2..=pages {
+        out.push((format!("page {page} of the task"), shown(task_view(spec, &items, None, page)?)));
     }
     for item in project.items.iter() {
-        out.push((format!("item {}", item.id), task_view(spec, &items, Some(&item.id), 1)?.to_string()));
+        out.push((format!("item {}", item.id), shown(task_view(spec, &items, Some(&item.id), 1)?)));
     }
     Ok(out)
 }

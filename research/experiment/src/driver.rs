@@ -183,6 +183,22 @@ pub trait Backend: Sync {
 struct Lockstep {
     next: usize,
     stopped: Vec<bool>,
+    /// The agent-turns in the order they play: turn 1 of every agent in order, then turn 2, and so on, except
+    /// that a run's one integrator plays its last turn after every other agent's last ([`last_turn_order`]).
+    order: Vec<(usize, u32)>,
+}
+
+/// The order of a lockstep run's agent-turns, as `(agent, turn)`: turn 1 of every agent in order, then turn 2,
+/// and so on; a run's one `integrator` plays its last turn last, after every other agent's last turn.
+fn last_turn_order(agents: usize, turns: u32, integrator: Option<usize>) -> Vec<(usize, u32)> {
+    let mut order: Vec<(usize, u32)> = (1..=turns).flat_map(|t| (0..agents).map(move |a| (a, t))).collect();
+    if let Some(n) = integrator
+        && let Some(at) = order.iter().position(|&(a, t)| a == n && t == turns)
+    {
+        let last = order.remove(at);
+        order.push(last);
+    }
+    order
 }
 
 pub struct Outcome {
@@ -334,6 +350,13 @@ struct Run<'a> {
     integrated: Mutex<String>,
     /// A project run's project, its Python image pinned from the plan, and when its change goes out.
     project: Option<ProjectRun>,
+    /// A project run's work items: who has taken which (task `cb6a40559593`).
+    taken: Option<Mutex<crate::taken::Taken>>,
+    /// The run's one integrator, if its integrator setting names one: it plays its last turn only once every
+    /// other agent has played its last (task `cb6a40559593`).
+    integrator: Option<usize>,
+    /// How many agents other than the one integrator are still playing, and the integrator's wait for none.
+    builders_left: (Mutex<usize>, Condvar),
 }
 
 /// What the driver holds of a project run (Weave mode, or git project mode).
@@ -359,6 +382,9 @@ fn project_run(cfg: &RunConfig, mode: &dyn Mode) -> Result<Option<ProjectRun>, S
     let pin =
         cfg.plan.python.as_ref().ok_or("a project run needs the Python pin (--python), which its plan records")?;
     let project = plan.load()?;
+    if cfg.agents > 999 {
+        return Err("a project run has at most 999 agents".into());
+    }
     crate::weave_mode::check_task_outputs(&project)?;
     let python = crate::python::Python::from_plan(pin, &project.python)?;
     let shares: Vec<f64> = plan.items.iter().map(|(_, s)| *s).collect();
@@ -440,8 +466,13 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     let plan = blake3::hash(&plan).to_hex().to_string();
     events.log(None, "setup", json!({"mode": mode.name(), "agents": cfg.agents, "turns": cfg.turns, "plan": plan}));
 
-    let mut tools = mode.tools(cfg.plan.task);
-    tools.extend(core_tools());
+    let tools = run_tools(mode, cfg.plan.task, project.is_some());
+    let integrator = match (&project, cfg.plan.integrator.as_deref()) {
+        (Some(_), Some(setting)) => crate::weave_mode::integrator_agent(setting, cfg.agents)?,
+        _ => None,
+    };
+    let taken =
+        project.as_ref().map(|p| Mutex::new(crate::taken::Taken::new(&p.project.items, cfg.agents, integrator)));
     let run = Run {
         cfg,
         limit: backend.result_limit(),
@@ -456,11 +487,15 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         turns_done: AtomicU32::new(0),
         released: Mutex::new(Vec::new()),
         finished: Mutex::new(vec![0; cfg.turns as usize]),
-        lockstep: backend
-            .lockstep()
-            .then(|| (Mutex::new(Lockstep { next: 0, stopped: vec![false; cfg.agents] }), Condvar::new())),
+        lockstep: backend.lockstep().then(|| {
+            let order = last_turn_order(cfg.agents, cfg.turns, integrator);
+            (Mutex::new(Lockstep { next: 0, stopped: vec![false; cfg.agents], order }), Condvar::new())
+        }),
         integrated: Mutex::new(String::new()),
         project,
+        taken,
+        integrator,
+        builders_left: (Mutex::new(cfg.agents - usize::from(integrator.is_some())), Condvar::new()),
     };
     run.snapshot(&mut run.hub(), None, "setup");
     // A wave due after turn 0 goes out before anyone plays.
@@ -499,6 +534,24 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     }
     let released = run.released.lock().unwrap_or_else(|e| e.into_inner()).clone();
     Ok(Outcome { modules, events: root.join("events.jsonl"), released_after: released.first().copied(), released })
+}
+
+/// Every tool a run's agents are offered, in the order `tools/list` gives them: the mode's, the core's and, in a
+/// project run, [`crate::taken::take_tool`]. The one source for the driver, the plan and the harness's allow-list
+/// (finding `8fb431e50a6b`).
+pub fn run_tools(mode: &dyn Mode, task: crate::task::Task, project: bool) -> Vec<ToolSpec> {
+    let mut tools = mode.tools(task);
+    tools.extend(core_tools());
+    if project {
+        tools.push(crate::taken::take_tool());
+    }
+    tools
+}
+
+/// The tools a real run's harness (Pi or Claude Code) allows its agents, by name: exactly [`run_tools`], what the
+/// shim advertises, so no call the prompt asks for halts the run (finding `8fb431e50a6b`).
+pub fn harness_tools(mode: &dyn Mode, task: crate::task::Task, project: bool) -> Vec<String> {
+    run_tools(mode, task, project).into_iter().map(|t| t.name.to_string()).collect()
 }
 
 /// Tools every mode has, which the core serves.
@@ -541,15 +594,59 @@ impl Run<'_> {
     }
 
     fn agent(&self, i: usize, root: &Path, backend: &dyn Backend) -> Result<(), String> {
+        // However a builder's thread ends, even by a panic, it no longer holds up the integrator's last turn. Made
+        // lazily: a guard made and dropped for the integrator would count it as a builder done.
+        let _done = self.integrator.is_some_and(|n| n != i).then(|| BuilderDone(&self.builders_left));
         let played = self.agent_turns(i, root, backend);
         self.lockstep_stop(i);
         played
+    }
+
+    /// The one integrator's last turn waits for every other agent's last turn to end (task `cb6a40559593`), so
+    /// work finished before the run's end can still reach main. Logged with how long it waited.
+    fn hold_last_turn(&self, i: usize, turn: u32, backend: &dyn Backend) {
+        if self.integrator != Some(i) || turn != self.cfg.turns {
+            return;
+        }
+        let start = Instant::now();
+        let (left, cv) = &self.builders_left;
+        let mut left = left.lock().unwrap_or_else(|e| e.into_inner());
+        while *left > 0 {
+            left = cv.wait(left).unwrap_or_else(|e| e.into_inner());
+        }
+        drop(left);
+        if backend.halted().is_some() {
+            // The run is stopping: no last turn is played, so none was held.
+            return;
+        }
+        let waited = start.elapsed().as_millis() as u64;
+        self.events.log(Some(&self.names[i]), "last_turn_held", json!({"turn": turn, "waited_ms": waited}));
+    }
+
+    /// A project run's `take_item` ([`crate::taken`]), logged by item and agent: project data, never an agent's
+    /// words.
+    fn take_item(&self, i: usize, args: &Value) -> Result<Value, String> {
+        let taken = self.taken.as_ref().ok_or("not a project run")?;
+        let a = crate::args::Args::new(args, &["item", "give_up"])?;
+        let item = a.text("item")?.to_string();
+        let give_up = match args.get("give_up") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => return Err("give_up must be true or false".into()),
+        };
+        let (result, changed) = taken.lock().unwrap_or_else(|e| e.into_inner()).take(i, &item, give_up)?;
+        if changed {
+            let event = if give_up { "item_given_up" } else { "item_taken" };
+            self.events.log(Some(&self.names[i]), event, json!({"item": result["item"], "by": "agent"}));
+        }
+        Ok(result)
     }
 
     fn agent_turns(&self, i: usize, root: &Path, backend: &dyn Backend) -> Result<(), String> {
         let name = &self.names[i];
         let socket = root.join("sockets").join(format!("a{i}.sock"));
         for turn in 1..=self.cfg.turns {
+            self.hold_last_turn(i, turn, backend);
             self.lockstep_wait(i, turn);
             if backend.halted().is_some() {
                 break;
@@ -592,8 +689,8 @@ impl Run<'_> {
     /// In lockstep, waits until it is agent `i`'s turn `turn`.
     fn lockstep_wait(&self, i: usize, turn: u32) {
         let Some((state, cv)) = &self.lockstep else { return };
-        let me = (turn as usize - 1) * self.cfg.agents + i;
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        let me = s.order.iter().position(|&slot| slot == (i, turn)).expect("every agent-turn is in the order");
         while s.next != me {
             s = cv.wait(s).unwrap_or_else(|e| e.into_inner());
         }
@@ -604,8 +701,7 @@ impl Run<'_> {
         let Some((state, cv)) = &self.lockstep else { return };
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.next += 1;
-        let total = self.cfg.agents * self.cfg.turns as usize;
-        while s.next < total && s.stopped[s.next % self.cfg.agents] {
+        while s.next < s.order.len() && s.stopped[s.order[s.next].0] {
             s.next += 1;
         }
         cv.notify_all();
@@ -616,10 +712,9 @@ impl Run<'_> {
         let Some((state, cv)) = &self.lockstep else { return };
         let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
         s.stopped[i] = true;
-        let total = self.cfg.agents * self.cfg.turns as usize;
-        if s.next < total && s.next % self.cfg.agents == i {
+        if s.next < s.order.len() && s.order[s.next].0 == i {
             s.next += 1;
-            while s.next < total && s.stopped[s.next % self.cfg.agents] {
+            while s.next < s.order.len() && s.stopped[s.order[s.next].0] {
                 s.next += 1;
             }
         }
@@ -698,6 +793,13 @@ impl Run<'_> {
                 json!({"turns_done": done, "wave": wave, "result": reply.result})
             };
             self.events.log(None, "changes_released", data);
+            if let Some(taken) = &self.taken {
+                // The change's items can be taken from now, and a change goes to the one agent holding what it
+                // revises, if one does.
+                for (item, agent) in taken.lock().unwrap_or_else(|e| e.into_inner()).change_out() {
+                    self.events.log(Some(&self.names[agent]), "item_taken", json!({"item": item, "by": "release"}));
+                }
+            }
             self.snapshot(&mut hub, None, "release");
             released.push(done);
         }
@@ -923,6 +1025,8 @@ impl Run<'_> {
             crate::args::Args::new(&args, &[]).and_then(|_| self.sync(i))
         } else if tool == "run_tests" && self.project.is_some() {
             crate::args::Args::new(&args, &[]).and_then(|_| self.run_tests(i))
+        } else if tool == "take_item" && self.taken.is_some() {
+            self.take_item(i, &args)
         } else if self.mode.hub_tools().contains(&tool.as_str()) {
             // The agent's own worker checks the values; the hub runs the checked form, as this agent.
             let req = Request { op: "validate".into(), tool: Some(tool.clone()), args, ..Request::default() };
@@ -943,6 +1047,12 @@ impl Run<'_> {
                 r.result
             })
         };
+        let mut result = result;
+        if let (Some(taken), "task", Ok(v)) = (&self.taken, tool_name(params), &mut result) {
+            // Each item's taker, as of now, on the index and an item's view.
+            let names = taken.lock().unwrap_or_else(|e| e.into_inner()).names();
+            crate::taken::show_taken(v, &names);
+        }
         let (text, is_error) = match &result {
             Ok(v) => (v.to_string(), false),
             Err(e) => (e.clone(), true),
@@ -960,6 +1070,23 @@ impl Run<'_> {
             json!({"turn": turn, "tool": shown, "ok": !is_error, "bytes": text.len(), "digest": digest(text.as_bytes()), "cut_from": cut_from, "record": record}),
         );
         json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+    }
+}
+
+/// The name of the tool a `tools/call` asks for.
+fn tool_name(params: &Value) -> &str {
+    params["name"].as_str().unwrap_or_default()
+}
+
+/// Ends a builder's play for [`Run::hold_last_turn`] when dropped.
+struct BuilderDone<'a>(&'a (Mutex<usize>, Condvar));
+
+impl Drop for BuilderDone<'_> {
+    fn drop(&mut self) {
+        let (left, cv) = self.0;
+        let mut left = left.lock().unwrap_or_else(|e| e.into_inner());
+        *left = left.saturating_sub(1);
+        cv.notify_all();
     }
 }
 
@@ -1145,6 +1272,14 @@ impl Write for Hashing<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_one_integrator_plays_its_last_turn_after_every_other_agents_last() {
+        assert_eq!(last_turn_order(2, 2, None), [(0, 1), (1, 1), (0, 2), (1, 2)]);
+        assert_eq!(last_turn_order(3, 2, Some(0)), [(0, 1), (1, 1), (2, 1), (1, 2), (2, 2), (0, 2)]);
+        assert_eq!(last_turn_order(3, 1, Some(1)), [(0, 1), (2, 1), (1, 1)]);
+        assert_eq!(last_turn_order(3, 2, Some(2)), [(0, 1), (1, 1), (2, 1), (0, 2), (1, 2), (2, 2)]);
+    }
 
     #[test]
     fn the_event_log_is_written_in_sequence_order() {
