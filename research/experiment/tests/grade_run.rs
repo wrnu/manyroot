@@ -526,4 +526,48 @@ mod macos_only {
     fn a_git_project_run_divides_the_items_and_its_integrator_plays_last() {
         a_run_divides_the_items_and_its_integrator_plays_last(bracken_experiment::git_project::NAME);
     }
+
+    /// What a real run's harness allows (`harness_tools`, which `agent_run` gives Pi and Claude Code) is exactly
+    /// what the shim advertises in a project run, in both modes, `take_item` included (finding `8fb431e50a6b`: at
+    /// d7f8e0a3 the allow-list left it out, so a real run halted on the first `take_item`).
+    #[test]
+    fn a_project_runs_harness_allows_exactly_the_tools_the_shim_advertises() {
+        use bracken_experiment::driver::{Backend, harness_tools};
+        use bracken_experiment::mock::Client;
+        use std::sync::Mutex;
+
+        /// Asks `tools/list` through the shim, as a harness would, and keeps the names.
+        struct Lister(Mutex<Vec<Vec<String>>>);
+        impl Backend for Lister {
+            fn turn(&self, _: usize, _: &str, _: u32, socket: &Path) -> Result<(), String> {
+                let mut c = Client::connect(socket, Some(&bin()))?;
+                let listed = c.request("tools/list", json!({}))?;
+                let names = listed["tools"].as_array().ok_or("no tools")?.iter();
+                let names = names.filter_map(|t| t["name"].as_str().map(str::to_string)).collect();
+                self.0.lock().expect("the list").push(names);
+                Ok(())
+            }
+            fn lockstep(&self) -> bool {
+                true
+            }
+        }
+
+        let Some(python) = pin() else { return };
+        for mode in ["weave", bracken_experiment::git_project::NAME] {
+            let tmp = tempfile::tempdir().expect("a temp dir");
+            let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+            let (project, _) = project_and_store(&root);
+            let cfg = config_of(mode, "agent-1", python.clone(), root.join("run"), 2, 1, &project, false, false);
+            let lister = Lister(Mutex::new(Vec::new()));
+            run(&cfg, &lister).expect("the run");
+            let m = bracken_experiment::mode::mode_named(mode).expect("the mode");
+            let allowed = harness_tools(m, cfg.plan.task, true);
+            assert!(allowed.iter().any(|t| t == "take_item"), "{mode}: {allowed:?}");
+            let listed = lister.0.into_inner().expect("the list");
+            assert_eq!(listed.len(), 2, "{mode}: one turn each");
+            for names in listed {
+                assert_eq!(names, allowed, "{mode}: the shim advertises what the harness allows");
+            }
+        }
+    }
 }

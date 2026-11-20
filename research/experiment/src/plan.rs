@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::backend::TURN_MESSAGE;
 use crate::bracken_mode::AcceptRule;
-use crate::driver::{RELEASE_AT, RunConfig, core_tools};
+use crate::driver::{RELEASE_AT, RunConfig};
 use crate::grader::HiddenCases;
 use crate::metrics::{DEFINITIONS, Measures, Records, incomplete, measure};
 use crate::mode::Mode;
@@ -221,11 +221,7 @@ impl Plan {
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_default();
         let task = cfg.plan.task;
-        let mut tools = mode.tools(task);
-        tools.extend(core_tools());
-        if cfg.plan.project.is_some() {
-            tools.push(crate::taken::take_tool());
-        }
+        let tools = crate::driver::run_tools(mode, task, cfg.plan.project.is_some());
         let tools = serde_json::to_vec(&tools).expect("tool specs are plain JSON");
         let mut prompts = BTreeMap::from([
             ("tools".to_string(), hash(&tools)),

@@ -466,16 +466,13 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     let plan = blake3::hash(&plan).to_hex().to_string();
     events.log(None, "setup", json!({"mode": mode.name(), "agents": cfg.agents, "turns": cfg.turns, "plan": plan}));
 
-    let mut tools = mode.tools(cfg.plan.task);
-    tools.extend(core_tools());
+    let tools = run_tools(mode, cfg.plan.task, project.is_some());
     let integrator = match (&project, cfg.plan.integrator.as_deref()) {
         (Some(_), Some(setting)) => crate::weave_mode::integrator_agent(setting, cfg.agents)?,
         _ => None,
     };
-    let taken = project.as_ref().map(|p| {
-        tools.push(crate::taken::take_tool());
-        Mutex::new(crate::taken::Taken::new(&p.project.items, cfg.agents, integrator))
-    });
+    let taken =
+        project.as_ref().map(|p| Mutex::new(crate::taken::Taken::new(&p.project.items, cfg.agents, integrator)));
     let run = Run {
         cfg,
         limit: backend.result_limit(),
@@ -539,6 +536,24 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     Ok(Outcome { modules, events: root.join("events.jsonl"), released_after: released.first().copied(), released })
 }
 
+/// Every tool a run's agents are offered, in the order `tools/list` gives them: the mode's, the core's and, in a
+/// project run, [`crate::taken::take_tool`]. The one source for the driver, the plan and the harness's allow-list
+/// (finding `8fb431e50a6b`).
+pub fn run_tools(mode: &dyn Mode, task: crate::task::Task, project: bool) -> Vec<ToolSpec> {
+    let mut tools = mode.tools(task);
+    tools.extend(core_tools());
+    if project {
+        tools.push(crate::taken::take_tool());
+    }
+    tools
+}
+
+/// The tools a real run's harness (Pi or Claude Code) allows its agents, by name: exactly [`run_tools`], what the
+/// shim advertises, so no call the prompt asks for halts the run (finding `8fb431e50a6b`).
+pub fn harness_tools(mode: &dyn Mode, task: crate::task::Task, project: bool) -> Vec<String> {
+    run_tools(mode, task, project).into_iter().map(|t| t.name.to_string()).collect()
+}
+
 /// Tools every mode has, which the core serves.
 pub fn core_tools() -> Vec<ToolSpec> {
     vec![
@@ -589,7 +604,7 @@ impl Run<'_> {
 
     /// The one integrator's last turn waits for every other agent's last turn to end (task `cb6a40559593`), so
     /// work finished before the run's end can still reach main. Logged with how long it waited.
-    fn hold_last_turn(&self, i: usize, turn: u32) {
+    fn hold_last_turn(&self, i: usize, turn: u32, backend: &dyn Backend) {
         if self.integrator != Some(i) || turn != self.cfg.turns {
             return;
         }
@@ -600,6 +615,10 @@ impl Run<'_> {
             left = cv.wait(left).unwrap_or_else(|e| e.into_inner());
         }
         drop(left);
+        if backend.halted().is_some() {
+            // The run is stopping: no last turn is played, so none was held.
+            return;
+        }
         let waited = start.elapsed().as_millis() as u64;
         self.events.log(Some(&self.names[i]), "last_turn_held", json!({"turn": turn, "waited_ms": waited}));
     }
@@ -615,9 +634,11 @@ impl Run<'_> {
             Some(Value::Bool(b)) => *b,
             Some(_) => return Err("give_up must be true or false".into()),
         };
-        let result = taken.lock().unwrap_or_else(|e| e.into_inner()).take(i, &item, give_up)?;
-        let event = if give_up { "item_given_up" } else { "item_taken" };
-        self.events.log(Some(&self.names[i]), event, json!({"item": result["item"], "by": "agent"}));
+        let (result, changed) = taken.lock().unwrap_or_else(|e| e.into_inner()).take(i, &item, give_up)?;
+        if changed {
+            let event = if give_up { "item_given_up" } else { "item_taken" };
+            self.events.log(Some(&self.names[i]), event, json!({"item": result["item"], "by": "agent"}));
+        }
         Ok(result)
     }
 
@@ -625,7 +646,7 @@ impl Run<'_> {
         let name = &self.names[i];
         let socket = root.join("sockets").join(format!("a{i}.sock"));
         for turn in 1..=self.cfg.turns {
-            self.hold_last_turn(i, turn);
+            self.hold_last_turn(i, turn, backend);
             self.lockstep_wait(i, turn);
             if backend.halted().is_some() {
                 break;

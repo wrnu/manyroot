@@ -92,8 +92,9 @@ impl Taken {
         self.by.iter().filter(|(_, a)| **a == agent).map(|(id, _)| id.as_str()).collect()
     }
 
-    /// `take_item` for `agent`: takes `item`, or with `give_up`, gives it up. The result says what holds now.
-    pub fn take(&mut self, agent: usize, item: &str, give_up: bool) -> Result<Value, String> {
+    /// `take_item` for `agent`: takes `item`, or with `give_up`, gives it up. The result says what holds now, and
+    /// whether anything changed (taking one's own item again changes nothing).
+    pub fn take(&mut self, agent: usize, item: &str, give_up: bool) -> Result<(Value, bool), String> {
         if !self.released.iter().any(|i| i == item) {
             return Err(format!("no released item {}: the task's index lists those released", short(item)));
         }
@@ -103,28 +104,30 @@ impl Taken {
                 return Err(format!("you haven't taken {item}, so there is nothing to give up"));
             }
             self.by.remove(item);
-            return Ok(json!({"item": item, "given_up": true, "yours": self.held(agent)}));
+            return Ok((json!({"item": item, "given_up": true, "yours": self.held(agent)}), true));
         }
         if self.integrator == Some(agent) {
             return Err("you are the run's one integrator: the other agents take the items, and you integrate their \
                         work, so you take none"
                 .into());
         }
-        match holder {
-            Some(a) if a == agent => {}
+        let changed = match holder {
+            Some(a) if a == agent => false,
             Some(a) => return Err(format!("{item} is taken by agent-{a}: leave it to them, and take another")),
             None => {
-                let share = self.share();
-                if self.held(agent).len() >= share {
+                // A change handed on at its release can put an agent past its share: say what it holds.
+                let (share, held) = (self.share(), self.held(agent).len());
+                if held >= share {
                     return Err(format!(
-                        "you hold {share} items, as many as one agent may now: finish them, or give one up to take \
-                         another"
+                        "you hold {held} items, and one agent may hold {share} now: finish them, or give one up to \
+                         take another"
                     ));
                 }
                 self.by.insert(item.to_string(), agent);
+                true
             }
-        }
-        Ok(json!({"item": item, TAKEN_BY: format!("agent-{agent}"), "yours": self.held(agent)}))
+        };
+        Ok((json!({"item": item, TAKEN_BY: format!("agent-{agent}"), "yours": self.held(agent)}), changed))
     }
 
     /// The change goes out: its items are released, and a change whose revised items one agent holds, all of
@@ -200,17 +203,18 @@ mod tests {
     fn builders_take_disjoint_items_up_to_their_share_and_the_integrator_takes_none() {
         let mut t = Taken::new(&five(), 4, Some(3));
         assert_eq!(t.share(), 2, "5 items over 3 builders");
-        t.take(0, "a", false).expect("free");
-        t.take(0, "a", false).expect("its own again");
+        assert!(t.take(0, "a", false).expect("free").1, "a taking");
+        assert!(!t.take(0, "a", false).expect("its own again").1, "nothing changes");
         let err = t.take(1, "a", false).expect_err("taken");
         assert!(err.contains("taken by agent-0"), "{err}");
         assert!(t.take(3, "b", false).expect_err("the integrator").contains("integrator"));
         assert!(t.take(0, "ch", false).expect_err("not released").contains("no released item"));
         t.take(0, "b", false).expect("its second");
-        assert!(t.take(0, "c", false).expect_err("over its share").contains("as many as one agent may"));
+        let err = t.take(0, "c", false).expect_err("over its share");
+        assert!(err.contains("you hold 2 items, and one agent may hold 2"), "{err}");
         assert!(t.take(1, "b", true).expect_err("not its own").contains("haven't taken"));
-        let given = t.take(0, "b", true).expect("its own");
-        assert_eq!(given["yours"], json!(["a"]));
+        let (given, changed) = t.take(0, "b", true).expect("its own");
+        assert_eq!((given["yours"].clone(), changed), (json!(["a"]), true));
         t.take(1, "b", false).expect("free again");
         assert_eq!(t.names(), BTreeMap::from([("a".into(), "agent-0".into()), ("b".into(), "agent-1".into())]));
     }
@@ -223,6 +227,8 @@ mod tests {
         }
         assert_eq!(t.change_out(), [("ch".to_string(), 0)], "ch2's items are held by two agents");
         assert_eq!(t.share(), 3, "7 items over 3 agents");
+        let err = t.take(0, "e", false).expect_err("a, b and the change handed on");
+        assert!(err.contains("you hold 3 items, and one agent may hold 3"), "{err}");
         t.take(2, "ch2", false).expect("released, and free");
         assert!(t.take(1, "ch", false).expect_err("agent-0's").contains("agent-0"));
     }
