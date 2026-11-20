@@ -1,6 +1,6 @@
 //! Grading a project run after it ends (answer `07959d6d9bc0`): each checkpoint's integrated tree, and the tree
-//! at the end, checked out of the hub's Ground by the manifest id its event names (finding `01e0ce2648ad`) and
-//! graded with the project's hidden set by [`crate::project_grader`]. The private store is named
+//! at the end, checked out of the hub's Ground by the manifest id its event names (finding `01e0ce2648ad`), or in
+//! git project mode read out of the hub's repository by the tree id its event names, and graded with the project's hidden set by [`crate::project_grader`]. The private store is named
 //! only on the command line; the grades go to a file of their own, outside the run, the project, the store, any
 //! Ground and any git checkout, and nothing reads them back into a run. A grade names groups and tests by index
 //! alone.
@@ -27,7 +27,8 @@ pub struct Point {
     /// Whether the project's change had gone out by then, and so its groups apply (the grade's share is 1),
     /// or not (0).
     pub change_released: bool,
-    /// The tree graded: the line's decision and its manifest id, the first head's on a forked line.
+    /// The tree graded: the line's decision and its manifest id, the first head's on a forked line; in git project
+    /// mode, main's commit and its tree id.
     pub decision: String,
     pub manifest: String,
     /// Whether the line was forked then: other heads weren't graded.
@@ -88,10 +89,12 @@ pub fn grade_run(
         .transpose()?;
     let partial = Partial::create(&grades)?;
     let mut out = &partial.file;
-    let hub = dir.join("hub").join(".bracken");
+    let git = plan.mode == crate::git_project::NAME;
+    let hub = if git { dir.join("hub").join("hub.git") } else { dir.join("hub").join(".bracken") };
+    let git_binary = if git { Some(crate::driver::git_binary()?) } else { None };
     let (mut points, mut all_pass, mut errors) = (0, 0, 0);
     let mut graded = BTreeMap::<(String, bool), Result<Grade, String>>::new();
-    for logged in trees(&events, plan.turns)? {
+    for logged in trees(&events, plan.turns, git)? {
         let key = (logged.manifest.clone(), logged.change_released);
         let g = match graded.get(&key) {
             // The same tree under the same groups: the grade it already has.
@@ -99,7 +102,10 @@ pub fn grade_run(
             None => {
                 let g = Scratch::new().and_then(|scratch| {
                     let tree = scratch.dir.join("tree");
-                    checkout(bracken, &hub, &logged.manifest, &tree)?;
+                    match &git_binary {
+                        Some(g) => write_tree(g, &hub, &logged.manifest, &tree)?,
+                        None => checkout(bracken, &hub, &logged.manifest, &tree)?,
+                    }
                     let share = if logged.change_released { 1.0 } else { 0.0 };
                     grade(&python, &project, &set, Tree::Dir(&tree), share)
                 });
@@ -287,19 +293,26 @@ struct Logged {
 }
 
 /// The trees a run logged to grade, in order: each checkpoint's, then the line at the end, as the final
-/// `integrated` event names it (or, for a run that stopped early, the last tree logged).
-fn trees(events: &[Value], turns: u32) -> Result<Vec<Logged>, String> {
+/// `integrated` event names it (or, for a run that stopped early, the last tree logged). In git project mode
+/// (`git`), each names a commit and a tree id, not a decision and a manifest.
+fn trees(events: &[Value], turns: u32, git: bool) -> Result<Vec<Logged>, String> {
     let logged = |at: Value, released: bool, e: &Value| -> Result<Logged, String> {
         let line = &e["data"]["line"];
         let head = &line["heads"][0];
         let (Some(decision), Some(manifest)) = (head["decision"].as_str(), head["manifest"].as_str()) else {
             return Err(format!("a {} event names no head of the line", e["event"].as_str().unwrap_or("?")));
         };
-        let hex = manifest.strip_prefix("blake3:").unwrap_or_default();
-        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("an event's manifest isn't blake3:<64 hex digits>".into());
+        if git {
+            if !crate::args::is_commit(decision) || !crate::args::is_commit(manifest) {
+                return Err("an event's commit or tree isn't 40 hex digits".into());
+            }
+        } else {
+            let hex = manifest.strip_prefix("blake3:").unwrap_or_default();
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("an event's manifest isn't blake3:<64 hex digits>".into());
+            }
+            crate::args::check_id(decision)?;
         }
-        crate::args::check_id(decision)?;
         Ok(Logged {
             at,
             change_released: released,
@@ -325,6 +338,21 @@ fn trees(events: &[Value], turns: u32) -> Result<Vec<Logged>, String> {
     let (released, e) = last.ok_or("the run logged no tree to grade")?;
     out.push(logged(json!("end"), released, e)?);
     Ok(out)
+}
+
+/// Writes tree `tree` of the git hub `repo` into `to`, a new directory: each file as
+/// [`crate::git_project::tree_at`] reads and checks it, nothing checked out by git.
+fn write_tree(git: &Path, repo: &Path, tree: &str, to: &Path) -> Result<(), String> {
+    std::fs::create_dir(to).map_err(|e| format!("making the tree to grade: {e}"))?;
+    let files =
+        crate::git_project::tree_at(git, repo, tree).map_err(|e| format!("reading {tree} from the hub: {e}"))?;
+    for (path, bytes) in files {
+        let file = to.join(&path);
+        std::fs::create_dir_all(file.parent().expect("a file in the tree has a parent"))
+            .and_then(|()| std::fs::write(&file, bytes))
+            .map_err(|e| format!("writing the tree to grade: {e}"))?;
+    }
+    Ok(())
 }
 
 /// Writes the manifest `manifest` of the hub's Ground `hub` into `to`, a new directory, with `bracken`.

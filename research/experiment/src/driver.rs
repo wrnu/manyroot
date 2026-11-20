@@ -336,7 +336,7 @@ struct Run<'a> {
     project: Option<ProjectRun>,
 }
 
-/// What the driver holds of a project run (Weave mode).
+/// What the driver holds of a project run (Weave mode, or git project mode).
 struct ProjectRun {
     project: crate::project::Project,
     python: crate::python::Python,
@@ -346,15 +346,15 @@ struct ProjectRun {
 }
 
 /// The project a run's plan names, loaded and checked against the plan, and its pinned Python image; None for a
-/// run of a task. Weave mode needs both: a project, and the Python pin every run of agent code uses (answer
-/// `5e40cacdbfb4`); no other mode takes a project.
+/// run of a task. Weave mode and git project mode need both: a project, and the Python pin every run of agent
+/// code uses (answer `5e40cacdbfb4`); no other mode takes a project.
 fn project_run(cfg: &RunConfig, mode: &dyn Mode) -> Result<Option<ProjectRun>, String> {
-    let weave = mode.name() == "weave";
+    let of_projects = matches!(mode.name(), "weave" | crate::git_project::NAME);
     let Some(plan) = &cfg.plan.project else {
-        return if weave { Err("weave mode needs a project (--project)".into()) } else { Ok(None) };
+        return if of_projects { Err(format!("{} mode needs a project (--project)", mode.name())) } else { Ok(None) };
     };
-    if !weave {
-        return Err(format!("{} mode takes no project; give --mode weave", mode.name()));
+    if !of_projects {
+        return Err(format!("{} mode takes no project; give --mode weave or git", mode.name()));
     }
     let pin =
         cfg.plan.python.as_ref().ok_or("a project run needs the Python pin (--python), which its plan records")?;
@@ -399,7 +399,7 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
     let sockets = root.join("sockets");
     // Only Git and Weave mode's workers may run git: its binary and the helpers in its exec path.
     let git = match mode.name() {
-        "git" | "weave" if cfg.sandbox => Some(Git::of(&cfg.git)?),
+        "git" | "weave" | crate::git_project::NAME if cfg.sandbox => Some(Git::of(&cfg.git)?),
         _ => None,
     };
     let profile = |dir: &Path, sockets: &[PathBuf], hub: bool| -> Result<Option<Sandbox>, String> {
@@ -1063,11 +1063,16 @@ pub fn sync_transfers(hub: &mut Worker, copy: &mut Worker, session: &Session) ->
     let down_bytes = Worker::bytes(&down)?;
     let args = json!({"meta": down.result});
     copy.ok(&Request { op: "fetch".into(), args, bytes: down.bytes, ..Request::default() })?;
-    Ok(json!({
+    let mut summary = json!({
         "up": {"bytes": up_bytes.len(), "digest": digest(&up_bytes)},
         "down": {"bytes": down_bytes.len(), "digest": digest(&down_bytes)},
         "skipped_prs": down.result["skipped"],
-    }))
+    });
+    // Git project mode: what became of the agent's own main, which the hub says in words it chose.
+    if let Some(main) = down.result["main"].as_str() {
+        summary["main"] = json!(main);
+    }
+    Ok(summary)
 }
 
 /// Bytes relayed one way, and their digest.

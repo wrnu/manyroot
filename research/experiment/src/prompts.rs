@@ -18,15 +18,35 @@ pub fn section(mode: &str) -> Option<&'static str> {
         "git" => Some(include_str!("../prompts/git.md")),
         "crdt" => Some(include_str!("../prompts/crdt.md")),
         "weave" => Some(include_str!("../prompts/weave.md")),
+        crate::git_project::NAME => Some(include_str!("../prompts/git-project.md")),
         _ => None,
     }
 }
 
+/// The words of [`PROJECT_BASE`] that are Weave's, and git project mode's for them (task `6bd13d994a03`): its
+/// base is Weave's in every other word.
+pub const GIT_WORDS: [(&str, &str); 2] = [
+    ("on the line everyone builds on", "on the main branch everyone builds on"),
+    (
+        "Before you integrate someone's proposal, look at what it changes.",
+        "Before you merge someone's branch, look at what it changes.",
+    ),
+];
+
+/// [`PROJECT_BASE`] in git project mode's words ([`GIT_WORDS`]).
+pub fn git_project_base() -> String {
+    GIT_WORDS.iter().fold(PROJECT_BASE.to_string(), |text, (weave, git)| text.replace(weave, git))
+}
+
 /// The system prompt for `mode`: the base prompt, then the mode's section. Weave mode's runs are of a
-/// project, so its base is [`PROJECT_BASE`].
+/// project, so its base is [`PROJECT_BASE`], and git project mode's is the same in git's words.
 pub fn system_prompt(mode: &str) -> Result<String, String> {
     let section = section(mode).ok_or_else(|| format!("no prompt for mode {mode}"))?;
-    let base = if mode == "weave" { PROJECT_BASE } else { BASE };
+    let base = match mode {
+        "weave" => PROJECT_BASE.to_string(),
+        crate::git_project::NAME => git_project_base(),
+        _ => BASE.to_string(),
+    };
     Ok(format!("{base}\n{section}"))
 }
 
@@ -48,12 +68,31 @@ pub const INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other a
 pub const BUILDER_ROLE: &str = "{integrator} is the run's one integrator: propose your work, and {integrator} \
      integrates it onto main; integrate is refused to you.";
 
-/// The sentence telling agent `name` of `agents` its role under the integrator setting `setting`: none for
-/// [`crate::weave_mode::ANY_AGENT`], where every agent integrates.
-pub fn role_message(setting: &str, name: &str, agents: usize) -> Result<Option<String>, String> {
+/// Git project mode's [`INTEGRATOR_ROLE`], in git's words (task `6bd13d994a03`). The plan hashes it.
+pub const GIT_INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents push their work on branches \
+     and ask for its integration, and only you update main, so review their requests, merge what's sound into your \
+     main, settle any conflict, sync, and integrate your own work too.";
+
+/// Git project mode's [`BUILDER_ROLE`], in git's words. The plan hashes it.
+pub const GIT_BUILDER_ROLE: &str = "{integrator} is the run's one integrator: push your work on a branch of your own \
+     and ask for its integration, and {integrator} merges it into main; updating main is refused to you.";
+
+/// The integrator's and the builders' role sentences in `mode`.
+pub fn roles(mode: &str) -> (&'static str, &'static str) {
+    if mode == crate::git_project::NAME {
+        (GIT_INTEGRATOR_ROLE, GIT_BUILDER_ROLE)
+    } else {
+        (INTEGRATOR_ROLE, BUILDER_ROLE)
+    }
+}
+
+/// The sentence telling agent `name` of `agents` in `mode` its role under the integrator setting `setting`: none
+/// for [`crate::weave_mode::ANY_AGENT`], where every agent integrates.
+pub fn role_message(mode: &str, setting: &str, name: &str, agents: usize) -> Result<Option<String>, String> {
+    let (integrator_role, builder_role) = roles(mode);
     Ok(crate::weave_mode::integrator_agent(setting, agents)?.map(|n| {
         let integrator = format!("agent-{n}");
-        if name == integrator { INTEGRATOR_ROLE.to_string() } else { BUILDER_ROLE.replace("{integrator}", &integrator) }
+        if name == integrator { integrator_role.to_string() } else { builder_role.replace("{integrator}", &integrator) }
     }))
 }
 
@@ -65,13 +104,17 @@ mod tests {
 
     #[test]
     fn one_integrator_and_its_builders_are_each_told_their_role() {
-        assert_eq!(role_message("any-agent", "agent-0", 4), Ok(None));
-        let integrator = role_message("agent-3", "agent-3", 4).expect("a setting").expect("a role");
-        assert_eq!(integrator, INTEGRATOR_ROLE);
-        let builder = role_message("agent-3", "agent-0", 4).expect("a setting").expect("a role");
-        assert!(builder.starts_with("agent-3 is the run's one integrator") && !builder.contains('{'), "{builder}");
-        assert!(role_message("agent-4", "agent-0", 4).is_err(), "no agent-4 in a run of 4");
-        assert!(role_message("someone", "agent-0", 4).is_err());
+        for (mode, own) in [("weave", INTEGRATOR_ROLE), (crate::git_project::NAME, GIT_INTEGRATOR_ROLE)] {
+            assert_eq!(role_message(mode, "any-agent", "agent-0", 4), Ok(None));
+            let integrator = role_message(mode, "agent-3", "agent-3", 4).expect("a setting").expect("a role");
+            assert_eq!(integrator, own);
+            let builder = role_message(mode, "agent-3", "agent-0", 4).expect("a setting").expect("a role");
+            assert!(builder.starts_with("agent-3 is the run's one integrator") && !builder.contains('{'), "{builder}");
+            assert!(role_message(mode, "agent-4", "agent-0", 4).is_err(), "no agent-4 in a run of 4");
+            assert!(role_message(mode, "someone", "agent-0", 4).is_err());
+        }
+        let git = role_message(crate::git_project::NAME, "agent-3", "agent-0", 4).expect("a setting").expect("a role");
+        assert!(git.contains("branch") && !git.contains("propose"), "git's words: {git}");
     }
 
     #[test]
@@ -85,6 +128,12 @@ mod tests {
         let weave = system_prompt("weave").expect("a prompt");
         assert!(weave.starts_with(PROJECT_BASE) && weave.ends_with(section("weave").expect("a section")));
         assert!(seen.insert(weave), "weave's prompt is its own");
+        let git = system_prompt(crate::git_project::NAME).expect("a prompt");
+        assert!(
+            git.starts_with(&git_project_base())
+                && git.ends_with(section(crate::git_project::NAME).expect("a section"))
+        );
+        assert!(seen.insert(git), "git project mode's prompt is its own");
         assert!(system_prompt("other").is_err());
         assert_eq!(
             turn_message(3, 8, "agent-1"),
@@ -172,11 +221,35 @@ mod tests {
         assert!(!BASE.contains(form));
     }
 
+    /// Git project mode's base is Weave's in every word but those [`GIT_WORDS`] gives git's for, and none of
+    /// Weave's own words is left in it or its section (task `6bd13d994a03`).
+    #[test]
+    fn git_project_mode_reads_as_weave_mode_in_gits_words() {
+        let git = git_project_base();
+        for (weave, theirs) in GIT_WORDS {
+            assert_eq!(PROJECT_BASE.matches(weave).count(), 1, "{weave}");
+            assert!(git.contains(theirs) && !git.contains(weave), "{theirs}");
+        }
+        let section = section(crate::git_project::NAME).expect("a section");
+        for word in ["propose", "proposal", "decision", "claim", "line", "Weave", "manifest"] {
+            assert!(!git.contains(word) && !section.contains(word), "{word}");
+            assert!(!GIT_INTEGRATOR_ROLE.contains(word) && !GIT_BUILDER_ROLE.contains(word), "{word}");
+        }
+        let tools = crate::mode::mode_named(crate::git_project::NAME).expect("the mode").tools(Task::Phase1);
+        let weave = crate::mode::mode_named("weave").expect("the mode").tools(Task::Phase1);
+        for t in tools.iter().filter(|t| crate::git_project::SHARED.contains(&t.name)) {
+            let w = weave.iter().find(|w| w.name == t.name).expect("the same tool");
+            assert_eq!((t.description, &t.input_schema), (w.description, &w.input_schema), "{} is Weave's", t.name);
+        }
+    }
+
     /// Nothing tells an agent it is measured, or that other modes exist (design section 4).
     #[test]
     fn the_prompts_never_mention_the_experiment() {
         let mut texts = vec![BASE.to_string(), PROJECT_BASE.to_string(), turn_message(1, 8, "agent-0")];
-        for name in ["bracken", "git", "crdt", "weave"] {
+        texts.extend([git_project_base(), GIT_INTEGRATOR_ROLE.into(), GIT_BUILDER_ROLE.into()]);
+        texts.extend([INTEGRATOR_ROLE.into(), BUILDER_ROLE.into()]);
+        for name in ["bracken", "git", "crdt", "weave", crate::git_project::NAME] {
             texts.push(section(name).expect("a section").to_string());
             let mode = mode_named(name).expect("a mode");
             texts.push(serde_json::to_string(&mode.tools(Task::Phase1)).expect("JSON"));

@@ -668,6 +668,108 @@ fn reference(v: &str) -> Result<&str, String> {
     }
 }
 
+/// A path in the working tree `tree`, checked: plain, and with no symlink on the way. Weave mode's file tools and
+/// git project mode's share these.
+pub(crate) fn tree_file(tree: &Path, path: &str) -> Result<PathBuf, String> {
+    plain_path(path)?;
+    let mut at = tree.to_path_buf();
+    for part in path.split('/') {
+        at.push(part);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(format!("path {}: a symlink is on the way", short(path)));
+        }
+    }
+    Ok(at)
+}
+
+/// Every file of the working tree `tree`, outside `.git`, as `(path, bytes)`, sorted.
+pub(crate) fn tree_listing(tree: &Path) -> Result<Vec<(String, u64)>, String> {
+    let mut out = Vec::new();
+    let mut todo = vec![(tree.to_path_buf(), String::new())];
+    while let Some((dir, rel)) = todo.pop() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| format!("listing {}: {e}", dir.display()))? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if rel.is_empty() && name == ".git" {
+                continue;
+            }
+            let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
+            let meta = entry.metadata().map_err(|e| e.to_string())?;
+            if meta.is_dir() {
+                todo.push((entry.path(), path));
+            } else if meta.is_file() {
+                out.push((path, meta.len()));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The read_file tool on the working tree `tree`.
+pub(crate) fn read_tree_file(tree: &Path, args: &Args) -> Result<Value, String> {
+    let path = args.text("path")?;
+    let file = tree_file(tree, path)?;
+    let bytes = std::fs::read(&file).map_err(|e| format!("reading {}: {}", short(path), e.kind()))?;
+    let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't UTF-8 text", short(path)))?;
+    let from = args.int_opt("offset", 1..=i64::from(u32::MAX))?.unwrap_or(1) as usize;
+    let limit = args.int_opt("limit", 1..=i64::from(u32::MAX))?.map_or(usize::MAX, |l| l as usize);
+    let lines: Vec<&str> = text.lines().collect();
+    let shown: Vec<String> =
+        lines.iter().enumerate().skip(from - 1).take(limit).map(|(i, l)| format!("{:>5}  {l}", i + 1)).collect();
+    Ok(json!({"path": path, "lines": lines.len(), "from": from, "text": shown.join("\n")}))
+}
+
+/// The write_file tool on the working tree `tree`.
+pub(crate) fn write_tree_file(tree: &Path, path: &str, text: &str) -> Result<Value, String> {
+    if text.len() > MAX_FILE_BYTES {
+        return Err(format!("a file holds at most {MAX_FILE_BYTES} bytes"));
+    }
+    let file = tree_file(tree, path)?;
+    if !file.exists() && tree_listing(tree)?.len() >= MAX_FILES {
+        return Err(format!("a tree holds at most {MAX_FILES} files"));
+    }
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("creating {}'s directory: {}", short(path), e.kind()))?;
+    }
+    if !is_within(&file, tree) {
+        return Err(format!("path {}: outside the tree", short(path)));
+    }
+    if std::fs::symlink_metadata(&file).is_ok_and(|m| !m.is_file()) {
+        return Err(format!("path {}: not a file", short(path)));
+    }
+    std::fs::write(&file, text).map_err(|e| format!("writing {}: {}", short(path), e.kind()))?;
+    Ok(json!({"path": path, "bytes": text.len()}))
+}
+
+/// The edit_file tool on the working tree `tree`.
+pub(crate) fn edit_tree_file(tree: &Path, args: &Args) -> Result<Value, String> {
+    let (path, old, new) =
+        (args.text("path")?, args.text_up_to("old", MAX_FILE_BYTES)?, args.text_up_to("new", MAX_FILE_BYTES)?);
+    if old.is_empty() {
+        return Err("`old` is empty: give the text to replace".into());
+    }
+    let file = tree_file(tree, path)?;
+    let text = std::fs::read_to_string(&file).map_err(|e| format!("reading {}: {}", short(path), e.kind()))?;
+    match text.matches(old).count() {
+        1 => {}
+        0 => return Err(format!("{} doesn't hold that text", short(path))),
+        n => return Err(format!("{} holds that text {n} times: give more of it, so it occurs once", short(path))),
+    }
+    write_tree_file(tree, path, &text.replacen(old, new, 1))
+}
+
+/// The delete_file tool on the working tree `tree`.
+pub(crate) fn delete_tree_file(tree: &Path, path: &str) -> Result<Value, String> {
+    let file = tree_file(tree, path)?;
+    let meta = std::fs::symlink_metadata(&file).map_err(|_| format!("no file {}", short(path)))?;
+    if !meta.is_file() {
+        return Err(format!("{} isn't a file", short(path)));
+    }
+    std::fs::remove_file(&file).map_err(|e| format!("deleting {}: {}", short(path), e.kind()))?;
+    Ok(json!({"deleted": path}))
+}
+
 pub struct WeaveStore {
     config: StoreConfig,
     /// bracken and git processes started.
@@ -1002,42 +1104,14 @@ impl WeaveStore {
         self.tree().join(".git").is_dir() && self.dirty().is_ok_and(|d| !d)
     }
 
-    /// A path in the working tree, checked: plain, and with no symlink on the way.
+    /// A path in the working tree, checked ([`tree_file`]).
     fn file(&self, path: &str) -> Result<PathBuf, String> {
-        plain_path(path)?;
-        let tree = self.tree();
-        let mut at = tree.clone();
-        for part in path.split('/') {
-            at.push(part);
-            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Err(format!("path {}: a symlink is on the way", short(path)));
-            }
-        }
-        Ok(at)
+        tree_file(&self.tree(), path)
     }
 
-    /// Every file of the working tree, outside `.git`, as `(path, bytes)`, sorted.
+    /// Every file of the working tree ([`tree_listing`]).
     fn files(&self) -> Result<Vec<(String, u64)>, String> {
-        let mut out = Vec::new();
-        let mut todo = vec![(self.tree(), String::new())];
-        while let Some((dir, rel)) = todo.pop() {
-            for entry in std::fs::read_dir(&dir).map_err(|e| format!("listing {}: {e}", dir.display()))? {
-                let entry = entry.map_err(|e| e.to_string())?;
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if rel.is_empty() && name == ".git" {
-                    continue;
-                }
-                let path = if rel.is_empty() { name } else { format!("{rel}/{name}") };
-                let meta = entry.metadata().map_err(|e| e.to_string())?;
-                if meta.is_dir() {
-                    todo.push((entry.path(), path));
-                } else if meta.is_file() {
-                    out.push((path, meta.len()));
-                }
-            }
-        }
-        out.sort();
-        Ok(out)
+        tree_listing(&self.tree())
     }
 
     fn setup_hub(&mut self) -> Result<Value, String> {
@@ -1160,64 +1234,19 @@ impl WeaveStore {
     }
 
     fn read_file(&mut self, args: &Args) -> Result<Value, String> {
-        let path = args.text("path")?;
-        let file = self.file(path)?;
-        let bytes = std::fs::read(&file).map_err(|e| format!("reading {}: {}", short(path), e.kind()))?;
-        let text = String::from_utf8(bytes).map_err(|_| format!("{} isn't UTF-8 text", short(path)))?;
-        let from = args.int_opt("offset", 1..=i64::from(u32::MAX))?.unwrap_or(1) as usize;
-        let limit = args.int_opt("limit", 1..=i64::from(u32::MAX))?.map_or(usize::MAX, |l| l as usize);
-        let lines: Vec<&str> = text.lines().collect();
-        let shown: Vec<String> =
-            lines.iter().enumerate().skip(from - 1).take(limit).map(|(i, l)| format!("{:>5}  {l}", i + 1)).collect();
-        Ok(json!({"path": path, "lines": lines.len(), "from": from, "text": shown.join("\n")}))
+        read_tree_file(&self.tree(), args)
     }
 
     fn write(&mut self, path: &str, text: &str) -> Result<Value, String> {
-        if text.len() > MAX_FILE_BYTES {
-            return Err(format!("a file holds at most {MAX_FILE_BYTES} bytes"));
-        }
-        let file = self.file(path)?;
-        if !file.exists() && self.files()?.len() >= MAX_FILES {
-            return Err(format!("a tree holds at most {MAX_FILES} files"));
-        }
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| format!("creating {}'s directory: {}", short(path), e.kind()))?;
-        }
-        if !is_within(&file, &self.tree()) {
-            return Err(format!("path {}: outside the tree", short(path)));
-        }
-        if std::fs::symlink_metadata(&file).is_ok_and(|m| !m.is_file()) {
-            return Err(format!("path {}: not a file", short(path)));
-        }
-        std::fs::write(&file, text).map_err(|e| format!("writing {}: {}", short(path), e.kind()))?;
-        Ok(json!({"path": path, "bytes": text.len()}))
+        write_tree_file(&self.tree(), path, text)
     }
 
     fn edit_file(&mut self, args: &Args) -> Result<Value, String> {
-        let (path, old, new) =
-            (args.text("path")?, args.text_up_to("old", MAX_FILE_BYTES)?, args.text_up_to("new", MAX_FILE_BYTES)?);
-        if old.is_empty() {
-            return Err("`old` is empty: give the text to replace".into());
-        }
-        let file = self.file(path)?;
-        let text = std::fs::read_to_string(&file).map_err(|e| format!("reading {}: {}", short(path), e.kind()))?;
-        match text.matches(old).count() {
-            1 => {}
-            0 => return Err(format!("{} doesn't hold that text", short(path))),
-            n => return Err(format!("{} holds that text {n} times: give more of it, so it occurs once", short(path))),
-        }
-        self.write(path, &text.replacen(old, new, 1))
+        edit_tree_file(&self.tree(), args)
     }
 
     fn delete_file(&mut self, path: &str) -> Result<Value, String> {
-        let file = self.file(path)?;
-        let meta = std::fs::symlink_metadata(&file).map_err(|_| format!("no file {}", short(path)))?;
-        if !meta.is_file() {
-            return Err(format!("{} isn't a file", short(path)));
-        }
-        std::fs::remove_file(&file).map_err(|e| format!("deleting {}: {}", short(path), e.kind()))?;
-        Ok(json!({"deleted": path}))
+        delete_tree_file(&self.tree(), path)
     }
 
     /// The working tree against its base's commit, so a proposal doesn't hide what it proposed (finding

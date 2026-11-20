@@ -21,6 +21,7 @@ use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routi
 use bracken_experiment::driver::{
     CALLS_PER_TURN, ResultLimit, RunConfig, TURN_LIMIT, check_socket_room, core_tools, git_binary, run,
 };
+use bracken_experiment::git_project::project_mode;
 use bracken_experiment::mock::MockBackend;
 use bracken_experiment::mode::{StoreConfig, mode_under};
 use bracken_experiment::pi::{PiBackend, PiConfig, PiCredential, PiExpect};
@@ -77,7 +78,8 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value_t = 10)]
         agents: usize,
-        /// Weave mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        /// Weave or git mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        /// With git, the run is git project mode's: git and branches on a hub, in place of Weave.
         #[arg(long)]
         project: Option<PathBuf>,
         /// A project run: the Python image to pin, by digest (`name@sha256:<hex>`), whose Python must be the
@@ -162,7 +164,8 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value_t = 3)]
         agents: usize,
-        /// Weave mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        /// Weave or git mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        /// With git, the run is git project mode's: git and branches on a hub, in place of Weave.
         #[arg(long)]
         project: Option<PathBuf>,
         /// A project run: the Python image to pin, by digest (`name@sha256:<hex>`), whose Python must be the
@@ -287,13 +290,13 @@ fn main() {
             project: project_inputs(project.as_deref(), python.as_deref(), hold_change, integrator.as_deref(), agents)
                 .unwrap_or_else(|e| refuse_run(&e)),
             // Refused here, before anything runs, like the other options.
-            caps: Caps::for_mode(&mode, &mode_token_cap)
+            caps: bracken_experiment::git_project::caps_for(&mode, project.is_some(), &mode_token_cap)
                 .and_then(|c| c.with_agent_caps(agent_token_cap, agent_output_cap))
                 .unwrap_or_else(|e| refuse_run(&e)),
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
             task: task_named(&task),
             dir,
-            mode,
+            mode: project_mode(&mode, project.is_some()).to_string(),
             agents,
             turns,
             harness: HarnessOptions {
@@ -345,7 +348,7 @@ fn main() {
                 accept_rule,
                 ..inputs.into_plan(PlanInputs::default())
             };
-            mock_run(dir, &mode, agents, turns, bracken, sandbox, plan)
+            mock_run(dir, project_mode(&mode, plan.project.is_some()), agents, turns, bracken, sandbox, plan)
         }
         Cmd::Project(ProjectCmd::Check { dir, hidden, json }) => project_check(&dir, hidden.as_deref(), json),
         Cmd::Project(cmd @ ProjectCmd::Grade { .. }) => project_grade(cmd),
@@ -616,7 +619,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
                 upstream: None,
             })?;
             if let Some(setting) = &setting {
-                backend.set_integrator(setting, a.agents)?;
+                backend.set_integrator(mode.name(), setting, a.agents)?;
             }
             run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
         }
@@ -643,7 +646,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
                 upstream: None,
             })?;
             if let Some(setting) = &setting {
-                backend.set_integrator(setting, a.agents)?;
+                backend.set_integrator(mode.name(), setting, a.agents)?;
             }
             run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
         }

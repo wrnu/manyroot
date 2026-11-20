@@ -188,6 +188,7 @@ pub fn mode_named(name: &str) -> Option<&'static dyn Mode> {
         "bracken" => Some(&crate::bracken_mode::BrackenMode::ONE_PASS),
         "crdt" => Some(&crate::crdt_mode::CrdtMode),
         "git" => Some(&crate::git_mode::GitMode),
+        crate::git_project::NAME => Some(&crate::git_project::GitProjectMode),
         "weave" => Some(&crate::weave_mode::WeaveMode),
         _ => None,
     }
