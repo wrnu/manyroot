@@ -1800,6 +1800,20 @@ fn weave_shadow_overrides_discussion_objections_only_from_outside_main_policy() 
         assert!(out.status.success(), "bracken {args:?}: {}", String::from_utf8_lossy(&out.stderr));
         common::bare_ids(String::from_utf8(out.stdout).unwrap().trim().to_owned())
     };
+    // The next tree, imported now so its manifest artifact is new (for the B4 case below).
+    let imported: serde_json::Value = serde_json::from_str(&weave(&[
+        "weave",
+        "import",
+        "--from-git",
+        &commits[2],
+        "--repo",
+        small.to_str().unwrap(),
+        "--as",
+        "weave-integrator",
+        "--json",
+    ]))
+    .unwrap();
+    let (hash, artifact) = (imported["manifest"].as_str().unwrap(), imported["manifest_id"].as_str().unwrap());
     let claim = real(&["claim", "the runner objects", "--as", "weave-runner"]);
     let member = real(&["relate", claim.lines().next().unwrap(), "contradicts", &head(), "--as", "weave-runner"]);
     let member = member.lines().next().unwrap();
@@ -1814,4 +1828,38 @@ fn weave_shadow_overrides_discussion_objections_only_from_outside_main_policy() 
     );
     assert!(stderr.contains("failed, so nothing was recorded"), "{stderr}");
     assert_eq!(head(), before, "a decision was recorded over {member}");
+
+    // weave-authority.md B4 (decision 51815720d632, finding 6cad0100be83): mallory replays weave-runner's
+    // fail on the next tree as an objection to its manifest. While that fail is the runner's latest it
+    // binds, and stops the shadow; once a later pass by the runner replaced it, it's answered overridden.
+    real(&["retract", member, "--as", "weave-runner"]);
+    let green: serde_json::Value = serde_json::from_str(&weave(&["weave", "green", "--json"])).unwrap();
+    let method = green["heads"][0]["checks"][0]["method"].as_str().unwrap().to_owned();
+    let result = |verdict: &str, attempt: u64| {
+        let details = format!("{hash}\nattempt {attempt}\nargv [\"true\"]\nexit 0\n\nout");
+        let out =
+            real(&["evidence", artifact, verdict, "--method", &method, "--details", &details, "--as", "weave-runner"]);
+        out.lines().next().unwrap().split_whitespace().last().unwrap().to_owned()
+    };
+    let fail = result("fail", 1);
+    let replay = weave(&["relate", &fail, "contradicts", artifact, "--as", "mallory"]);
+    let replay = replay.lines().next().unwrap().to_owned();
+    let out = shadow_of(&commits[2]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("doesn't answer the") && !stderr.contains("answering them"), "{stderr}");
+    assert_eq!(head(), before, "a decision was recorded over {replay}, a fail still latest");
+
+    result("pass", 2);
+    let out = shadow_of(&commits[2]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(stderr.contains("answering them overridden") && stderr.contains(&replay), "{stderr}");
+    let log: serde_json::Value = serde_json::from_str(&weave(&["weave", "log", "--json"])).unwrap();
+    let answers =
+        &log["decisions"].as_array().unwrap().iter().find(|d| d["decision"] == head().as_str()).unwrap()["answers"];
+    let answer = answers.as_array().unwrap().iter().find(|a| a["objection"] == replay.as_str()).expect("answered");
+    assert_eq!(answer["disposition"], "overridden", "{answers}");
+    let reason = answer["reason"].as_str().unwrap();
+    assert!(reason.contains("evidence-backed") && reason.contains(&fail[..12]) && reason.contains("B4"), "{reason}");
 }

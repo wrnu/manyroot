@@ -1,7 +1,11 @@
 # Who may stop a line: a removed integrator, and a replaced fail
 
 This is a design only. It changes no format, code, test or fixture (task
-`40798b0c2c4f`, decision `a2e0b9c241c7`). It covers two items from the
+`40798b0c2c4f`, decision `a2e0b9c241c7`). The owner answered section 4 on
+2026-11-19 (decision `51815720d632`): A5 yes, before the join; A4 yes, from
+the join; A3 not now; B4 and B6 yes, before the join. Task `e2ab087e8d3e`
+builds A5, B4, B6 and the `scripts/weave-shadow` change (docs/releases.md,
+2026-11-19). It covers two items from the
 hostile-writer review (task `ee121849975b`, weave-freeze.md question 8).
 The owner chose to settle them by design, not in a fix PR:
 - **A.** A removed integrator keeps the power to stop main, and so every
@@ -54,8 +58,8 @@ items here is note `6ce8a8d82af5`, points (3) and (4).
 - **B: recommended, option B4.** A fail that a pass replaced still backs
   an evidence-backed objection, but that objection may also be answered
   `overridden`. A pass replaced it when the validator's latest results for
-  that manifest and method, in the decision's past, hold no fail. A fail
-  replaced by another fail stays binding. This widens rule 5's table and narrows nothing, so no
+  that manifest and method, in the decision's past, are a single pass. A fail
+  replaced by another fail, or by concurrent passes, stays binding. This widens rule 5's table and narrows nothing, so no
   decision that qualifies today stops qualifying. It's pinned, not frozen.
   It needs readers upgraded before any integrator relies on it, a matching
   change to `scripts/weave-shadow`, and `weave review` to show such
@@ -467,11 +471,11 @@ binding one.
 #### B1. The latest-result rule for an objection's basis
 
 **Rule.** A fail stops backing an evidence-backed objection only when it
-has been *replaced by a pass*. That means: in `E`'s past, the validator has
-eligible results for that manifest and method that are later than it, and
-its latest ones among them hold no fail. This is green's latest-result
-rule, judged within `E`'s past, so several concurrent latest results that
-include a fail count as one fail. A fail replaced by another fail (the check
+has been *replaced by a pass*. That means: in `E`'s past, the validator's
+latest eligible results for that manifest and method are a single pass.
+This is green's latest-result rule, judged within `E`'s past, so several
+concurrent latest results count as one fail, even if all passed (finding
+`91b445207f20`). A fail replaced by another fail (the check
 really fails again) stays binding. So does a fail beside a concurrent pass.
 Only an objection from a fail a pass replaced becomes discussion.
 
@@ -523,13 +527,15 @@ little.
 **Rule.** The basis stays evidence-backed. The objection allows
 `overridden` **as well** only when, in `E`'s past, a pass replaced the
 failing result. That is: the validator has later eligible results for that
-manifest and method, and its latest ones hold no fail. This matches green's
-rule that concurrent latest results count as a fail (finding
-`32833dfc442b`). A fail replaced by another fail, or standing beside a
+manifest and method, and its latest is a single pass. This matches green's
+rule that several concurrent latest results count as a fail, even if all
+passed (findings `32833dfc442b`, `91b445207f20`). A fail replaced by another fail, or standing beside a
 concurrent latest fail, stays binding exactly as today: `accepted_breakage`
 is its only answer for a tree used unchanged. When B4 applies, the
-objection's Its allowed set becomes
-`fixed`, `fell_back` (in the window), `accepted_breakage` and `overridden`.
+objection's allowed set becomes `accepted_breakage` and `overridden` for a
+tree used unchanged, and `fixed`, `fell_back`, `accepted_breakage` and
+`overridden` for one in a decision's window, as `Basis::allows` gives today
+plus `overridden`.
 The answer's `reason` is still required, and stays on record.
 
 **Changes.** Rule 5's table (pinned; weave.md 575-593, `Basis::allows` and
@@ -581,8 +587,9 @@ fixes nothing alone, but today the integrator gets no warning.
 ### 2.4 Comparison
 
 "Replaced" here means replaced by a pass: the validator's latest results
-for that manifest and method, in `E`'s past, hold no fail. A fail replaced
-by another fail stays binding under every option.
+for that manifest and method, in `E`'s past, are a single pass. A fail
+replaced by another fail, or by concurrent passes, stays binding under every
+option.
 
 | Option | A replaced fail blocks a tree | Honest objections kept | Tier | Existing decisions | Main cost or residual |
 |---|---|---|---|---|---|
@@ -663,7 +670,8 @@ ones. B4 needs readers-first, and A5 doesn't.
 4. **B: let an objection be answered `overridden` when its fail was
    replaced by a pass (B4), and show it (B6)?** That means the validator's
    latest results for that manifest and method, in the decision's past,
-   hold no fail. A fail replaced by another fail stays binding.
+   are a single pass. A fail replaced by another fail, or by concurrent
+   passes, stays binding.
    *Recommended: yes, before the join, with `scripts/weave-shadow`
    following.* It ends the replay without moving any existing verdict, and
    it keeps honest evidence objections binding while the tree still fails. A

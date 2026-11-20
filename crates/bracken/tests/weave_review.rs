@@ -316,3 +316,160 @@ fn one_answer_naming_the_line_answers_every_objection_in_the_window() {
     let review = w.json(&["weave", "review", "--json"]);
     assert_eq!(review["open"], serde_json::json!([]), "{review}");
 }
+
+impl Weave {
+    /// A candidate tree: git's HEAD after a new commit, imported and never integrated: (manifest hash,
+    /// manifest artifact).
+    fn candidate(&self, bytes: &[u8]) -> (String, String) {
+        self.commit("b.txt", bytes);
+        let imported = self.json(&["weave", "import", "--as", AS, "--json"]);
+        let s = |k: &str| imported[k].as_str().unwrap_or_else(|| panic!("{k} in {imported}")).to_owned();
+        (s("manifest"), s("manifest_id"))
+    }
+
+    /// What `weave green --manifest` says integrating `hash` unchanged must answer.
+    fn must_answer(&self, hash: &str) -> Value {
+        self.json(&["weave", "green", "--manifest", hash, "--json"])["must_answer"].clone()
+    }
+
+    /// Runs bracken on another replica.
+    fn ok_on(&self, ground: &std::path::Path, args: &[&str]) -> String {
+        let out = Command::new(env!("CARGO_BIN_EXE_bracken"))
+            .args(args)
+            .current_dir(&self.repo)
+            .env("BRACKEN_DIR", ground)
+            .env_remove("BRACKEN_AGENT")
+            .output()
+            .expect("bracken runs");
+        assert!(out.status.success(), "bracken {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).expect("UTF-8")
+    }
+}
+
+// weave-authority.md B4 and B6 (decision 51815720d632, finding 6cad0100be83): any writer can relate a
+// validator's fail `contradicts` a tree. While that fail is the validator's latest, the objection binds:
+// integrating the tree unchanged takes accepted_breakage. Once a later pass by the same validator replaced
+// it, the objection may also be answered overridden, so a replayed flake no longer blocks the tree; and
+// `weave green --manifest` lists it, saying so.
+#[test]
+fn a_fail_a_pass_replaced_backs_an_objection_that_may_be_overridden() {
+    let w = Weave::new();
+    w.integrate(&[]);
+    let method = w.method();
+    let (hash, artifact) = w.candidate(b"two\n");
+    w.ok(&["id", "new", "mallory"]);
+    let fail = w.result(&method, (&hash, &artifact), false, 1);
+    let objection = w.id(&["relate", &fail, "contradicts", &artifact, "--as", "mallory", "--json"]);
+
+    // Its validator's latest: binding, as before.
+    let open = w.must_answer(&hash);
+    assert_eq!(open[0]["objection"], objection.as_str(), "{open}");
+    assert_eq!(open[0]["basis"]["kind"], "evidence-backed");
+    assert_eq!(open[0]["basis"]["replaced"], false);
+    assert_eq!(open[0]["allowed"], serde_json::json!(["accepted_breakage"]));
+    let overridden = format!("{}=overridden:a flake", &artifact[..12]);
+    let refused = w.fails(&["weave", "integrate", "--as", AS, "--answer", &overridden]);
+    assert!(refused.contains("rule 5") && refused.contains("overridden"), "{refused}");
+
+    // Replaced by a pass: it may be overridden.
+    w.result(&method, (&hash, &artifact), true, 2);
+    let open = w.must_answer(&hash);
+    assert_eq!(open[0]["basis"]["kind"], "evidence-backed", "{open}");
+    assert_eq!(open[0]["basis"]["replaced"], true);
+    assert_eq!(open[0]["allowed"], serde_json::json!(["accepted_breakage", "overridden"]));
+    let text = w.ok(&["weave", "green", "--manifest", &hash]);
+    assert!(text.contains("objections integrating it unchanged must answer: 1"), "{text}");
+    assert!(text.contains("replaced by a later pass"), "{text}");
+    let unanswered = w.fails(&["weave", "integrate", "--as", AS]);
+    assert!(unanswered.contains("rule 5") && unanswered.contains(&objection), "{unanswered}");
+    let (d, _, _) = w.integrate(&["--answer", &overridden]);
+    let green = w.json(&["weave", "green", "--json"]);
+    assert_eq!(green["green"][0], d.as_str(), "the tree goes green, with no breakage: {green}");
+    assert!(w.must_answer(&hash).as_array().expect("a list").is_empty(), "settled on the line");
+}
+
+// B4 only after a pass: a fail replaced by another fail (the check really fails again) stays binding.
+#[test]
+fn a_fail_replaced_by_a_fail_still_binds() {
+    let w = Weave::new();
+    w.integrate(&[]);
+    let method = w.method();
+    let (hash, artifact) = w.candidate(b"two\n");
+    w.ok(&["id", "new", "mallory"]);
+    let first = w.result(&method, (&hash, &artifact), false, 1);
+    w.result(&method, (&hash, &artifact), false, 2);
+    w.ok(&["relate", &first, "contradicts", &artifact, "--as", "mallory"]);
+    let open = w.must_answer(&hash);
+    assert_eq!(open[0]["basis"]["replaced"], false, "{open}");
+    assert_eq!(open[0]["allowed"], serde_json::json!(["accepted_breakage"]));
+    let overridden = format!("{}=overridden:a flake", &artifact[..12]);
+    let refused = w.fails(&["weave", "integrate", "--as", AS, "--answer", &overridden]);
+    assert!(refused.contains("rule 5") && refused.contains("overridden"), "{refused}");
+}
+
+// B4 by green's rule: several concurrent latest results that include a fail count as one fail. The
+// validator's fail F1 is replaced by a pass P that descends from it alone, while a fail F3 by the same
+// validator, written on another replica, is concurrent with both: its latest results are P and F3, a
+// fail, so F1's objection still binds, though a later result does follow F1.
+#[test]
+fn a_fail_beside_a_concurrent_latest_fail_still_binds() {
+    let w = Weave::new();
+    w.integrate(&[]);
+    let method = w.method();
+    let (hash, artifact) = w.candidate(b"two\n");
+    w.ok(&["id", "new", "mallory"]);
+    let other = w._tmp.path().join("other");
+    let out = Command::new("cp").arg("-R").arg(&w.ground).arg(&other).output().expect("cp runs");
+    assert!(out.status.success());
+    let parsed: ContentHash = hash.parse().expect("a hash");
+    let details = details(&parsed, 3, &["true".to_owned()], &Exit::Code(1), &RecordedTail::Text("out".into()));
+    w.ok_on(&other, &["evidence", &artifact, "fail", "--method", &method, "--details", &details, "--as", VAL]);
+    let f1 = w.result(&method, (&hash, &artifact), false, 1);
+    w.result(&method, (&hash, &artifact), true, 2);
+    w.ok(&["relate", &f1, "contradicts", &artifact, "--as", "mallory"]);
+    assert_eq!(w.must_answer(&hash)[0]["basis"]["replaced"], true, "before the concurrent fail arrives");
+    let bundle = w._tmp.path().join("bundle");
+    w.ok_on(&other, &["export", bundle.to_str().expect("UTF-8")]);
+    w.ok(&["import", bundle.to_str().expect("UTF-8")]);
+
+    let open = w.must_answer(&hash);
+    assert_eq!(open[0]["basis"]["replaced"], false, "{open}");
+    assert_eq!(open[0]["allowed"], serde_json::json!(["accepted_breakage"]));
+    let overridden = format!("{}=overridden:a flake", &artifact[..12]);
+    let refused = w.fails(&["weave", "integrate", "--as", AS, "--answer", &overridden]);
+    assert!(refused.contains("rule 5") && refused.contains("overridden"), "{refused}");
+}
+
+// Finding 91b445207f20: green counts several concurrent latest results as one fail even when every one
+// passed, so a fail followed by two concurrent passes isn't green. B4 follows green: such a fail isn't
+// replaced, and its objection still binds.
+#[test]
+fn a_fail_followed_by_two_concurrent_passes_still_binds() {
+    let w = Weave::new();
+    w.integrate(&[]);
+    let method = w.method();
+    let (hash, artifact) = w.candidate(b"two\n");
+    w.ok(&["id", "new", "mallory"]);
+    let f1 = w.result(&method, (&hash, &artifact), false, 1);
+    let other = w._tmp.path().join("other");
+    let out = Command::new("cp").arg("-R").arg(&w.ground).arg(&other).output().expect("cp runs");
+    assert!(out.status.success());
+    let parsed: ContentHash = hash.parse().expect("a hash");
+    let details = details(&parsed, 3, &["true".to_owned()], &Exit::Code(0), &RecordedTail::Text("out".into()));
+    w.ok_on(&other, &["evidence", &artifact, "pass", "--method", &method, "--details", &details, "--as", VAL]);
+    w.result(&method, (&hash, &artifact), true, 2);
+    w.ok(&["relate", &f1, "contradicts", &artifact, "--as", "mallory"]);
+    assert_eq!(w.must_answer(&hash)[0]["basis"]["replaced"], true, "one pass latest, before the other arrives");
+    let bundle = w._tmp.path().join("bundle");
+    w.ok_on(&other, &["export", bundle.to_str().expect("UTF-8")]);
+    w.ok(&["import", bundle.to_str().expect("UTF-8")]);
+
+    let green = w.json(&["weave", "green", "--manifest", &hash, "--json"]);
+    assert_eq!(green["green"], false, "two concurrent latest passes aren't green: {green}");
+    let open = &green["must_answer"];
+    assert_eq!(open[0]["basis"]["replaced"], false, "{open}");
+    assert_eq!(open[0]["allowed"], serde_json::json!(["accepted_breakage"]));
+    let overridden = format!("{}=overridden:a flake", &artifact[..12]);
+    let refused = w.fails(&["weave", "integrate", "--as", AS, "--answer", &overridden]);
+    assert!(refused.contains("rule 5") && refused.contains("overridden"), "{refused}");
+}

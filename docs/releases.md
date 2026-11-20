@@ -91,6 +91,32 @@ and the pinned binary needn't change.
 - **Migration:** none. The manager stops passing `--delegated`; a gated action waits for the owner to run
   `scripts/owner-approve`. After the merge, builders read AGENTS.md (briefs say "Read AGENTS.md first").
 
+### 2026-11-19: removing a Weave integrator ends their stop, and a replayed fail a pass replaced may be overridden (task e2ab087e8d3e)
+
+The owner's choices on docs/design/weave-authority.md (decision `51815720d632`): A5, B4 and B6. Pinned rules
+only (weave-freeze.md 1.6): no format, encoding, id, golden vector or fixture changes, and the same records
+are valid. Every existing Ground opens as before.
+- **A5: G8 reads the line's current policy too** (finding `39cb855d11d0`). A decision that doesn't decode
+  counts against its line only while its author integrates it under the policy in its own past and under
+  the line's current policy, and a decision brings other lines into a judgement only on the same terms.
+  So removing an integrator with `line policy` now ends a stop they started, for every reader that holds
+  the removal, and a stale replica's past no longer gives them another. No verdict changes, only what
+  refuses: an older binary still refuses where this one goes on, so the order of upgrades doesn't matter.
+  **Still:** a line they author, or still integrate, that main's integrator merged into main can still stop
+  main (accepted, decision `a2e0b9c241c7`).
+- **B4: an objection from a fail a pass replaced may be answered `overridden`** (finding `6cad0100be83`).
+  An evidence-backed objection whose fail's validator, in the answering decision's past, has later results
+  for that manifest and method whose latest is a single pass (several concurrent latest results count as
+  a fail, as in green, even if all passed; finding `91b445207f20`) now allows `overridden` as well as `accepted_breakage`. A fail replaced by another fail binds as
+  before. This only adds an allowed answer, so every decision that qualified still does, but an older
+  binary judges a decision answered this way unqualified, and the two show different heads. **Upgrade both
+  Weave binaries, the pinned `.bracken-bin` and `~/bracken-weave`'s, before answering such an objection
+  `overridden`**, and `scripts/weave-shadow` (which now does so for objections from outside line main's
+  policy) runs only after both are.
+- **B6: `weave green --manifest` lists what integrating that tree unchanged must answer** (`must_answer` in
+  `--json`), and `weave review` and `weave green --manifest` mark an evidence-backed objection whose fail a
+  pass replaced (`"replaced": true` in the basis; "replaced by a later pass" in text).
+
 ### 2026-11-19: the store fails closed on a bad agent directory, identity file or object listing (task c0eb61747345)
 
 Neon's recommendation 2 (decision `c8bbb2886be3`, lead `0fe1e087ae37`). Storage hardening only: no change to

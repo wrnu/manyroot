@@ -19,8 +19,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use manyroot::{AgentId, ContributionId};
+use manyroot::{AgentId, ContributionId, Graph};
 
+use crate::ancestry::Ancestry;
 use crate::format::{Change, ChangeEntry, Decision, Disposition, Line, parse_method};
 use crate::ground::{GoalLink, Index, Retractions};
 use crate::hash::ContentHash;
@@ -32,10 +33,15 @@ use crate::shared::{Set, SetMap};
 /// What backs an objection, under one policy over one causal past.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Basis {
-    /// `from` is a failing check result eligible there, for `check`.
+    /// `from` is a failing check result eligible there, for `check`. `replaced` if a pass replaced it
+    /// there: its validator's latest eligible results for that manifest and method, in that past, are a
+    /// single pass, by green's rule that several concurrent latest results count as one fail, even if
+    /// every one passed (finding 91b445207f20). Such an objection
+    /// may also be answered `overridden` (weave-authority.md B4, decision 51815720d632).
     Evidence {
         result: ContributionId,
         check: String,
+        replaced: bool,
     },
     /// `from` is a goal that binds the line there.
     Goal(ContributionId),
@@ -57,7 +63,12 @@ impl Basis {
     pub fn allows(&self, uses: bool) -> Vec<Disposition> {
         let mut allowed = if uses { vec![] } else { vec![Disposition::Fixed, Disposition::FellBack] };
         match self {
-            Basis::Evidence { .. } => allowed.push(Disposition::AcceptedBreakage),
+            Basis::Evidence { replaced, .. } => {
+                allowed.push(Disposition::AcceptedBreakage);
+                if *replaced {
+                    allowed.push(Disposition::Overridden);
+                }
+            }
             Basis::Goal(_) => {}
             Basis::Discussion => allowed.push(Disposition::Overridden),
         }
@@ -129,6 +140,12 @@ pub struct Obligations {
     changes: HashMap<ContributionId, Option<Vec<ChangeEntry>>>,
     /// The results an objection comes from, by id.
     results: HashMap<ContributionId, CheckResult>,
+    /// For each of those, the other results by its author for its manifest and method: what may have
+    /// replaced it (weave-authority.md B4).
+    siblings: HashMap<ContributionId, Vec<CheckResult>>,
+    /// The pairs of those results, the one in `results` included, where the first is a strict causal
+    /// ancestor of the second: answered once over the replica by [`Obligations::index_siblings`].
+    below: HashSet<(ContributionId, ContributionId)>,
     /// The goal links of each goal claim an objection comes from.
     links: HashMap<ContributionId, Vec<GoalLink>>,
     /// The decisions that may qualify: not retracted, on a line, by one of its integrators under the
@@ -209,6 +226,12 @@ impl Obligations {
             }
             if let Some(r) = results.get(&review.from) {
                 ob.results.insert(r.id, (*r).clone());
+                ob.siblings.entry(r.id).or_insert_with(|| {
+                    let same = |s: &&CheckResult| {
+                        s.id != r.id && s.author == r.author && s.manifest == r.manifest && s.method == r.method
+                    };
+                    ix.check_results().iter().filter(same).cloned().collect()
+                });
             }
             if let Some(l) = links.get(&review.from) {
                 ob.links.insert(review.from, l.clone());
@@ -224,6 +247,42 @@ impl Obligations {
             }
         }
         ob
+    }
+
+    /// Answers, over the replica, which results of each group of [`Obligations::siblings`] lie below
+    /// which: by the ancestor index, or by a walk with `walking`. Called once, before any basis is
+    /// classified.
+    pub(crate) fn index_siblings(&mut self, g: &Graph, walking: bool) {
+        let groups: Vec<Vec<ContributionId>> = self
+            .siblings
+            .iter()
+            .filter(|(_, others)| !others.is_empty())
+            .map(|(r, others)| std::iter::once(*r).chain(others.iter().map(|s| s.id)).collect())
+            .collect();
+        let refs: HashMap<ContributionId, Vec<ContributionId>> = match walking {
+            true => HashMap::new(),
+            false => groups
+                .iter()
+                .flat_map(|group| group.iter().map(move |b| (*b, group.iter().filter(|a| *a != b).copied().collect())))
+                .fold(HashMap::new(), |mut refs: HashMap<ContributionId, Vec<ContributionId>>, (b, asked)| {
+                    refs.entry(b).or_default().extend::<Vec<ContributionId>>(asked);
+                    refs
+                }),
+        };
+        let index = Ancestry::build(g, &refs, &[]);
+        for group in &groups {
+            for a in group {
+                for b in group.iter().filter(|b| *b != a) {
+                    let below = match walking {
+                        true => g.is_ancestor(a, b),
+                        false => index.is_ancestor(a, b).unwrap_or_else(|| g.contains(a) && g.is_ancestor(a, b)),
+                    };
+                    if below {
+                        self.below.insert((*a, *b));
+                    }
+                }
+            }
+        }
     }
 
     /// What an answer names, if anything: an objection, or a target whose objections it covers.
@@ -588,6 +647,11 @@ impl Obligations {
             past.push(o.from);
             past.extend(retractions.below(&o.from));
             epoch.push(o.from);
+            for s in self.siblings.get(&o.from).into_iter().flatten() {
+                past.push(s.id);
+                past.extend(retractions.below(&s.id));
+                epoch.push(s.id);
+            }
         }
         if let Some(links) = self.links.get(&o.from) {
             past.extend(retractions.below(&o.from));
@@ -623,7 +687,21 @@ impl Obligations {
                 && !retractions.within(&r.id, &mut *in_past)
                 && in_epoch(&r.id);
             if eligible {
-                return Basis::Evidence { result: r.id, check: check.expect("tested above") };
+                // Its validator's eligible results for the same manifest and method in this past, itself
+                // included: replaced by a pass when their latest is a single pass (weave-authority.md B4).
+                let mut kept: Vec<&CheckResult> = vec![r];
+                for s in self.siblings.get(&r.id).into_iter().flatten() {
+                    if in_past(&s.id) && !retractions.within(&s.id, &mut *in_past) && in_epoch(&s.id) {
+                        kept.push(s);
+                    }
+                }
+                // Green's rule (`Checks::tally`): the validator's latest results count as a pass only when
+                // they are one pass; several concurrent latest results count as one fail, even if all pass
+                // (finding 91b445207f20).
+                let latest: Vec<&&CheckResult> =
+                    kept.iter().filter(|x| !kept.iter().any(|later| self.below.contains(&(x.id, later.id)))).collect();
+                let replaced = matches!(latest.as_slice(), [one] if one.passed);
+                return Basis::Evidence { result: r.id, check: check.expect("tested above"), replaced };
             }
         }
         if let Some(links) = self.links.get(&o.from) {
@@ -818,6 +896,7 @@ impl Obligations {
             .iter()
             .map(|(_, at)| self.list[*at as usize].from)
             .filter(|f| self.results.contains_key(f))
+            .flat_map(|f| std::iter::once(f).chain(self.siblings.get(&f).into_iter().flatten().map(|s| s.id)))
             .collect();
         rs.sort_unstable();
         rs.dedup();
@@ -828,6 +907,20 @@ impl Obligations {
     pub(crate) fn next_move(&self, lines: &Lines, line: &ContributionId, heads: &[ContributionId]) -> Vec<(bool, At)> {
         let settled = self.settled_on(&self.settled_for(heads), line);
         self.window_for(lines, line, heads, &settled).iter().map(|at| (false, *at)).collect()
+    }
+
+    /// The objections to manifest `hash` that a next move on `line`, from `heads`, using that tree
+    /// unchanged would have to answer, less those an answer on the line settled (weave-authority.md B6).
+    pub(crate) fn of_manifest(
+        &self,
+        line: &ContributionId,
+        hash: &ContentHash,
+        heads: &[ContributionId],
+    ) -> Vec<(bool, At)> {
+        let settled = self.settled_on(&self.settled_for(heads), line);
+        let mut ats: Vec<At> = self.to_manifest.get(hash).cloned().unwrap_or_default();
+        ats.retain(|at| !settled.contains(*at));
+        ats.into_iter().map(|at| (true, at)).collect()
     }
 
     /// The objections to a manifest or proposal that a next move on its line, from `heads`, using
