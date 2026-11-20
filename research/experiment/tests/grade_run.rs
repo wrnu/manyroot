@@ -153,9 +153,24 @@ mod macos_only {
         hold_change: bool,
         sandbox: bool,
     ) -> RunConfig {
+        config_of("weave", ANY_AGENT, python, root, agents, turns, project, hold_change, sandbox)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn config_of(
+        mode: &'static str,
+        integrator: &str,
+        python: PythonPin,
+        root: PathBuf,
+        agents: usize,
+        turns: u32,
+        project: &Path,
+        hold_change: bool,
+        sandbox: bool,
+    ) -> RunConfig {
         RunConfig {
             root,
-            mode: "weave",
+            mode,
             agents,
             turns,
             worker_bin: bin(),
@@ -167,7 +182,7 @@ mod macos_only {
             plan: PlanInputs {
                 project: Some(ProjectPlan::of(&Project::load(project).expect("the project")).expect("its plan")),
                 python: Some(python),
-                integrator: Some(ANY_AGENT.into()),
+                integrator: Some(integrator.into()),
                 hold_change,
                 ..PlanInputs::default()
             },
@@ -338,6 +353,62 @@ mod macos_only {
             .map(|e| e.expect("an entry").file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names.len(), 2, "no partial file left: {names:?}");
+    }
+
+    /// Git project mode (task `6bd13d994a03`): the tiny project, 4 agents x 2 turns, agent-3 the one integrator,
+    /// sandboxed, then graded as a Weave run is: a line for each checkpoint and the end, each tree read out of the
+    /// hub's repository by the tree id its event names, with main's commit. The builders' turn-2 work is on main
+    /// by the second checkpoint, through agent-3's merges of their requests.
+    #[test]
+    fn a_git_project_run_is_graded_after_it_ends() {
+        let Some(python) = pin() else { return };
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+        let (project, store) = project_and_store(&root);
+        let name = bracken_experiment::git_project::NAME;
+        let cfg = config_of(name, "agent-3", python, root.join("run"), 4, 2, &project, false, true);
+        let mock =
+            MockBackend { seed: 1, shim: Some(bin()), lockstep: true, integrator: Some(3), ..MockBackend::default() };
+        run(&cfg, &mock).expect("the run");
+        let log = std::fs::read_to_string(cfg.root.join("events.jsonl")).expect("the events");
+        assert!(!log.contains("\"turn_error\""), "no turn erred");
+        let plan: Value =
+            serde_json::from_slice(&std::fs::read(cfg.root.join("plan.json")).expect("the plan")).expect("JSON");
+        assert_eq!((plan["mode"].clone(), plan["rules"][0][0].clone()), (json!(name), json!("git-integrator")));
+        let roles = (plan["prompts"]["role-integrator"].clone(), plan["prompts"]["role-builder"].clone());
+        let hash = |t: &str| json!(blake3::hash(t.as_bytes()).to_hex().to_string());
+        use bracken_experiment::prompts::{GIT_BUILDER_ROLE, GIT_INTEGRATOR_ROLE};
+        assert_eq!(roles, (hash(GIT_INTEGRATOR_ROLE), hash(GIT_BUILDER_ROLE)), "git's role lines are hashed");
+
+        let grades = root.join("git.jsonl");
+        let summary =
+            bracken_experiment::grade_run::grade_run(&cfg.root, &store, &grades, &bracken(), None).expect("graded");
+        assert_eq!((summary.points, summary.errors), (3, 0), "{summary:?}");
+        let points: Vec<Value> = std::fs::read_to_string(&grades)
+            .expect("the grades")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("a JSON line"))
+            .collect();
+        let at: Vec<Value> = points.iter().map(|p| p["at"].clone()).collect();
+        assert_eq!(at, [json!(1), json!(2), json!("end")]);
+        // The change goes out once 4 of the 8 agent-turns are used: after the first checkpoint.
+        let released: Vec<bool> = points.iter().map(|p| p["change_released"] == true).collect();
+        assert_eq!(released, [false, true, true]);
+        for (k, p) in points.iter().enumerate() {
+            let hex = |v: &Value| v.as_str().is_some_and(|c| c.len() == 40 && c.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert!(hex(&p["decision"]) && hex(&p["manifest"]) && p["forked"] == false, "main's commit and tree: {p}");
+            let turn = p["grade"]["groups"].as_array().expect("groups").iter().find(|g| g["index"] == 3).expect("3");
+            let outcomes = if k == 0 { json!(["error"]) } else { json!(["pass"]) };
+            assert_eq!(turn["outcomes"], outcomes, "agent 0's turn-2 branch is on main from checkpoint 2: {p}");
+        }
+        assert_eq!(points[1]["manifest"], points[2]["manifest"], "the end is the last checkpoint's tree");
+        assert_ne!(points[0]["manifest"], points[1]["manifest"]);
+        let text = std::fs::read_to_string(&grades).expect("the grades");
+        let store_path = store.to_string_lossy().into_owned();
+        assert!(!text.contains(MARKER) && !text.contains(&store_path), "{text}");
+        for (path, bytes) in all_bytes(&cfg.root) {
+            assert!(!contains(&bytes, MARKER.as_bytes()), "{} holds the marker", path.display());
+        }
     }
 
     /// A run holding its change back never releases it, and its plan says so: no change point, no held item's

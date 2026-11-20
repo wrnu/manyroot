@@ -25,6 +25,12 @@
 //! each integrate onto the same head and fork it: the next turn settles the fork by integrating one head's
 //! tree with every head as a parent (losing the other's changes, as a mock may), and an integration the
 //! line refuses leaves its proposal open.
+//!
+//! In git project mode it reads the task the same way and writes the same module, on its own main where it
+//! may update main, else on a branch of the turn, from `origin/main`, whose integration it asks for. An agent
+//! that updates main merges `origin/main` first, and with one integrator, every open request's branch too; then
+//! its sync pushes main. A main the hub refuses as no fast-forward (agents not in lockstep) is merged with
+//! `origin/main` and pushed again once.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -316,6 +322,9 @@ impl MockBackend {
         let tools = c.request("tools/list", json!({}))?;
         let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
+        if has("request_integration") {
+            return git_project_turn(c, agent, turn, self.integrator);
+        }
         if has("propose") {
             return weave_turn(c, agent, turn, self.integrator);
         }
@@ -447,27 +456,7 @@ impl MockBackend {
 /// One Weave-mode turn of a project run (see the module's doc). With one `integrator`, any other agent only
 /// proposes, and the integrator integrates every open proposal, its own with them.
 fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>) -> Result<(), String> {
-    let task = c.tool("task", json!({}))?;
-    if task["spec"].as_str().is_none_or(str::is_empty) {
-        return Err("the task tool showed no spec".into());
-    }
-    // The whole task, page by page, as the prompt says (task fb08637d1101): every item in the index is in full on
-    // the page it names.
-    let ids: Vec<&str> = task["items"].as_array().into_iter().flatten().filter_map(|i| i["id"].as_str()).collect();
-    let mut texts: Vec<String> = Vec::new();
-    for page in 1..=task["pages"].as_u64().unwrap_or(1) {
-        let shown = if page == 1 { task.clone() } else { c.tool("task", json!({"page": page}))? };
-        texts.extend(shown["texts"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)));
-    }
-    if let Some(missing) = ids.iter().find(|id| !texts.iter().any(|t| t.starts_with(&format!("Item {id} (")))) {
-        return Err(format!("the task's pages left out item {missing}"));
-    }
-    // One item again by its id, as an agent may (task b58cf9180030).
-    let id = ids.get((agent + turn as usize) % ids.len().max(1)).ok_or("the task tool listed no item")?;
-    let item = c.tool("task", json!({"item": id}))?;
-    if !item["text"].as_str().is_some_and(|t| t.starts_with(&format!("Item {id} ("))) {
-        return Err(format!("the task tool showed item {id} as {item}"));
-    }
+    read_task(c, agent, turn)?;
     let head = c.tool("head", json!({}))?;
     let heads: Vec<String> = head["heads"]
         .as_array()
@@ -485,20 +474,7 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>
     } else if heads.first().map(String::as_str) != head["base"].as_str() {
         c.tool("update", json!({}))?;
     }
-    let files = c.tool("list_files", json!({}))?;
-    let init = files["files"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|f| f["path"].as_str())
-        .find(|p| p.ends_with("/__init__.py") && p.matches('/').count() == 1)
-        .ok_or("no package in the tree")?
-        .to_string();
-    c.tool("read_file", json!({"path": init, "limit": 20}))?;
-    let package = init.trim_end_matches("/__init__.py");
-    let module = format!("{package}/by_agent_{agent}_turn_{turn}.py");
-    c.tool("write_file", json!({"path": module, "text": format!("VALUE = {}\n", turn * 10 + agent as u32)}))?;
-    c.tool("run_tests", json!({}))?;
+    let module = write_own_module(c, agent, turn)?;
     let proposed = c.tool("propose", json!({"summary": format!("agent {agent}'s module of turn {turn}")}))?;
     let proposal = proposed["proposal"].as_str().ok_or("propose gave no proposal")?.to_string();
     if integrator.is_some_and(|n| n != agent) {
@@ -528,6 +504,103 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>
     }
     c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}")}))?;
     c.tool("sync", json!({}))?;
+    Ok(())
+}
+
+/// One git-project-mode turn of a project run (see the module's doc).
+fn git_project_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>) -> Result<(), String> {
+    read_task(c, agent, turn)?;
+    let updates_main = integrator.is_none_or(|n| n == agent);
+    let branch = if updates_main { "main".to_string() } else { format!("agent-{agent}-turn-{turn}") };
+    let status = c.tool("status", json!({}))?;
+    if status["branch"] != "main" {
+        c.tool("switch", json!({"branch": "main"}))?;
+    }
+    if updates_main {
+        c.tool("merge", json!({"ref": "origin/main"}))?;
+    } else {
+        c.tool("switch", json!({"branch": branch, "create": true}))?;
+    }
+    let module = write_own_module(c, agent, turn)?;
+    c.tool("commit", json!({"message": format!("agent {agent}'s module of turn {turn}")}))?;
+    let diff = c.tool("diff", json!({"against": "origin/main"}))?;
+    if !diff["files"].as_array().is_some_and(|f| f.iter().any(|f| f["path"] == module.as_str())) {
+        return Err(format!("the diff against origin/main leaves out {module}: {diff}"));
+    }
+    if !updates_main {
+        c.tool("request_integration", json!({"branch": branch, "summary": format!("agent {agent}'s turn {turn}")}))?;
+        c.tool("notes_write", json!({"text": format!("turn {turn}: asked for {module}")}))?;
+        c.tool("sync", json!({}))?;
+        return Ok(());
+    }
+    if integrator.is_some() {
+        let open = c.tool("requests", json!({}))?;
+        for r in open["requests"].as_array().into_iter().flatten() {
+            // Each agent writes its own files, so no merge conflicts.
+            let merged = c.tool("merge", json!({"ref": r["branch"]}))?;
+            if merged["merged"] != true {
+                return Err(format!("merging {} conflicts: {merged}", r["branch"]));
+            }
+        }
+    }
+    let synced = c.tool("sync", json!({}))?;
+    if synced["main"].as_str().is_some_and(|m| m.contains("fast-forward")) {
+        c.tool("merge", json!({"ref": "origin/main"}))?;
+        let again = c.tool("sync", json!({}))?;
+        if again["main"] != "updated" && again["main"] != "up to date" {
+            return Err(format!("main wasn't updated: {again}"));
+        }
+    } else if synced["main"] != "updated" {
+        return Err(format!("main wasn't updated: {synced}"));
+    }
+    c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}")}))?;
+    c.tool("sync", json!({}))?;
+    Ok(())
+}
+
+/// Writes the agent's own module of this turn into the package, after looking at its tree, and runs the public
+/// tests: its path.
+fn write_own_module(c: &mut Client, agent: usize, turn: u32) -> Result<String, String> {
+    let files = c.tool("list_files", json!({}))?;
+    let init = files["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["path"].as_str())
+        .find(|p| p.ends_with("/__init__.py") && p.matches('/').count() == 1)
+        .ok_or("no package in the tree")?
+        .to_string();
+    c.tool("read_file", json!({"path": init, "limit": 20}))?;
+    let package = init.trim_end_matches("/__init__.py");
+    let module = format!("{package}/by_agent_{agent}_turn_{turn}.py");
+    c.tool("write_file", json!({"path": module, "text": format!("VALUE = {}\n", turn * 10 + agent as u32)}))?;
+    c.tool("run_tests", json!({}))?;
+    Ok(module)
+}
+
+/// Reads the whole task, page by page, and one item again, as the prompt says.
+fn read_task(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
+    let task = c.tool("task", json!({}))?;
+    if task["spec"].as_str().is_none_or(str::is_empty) {
+        return Err("the task tool showed no spec".into());
+    }
+    // The whole task, page by page, as the prompt says (task fb08637d1101): every item in the index is in full on
+    // the page it names.
+    let ids: Vec<&str> = task["items"].as_array().into_iter().flatten().filter_map(|i| i["id"].as_str()).collect();
+    let mut texts: Vec<String> = Vec::new();
+    for page in 1..=task["pages"].as_u64().unwrap_or(1) {
+        let shown = if page == 1 { task.clone() } else { c.tool("task", json!({"page": page}))? };
+        texts.extend(shown["texts"].as_array().into_iter().flatten().filter_map(|t| t.as_str().map(str::to_string)));
+    }
+    if let Some(missing) = ids.iter().find(|id| !texts.iter().any(|t| t.starts_with(&format!("Item {id} (")))) {
+        return Err(format!("the task's pages left out item {missing}"));
+    }
+    // One item again by its id, as an agent may (task b58cf9180030).
+    let id = ids.get((agent + turn as usize) % ids.len().max(1)).ok_or("the task tool listed no item")?;
+    let item = c.tool("task", json!({"item": id}))?;
+    if !item["text"].as_str().is_some_and(|t| t.starts_with(&format!("Item {id} ("))) {
+        return Err(format!("the task tool showed item {id} as {item}"));
+    }
     Ok(())
 }
 

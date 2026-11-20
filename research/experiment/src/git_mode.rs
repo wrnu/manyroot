@@ -192,7 +192,7 @@ fn allowed(name: &str) -> &'static [&'static str] {
 
 /// Options on every git command: nothing in a repository, a working copy or the
 /// environment can make git run a program, and every object fetched is checked.
-const FIXED: [&str; 17] = [
+const FIXED: [&str; 18] = [
     "core.fsmonitor=false",
     "core.symlinks=false",
     "core.attributesFile=/dev/null",
@@ -210,6 +210,7 @@ const FIXED: [&str; 17] = [
     "init.defaultBranch=main",
     "merge.conflictStyle=merge",
     "advice.detachedHead=false",
+    "credential.helper=",
 ];
 
 /// The first git whose fetch from a bundle checks objects as `fetch.fsckObjects` asks: older ones take a
@@ -244,8 +245,17 @@ pub struct Output {
     pub raw: Vec<u8>,
 }
 
+/// What a tree may hold: Phase 1's task files, or an evaluation project's files ([`crate::git_project`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeRule {
+    Task,
+    Project,
+}
+
 pub struct GitStore {
     pub(crate) config: StoreConfig,
+    /// What every tree this store takes in may hold.
+    pub(crate) rule: TreeRule,
     /// git processes started, and their argv, for tests.
     pub runs: Vec<Vec<String>>,
     files: u64,
@@ -259,8 +269,14 @@ pub struct GitStore {
 
 impl GitStore {
     pub fn new(config: StoreConfig) -> GitStore {
+        GitStore::with_rule(config, TreeRule::Task)
+    }
+
+    /// A store whose trees follow `rule`.
+    pub fn with_rule(config: StoreConfig, rule: TreeRule) -> GitStore {
         GitStore {
             config,
+            rule,
             runs: Vec::new(),
             files: 0,
             quarantine: None,
@@ -289,6 +305,17 @@ impl GitStore {
 
     /// Runs git in `dir` with `argv`, the fixed options and a cleared environment.
     pub(crate) fn git_in(&mut self, dir: &Path, argv: &[&str], stdin: Option<&[u8]>) -> Result<Output, String> {
+        self.git_in_env(dir, argv, stdin, &[])
+    }
+
+    /// [`GitStore::git_in`], with the variables `vars` set too: only ones the store chooses, never an agent.
+    pub(crate) fn git_in_env(
+        &mut self,
+        dir: &Path,
+        argv: &[&str],
+        stdin: Option<&[u8]>,
+        vars: &[(&str, &Path)],
+    ) -> Result<Output, String> {
         let hooks = self.config.dir.join("no-hooks");
         std::fs::create_dir_all(&hooks).map_err(|e| format!("creating {}: {e}", hooks.display()))?;
         let mut cmd = Command::new(&self.config.git);
@@ -299,7 +326,8 @@ impl GitStore {
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("GIT_CEILING_DIRECTORIES", &self.config.dir)
             .env("HOME", &self.config.dir)
-            .current_dir(dir);
+            .current_dir(dir)
+            .envs(vars.iter().copied());
         if self.config.trace {
             cmd.env("GIT_TRACE", self.config.dir.join("git-trace.log"));
         }
@@ -457,6 +485,25 @@ impl GitStore {
         Ok(())
     }
 
+    /// Counts a push of `bytes` against `session`'s agent's quota, refusing one past it. Counted before anything
+    /// is checked: a refused push uses quota too. In a file of its own, so a sync never reads PR text (finding
+    /// `7d119d53922f`).
+    pub(crate) fn charge(&mut self, session: &Session, bytes: usize) -> Result<(), String> {
+        let counter = self.config.dir.join("received.json");
+        let mut used: BTreeMap<String, u64> = match std::fs::read_to_string(&counter) {
+            Ok(t) => serde_json::from_str(&t).map_err(|e| format!("the push counter: {e}"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(e) => return Err(format!("reading the push counter: {e}")),
+        };
+        let total = used.get(&session.name).copied().unwrap_or(0) + bytes as u64;
+        if total > session.quota_bytes {
+            return Err("this agent's pushes have used their quota".into());
+        }
+        used.insert(session.name.clone(), total);
+        let text = serde_json::to_string(&used).map_err(|e| e.to_string())?;
+        std::fs::write(&counter, text).map_err(|e| format!("writing the push counter: {e}"))
+    }
+
     /// Which of `shas` name commits here, by one `git cat-file --batch-check`.
     pub(crate) fn commits_here(&mut self, shas: &[String]) -> Result<std::collections::BTreeSet<String>, String> {
         let asked: Vec<&String> = shas.iter().filter(|s| is_commit(s)).collect();
@@ -503,6 +550,9 @@ impl GitStore {
     fn trees_problem(&mut self, commits: &[String]) -> Result<Option<String>, String> {
         if commits.is_empty() {
             return Ok(None);
+        }
+        if self.rule == TreeRule::Project {
+            return crate::git_project::trees_problem(self, commits);
         }
         let short = |sha: &str| sha[..12.min(sha.len())].to_string();
         let mut trees = std::collections::BTreeMap::new();
@@ -557,7 +607,7 @@ impl GitStore {
     }
 
     /// The objects `ids` name, by one `git cat-file --batch`: id, type and content each.
-    fn batch(&mut self, ids: &[String]) -> Result<Vec<(String, String, Vec<u8>)>, String> {
+    pub(crate) fn batch(&mut self, ids: &[String]) -> Result<Vec<(String, String, Vec<u8>)>, String> {
         let repo = self.repo();
         let out = self.git_in(&repo, &["cat-file", "--batch"], Some((ids.join("\n") + "\n").as_bytes()))?;
         if !out.ok {
@@ -983,21 +1033,7 @@ impl Store for GitStore {
     /// One agent's branches into `refs/agents/<agent>/`, after the bundle's checks.
     fn receive(&mut self, session: &Session, push: Transfer) -> Result<Value, String> {
         let agent = agent_ref(session)?;
-        // In a file of its own, so a sync never reads PR text (finding `7d119d53922f`).
-        let counter = self.config.dir.join("received.json");
-        let mut used: BTreeMap<String, u64> = match std::fs::read_to_string(&counter) {
-            Ok(t) => serde_json::from_str(&t).map_err(|e| format!("the push counter: {e}"))?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-            Err(e) => return Err(format!("reading the push counter: {e}")),
-        };
-        let total = used.get(&session.name).copied().unwrap_or(0) + push.bytes.len() as u64;
-        if total > session.quota_bytes {
-            return Err("this agent's pushes have used their quota".into());
-        }
-        // Counted before anything is checked: a refused push uses quota too.
-        used.insert(session.name.clone(), total);
-        let text = serde_json::to_string(&used).map_err(|e| e.to_string())?;
-        std::fs::write(&counter, text).map_err(|e| format!("writing the push counter: {e}"))?;
+        self.charge(session, push.bytes.len())?;
         let mut taken = Vec::new();
         if !push.bytes.is_empty() {
             taken = self.take_bundle(&push.bytes, Some(MAX_NEW_COMMITS), |r| {

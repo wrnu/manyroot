@@ -77,7 +77,8 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value_t = 10)]
         agents: usize,
-        /// Weave mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        /// Weave or git mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        /// With git, the run is git project mode's: git and branches on a hub, in place of Weave.
         #[arg(long)]
         project: Option<PathBuf>,
         /// A project run: the Python image to pin, by digest (`name@sha256:<hex>`), whose Python must be the
@@ -162,7 +163,8 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value_t = 3)]
         agents: usize,
-        /// Weave mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        /// Weave or git mode: the evaluation project agents build, in place of the task (docs/design/eval-suite.md).
+        /// With git, the run is git project mode's: git and branches on a hub, in place of Weave.
         #[arg(long)]
         project: Option<PathBuf>,
         /// A project run: the Python image to pin, by digest (`name@sha256:<hex>`), whose Python must be the
@@ -293,7 +295,7 @@ fn main() {
             accept_rule: AcceptRule::named(&accept_rule).expect("clap checked the name"),
             task: task_named(&task),
             dir,
-            mode,
+            mode: project_mode(&mode, project.is_some()).to_string(),
             agents,
             turns,
             harness: HarnessOptions {
@@ -345,7 +347,7 @@ fn main() {
                 accept_rule,
                 ..inputs.into_plan(PlanInputs::default())
             };
-            mock_run(dir, &mode, agents, turns, bracken, sandbox, plan)
+            mock_run(dir, project_mode(&mode, plan.project.is_some()), agents, turns, bracken, sandbox, plan)
         }
         Cmd::Project(ProjectCmd::Check { dir, hidden, json }) => project_check(&dir, hidden.as_deref(), json),
         Cmd::Project(cmd @ ProjectCmd::Grade { .. }) => project_grade(cmd),
@@ -400,6 +402,12 @@ fn project_inputs(
         integrator: Some(integrator.to_string()),
         hold_change,
     })
+}
+
+/// The mode a run of `mode` is, with a project or not: git with a project is git project mode, git and branches
+/// on a project's tree (task `6bd13d994a03`); every other mode is itself.
+fn project_mode(mode: &str, project: bool) -> &str {
+    if mode == "git" && project { bracken_experiment::git_project::NAME } else { mode }
 }
 
 /// The tasks `--task` takes.
@@ -616,7 +624,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
                 upstream: None,
             })?;
             if let Some(setting) = &setting {
-                backend.set_integrator(setting, a.agents)?;
+                backend.set_integrator(mode.name(), setting, a.agents)?;
             }
             run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
         }
@@ -643,7 +651,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
                 upstream: None,
             })?;
             if let Some(setting) = &setting {
-                backend.set_integrator(setting, a.agents)?;
+                backend.set_integrator(mode.name(), setting, a.agents)?;
             }
             run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
         }

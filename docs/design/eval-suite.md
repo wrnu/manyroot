@@ -674,6 +674,46 @@ the same way, runs a project's agents through **Weave mode**
   once every tree is graded, never replacing a file. No run reads it, and
   nothing records the store's path.
 
+### Git project mode
+
+The eval pilot's git baseline (task `6bd13d994a03`, owner decision
+`b1b56d75221b`): `run --mode git --project <dir>` (and `mock-run`) runs a
+project with git and branches in place of Bracken and Weave
+(`src/git_project.rs`, recorded in the plan as mode `git-project`). The
+project, the plan, the task tool, the file tools, `run_tests`, the change's
+release, the integrator setting and the checkpoints are Weave mode's; the
+prompt is Weave's in git's words, and so are the role sentences.
+
+- **The hub** is a bare repository under the run directory, its `main` one
+  commit of the seed. **A copy** is a clone of it: a working tree with its own
+  repository. Its git tools: `status`, `switch` (with `create`, from
+  `origin/main` or any branch), `commit` (which concludes a merge, refused
+  while a conflicted file holds markers), `merge` (or abort), `diff`, `log`,
+  `request_integration` and `requests`.
+- **Sync** pushes every local branch to the hub as `<agent>/<branch>`, with the
+  requests made since, and fetches `main` and every agent's branches as
+  `origin/main` and `origin/<agent>/<branch>`, the task as released so far and
+  the open requests. A request closes once its branch is in `main`.
+- **Main:** an agent's own `main` goes with its sync, and the hub makes it
+  `main` only if the integrator setting lets that agent update main (every
+  agent under `any-agent`, else the one it names) and it is a fast-forward of
+  the hub's `main`; the sync's result says what became of it. The hub
+  enforces both, whatever the prompt says.
+- **Isolation:** as in Phase 1's git mode, data moves only as git bundles the
+  driver carries, each checked before any of it is kept, so no agent's
+  process reaches the hub's repository or another copy. git runs from its
+  absolute path with a cleared environment, no system or global
+  configuration, no hooks, attributes or credential helper, no protocol but a
+  bundle's file, and every object fetched checked. Every ref an agent names
+  passes the mode's own rule and `git check-ref-format`, and goes to git whole
+  after `--end-of-options`; free text goes on standard input. Every tree the
+  hub or a copy takes in holds only regular files at plain paths, within
+  Weave's limits.
+- **Checkpoints and grading:** a checkpoint's line names `main`'s commit and
+  tree id as `decision` and `manifest`, so `grade-run` writes the same lines
+  for both modes; it reads each tree out of the hub's repository, each file
+  checked, nothing checked out by git.
+
 ## Cost estimate
 
 From Phase 1 and 2's measured use, and Candidate B's estimates for Python

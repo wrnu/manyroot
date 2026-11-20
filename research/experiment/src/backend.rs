@@ -564,13 +564,13 @@ pub struct HarnessBackend<H> {
 }
 
 impl<H: Harness> HarnessBackend<H> {
-    /// Tells each of the run's `agents` its role under the integrator setting `setting`
+    /// Tells each of the run's `agents` in `mode` its role under the integrator setting `setting`
     /// ([`crate::prompts::role_message`]): nothing for [`crate::weave_mode::ANY_AGENT`].
-    pub fn set_integrator(&mut self, setting: &str, agents: usize) -> Result<(), String> {
+    pub fn set_integrator(&mut self, mode: &str, setting: &str, agents: usize) -> Result<(), String> {
         self.roles.clear();
         for i in 0..agents {
             let name = format!("agent-{i}");
-            if let Some(role) = crate::prompts::role_message(setting, &name, agents)? {
+            if let Some(role) = crate::prompts::role_message(mode, setting, &name, agents)? {
                 self.roles.insert(name, role);
             }
         }

@@ -231,8 +231,9 @@ impl Plan {
         let mut change_after = None;
         let setting = cfg.plan.integrator.as_deref().unwrap_or(crate::weave_mode::ANY_AGENT);
         if cfg.plan.project.is_some() && setting != crate::weave_mode::ANY_AGENT {
-            prompts.insert("role-integrator".into(), hash(crate::prompts::INTEGRATOR_ROLE.as_bytes()));
-            prompts.insert("role-builder".into(), hash(crate::prompts::BUILDER_ROLE.as_bytes()));
+            let (integrator, builder) = crate::prompts::roles(mode.name());
+            prompts.insert("role-integrator".into(), hash(integrator.as_bytes()));
+            prompts.insert("role-builder".into(), hash(builder.as_bytes()));
         }
         if let Some(project) = &cfg.plan.project {
             // A project's texts take the task's place: those agents are given, so a held change's not.
@@ -287,7 +288,16 @@ impl Plan {
                             crate::weave_mode::integrator_rule(setting)
                         )
                     };
-                    vec![("weave-integrator".to_string(), rule)]
+                    if mode.name() == crate::git_project::NAME {
+                        let rule = format!(
+                            "Task 6bd13d994a03: {} The hub makes an agent's own main its main only if that agent may \
+                             update main and it is a fast-forward of the hub's main.",
+                            crate::weave_mode::integrator_rule(setting)
+                        );
+                        vec![("git-integrator".to_string(), rule)]
+                    } else {
+                        vec![("weave-integrator".to_string(), rule)]
+                    }
                 }
                 (None, _) => rules(cfg.plan.accept_rule),
             },
