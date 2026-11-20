@@ -1,6 +1,6 @@
 # The process
 
-How an owner and a team of agents work on a repository that coordinates through a Bracken Ground. It's set up by [SKILL.md](SKILL.md). Each repo's `docs/development.md` gives its value for every `<placeholder>` here, plus its tool mapping. Section references ("section 9.4") are to this file.
+How an owner and a team of agents work on a repository that coordinates through a Bracken Ground. It's set up by [SKILL.md](SKILL.md). It's the kickoff template: in a running team, agents follow the repo's `AGENTS.md`, which carries the rules below that apply day to day, and this file isn't on their reading path. Each repo's `docs/development.md` gives its value for every `<placeholder>` here, plus its tool mapping. Section references ("section 9.4") are to this file.
 
 ## 1. Goal
 
@@ -37,7 +37,7 @@ Agents act alone only on what can't reach users, can't cost money and doesn't to
 
 **Ask first:** merging anything that publishes or deploys (batch these so the owner approves several at once); releases and publishing; billed builds, manual deploys, access or permission changes; `<project-specific gated actions>`; **upgrading the pinned `bracken` binary when the change touches the protocol or storage format**; major process changes, or ones that touch an outside system, send data somewhere new, cost money, add tools, services or schedules, or change how agents work with the owner.
 
-**Delegation.** The owner may delegate their go to the manager for everything but a list of sensitive or destructive actions (the project's list is in `docs/development.md`). The manager then decides the "ask first" items itself and records each such decision as a claim tagged `owner-review` (what, why, how to undo), and reports them to the owner at the next check-in to agree or reverse. A check-in happens when the owner returns or asks: the manager lists `scripts/bk log --tag owner-review --current` and records each answer (section 4.1).
+**Delegation.** The owner may delegate their go to the manager for everything but a short list of sensitive or destructive actions (the project's list is in `AGENTS.md`): there, the owner runs `scripts/owner-approve` themself; the manager never signs as owner. The manager then decides the "ask first" items itself and records each such decision as a claim tagged `owner-review` (what, why, how to undo), and reports them to the owner at the next check-in to agree or reverse. A check-in happens when the owner returns or asks: the manager lists `scripts/bk log --tag owner-review --current` and records each answer (section 4.1).
 
 **Builders and reviewers ask the manager** for any approval, never the owner: a `question` claim, then a message. The manager answers within the delegation, and raises an `owner-ask` only for the owner's list.
 
@@ -171,10 +171,10 @@ Spend the quota you have most of. Default model for the manager, builders and se
 
 The manager makes the builder's identity and its team token when it writes the `task` claim, before launching, so the builder's first write isn't refused and no server restart lands mid-task: with a team server that holds keys, `scripts/team-server key <identity>` (with the owner's approval of the identity), or an existing identity reused; otherwise `scripts/bk id new builder-<branch>` and `scripts/team-server token <identity>`. Either restarts the server, so never while a counted run or merge is in progress. `scripts/team-server ready <identity>`, which only reads, must then say it's ready to launch. The manager contributes the `task` claim and uses **launch-builder** (base `main`, from origin). For stacked work, base on the parent branch, not from origin. Use **delegate** instead for short child work whose answer the manager needs.
 
-**Brief a builder like a peer who knows nothing yet.** Agents most often fail by not knowing when to stop, drifting from the task and guessing instead of asking. The brief goes in the `task` claim, using this template. The launch message is just: "Role: builder. Read docs/builder.md, then `scripts/bk show <task id>`."
+**Brief a builder like a peer who knows nothing yet.** Agents most often fail by not knowing when to stop, drifting from the task and guessing instead of asking. The brief goes in the `task` claim, using this template. The launch message is just: "Role: builder. Read AGENTS.md, then `scripts/bk show <task id>`."
 
 ```
-Role: builder. Read docs/builder.md first.
+Role: builder. Read AGENTS.md first.
 Identity: builder-<branch>   Manager thread: <id>
 Objective: <one or two sentences: the outcome, not the steps>
 Read first: <files, docs, and Ground ids: decisions, notes, earlier tasks>
@@ -252,21 +252,21 @@ When something costs time, gets lost, needs the owner when it shouldn't, or near
 - Everyone proposes via `process` claims. The manager decides, and records a `decision` that `supports` or `contradicts` the proposal.
 - **Small changes** (wording, a missing step, a checklist item, a better brief, a lint rule, a gotcha or preference claim, a local script): the manager makes them, merges them (they deploy nothing) and mentions them in its next update.
 - **Bigger changes:** a short proposal to the owner: problem, change, cost, and which numbers (below) it should move.
-- **Every process decision**, small or big, names the number it should move, in one line of its `decision` claim, written before it takes effect. About two weeks later the manager records a claim that `refines` the decision with what moved, and proposes reverting it if nothing did.
+- **Every process change is a time-boxed experiment:** a claim tagged `experiment` with `rule:`, `metric:` (a key `scripts/metrics` computes), `baseline:`, `target:` and `expires:` (14 days by default, at most 28). At expiry it lapses, and `scripts/merge` says so, unless a manager `decision` citing the metrics that show the target met `supports` it. One rule in, one rule out: `AGENTS.md` stays under its size limit.
 - Process claims about one recurring problem `refine` the first claim about it, so the problem's history is one `scripts/bk show` away.
 
 ### Keeping the skill current
 
 The skill is the team's process, and the owner wants it to match where development actually is at all times. Anyone kicking off a new team from it should get today's setup, not last month's. So:
 
-- `process.md` (this file) is the only copy of the process. A repo's `docs/development.md` holds only that repo's values and links here; it never copies the process.
-- **Every change to how the team works updates the skill in the same PR:** `process.md` for the process, `SKILL.md` for kickoff steps, `templates/` for installed files. The PR description says which.
+- `process.md` (this file) is the kickoff template. A repo's `AGENTS.md` holds the rules its agents follow day to day, and its `docs/development.md` only its live settings.
+- **Every change to how the team works updates the skill in the same PR:** `process.md` for the process, `SKILL.md` for kickoff steps, `templates/` for installed files, and the repo's `AGENTS.md` where it carries the rule. The PR description says which.
 - Lessons that would help any project (a gotcha in the kickoff steps, a better default) go into the skill too, not only into one repo's Ground.
 - Before merging any `process`-class PR, the manager checks that the skill and the repo agree: no doc, template or AGENTS.md rule contradicts `process.md`.
 
 ### Measuring
 
-Judge the process by results, not by whether steps were followed. Every week, the manager (or a scheduled run reporting to it) contributes a claim tagged `metrics` with the week's row:
+Judge the process by results, not by whether steps were followed. Every week, the manager records `scripts/metrics`' output (`scripts/bk claim "$(scripts/metrics)" --tag metrics --as <you>`): PRs merged, reverts and follow-up fixes, real and rejected findings per PR, review rounds per PR, gate misfires, owner asks, and each experiment's days left. Its header defines each number. The original row was:
 
 | Week | PRs merged | Reverts / follow-up fixes | Problems that reached users | Owner asks (gated / other) | Review findings (real / rejected) | Ground conflicts (opened / settled) | Notes |
 |---|---|---|---|---|---|---|---|

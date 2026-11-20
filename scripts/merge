@@ -57,7 +57,7 @@
 #      tagged owner-review, by manager, not retracted or superseded (as in 1), whose first line names the pr
 #      claim's full id and the head's full sha; an 'owner:' path (a golden vector, a pinned fixture value,
 #      tests/fixtures/) also needs the owner's own go (question 3): a current approval the owner ran with
-#      scripts/owner-approve, not --delegated, of the pr claim's full id, that owner related supports the
+#      scripts/owner-approve (not tagged delegated) of the pr claim's full id, that owner related supports the
 #      claim (the claim names the sha); a 'security:' path (the directories of the freeze's refusals,
 #      section 1.8) needs a pass by reviewer, not retracted, on the claim, 'independent review (<model>)
 #      @ <sha>'. Each refusal names the paths and what's missing. Only frozen's exit 3 and its one line mean
@@ -71,12 +71,17 @@
 #      and an addition, so one out of it counts too; a head that doesn't merge cleanly fails) needs a current
 #      manager pass on the pr claim whose method starts 'research docker tests' and ends ' @ <sha>': the
 #      by-hand run on the Mac with Docker running (docs/development.md). Any other head passes this check;
-#   7. with --owner-approval, for a PR whose class needs the owner's go (docs/development.md, Owner
-#      approvals): a current claim tagged approval (not superseded, as in 1), written by owner (scripts/owner-approve), that owner
-#      related supports this pr claim itself, by its full id. An approval of a task, another PR or an
-#      earlier head doesn't count (findings 9e8e0c849724, fb07d1777cf6): each head needs its own. A
-#      manager-signed quote doesn't count. In v0 keys are shared, so this checks recorded intent, not
-#      proof (task ec880b9c2c86).
+#   7. with --owner-approval, for a PR whose class needs the owner's go (AGENTS.md, Safety): a current
+#      claim tagged approval (not superseded, as in 1), written by owner with scripts/owner-approve, so not
+#      tagged delegated, that owner related supports this pr claim itself, by its full id. An approval of a
+#      task, another PR or an earlier head doesn't count (findings 9e8e0c849724, fb07d1777cf6): each head
+#      needs its own. A manager-signed quote doesn't count, nor does an approval the manager signed on the
+#      owner's delegation (--delegated is gone, task 9b65c13e9d66). In v0 keys are shared, so this
+#      checks recorded intent, not proof (task ec880b9c2c86).
+# Before the checks, it prints one 'note  experiments' line naming every expired experiment (a current claim
+# tagged experiment, AGENTS.md, Process changes and experiments) that no current manager decision supports:
+# its rule has lapsed. It expires on its 'expires: <YYYY-MM-DD>' line, or 14 days after it was written if it
+# has none, and never later than 28 days after. The line never blocks the merge (task 9b65c13e9d66).
 # A batch pass (scripts/verify-seq --batch, decision db6f7705c0a4) is a manager pass whose method is
 # 'scripts/test-table[ --split] @ <sha> batch <batch claim> on <main> tree <key> run <evidence>'. It
 # counts only if the batch claim is a current manager claim tagged batch that lists this PR, claim and
@@ -225,6 +230,33 @@ if [ -f "$main/.bracken-team" ]; then
 else
   echo "team server: none set up (no .bracken-team); reading the local replica"
 fi
+
+# Expired experiments (see the header): one line, never a failed check.
+expired_experiments() {
+  local exps today lapsed=() e about
+  exps=$(bk log --tag experiment --current --json 2>/dev/null) || { echo "couldn't read the experiment claims"; return; }
+  today=$(date -u +%Y-%m-%d)
+  for e in $(jq -r --arg today "$today" "$live"'
+    .[] | select(.kind == "claim" and live and (.body.tags | index("experiment")))
+    | (.timestamp_ms / 1000 | floor) as $start
+    | ([(.body.statement // "") | match("(?m)^expires:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]*$") | .captures[0].string]
+        | first // null) as $given
+    | ([if $given then ($given + "T00:00:00Z" | fromdateiso8601) else $start + 14 * 86400 end, $start + 28 * 86400]
+        | min | todate[0:10]) as $ends
+    | select($ends < $today) | "\(.id):\($ends)"' <<<"$exps"); do
+    # Kept: a current manager decision supports it (its statement cites the metrics that met the target).
+    about=$(bk show "${e%%:*}" --json 2>/dev/null) || about='{"referrers": []}'
+    jq -e --argjson decisions "$(bk log --tag decision --current --json 2>/dev/null || echo '[]')" "$live"'
+      ([$decisions[] | select(.kind == "claim" and .author_name == "manager" and live) | .id]) as $d
+      | any(.referrers[]; .kind == "relation" and .retracted == false and .author_name == "manager"
+        and .body.kind == "supports" and (.body.from as $f | any($d[]; . == $f)))' <<<"$about" >/dev/null ||
+      lapsed+=("${e:0:12} (ended ${e##*:})")
+  done
+  [ ${#lapsed[@]} -eq 0 ] ||
+    echo "expired, so their rules have lapsed unless a manager decision citing the metrics supports them: ${lapsed[*]}"
+}
+experiments=$(expired_experiments)
+[ -z "$experiments" ] || printf '%-4s  %-12s %s\n' note experiments "$experiments"
 
 origin=$(git -C "$main" config --get remote.origin.url)
 # Not printed: an origin URL can carry a password.
@@ -683,7 +715,7 @@ else
     fi
     if [ -n "$owner_paths" ]; then
       approvals=$(bk log --tag approval --current --json) || fail "couldn't read the current approvals"
-      # The owner's own go (question 3): one the owner ran, never one signed on the owner's delegation,
+      # The owner's own go (question 3): one the owner ran, never one tagged delegated,
       # naming this pr claim and supporting it by the owner's own relation. The claim names the sha.
       approval=''
       for a in $(jq -r --arg t "$full" '.referrers[] | select(.kind == "relation" and .retracted == false
@@ -700,7 +732,7 @@ else
       if [ -n "$approval" ]; then
         have+=("the owner's approval ${approval:0:12}")
       else
-        missing+=("$owner_paths: no current approval the owner ran (scripts/owner-approve $full, not --delegated) that names and supports pr claim $full at $sha")
+        missing+=("$owner_paths: no current approval the owner ran (scripts/owner-approve $full) that names and supports pr claim $full at $sha")
       fi
     fi
     if [ -n "$security_paths" ]; then
@@ -770,11 +802,10 @@ if $owner_approval; then
   approved=""
   for a in $(jq -r --arg t "$full" '.referrers[] | select(.kind == "relation" and .retracted == false
     and .author_name == "owner" and .body.kind == "supports" and .body.to == $t) | .body.from' <<<"$shown"); do
-    if jq -e --arg a "$a" "$live"' any(.[]; .id == $a and .author_name == "owner" and live)' <<<"$approvals" >/dev/null; then
+    if jq -e --arg a "$a" "$live"' any(.[]; .id == $a and .author_name == "owner" and live
+      and ((.body.tags | index("delegated")) | not))' <<<"$approvals" >/dev/null; then
       approved="${a:0:12} supports the pr claim"
       ignored_supersedes "$approvals" "$a" "the owner's approval"
-      ! jq -e --arg a "$a" 'any(.[]; .id == $a and (.body.tags | index("delegated")))' <<<"$approvals" >/dev/null ||
-        approved="$approved, signed by the manager on the owner's delegation"
       break
     fi
   done
@@ -782,7 +813,7 @@ if $owner_approval; then
     owner_case="owner-signed approval $approved"
     check ok owner "$owner_case"
   else
-    check FAIL owner "no current owner-signed approval supports pr claim $claim itself (one of a task or an earlier head doesn't count); the owner signs one with scripts/owner-approve $claim \"<what>\" (a manager-signed quote doesn't count)"
+    check FAIL owner "no current approval the owner ran supports pr claim $claim itself (one of a task or an earlier head doesn't count); the owner signs one with scripts/owner-approve $claim \"<what>\" (a manager-signed quote or a delegated approval doesn't count)"
   fi
 fi
 

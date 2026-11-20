@@ -14,7 +14,7 @@ Each step past `main` needs the owner's go, recorded in the Ground as a claim `-
 
 ## Release path by change class
 
-The classes and the risky ones are defined in [development.md](development.md). Any PR the manager authored also needs the independent review (process section 4.2).
+The classes and the risky ones are defined in [development.md](development.md). Any PR the manager authored also needs the independent review (AGENTS.md, section 5).
 
 | Class | Review | Extra steps |
 |---|---|---|
@@ -30,13 +30,16 @@ The classes and the risky ones are defined in [development.md](development.md). 
 
 ## Needs the owner's go
 
-The owner delegated everything else to the manager (decision `adcb78b88c6c`), including protocol-class merges and pinned-binary upgrades, which the manager logs as `owner-review` claims. Still the owner's go:
+Only these need the owner's own approval, which the owner signs with `scripts/owner-approve` in a terminal (AGENTS.md, section 1; task `9b65c13e9d66`, owner decision `c8bbb2886be3`):
 
-- Publishing crates; changing the repository's visibility; licence changes.
-- Granting access to `wrnu/manyroot`; changing branch protection.
-- Deleting or rewriting history or data: force-push, deleting branches others use, removing Ground files.
-- Creating, exposing or moving credentials and secrets.
-- Spending money; new outside services, infrastructure or schedules; sending data somewhere new.
+- A frozen-format change (a golden vector, a pinned fixture value, `crates/tree/tests/fixtures/`), or the join cutover.
+- Model runs or spending beyond an approved budget; a new paid service or a schedule.
+- Which models or providers agents run on.
+- A new repository.
+- Repository visibility, licence, branch protection, access, or publishing (crates or otherwise).
+- Destructive history, data or key actions: force-pushing `main`, deleting or rewriting Ground objects, moving root or owner keys.
+
+Everything else, protocol-class merges and pinned-binary upgrades included, the manager decides and records as a claim tagged `decision` (and, for a protocol change, an `owner-review` claim naming the `pr` claim and head, which `scripts/merge` checks).
 
 ## Test reports
 
@@ -72,6 +75,21 @@ If the new binary can't open the Ground, reinstall the previous commit's binary 
 Each protocol or storage change adds an entry here: what changed, whether existing Grounds still open, and if not, how to carry them forward. Re-encoding a contribution changes its id, so it has to be signed again, and that needs its author's private key. Without the keys, old contributions stay readable only by a binary that still understands the old format. So a protocol change either keeps reading the old format, or migrates while every key still exists.
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
+
+### 2026-11-19: one AGENTS.md, no delegated approvals, process changes as experiments (task 9b65c13e9d66)
+
+Process and merge-gate tooling, no format, record or fixture change; every Ground opens and reads as before,
+and the pinned binary needn't change.
+- **AGENTS.md** is the one doc agents follow, at most 12 KB (`crates/bracken/tests/agents_md.rs`).
+  `docs/builder.md` is a pointer; the old `docs/development.md` and builder card are in `docs/archive/`, and
+  `docs/development.md` keeps only live settings.
+- **`scripts/owner-approve --delegated` is gone**, refused with a message. `scripts/merge --owner-approval`
+  and its frozen check count only an approval the owner ran: one tagged `delegated` no longer counts for a
+  merge. Earlier delegated approvals stay as records.
+- **Experiments and metrics.** `scripts/metrics` (read-only) prints the week's metrics claim for the manager
+  to record; `scripts/merge` prints a `note  experiments` line naming lapsed experiments, never failing.
+- **Migration:** none. The manager stops passing `--delegated`; a gated action waits for the owner to run
+  `scripts/owner-approve`. After the merge, builders read AGENTS.md (briefs say "Read AGENTS.md first").
 
 ### 2026-11-19: removing a Weave integrator ends their stop, and a replayed fail a pass replaced may be overridden (task e2ab087e8d3e)
 

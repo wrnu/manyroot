@@ -718,8 +718,9 @@ fn a_failed_merge_call_retracts_the_gate_evidence_only_when_github_shows_the_pr_
 
 /// Task ec880b9c2c86: with --owner-approval, merge's owner check needs a current approval signed by owner
 /// that supports the pr claim itself. None, a manager-signed quote, a retracted one, one of a task the
-/// claim implements (finding 9e8e0c849724) or one borrowed from an earlier head through implements
-/// (finding fb07d1777cf6) fails; without the flag there's no owner check.
+/// claim implements (finding 9e8e0c849724), one borrowed from an earlier head through implements
+/// (finding fb07d1777cf6) or one tagged delegated (task 9b65c13e9d66) fails; without the flag there's no
+/// owner check.
 #[test]
 fn merge_with_owner_approval_needs_an_owner_signed_approval_of_the_pr_claim_itself() {
     for scripts in SCRIPTS {
@@ -771,7 +772,55 @@ fn merge_with_owner_approval_needs_an_owner_signed_approval_of_the_pr_claim_itse
         let delegated = bk(&dir, &[&["claim", "Approval (owner, delegated): merge #1"][..], &tags].concat());
         bk(&dir, &["relate", &delegated, "supports", &claim, "--as", "owner"]);
         let (code, line) = owner(&mut merge);
-        assert!(code == Some(0) && line.contains("on the owner's delegation"), "{scripts}: {line}");
+        assert!(code == Some(1) && line.starts_with("FAIL"), "{scripts}: a delegated approval counted: {line}");
+    }
+}
+
+/// Task 9b65c13e9d66: before its checks, merge prints one `note  experiments` line naming each current
+/// experiment past its `expires:` date that no current manager decision supports, and the line never fails
+/// the merge. One not yet expired, one with no `expires:` line (14 days from now), one the manager's
+/// current decision supports, and a retracted one aren't named; with none expired there's no line.
+#[test]
+fn merge_names_expired_experiments_without_failing() {
+    for scripts in SCRIPTS {
+        let change = |dir: &Path| std::fs::write(dir.join("code.txt"), "a change\n").unwrap();
+        let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, |_| {}, change, |_| {}, None);
+        let lines = |merge: &mut Command| {
+            let out = merge.output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+            assert!(out.status.success(), "{scripts}: {stdout}{}", String::from_utf8_lossy(&out.stderr));
+            stdout
+                .lines()
+                .filter(|l| l.split_whitespace().nth(1) == Some("experiments"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(lines(&mut merge), Vec::<String>::new(), "{scripts}");
+        let experiment = |rule: &str, expires: Option<&str>| {
+            let mut text =
+                format!("Experiment (manager): {rule}\nrule: {rule}\nmetric: prs_merged\nbaseline: 3\ntarget: 5");
+            if let Some(date) = expires {
+                text += &format!("\nexpires: {date}");
+            }
+            bk(&dir, &["claim", &text, "--tag", "experiment", "--as", "manager"])
+        };
+        let lapsed = experiment("one PR a day", Some("2020-01-01"));
+        let kept = experiment("two reviewers", Some("2020-01-02"));
+        let gone = experiment("no reviews", Some("2020-01-03"));
+        bk(&dir, &["retract", &gone, "--as", "manager"]);
+        experiment("short briefs", Some("2099-01-01"));
+        experiment("no expiry given", None);
+        let decision =
+            bk(&dir, &["claim", "Decision (manager): kept, metrics met", "--tag", "decision", "--as", "manager"]);
+        bk(&dir, &["relate", &decision, "supports", &kept, "--as", "manager"]);
+        let found = lines(&mut merge);
+        assert_eq!(found.len(), 1, "{scripts}: {found:?}");
+        let named = format!("{} (ended 2020-01-01)", &lapsed[..12]);
+        assert!(found[0].starts_with("note") && found[0].contains(&named), "{scripts}: {found:?}");
+        for other in [&kept, &gone] {
+            assert!(!found[0].contains(&other[..12]), "{scripts}: {found:?}");
+        }
+        assert_eq!(found[0].matches("(ended ").count(), 1, "{scripts}: the unexpired ones named: {found:?}");
     }
 }
 

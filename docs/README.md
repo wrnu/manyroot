@@ -6,8 +6,8 @@
 | [protocol.md](protocol.md) | The Manyroot protocol, version 1 draft |
 | [cli.md](cli.md) | Every `bracken` command: recording work, reading state, the web view, sync, intents, Weave (moved from the README) |
 | [demo.md](demo.md) | The agent demo harness: how to run it and what its report measures |
-| [development.md](development.md) | This repo's values for the team process: profile, models, risky classes, tool mapping, remotes and GitHub commands. The process itself is [process.md](../.claude/skills/agent-team-kickoff/process.md) |
-| [builder.md](builder.md) | One-page role card for builders |
+| [development.md](development.md) | This repo's live settings: profile, models, risky classes, the owner-approval list, tool mapping, team server, remotes and GitHub commands. The rules agents follow are [AGENTS.md](../AGENTS.md) |
+| [archive/](archive/) | History only, not followed: the old [development.md](archive/development.md) and builder role card ([builder.md](archive/builder.md)), archived 2026-11-19 |
 | [design/eval-suite.md](design/eval-suite.md) | Proposal (2026-10-30): an evaluation suite of Python projects (spec, seed, hidden tests, golden solution) to test Bracken and Weave as a development system; full traces, metrics decided after exploratory pilots, isolation, a cost estimate |
 | [design/agents.md](design/agents.md) | Decided (2026-10-30): how agents relate to Bracken and Weave: Bracken owns the record and the work queue, harnesses launch agents, `bracken watch`, CLI first, and the experiment crate repurposed to evaluate Weave configurations with Claude Code and Pi |
 | [design/weave-mode.md](design/weave-mode.md) | Design sketch (2026-10-30): Weave's model, content as immutable file versions and manifests, an agent integrator, and main and green as causal queries; the spec below is built from it |
