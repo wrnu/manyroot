@@ -22,13 +22,14 @@
 #   findings_real_per_pr, findings_rejected_per_pr
 #                         those over prs_merged (null when nothing merged)
 #   review_rounds_per_pr  for the PRs merged in the week, the mean count of their pr claims (heads) that
-#                         reviewer or security gave evidence on (null when nothing merged)
+#                         reviewer or security gave evidence on: claims with the PR's number and the merged
+#                         claim's branch, as numbers restarted on GitHub (null when nothing merged)
 #   gate_misfires         claims tagged misfire written in the week (the gate refused a good head or let
 #                         a bad one through), plus merge-gate passes retracted in the week
 #   owner_asks_gated, owner_asks_other
 #                         claims tagged approval / owner-ask written in the week
 #   experiments_active    current experiments not yet expired on --today
-#   builder_pass_minutes  for the pr claims written in the week whose head this checkout holds, the minutes
+#   builder_pass_minutes  for the builders' pr claims written in the week whose head this checkout holds, the minutes
 #                         from the head commit's committer time to the last pass its claim's author recorded
 #                         on it; the median (null when there are none)
 #
@@ -100,8 +101,17 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
     | map({key: .[0].body.target, value: (max_by(.timestamp_ms).body.verdict)}) | from_entries) as $triage
 | ($claims | map(select((.body.tags // []) | index("finding")) | select(inweek) | $triage[.id] // "untriaged")) as $findings
 | ($merged | length) as $n
+# PR numbers restarted at the move to GitHub (2026-11-04), so the heads of a merged PR are the pr claims with
+# its number and its branch: the branch of the latest such claim with a live merge-gate pass, else the latest.
+| ($all | map(select(.kind == "retract") | .body.target)) as $gone
 | ([$numbers[] as $num
-    | [$claims[] | select((.body.tags // []) | index("pr")) | select((.body.statement // "") | startswith("PR #\($num) "))
+    | [$claims[] | select((.body.tags // []) | index("pr"))
+        | ((.body.statement // "") | capture("^PR #(?<n>[0-9]+) (?<branch>[^ ]+) @ ") // null) as $m
+        | select($m != null and $m.n == $num) | . + {branch: $m.branch}] as $mine
+    | ([$mine[] | .id as $id | select(any($evidence[]; .body.target == $id and .author_name == "manager"
+          and ((.body.method // "") | startswith("merge gate @")) and (.id as $e | any($gone[]; . == $e) | not)))]
+        | max_by(.timestamp_ms) // ($mine | max_by(.timestamp_ms))) as $merged_claim
+    | [$mine[] | select(.branch == $merged_claim.branch)
         | .id as $id | select(any($evidence[]; .body.target == $id and (.author_name == "reviewer" or .author_name == "security")))]
     | length] | add // 0) as $rounds
 | ($decs | map(select(.kind == "claim" and .author_name == "manager" and .retracted == false) | .id)) as $decision_ids
@@ -115,6 +125,7 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
 | ([$claims[] | select(((.body.tags // []) | index("pr")) and inweek) | . as $pr
     | ((.body.statement // "") | capture("^PR #[0-9]+ [^ ]+ @ (?<sha>[0-9a-f]{40}):") | .sha) as $sha
     | select($head_time[$sha] != null)
+    | select(($pr.author_name // "") | startswith("builder"))
     | [$evidence[] | select(.body.target == $pr.id and .body.verdict == "pass" and .author_name == $pr.author_name
         and (.id as $i | any($retracted[]; . == $i) | not)) | .timestamp_ms] as $passes
     | select(($passes | length) > 0)

@@ -32,8 +32,10 @@ The classes and the risky ones are defined in [development.md](development.md). 
 
 Only these need the owner's own approval, which the owner signs with `scripts/owner-approve` in a terminal (AGENTS.md, section 1; task `9b65c13e9d66`, owner decision `c8bbb2886be3`):
 
-- A frozen protocol or format change, or the join cutover.
-- Spending beyond an approved budget; a new paid service or a schedule.
+- A frozen-format change (a golden vector, a pinned fixture value, `crates/tree/tests/fixtures/`), or the join cutover.
+- Model runs or spending beyond an approved budget; a new paid service or a schedule.
+- Which models or providers agents run on.
+- A new repository.
 - Repository visibility, licence, branch protection, access, or publishing (crates or otherwise).
 - Destructive history, data or key actions: force-pushing `main`, deleting or rewriting Ground objects, moving root or owner keys.
 

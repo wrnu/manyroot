@@ -10,7 +10,8 @@ fn date_from_now(days: i64) -> String {
 
 /// A throwaway Ground and main line with one of everything metrics counts, all from this week: two merged
 /// PRs (one a fix) and a revert on main; a real, a rejected and an untriaged finding; PR #1 reviewed at two
-/// heads and PR #2 at one; a misfire claim and a retracted merge-gate pass; an approval and an owner ask;
+/// heads, PR #2 at one and a Forge-era claim reusing #2's number on another branch at one more, which doesn't
+/// count; a misfire claim and a retracted merge-gate pass; an approval and an owner ask;
 /// five experiments; and two heads whose builder's last passes came 30 and 10 minutes after their commits,
 /// a median of 20. With --today a week ahead, the week counted is this one. It counts each, lists the
 /// experiments with their days left (one with no expires line ends 14 days after it was written, one asking
@@ -32,6 +33,9 @@ fn metrics_counts_the_week_and_the_experiments_and_writes_nothing() {
     let evidence = |on: &str, verdict: &str, method: &str, who: &str| {
         bk(&dir, &["evidence", on, verdict, "--method", method, "--as", who])
     };
+    // A Forge-era claim reusing PR #2's number, on another branch, reviewed twice: it isn't PR #2's head. PR #2's
+    // own head is told apart by its branch, read from its claim with the merge-gate pass.
+    let forge = claim("PR #2 old-forge-branch @ 9999: before the move", "pr", "builder");
     let first = claim("PR #1 a @ 0000: a thing", "pr", "builder");
     let second = claim("PR #1 a @ 1111: a thing", "pr", "builder");
     let fix = claim("PR #2 c @ 2222: a fix", "pr", "builder");
@@ -39,6 +43,9 @@ fn metrics_counts_the_week_and_the_experiments_and_writes_nothing() {
     evidence(&first, "fail", "independent review (m) @ 0000", "reviewer");
     evidence(&second, "pass", "independent review (m) @ 1111", "reviewer");
     evidence(&fix, "pass", "security review (m) @ 2222", "security");
+    evidence(&fix, "pass", "merge gate @ 2222", "manager");
+    evidence(&forge, "fail", "independent review (m) @ 9999", "reviewer");
+    evidence(&forge, "pass", "security review (m) @ 9999", "security");
     for (verdict, n) in [(Some("pass"), 1), (Some("fail"), 2), (None, 3)] {
         let finding = claim(&format!("Finding {n}"), "finding", "reviewer");
         if let Some(v) = verdict {
