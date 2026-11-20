@@ -222,11 +222,19 @@ impl ContributionContent {
     }
 }
 
-/// On-disk and on-wire form.
-#[derive(Serialize, Deserialize)]
+/// On-disk and on-wire form, as read.
+#[derive(Deserialize)]
 struct WireContribution {
     content: ContributionContent,
     signature: Signature,
+}
+
+/// [`WireContribution`] as written, borrowing the contribution it encodes. Serde writes a reference as
+/// the value it points at, so this encodes to the same bytes without copying the content.
+#[derive(Serialize)]
+struct WireContributionRef<'a> {
+    content: &'a ContributionContent,
+    signature: &'a Signature,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -234,6 +242,23 @@ pub struct Contribution {
     id: ContributionId,
     content: ContributionContent,
     signature: Signature,
+    /// The length of [`Contribution::encode`]'s bytes, worked out once: the bytes read, or counted when
+    /// the contribution was made. It follows from the other fields, so it never changes what's equal.
+    encoded_len: usize,
+}
+
+/// A writer that only counts what it's given.
+struct Counter(usize);
+
+impl std::io::Write for Counter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -259,7 +284,7 @@ impl Contribution {
         let content = ContributionContent::assemble(ground, identity.agent_id(), parents, timestamp_ms, body);
         let id = content.id();
         let signature = identity.sign(&id);
-        Contribution { id, content, signature }
+        Contribution::assembled(id, content, signature)
     }
 
     /// [`Contribution::create`] through any [`Signer`], such as one whose key is held elsewhere. Fails if
@@ -274,15 +299,28 @@ impl Contribution {
         let content = ContributionContent::assemble(ground, signer.agent_id(), parents, timestamp_ms, body);
         let id = content.id();
         let signature = signer.sign_content(&content, &id)?;
-        let c = Contribution { id, content, signature };
+        let c = Contribution::assembled(id, content, signature);
         if !c.signature_is_valid() {
             return Err(SignError("the signer returned a signature that doesn't verify under its author key".into()));
         }
         Ok(c)
     }
 
+    /// A contribution from its parts, its encoded length counted without keeping the bytes.
+    fn assembled(id: ContributionId, content: ContributionContent, signature: Signature) -> Contribution {
+        let mut counter = Counter(0);
+        ciborium::into_writer(&WireContributionRef { content: &content, signature: &signature }, &mut counter)
+            .expect("counting bytes cannot fail");
+        Contribution { id, content, signature, encoded_len: counter.0 }
+    }
+
     pub fn id(&self) -> ContributionId {
         self.id
+    }
+
+    /// The length of [`Contribution::encode`]'s bytes, without encoding it again.
+    pub fn encoded_len(&self) -> usize {
+        self.encoded_len
     }
 
     pub fn content(&self) -> &ContributionContent {
@@ -314,8 +352,8 @@ impl Contribution {
     }
 
     pub fn encode(&self) -> Vec<u8> {
-        let wire = WireContribution { content: self.content.clone(), signature: self.signature };
-        let mut bytes = Vec::new();
+        let wire = WireContributionRef { content: &self.content, signature: &self.signature };
+        let mut bytes = Vec::with_capacity(self.encoded_len);
         ciborium::into_writer(&wire, &mut bytes).expect("writing to a Vec cannot fail");
         bytes
     }
@@ -327,7 +365,12 @@ impl Contribution {
             return Err(DecodeError::TooLarge(bytes.len()));
         }
         let wire: WireContribution = ciborium::from_reader(bytes).map_err(|e| DecodeError::Malformed(e.to_string()))?;
-        let c = Contribution { id: wire.content.id(), content: wire.content, signature: wire.signature };
+        let c = Contribution {
+            id: wire.content.id(),
+            content: wire.content,
+            signature: wire.signature,
+            encoded_len: bytes.len(),
+        };
         // Exactly one byte string per contribution: no trailing data and no
         // alternative CBOR encodings of the same value.
         if c.encode() != bytes {

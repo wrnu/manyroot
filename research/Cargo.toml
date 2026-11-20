@@ -1,0 +1,34 @@
+# The research workspace (owner decision c8bbb2886be3, Neon recommendation 3a): the experiment runner,
+# the demo and the query lab, kept out of the product workspace so `cargo test --workspace` at the root
+# never builds them. They reach the product crates by path. Their tests that run the `bracken` binary
+# find it beside their own binaries: .cargo/config.toml here shares the root's target directory, so
+# build it first at the root (`cargo build --locked -p bracken`), as .github/workflows/research.yml does.
+[workspace]
+resolver = "3"
+members = ["demo", "experiment", "query-lab"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/wrnu/manyroot"
+
+[workspace.dependencies]
+manyroot = { path = "../crates/manyroot" }
+anyhow = "1"
+# The same exact pin as the root workspace's (decision bae92c497714).
+blake3 = "=1.8.7"
+clap = { version = "4", features = ["derive", "env"] }
+hex = "0.4"
+humantime = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"
+
+# The root workspace's profiles, which a sibling workspace doesn't inherit (owner decision 8ac9b0239d90,
+# task 489bfeb6b5af).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2

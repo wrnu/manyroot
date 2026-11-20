@@ -1,0 +1,27 @@
+# cargo-nextest's profiles for the research workspace, as the root's .config/nextest.toml has them for
+# the product crates (decision 4bf44934cb67): plain `cargo nextest run` and `cargo test` run every test,
+# and the `fast` profile leaves out the tests at 30 s or over in one measured run, each named exactly by
+# its test binary and its name. It runs 4 tests at a time (task c29555cbb440).
+
+[profile.fast]
+test-threads = 4
+default-filter = """
+not (
+    (binary_id(=bracken-experiment) & (
+        test(=metrics::tests::checkpoints_rank_every_mode_alike_from_its_shared_library)
+        | test(=bracken_mode::tests::concurrent_work_across_pages_is_listed_once)
+        | test(=metrics::tests::every_contract_case_is_judged_by_the_agents_working_copy_in_every_mode)
+        | test(=python::tests::docker::the_parent_never_acts_on_a_path_the_code_can_swap)
+        | test(=project_grader::tests::docker::agent_code_reads_no_hidden_test_imported_or_as_a_command)
+    ))
+    | (binary_id(=bracken-experiment::report) & (
+        test(=scripted_phase_two_moves_give_hand_checked_checkpoints_in_every_mode)
+        | test(=a_phase_two_mock_run_of_each_mode_is_graded_as_phase_two_and_releases_both_waves)
+    ))
+    | (binary_id(=bracken-experiment::core) & test(=a_git_mode_mock_run_goes_end_to_end_through_the_shim))
+    | (binary_id(=bracken-demo::adversary) & (
+        test(=crafted_rounds_in_wip_claims_count_as_the_round_they_arrive)
+        | test(=an_adversary_cannot_hide_others_fresh_wip_claims)
+    ))
+)
+"""

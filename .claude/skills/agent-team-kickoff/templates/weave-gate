@@ -18,7 +18,7 @@
 # 'off: <why>' and exits 1.
 #
 # record (verify-seq --weave, as manager): with the switch on, it computes M, git's merge of main (ON, by
-# default origin/main) with the head, as scripts/merge does (scripts/code-scope chain). It imports M into
+# default origin/main) with the head, as scripts/merge does (scripts/tree-scope chain). It imports M into
 # the Weave Ground as manifest H (weave-integrator), checks weave verify --git M --manifest H says equal,
 # and has weave-runner validate H for the checks with no result yet. If line main's current policy has
 # fmt, clippy, table and mac and weave green --manifest H says each is green, it records one manager
@@ -249,7 +249,7 @@ taken_over() {
 # merged <main> <sha>: prints '<commit> <key>' of git's merge, or returns 1 on a conflict.
 merged() {
   local line
-  line=$(cd "$main" && "$here/code-scope" chain "$1" "$2" 2>/dev/null | tail -n 1) || return 1
+  line=$(cd "$main" && "$here/tree-scope" chain "$1" "$2" 2>/dev/null | tail -n 1) || return 1
   [[ $line =~ ^1\ ([0-9a-f]{40})\ ([0-9a-f]{40,64})$ ]] || return 1
   echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
 }

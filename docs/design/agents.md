@@ -25,7 +25,7 @@ does that, and talks to Bracken only through the CLI.
 Two reasons:
 - **Harnesses differ most at launch:** auth, sandboxes, models, costs and
   permissions. Owning launch would tie Bracken to every harness's quirks,
-  which is the coupling `crates/experiment/src/claude.rs` already shows.
+  which is the coupling `research/experiment/src/claude.rs` already shows.
 - **The CLI is already neutral.** Anything that can run a command and read
   JSON can take part today. Keeping it the only door keeps one surface to
   test, review and secure.
@@ -122,7 +122,7 @@ secure.
 
 ## Evaluating configurations
 
-`crates/experiment` is repurposed, not retired. It keeps what was hard to
+`research/experiment` is repurposed, not retired. It keeps what was hard to
 build:
 - the sandbox and fixed environment per agent;
 - token accounting, caps and fail-closed handling;
@@ -134,7 +134,7 @@ task under different Weave configurations (who integrates, guardrails,
 windows, which head agents build on, test cadence) and compares them.
 
 The backend is an interface: start a turn with a prompt and an
-environment, stream events, report usage, stop. `crates/experiment/src/backend.rs`
+environment, stream events, report usage, stop. `research/experiment/src/backend.rs`
 holds it. A `Harness` declares its pinned program, its turn configuration
 and the environment entries it may add, and gives each turn's arguments and
 how to read its events. The backend owns the guarantees, the same for every
@@ -151,7 +151,7 @@ The owner's order (decision `adf43778c85d`):
 1. Finish the Weave build steps already planned (weave.md section 6).
 2. `bracken watch`.
 3. This design note.
-4. Repurpose `crates/experiment`, with Pi as the second backend.
+4. Repurpose `research/experiment`, with Pi as the second backend.
 5. MCP, if it still seems worth it.
 
 Proposed, not yet placed in the order: the work queue view, and a generic

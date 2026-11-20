@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# tree-scope: which changes can't alter what builds or tests, and what Weave's format freeze guards, for
+# scripts/test-table, bk-evidence, verify-seq, weave-gate and merge (owner decision 642a47c04a10, task
+# a40bde8af77d). It holds what scripts/code-scope did apart from test scoping, which owner decision
+# c8bbb2886be3 retired (task bfc942cd7ced): a counted run is the docs-only fast path or the full table.
+#
+#   tree-scope docs-only <base> <head>
+#   tree-scope key <commit>
+#   tree-scope chain <main> <head>...
+#   tree-scope frozen <base> <head>
+#
+# Docs are the *.md files and everything under docs/, outside crates/ and research/ (they hold .md
+# files the code compiles in, such as the experiment's prompts, so those count as code), except
+# docs/protocol.md and docs/design/weave-freeze.md, which the protocol class and Weave's format freeze
+# rest on: those take the full table. .bracken/ is the Ground.
+#
+# docs-only exits 0 when what <head> changed since its merge base with <base> is at least one path,
+# and every path is docs. Renames count as a deletion and an addition, so renaming or deleting a
+# file that isn't docs is a code change. It exits 1, naming the first such path, otherwise, and 2 on
+# an error (no such commit, say): only 0 means docs-only.
+#
+# key prints a hash of <commit>'s tree without .bracken/ and docs. Two trees with the same key
+# differ only in the Ground and docs, so they build and test alike; the Ground guards, which read
+# both, must still run.
+#
+# chain prints the prefixes of a batch (decision db6f7705c0a4): P_0 = <main>, then P_i = P_(i-1)
+# merged with the i-th head, as git merge-tree computes it, which is the tree GitHub's squash merge
+# of that head onto P_(i-1) produces. One line each, '<i> <commit> <key>', for i = 0..n. The merge
+# commits are made with git commit-tree, nothing else refers to them, and no ref or worktree changes.
+# A head that doesn't merge cleanly onto its prefix stops it: exit 1, naming that head.
+#
+# frozen names what <head> changed since its merge base with <base> that Weave's format freeze guards
+# (docs/design/weave-freeze.md 2.4, G6; decision bae92c497714), for scripts/merge. The set is keyed on
+# directories, never on a list of modules, so a module split or a new file lands in it
+# by itself. One line for each, each with its reason, and exit 0 if it printed any. If none, it prints
+# 'tree-scope: nothing since <merge base> is frozen or holds the freeze's refusals' and exits 3, an answer
+# of its own, so a failure (exit 1 from set -e included) never reads as nothing to check; 2 on an error. A
+# changed path holding a newline or another control character is an error, named escaped on standard
+# error with nothing on standard output, since one couldn't be printed a line each (findings
+# db2dc1c6120e, e3f9ae2b1820). So is a changed path that differs only in ASCII case from another path in the
+# merged tree (<base> merged with <head>, as GitHub's squash merge makes it), naming both: a
+# case-insensitive checkout writes one over the other; a head that doesn't merge cleanly; and several
+# merge bases, a criss-cross history a diff from one can miss (findings 89119f47ba5c, bb7107f27076). Every
+# path is matched with its ASCII letters lowercased. A path holding any byte outside
+# printable ASCII is refused too, named escaped: APFS folds some non-ASCII letters onto ASCII ones (finding
+# 5b38ef3c9557), and main tracks no such path. frozen reads what <head> changed since the merge
+# base and every path that differs between <base> and the merged tree, since the merge carries a head's edit
+# onto a path main renamed (finding e1a2fe970409). A changed path that is a symlink or a gitlink in
+# the merged tree or <head> is refused too; main tracks neither. The
+# case check compares each path's leading directories as well (finding 304dd65b233c). Renames count as a deletion and an addition, and a change only in comments
+# counts too.
+#   'tree-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
+#     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, the committed pin
+#     .config/weave-root (docs/design/weave-marker.md, option A), and, as
+#     'tree-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
+#     crate the frozen formats rest on: unicode-normalization, icu_casemap, ciborium, blake3, imara-diff.
+#     merge asks for a current owner-review claim by manager naming the pr claim and the head.
+#   'tree-scope: owner: <path> (<why>)': a path that holds a golden vector or a pinned fixture value
+#     (format_guard.rs, weave_fixture.rs, tests/fixtures/), whose change needs the owner's own go
+#     (question 3): merge asks for an approval the owner ran, of the pr claim.
+#   'tree-scope: security: <path> (<why>)': a path in a directory that holds the refusals of the
+#     freeze's section 1.8, crates/tree/src/, crates/bracken/src/weave.rs and crates/bracken/src/weave/:
+#     merge asks for an independent review's pass at the head.
+#
+set -euo pipefail
+
+usage() {
+  echo "usage: tree-scope docs-only <base> <head> | tree-scope key <commit> | tree-scope chain <main> <head>... | tree-scope frozen <base> <head>" >&2
+  exit 2
+}
+
+# docs <path>: whether <path> is docs (see the header). Matched lowercased, as frozen matches, so
+# Docs/Protocol.md, which a case-insensitive checkout writes over docs/protocol.md, isn't docs either.
+docs() {
+  case "$(lower "$1")" in
+    crates/* | research/* | docs/protocol.md | docs/design/weave-freeze.md) return 1 ;;
+    *.md | docs/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# lower <path>: <path> with ASCII letters lowercased. frozen and docs match on it, since a case-insensitive
+# checkout (macOS's default) writes Crates/Tree/src/lib.rs over crates/tree/src/lib.rs (finding 89119f47ba5c).
+lower() { printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z'; }
+# bases <base> <head>: their merge bases, one a line; exit 2 if there's none.
+bases() { git merge-base --all "$1" "$2" || exit 2; }
+
+# merged_tree <tip> <head>: the tree GitHub's squash merge of <head> onto <tip> gives, as git merge-tree
+# computes it; fails on a conflict.
+merged_tree() {
+  local out
+  out=$(git merge-tree --write-tree --no-messages "$1" "$2" 2>/dev/null) || return 1
+  echo "${out%%$'\n'*}"
+}
+# changed_paths <tip> <head> <base> <merged> <file>: into <file>, NUL-separated and once each, what <head>
+# changed since <base>, and every path that differs between <tip> and <merged>: the merge detects renames on
+# main's side, so a head's edit can land on a path main moved, which the first diff never names (finding
+# e1a2fe970409).
+changed_paths() {
+  { git diff --no-renames --name-only -z "$3" "$2" && git diff --no-renames --name-only -z "$1" "$4"; } |
+    LC_ALL=C sort -uz >"$5"
+}
+# unprintable <path>: whether <path> holds a byte outside printable ASCII (0x20-0x7e): a control character,
+# or a letter a filesystem may fold onto another (APFS folds the long s onto s and the Kelvin sign onto k,
+# finding 5b38ef3c9557). main tracks no such path, so these are refused rather than folded.
+# The '.' keeps a newline left over: command substitution strips trailing newlines.
+unprintable() {
+  local rest
+  rest=$(printf '%s' "$1" | LC_ALL=C tr -d ' -~'; echo .)
+  [ "$rest" != . ]
+}
+# escaped <path>: <path> quoted for the shell, every byte outside printable ASCII escaped.
+escaped() { LC_ALL=C bash -c 'printf %q "$1"' _ "$1"; }
+
+# special_changed <changed file> <tree>...: each path in <changed file> (NUL-separated, printable ASCII by
+# then) that is a symlink (mode 120000) or a gitlink (160000) in any <tree>, one '<path> (<what>)' a line.
+# main tracks neither, and a symlink named as a case variant of a directory replaces that directory on a
+# case-insensitive checkout (finding 304dd65b233c), so both are refused rather than judged.
+special_changed() {
+  local changed=$1 t
+  shift
+  for t in "$@"; do git ls-tree -r -z "$t" || return 1; done | tr '\0' '\n' |
+    LC_ALL=C awk -F'\t' -v list="$changed" 'BEGIN { while ((getline l < list) > 0) ch[l] = 1 }
+      { split($1, m, " ") }
+      (m[1] == "120000" || m[1] == "160000") && ($2 in ch) && !(($2, m[1]) in said) {
+        said[$2, m[1]] = 1; print $2 " (" (m[1] == "120000" ? "a symlink" : "a gitlink") ")" }'
+}
+
+# What the format freeze guards (see frozen in the header). frozen_mode <path> prints why <path> is in the
+# frozen set, or returns 1; owner_mode why a change to it needs the owner's own go; security_mode why it
+# needs an independent review. Each keyed on directories.
+frozen_mode() {
+  case "$(lower "$1")" in
+    crates/tree/src/*) echo "crates/tree's source, which holds Weave's frozen formats and their rules" ;;
+    crates/tree/cargo.toml) echo "crates/tree's manifest: what its formats build from" ;;
+    crates/tree/tests/format_guard.rs) echo "the format guard: golden vectors and pins" ;;
+    crates/tree/tests/paths.rs) echo "the path, folding and collision rules' guard" ;;
+    crates/tree/tests/lines.rs) echo "the ancestor rule's guard" ;;
+    crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's test and its pinned values" ;;
+    crates/tree/tests/fixtures/*) echo "a Weave fixture" ;;
+    .config/weave-root) echo "the Weave Ground's committed pin: its id, and the root whose marker counts" ;;
+    *) return 1 ;;
+  esac
+}
+owner_mode() {
+  case "$(lower "$1")" in
+    crates/tree/tests/format_guard.rs) echo "golden vectors and pinned values: the owner's own go" ;;
+    crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's pinned values: the owner's own go" ;;
+    crates/tree/tests/fixtures/*) echo "a Weave fixture: the owner's own go" ;;
+    *) return 1 ;;
+  esac
+}
+security_mode() {
+  case "$(lower "$1")" in
+    crates/tree/src/*) echo "crates/tree's source, where the freeze's refusals at write and use live" ;;
+    crates/bracken/src/weave.rs | crates/bracken/src/weave/*) echo "Weave's CLI, where the freeze's refusals at use live" ;;
+    *) return 1 ;;
+  esac
+}
+# The crates whose Cargo.lock entries the frozen formats rest on: Unicode's tables and folding, the
+# encoding, the content hash, and the line merge.
+FROZEN_CRATES='unicode-normalization icu_casemap ciborium blake3 imara-diff'
+# lock_entry <commit> <crate>: <crate>'s [[package]] entries in <commit>'s Cargo.lock, blank if none.
+lock_entry() {
+  { git show "$1:Cargo.lock" 2>/dev/null || true; } | awk -v n="$2" 'BEGIN { RS = "" } $0 ~ "\nname = \"" n "\"\n" { print; print "" }'
+}
+# lock_versions <entries>: their versions, space-separated, or 'none'.
+lock_versions() {
+  local v
+  v=$(sed -n 's/^version = "\(.*\)"$/\1/p' <<<"$1" | tr '\n' ' ' | sed 's/ $//')
+  echo "${v:-none}"
+}
+
+case "${1:-}" in
+  frozen)
+    [ $# -eq 3 ] || usage
+    all_bases=$(bases "$2" "$3") || exit 2
+    if [ "$(wc -l <<<"$all_bases")" -gt 1 ]; then
+      echo "tree-scope: frozen: $(tr "\n" " " <<<"$all_bases" | sed "s/ \$//") are all merge bases of $2 and $3: a criss-cross history, which a diff from one of them can miss, so this can't say what's frozen" >&2
+      exit 2
+    fi
+    base=$all_bases
+    head=$(git rev-parse --verify -q "$3^{commit}") || exit 2
+    merged=$(merged_tree "$2" "$head") ||
+      { echo "tree-scope: frozen: $head doesn't merge cleanly onto $2, so the merged tree can't be checked" >&2; exit 2; }
+    changed=$(mktemp)
+    tree_paths=$(mktemp)
+    trap 'rm -f "$changed" "$tree_paths"' EXIT
+    changed_paths "$2" "$head" "$base" "$merged" "$changed" || exit 2
+    # Every path first, so a refusal prints nothing on standard output.
+    while IFS= read -r -d '' path; do
+      if unprintable "$path"; then
+        echo "tree-scope: frozen: a changed path holds a newline, another control character or a byte outside printable ASCII, so it's refused: $(escaped "$path")" >&2
+        exit 2
+      fi
+    done <"$changed"
+    lines=$(mktemp)
+    trap 'rm -f "$changed" "$tree_paths" "$lines"' EXIT
+    tr '\0' '\n' <"$changed" >"$lines"
+    special=$(special_changed "$lines" "$merged" "$head") || exit 2
+    if [ -n "$special" ]; then
+      echo "tree-scope: frozen: a changed path is a symlink or a gitlink, which main tracks none of, so it's refused: $(tr '\n' ';' <<<"$special" | sed 's/;$//; s/;/; /g')" >&2
+      exit 2
+    fi
+    # A changed path that differs only in ASCII case from another path in the merged tree: a case-insensitive
+    # checkout (macOS's default) writes one over the other (finding 89119f47ba5c), so refuse, naming both.
+    git ls-tree -r -z --name-only "$merged" | tr '\0' '\n' >"$tree_paths" || exit 2
+    # Each path and each of its leading directories (finding 304dd65b233c: a case variant of a directory
+    # replaces it): any two spellings with one lowercase form, one of them from a changed path, collide.
+    collisions=$(LC_ALL=C awk '
+      function add(p, touched,   n, i, part, pre, k) {
+        n = split(p, part, "/")
+        pre = ""
+        for (i = 1; i <= n; i++) {
+          pre = (i == 1) ? part[1] : pre "/" part[i]
+          k = tolower(pre)
+          if (touched) hit[k] = 1
+          if ((k, pre) in seen) continue
+          seen[k, pre] = 1
+          all[k] = (k in all) ? all[k] " and " pre : pre
+          count[k]++
+        }
+      }
+      NR == FNR { add($0, 1); next }
+      { add($0, 0) }
+      END { for (k in hit) if (count[k] > 1) print all[k] }' "$lines" "$tree_paths") || exit 2
+    if [ -n "$collisions" ]; then
+      echo "tree-scope: frozen: paths or directories differing only in case, which a case-insensitive checkout writes over each other: $(tr '\n' ';' <<<"$collisions" | sed 's/;$//; s/;/; /g')" >&2
+      exit 2
+    fi
+    found=false
+    while IFS= read -r -d '' path; do
+      if why=$(frozen_mode "$path"); then found=true; echo "tree-scope: frozen: $path ($why)"; fi
+      if why=$(owner_mode "$path"); then found=true; echo "tree-scope: owner: $path ($why)"; fi
+      if why=$(security_mode "$path"); then found=true; echo "tree-scope: security: $path ($why)"; fi
+      if [ "$path" = Cargo.lock ]; then
+        for crate in $FROZEN_CRATES; do
+          before=$(lock_entry "$base" "$crate")
+          after=$(lock_entry "$head" "$crate")
+          if [ "$before" = "$after" ]; then
+            before=$(lock_entry "$2" "$crate")
+            after=$(lock_entry "$merged" "$crate")
+          fi
+          [ "$before" != "$after" ] || continue
+          found=true
+          was=$(lock_versions "$before") now=$(lock_versions "$after")
+          if [ "$was" = "$now" ]; then
+            echo "tree-scope: frozen: Cargo.lock ($crate $was: its entry changed, and Weave's frozen formats rest on it)"
+          else
+            echo "tree-scope: frozen: Cargo.lock ($crate $was -> $now, and Weave's frozen formats rest on it)"
+          fi
+        done
+      fi
+    done <"$changed"
+    $found || { echo "tree-scope: nothing since $base is frozen or holds the freeze's refusals"; exit 3; }
+    ;;
+  docs-only)
+    [ $# -eq 3 ] || usage
+    base=$(git merge-base "$2" "$3") || exit 2
+    changed=$(mktemp)
+    trap 'rm -f "$changed"' EXIT
+    git diff --no-renames --name-only -z "$base" "$3" >"$changed" || exit 2
+    any=false
+    while IFS= read -r -d '' path; do
+      any=true
+      docs "$path" || { echo "tree-scope: not docs: $path"; exit 1; }
+    done <"$changed"
+    $any || { echo "tree-scope: no change since $base"; exit 1; }
+    echo "tree-scope: docs only since $base"
+    ;;
+  key)
+    [ $# -eq 2 ] || usage
+    tree=$(git rev-parse --verify -q "$2^{tree}") || { echo "tree-scope: no commit $2" >&2; exit 2; }
+    listing=$(mktemp)
+    trap 'rm -f "$listing"' EXIT
+    git ls-tree -r -z --full-tree "$tree" >"$listing" || exit 2
+    # Each entry is '<mode> <type> <object>\t<path>'; only the path decides what's left out.
+    while IFS= read -r -d '' entry; do
+      path=${entry#*$'\t'}
+      case "$path" in .bracken/*) continue ;; esac
+      docs "$path" && continue
+      printf '%s\0' "$entry"
+    done <"$listing" | git hash-object --stdin
+    ;;
+  chain)
+    [ $# -ge 3 ] || usage
+    self=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")
+    prefix=$(git rev-parse --verify -q "$2^{commit}") || { echo "tree-scope: no commit $2" >&2; exit 2; }
+    shift 2
+    echo "0 $prefix $("$self" key "$prefix")"
+    i=0
+    for head in "$@"; do
+      i=$((i + 1))
+      head=$(git rev-parse --verify -q "$head^{commit}") || { echo "tree-scope: no commit $head" >&2; exit 2; }
+      tree=$(git merge-tree --write-tree "$prefix" "$head" 2>/dev/null | head -n 1) && [ -n "$tree" ] ||
+        { echo "tree-scope: head $i, $head, doesn't merge cleanly onto the batch before it" >&2; exit 1; }
+      prefix=$(git -c user.name=tree-scope -c user.email=tree-scope@invalid commit-tree "$tree" -p "$prefix" -p "$head" \
+        -m "batch prefix $i") || exit 2
+      echo "$i $prefix $("$self" key "$prefix")"
+    done
+    ;;
+  *) usage ;;
+esac

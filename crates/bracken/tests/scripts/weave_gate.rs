@@ -234,9 +234,9 @@ impl Batch {
         self.command("scripts/merge", &args).output().unwrap()
     }
 
-    /// The key of git's merge of `main` with PR #n's head, as scripts/code-scope chain gives it.
+    /// The key of git's merge of `main` with PR #n's head, as scripts/tree-scope chain gives it.
     fn merge_key(&self, main: &str, n: usize) -> String {
-        let out = run(&self.dir, "scripts/code-scope", &["chain", main, &self.shas[n - 1]]);
+        let out = run(&self.dir, "scripts/tree-scope", &["chain", main, &self.shas[n - 1]]);
         let text = String::from_utf8(out.stdout).unwrap();
         text.lines().last().unwrap().split(' ').nth(2).unwrap().to_owned()
     }

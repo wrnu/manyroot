@@ -198,7 +198,7 @@ the working agents. The other three modes stay untouched, so their recorded
 runs stay valid as reference points, and none of this changes the Phase 2
 replicates.
 
-**Cost.** One builder PR in `crates/experiment` (an integrator over
+**Cost.** One builder PR in `research/experiment` (an integrator over
 Bracken mode's store, the `accepted` tool, tests and mock runs, no model
 calls), a day or two of builder time and the usual reviews. Then a 2×2
 calibration (about 0.6 M tokens) and a replicate. Four modes make a

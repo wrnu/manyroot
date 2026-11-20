@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
-members = ["crates/manyroot", "crates/bracken", "crates/demo", "crates/experiment", "crates/scope", "crates/tree", "crates/query-lab"]
+members = ["crates/manyroot", "crates/bracken", "crates/tree"]
+# The research crates are a sibling workspace of their own (research/Cargo.toml; owner decision c8bbb2886be3).
+exclude = ["research"]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,7 +16,7 @@ bracken-tree = { path = "crates/tree" }
 anyhow = "1"
 # Pinned exactly, as Weave's format freeze asks (decision bae92c497714, Q5; docs/design/weave-freeze.md):
 # blake3 is the content hash, ciborium the canonical encoding, icu_casemap and unicode-normalization
-# the folding paths are compared by. A bump changes Cargo.lock, which scripts/code-scope frozen names.
+# the folding paths are compared by. A bump changes Cargo.lock, which scripts/tree-scope frozen names.
 blake3 = "=1.8.7"
 ciborium = "=0.2.2"
 clap = { version = "4", features = ["derive", "env"] }

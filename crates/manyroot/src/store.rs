@@ -19,14 +19,15 @@
 //! any number of agent processes can write to one replica without locking:
 //! two processes writing concurrently just produce concurrent contributions.
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::contribution::{Body, Contribution, DecodeError};
+use crate::contribution::{Body, Contribution, DecodeError, MAX_CONTRIBUTION_BYTES};
+use crate::fsx::{self, Dir, Kind};
 use crate::graph::{Graph, ImportReport, RuleViolation};
 use crate::id::{AgentId, ContributionId, GroundId};
 use crate::identity::{self, Identity, IdentityError, SignError, Signer};
@@ -99,15 +100,21 @@ impl Store {
     /// Creates an empty replica of an existing Ground, e.g. before syncing.
     pub fn create(dir: &Path, info: GroundInfo) -> Result<Store, StoreError> {
         let manifest = dir.join("ground.json");
-        if manifest.exists() {
+        if fs::symlink_metadata(&manifest).is_ok() {
             return Err(StoreError::AlreadyExists(dir.to_owned()));
         }
+        fs::create_dir_all(dir).map_err(io(dir))?;
+        let root = open_root(dir)?;
         for sub in ["objects", "identities"] {
-            let p = dir.join(sub);
-            fs::create_dir_all(&p).map_err(io(&p))?;
+            root.sub_or_create(sub, 0o777).map_err(|e| fail(root.join(sub), e))?;
         }
         let json = serde_json::to_string_pretty(&info).expect("ground info serializes") + "\n";
-        fs::write(&manifest, json).map_err(io(&manifest))?;
+        match root.write_new("ground.json", json.as_bytes(), 0o666) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(StoreError::AlreadyExists(dir.to_owned()));
+            }
+            other => other.map_err(|e| fail(manifest, e))?,
+        }
         Ok(Store { dir: dir.to_owned(), graph: Graph::new(info.ground), info })
     }
 
@@ -137,12 +144,12 @@ impl Store {
     /// The caller then opens with [`Store::open`], which reports what's really wrong, if anything.
     pub fn open_trusting(dir: &Path, trusted: Vec<Contribution>) -> Result<Store, StoreError> {
         let info = read_info(dir)?;
-        let files = object_files(dir)?;
+        let (objects, files) = object_files(dir)?;
         let mut graph = Graph::new(info.ground);
         let mut batch = Vec::new();
         if trusted.is_empty() {
-            for (path, _) in files {
-                batch.push(read_object(dir, path)?);
+            for (path, regular) in files {
+                batch.push(read_regular_object(objects.as_ref(), dir, path, regular)?);
             }
         } else {
             // Name every object by the id its file name spells, only in its canonical (lowercase)
@@ -180,10 +187,11 @@ impl Store {
                 seen.insert(id);
                 pool.insert(id, (c, true));
             }
-            let mut rest: Vec<(ContributionId, PathBuf)> = on_disk.into_iter().map(|(id, (p, _))| (id, p)).collect();
+            let mut rest: Vec<(ContributionId, PathBuf, bool)> =
+                on_disk.into_iter().map(|(id, (p, regular))| (id, p, regular)).collect();
             rest.sort();
-            for (_, path) in rest {
-                let c = read_object(dir, path)?;
+            for (_, path, regular) in rest {
+                let c = read_regular_object(objects.as_ref(), dir, path, regular)?;
                 pool.insert(c.id(), (c, false));
             }
             // `Graph::import_with`'s walk, Kahn's algorithm with ready ids taken smallest first, over the
@@ -308,84 +316,137 @@ impl Store {
     pub fn create_identity_in(&self, name: &str, key_dir: &Path) -> Result<Identity, StoreError> {
         let identity = Identity::generate(name)?;
         let file = format!("{name}.json");
-        let key_path = key_dir.join(&file);
-        let entry_path = self.agents_dir().join(&file);
-        if key_path.exists() || entry_path.exists() || self.identities_dir().join(&file).exists() {
+        // A name is taken by anything at its path, a dangling symlink included.
+        let taken = |d: &Path| fs::symlink_metadata(d.join(&file)).is_ok();
+        if taken(key_dir) || taken(&self.agents_dir()) || taken(&self.identities_dir()) {
             return Err(StoreError::NameTaken(name.to_owned()));
         }
-        for dir in [key_dir.to_owned(), self.agents_dir()] {
-            fs::create_dir_all(&dir).map_err(io(&dir))?;
-        }
-        identity.save(&key_path)?;
+        // Each directory is created if missing and refused if it is a symlink or not a directory.
+        let root = open_root(&self.dir)?;
+        let agents = root.sub_or_create("agents", 0o777).map_err(|e| fail(self.agents_dir(), e))?;
+        let keys = if key_dir == self.identities_dir() {
+            root.sub_or_create("identities", 0o777).map_err(|e| fail(self.identities_dir(), e))?
+        } else {
+            key_directory(key_dir)?
+        };
+        identity.save_in(&keys, &file)?;
         let entry = AgentEntry { name: name.to_owned(), agent: identity.agent_id() };
         let json = serde_json::to_string_pretty(&entry).expect("agent entry serializes") + "\n";
-        fs::write(&entry_path, json).map_err(io(&entry_path))?;
+        let written = match agents.write_new(&file, json.as_bytes(), 0o666) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(StoreError::NameTaken(name.to_owned())),
+            other => other.map_err(|e| fail(agents.join(&file), e)),
+        };
+        if written.is_err() {
+            // The key was made just now, for this entry alone.
+            let _ = keys.remove(&file);
+        }
+        written?;
         Ok(identity)
     }
 
     pub fn identity(&self, name: &str) -> Result<Identity, StoreError> {
         identity::validate_name(name)?;
-        let path = self.identities_dir().join(format!("{name}.json"));
-        if !path.exists() {
-            return Err(StoreError::UnknownIdentity(name.to_owned()));
-        }
-        Ok(Identity::load(&path)?)
+        let file = format!("{name}.json");
+        let unknown = || StoreError::UnknownIdentity(name.to_owned());
+        let Some(ids) = open_sub(&open_root(&self.dir)?, "identities")? else { return Err(unknown()) };
+        let bytes = match ids.read(&file, MAX_SMALL_FILE) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(unknown()),
+            other => other.map_err(|e| fail(ids.join(&file), e))?,
+        };
+        Ok(Identity::parse(&ids.join(&file), &bytes)?)
     }
 
     /// Local identities, sorted by name.
     pub fn identities(&self) -> Result<Vec<Identity>, StoreError> {
-        let dir = self.identities_dir();
         let mut out = Vec::new();
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(io(&dir)(e)),
-        };
-        for entry in entries {
-            let path = entry.map_err(io(&dir))?.path();
-            if path.extension().is_some_and(|e| e == "json") {
-                out.push(Identity::load(&path)?);
+        let Some(ids) = open_sub(&open_root(&self.dir)?, "identities")? else { return Ok(out) };
+        for (name, kind) in ids.entries().map_err(|e| fail(ids.path().to_owned(), e))? {
+            let Some(name) = name.to_str().filter(|n| n.ends_with(".json")) else { continue };
+            let path = ids.join(name);
+            if kind != Kind::File {
+                return Err(StoreError::Corrupt { path, reason: fsx::NOT_A_FILE.into() });
             }
+            let bytes = ids.read(name, MAX_SMALL_FILE).map_err(|e| fail(path.clone(), e))?;
+            // Checks the name, and that it's the file's.
+            out.push(Identity::parse(&path, &bytes)?);
         }
         out.sort_by(|a, b| a.name().cmp(b.name()));
         Ok(out)
     }
 
-    /// Every agent with a known name: the public directory plus local
-    /// identities, sorted by name.
+    /// Every agent with a known name: the public directory plus local identities, sorted by name.
+    ///
+    /// Fails closed, as [`StoreError::Corrupt`], on a directory that could misname an agent: an entry
+    /// in `agents/` that isn't a regular file named `<name>.json` for a valid name, one whose `name`
+    /// isn't its file's, two entries with one name or one key, or a local identity whose key the
+    /// directory lists under another name, or whose name it lists with another key. Names starting with
+    /// a dot are skipped, as another process's write in flight. [`Store::open`] doesn't read `agents/`,
+    /// so call this to check it.
     pub fn agents(&self) -> Result<Vec<AgentEntry>, StoreError> {
-        let mut by_name = std::collections::BTreeMap::new();
-        let dir = self.agents_dir();
-        match fs::read_dir(&dir) {
-            Ok(entries) => {
-                for entry in entries {
-                    let path = entry.map_err(io(&dir))?.path();
-                    if path.extension().is_none_or(|e| e != "json") {
-                        continue;
-                    }
-                    let text = fs::read_to_string(&path).map_err(io(&path))?;
-                    let entry: AgentEntry = serde_json::from_str(&text)
-                        .map_err(|e| StoreError::Corrupt { path: path.clone(), reason: e.to_string() })?;
-                    by_name.insert(entry.name.clone(), entry);
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(io(&dir)(e)),
-        }
+        let mut by_name: BTreeMap<String, AgentEntry> =
+            self.directory()?.into_iter().map(|e| (e.name.clone(), e)).collect();
+        let mut by_key: HashMap<AgentId, String> = by_name.values().map(|e| (e.agent, e.name.clone())).collect();
         for identity in self.identities()? {
             let local = AgentEntry { name: identity.name().to_owned(), agent: identity.agent_id() };
-            match by_name.get(&local.name) {
-                Some(listed) if listed.agent != local.agent => {
+            let entry_path = self.agents_dir().join(format!("{}.json", local.name));
+            match (by_name.get(&local.name), by_key.get(&local.agent)) {
+                (Some(listed), _) if listed.agent != local.agent => {
                     return Err(StoreError::Corrupt {
-                        path: self.agents_dir().join(format!("{}.json", local.name)),
+                        path: entry_path,
                         reason: format!("lists a different key than local identity {:?}", local.name),
                     });
                 }
-                Some(_) => {}
-                None => {
+                (_, Some(other)) if *other != local.name => {
+                    return Err(StoreError::Corrupt {
+                        path: self.agents_dir().join(format!("{other}.json")),
+                        reason: format!("lists local identity {:?}'s key under another name", local.name),
+                    });
+                }
+                (Some(_), _) => {}
+                (None, _) => {
+                    by_key.insert(local.agent, local.name.clone());
                     by_name.insert(local.name.clone(), local);
                 }
             }
+        }
+        Ok(by_name.into_values().collect())
+    }
+
+    /// The public directory alone, `agents/`, sorted by name, never reading `identities/`: what
+    /// [`Store::agents`] reads from it, with the same checks, failing closed as it does on an entry that
+    /// isn't a regular file named `<name>.json` for a valid name, whose `name` isn't its file's, or a
+    /// second entry for a name or a key.
+    pub fn directory(&self) -> Result<Vec<AgentEntry>, StoreError> {
+        let mut by_name: BTreeMap<String, AgentEntry> = BTreeMap::new();
+        let mut by_key: HashMap<AgentId, String> = HashMap::new();
+        let Some(dir) = open_sub(&open_root(&self.dir)?, "agents")? else { return Ok(Vec::new()) };
+        for (file_name, kind) in dir.entries().map_err(|e| fail(dir.path().to_owned(), e))? {
+            let path = dir.path().join(&file_name);
+            let corrupt = |reason: String| StoreError::Corrupt { path: path.clone(), reason };
+            let Some(file_name) = file_name.to_str() else {
+                return Err(corrupt("not named <name>.json".into()));
+            };
+            if file_name.starts_with('.') {
+                continue; // in-flight write from another process
+            }
+            let Some(stem) = file_name.strip_suffix(".json").filter(|n| identity::validate_name(n).is_ok()) else {
+                return Err(corrupt("not named <name>.json for a valid name".into()));
+            };
+            if kind != Kind::File {
+                return Err(corrupt(fsx::NOT_A_FILE.into()));
+            }
+            let bytes = dir.read(file_name, MAX_SMALL_FILE).map_err(|e| fail(path.clone(), e))?;
+            let listed: AgentEntry = serde_json::from_slice(&bytes).map_err(|e| corrupt(e.to_string()))?;
+            if listed.name != stem {
+                return Err(corrupt(format!("names {:?}, not {stem:?}", listed.name)));
+            }
+            if by_name.contains_key(&listed.name) {
+                return Err(corrupt(format!("a second entry named {:?}", listed.name)));
+            }
+            if let Some(other) = by_key.insert(listed.agent, listed.name.clone()) {
+                return Err(corrupt(format!("lists the key of {other:?} under another name")));
+            }
+            by_name.insert(listed.name.clone(), listed);
         }
         Ok(by_name.into_values().collect())
     }
@@ -437,49 +498,116 @@ fn merge(into: &mut ImportReport, from: ImportReport) {
     into.unresolved.extend(from.unresolved);
 }
 
-fn read_info(dir: &Path) -> Result<GroundInfo, StoreError> {
-    let manifest = dir.join("ground.json");
-    let text = match fs::read_to_string(&manifest) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(StoreError::NotAGround(dir.to_owned())),
-        Err(e) => return Err(io(&manifest)(e)),
-    };
-    serde_json::from_str(&text).map_err(|e| StoreError::Corrupt { path: manifest.clone(), reason: e.to_string() })
+/// Files the store reads whole other than objects (`ground.json`, agent entries, identity files) are
+/// at most this long; a longer one is refused as it doesn't parse.
+const MAX_SMALL_FILE: usize = 1 << 20;
+
+/// An I/O error at `path` as a store error: a refusal from [`fsx`] (a symlink, or not a regular file
+/// or directory) is [`StoreError::Corrupt`].
+fn fail(path: PathBuf, e: std::io::Error) -> StoreError {
+    match fsx::refusal(&e) {
+        Some(reason) => StoreError::Corrupt { path, reason },
+        None => StoreError::Io { path, source: e },
+    }
 }
 
-/// Every object file's path, and whether the listing says it's a regular file (never following a link):
-/// each entry in a directory under `objects/`, but those whose names start with a dot (another
-/// process's write in flight) or aren't UTF-8.
-fn object_files(dir: &Path) -> Result<Vec<(PathBuf, bool)>, StoreError> {
-    let mut out = Vec::new();
-    let objects = dir.join("objects");
-    let shards = match fs::read_dir(&objects) {
-        Ok(shards) => shards.collect::<Vec<_>>(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(e) => return Err(io(&objects)(e)),
+/// The replica's own directory, opened (following it, if it's a link: it's what the caller named).
+fn open_root(dir: &Path) -> Result<Dir, StoreError> {
+    Dir::open(dir).map_err(|e| fail(dir.to_owned(), e))
+}
+
+/// The directory `name` in `root`, `None` if there's none, refusing a symlink or anything else.
+fn open_sub(root: &Dir, name: &str) -> Result<Option<Dir>, StoreError> {
+    match root.sub(name) {
+        Ok(d) => Ok(Some(d)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(fail(root.join(name), e)),
+    }
+}
+
+/// A key directory outside the replica: its parent is created if missing, and it is created (0700)
+/// if missing and refused if it is a symlink or not a directory.
+fn key_directory(key_dir: &Path) -> Result<Dir, StoreError> {
+    let parent = key_dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let Some(name) = key_dir.file_name().and_then(|n| n.to_str()) else {
+        return Err(StoreError::Corrupt { path: key_dir.to_owned(), reason: "not a directory name".into() });
     };
-    for shard in shards {
-        let shard = shard.map_err(io(&objects))?.path();
-        if !shard.is_dir() {
+    fs::create_dir_all(parent).map_err(io(parent))?;
+    Dir::open(parent).and_then(|p| p.sub_or_create(name, 0o700)).map_err(|e| fail(key_dir.to_owned(), e))
+}
+
+fn read_info(dir: &Path) -> Result<GroundInfo, StoreError> {
+    let manifest = dir.join("ground.json");
+    let not_a_ground = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+    let root = match Dir::open(dir) {
+        Err(e) if not_a_ground(&e) => return Err(StoreError::NotAGround(dir.to_owned())),
+        other => other.map_err(|e| fail(dir.to_owned(), e))?,
+    };
+    let bytes = match root.read("ground.json", MAX_SMALL_FILE) {
+        Err(e) if not_a_ground(&e) => return Err(StoreError::NotAGround(dir.to_owned())),
+        other => other.map_err(|e| fail(manifest.clone(), e))?,
+    };
+    serde_json::from_slice(&bytes).map_err(|e| StoreError::Corrupt { path: manifest.clone(), reason: e.to_string() })
+}
+
+/// Each object file's path, and whether the listing says it's a regular file.
+type ObjectFiles = Vec<(PathBuf, bool)>;
+
+/// `objects/`, opened if there is one, and every object file's path and whether the listing says it's
+/// a regular file (never following a link): each entry in a shard directory under `objects/`, but those
+/// whose names start with a dot (another process's write in flight) or aren't UTF-8. `objects/` itself
+/// and every entry of it not named with a dot must be real directories, opened without following a
+/// link: a symlinked `objects/` or shard, or a stray file, is [`StoreError::Corrupt`].
+fn object_files(dir: &Path) -> Result<(Option<Dir>, ObjectFiles), StoreError> {
+    let mut out = Vec::new();
+    let Some(objects) = open_sub(&open_root(dir)?, "objects")? else { return Ok((None, out)) };
+    let not_a_shard =
+        |path: PathBuf| StoreError::Corrupt { path, reason: "not a shard directory (or a symlink)".into() };
+    for (name, kind) in objects.entries().map_err(|e| fail(objects.path().to_owned(), e))? {
+        let path = objects.path().join(&name);
+        let Some(name) = name.to_str() else { return Err(not_a_shard(path)) };
+        if name.starts_with('.') {
             continue;
         }
-        for entry in fs::read_dir(&shard).map_err(io(&shard))? {
-            let entry = entry.map_err(io(&shard))?;
-            let path = entry.path();
-            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        if kind != Kind::Dir {
+            return Err(not_a_shard(path));
+        }
+        let shard = match objects.sub(name) {
+            Err(e) if fsx::refusal(&e).is_some() => return Err(not_a_shard(path)),
+            other => other.map_err(|e| fail(path.clone(), e))?,
+        };
+        for (file_name, kind) in shard.entries().map_err(|e| fail(path.clone(), e))? {
+            let Some(file_name) = file_name.to_str() else { continue };
             if file_name.starts_with('.') {
                 continue; // in-flight write from another process
             }
-            let regular = entry.file_type().map_err(io(&path))?.is_file();
-            out.push((path, regular));
+            out.push((path.join(file_name), kind == Kind::File));
         }
     }
-    Ok(out)
+    Ok((Some(objects), out))
+}
+
+/// [`read_object`], refusing first an object the listing says isn't a regular file (`regular`). The
+/// read itself opens the shard and the file without following a link, and checks the open file's type.
+fn read_regular_object(
+    objects: Option<&Dir>,
+    dir: &Path,
+    path: PathBuf,
+    regular: bool,
+) -> Result<Contribution, StoreError> {
+    if !regular {
+        return Err(StoreError::Corrupt { path, reason: fsx::NOT_A_FILE.into() });
+    }
+    let objects = objects.expect("listed objects come from objects/");
+    read_object(objects, dir, path)
 }
 
 /// Reads and decodes one object, refusing it unless its path is its id's.
-fn read_object(dir: &Path, path: PathBuf) -> Result<Contribution, StoreError> {
-    let bytes = fs::read(&path).map_err(io(&path))?;
+fn read_object(objects: &Dir, dir: &Path, path: PathBuf) -> Result<Contribution, StoreError> {
+    let name = |p: Option<&Path>| p.and_then(Path::file_name).and_then(|n| n.to_str()).unwrap_or_default().to_owned();
+    let (shard, file) = (name(path.parent()), name(Some(&path)));
+    let bytes =
+        objects.sub(&shard).and_then(|s| s.read(&file, MAX_CONTRIBUTION_BYTES)).map_err(|e| fail(path.clone(), e))?;
     let c =
         Contribution::decode(&bytes).map_err(|e| StoreError::Corrupt { path: path.clone(), reason: e.to_string() })?;
     if path != object_path(dir, &c.id()) {
@@ -494,32 +622,15 @@ fn object_path(dir: &Path, id: &ContributionId) -> PathBuf {
 }
 
 /// Writes one object without following a symlink out of the Ground: `objects/` and the shard
-/// must be real directories (created here if missing), and the temporary file is created new, so
-/// an existing file or symlink in its place fails the write. The rename replaces whatever is at
-/// the object's path, a symlink included, rather than writing through it.
+/// must be real directories (created here if missing), opened without following a link, and the
+/// temporary file is created new, under a random name, so an existing file or symlink in its place
+/// fails the write. The file is synced before the rename, which replaces whatever is at the
+/// object's path, a symlink included, rather than writing through it. A failed write leaves no
+/// temporary file behind.
 fn write_object(dir: &Path, c: &Contribution) -> Result<(), StoreError> {
     let path = object_path(dir, &c.id());
-    let shard = path.parent().expect("object path has a shard dir");
-    for d in [&dir.join("objects"), shard] {
-        real_dir(d)?;
-    }
-    let tmp = shard.join(format!(".tmp-{}-{}", std::process::id(), c.id().short()));
-    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&tmp).map_err(io(&tmp))?;
-    std::io::Write::write_all(&mut file, &c.encode()).map_err(io(&tmp))?;
-    drop(file);
-    fs::rename(&tmp, &path).map_err(io(&path))
-}
-
-/// Creates `d` if it doesn't exist, and refuses it if it is anything but a directory, a symlink
-/// to one included.
-fn real_dir(d: &Path) -> Result<(), StoreError> {
-    match fs::symlink_metadata(d) {
-        Ok(m) if m.is_dir() => Ok(()),
-        Ok(_) => Err(StoreError::Corrupt { path: d.to_owned(), reason: "not a directory (or a symlink)".into() }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => match fs::create_dir(d) {
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => real_dir(d),
-            other => other.map_err(io(d)),
-        },
-        Err(e) => Err(io(d)(e)),
-    }
+    let hex = c.id().to_hex();
+    let objects = open_root(dir)?.sub_or_create("objects", 0o777).map_err(|e| fail(dir.join("objects"), e))?;
+    let shard = objects.sub_or_create(&hex[..2], 0o777).map_err(|e| fail(objects.join(&hex[..2]), e))?;
+    shard.replace(&hex[2..], &c.id().short(), &c.encode(), 0o666).map_err(|e| fail(path, e))
 }

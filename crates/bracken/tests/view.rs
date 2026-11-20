@@ -707,10 +707,26 @@ fn every_asset_is_served_with_the_csp() {
     }
 }
 
-/// Two agent entries that give one name to different keys: neither key is shown by that name, so one
-/// agent can't pass as another, and the name a key also has elsewhere still shows.
+/// `bracken view` on `dir` refuses to start: its stderr.
+fn view_refused(dir: &Path) -> String {
+    let out = Command::new(BIN).arg("view").env("BRACKEN_DIR", dir).env_remove("BRACKEN_AGENT").output().unwrap();
+    assert!(!out.status.success(), "bracken view started: {}", String::from_utf8_lossy(&out.stdout));
+    String::from_utf8(out.stderr).unwrap()
+}
+
+/// `bracken log --json` on `dir` fails: its stderr.
+fn log_refused(dir: &Path) -> String {
+    let out =
+        Command::new(BIN).args(["log", "--json"]).env("BRACKEN_DIR", dir).env_remove("BRACKEN_AGENT").output().unwrap();
+    assert!(!out.status.success(), "log --json succeeded");
+    String::from_utf8(out.stderr).unwrap()
+}
+
+/// Two agent entries that give one name to different keys: the view refuses the directory, as the CLI
+/// does, rather than show either key by that name, so one agent can't pass as another (finding
+/// 81a3c4d7bdec; task c0eb61747345 made both fail closed).
 #[test]
-fn a_name_two_keys_claim_names_neither() {
+fn a_name_two_keys_claim_is_refused() {
     let dir = ground();
     ok(&dir, &["claim", "spec", "--as", "alice"]);
     ok(&dir, &["claim", "spec too", "--as", "val"]);
@@ -718,10 +734,9 @@ fn a_name_two_keys_claim_names_neither() {
     let val: Value = serde_json::from_str(&val).unwrap();
     let forged = serde_json::json!({"name": "alice", "agent": val["agent"]});
     std::fs::write(dir.join("agents/mallory.json"), forged.to_string()).unwrap();
-    let v = view(&dir);
-    let names: Vec<Value> =
-        v.api("/api/ground")["agents"].as_array().unwrap().iter().map(|a| a["name"].clone()).collect();
-    assert_eq!(names, [Value::Null, serde_json::json!("val")]);
+    for err in [view_refused(&dir), log_refused(&dir)] {
+        assert!(err.contains("agents/mallory.json") && err.contains("names \"alice\", not \"mallory\""), "{err}");
+    }
 }
 
 /// `/api/trust` counts as the CLI does: for every subject, `show --json`'s evidence that stands (by its
@@ -878,19 +893,20 @@ fn tension_agrees_with_conflicts_and_show() {
     );
 }
 
-/// A key published under two names shows by the one the CLI picks, so the view and `log --json` agree.
+/// A key published under two names: `log --json` and the view both refuse the directory, naming the
+/// file (task c0eb61747345, Neon's counterexample {name: zzz, agent: <another's key>}).
 #[test]
-fn a_key_with_two_names_shows_as_the_cli_shows_it() {
+fn a_key_with_two_names_is_refused_by_the_cli_and_the_view() {
     let dir = ground();
     ok(&dir, &["claim", "spec", "--as", "bob"]);
     let bob = std::fs::read_to_string(dir.join("agents/bob.json")).unwrap();
     let bob: Value = serde_json::from_str(&bob).unwrap();
     std::fs::write(dir.join("agents/zed.json"), serde_json::json!({"name": "zed", "agent": bob["agent"]}).to_string())
         .unwrap();
-    let cli = json(&dir, &["log", "--json"])[0]["author_name"].clone();
-    let v = view(&dir);
-    assert_eq!(v.api("/api/ground")["agents"][0]["name"], cli);
-    assert_eq!(cli, "zed");
+    for err in [view_refused(&dir), log_refused(&dir)] {
+        let names_file = err.contains("agents/bob.json") || err.contains("agents/zed.json");
+        assert!(names_file && err.contains("under another name"), "{err}");
+    }
 }
 
 /// `BRACKEN_VIEW_REREAD_DELAY_MS` is capped: a huge value still lets a write show within a few polls.

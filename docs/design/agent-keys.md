@@ -765,7 +765,7 @@ counting. **Part B, steps 3 to 5, is open and not to be built**: the rows
 are kept as the round 3 sketch, and its redesign starts with the
 role-resolution refactor (*Part B is open*). A step that touches
 `crates/manyroot` or `crates/tree/src/` takes the full table
-(`scripts/code-scope full`).
+(every code change does, since owner decision `c8bbb2886be3`).
 
 | # | Part | PR | Class | Tests |
 |---|---|---|---|---|

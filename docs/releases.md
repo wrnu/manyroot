@@ -24,6 +24,8 @@ The classes and the risky ones are defined in [development.md](development.md). 
 | crypto | security, independent | none |
 | protocol, storage | security, independent | the manager's go, logged as `owner-review`; a migration note below; upgrade the pinned binary afterwards |
 
+**After merging task bfc942cd7ced** (research crates move to `research/`; `scripts/code-scope`, `bracken-scope` and the light run are gone; owner decision `c8bbb2886be3`, superseding `464d3ccca45e` and `73f2ba4c08e5`): no binary upgrade, and no protocol or format change. The manager re-pins main's Weave policy right after the merge, since `scripts/test-table`'s hash, which the policy pins, changed: a new version of line main's policy through `scripts/weave line policy main`, citing the owner's decision (`scripts/weave-pin` is the Ground's pin, which doesn't change): until then the Weave gate can't count a head, and every head takes git's counted run. `scripts/verify-seq --light` and `scripts/test-table --split -p`, `--light` and `--remote -p` are refused, and `scripts/merge` counts no light pass, so a head whose only counted pass is light needs the full run again. `scripts/tree-scope key` now leaves out everything under `docs/` but keeps `docs/protocol.md` and `docs/design/weave-freeze.md`, so a tree key recorded before the merge can differ from the same tree's key after it: a `--reuse` or batch pass across the merge fails closed and needs a fresh run. Old worktrees' `target/` hold stale `bracken-scope`, `bracken-demo` and `bracken-experiment` builds that `scripts/cleanup` clears as usual.
+
 **After merging task 3b96803d923c** (`scripts/weave-propose` reads gh's JSON apart from its stderr, and `scripts/weave-gate` reads `weave green`'s the same way): no binary upgrade. Builders run the main checkout's copy, so the fix takes effect when the main checkout is on the merge. Until then, with gh 2.105.0 or later, `weave-propose` refuses every PR as a fork (gotcha `d532678d900c`): say so in the `pr` claim, and the merge falls back to the import. `weave-gate` still refuses when `weave green` warns on stderr that a record doesn't decode.
 
 ## Needs the owner's go
@@ -96,6 +98,43 @@ are valid. Every existing Ground opens as before.
 - **B6: `weave green --manifest` lists what integrating that tree unchanged must answer** (`must_answer` in
   `--json`), and `weave review` and `weave green --manifest` mark an evidence-backed objection whose fail a
   pass replaced (`"replaced": true` in the basis; "replaced by a later pass" in text).
+
+### 2026-11-19: the store fails closed on a bad agent directory, identity file or object listing (task c0eb61747345)
+
+Neon's recommendation 2 (decision `c8bbb2886be3`, lead `0fe1e087ae37`). Storage hardening only: no change to
+the encoding, ids, the signing context, the validity rules, bundles, sync, or any golden vector or fixture.
+`Contribution::encode` gives the same bytes; it borrows the content instead of copying it, and each
+contribution keeps its encoded length (`Contribution::encoded_len`), which `Graph::check`, sync's batching and
+`bracken serve`'s quotas read instead of encoding again.
+- **`Store::agents` fails closed** (`StoreError::Corrupt`) on an `agents/` entry that isn't a regular file
+  named `<name>.json` for a valid name, whose `name` isn't its file's, a second entry for a name or a key, or a
+  local identity whose key the directory lists under another name. Names starting with a dot are skipped.
+  Every command that shows names reads it, and `bracken verify` now does too. `Store::open` still doesn't.
+  `bracken view` reads the directory alone through `Store::directory`, with the same rules and without
+  `identities/`, so it refuses such a directory as the CLI does where it used to pick or drop a name.
+- **Identity files** (`Identity::load`, `Store::identities`) must be regular files named `<name>.json` for the
+  valid name they hold.
+- **Writes**: an object's temporary file has a random name, is synced before the rename and is removed if the
+  write fails. `ground.json` and a new `agents/<name>.json` are written to a synced temporary file and linked
+  into place, so neither follows a planted symlink, replaces a file or is left half-written.
+- **Opening** refuses, as `Corrupt`, a shard of `objects/` that is a symlink or not a directory, any other
+  entry there not named with a dot, and an object file that isn't a regular file, in `Store::open` and in the
+  untrusted objects of `Store::open_trusting`. Before, a symlinked shard or object was followed and stray files
+  were skipped.
+- **No symlink is followed inside a replica** (round 2, findings `58b9903c1820`, `99f862b78057`,
+  `23253fd20e5b`). `agents/`, `identities/`, `objects/`, every shard, `ground.json` and a `--key-dir` that is a
+  symlink are refused on every read and write (`Corrupt`); only the replica's own directory is followed. Every
+  directory under it is opened with `O_DIRECTORY | O_NOFOLLOW` and every file with `O_NOFOLLOW | O_NONBLOCK`,
+  relative to its directory's descriptor, and a file's type is checked on the open descriptor, so a link or a
+  FIFO swapped in after a listing is refused rather than followed or blocked on (`crates/manyroot/src/fsx.rs`,
+  through `rustix`, which `crates/tree` already used). `Identity::save` writes a 0600 dot-named temporary file
+  (no `.json`), synced, then hard-links it in place, so a key is never seen half-written. None of this
+  repository's setups (the main Ground, `~/bracken-weave/manyroot`, the team server's `ground/` and `keys/`,
+  worktree copies) uses a symlinked directory or `ground.json`.
+- **Existing Grounds open unchanged** if they hold none of these. This repository's own `agents/`,
+  `identities/` names and `objects/` were checked against a copy before the merge and pass. A replica that
+  holds one now fails with an error naming the path: fix or remove that entry.
+- **No migration.** Upgrade the pinned binary after the merge.
 
 ### 2026-11-19: Weave readers bound an unreadable record's cost, and a line name never reads as an id first (task fe2c9d96a787)
 

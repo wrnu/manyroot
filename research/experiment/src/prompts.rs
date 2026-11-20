@@ -1,0 +1,190 @@
+//! What agents are told (design section 3, Prompts; decision `4cf00e1d701d`):
+//! one base prompt for every mode, a short "Where things are" section per
+//! mode, of the same shape in each, and the mode's tool descriptions. The
+//! files are in `research/experiment/prompts/`, built into the binary, and
+//! hashed for the run's plan, so a run's prompts can't drift from what was
+//! reviewed.
+
+/// The prompt every mode shares.
+pub const BASE: &str = include_str!("../prompts/base.md");
+
+/// The prompt of a project run (Weave mode), in place of [`BASE`]: a project, not a library of functions.
+pub const PROJECT_BASE: &str = include_str!("../prompts/project.md");
+
+/// A mode's "Where things are" section.
+pub fn section(mode: &str) -> Option<&'static str> {
+    match mode {
+        "bracken" => Some(include_str!("../prompts/bracken.md")),
+        "git" => Some(include_str!("../prompts/git.md")),
+        "crdt" => Some(include_str!("../prompts/crdt.md")),
+        "weave" => Some(include_str!("../prompts/weave.md")),
+        _ => None,
+    }
+}
+
+/// The system prompt for `mode`: the base prompt, then the mode's section. Weave mode's runs are of a
+/// project, so its base is [`PROJECT_BASE`].
+pub fn system_prompt(mode: &str) -> Result<String, String> {
+    let section = section(mode).ok_or_else(|| format!("no prompt for mode {mode}"))?;
+    let base = if mode == "weave" { PROJECT_BASE } else { BASE };
+    Ok(format!("{base}\n{section}"))
+}
+
+/// The first message of each turn: which turn of how many, and who the agent is.
+pub fn turn_message(turn: u32, turns: u32, name: &str) -> String {
+    crate::backend::TURN_MESSAGE
+        .replace("{turns}", &turns.to_string())
+        .replace("{turn}", &turn.to_string())
+        .replace("{name}", name)
+}
+
+/// The role sentence of the one integrator, after its turn message, when the run's integrator setting names one
+/// agent (task `5b2f7f4a6b7f`); the plan hashes it.
+pub const INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents propose their work and only you \
+     integrate onto main, so review their proposals, integrate what's sound, settle any conflict, and propose and \
+     integrate your own work too.";
+
+/// The role sentence of every other agent then: `{integrator}` is the integrator's name. The plan hashes it.
+pub const BUILDER_ROLE: &str = "{integrator} is the run's one integrator: propose your work, and {integrator} \
+     integrates it onto main; integrate is refused to you.";
+
+/// The sentence telling agent `name` of `agents` its role under the integrator setting `setting`: none for
+/// [`crate::weave_mode::ANY_AGENT`], where every agent integrates.
+pub fn role_message(setting: &str, name: &str, agents: usize) -> Result<Option<String>, String> {
+    Ok(crate::weave_mode::integrator_agent(setting, agents)?.map(|n| {
+        let integrator = format!("agent-{n}");
+        if name == integrator { INTEGRATOR_ROLE.to_string() } else { BUILDER_ROLE.replace("{integrator}", &integrator) }
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mode::mode_named;
+    use crate::task::Task;
+
+    #[test]
+    fn one_integrator_and_its_builders_are_each_told_their_role() {
+        assert_eq!(role_message("any-agent", "agent-0", 4), Ok(None));
+        let integrator = role_message("agent-3", "agent-3", 4).expect("a setting").expect("a role");
+        assert_eq!(integrator, INTEGRATOR_ROLE);
+        let builder = role_message("agent-3", "agent-0", 4).expect("a setting").expect("a role");
+        assert!(builder.starts_with("agent-3 is the run's one integrator") && !builder.contains('{'), "{builder}");
+        assert!(role_message("agent-4", "agent-0", 4).is_err(), "no agent-4 in a run of 4");
+        assert!(role_message("someone", "agent-0", 4).is_err());
+    }
+
+    #[test]
+    fn every_mode_has_its_own_prompt() {
+        let mut seen = std::collections::BTreeSet::new();
+        for name in ["bracken", "git", "crdt"] {
+            let prompt = system_prompt(name).expect("a prompt");
+            assert!(prompt.starts_with(BASE) && prompt.ends_with(section(name).expect("a section")));
+            assert!(seen.insert(prompt), "{name}'s prompt is its own");
+        }
+        let weave = system_prompt("weave").expect("a prompt");
+        assert!(weave.starts_with(PROJECT_BASE) && weave.ends_with(section("weave").expect("a section")));
+        assert!(seen.insert(weave), "weave's prompt is its own");
+        assert!(system_prompt("other").is_err());
+        assert_eq!(
+            turn_message(3, 8, "agent-1"),
+            "This is your turn 3 of 8. You are agent-1. Start by reading your notes."
+        );
+    }
+
+    /// The sections have one shape: the same heading and four sentences in the same order, of
+    /// similar length (decision `4cf00e1d701d`).
+    #[test]
+    fn the_mode_sections_have_one_shape() {
+        let sentences = |name: &str| -> Vec<String> {
+            let text = section(name).expect("a section");
+            let body = text.strip_prefix("## Where things are\n\n").expect("the heading");
+            body.trim().split(". ").map(str::to_string).collect()
+        };
+        let words = |name: &str| -> usize { sentences(name).iter().map(|s| s.split_whitespace().count()).sum() };
+        let (low, high) =
+            ["bracken", "git", "crdt"].iter().map(|m| words(m)).fold((usize::MAX, 0), |(l, h), w| (l.min(w), h.max(w)));
+        assert!(high * 10 <= low * 12, "within 20% of each other: {low} to {high} words");
+        for name in ["bracken", "git", "crdt"] {
+            let s = sentences(name);
+            assert_eq!(s.len(), 4, "{name}: four sentences");
+            assert!(s[0].starts_with("The task is"), "{name}: where the task is");
+            assert!(s[1].starts_with("A change to the task arrives as"), "{name}: where changes appear");
+            assert!(s[2].starts_with("The library counts once it is"), "{name}: what integrated means");
+            assert_eq!(s[3], "Others' work reaches you, and yours reaches them, only when you sync.", "{name}");
+        }
+    }
+
+    /// Each mode names its shared channel once, in one tool description, in the same sentence form
+    /// (finding `6436d068437e`), and the prompts name none.
+    #[test]
+    fn each_mode_names_its_shared_channel_once_alike() {
+        let phrase = " where agents talk to each other: everyone can read ";
+        for name in ["bracken", "git", "crdt"] {
+            let tools = mode_named(name).expect("a mode").tools(Task::Phase1);
+            let naming: Vec<_> = tools.iter().filter(|t| t.description.contains(phrase)).collect();
+            assert_eq!(naming.len(), 1, "{name}: one tool names the channel");
+            let reader = naming[0].description.rsplit("with ").next().expect("a tool");
+            assert!(tools.iter().any(|t| t.name == reader), "{name}: read with one of its tools, not {reader}");
+            assert!(!section(name).expect("a section").contains(phrase), "{name}'s section names none");
+        }
+        assert!(!BASE.contains(phrase));
+    }
+
+    /// Every mode's prompt says, in the shared words, that an author's own check never counts, so
+    /// others' current work that waits for a verdict is checked first and the verdict recorded, and
+    /// that inputs are a, b and c whatever the specification calls them (task `6b3f9afbdcf2`,
+    /// approval `e0ff76633d31`, analysis `61e53d61b843`). The verdict is named in each mode's form,
+    /// a pass or an approval, so no mode's word stands for the others' (finding `26aeb8d5d0e1`).
+    #[test]
+    fn every_prompt_says_whose_check_counts_and_what_inputs_are_named() {
+        let rules = [
+            "A function's inputs are always named a, b and c, in the order its specification lists them, whatever \
+             names the specification gives them.",
+            "Your own check of your own work never counts as anyone else's: where the library needs another \
+             agent's verdict before work counts (a pass, or an approval), only theirs does. So when others' current \
+             work waits for such a verdict, check it first and record yours, before you write more of your own.",
+        ];
+        for name in ["bracken", "git", "crdt"] {
+            let prompt = system_prompt(name).expect("a prompt");
+            for rule in rules {
+                assert_eq!(prompt.matches(rule).count(), 1, "{name}: {rule}");
+            }
+        }
+        for name in ["bracken", "git", "crdt"] {
+            assert!(!section(name).expect("a section").contains("a, b and c"), "{name}: the base says it, once");
+        }
+    }
+
+    /// Each mode shows the definition form once, in the same words, in the tool that writes a
+    /// definition: the artifact in Bracken, an edit in Git and CRDT (task `eca3770b7ae4`; the second
+    /// Pi run's outcome `e7034ccbf48f` had 8 writes without it).
+    #[test]
+    fn each_mode_shows_the_definition_form_once_in_its_writing_tool() {
+        let form = "Each definition is one line: `def <name> <arity> : <program>`";
+        for (name, writer) in [("bracken", "artifact"), ("git", "edit"), ("crdt", "edit")] {
+            for task in [Task::Phase1, Task::Phase2] {
+                let tools = mode_named(name).expect("a mode").tools(task);
+                let showing: Vec<_> = tools.iter().filter(|t| t.description.contains(form)).map(|t| t.name).collect();
+                assert_eq!(showing, [writer], "{name}, {task:?}");
+            }
+        }
+        assert!(!BASE.contains(form));
+    }
+
+    /// Nothing tells an agent it is measured, or that other modes exist (design section 4).
+    #[test]
+    fn the_prompts_never_mention_the_experiment() {
+        let mut texts = vec![BASE.to_string(), PROJECT_BASE.to_string(), turn_message(1, 8, "agent-0")];
+        for name in ["bracken", "git", "crdt", "weave"] {
+            texts.push(section(name).expect("a section").to_string());
+            let mode = mode_named(name).expect("a mode");
+            texts.push(serde_json::to_string(&mode.tools(Task::Phase1)).expect("JSON"));
+        }
+        let all = texts.join("\n").to_lowercase();
+        for word in ["experiment", "metric", "measure", "token", "score", "grader", "hidden", "mode", "crdt", "bracken"]
+        {
+            assert!(!all.contains(word), "a prompt mentions {word:?}");
+        }
+    }
+}

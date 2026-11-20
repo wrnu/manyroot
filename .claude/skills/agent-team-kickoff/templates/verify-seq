@@ -5,14 +5,13 @@
 #   [ON=origin/main] verify-seq [--split [-j N]] <pr claim>:<sha> ...
 #   [ON=origin/main] verify-seq [--split] --batch <pr claim>:<sha> ...
 #   [ON=origin/main] verify-seq --split [-j N] --speculative <pr claim>:<sha> ...
-#   [ON=origin/main] verify-seq --light [--reason <why>] <pr claim>:<sha> ...
 #   [ON=origin/main] verify-seq --weave <pr claim>:<sha> ...
 #   --reason <why> goes with any of them but --weave
 #
 # For each pair, in a scratch worktree at <sha> (removed afterwards if the run left it clean), this
 # checkout's bk-evidence records a run of scripts/test-table on <claim> as manager, and the last two
 # lines of its output show here. With ON set, it tests the merge with ON (bk-evidence --on "$ON") and
-# passes --reuse: when the merged tree's key (scripts/code-scope: the tree without .bracken/ and docs)
+# passes --reuse: when the merged tree's key (scripts/tree-scope: the tree without .bracken/ and docs)
 # already has the manager's pass of the whole table on a pr claim of the same PR, only the Ground
 # guards run, and the evidence cites that pass (owner decision 642a47c04a10). So re-verifying after
 # main moved only in docs or the Ground costs the guards alone. The main checkout's
@@ -55,23 +54,9 @@
 # pass or pin that can't be written isn't reported as done: the queue stops there and exits 1, as it does
 # when a run's job ends without recording anything.
 #
-# --light (decision 464d3ccca45e, answer 10cf8a5053a3) is the light counted run, for one head at a time,
-# here. The full table stays the default; the manager chooses light, by risk. Its scope is the packages
-# scripts/code-scope packages computes from the head's changed files, by bracken-scope packages (guppy's
-# determinator, task de42fa5c776d; findings 0095e19fcdb7, 4825c59b07e9), never the builder's own choice. For each head it first checks,
-# and refuses with the reason, recording nothing, unless:
-#   - the scope isn't empty (a change only to rustfmt.toml has none: run the full table);
-#   - the pr claim's author recorded passes on that exact head of cargo fmt --check, both clippies
-#     (cargo clippy --all-targets -- -D warnings, and with --target x86_64-unknown-linux-gnu), and cargo
-#     nextest run -P fast -p <package>... and scripts/test-table --remote -p <package>..., each naming
-#     every package in the scope (scripts/code-scope light-passes);
-#   - scripts/code-scope full names no path the head changed since main (its list, the one list of
-#     the paths that need the whole table, is the only place they're named).
-# Those passes are a precondition only: nothing counted rests on them (finding 94e07ed7dd6b). It then
-# runs scripts/test-table --split -p <the scope> on the merged tree (bk-evidence --on ON, default
-# origin/main, without --reuse): the scope's light table in a box, and its macOS-only tests here. So
-# main merged with the head is always tested for the scope, whether or not main moved since the
-# builder's run. Batches stay full: --light refuses --batch, --speculative, --split and -j.
+# There is no light counted run (owner decision c8bbb2886be3, task bfc942cd7ced, superseding decisions
+# 464d3ccca45e and 73f2ba4c08e5): a counted run is the whole table, which test-table itself cuts to fmt
+# and the Ground guards for a docs-only head.
 #
 # --weave (plan cc496dcee0e3 step 1b, decision bbbf898cbcfe) runs nothing here: for each head in turn,
 # scripts/weave-gate record has line main's Weave results on main (ON) merged with the head counted in
@@ -80,15 +65,14 @@
 # head it can't count (a conflict, no Weave proposal, a change to scripts/test-table or Cargo.lock, a
 # check not green) is named with the reason, and needs git's counted run: verify-seq exits 1.
 #
-# Every run's evidence details end with 'test-table: counted run mode: <light|full>: <why>': for light,
-# the scope and the builder's passes it checked; for full, any path code-scope full names, then
-# --reason, if given, or 'the default'.
+# Every run's evidence details end with 'test-table: counted run mode: full: <why>': --reason, if given,
+# or 'the default'.
 #
 # A Ctrl-C or SIGTERM stops every running run, each box deleted, and records no evidence for them;
 # it exits 130.
 set -uo pipefail
 
-usage() { echo "usage: [ON=<main>] verify-seq [--split [-j N]] [--batch | --speculative] [--reason <why>] <pr claim>:<sha> ..." >&2; echo "       [ON=<main>] verify-seq --light [--reason <why>] <pr claim>:<sha> ..." >&2; echo "       [ON=<main>] verify-seq --weave <pr claim>:<sha> ..." >&2; exit 2; }
+usage() { echo "usage: [ON=<main>] verify-seq [--split [-j N]] [--batch | --speculative] [--reason <why>] <pr claim>:<sha> ..." >&2; echo "       [ON=<main>] verify-seq --weave <pr claim>:<sha> ..." >&2; exit 2; }
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
 cd "$main" || exit 1
@@ -96,14 +80,12 @@ table=(scripts/test-table)
 jobs=''
 batch=false
 speculative=false
-light=false
 weave=false
 reason=''
 while [ $# -gt 0 ]; do
   case "$1" in
     --split) table=(scripts/test-table --split); shift ;;
     --weave) weave=true; shift ;;
-    --light) light=true; shift ;;
     --reason) [ $# -ge 2 ] && [[ $2 =~ [^[:space:]] ]] && [[ $2 != *$'\n'* ]] ||
       { echo "verify-seq: --reason takes one line saying why" >&2; exit 2; }
       reason=$2; shift 2 ;;
@@ -118,7 +100,7 @@ while [ $# -gt 0 ]; do
 done
 
 if $weave; then
-  [ ${#table[@]} -eq 1 ] && ! $light && ! $batch && ! $speculative && [ -z "$jobs" ] && [ -z "$reason" ] ||
+  [ ${#table[@]} -eq 1 ] && ! $batch && ! $speculative && [ -z "$jobs" ] && [ -z "$reason" ] ||
     { echo "verify-seq: --weave takes no other mode or option: Weave's runs are line main's checks" >&2; exit 2; }
   [ $# -ge 1 ] || usage
   status=0
@@ -155,13 +137,6 @@ split=false
 ! $batch || [ -z "$jobs" ] || { echo "verify-seq: --batch runs one tree at a time; -j doesn't apply" >&2; exit 2; }
 ! $batch || ! $speculative || { echo "verify-seq: --batch and --speculative don't go together" >&2; exit 2; }
 ! $speculative || $split || { echo "verify-seq: --speculative needs --split: its runs go in boxes at once" >&2; exit 2; }
-if $light; then
-  ! $split && ! $batch && ! $speculative && [ -z "$jobs" ] ||
-    { echo "verify-seq: --light runs one head at a time, here: batches and --split stay full" >&2; exit 2; }
-  command -v jq >/dev/null || { echo "verify-seq: --light needs jq" >&2; exit 2; }
-  # The light run always tests the merged tree.
-  ON=${ON:-origin/main}
-fi
 # Each run's mode, for its evidence's details (test-table prints it at the end).
 export TEST_TABLE_MODE="full: ${reason:-the default}"
 # Boxes at once (decision 2a9e444218d6, answer c3e60ba8b879): 4 by default with --split; one run at a
@@ -176,60 +151,12 @@ fi
 # verify-seq would exit with the run's boxes still up. bk-evidence runs in this shell, not a subshell,
 # which would take SIGTERM's default again. A signal before bk-evidence starts stops it starting
 # (note fa805ecf517e); one as it starts reaches it too, through the job's group.
-# light_check <pr claim> <sha>: whether a light run may count for this head, by the rules above. Sets
-# light_scope (the -p options) and light_why (what it checked), or prints why not and returns 1.
-light_check() {
-  local claim=$1 h=$2 shown id author methods scope missing full rc=0
-  scope=$(cd "$main" && "$here/code-scope" packages "$ON" "$h" 2>&1) ||
-    { echo "light refused: code-scope packages failed: $scope"; return 1; }
-  [ -n "$scope" ] || { echo "light refused: no package to test (a change only to rustfmt.toml): run the full table"; return 1; }
-  # shellcheck disable=SC2086 # one package name a word
-  light_scope=$(printf ' -p %s' $scope)
-  shown=$(bk show "$claim" --json 2>/dev/null) || { echo "light refused: no claim $claim"; return 1; }
-  id=$(jq -r .id <<<"$shown")
-  author=$(jq -r '.author_name // empty' <<<"$shown")
-  [ -n "$author" ] || { echo "light refused: $claim has no author name"; return 1; }
-  methods=$(bk log --kind evidence --author "$author" --json | jq -r --arg t "$id" '.[]
-    | select(.body.target == $t and .body.verdict == "pass" and (.retracted | not)) | .body.method') ||
-    { echo "light refused: couldn't read $author's evidence on $claim"; return 1; }
-  # shellcheck disable=SC2086 # one package name a word
-  missing=$("$here/code-scope" light-passes "$h" $scope <<<"$methods" 2>&1) || rc=$?
-  if [ "$rc" -eq 1 ]; then
-    echo "light refused: $author has $missing (on $claim)"
-    return 1
-  elif [ "$rc" -ne 0 ]; then
-    echo "light refused: code-scope light-passes failed: $missing"
-    return 1
-  fi
-  if full=$(cd "$main" && "$here/code-scope" full "$ON" "$h" 2>&1); then
-    echo "light refused: the full table is required: $(tr '\n' ' ' <<<"$full" | sed 's/ $//')"
-    return 1
-  elif [ $? -ne 1 ]; then
-    echo "light refused: code-scope full failed: $full"
-    return 1
-  fi
-  light_why="the scope$light_scope, from the changed files; $author's passes on $h of fmt, both clippies, the fast run and --remote, naming it; no path needs the full table"
-}
-
 verify() {
-  local claim=${1%%:*} h=${1#*:} stopped=false light_scope='' light_why='' full
+  local claim=${1%%:*} h=${1#*:} stopped=false
   local v="${TMPDIR:-/tmp}/verify-$h"
   local cmd=("${table[@]}")
   trap 'stopped=true' INT TERM
   echo "== $claim @ ${h:0:7}"
-  if $light; then
-    if ! light_check "$claim" "$h"; then
-      cd "$main" && git worktree remove "$v"
-      echo "nothing run or recorded for $claim"
-      return
-    fi
-    # shellcheck disable=SC2206 # the -p options, one word each
-    cmd=(scripts/test-table --split $light_scope)
-    TEST_TABLE_MODE="light: ${reason:+$reason; }$light_why"
-  elif full=$(cd "$main" && "$here/code-scope" full "${ON:-origin/main}" "$h" 2>/dev/null); then
-    full=${full//code-scope: full: /}
-    TEST_TABLE_MODE="full: required: ${full//$'\n'/; }; ${reason:-the default}"
-  fi
   # The worktree is made before the fork, one at a time (see the loop below).
   cd "$v" || return
   if $stopped; then
@@ -237,11 +164,7 @@ verify() {
     echo "interrupted before the run; nothing recorded"
     return
   fi
-  if $light; then
-    "$here/bk-evidence" "$claim" --as manager --on "$ON" -- "${cmd[@]}" >"$logs/$claim.out" 2>&1
-  else
-    "$here/bk-evidence" "$claim" --as manager ${ON:+--on "$ON" --reuse} -- "${cmd[@]}" >"$logs/$claim.out" 2>&1
-  fi
+  "$here/bk-evidence" "$claim" --as manager ${ON:+--on "$ON" --reuse} -- "${cmd[@]}" >"$logs/$claim.out" 2>&1
   # Recorded only if bk-evidence says so; anything else (a changed checkout, an unconfirmed write) is a PR
   # not run, and verify-seq exits 1 (finding f764c35b1147).
   ! grep -qE '^bk-evidence: recorded (pass|fail) [0-9a-f]{64} ' "$logs/$claim.out" || touch "$logs/$claim.ok"
@@ -316,10 +239,10 @@ run_batch() {
   m=$(git rev-parse --verify -q "$on^{commit}") || { echo "verify-seq: no commit '$on' (nothing run)" >&2; return 1; }
   read_pairs "$@" || return
   local chain
-  chain=$("$here/code-scope" chain "$m" "${heads[@]}") || { echo "verify-seq: the batch doesn't merge (nothing run)" >&2; return 1; }
+  chain=$("$here/tree-scope" chain "$m" "${heads[@]}") || { echo "verify-seq: the batch doesn't merge (nothing run)" >&2; return 1; }
   while read -r i c k; do commits[i]=$c keys[i]=$k; done <<<"$chain"
   n=${#heads[@]}
-  if "$here/code-scope" docs-only "$m" "${commits[n]}" >/dev/null 2>&1; then
+  if "$here/tree-scope" docs-only "$m" "${commits[n]}" >/dev/null 2>&1; then
     echo "verify-seq: the batch changes only docs, which leave other runs current; verify these heads one by one (nothing run)" >&2
     return 1
   fi
@@ -450,11 +373,11 @@ run_speculative() {
   # PRs keep their own fast path), and one that doesn't merge onto the prefix before it.
   prefix=$m
   for i in "${!heads[@]}"; do
-    if "$here/code-scope" docs-only "$m" "${heads[i]}" >/dev/null 2>&1; then
+    if "$here/tree-scope" docs-only "$m" "${heads[i]}" >/dev/null 2>&1; then
       bad+=("#${prs[i]} changes only docs: verify it on its own")
       continue
     fi
-    line=$("$here/code-scope" chain "$prefix" "${heads[i]}" 2>/dev/null | sed -n '2p')
+    line=$("$here/tree-scope" chain "$prefix" "${heads[i]}" 2>/dev/null | sed -n '2p')
     if [ -z "$line" ]; then
       bad+=("#${prs[i]} doesn't merge onto main with the members before it")
       continue
@@ -481,7 +404,7 @@ run_speculative() {
     [ "$done" -eq 0 ] || prefix=${pcommit[done]}
     for ((p = done + 1; p <= n; p++)); do
       i=${active[p - 1]}
-      line=$("$here/code-scope" chain "$prefix" "${heads[i]}" 2>/dev/null | sed -n '2p')
+      line=$("$here/tree-scope" chain "$prefix" "${heads[i]}" 2>/dev/null | sed -n '2p')
       if [ -z "$line" ]; then
         # Only after a member was pinned and taken out: this one needed it.
         dropped+=("#${prs[i]} doesn't merge onto main without ${pinned[*]}: verify it again")

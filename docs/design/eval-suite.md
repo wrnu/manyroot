@@ -77,8 +77,8 @@ agents that drafted or reviewed a project never run on it.
 
 As built (task `9345098e82aa`, split note `842c4f4821e9`; owner decision
 `594307ea44a2`, manager's answers `c008b959c572`). A project is a directory
-under `crates/experiment/projects/<name>/`, all of which agents may read;
-`crates/experiment/tests/fixtures/project-tiny` is a small example.
+under `research/experiment/projects/<name>/`, all of which agents may read;
+`research/experiment/tests/fixtures/project-tiny` is a small example.
 
 ```
 <name>/
@@ -226,7 +226,7 @@ Requirements for building the runner (from security's review, evidence
 That execution profile is a new risky surface, and gets its own tests and
 security review, as Candidate B planned.
 
-**The execution profile as built** (`crates/experiment/src/python.rs`, tasks
+**The execution profile as built** (`research/experiment/src/python.rs`, tasks
 `9345098e82aa` and `879a58e77bde`, decision `ac22cedd8fee`): agent code runs
 in a container on Docker (Docker Desktop on the Mac), where the kernel
 enforces the limits that `sandbox-exec` couldn't (disk, memory and
@@ -336,7 +336,7 @@ stretch a group without end.
 
 ## Grading
 
-The grader (`crates/experiment/src/project_grader.rs`, task
+The grader (`research/experiment/src/project_grader.rs`, task
 `9345098e82aa`) runs a project's hidden tests on a tree, and reports counts
 per item and per group, by index: no test's name, source, expected value or
 message. The tests and the code under test never share a process:
@@ -587,15 +587,19 @@ output, nor a grade (task `6a80d88373a5`).
 
 As built so far (task `e4970250b3e4`, design note `43554a820efb`, answer
 `07959d6d9bc0`): `bracken-experiment run --mode weave --project <dir>
---python <image> [--hold-change]`, and `mock-run`
+--python <image> [--hold-change] [--integrator <setting>]`, and `mock-run`
 the same way, runs a project's agents through **Weave mode**
 (`src/weave_mode.rs`). `grade-run` grades the run after it ends.
 
 - **The plan** records the project (its directory, a digest of all of it,
   each item's release share, its hidden reference and the hash of each text
   agents get), the pinned Python image, and the configuration's
-  **integrator setting**: for now `any-agent`, every agent an integrator.
-  The run refuses a project without `--python`, Weave mode without a
+  **integrator setting**: `any-agent`, every agent an integrator (the
+  default), or `agent-<n>` (`--integrator`, answer `81403ed96c96`), the run's
+  one integrator, which main's policy names alone beside the setter. Then
+  each turn message tells every agent its role: the integrator reviews and
+  integrates proposals, and every other agent proposes, as integrate is
+  refused to it. The run refuses a project without `--python`, Weave mode without a
   project, and any other mode with one. Neither the plan nor anything else
   in the run holds the private store's path.
 - **The hub** is a throwaway Weave Ground under the run directory, never
@@ -604,8 +608,8 @@ the same way, runs a project's agents through **Weave mode**
   seed as `main`'s first decision, so the seed is the run's first tree;
   states the spec and the items released at the start as claims; records
   the integrator setting as a decision claim; and, once every copy has a
-  key, writes `main`'s policy naming the setter and every agent as
-  integrators, citing that claim.
+  key, writes `main`'s policy naming the setter and every agent, or the one
+  agent the setting names, as integrators, citing that claim.
 - **An agent's copy** is a replica of the hub's Ground, synced as Bracken
   mode syncs, beside a git working tree that only the store touches. Its
   tools: `task` (the spec and the items released so far: only claims the

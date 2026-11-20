@@ -560,9 +560,10 @@ fn a_symlinked_objects_shard_is_refused() {
     let id = claim(&g.a, "alice", "aimed outside");
     let outside = g.tmp.join("outside");
     std::fs::create_dir(&outside).unwrap();
+    // The running server's write meets the link: an open refuses one (task c0eb61747345).
+    let server = g.http(&[]);
     #[cfg(unix)]
     std::os::unix::fs::symlink(&outside, g.b.join("objects").join(&id[..2])).unwrap();
-    let server = g.http(&[]);
     let out = sync_http(&g.a, &server.url, TOKEN, &[]);
     assert!(!out.status.success());
     drop(server);
@@ -699,15 +700,20 @@ fn a_store_write_failing_mid_batch_still_logs_and_counts_what_was_stored() {
     }
     let outside = g.tmp.join("outside");
     std::fs::create_dir(&outside).unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&outside, g.b.join("objects").join(&two[..2])).unwrap();
+    // The server opens the replica first: an open refuses a symlinked shard (task c0eb61747345), so the
+    // link only makes the running server's write fail, and goes before anything reads the replica again.
     let server = g.http(&[]);
+    let shard = g.b.join("objects").join(&two[..2]);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &shard).unwrap();
     let out = sync_http(&g.a, &server.url, TOKEN, &[]);
     assert!(!out.status.success());
     // Whatever reached the replica is in the first-seen log, and the server stores nothing more.
     let again = sync_http(&g.a, &server.url, TOKEN, &[]);
     assert!(stderr(&again).contains("can't store anything"), "{}", stderr(&again));
     drop(server);
+    #[cfg(unix)]
+    std::fs::remove_file(&shard).unwrap();
     let held = ids(&g.b);
     let logged: Vec<String> = g.first_seen().iter().map(|s| s["id"].as_str().unwrap().to_owned()).collect();
     assert!(held.contains(&one));

@@ -11,7 +11,7 @@ fn a_batch_passes_every_member_once_and_merge_batch_merges_them_onto_the_tested_
         assert_eq!(b.runs(), ["run a1.rs a2.rs a3.rs "], "{scripts}: one run, of the whole batch");
         let batch = b.batch_claim();
         let key = String::from_utf8(
-            run(&b.dir, "scripts/code-scope", &["chain", "origin/main", &b.shas[0], &b.shas[1], &b.shas[2]]).stdout,
+            run(&b.dir, "scripts/tree-scope", &["chain", "origin/main", &b.shas[0], &b.shas[1], &b.shas[2]]).stdout,
         )
         .unwrap()
         .lines()
@@ -49,7 +49,7 @@ fn a_batch_passes_every_member_once_and_merge_batch_merges_them_onto_the_tested_
         assert_eq!(b.merged(), [1, 2, 3], "{scripts}");
         let tip = b.forge_main();
         run(&b.dir, "git", &["fetch", "-q", "origin"]);
-        let now = String::from_utf8(run(&b.dir, "scripts/code-scope", &["key", &tip]).stdout).unwrap();
+        let now = String::from_utf8(run(&b.dir, "scripts/tree-scope", &["key", &tip]).stdout).unwrap();
         assert_eq!(now.trim(), key, "{scripts}: main ends on the tested tree");
         for n in 1..=3 {
             assert!(
@@ -547,7 +547,7 @@ fn a_speculative_queue_pins_the_first_member_only_when_main_alone_passes() {
     }
 }
 
-/// Task 1e89b53c6a4a: the same, with the real test-table, code-scope and Ground guards, and a stub cargo
+/// Task 1e89b53c6a4a: the same, with the real test-table, tree-scope and Ground guards, and a stub cargo
 /// whose clippy fails on a tree holding `broken`. Main alone, where HEAD is origin/main, runs the whole
 /// table but not the guards, which have nothing to compare, so it passes: --batch pins the first member,
 /// and --speculative pins it too and then tests the second without it. --speculative's runs are --split

@@ -155,7 +155,7 @@ impl Intake {
         if policy.allow.is_some() && first_seen.is_none() {
             bail!("a server that accepts contributions needs --first-seen");
         }
-        let store_bytes = store.graph().iter().map(|c| c.encode().len() as u64).sum();
+        let store_bytes = store.graph().iter().map(|c| c.encoded_len() as u64).sum();
         let mut intake =
             Intake { store, policy, log: None, usage: HashMap::new(), store_bytes, broken: None, generation: 0 };
         if let Some(path) = first_seen {
@@ -209,7 +209,7 @@ impl Intake {
         if !allow.contains(&c.author()) {
             return Some(format!("author {} isn't on this server's allowlist", c.author()));
         }
-        let bytes = c.encode().len() as u64;
+        let bytes = c.encoded_len() as u64;
         // One batch has one credential, so its pending bytes are the whole batch's.
         let pending_store = pending.get(&keys[1]).map_or(0, |p| p.1);
         if self.store_bytes + pending_store + bytes > self.policy.store_cap {
@@ -246,7 +246,7 @@ impl Intake {
                 refused.push(Rejected { id: c.id(), reason });
                 continue;
             }
-            let bytes = c.encode().len() as u64;
+            let bytes = c.encoded_len() as u64;
             for k in keys {
                 let p = pending.entry(k).or_default();
                 p.0 += 1;
@@ -256,7 +256,7 @@ impl Intake {
             passed.push(c);
         }
         let sizes: HashMap<ContributionId, (AgentId, u64)> =
-            passed.iter().map(|c| (c.id(), (c.author(), c.encode().len() as u64))).collect();
+            passed.iter().map(|c| (c.id(), (c.author(), c.encoded_len() as u64))).collect();
         let (report, failed) = match self.store.import(passed) {
             Ok(report) => (report, None),
             Err(e) => {
@@ -894,7 +894,7 @@ impl Page {
         let (mut contributions, mut bytes, mut more) = (Vec::new(), 0, false);
         for id in g.topo_order().into_iter().filter(|id| !seen.contains(id)) {
             let c = g.get(&id).expect("ordered ids exist");
-            let size = c.encode().len();
+            let size = c.encoded_len();
             if !contributions.is_empty() && (contributions.len() == FEED_REPLY_COUNT || bytes + size > FEED_REPLY_BYTES)
             {
                 more = true;
