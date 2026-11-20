@@ -16,7 +16,10 @@
 //! - **The gate**: Pi's first event, its session header, shows no model or tools, so it passes only as
 //!   a version-3 header whose `cwd` is the agent's home; what it can't show is fixed by the pin and the
 //!   checked configuration, every assistant message from another provider or model stops the run, and
-//!   only the shim's tools are allowed (`--tools mcp__experiment__*`).
+//!   only the shim's tools are allowed (`--tools mcp__experiment__*`). A call to one of Pi's own tools
+//!   ([`BUILT_IN`]) stops the run: the sandbox relies on their absence. A call to any other name Pi refuses
+//!   itself ('Tool <name> not found'), running nothing; the backend counts it and names the shim's tools to
+//!   the agent (process `dc2dd9647315` (1), answer `98c18ce63bfc`), and the run goes on.
 //! - **Its result**: Pi gives no total of its own, so the turn's result is the stream's sum, which the
 //!   backend records as such and doesn't check against the stream (answer cc34f6275877 (2)). Pi's
 //!   compaction is off, and one beginning stops the run: a summary call reports its usage only in
@@ -45,6 +48,24 @@ use crate::sandbox::{Profile, resolved};
 /// 5f9353037f2f).
 pub const ENV_NAMES: [&str; 5] =
     ["PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY"];
+
+/// Pi 1.4.0's own tools (`allToolNames` in its `core/tools`), its MCP extension's resource tools and the
+/// placeholder it declares for Anthropic's prompt cache: a call to one stops the run, as `--tools` should have
+/// left every one of them out.
+pub const BUILT_IN: [&str; 12] = [
+    "__pi_deferred_placeholder__",
+    "read",
+    "bash",
+    "powershell",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+    "list_mcp_resources",
+    "list_mcp_resource_templates",
+    "read_mcp_resource",
+];
 
 /// The providers a run may name, each with the one environment entry Pi reads its key from.
 pub const PROVIDERS: [(&str, &str); 2] = [("anthropic", "ANTHROPIC_AUTH_TOKEN"), ("openrouter", "OPENROUTER_API_KEY")];
@@ -340,13 +361,16 @@ impl Pi {
             })
             .collect();
         let tools = tools.ok_or("a tool call without an id")?;
-        // The header can't show the tools Pi declared, so each call shows it: only the shim's.
+        // The header can't show the tools Pi declared, so each call shows it: one of Pi's own stops the run; any
+        // other name not the shim's Pi refuses, and the backend counts.
+        // In any case: Pi's names are lowercase, and a near-miss in case is still one of them (security note 1).
+        if let Some((_, n)) = tools.iter().find(|(_, n)| BUILT_IN.iter().any(|b| b.eq_ignore_ascii_case(n))) {
+            return Err(format!("a call to {}, one of Pi's own tools", crate::args::short(n)));
+        }
         let shim =
             |n: &str| n.strip_prefix(&format!("mcp__{SERVER}__")).is_some_and(|t| self.tools.iter().any(|x| x == t));
-        if let Some((_, n)) = tools.iter().find(|(_, n)| !shim(n)) {
-            return Err(format!("a call to {}, which isn't one of the shim's tools", crate::args::short(n)));
-        }
-        Ok(Event::Message { id, model: m["model"].clone(), usage, tools })
+        let (tools, unknown): (Vec<_>, Vec<_>) = tools.into_iter().partition(|(_, n)| shim(n));
+        Ok(Event::Message { id, model: m["model"].clone(), usage, tools, unknown })
     }
 }
 
@@ -411,7 +435,12 @@ impl Harness for Pi {
             "provider": self.credential.provider,
             "host": self.credential.host,
             "key_entry": self.credential.key_name,
+            "unknown_tools": "refused by Pi, counted, and named back with the shim's tools; Pi's own halt",
         })
+    }
+
+    fn offered_tools(&self) -> Vec<String> {
+        self.tools.iter().map(|t| format!("mcp__{SERVER}__{t}")).collect()
     }
 
     fn env_names(&self) -> &[&str] {
@@ -572,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn an_assistant_message_is_counted_and_any_other_model_or_tool_stops_the_run() {
+    fn an_assistant_message_is_counted_another_model_or_pis_own_tool_stops_the_run_and_another_name_is_refused() {
         let p = pi(None);
         with_turn(|t| {
             let calls = json!([
@@ -599,11 +628,28 @@ mod tests {
                 err(assistant("anthropic", "claude-sonnet-5-5", json!([])))
                     .contains("not the plan's anthropic/claude-opus-5-5")
             );
-            for name in ["bash", "mcp__other__notes_read", "mcp__experiment__rm", "__pi_deferred_placeholder__"] {
+            for name in BUILT_IN.into_iter().chain(["Bash", "READ", "Write", "LS"]) {
                 let call = json!([{"type": "toolCall", "id": "c1", "name": name, "arguments": {}}]);
                 let e = err(assistant("anthropic", "claude-opus-5-5", call));
-                assert!(e.ends_with("which isn't one of the shim's tools"), "{name}: {e}");
+                assert!(e.ends_with("one of Pi's own tools"), "{name}: {e}");
             }
+            // Any other name not the shim's: Pi refuses it and runs nothing, so the run goes on, the call counted
+            // apart from the shim's (process dc2dd9647315 (1)): e3gb's bare write_file, e3wb's invented tool.
+            for name in ["write_file", "mcp__experiment__give_up_item", "mcp__other__notes_read", "mcp__experiment__rm"]
+            {
+                let call = json!([
+                    {"type": "toolCall", "id": "c1", "name": "mcp__experiment__notes_read", "arguments": {}},
+                    {"type": "toolCall", "id": "c2", "name": name, "arguments": {}},
+                ]);
+                let Ok(Event::Message { tools, unknown, .. }) =
+                    p.event(&assistant("anthropic", "claude-opus-5-5", call), false, t)
+                else {
+                    panic!("{name}: not a message");
+                };
+                assert_eq!(tools, [("c1".to_string(), "mcp__experiment__notes_read".to_string())], "{name}");
+                assert_eq!(unknown, [("c2".to_string(), name.to_string())]);
+            }
+            assert_eq!(p.offered_tools(), ["mcp__experiment__notes_read", "mcp__experiment__claim"]);
         });
     }
 
@@ -674,6 +720,7 @@ mod tests {
             json!({
                 "result": "the stream's sum", "compaction": "off", "test_ca": false,
                 "provider": "anthropic", "host": "llm.stub.invalid", "key_entry": "ANTHROPIC_AUTH_TOKEN",
+                "unknown_tools": "refused by Pi, counted, and named back with the shim's tools; Pi's own halt",
             })
         );
         assert_eq!(pi(Some(b"a CA".to_vec())).about()["test_ca"], true);
