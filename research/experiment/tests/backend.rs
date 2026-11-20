@@ -133,7 +133,7 @@ impl Harness for Mock {
                 let tools = words
                     .map(|w| w.split_once(':').map(|(i, n)| (i.into(), n.into())).ok_or("an unreadable event"))
                     .collect::<Result<_, _>>()?;
-                Ok(Event::Message { id, model: json!("mock"), usage, tools })
+                Ok(Event::Message { id, model: json!("mock"), usage, tools, unknown: Vec::new() })
             }
             "settled" => Ok(Event::Result {
                 usage: None,

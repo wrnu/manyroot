@@ -3,7 +3,11 @@
 // completions as OpenRouter serves them, for one Pi turn, so a turn runs end to end with no model. Run
 // by the test prefix's own node, outside the sandbox:
 //
-//   node pi-stub.mjs <cert.pem> <key.pem> <log.jsonl> <token>
+//   node pi-stub.mjs <cert.pem> <key.pem> <log.jsonl> <token> [<tool>]
+//
+// Given <tool>, its first chat completion calls that tool by name instead, and later ones, once a tool result
+// is in the conversation, answer as usual: so a test sees what Pi does with a call to a name (process
+// dc2dd9647315). The log then also holds each request's tool results' text.
 //
 // It prints its port, then answers every POST .../v1/messages and .../chat/completions with one
 // assistant message of fixed text and the same usage (input 1200, cache read 4000, cache write 300,
@@ -14,7 +18,7 @@
 import { appendFileSync, readFileSync } from "node:fs";
 import { createServer } from "node:https";
 
-const [cert, key, log, token] = process.argv.slice(2);
+const [cert, key, log, token, call] = process.argv.slice(2);
 
 const sse = (res, event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`);
 
@@ -35,6 +39,7 @@ const server = createServer({ cert: readFileSync(cert), key: readFileSync(key) }
         auth: auth === `Bearer ${token}` ? "the token" : auth ? "another" : "none",
         model: request.model ?? null,
         tools: (request.tools ?? []).map((t) => t.name ?? t.function?.name),
+        tool_results: (request.messages ?? []).filter((m) => m.role === "tool").map((m) => JSON.stringify(m.content)),
       }) + "\n",
     );
     const path = new URL(req.url, "https://stub").pathname;
@@ -42,6 +47,16 @@ const server = createServer({ cert: readFileSync(cert), key: readFileSync(key) }
       res.writeHead(200, { "content-type": "text/event-stream" });
       const chunk = (rest) =>
         res.write(`data: ${JSON.stringify({ id: "gen-stub-1", object: "chat.completion.chunk", model: request.model, ...rest })}\n\n`);
+      if (call && !(request.messages ?? []).some((m) => m.role === "tool")) {
+        const fn = { name: call, arguments: "{}" };
+        const delta = { role: "assistant", tool_calls: [{ index: 0, id: "call_stub_1", type: "function", function: fn }] };
+        chunk({ choices: [{ index: 0, delta, finish_reason: null }] });
+        chunk({ choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] });
+        chunk({ choices: [], usage: { prompt_tokens: 5500, completion_tokens: 7, prompt_tokens_details: { cached_tokens: 4000, cache_write_tokens: 300 } } });
+        res.write("data: [DONE]\n\n");
+        res.end();
+        return;
+      }
       chunk({ choices: [{ index: 0, delta: { role: "assistant", content: "Done." }, finish_reason: null }] });
       chunk({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] });
       const details = { cached_tokens: 4000, cache_write_tokens: 300 };

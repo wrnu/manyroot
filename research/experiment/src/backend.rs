@@ -444,6 +444,9 @@ pub enum Event {
         usage: Tokens,
         /// The tool calls it asks for: (call id, tool name).
         tools: Vec<(String, String)>,
+        /// The names it asked for that the shim doesn't offer and the harness refused itself, running nothing
+        /// (process `dc2dd9647315` (1)): counted, and named to the agent with the tools it has. Not in `tools`.
+        unknown: Vec<String>,
     },
     /// The turn's end, with the harness's own figures for it.
     Result {
@@ -458,6 +461,58 @@ pub enum Event {
     },
     /// Anything else: kept in the transcript only.
     Other,
+}
+
+/// Calls to tools the shim doesn't offer, which the harness refused itself (process `dc2dd9647315` (1)): how
+/// many in the run, and per agent the names not yet named back to it with the tools it has. The driver puts that
+/// hint on the agent's next shim result ([`Backend::unknown_hint`]); one still waiting when its turn ends opens
+/// its next turn's message ([`UnknownCalls::turn_message`]).
+#[derive(Debug, Default)]
+pub struct UnknownCalls {
+    /// The tools as the agent's harness names them to it.
+    offered: Vec<String>,
+    waiting: Mutex<BTreeMap<String, Vec<String>>>,
+    total: std::sync::atomic::AtomicU64,
+}
+
+impl UnknownCalls {
+    pub fn new(offered: Vec<String>) -> UnknownCalls {
+        UnknownCalls { offered, ..UnknownCalls::default() }
+    }
+
+    /// `agent` asked for `name`, which isn't one of its tools.
+    pub fn note(&self, agent: &str, name: &str) {
+        self.total.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        waiting.entry(agent.to_string()).or_default().push(crate::args::short(name));
+    }
+
+    /// The run's count so far.
+    pub fn total(&self) -> u64 {
+        self.total.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The hint for `agent`'s calls not yet named to it, taken: none if there are none.
+    pub fn take_hint(&self, agent: &str) -> Option<String> {
+        let names = self.waiting.lock().unwrap_or_else(|e| e.into_inner()).remove(agent)?;
+        let mut unique: Vec<&str> = Vec::new();
+        for n in &names {
+            if !unique.contains(&n.as_str()) {
+                unique.push(n);
+            }
+        }
+        let (asked, verb) =
+            if unique.len() == 1 { (unique[0].to_string(), "isn't") } else { (unique.join(", "), "aren't") };
+        Some(format!("{asked} {verb} among your tools, so nothing ran. Your tools are: {}.", self.offered.join(", ")))
+    }
+
+    /// A turn's opening `message`, after the hint for any of `agent`'s calls its last turn ended before naming.
+    pub fn turn_message(&self, agent: &str, message: &str) -> String {
+        match self.take_hint(agent) {
+            Some(hint) => format!("{hint}\n\n{message}"),
+            None => message.to_string(),
+        }
+    }
 }
 
 /// An agent harness, as the backend drives it. Every error that a method marks as stopping the run
@@ -485,6 +540,12 @@ pub trait Harness: Sync {
     /// result comes from: the first usage row and the plan hold it ([`HarnessBackend::harness_record`]).
     fn about(&self) -> Value {
         json!({})
+    }
+
+    /// The shim's tools as it names them to the model, for the hint after a call to another name
+    /// ([`UnknownCalls`]): empty for a harness whose stream never reports such a call.
+    fn offered_tools(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// How its agents' tool results are bounded ([`Backend::result_limit`]): under its own cap.
@@ -561,6 +622,8 @@ pub struct HarnessBackend<H> {
     /// Each agent's role sentence, after its turn message: none unless [`HarnessBackend::set_integrator`] names
     /// one integrator.
     roles: BTreeMap<String, String>,
+    /// Calls to names the shim doesn't offer, which the harness refused (process `dc2dd9647315` (1)).
+    unknown: UnknownCalls,
 }
 
 impl<H: Harness> HarnessBackend<H> {
@@ -608,7 +671,9 @@ impl<H: Harness> HarnessBackend<H> {
             "declared": env_names,
             "about": harness.about(),
         });
+        let unknown = UnknownCalls::new(harness.offered_tools());
         let backend = HarnessBackend {
+            unknown,
             harness,
             secret,
             pin,
@@ -686,6 +751,12 @@ impl<H: Harness> HarnessBackend<H> {
         if let Some(role) = self.roles.get(name) {
             message = format!("{message} {role}");
         }
+        // A hint its last turn ended before naming opens this one (answer `98c18ce63bfc`).
+        let opened = self.unknown.turn_message(name, &message);
+        if opened != message {
+            self.record(json!({"agent": name, "turn": turn, "unknown_hint": "turn message"}));
+        }
+        let message = opened;
         let own = self.cfg.dir.join("agents").join(name);
         let (home, tmp) = (own.join("home"), own.join("tmp"));
         for d in [&own, &home, &tmp] {
@@ -855,7 +926,12 @@ impl<H: Harness> HarnessBackend<H> {
                 continue;
             }
             match event {
-                Event::Message { id, model, usage, tools } => {
+                Event::Message { id, model, usage, tools, unknown } => {
+                    // Refused by the harness and counted, not run, and not a call the driver counts either.
+                    for n in &unknown {
+                        self.record(json!({"agent": name, "turn": turn, "unknown_tool": crate::args::short(n)}));
+                        self.unknown.note(name, n);
+                    }
                     // A model call beyond the grace's: counted, then the process ends.
                     let beyond_grace = grace.is_some_and(|(_, at)| {
                         !messages.contains_key(&id) && messages.len() >= at + caps.cap_grace_calls
@@ -972,6 +1048,14 @@ impl<H: Harness> Backend for HarnessBackend<H> {
 
     fn halted(&self) -> Option<String> {
         self.halt.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn unknown_hint(&self, agent: &str) -> Option<String> {
+        self.unknown.take_hint(agent)
+    }
+
+    fn unknown_calls(&self) -> u64 {
+        self.unknown.total()
     }
 }
 

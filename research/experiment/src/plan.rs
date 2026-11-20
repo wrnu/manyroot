@@ -332,6 +332,13 @@ fn project_rules(setting: &str) -> Vec<(String, String)> {
                  has ended its last turn."
             ),
         ));
+        rules.push((
+            "integrator-each-turn".to_string(),
+            format!(
+                "Task 61911c91247f: {setting} starts each of its turns only once every other agent has ended that \
+                 turn, so it integrates their proposals as they come, while they play their next."
+            ),
+        ));
     }
     rules
 }
