@@ -6,9 +6,10 @@
 # run's result on a pr claim, so the two can be compared (decision d9fa2c08146c).
 #
 # What it leaves out, which only the counted run (scripts/test-table --split) checks (finding
-# a5b068929177): the Docker-backed macos_only tests, since GitHub's macOS runners have no Docker (the
-# macOS job lists each one that skipped, in its log and its summary, never as a pass), and --split's
-# cross-check that every test runs on Linux or the Mac.
+# a5b068929177): --split's cross-check that every test runs on Linux or the Mac. Any macos_only test that
+# skips for want of Docker (GitHub's macOS runners have none) is listed as skipped in the macOS job's log
+# and summary, never as a pass. The research workspace has its own workflow, research.yml, which runs its
+# Docker tests on Linux (finding d160c76dafca).
 #
 # Hardened for a public repository: read-only token, no secrets, never pull_request_target or
 # workflow_run (a pull_request run from a fork gets no secrets and a read-only token), third-party
@@ -45,7 +46,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      # Full history, for the Ground guards' append-only check and scripts/code-scope against main.
+      # Full history, for the Ground guards' append-only check and scripts/tree-scope against main.
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

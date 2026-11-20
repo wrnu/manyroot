@@ -86,7 +86,7 @@ subsystem: replication, plus materialized views of merged state. The graph
 itself is the CRDT. This spec is mostly Bracken's code layer on top of it.
 Its first materialized view is a source tree (owner decision
 `46b91e01edc2`). So it is built as Bracken's crate `crates/tree` (package
-`bracken-tree`, like `crates/demo`'s `bracken-demo`), not inside manyroot.
+`bracken-tree`, like `research/demo`'s `bracken-demo`), not inside manyroot.
 The user-facing names stay `bracken weave` and `scripts/weave`.
 
 | Part | Where it lives now | Generic candidate for manyroot after dogfooding |
@@ -995,7 +995,7 @@ nothing else runs a check on a Weave manifest (security note
   `~/.cargo` and `~/.rustup` are never writable from a check, and unreviewed
   code can't plant something that a later, unsandboxed build would run.
 - **The sandbox profile is deny-by-default**, like the experiment's
-  (`crates/experiment/src/sandbox.rs`), and on macOS it is applied with
+  (`research/experiment/src/sandbox.rs`), and on macOS it is applied with
   `sandbox-exec`:
   - reads are allowed only from the temporary directory, the system's own
     directories, the vendor directory and the toolchain, read-only. The

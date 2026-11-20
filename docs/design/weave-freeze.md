@@ -256,8 +256,8 @@ tripwire don't match it (section 4).
 | `crates/tree/tests/lines.rs` | The ancestor rule: a reference that isn't an ancestor makes the record `NotAnAncestor` and views ignore it | An assertion |
 | `crates/tree/tests/weave_fixture.rs` with `tests/fixtures/weave-v1` | A Ground written by `bracken-tree` 0.1.0: 80 contributions with pinned ids, covering every media type, results, reviews, a goal and a policy change. It checks that it opens, that every record reads back to its bytes, every derived status, and that the scenario rebuilds the fixture byte for byte. Since the ids are pinned, so is every byte the scenario writes: `details` from `details()`, argv-only methods, change hashes, `Exit::Code`'s text. | An id, byte or status mismatch, or the rebuild differing |
 | `crates/tree/tests/coordination_fixture.rs` and `crates/bracken/tests/coordination_fixture.rs` | The coordination fixture `ground-v1` reads as recorded with Weave linked in, and Weave finds nothing of its own there | A status or acceptance mismatch |
-| `scripts/code-scope full` | A head touching `crates/tree/src/*`, `crates/tree/Cargo.toml`, `weave_fixture.rs`, `tests/fixtures/*`, `Cargo.toml` or `Cargo.lock` gets the full table, so every guard above runs | `scripts/verify-seq --light` and `scripts/merge` refuse a light run |
-| AGENTS.md's protocol class; releases.md's release path | A protocol-class change needs an independent review, the manager's go logged as `owner-review`, and a migration note | `scripts/merge`'s `frozen` check, through `scripts/code-scope frozen` (G6, PR #29), refuses a head that changes a frozen path without a current `owner-review` by manager naming the pr claim and the head, a golden vector or pinned fixture without the owner's own approval, or a path holding 1.8's refusals without an independent review's pass at the head. The migration note, and the review of a protocol-class path outside Weave's, are still review, not a script |
+| The counted run (`scripts/test-table`) | Every head that changes code gets the full table, so every guard above runs: there's no light run since owner decision `c8bbb2886be3`, which retired `scripts/code-scope full` (task `bfc942cd7ced`) | `scripts/merge` counts only a pass of the whole table, or of its docs-only path for a head that changes only docs (never this page or `docs/protocol.md`) |
+| AGENTS.md's protocol class; releases.md's release path | A protocol-class change needs an independent review, the manager's go logged as `owner-review`, and a migration note | `scripts/merge`'s `frozen` check, through `scripts/tree-scope frozen` (G6, PR #29; `scripts/code-scope frozen` until task `bfc942cd7ced` moved it), refuses a head that changes a frozen path without a current `owner-review` by manager naming the pr claim and the head, a golden vector or pinned fixture without the owner's own approval, or a path holding 1.8's refusals without an independent review's pass at the head. The migration note, and the review of a protocol-class path outside Weave's, are still review, not a script |
 
 ### 2.2 Each frozen item, and its guard
 
@@ -317,7 +317,9 @@ full table, and adds pins without changing any format.
 - **G5. Content-hash text form**: in `format_guard.rs`, a golden parse of
   `blake3:<hex>`, with refusals of the bare, uppercase and short forms. It
   repeats `hash.rs`'s unit tests in the file the freeze names.
-- **G6. Make the review requirement mechanical** (merge-gate tooling). The
+- **G6. Make the review requirement mechanical** (merge-gate tooling; as built in PR #29. Task
+  `bfc942cd7ced` later moved `code-scope frozen` unchanged into `scripts/tree-scope` and retired
+  `code-scope full`, with the light run it served). The
   set is keyed on directories, as `code-scope full` is, never on a list of
   modules: frozen rules live in `format.rs`, `hash.rs`, `path.rs`,
   `lines.rs`, `ground.rs`, `results.rs` and `import.rs`, and a module split

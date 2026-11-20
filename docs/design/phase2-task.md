@@ -96,7 +96,7 @@ at 8: the larger task supplies the extra work, not more turns.
 **Build steps (no model calls):**
 1. Specs, reference implementations in Rust, two correct and two subtly wrong
    candidates each, and public and hidden cases for about 90 functions, in
-   `crates/experiment/src/task.rs` and `grader.rs`, with the same tests as
+   `research/experiment/src/task.rs` and `grader.rs`, with the same tests as
    Phase 1's step 1.
 2. Two change waves, and the driver's release of the second wave.
 3. Mock-backend scripts for the larger task, and a full mock run of all three
@@ -308,7 +308,7 @@ beside Phase 1's. The change waves are step 2's, in
 **A task selector.** `--task phase1` or `--task phase2` on `run` and
 `mock-run`, with Phase 1's as the default. The plan records the task, and a
 plan from before the selector reads as Phase 1's. Phase 1's task is its own
-file (`crates/experiment/src/task/phase1.rs`), moved unchanged. A test pins
+file (`research/experiment/src/task/phase1.rs`), moved unchanged. A test pins
 its task texts and each mode's tool list to the hashes in replicate 3's
 plans, so Phase 1 gives agents byte for byte what its runs were given, except
 for the wording of Bracken mode's `accepted` tool, which PR #55 changed along
@@ -316,7 +316,7 @@ with the acceptance rule. The
 plan's measuring-code hash covers both tasks' files, so reporting a Phase 1
 run needs the build that ran it, as before.
 
-**The task** (`crates/experiment/src/task/phase2.rs`) has 90 functions in
+**The task** (`research/experiment/src/task/phase2.rs`) has 90 functions in
 eight modules, one layer per module:
 
 | Layer | Modules | Functions |

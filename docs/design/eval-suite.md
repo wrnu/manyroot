@@ -77,8 +77,8 @@ agents that drafted or reviewed a project never run on it.
 
 As built (task `9345098e82aa`, split note `842c4f4821e9`; owner decision
 `594307ea44a2`, manager's answers `c008b959c572`). A project is a directory
-under `crates/experiment/projects/<name>/`, all of which agents may read;
-`crates/experiment/tests/fixtures/project-tiny` is a small example.
+under `research/experiment/projects/<name>/`, all of which agents may read;
+`research/experiment/tests/fixtures/project-tiny` is a small example.
 
 ```
 <name>/
@@ -226,7 +226,7 @@ Requirements for building the runner (from security's review, evidence
 That execution profile is a new risky surface, and gets its own tests and
 security review, as Candidate B planned.
 
-**The execution profile as built** (`crates/experiment/src/python.rs`, tasks
+**The execution profile as built** (`research/experiment/src/python.rs`, tasks
 `9345098e82aa` and `879a58e77bde`, decision `ac22cedd8fee`): agent code runs
 in a container on Docker (Docker Desktop on the Mac), where the kernel
 enforces the limits that `sandbox-exec` couldn't (disk, memory and
@@ -336,7 +336,7 @@ stretch a group without end.
 
 ## Grading
 
-The grader (`crates/experiment/src/project_grader.rs`, task
+The grader (`research/experiment/src/project_grader.rs`, task
 `9345098e82aa`) runs a project's hidden tests on a tree, and reports counts
 per item and per group, by index: no test's name, source, expected value or
 message. The tests and the code under test never share a process:

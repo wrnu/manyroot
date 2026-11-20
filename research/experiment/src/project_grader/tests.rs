@@ -24,16 +24,18 @@ fn a_calls_deadline_is_the_hosts_moved_by_its_servers_start() {
     assert_eq!(super::call_deadline(host, Duration::ZERO, host + s(60)), host);
 }
 
-/// In `macos_only` though they don't need macOS, so the counted run's Mac side runs them: Docker is on this Mac
-/// and not in the test boxes, where they skip (decision ac22cedd8fee, docs/development.md).
-mod macos_only {
+/// In `docker`, a group of their own (finding d160c76dafca): they need Docker, not macOS. No CI runner runs
+/// them with Docker yet (Linux portability is deferred task 1efdf2e34f46): the manager runs them by hand on the
+/// Mac, with BRACKEN_TEST_REQUIRE_DOCKER set so a skip fails, and scripts/merge asks for that run on a head that
+/// changes them (decision ac22cedd8fee, answer 5b3aa570643b, docs/development.md).
+mod docker {
     use std::path::{Path, PathBuf};
 
     use serde_json::{Value, json};
 
     use super::super::*;
     use crate::project::digest;
-    use crate::python::tests::macos_only::python;
+    use crate::python::tests::docker::python;
 
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().expect("a parent")).expect("a directory");

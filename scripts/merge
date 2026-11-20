@@ -22,20 +22,16 @@
 #      written by the manager, which the manager related depends_on it (process 4.2);
 #   4. the GitHub PR is open, targets main, and its head is that sha;
 #   scope: a manager pass of scripts/test-table on the sha that bk-evidence labelled docs-only
-#      counts only if the head is docs-only by scripts/code-scope (everything it changed since main
-#      is *.md outside crates/); one that reuses an earlier pass ('tree <key> reuses <id>') counts
+#      counts only if the head is docs-only by scripts/tree-scope (everything it changed since main
+#      is *.md or under docs/, outside crates/ and research/, and neither docs/protocol.md nor
+#      docs/design/weave-freeze.md); one that reuses an earlier pass ('tree <key> reuses <id>') counts
 #      only if <id> is a current manager pass of the whole table on a pr claim of the same PR with the
 #      same key (owner decision 642a47c04a10). Any other such pass fails this check. Here and in 5,
 #      'scripts/test-table --split' (the whole table in a box plus the macOS-only tests on the Mac,
-#      owner decision 01a2d668b67e) counts as scripts/test-table; --remote alone doesn't. A light pass
-#      ('scripts/test-table --split -p <package>... @ <sha> on <main sha> tree <key>', from
-#      scripts/verify-seq --light: decision 464d3ccca45e, answer 10cf8a5053a3) counts as the --on form
-#      does in 5, but fails this check unless all of these hold: scripts/code-scope full names no path
-#      the head changed since main's tip (its list, the one list of the paths that need the whole
-#      table, is the only place they're named); its packages include every one scripts/code-scope packages computes
-#      for the head (bracken-scope packages, findings 0095e19fcdb7, 4825c59b07e9); and the pr claim's
-#      author has the five passes on the exact sha that verify-seq --light checks first (scripts/code-scope
-#      light-passes, finding 013ac6db02d9). It exists only for a merged tree, never for the bare head;
+#      owner decision 01a2d668b67e) counts as scripts/test-table; --remote alone doesn't. There is no light
+#      pass (owner decision c8bbb2886be3, task bfc942cd7ced, superseding decisions 464d3ccca45e and
+#      73f2ba4c08e5): a pass of part of the table, 'scripts/test-table --split -p ...' among them, counts
+#      for nothing here;
 #   5. main's tip is an ancestor of the sha, or every file main changed since the
 #      branch point is under .bracken/, or is untouched by the branch and either
 #      under docs/ (not docs/vision.md) or a .md file under .claude/skills/ outside
@@ -45,7 +41,7 @@
 #      the merge ('scripts/test-table @ <sha> on <main sha>', from bk-evidence --on, with
 #      ' tree <key>' and then ' docs-only' or ' reuses <id>' after it as bk-evidence now
 #      records them) with a main sha that main's tip has moved past only in those same
-#      paths. A light pass counts here too, where the scope check allows it, and so does a Weave pass
+#      paths. A Weave pass counts here too
 #      ('scripts/test-table --weave @ <sha> on <main sha> tree <key> manifest <H>', from verify-seq
 #      --weave: line main's Weave results on that merge, plan cc496dcee0e3 step 1b), but the scope
 #      check fails unless scripts/weave-gate check agrees, reading everything afresh: the Weave gate
@@ -56,7 +52,7 @@
 #      files under .bracken/, the Ground append-only, the Ground opens, and
 #      docs/vision.md matches it;
 #   frozen: what Weave's format freeze guards (docs/design/weave-freeze.md 2.4, G6; decision
-#      bae92c497714), as main's scripts/code-scope frozen names it for the head since main's tip. If it
+#      bae92c497714), as main's scripts/tree-scope frozen names it for the head since main's tip. If it
 #      names anything, then for each kind of line it prints: a 'frozen:' path needs a current claim
 #      tagged owner-review, by manager, not retracted or superseded (as in 1), whose first line names the pr
 #      claim's full id and the head's full sha; an 'owner:' path (a golden vector, a pinned fixture value,
@@ -67,6 +63,14 @@
 #      @ <sha>'. Each refusal names the paths and what's missing. Only frozen's exit 3 and its one line mean
 #      nothing to check; any other exit, or an exit 0 with a line that isn't '<kind>: <path> (<why>)' of
 #      those three kinds, fails the check (findings db2dc1c6120e, e3f9ae2b1820);
+#   docker: the research workspace's Docker tests run on no CI runner that has Docker (finding d160c76dafca,
+#      answer 5b3aa570643b; Linux portability is deferred task 1efdf2e34f46), so a head whose change since
+#      its merge base with main's tip, or whose merge with it changes, anything under research/ or the old
+#      crates/experiment/ and crates/demo/ (decision 07dd5c4f; the product crates the research tests build on
+#      are left out, and the manager runs the research Docker tests on main weekly instead) (matched ASCII-lowercased, read NUL-separated; a rename counts as a deletion
+#      and an addition, so one out of it counts too; a head that doesn't merge cleanly fails) needs a current
+#      manager pass on the pr claim whose method starts 'research docker tests' and ends ' @ <sha>': the
+#      by-hand run on the Mac with Docker running (docs/development.md). Any other head passes this check;
 #   7. with --owner-approval, for a PR whose class needs the owner's go (docs/development.md, Owner
 #      approvals): a current claim tagged approval (not superseded, as in 1), written by owner (scripts/owner-approve), that owner
 #      related supports this pr claim itself, by its full id. An approval of a task, another PR or an
@@ -351,15 +355,13 @@ tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no o
 # The manager's passes of scripts/test-table naming the sha, one '<main sha>\x1f<key>\x1f<suffix>' line
 # each, split on the unit separator: a tab is whitespace to read, so an empty main and key would collapse
 # and a suffix land in the wrong field, never checked (task 962bd6b61626); the main and key are empty for a pass without --on, the suffix ' docs-only', ' reuses <id>',
-# ' light -p <package>...' (a light pass, always with --on), ' weave <manifest> <evidence>' (line main's
+# ' weave <manifest> <evidence>' (line main's
 # Weave results on the merge, recorded by verify-seq --weave and re-checked below by scripts/weave-gate
 # check) or empty.
 tables=$(jq -r --arg full "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
   and .retracted == false and .author_name == "manager" and .body.target == $full and .body.verdict == "pass")
   | . as $e | .body.method
   | ((capture("^scripts/test-table( --split)? @ (?<h>[0-9a-f]{40})( on (?<m>[0-9a-f]{40})( tree (?<k>[0-9a-f]{40,64}))?)?(?<x> docs-only| reuses [0-9a-f]{64})?$")?)
-     // (capture("^scripts/test-table --split(?<p>( -p [A-Za-z0-9][A-Za-z0-9_-]*)+) @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40}) tree (?<k>[0-9a-f]{40,64})$")?
-         | .x = " light" + .p)
      // (capture("^scripts/test-table --weave @ (?<h>[0-9a-f]{40}) on (?<m>[0-9a-f]{40}) tree (?<k>[0-9a-f]{40,64}) manifest (?<w>blake3:[0-9a-f]{64})$")?
          | .x = " weave " + .w + " " + $e.id))
   | select(.h == $sha) | [.m // "", .k // "", .x // ""] | join("\u001f")] | unique | .[]' <<<"$shown")
@@ -386,7 +388,7 @@ batch_pass_ok() {
   run_commit=$c
   [ -n "$c" ] && [ "$(key_of "$c")" = "$3" ]
 }
-key_of() { (cd "$main" && "$here/code-scope" key "$1" 2>/dev/null); }
+key_of() { (cd "$main" && "$here/tree-scope" key "$1" 2>/dev/null); }
 # untested <from> [<to>]: what changed from <from> to <to> (main's tip by default) that can change what
 # builds, tests or runs. Docs and skill .md files count only where $ours, the paths the head (or the
 # batch's members) changed, lists them; docs/vision.md and skill templates always count.
@@ -416,10 +418,10 @@ batch_ours() {
   done
   ours=$(sort -u <<<"$all")
 }
-# merged_commit <onto> <head>...: <onto> merged with the heads in order (code-scope chain); empty on a conflict.
-merged_commit() { (cd "$main" && "$here/code-scope" chain "$@" 2>/dev/null | tail -n 1 | cut -d' ' -f2); }
+# merged_commit <onto> <head>...: <onto> merged with the heads in order (tree-scope chain); empty on a conflict.
+merged_commit() { (cd "$main" && "$here/tree-scope" chain "$@" 2>/dev/null | tail -n 1 | cut -d' ' -f2); }
 # merged_key <onto> <head>...: the key of <onto> merged with the heads in order; empty if they don't merge.
-merged_key() { (cd "$main" && "$here/code-scope" chain "$@" 2>/dev/null | tail -n 1 | cut -d' ' -f3); }
+merged_key() { (cd "$main" && "$here/tree-scope" chain "$@" 2>/dev/null | tail -n 1 | cut -d' ' -f3); }
 expect_after=''
 # A batch pass counts in the plain form only for exactly the tested tree: never a prefix (decision
 # db6f7705c0a4).
@@ -450,7 +452,7 @@ batch_member_main() {
     check FAIL main "no manager batch pass of batch ${batch_member:0:12} on this claim that counts (a current batch claim listing #$pr $full @ $sha, and its run's pass)"
     return
   fi
-  if ! chain=$(cd "$main" && "$here/code-scope" chain "$b_main" "${b_sha[@]}" 2>&1); then
+  if ! chain=$(cd "$main" && "$here/tree-scope" chain "$b_main" "${b_sha[@]}" 2>&1); then
     check FAIL main "batch ${b_full:0:12} no longer merges onto its own main: $chain"
     return
   fi
@@ -509,48 +511,14 @@ docs_only=false
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
   check FAIL scope "$sha isn't on origin"
 else
-  if scope=$(cd "$main" && "$here/code-scope" docs-only "$tip" "$sha" 2>&1); then docs_only=true; fi
-  scope=${scope#code-scope: }
+  if scope=$(cd "$main" && "$here/tree-scope" docs-only "$tip" "$sha" 2>&1); then docs_only=true; fi
+  scope=${scope#tree-scope: }
   wrong=()
-  needs_full='' light_packages='' light_passes='' weave_case=''
+  weave_case=''
   weave_dropped=() weave_dropped_ids=() weave_ignored=()
   while IFS=$'\x1f' read -r m k x; do
     case "$x" in
       " docs-only") $docs_only || wrong+=("a docs-only pass${m:+ on main $m} on a head that isn't docs-only ($scope)") ;;
-      " light -p "*)
-        # The one list of what needs the whole table (code-scope full), and the scope from bracken-scope
-        # packages (code-scope packages), read as verify-seq --light reads them.
-        [ -n "$needs_full" ] || needs_full=$(cd "$main" && "$here/code-scope" full "$tip" "$sha" 2>&1; echo "exit $?")
-        case "${needs_full##*exit }" in
-          1) ;;
-          0) wrong+=("a light pass on main $m, but the head needs the whole table: $(sed '$d; s/^code-scope: full: //' <<<"$needs_full" | tr '\n' ' ' | sed 's/ $//')") ;;
-          *) wrong+=("a light pass on main $m, and code-scope full failed: $(sed '$d' <<<"$needs_full" | tr '\n' ' ')") ;;
-        esac
-        [ -n "$light_packages" ] || light_packages=$(cd "$main" && "$here/code-scope" packages "$tip" "$sha" 2>&1; echo "exit $?")
-        if [ "${light_packages##*exit }" != 0 ]; then
-          wrong+=("a light pass on main $m, and code-scope packages failed: $(sed '$d' <<<"$light_packages" | tr '\n' ' ')")
-        elif [ "$light_packages" = "exit 0" ]; then
-          wrong+=("a light pass on main $m, but the head has no package to test")
-        else
-          lacks=()
-          while IFS= read -r p; do
-            [[ "$x " == *" -p $p "* ]] || lacks+=("$p")
-          done < <(sed '$d' <<<"$light_packages")
-          [ ${#lacks[@]} -eq 0 ] || wrong+=("a light pass on main $m that leaves out ${lacks[*]}, which the head's changes need")
-          # The pr claim's author's five passes on the exact sha, verify-seq --light's precondition.
-          if [ -z "$light_passes" ]; then
-            # shellcheck disable=SC2046 # one package name a word
-            light_passes=$(jq -r --arg full "$full" '.author_name as $a | [.referrers[] | select(.kind == "evidence"
-              and .retracted == false and .author_name == $a and .body.target == $full and .body.verdict == "pass")
-              | .body.method] | .[]' <<<"$shown" | "$here/code-scope" light-passes "$sha" $(sed '$d' <<<"$light_packages") 2>&1; echo "exit $?")
-          fi
-          case "${light_passes##*exit }" in
-            0) ;;
-            1) wrong+=("a light pass on main $m, but the pr claim's author has $(sed '$d' <<<"$light_passes")") ;;
-            *) wrong+=("a light pass on main $m, and code-scope light-passes failed: $(sed '$d' <<<"$light_passes" | tr '\n' ' ')") ;;
-          esac
-        fi
-        ;;
       " reuses "*) reuses_a_pass "${x# reuses }" "$k" ||
         wrong+=("a pass reusing ${x# reuses }, which isn't a current manager pass of the whole table on PR #$pr with key ${k:-none}") ;;
       " weave "*)
@@ -662,14 +630,14 @@ else
 fi
 
 # 6a. The format freeze (docs/design/weave-freeze.md 2.4, G6; decision bae92c497714), through main's
-# code-scope, as for full: see the header.
+# scripts/tree-scope: see the header.
 frozen_case="nothing frozen"
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
   check FAIL frozen "$sha isn't on origin"
 else
   rc=0
   frozen_err=$(mktemp)
-  frozen=$(cd "$main" && "$here/code-scope" frozen "$tip" "$sha" 2>"$frozen_err") || rc=$?
+  frozen=$(cd "$main" && "$here/tree-scope" frozen "$tip" "$sha" 2>"$frozen_err") || rc=$?
   frozen_why=$(tr '\n' ' ' <"$frozen_err" | sed 's/ $//')
   rm -f "$frozen_err"
   # Fail closed (findings db2dc1c6120e, e3f9ae2b1820): only exit 3 with exactly its one line means nothing
@@ -680,23 +648,23 @@ else
     [ -n "$frozen" ] || unread="no line at all"
     while IFS= read -r l; do
       [ -n "$unread" ] && break
-      [[ $l =~ ^code-scope:\ (frozen|owner|security):\ [^[:cntrl:]]+\ \([^[:cntrl:]]+\)$ ]] ||
+      [[ $l =~ ^tree-scope:\ (frozen|owner|security):\ [^[:cntrl:]]+\ \([^[:cntrl:]]+\)$ ]] ||
         unread="a line it can't read: $(printf '%q' "$l")"
     done <<<"$frozen"
   elif [ "$rc" = 3 ]; then
-    [[ $frozen =~ ^code-scope:\ nothing\ since\ [0-9a-f]{40,64}\ is\ frozen\ or\ holds\ the\ freeze\'s\ refusals$ ]] ||
+    [[ $frozen =~ ^tree-scope:\ nothing\ since\ [0-9a-f]{40,64}\ is\ frozen\ or\ holds\ the\ freeze\'s\ refusals$ ]] ||
       unread="an answer for nothing to check that isn't its one line: $(printf '%q' "$frozen")"
   fi
   if [ "$rc" = 3 ] && [ -z "$unread" ]; then
-    check ok frozen "$frozen_case: ${frozen#code-scope: }"
+    check ok frozen "$frozen_case: ${frozen#tree-scope: }"
   elif [ "$rc" != 0 ] && [ "$rc" != 3 ]; then
-    check FAIL frozen "code-scope frozen failed (exit $rc), so the freeze check can't decide: ${frozen_why:-no message}"
+    check FAIL frozen "tree-scope frozen failed (exit $rc), so the freeze check can't decide: ${frozen_why:-no message}"
   elif [ -n "$unread" ]; then
-    check FAIL frozen "code-scope frozen exited $rc with $unread, so the freeze check can't decide"
+    check FAIL frozen "tree-scope frozen exited $rc with $unread, so the freeze check can't decide"
   else
     missing=() have=()
-    # paths_of <kind>: the paths code-scope named with 'code-scope: <kind>: <path> (<why>)', space-separated.
-    paths_of() { sed -n "s/^code-scope: $1: \\(.*\\) (.*)\$/\\1/p" <<<"$frozen" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
+    # paths_of <kind>: the paths tree-scope named with 'tree-scope: <kind>: <path> (<why>)', space-separated.
+    paths_of() { sed -n "s/^tree-scope: $1: \\(.*\\) (.*)\$/\\1/p" <<<"$frozen" | sort -u | tr '\n' ' ' | sed 's/ $//'; }
     frozen_paths=$(paths_of frozen) owner_paths=$(paths_of owner) security_paths=$(paths_of security)
     # A full id or sha, named as a word of its own: not part of a longer hex string.
     named() { printf '(^|[^0-9a-f])%s([^0-9a-f]|$)' "$1"; }
@@ -753,6 +721,48 @@ else
   fi
 fi
 
+# 6b. The research Docker tests (see the header): run by hand on the Mac, recorded by the manager.
+docker_case="no research Docker code changed"
+if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  check FAIL docker "$sha isn't on origin"
+elif ! docker_base=$(git -C "$main" merge-base "$tip" "$sha") ||
+  ! docker_merged=$(git -C "$main" merge-tree --write-tree --no-messages "$tip" "$sha" 2>/dev/null | head -n 1) ||
+  [ -z "$docker_merged" ] ||
+  ! docker_list=$(mktemp) ||
+  ! { git -C "$main" diff --no-renames --name-only -z "$docker_base" "$sha" &&
+    git -C "$main" diff --no-renames --name-only -z "$tip" "$docker_merged"; } >"$docker_list"; then
+  # Fails closed: a head that doesn't merge cleanly, or a diff that fails, can't be judged.
+  check FAIL docker "couldn't list what $sha changes since its merge base with main ($tip), or what merging it changes"
+else
+  # As tree-scope's changed_paths reads them (finding b791a20398d9): NUL-separated, so a name holding a
+  # quote, a backslash or a newline is read as it is; what the head changed since the merge base, and every
+  # path that differs between main's tip and the merged tree, since the merge carries a head's edit onto a
+  # path main renamed. Renames count as a deletion and an addition.
+  docker_found=()
+  while IFS= read -r -d '' f; do
+    case "$(printf '%s' "$f" | LC_ALL=C tr 'A-Z' 'a-z')" in
+      # The whole research workspace (findings d20fc8dd320c, 0d91699b857e): the Docker tests exercise most of
+      # the experiment, the demo it depends on, and the workspace's own Cargo.toml and Cargo.lock.
+      # crates/experiment/ and crates/demo/ are where they lived before task bfc942cd7ced moved them.
+      research/* | crates/experiment/* | crates/demo/*) docker_found+=("$f") ;;
+    esac
+  done < <(LC_ALL=C sort -uz "$docker_list")
+  rm -f "$docker_list"
+  docker_paths=''
+  [ ${#docker_found[@]} -eq 0 ] || docker_paths=$(printf '%q ' "${docker_found[@]}" | sed 's/ $//')
+  if [ -z "$docker_paths" ]; then
+    check ok docker "$docker_case"
+  elif docker_pass=$(jq -r --arg t "$full" --arg sha "$sha" '[.referrers[] | select(.kind == "evidence"
+    and .retracted == false and .author_name == "manager" and .body.target == $t and .body.verdict == "pass"
+    and (.body.method | startswith("research docker tests") and endswith(" @ " + $sha)))] | .[0].id // empty' \
+    <<<"$shown") && [ -n "$docker_pass" ]; then
+    docker_case="research Docker code changed ($docker_paths), and the manager's run of its Docker tests at $sha passed (${docker_pass:0:12})"
+    check ok docker "$docker_case"
+  else
+    check FAIL docker "the head changes research's Docker-tested code ($docker_paths), which no CI runner tests with Docker: run them on the Mac with Docker running (cd research && cargo nextest run -E 'test(~docker::) | binary(grade_run) | binary(weave)') and record a manager pass on pr claim $full, method 'research docker tests @ $sha' (docs/development.md)"
+  fi
+fi
+
 # 7. The owner's own approval, when the class needs it.
 owner_case="not required for this class"
 if $owner_approval; then
@@ -788,8 +798,8 @@ if $dry_run; then
   exit 0
 fi
 
-printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\ngithub head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nfrozen: %s\nowner: %s\n' \
-  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$frozen_case" "$owner_case" >"$details"
+printf 'claim: %s is the current pr claim for #%s (%s @ %s)\ngate: accepted under %s (passes: %s)\nfindings: %s\ngithub head: %s (PR #%s open against main)\nmain: %s\nguards: %s\nfrozen: %s\ndocker: %s\nowner: %s\n' \
+  "$full" "$pr" "$branch" "$sha" "$policy_text" "$passes" "$findings_text" "$f_head" "$pr" "$main_case" "$guards_case" "$frozen_case" "$docker_case" "$owner_case" >"$details"
 written=$(bk evidence "$claim" pass --method "merge gate @ $sha" --details-file "$details" --as "$agent") ||
   fail "couldn't record the merge-gate evidence; not merging"
 # The first line's last word: 'evidence <id>' (task d4e958fd6719), or a bare id from an older pinned binary.

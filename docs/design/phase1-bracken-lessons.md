@@ -15,8 +15,8 @@
 - **The local transcripts** of those turns: every tool call, its arguments and
   the size and head of its result, and the private notes agents saved. They
   are paraphrased here, never quoted, and stay on the machine that ran them.
-- **The code as run:** `crates/experiment/src/bracken_mode.rs` (the tools),
-  `crates/experiment/prompts/` (the prompts) and the `bracken` CLI at main
+- **The code as run:** `research/experiment/src/bracken_mode.rs` (the tools),
+  `research/experiment/prompts/` (the prompts) and the `bracken` CLI at main
   `cfbdb7a`.
 
 Counts below are per run unless they say otherwise, given as the range over

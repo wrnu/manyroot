@@ -2,9 +2,8 @@
 # test-table: the whole test table, as the manager counts it, in one command.
 #
 #   test-table
-#   test-table --remote [-p <package>]...
-#   test-table --split [-p <package>]...
-#   test-table --light -p <package>...       (in --split -p's box)
+#   test-table --remote
+#   test-table --split
 #   test-table --lists [-p <package>]...     (in --split's box)
 #   test-table --weave-box [-p <package>]...           (as weave validate's box check)
 #   test-table --weave-mac <box check> [-p <package>]... (as weave validate's mac check)
@@ -22,7 +21,8 @@
 # main moves can't count. Another project replaces the commands with its own table.
 #
 # Docs-only (owner decision 642a47c04a10): when everything HEAD changed since it left origin/main is
-# docs, by scripts/code-scope (*.md outside crates/; a rename or deletion of anything else is code),
+# docs, by scripts/tree-scope (*.md and docs/, outside crates/ and research/, never docs/protocol.md
+# or docs/design/weave-freeze.md; a rename or deletion of anything else is code),
 # it runs only cargo fmt --check and the Ground guards, and says 'docs-only: skipped clippy and cargo
 # test', which bk-evidence then records in its method. Anything else, no origin/main, or no change
 # at all runs the whole table.
@@ -51,10 +51,8 @@
 # list them) is deleted by id. A Ctrl-C before boat prints the id leaves the deletion to boat run
 # alone. In the box, the guards use the bracken cargo just built.
 #
-# --remote -p <package>... runs only 'cargo test --locked -p <package>...' in the box, after the same
-# setup, for a builder's scoped tests (decision ef5b807d3196 (1)) when this machine is loaded. It isn't
-# the table, and it never counts as it: scripts/merge and bk-evidence --reuse take only exactly
-# scripts/test-table or scripts/test-table --split.
+# Only exactly scripts/test-table or scripts/test-table --split counts as the table: scripts/merge and
+# bk-evidence --reuse take nothing else.
 #
 # --split is the manager's counted run (owner decision 01a2d668b67e): the whole table in one box, as
 # --remote runs it, and at the same time, here, only the tests that need macOS, which Linux skips:
@@ -71,16 +69,11 @@
 # It ends with the last lines of both parts. A docs-only head (below) runs locally, with no box. A
 # Ctrl-C or a failure here stops the box, and the box is deleted as --remote deletes it.
 #
-# --split -p <package>... is the light counted run (decision 464d3ccca45e, finding 94e07ed7dd6b), run by
-# scripts/verify-seq --light in the merged tree (bk-evidence --on), the packages scripts/code-scope
-# packages computes. It's --split for those packages only: the box runs --light -p <package>... (cargo
-# fmt --check, both clippies, cargo nextest run -p <package>..., every test of those packages, the slow
-# ones too, cargo test --doc for those of them with a library, and the Ground guards), and this Mac
-# runs their macOS-only tests, the lists of both sides restricted to them too. It isn't the whole
-# table, and it counts only where scripts/merge takes a light pass: never for a head scripts/code-scope
-# full names. A docs-only head runs it too, with no shortcut. --light alone runs the box's part here.
+# There is no light counted run (owner decision c8bbb2886be3, task bfc942cd7ced, superseding decisions
+# 464d3ccca45e and 73f2ba4c08e5): --split and --remote take no -p, and --light, the light table, runs
+# only in Weave's box (--in-tree --light, for --weave-box -p below).
 #
-# With TEST_TABLE_MODE set (verify-seq sets it: the mode, light or full, and why), a run that passes, or
+# With TEST_TABLE_MODE set (verify-seq sets it: the mode, full, and why), a run that passes, or
 # fails through a check here, ends with 'test-table: counted run mode: <it>', so the evidence's details
 # hold it.
 #
@@ -187,9 +180,9 @@ need_nextest() {
   cargo nextest --version >/dev/null 2>&1 || fail "needs cargo-nextest (cargo install --locked cargo-nextest; reference 4f8a96525a1e)"
 }
 
-# The packages --remote -p names: the box runs only their tests, not the table. For --split -p
-# (light_split) and --light, the light table's packages; libs, after scope_libs, those of them with a
-# library, as -p options.
+# The packages the Weave modes' -p names (--weave-box -p, --weave-mac -p, and in their box --light and
+# --lists): the light table's packages, light_split set for the Mac's part; libs, after scope_libs, those
+# of them with a library, as -p options.
 packages=()
 light=false
 light_split=false
@@ -218,16 +211,15 @@ scope_args() {
 # The box's setup, before anything of the tree: the tools it lacks.
 # It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
 # programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both and
-# need 2.46 (MIN_GIT in crates/experiment/src/git_mode.rs). The git-core PPA has the current git.
+# need 2.46 (MIN_GIT in research/experiment/src/git_mode.rs). The git-core PPA has the current git.
 # Launchpad times out or drops the connection now and then (task 95302a01f49a), so adding the PPA is
 # tried four times, each for at most 2 minutes, 10, 30 and 90 s apart. If it still fails, the image's
 # own git does only if it's 2.46 or later; otherwise setup fails, saying so. Whichever git it ends
 # with is checked against 2.46. need_git holds that number, which a test keeps equal to MIN_GIT.
 # Their output shows only if they fail. Then cargo-nextest, as pinned. After its checkout, --remote
-# also fetches every crate the host's whole package graph needs, dev-dependencies of packages the -p
-# list leaves out included: bracken-scope's cargo metadata --offline reads them all, and a build fetches
-# only what it builds (task 53efd11c6e4a: unicode-properties, manyroot's dev-dependency, without -p
-# manyroot).
+# also fetches every crate the host's whole package graph needs, dev-dependencies of packages a -p
+# list leaves out included, since a build fetches only what it builds (task 53efd11c6e4a:
+# unicode-properties, manyroot's dev-dependency, without -p manyroot).
 # shellcheck disable=SC2016 # expanded in the box
 box_setup='set -eu
 sudo=; [ "$(id -u)" -eq 0 ] || sudo=sudo
@@ -278,8 +270,7 @@ echo "$nextest_sha256  $nextest_dir/$nextest_tar" | sha256sum -c --quiet - >/dev
 setup tar -xzf "$nextest_dir/$nextest_tar" -C "$nextest_dir" cargo-nextest
 export PATH="$nextest_dir:$PATH"'
 
-# The table in one boat box, for HEAD, or only the tests of $packages; $1, if given, runs in the box
-# after it.
+# The table in one boat box, for HEAD; $1, if given, runs in the box after it.
 remote() {
   local rc line
   command -v boat >/dev/null || fail "--remote needs boat (reference ea41264b3c38)"
@@ -309,23 +300,9 @@ cd tree
 git fetch -q ../tree.bundle +HEAD:refs/heads/tested +refs/remotes/origin/main:refs/remotes/origin/main
 git checkout -q tested
 setup cargo fetch --locked --target "$(rustc -vV | sed -n "s/^host: //p")"'
-  local what="the table"
-  if $light_split; then
-    what="the light table:$(printf ' -p %s' "${packages[@]}")"
-    # The Ground guards need the bracken binary, which the scope's tests may not build.
-    # shellcheck disable=SC2016 # expanded in the box
-    inner="$inner"'
-cargo build --locked -q -p bracken --bin bracken
-BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table --light'"$(printf ' -p %s' "${packages[@]}")"
-  elif [ ${#packages[@]} -gt 0 ]; then
-    what="cargo test --locked$(printf ' -p %s' "${packages[@]}")"
-    inner="$inner
-$what"
-  else
-    # shellcheck disable=SC2016 # expanded in the box
-    inner="$inner"'
+  # shellcheck disable=SC2016 # expanded in the box
+  inner="$inner"'
 BRACKEN_BIN="$PWD/target/debug/bracken" scripts/test-table'
-  fi
   inner="nextest_version=$nextest_version nextest_sha256=$nextest_sha256
 $inner${1:+
 $1}"
@@ -340,13 +317,7 @@ $1}"
     echo "test-table: the box's table exited $rc" >&2
     exit "$rc"
   fi
-  if $light_split; then
-    echo "test-table: $what passed at $(git rev-parse HEAD), in a box; not the whole table"
-  elif [ ${#packages[@]} -gt 0 ]; then
-    echo "test-table: $what passed at $(git rev-parse HEAD), in a box; not the whole table"
-  else
-    echo "test-table: all passed at $(git rev-parse HEAD), in a box"
-  fi
+  echo "test-table: all passed at $(git rev-parse HEAD), in a box"
 }
 
 # The tests a 'cargo test -- --list' printed, as sorted '<test binary>|<test>' lines: the binary is the
@@ -491,11 +462,7 @@ split() {
   need_nextest
   [ -z "$(git status --porcelain)" ] || fail "--split tests HEAD: commit or set aside the changes first"
   git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
-  if $light_split; then
-    scope_libs
-  else
-    libs=(--workspace)
-  fi
+  libs=(--workspace)
   # split_tmp, box_job and here_job are globals: the EXIT trap runs after this function has returned.
   split_tmp=$(mktemp -d)
   # The tests here end by 1800 s, as the local table's do. TEST_TABLE_HERE_LIMIT can only shorten it
@@ -535,11 +502,7 @@ split() {
   }
   trap stop_parts EXIT
   trap 'exit 130' INT TERM
-  if $light_split; then
-    echo "test-table: the light table in a box:$(printf ' -p %s' "${packages[@]}") (output at the end), and here their macOS-only tests"
-  else
-    echo "test-table: the whole table in a box (output at the end), and here the macOS-only tests"
-  fi
+  echo "test-table: the whole table in a box (output at the end), and here the macOS-only tests"
   set -m
   (remote "$lists") >"$split_tmp/box" 2>&1 &
   box_job=$!
@@ -560,11 +523,7 @@ split() {
   grep -E '^ *Summary \[|^test-table: ' "$split_tmp/here" | tail -n 8 || true
   [ "$rc" -eq 0 ] || { echo "test-table: the box's table exited $rc" >&2; exit "$rc"; }
   compare_lists
-  if $light_split; then
-    echo "test-table: light run passed at $(git rev-parse HEAD):$(printf ' -p %s' "${packages[@]}"), in a box, and their macOS-only tests here; not the whole table"
-  else
-    echo "test-table: all passed at $(git rev-parse HEAD): the whole table in a box, and the macOS-only tests here"
-  fi
+  echo "test-table: all passed at $(git rev-parse HEAD): the whole table in a box, and the macOS-only tests here"
   mode_line
 }
 
@@ -905,12 +864,14 @@ case "${1:-}" in
   '') ;;
   --remote)
     shift
-    take_packages "test-table --remote [-p <package>]..." "$@"
+    [ $# -eq 0 ] || fail "usage: test-table --remote (it takes no -p: there's no scoped run, decision c8bbb2886be3)"
     remote
     exit 0
     ;;
   --light)
     shift
+    # Only Weave's box runs the light table (--weave-box -p): no counted run is light (decision c8bbb2886be3).
+    $in_tree || fail "--light runs only in Weave's box (--in-tree --light): there's no light counted run"
     [ $# -ge 2 ] || fail "usage: test-table --light -p <package>..."
     take_packages "test-table --light -p <package>..." "$@"
     light=true
@@ -923,14 +884,9 @@ case "${1:-}" in
     ;;
   --split)
     shift
-    take_packages "test-table --split [-p <package>]..." "$@"
-    if [ ${#packages[@]} -gt 0 ]; then
-      light_split=true
-      split
-      exit 0
-    fi
+    [ $# -eq 0 ] || fail "usage: test-table --split (it takes no -p: there's no light counted run, decision c8bbb2886be3)"
     # A docs-only head runs the local docs-only table below: nothing for a box to do.
-    "$here/code-scope" docs-only origin/main HEAD >/dev/null 2>&1 || { split; exit 0; }
+    "$here/tree-scope" docs-only origin/main HEAD >/dev/null 2>&1 || { split; exit 0; }
     ;;
   --weave-box)
     shift
@@ -947,7 +903,7 @@ case "${1:-}" in
     weave_mac "$check"
     exit 0
     ;;
-  *) fail "usage: test-table [--remote [-p <package>]... | --split [-p <package>]... | --light -p <package>... | --lists [-p <package>]... | --weave-box [-p <package>]... | --weave-mac <box check> [-p <package>]...]" ;;
+  *) fail "usage: test-table [--remote | --split | --lists [-p <package>]... | --weave-box [-p <package>]... | --weave-mac <box check> [-p <package>]...]" ;;
 esac
 
 step() {
@@ -987,7 +943,7 @@ if $light; then
   mode_line
   exit 0
 fi
-if ! $in_tree && scope=$("$here/code-scope" docs-only origin/main HEAD 2>&1); then
+if ! $in_tree && scope=$("$here/tree-scope" docs-only origin/main HEAD 2>&1); then
   echo "test-table: $scope"
   step cargo fmt --check
   echo "test-table: docs-only: skipped clippy and cargo test"

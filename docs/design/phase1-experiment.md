@@ -110,7 +110,7 @@ The demo's language, extended just enough to make a library:
   language (`abs`, `sign`, `max2`), layer 1 (`order`) calls layer 0
   (`clamp3`, `dist`, `median3`), and so on up to layer 3 (`shape`), so later
   functions are only as right as what they call. The list is `SPECS` in
-  `crates/experiment/src/task/phase1.rs`. Runs choose their task with
+  `research/experiment/src/task/phase1.rs`. Runs choose their task with
   `--task`, and Phase 1's is the default, so this one stays runnable as it
   ran ([phase2-task.md](phase2-task.md), Step 1 as built).
 - **6 change requests**, released together when the agents have used 40% of
@@ -729,7 +729,7 @@ the task rather than on the numbers. They are reviewed for neutrality before
 the pilot (an independent reviewer reads the three side by side), and their
 hashes go into the run's plan.
 
-The files are in `crates/experiment/prompts/`: `base.md`, shared, and one
+The files are in `research/experiment/prompts/`: `base.md`, shared, and one
 "Where things are" section per mode (decision `4cf00e1d701d`). The system
 prompt is the base, then the mode's section. They are built into the binary.
 The run's `plan.json` holds the blake3 of the system prompt it actually gives
@@ -987,7 +987,7 @@ gains nothing.
 
 ### How step 5 records and reports
 
-Built in step 5 (`crates/experiment`, `plan.rs` and `metrics.rs`), with the
+Built in step 5 (`research/experiment`, `plan.rs` and `metrics.rs`), with the
 definitions the manager settled (question `6c4aa5dc0a01`, decision
 `bbb261d50871`):
 
@@ -1322,7 +1322,7 @@ service: the agents use this machine's existing Claude Code setup.
 
 ### Build steps
 
-Each step is one PR in a new crate, `crates/experiment` (`bracken-experiment`),
+Each step is one PR in a new crate, `research/experiment` (`bracken-experiment`),
 reusing `bracken-demo` as a library. None changes `crates/manyroot`, the
 protocol or the `bracken` CLI. Class `cli` unless stated. The last column
 lists every crate a step plans to add, so its supply-chain review knows what
