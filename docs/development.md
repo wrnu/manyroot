@@ -10,7 +10,7 @@ What agents follow is [AGENTS.md](../AGENTS.md). This file holds only this repos
 | Change classes | docs, process, cli, library, merge-gate tooling, crypto, protocol, storage. Risky: **protocol** (`crates/manyroot/src/{contribution,graph,id,identity}.rs`, `docs/protocol.md`), **storage** (`store.rs`, `bundle.rs`), **crypto**, **merge-gate tooling** (`scripts/`, `.github/`, the pinned-binary procedure). Release path per class: [releases.md](releases.md) |
 | Models | Builders, manager, security and other delegates: Claude Opus 5.5 (`claudeAgent` / `claude-opus-5-5`), medium effort. Independent reviewer: Gemini 4 Neon (High) on Antigravity, for risky classes and manager-authored PRs. No Codex (decision `b1b56d75221b`) |
 | Remote | Public `wrnu/manyroot` on GitHub (decision `761565b7ffb9`), through `gh`'s own login. The Forge, `forge.jx.rs/Autimo/manyroot`, is the read-only remote `forge` |
-| CI | Observer (decision `d9fa2c08146c`): `.github/workflows/ci.yml` runs on every push and PR, reports only, and no merge waits on it. `"$main/scripts/ci-result" --record <pr claim> --as <you>` records a head's run; when it disagrees with the counted run, the manager records a `ci-disagreement` claim |
+| CI | Observer (decision `d9fa2c08146c`): `.github/workflows/ci.yml` runs on every push and PR, and `.github/workflows/research.yml` runs the research workspace on Linux and macOS when `research/` or `crates/{manyroot,tree,bracken}` change; they report only, and no merge waits on them. `"$main/scripts/ci-result" --record <pr claim> --as <you>` records a head's run; when it disagrees with the counted run, the manager records a `ci-disagreement` claim |
 | Branch protection | None (a free account can't). Never force-push or delete `main` |
 | Deploys | Nothing deploys on merge; nothing is published |
 | Licence | `MIT OR Apache-2.0` (decision `42ac996e6355`) |
@@ -62,6 +62,18 @@ After each merge, once it's in the main checkout and the pinned binary is upgrad
 ## Remote test runs (boat.dev)
 
 `scripts/test-table --remote` runs the table in a fresh Linux box (the $20/month `box_20` plan, decision `2a9e444218d6`; `boat limits` shows what's left). It commits nothing, pushes only a bundle of HEAD and `origin/main`, and deletes the box on every way out. By hand: `boat run --no-env --push <dir> -- <cmd>`, never `-e`, then check `boat list --all` is empty. A box has no Docker or macOS, so the macOS-only tests (`mod macos_only`) run on this Mac.
+
+## The research workspace and its Docker run
+
+`research/` (the experiment runner, the demo, the query lab) is a sibling Cargo workspace with its own `Cargo.lock`; test it in `research/` after `cargo build -p bracken` at the root. Its Docker tests (`docker` modules, decision `ac22cedd8fee`) run on no CI runner (deferred task `1efdf2e34f46`), so `scripts/merge`'s `docker` check fails a head touching anything under `research/`, or the old `crates/experiment/` and `crates/demo/`, until the manager records a pass on its pr claim whose method starts `research docker tests` and ends ` @ <head sha>`. On this Mac, with Docker running and the image `research/experiment/src/python.rs` names as `IMAGE` pulled, in a clean checkout at the head after `cargo build -p bracken`:
+
+```sh
+(cd research && BRACKEN_TEST_REQUIRE_DOCKER=1 cargo nextest run --locked -E 'test(~docker::) | binary(grade_run) | binary(weave)') >"$TMPDIR/research-docker.log" 2>&1 &&
+  tail -n 30 "$TMPDIR/research-docker.log" >"$TMPDIR/research-docker.tail" &&
+  scripts/bk evidence <pr claim> pass --method "research docker tests @ $(git rev-parse HEAD)" --details-file "$TMPDIR/research-docker.tail" --as manager
+```
+
+The check leaves out what the research build also rests on but lives outside `research/`: the product crates (`crates/bracken`, the binary its tests run, `crates/tree`, `crates/manyroot`) and the root build settings that apply to it too, `.cargo/config.toml` (its rustc wrapper, which `research/.cargo/config.toml` follows), `Cargo.toml` and `rustfmt.toml` (security note on `a925a3b73365`). That residual is accepted (decision `07dd5c4f`): the manager runs the same command on `main` weekly, and before the join, recording it on that week's metrics claim, until task `1efdf2e34f46` puts these tests in CI.
 
 ## Remotes
 

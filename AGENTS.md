@@ -1,6 +1,6 @@
 # Agent guide
 
-The one doc every agent follows. Live settings are in [docs/development.md](docs/development.md); each script's header is its manual; `docs/archive/` is history only.
+The one doc agents follow. Live settings: [docs/development.md](docs/development.md); each script's header is its manual; `docs/archive/` is history.
 
 ## 1. Safety and frozen boundaries
 
@@ -9,7 +9,7 @@ The one doc every agent follows. Live settings are in [docs/development.md](docs
 - **The Ground.** Never edit or delete files under `.bracken/` by hand: write only through `scripts/bk`. Only the manager commits `.bracken/`, only with `scripts/ground-checkpoint`.
 - **The Weave Ground**, `~/bracken-weave/manyroot`, is reached only through `scripts/weave`. Never edit it or copy its `identities/`; only the manager runs `scripts/weave-backup`, to the destination the owner approved.
 - **Your own binary** gets a throwaway Ground: `BRACKEN_DIR=$(mktemp -d)/g target/debug/bracken init`. `scripts/bk` uses the pinned binary and the main checkout's Ground. Never stage `.bracken/` (your copy is stale) or sign as another identity.
-- **No secrets or personal data** in the Ground, PRs or briefs. The Ground is public: `.bracken/` is in the public GitHub repo, and every contribution is permanent (decision `473d5df9b1ab`).
+- **No secrets or personal data** in the Ground, PRs or briefs: the Ground is public and permanent (decision `473d5df9b1ab`).
 - **The owner's own approval** (`scripts/owner-approve <id> "<what>"`, run by the owner in a terminal) is needed only for: a frozen protocol or format change, or the join cutover; spending beyond an approved budget, a new paid service or a schedule; repo visibility, licence, branch protection, access or publishing; destructive history, data or key actions (force-pushing `main`, deleting or rewriting Ground objects, moving root or owner keys). Everything else the manager decides, as a claim tagged `decision`. Earlier approvals, `--delegated` ones included, stay valid records. Nothing is published and nothing deploys on merge ([docs/releases.md](docs/releases.md)).
 
 ## 2. Repo and code conventions
@@ -45,11 +45,11 @@ The one doc every agent follows. Live settings are in [docs/development.md](docs
 | Gate misfire | claim `--tag misfire`: the gate refused a good head or passed a bad one |
 | Disagreement | a claim that `contradicts` it, with your reasoning |
 
-Don't repeat what code, git log or docs say. To change your entry, `claim … --supersedes <old>`.
+Don't repeat code, git log or docs. To change your entry, `claim … --supersedes <old>`.
 
 ## 4. Build, test and merge loop
 
-**Roles.** The owner decides and talks only to the manager. The manager plans, writes tasks, verifies, triages, merges and owns shared resources (merges, the pinned binary, checkpoints, the team server). A builder has one task, worktree, branch and PR, and talks only to the manager (`t3_thread_send` to the manager's thread, carrying ids; in its own thread it writes only "Reported to manager."). Reviewers and security are short-lived children writing only findings and evidence. Ask the manager (a `question` claim, then its id) rather than guess: an ambiguous spec, two reasonable designs, a hard-to-undo assumption, any approval. Keep to the brief's scope and stop-and-report limits.
+**Roles.** The owner decides and talks only to the manager. The manager plans, writes tasks, verifies, triages, merges and owns shared resources (merges, the pinned binary, checkpoints, the team server). A builder has one task, worktree, branch and PR, and talks only to the manager (`t3_thread_send`, carrying ids; in its own thread only "Reported to manager."). Reviewers and security are short-lived children writing only findings and evidence. Ask the manager (a `question` claim, then its id) rather than guess: an ambiguous spec, two reasonable designs, a hard-to-undo assumption, any approval. Keep to the brief's scope and stop-and-report limits.
 
 **Builder loop.**
 1. Read your brief; if a read says your identity has no team token, stop and tell the manager. Your branch exists.
@@ -66,10 +66,11 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 scripts/test-table --remote
 ```
+A head changing `research/` (a sibling workspace `cargo test --workspace` never builds) also records `bash -c 'cd research && cargo test --locked'`, after `cargo build -p bracken` at the root.
 
 **Counted run** (the manager's, on `main` merged with the exact head; GitHub Actions only observes): a head changing only `*.md` and `docs/**` gets fmt and the Ground guards, except `docs/protocol.md` and `docs/design/weave-freeze.md`, which take the full run: fmt, both clippies, `cargo test --workspace` on macOS and Linux, the Ground guards. With the Weave gate on, line main's Weave results on that merged tree can stand in (`scripts/verify-seq --weave`).
 
-**Merge.** `scripts/merge` checks and records the gate: the current `pr` claim accepted under its class's policy (builder, low risk: `--validator manager --validator security --min-passes 2`; builder, risky class: add `--validator reviewer`, `--min-passes 3`; manager-authored: `--validator reviewer --validator security --min-passes 2`), every finding triaged and every confirmed one fixed or deferred, the remote head equal to the claimed sha, the counted run, the Ground guards and the freeze's checks. Before running a PR's code, the manager reads its build-script and dependency changes. After a merge the manager pulls only with `scripts/ground-checkpoint` and `git merge --no-edit <the sha it names>`, upgrades the pinned binary if `crates/bracken` or `crates/manyroot` changed ([releases.md](docs/releases.md)), and removes finished worktrees (clean, nothing unpushed).
+**Merge.** `scripts/merge` checks and records the gate: the current `pr` claim accepted under its class's policy (builder, low risk: `--validator manager --validator security --min-passes 2`; builder, risky class: add `--validator reviewer`, `--min-passes 3`; manager-authored: `--validator reviewer --validator security --min-passes 2`), every finding triaged and every confirmed one fixed or deferred, the remote head equal to the claimed sha, the counted run, the Ground guards, the freeze's checks, and for a head touching `research/` the manager's research Docker run (development.md). Before running a PR's code, the manager reads its build and dependency changes. After a merge the manager pulls only with `scripts/ground-checkpoint` and `git merge --no-edit <the sha it names>`, upgrades the pinned binary if `crates/bracken` or `crates/manyroot` changed ([releases.md](docs/releases.md)), and removes finished worktrees (clean, nothing unpushed).
 
 ## 5. Review standard
 
