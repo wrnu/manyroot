@@ -579,17 +579,29 @@ never changes whether `E` qualified (finding `b2098df8e4be`). A decision
    `e99c224ed5b6`). The basis is classified under `P_E`, over `E`'s
    ancestors, and a counted fail is one eligible for the objected decision
    (or, for an objection to a manifest or a proposal, for `E`), whether or
-   not a later result replaced it; its check is the failing check:
+   not a later result replaced it; its check is the failing check. It's
+   *replaced by a pass* when, over `E`'s ancestors, its validator's latest
+   eligible results for that manifest and method are a single pass, by the
+   latest-result rule above (several concurrent latest results count as one
+   fail, even if all passed; finding `91b445207f20`). A fail replaced by
+   another fail, or by concurrent passes, isn't:
 
    | Disposition | Means, and is checked as | Allowed for |
    |---|---|---|
    | `fixed` | `A`'s manifest hash differs from `D`'s, and, for an evidence-backed objection, the failing check isn't in `A`'s breakage | any basis |
    | `fell_back` | `A`'s manifest hash equals the manifest of a qualifying ancestor of `D` | any basis |
    | `accepted_breakage` | `A`'s breakage lists the failing check, so the guardrails govern it | evidence-backed |
-   | `overridden` | nothing beyond the reason | discussion only |
+   | `overridden` | nothing beyond the reason | discussion, or evidence-backed by a fail replaced by a pass |
 
    So an objection backed by failing evidence or by a binding goal can't
-   simply be overridden. Whether a `fixed` really fixed anything shows in
+   simply be overridden, while that evidence still stands: once the
+   validator's own later pass replaced the fail, anyone who replays it as
+   an objection may be answered `overridden`, with a reason, so a flake
+   can't block a tree (weave-authority.md B4, decision `51815720d632`,
+   finding `6cad0100be83`). `weave review` and `weave green --manifest`
+   mark such an objection `replaced`, and `weave green --manifest` lists the
+   objections to its manifest that integrating it unchanged must answer
+   (B6). Whether a `fixed` really fixed anything shows in
    green, once the checks have run on `A`'s manifest.
 
    **One answer can cover many objections** (decisions `8cf20fe7669a` and

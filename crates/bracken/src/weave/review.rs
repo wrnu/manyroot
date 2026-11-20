@@ -246,10 +246,14 @@ fn green_on_manifest(
     ix.manifest(&hash).with_context(|| format!("--manifest {hash}: this replica holds no such manifest"))?;
     let counted = checks.counted_on_manifest(s.graph(), &version, policy, &hash);
     let green = !counted.is_empty() && counted.iter().all(Counted::green);
+    // What integrating this tree unchanged on the line would have to answer: objections to its manifest,
+    // which no other read lists (weave-authority.md B6).
+    let must_answer = lines.manifest_objections(s.graph(), ix, line, &hash).unwrap_or_default();
     if out.json {
         let per_check: Vec<Value> = counted.iter().map(|c| counted_json(c, checks, names)).collect();
+        let must_answer: Vec<Value> = must_answer.iter().map(|o| open_json(o, names)).collect();
         print_json(&json!({"line": line, "version": version, "manifest": hash.to_string(), "green": green,
-                           "checks": per_check}));
+                           "checks": per_check, "must_answer": must_answer}));
         return Ok(ExitCode::SUCCESS);
     }
     println!(
@@ -260,6 +264,12 @@ fn green_on_manifest(
     );
     for c in &counted {
         println!("{}", counted_text(c, checks, names));
+    }
+    if !must_answer.is_empty() {
+        println!("objections integrating it unchanged must answer: {}", must_answer.len());
+        for o in &must_answer {
+            println!("{}", open_text(o, names));
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -299,7 +309,9 @@ fn review_text(r: &Review, t: &Target, names: &Names) -> String {
 
 fn basis_json(b: &Basis) -> Value {
     match b {
-        Basis::Evidence { result, check } => json!({"kind": b.kind(), "result": result, "check": check}),
+        Basis::Evidence { result, check, replaced } => {
+            json!({"kind": b.kind(), "result": result, "check": check, "replaced": replaced})
+        }
         Basis::Goal(goal) => json!({"kind": b.kind(), "goal": goal}),
         Basis::Discussion => json!({"kind": b.kind()}),
     }
@@ -314,7 +326,14 @@ fn open_json(o: &Open, names: &Names) -> Value {
 
 fn open_text(o: &Open, names: &Names) -> String {
     let basis = match &o.basis {
-        Basis::Evidence { result, check } => format!("evidence-backed: {} fails {}", result.short(), printable(check)),
+        Basis::Evidence { result, check, replaced: false } => {
+            format!("evidence-backed: {} fails {}", result.short(), printable(check))
+        }
+        // A pass by the same validator replaced the fail, so the objection may be overridden
+        // (weave-authority.md B4, B6).
+        Basis::Evidence { result, check, replaced: true } => {
+            format!("evidence-backed: {} fails {}, replaced by a later pass", result.short(), printable(check))
+        }
         Basis::Goal(goal) => format!("goal-backed: goal {}", goal.short()),
         Basis::Discussion => "discussion".to_owned(),
     };

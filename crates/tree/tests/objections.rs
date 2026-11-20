@@ -644,7 +644,9 @@ fn open_objections_are_what_the_next_move_must_answer() {
     let open = lines.open_objections(&w.g, &ix, &w.line).expect("a current policy");
     assert_eq!(open.len(), 1);
     assert_eq!(open[0].objection.id, o);
-    assert!(matches!(&open[0].basis, Basis::Evidence { result, check } if *result == fail && check == "test"));
+    assert!(
+        matches!(&open[0].basis, Basis::Evidence { result, check, replaced: false } if *result == fail && check == "test")
+    );
     use Disposition::*;
     assert_eq!(open[0].allowed, [Fixed, FellBack, AcceptedBreakage]);
     let m2 = w.tree(&[("a", b"2")]);
