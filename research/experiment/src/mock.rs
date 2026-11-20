@@ -70,6 +70,8 @@ pub struct MockBackend {
     /// `dc2dd9647315` (1)): `(agent, turn, first)`, before the turn's first tool call if `first`, so that call's
     /// result names the tools, else after its last, so the hint opens the agent's next turn.
     pub unknown_at: Vec<(usize, u32, bool)>,
+    /// How many calls each place in `unknown_at` makes.
+    pub unknown_each: u32,
     /// Those calls, counted, and their hints not yet given.
     pub unknown: crate::backend::UnknownCalls,
     /// Each hint an agent was given: `(agent, turn, hint)`, on a tool result or opening its turn.
@@ -91,6 +93,7 @@ impl Default for MockBackend {
             lockstep: false,
             integrator: None,
             unknown_at: Vec::new(),
+            unknown_each: 1,
             unknown: crate::backend::UnknownCalls::default(),
             hinted: std::sync::Mutex::new(Vec::new()),
         }
@@ -312,6 +315,10 @@ impl Backend for MockBackend {
         self.unknown.total()
     }
 
+    fn unknown_since(&self, agent: &str) -> u32 {
+        self.unknown.take_count(agent)
+    }
+
     fn turn(&self, agent: usize, name: &str, turn: u32, socket: &Path) -> Result<(), String> {
         let hinted = |hint: &str| {
             self.hinted.lock().unwrap_or_else(|e| e.into_inner()).push((agent, turn, hint.trim().to_string()));
@@ -322,7 +329,7 @@ impl Backend for MockBackend {
             hinted(&opened);
         }
         if self.unknown_at.contains(&(agent, turn, true)) {
-            self.unknown.note(name, UNKNOWN_TOOL);
+            (0..self.unknown_each).for_each(|_| self.unknown.note(name, UNKNOWN_TOOL));
         }
         let mut c = Client::connect(socket, self.shim.as_deref())?;
         let played = self.play(&mut c, agent, name, turn);
@@ -330,7 +337,7 @@ impl Backend for MockBackend {
             hinted(hint);
         }
         if self.unknown_at.contains(&(agent, turn, false)) {
-            self.unknown.note(name, UNKNOWN_TOOL);
+            (0..self.unknown_each).for_each(|_| self.unknown.note(name, UNKNOWN_TOOL));
         }
         match &self.usage {
             Some(path) => usage(path, name, turn, &c.asked).and(played),

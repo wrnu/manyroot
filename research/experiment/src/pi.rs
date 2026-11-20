@@ -363,13 +363,13 @@ impl Pi {
         let tools = tools.ok_or("a tool call without an id")?;
         // The header can't show the tools Pi declared, so each call shows it: one of Pi's own stops the run; any
         // other name not the shim's Pi refuses, and the backend counts.
-        if let Some((_, n)) = tools.iter().find(|(_, n)| BUILT_IN.contains(&n.as_str())) {
+        // In any case: Pi's names are lowercase, and a near-miss in case is still one of them (security note 1).
+        if let Some((_, n)) = tools.iter().find(|(_, n)| BUILT_IN.iter().any(|b| b.eq_ignore_ascii_case(n))) {
             return Err(format!("a call to {}, one of Pi's own tools", crate::args::short(n)));
         }
         let shim =
             |n: &str| n.strip_prefix(&format!("mcp__{SERVER}__")).is_some_and(|t| self.tools.iter().any(|x| x == t));
         let (tools, unknown): (Vec<_>, Vec<_>) = tools.into_iter().partition(|(_, n)| shim(n));
-        let unknown = unknown.into_iter().map(|(_, n)| n).collect();
         Ok(Event::Message { id, model: m["model"].clone(), usage, tools, unknown })
     }
 }
@@ -628,7 +628,7 @@ mod tests {
                 err(assistant("anthropic", "claude-sonnet-5-5", json!([])))
                     .contains("not the plan's anthropic/claude-opus-5-5")
             );
-            for name in BUILT_IN {
+            for name in BUILT_IN.into_iter().chain(["Bash", "READ", "Write", "LS"]) {
                 let call = json!([{"type": "toolCall", "id": "c1", "name": name, "arguments": {}}]);
                 let e = err(assistant("anthropic", "claude-opus-5-5", call));
                 assert!(e.ends_with("one of Pi's own tools"), "{name}: {e}");
@@ -647,7 +647,7 @@ mod tests {
                     panic!("{name}: not a message");
                 };
                 assert_eq!(tools, [("c1".to_string(), "mcp__experiment__notes_read".to_string())], "{name}");
-                assert_eq!(unknown, [name.to_string()]);
+                assert_eq!(unknown, [("c2".to_string(), name.to_string())]);
             }
             assert_eq!(p.offered_tools(), ["mcp__experiment__notes_read", "mcp__experiment__claim"]);
         });

@@ -24,7 +24,8 @@ use bracken_experiment::sandbox::Profile;
 const SECRET: &str = "mock-secret-not-a-real-one-0123";
 
 /// A harness whose turn is `script`, run by `/bin/bash` with the turn message as `$1`. Its events, a line
-/// each: `init ok` or `init <why not>`; `call <id> <input> <output> [<call id>:<tool>...]`;
+/// each: `init ok` or `init <why not>`; `call <id> <input> <output> [<call id>:<tool>...]`, a call written
+/// `?<call id>:<tool>` being to a name the shim doesn't offer, which the harness refused;
 /// `result <input> <output>`; `settled`, a result with no total of its own; anything else is other.
 struct Mock {
     script: String,
@@ -97,6 +98,10 @@ impl Harness for Mock {
         json!({"result": "the mock's"})
     }
 
+    fn offered_tools(&self) -> Vec<String> {
+        vec!["mcp__experiment__notes_read".into()]
+    }
+
     fn env_names(&self) -> &[&str] {
         self.now().map_or(&self.names, |l| &l.names)
     }
@@ -130,10 +135,11 @@ impl Harness for Mock {
             "call" => {
                 let id = words.next().ok_or("an unreadable event")?.to_string();
                 let usage = Tokens { input: number(words.next())?, output: number(words.next())?, ..Tokens::default() };
-                let tools = words
+                let calls: Vec<(String, String)> = words
                     .map(|w| w.split_once(':').map(|(i, n)| (i.into(), n.into())).ok_or("an unreadable event"))
                     .collect::<Result<_, _>>()?;
-                Ok(Event::Message { id, model: json!("mock"), usage, tools, unknown: Vec::new() })
+                let (unknown, tools): (Vec<_>, Vec<_>) = calls.into_iter().partition(|(i, _)| i.starts_with('?'));
+                Ok(Event::Message { id, model: json!("mock"), usage, tools, unknown })
             }
             "settled" => Ok(Event::Result {
                 usage: None,
@@ -835,6 +841,53 @@ mod macos_only {
         let s = Setup::new(&script, caps);
         assert_eq!(s.turn(1), Err("agent-0's turn 1 ended at its tool calls cap".into()));
         assert!(s.usage().iter().any(|r| r["past_tool_call_cap"] == 2));
+    }
+
+    /// Calls to names the shim doesn't offer, which the harness refused, count toward the tool-call cap: a turn
+    /// of nothing else still reaches it (finding a4ff1a0dac7b).
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn refused_calls_to_unknown_names_reach_the_tool_call_cap() {
+        let caps = Caps { calls_per_turn: 1, cap_grace_calls: 1, ..caps() };
+        let script = format!(
+            "echo init ok; echo call m1 10 1 ?a:write_file ?b:write_file; echo call m2 10 1; echo call m3 10 1; \
+             {FOREVER}"
+        );
+        let s = Setup::new(&script, caps);
+        assert_eq!(s.turn(1), Err("agent-0's turn 1 ended at its tool calls cap".into()));
+        let usage = s.usage();
+        assert!(usage.iter().any(|r| r["past_tool_call_cap"] == 2), "{usage:#?}");
+        assert_eq!(usage.iter().filter(|r| r["unknown_tool"] == "`write_file`").count(), 2);
+        assert_eq!(s.backend.unknown_calls(), 2);
+        assert_eq!(s.backend.unknown_since("agent-0"), 2, "the driver counts them at the next shim call");
+        assert_eq!(s.backend.unknown_since("agent-0"), 0, "once");
+    }
+
+    /// A hint the turn ended before giving, on no shim result, opens the agent's next turn message, once (answer
+    /// 98c18ce63bfc).
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn an_undelivered_hint_opens_the_next_turns_message() {
+        let script = "echo init ok; echo \"said $1\"; echo call m1 10 1 ?c1:give_up_item; echo result 10 1";
+        let s = Setup::new(script, caps());
+        for turn in 1..=3 {
+            s.turn(turn).expect("a turn");
+        }
+        let opened = |turn: u32| {
+            let t = s.transcript(turn).expect("a transcript");
+            t.lines().find(|l| l.starts_with("said ")).expect("the message").to_string()
+        };
+        assert!(opened(1).starts_with("said This is your turn 1"), "{}", opened(1));
+        let hint = "said `give_up_item` isn't among your tools, so nothing ran. Your tools are: \
+                    mcp__experiment__notes_read.";
+        assert_eq!(opened(2), hint, "turn 2 opens with turn 1's hint");
+        let t2 = s.transcript(2).expect("turn 2");
+        assert!(t2.contains("This is your turn 2"), "then the turn message: {t2}");
+        assert_eq!(opened(3), hint, "turn 3 with turn 2's own, not turn 1's again");
+        let rows: Vec<Value> = s.usage().into_iter().filter(|r| r["unknown_hint"] == "turn message").collect();
+        let turns: Vec<&Value> = rows.iter().map(|r| &r["turn"]).collect();
+        assert_eq!(turns, [&json!(2), &json!(3)]);
+        assert!(s.backend.unknown_hint("agent-0").is_some(), "turn 3's own still waits");
     }
 
     #[test]

@@ -768,8 +768,10 @@ in e3gc it stopped mid-merge and lost one builder's four items (note
   the backend counts it (a `usage.jsonl` row, an `unknown_calls` event with
   the run's count, a line in the run's output), and the driver adds one
   block naming the offered tools to the agent's next tool result, or, when
-  its turn ended first, to the start of its next turn's message. A call to
-  one of Pi's own tools still stops the run. Claude Code's backend is
+  its turn ended first, to the start of its next turn's message. Such calls
+  count toward the turn's tool-call cap, in the backend's count and the
+  driver's (finding `a4ff1a0dac7b`). A call to one of Pi's own tools, in
+  any case, still stops the run. Claude Code's backend is
   unchanged: Claude Code refuses an unknown name itself and has no per-call
   check that halts.
 - **Refusals name their way out:** each `take_item` refusal names the tool

@@ -188,6 +188,12 @@ pub trait Backend: Sync {
     fn unknown_calls(&self) -> u64 {
         0
     }
+
+    /// How many such calls of `agent`'s the driver hasn't yet counted toward its tool-call cap, taken: they count
+    /// as calls of the turn, as the backend counts them toward its own cap (finding `a4ff1a0dac7b`).
+    fn unknown_since(&self, _agent: &str) -> u32 {
+        0
+    }
 }
 
 /// The next agent-turn allowed to run in lockstep, and the agents that have stopped playing.
@@ -999,6 +1005,10 @@ impl Run<'_> {
                 continue;
             };
             let Some(id) = msg.get("id").cloned() else { continue };
+            if msg["method"] == "tools/call" {
+                // Calls the harness refused since the last count are this turn's calls too.
+                calls += backend.unknown_since(name);
+            }
             let reply = match msg["method"].as_str().unwrap_or_default() {
                 "initialize" => json!({"result": {
                     "protocolVersion": msg["params"]["protocolVersion"].as_str().unwrap_or("2025-06-18"),

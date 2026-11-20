@@ -444,9 +444,10 @@ pub enum Event {
         usage: Tokens,
         /// The tool calls it asks for: (call id, tool name).
         tools: Vec<(String, String)>,
-        /// The names it asked for that the shim doesn't offer and the harness refused itself, running nothing
-        /// (process `dc2dd9647315` (1)): counted, and named to the agent with the tools it has. Not in `tools`.
-        unknown: Vec<String>,
+        /// The calls it asked for, as `tools`, to names the shim doesn't offer, which the harness refused itself,
+        /// running nothing (process `dc2dd9647315` (1)): counted, toward the tool-call cap too (finding
+        /// `a4ff1a0dac7b`), and named to the agent with the tools it has. Not in `tools`.
+        unknown: Vec<(String, String)>,
     },
     /// The turn's end, with the harness's own figures for it.
     Result {
@@ -472,6 +473,8 @@ pub struct UnknownCalls {
     /// The tools as the agent's harness names them to it.
     offered: Vec<String>,
     waiting: Mutex<BTreeMap<String, Vec<String>>>,
+    /// Per agent, the calls the driver hasn't yet counted toward its tool-call cap ([`UnknownCalls::take_count`]).
+    uncounted: Mutex<BTreeMap<String, u32>>,
     total: std::sync::atomic::AtomicU64,
 }
 
@@ -485,6 +488,12 @@ impl UnknownCalls {
         self.total.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut waiting = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
         waiting.entry(agent.to_string()).or_default().push(crate::args::short(name));
+        *self.uncounted.lock().unwrap_or_else(|e| e.into_inner()).entry(agent.to_string()).or_default() += 1;
+    }
+
+    /// How many of `agent`'s calls the driver hasn't yet counted toward its tool-call cap, taken.
+    pub fn take_count(&self, agent: &str) -> u32 {
+        self.uncounted.lock().unwrap_or_else(|e| e.into_inner()).remove(agent).unwrap_or(0)
     }
 
     /// The run's count so far.
@@ -927,10 +936,12 @@ impl<H: Harness> HarnessBackend<H> {
             }
             match event {
                 Event::Message { id, model, usage, tools, unknown } => {
-                    // Refused by the harness and counted, not run, and not a call the driver counts either.
-                    for n in &unknown {
+                    // Refused by the harness, not run, and counted: in the run's total, toward this turn's tool-call
+                    // cap here, and toward the driver's at the agent's next shim call (finding `a4ff1a0dac7b`).
+                    for (call, n) in &unknown {
                         self.record(json!({"agent": name, "turn": turn, "unknown_tool": crate::args::short(n)}));
                         self.unknown.note(name, n);
+                        tool_uses.insert(call.clone());
                     }
                     // A model call beyond the grace's: counted, then the process ends.
                     let beyond_grace = grace.is_some_and(|(_, at)| {
@@ -1056,6 +1067,10 @@ impl<H: Harness> Backend for HarnessBackend<H> {
 
     fn unknown_calls(&self) -> u64 {
         self.unknown.total()
+    }
+
+    fn unknown_since(&self, agent: &str) -> u32 {
+        self.unknown.take_count(agent)
     }
 }
 

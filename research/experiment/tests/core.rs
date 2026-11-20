@@ -891,3 +891,46 @@ fn bracken_records_an_agents_contract_members_after_its_calls_and_its_syncs() {
     assert!(phase1.ok(&release(2)).is_err(), "Phase 1 has one release");
     assert!(phase1.ok(&release(1)).is_ok());
 }
+
+/// The driver counts calls the harness refused, to names the shim doesn't offer, toward the turn's tool-call
+/// cap (finding a4ff1a0dac7b): an agent whose refused calls used up its turn's calls is refused its next shim
+/// call, and that result still names its tools.
+#[test]
+fn refused_unknown_calls_count_toward_the_drivers_tool_call_cap() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = RunConfig {
+        root: dir.path().join("run"),
+        mode: "bracken",
+        agents: 1,
+        turns: 1,
+        worker_bin: bin(),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        trace: false,
+        calls_per_turn: 3,
+        turn_limit: TURN_LIMIT,
+        plan: PlanInputs::default(),
+        sandbox: false,
+    };
+    let mock = MockBackend {
+        task: Task::Phase1,
+        seed: 3,
+        shim: Some(bin()),
+        unknown_at: vec![(0, 1, true)],
+        unknown_each: 3,
+        unknown: bracken_experiment::backend::UnknownCalls::new(vec!["notes_read".into()]),
+        ..MockBackend::default()
+    };
+    let outcome = run(&cfg, &mock).expect("the run");
+    assert_eq!(outcome.unknown_calls, 3);
+    let log = events(&outcome.events);
+    let refused: Vec<&Value> = log.iter().filter(|e| e["event"] == "call_refused").collect();
+    assert!(!refused.is_empty(), "the shim call after them is refused");
+    assert_eq!(refused[0]["data"]["calls"], 3, "{:?}", refused[0]);
+    let first_call = log.iter().position(|e| e["event"] == "tool_call");
+    let first_refused = log.iter().position(|e| e["event"] == "call_refused");
+    assert!(first_call.is_none_or(|c| Some(c) > first_refused), "no shim call ran before the refusal");
+    let hinted = mock.hinted.lock().expect("the hints").clone();
+    assert_eq!(hinted.len(), 1, "{hinted:?}");
+    assert!(hinted[0].2.contains("Your tools are: notes_read."), "{hinted:?}");
+}
