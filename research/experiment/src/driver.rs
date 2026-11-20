@@ -955,6 +955,9 @@ impl Run<'_> {
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600)).map_err(|e| e.to_string())?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let name = self.names[i].clone();
+        // Refused calls left from the agent's last turn, after its last shim call, were that turn's: the backend
+        // counted them toward its cap then. Dropped before this turn's harness starts (finding `07f980eab6b2`).
+        backend.unknown_since(&name);
         let deadline = Instant::now() + self.cfg.turn_limit;
         let result = std::thread::scope(|scope| {
             let player = scope.spawn(|| backend.turn(i, &name, turn, socket));

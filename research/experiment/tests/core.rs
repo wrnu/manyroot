@@ -934,3 +934,43 @@ fn refused_unknown_calls_count_toward_the_drivers_tool_call_cap() {
     assert_eq!(hinted.len(), 1, "{hinted:?}");
     assert!(hinted[0].2.contains("Your tools are: notes_read."), "{hinted:?}");
 }
+
+/// Refused calls made after an agent's last shim call of a turn count toward that turn, not the next: the next
+/// turn's calls are its own (finding 07f980eab6b2, the reviewer's counterexample).
+#[test]
+fn refused_unknown_calls_after_a_turns_last_shim_call_dont_count_toward_the_next_turn() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = RunConfig {
+        root: dir.path().join("run"),
+        mode: "bracken",
+        agents: 1,
+        turns: 2,
+        worker_bin: bin(),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        trace: false,
+        calls_per_turn: 3,
+        turn_limit: TURN_LIMIT,
+        plan: PlanInputs::default(),
+        sandbox: false,
+    };
+    let mock = MockBackend {
+        task: Task::Phase1,
+        seed: 3,
+        shim: Some(bin()),
+        unknown_at: vec![(0, 1, false)],
+        unknown_each: 3,
+        unknown: bracken_experiment::backend::UnknownCalls::new(vec!["notes_read".into()]),
+        ..MockBackend::default()
+    };
+    let outcome = run(&cfg, &mock).expect("the run");
+    assert_eq!(outcome.unknown_calls, 3);
+    let log = events(&outcome.events);
+    // Turn 2 runs its own 3 calls before any refusal; at 3b9830cf, turn 1's leftovers refused its first.
+    let turn_2: Vec<&Value> = log.iter().filter(|e| e["data"]["turn"] == 2).collect();
+    let refused = turn_2.iter().position(|e| e["event"] == "call_refused").unwrap_or(turn_2.len());
+    let ran = turn_2[..refused].iter().filter(|e| e["event"] == "tool_call").count();
+    assert!(ran == 3 || (ran > 0 && refused == turn_2.len()), "turn 2 ran {ran} calls before a refusal");
+    let hinted: Vec<(usize, u32)> = mock.hinted.lock().expect("the hints").iter().map(|(a, t, _)| (*a, *t)).collect();
+    assert_eq!(hinted, [(0, 2)], "the hint still opens turn 2");
+}
