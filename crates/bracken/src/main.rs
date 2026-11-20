@@ -511,6 +511,8 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Verify { out } => {
             let s = snapshot::verify(&ground_dir(cli.dir.as_deref())?)?;
+            // Opening doesn't read the agent directory, so check it here: a bad entry could misname an agent.
+            s.agents()?;
             let n = s.graph().len();
             let written = !snapshot::full_check();
             if out.json {

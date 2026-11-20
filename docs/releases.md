@@ -71,6 +71,43 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-11-19: the store fails closed on a bad agent directory, identity file or object listing (task c0eb61747345)
+
+Neon's recommendation 2 (decision `c8bbb2886be3`, lead `0fe1e087ae37`). Storage hardening only: no change to
+the encoding, ids, the signing context, the validity rules, bundles, sync, or any golden vector or fixture.
+`Contribution::encode` gives the same bytes; it borrows the content instead of copying it, and each
+contribution keeps its encoded length (`Contribution::encoded_len`), which `Graph::check`, sync's batching and
+`bracken serve`'s quotas read instead of encoding again.
+- **`Store::agents` fails closed** (`StoreError::Corrupt`) on an `agents/` entry that isn't a regular file
+  named `<name>.json` for a valid name, whose `name` isn't its file's, a second entry for a name or a key, or a
+  local identity whose key the directory lists under another name. Names starting with a dot are skipped.
+  Every command that shows names reads it, and `bracken verify` now does too. `Store::open` still doesn't.
+  `bracken view` reads the directory alone through `Store::directory`, with the same rules and without
+  `identities/`, so it refuses such a directory as the CLI does where it used to pick or drop a name.
+- **Identity files** (`Identity::load`, `Store::identities`) must be regular files named `<name>.json` for the
+  valid name they hold.
+- **Writes**: an object's temporary file has a random name, is synced before the rename and is removed if the
+  write fails. `ground.json` and a new `agents/<name>.json` are written to a synced temporary file and linked
+  into place, so neither follows a planted symlink, replaces a file or is left half-written.
+- **Opening** refuses, as `Corrupt`, a shard of `objects/` that is a symlink or not a directory, any other
+  entry there not named with a dot, and an object file that isn't a regular file, in `Store::open` and in the
+  untrusted objects of `Store::open_trusting`. Before, a symlinked shard or object was followed and stray files
+  were skipped.
+- **No symlink is followed inside a replica** (round 2, findings `58b9903c1820`, `99f862b78057`,
+  `23253fd20e5b`). `agents/`, `identities/`, `objects/`, every shard, `ground.json` and a `--key-dir` that is a
+  symlink are refused on every read and write (`Corrupt`); only the replica's own directory is followed. Every
+  directory under it is opened with `O_DIRECTORY | O_NOFOLLOW` and every file with `O_NOFOLLOW | O_NONBLOCK`,
+  relative to its directory's descriptor, and a file's type is checked on the open descriptor, so a link or a
+  FIFO swapped in after a listing is refused rather than followed or blocked on (`crates/manyroot/src/fsx.rs`,
+  through `rustix`, which `crates/tree` already used). `Identity::save` writes a 0600 dot-named temporary file
+  (no `.json`), synced, then hard-links it in place, so a key is never seen half-written. None of this
+  repository's setups (the main Ground, `~/bracken-weave/manyroot`, the team server's `ground/` and `keys/`,
+  worktree copies) uses a symlinked directory or `ground.json`.
+- **Existing Grounds open unchanged** if they hold none of these. This repository's own `agents/`,
+  `identities/` names and `objects/` were checked against a copy before the merge and pass. A replica that
+  holds one now fails with an error naming the path: fix or remove that entry.
+- **No migration.** Upgrade the pinned binary after the merge.
+
 ### 2026-11-19: Weave readers bound an unreadable record's cost, and a line name never reads as an id first (task fe2c9d96a787)
 
 Two fixes from the hostile-writer review (task `ee121849975b`), accepted by the owner (decision

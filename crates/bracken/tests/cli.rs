@@ -2140,3 +2140,24 @@ fn watch_open_reports_a_finding_once_when_its_contradicts_arrives_later() {
     let err = bracken_fails(dir, &["watch", "--follow", "--interval", "1000years"]);
     assert!(err.contains("over the maximum"), "{err}");
 }
+
+#[test]
+fn verify_fails_on_an_agent_entry_that_could_misname_an_agent() {
+    // Task c0eb61747345: opening doesn't read agents/, so verify checks it.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init", "--name", "g"]);
+    let manager = bracken(dir, &["id", "new", "manager"]);
+    bracken(dir, &["claim", "hello", "--as", "manager"]);
+    bracken(dir, &["verify"]);
+    let agents = dir.join(".bracken/agents");
+    let entry = |name: &str, agent: &str| serde_json::json!({ "name": name, "agent": agent }).to_string();
+    std::fs::write(agents.join("zzz.json"), entry("zzz", &manager)).unwrap();
+    let err = bracken_fails(dir, &["verify"]);
+    assert!(err.contains("under another name"), "{err}");
+    std::fs::write(agents.join("zzz.json"), entry("manager", &manager)).unwrap();
+    let err = bracken_fails(dir, &["verify"]);
+    assert!(err.contains("not \"zzz\""), "{err}");
+    std::fs::remove_file(agents.join("zzz.json")).unwrap();
+    bracken(dir, &["verify"]);
+}

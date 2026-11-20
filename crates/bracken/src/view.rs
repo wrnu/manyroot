@@ -21,8 +21,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use manyroot::Store;
 use manyroot::validation::{open_conflicts, open_supersessors};
-use manyroot::{AgentEntry, Store};
 use manyroot::{
     AgentId, Assessment, Body, Conflict, Contribution, ContributionId, Graph, Policy, RelationKind, Status, Verdict,
 };
@@ -162,42 +162,11 @@ impl Snapshot {
 /// Agents' names from the public directory, `agents/*.json`. Unlike `Names::load` (which goes
 /// through `Store::agents`), this never reads `identities/`, where the private keys are.
 ///
-/// A name two entries give to different keys is refused: neither key gets it, so both show by key, and
-/// one agent can't pass as another (finding 81a3c4d7bdec). A key named twice keeps the name the CLI's
-/// `Names` keeps, the last in name order, so `author_name` matches `log --json`.
+/// It reads it through `Store::directory`, with the CLI's rules: a directory that could misname an
+/// agent, such as one name for two keys or two names for one key, is refused, so the view fails as
+/// the CLI does rather than pick a name (finding 81a3c4d7bdec, task c0eb61747345).
 pub fn public_names(store: &Store) -> Result<Names> {
-    let dir = store.agents_dir();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Names(HashMap::new())),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
-    };
-    let mut paths = Vec::new();
-    for entry in entries {
-        let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
-        if path.extension().is_some_and(|e| e == "json") {
-            paths.push(path);
-        }
-    }
-    paths.sort();
-    let mut entries = Vec::with_capacity(paths.len());
-    let mut keys: HashMap<String, HashSet<AgentId>> = HashMap::new();
-    for path in &paths {
-        let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let entry: AgentEntry = serde_json::from_str(&text).with_context(|| format!("reading {}", path.display()))?;
-        keys.entry(entry.name.clone()).or_default().insert(entry.agent);
-        entries.push(entry);
-    }
-    let mut names: HashMap<AgentId, String> = HashMap::new();
-    for entry in entries {
-        if keys[&entry.name].len() == 1 {
-            let name = names.entry(entry.agent).or_default();
-            if entry.name > *name {
-                *name = entry.name;
-            }
-        }
-    }
-    Ok(Names(names))
+    Ok(Names(store.directory()?.into_iter().map(|e| (e.agent, e.name)).collect()))
 }
 
 /// The replica's object files and agent entries, counted. The Ground is append-only, so a change

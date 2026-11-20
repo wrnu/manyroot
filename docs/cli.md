@@ -114,7 +114,8 @@ that are most of a read's cost.
 - **Forcing a full check.** `BRACKEN_FULL_CHECK=1` makes every read a full check that neither reads nor
   writes the snapshot. `scripts/merge`, `scripts/verify-seq` and `scripts/ground-guards` set it.
   `bracken verify [--json]` re-reads and checks every object once, prints how many, and rewrites the
-  snapshot; it fails, as a full check does, if any object is damaged or overwritten.
+  snapshot; it fails, as a full check does, if any object is damaged or overwritten, and also if an
+  `agents/` entry could misname an agent (one not named for its own valid name, or a second name for a key).
 - **On disk.** `cache/` holds a `.gitignore` of `*`, so git never commits it, and nothing is written
   outside it. The snapshot goes to a temporary file of its own, created fresh (never through a link),
   then renamed into place. A `cache` that isn't a real directory is never written to. `bracken view`
