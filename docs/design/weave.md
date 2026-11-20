@@ -581,9 +581,10 @@ never changes whether `E` qualified (finding `b2098df8e4be`). A decision
    (or, for an objection to a manifest or a proposal, for `E`), whether or
    not a later result replaced it; its check is the failing check. It's
    *replaced by a pass* when, over `E`'s ancestors, its validator's latest
-   eligible results for that manifest and method hold no fail, by the
+   eligible results for that manifest and method are a single pass, by the
    latest-result rule above (several concurrent latest results count as one
-   fail). A fail replaced by another fail isn't:
+   fail, even if all passed; finding `91b445207f20`). A fail replaced by
+   another fail, or by concurrent passes, isn't:
 
    | Disposition | Means, and is checked as | Allowed for |
    |---|---|---|

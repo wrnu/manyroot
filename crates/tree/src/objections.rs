@@ -34,8 +34,9 @@ use crate::shared::{Set, SetMap};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Basis {
     /// `from` is a failing check result eligible there, for `check`. `replaced` if a pass replaced it
-    /// there: its validator's latest eligible results for that manifest and method, in that past, hold no
-    /// fail, by green's rule that several concurrent latest results count as one fail. Such an objection
+    /// there: its validator's latest eligible results for that manifest and method, in that past, are a
+    /// single pass, by green's rule that several concurrent latest results count as one fail, even if
+    /// every one passed (finding 91b445207f20). Such an objection
     /// may also be answered `overridden` (weave-authority.md B4, decision 51815720d632).
     Evidence {
         result: ContributionId,
@@ -687,18 +688,19 @@ impl Obligations {
                 && in_epoch(&r.id);
             if eligible {
                 // Its validator's eligible results for the same manifest and method in this past, itself
-                // included: replaced by a pass when none of their fails is latest among them, which leaves
-                // only passes latest (weave-authority.md B4).
+                // included: replaced by a pass when their latest is a single pass (weave-authority.md B4).
                 let mut kept: Vec<&CheckResult> = vec![r];
                 for s in self.siblings.get(&r.id).into_iter().flatten() {
                     if in_past(&s.id) && !retractions.within(&s.id, &mut *in_past) && in_epoch(&s.id) {
                         kept.push(s);
                     }
                 }
-                let replaced = kept
-                    .iter()
-                    .filter(|f| !f.passed)
-                    .all(|f| kept.iter().any(|later| self.below.contains(&(f.id, later.id))));
+                // Green's rule (`Checks::tally`): the validator's latest results count as a pass only when
+                // they are one pass; several concurrent latest results count as one fail, even if all pass
+                // (finding 91b445207f20).
+                let latest: Vec<&&CheckResult> =
+                    kept.iter().filter(|x| !kept.iter().any(|later| self.below.contains(&(x.id, later.id)))).collect();
+                let replaced = matches!(latest.as_slice(), [one] if one.passed);
                 return Basis::Evidence { result: r.id, check: check.expect("tested above"), replaced };
             }
         }

@@ -439,3 +439,37 @@ fn a_fail_beside_a_concurrent_latest_fail_still_binds() {
     let refused = w.fails(&["weave", "integrate", "--as", AS, "--answer", &overridden]);
     assert!(refused.contains("rule 5") && refused.contains("overridden"), "{refused}");
 }
+
+// Finding 91b445207f20: green counts several concurrent latest results as one fail even when every one
+// passed, so a fail followed by two concurrent passes isn't green. B4 follows green: such a fail isn't
+// replaced, and its objection still binds.
+#[test]
+fn a_fail_followed_by_two_concurrent_passes_still_binds() {
+    let w = Weave::new();
+    w.integrate(&[]);
+    let method = w.method();
+    let (hash, artifact) = w.candidate(b"two\n");
+    w.ok(&["id", "new", "mallory"]);
+    let f1 = w.result(&method, (&hash, &artifact), false, 1);
+    let other = w._tmp.path().join("other");
+    let out = Command::new("cp").arg("-R").arg(&w.ground).arg(&other).output().expect("cp runs");
+    assert!(out.status.success());
+    let parsed: ContentHash = hash.parse().expect("a hash");
+    let details = details(&parsed, 3, &["true".to_owned()], &Exit::Code(0), &RecordedTail::Text("out".into()));
+    w.ok_on(&other, &["evidence", &artifact, "pass", "--method", &method, "--details", &details, "--as", VAL]);
+    w.result(&method, (&hash, &artifact), true, 2);
+    w.ok(&["relate", &f1, "contradicts", &artifact, "--as", "mallory"]);
+    assert_eq!(w.must_answer(&hash)[0]["basis"]["replaced"], true, "one pass latest, before the other arrives");
+    let bundle = w._tmp.path().join("bundle");
+    w.ok_on(&other, &["export", bundle.to_str().expect("UTF-8")]);
+    w.ok(&["import", bundle.to_str().expect("UTF-8")]);
+
+    let green = w.json(&["weave", "green", "--manifest", &hash, "--json"]);
+    assert_eq!(green["green"], false, "two concurrent latest passes aren't green: {green}");
+    let open = &green["must_answer"];
+    assert_eq!(open[0]["basis"]["replaced"], false, "{open}");
+    assert_eq!(open[0]["allowed"], serde_json::json!(["accepted_breakage"]));
+    let overridden = format!("{}=overridden:a flake", &artifact[..12]);
+    let refused = w.fails(&["weave", "integrate", "--as", AS, "--answer", &overridden]);
+    assert!(refused.contains("rule 5") && refused.contains("overridden"), "{refused}");
+}

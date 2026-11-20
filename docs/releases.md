@@ -86,8 +86,8 @@ are valid. Every existing Ground opens as before.
   main (accepted, decision `a2e0b9c241c7`).
 - **B4: an objection from a fail a pass replaced may be answered `overridden`** (finding `6cad0100be83`).
   An evidence-backed objection whose fail's validator, in the answering decision's past, has later results
-  for that manifest and method whose latest hold no fail (concurrent latest results count as a fail, as in
-  green) now allows `overridden` as well as `accepted_breakage`. A fail replaced by another fail binds as
+  for that manifest and method whose latest is a single pass (several concurrent latest results count as
+  a fail, as in green, even if all passed; finding `91b445207f20`) now allows `overridden` as well as `accepted_breakage`. A fail replaced by another fail binds as
   before. This only adds an allowed answer, so every decision that qualified still does, but an older
   binary judges a decision answered this way unqualified, and the two show different heads. **Upgrade both
   Weave binaries, the pinned `.bracken-bin` and `~/bracken-weave`'s, before answering such an objection
