@@ -714,6 +714,36 @@ prompt is Weave's in git's words, and so are the role sentences.
   for both modes; it reads each tree out of the hub's repository, each file
   checked, nothing checked out by git.
 
+### Dividing the work and the integrator's last turn
+
+Stage 3 (task `cb6a40559593`), the same in both project modes, so the
+coordination substrate stays the only difference. Stages 1-2 and the git
+baseline found every agent building every item and the one integrator's
+turns ending before the builders' (notes `950a7e400f1f`, `63ca18dbfdf7`).
+
+- **Taking items:** the runner (the driver, `src/taken.rs`) holds who has
+  taken each work item; agents take one with the `take_item` tool, in words
+  neither mode owns, and the task tool's index and an item's view show its
+  taker (`taken_by`, for which each page keeps room). Only a released item
+  can be taken, by one agent at a time, and an agent holds at most its fair
+  share, the released items over the agents that may take items, rounded
+  up; `give_up` frees one. An item stays taken until given up, so the index
+  says whose work it is. A run's one integrator takes none: it integrates
+  the builders' items. When the change goes out, a change whose revised
+  items one agent holds, all of them, is taken for that agent (it holds the
+  code the change revises); otherwise it is free to take. The prompt says to
+  take an item before working on it and never to work on another's. Takings
+  and give-ups are events, by item id and agent.
+- **The integrator plays last:** with a named integrator, the driver starts
+  its last turn only once every other agent's thread has ended its last
+  turn (or stopped), so whatever builders finish before the run's end can
+  still reach main; a lockstep (mock) run plays it last in its order too.
+  The role sentences say so. The wait is a `last_turn_held` event; it adds
+  to wall time the integrator's last turn after the slowest builder's last,
+  instead of beside it.
+- The plan records both rules (`take-items`, `integrator-last`) and the
+  tool's description among the hashed tools.
+
 ## Cost estimate
 
 From Phase 1 and 2's measured use, and Candidate B's estimates for Python

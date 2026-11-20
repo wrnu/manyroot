@@ -26,6 +26,9 @@
 //! tree with every head as a parent (losing the other's changes, as a mock may), and an integration the
 //! line refuses leaves its proposal open.
 //!
+//! In both project modes, after reading the task, an agent takes the first item no one has taken (task
+//! `cb6a40559593`), unless it is the run's one integrator; it writes its own module whatever it holds.
+//!
 //! In git project mode it reads the task the same way and writes the same module, on its own main where it
 //! may update main, else on a branch of the turn, from `origin/main`, whose integration it asks for. An agent
 //! that updates main merges `origin/main` first, and with one integrator, every open request's branch too; then
@@ -322,11 +325,12 @@ impl MockBackend {
         let tools = c.request("tools/list", json!({}))?;
         let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
+        let noted = notes["notes"].as_str().unwrap_or_default().to_string();
         if has("request_integration") {
-            return git_project_turn(c, agent, turn, self.integrator);
+            return git_project_turn(c, agent, turn, self.integrator, &noted);
         }
         if has("propose") {
-            return weave_turn(c, agent, turn, self.integrator);
+            return weave_turn(c, agent, turn, self.integrator, &noted);
         }
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
         if has("replace") && !has("pr_open") {
@@ -455,8 +459,9 @@ impl MockBackend {
 
 /// One Weave-mode turn of a project run (see the module's doc). With one `integrator`, any other agent only
 /// proposes, and the integrator integrates every open proposal, its own with them.
-fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>) -> Result<(), String> {
-    read_task(c, agent, turn)?;
+fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>, notes: &str) -> Result<(), String> {
+    let task = read_task(c, agent, turn)?;
+    let took = take_an_item(c, agent, &task, integrator, notes)?;
     let head = c.tool("head", json!({}))?;
     let heads: Vec<String> = head["heads"]
         .as_array()
@@ -478,7 +483,7 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>
     let proposed = c.tool("propose", json!({"summary": format!("agent {agent}'s module of turn {turn}")}))?;
     let proposal = proposed["proposal"].as_str().ok_or("propose gave no proposal")?.to_string();
     if integrator.is_some_and(|n| n != agent) {
-        c.tool("notes_write", json!({"text": format!("turn {turn}: proposed {module}")}))?;
+        c.tool("notes_write", json!({"text": format!("turn {turn}: proposed {module}{took}")}))?;
         c.tool("sync", json!({}))?;
         return Ok(());
     }
@@ -502,14 +507,21 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>
         Err(e) if e.contains("is forked") => {}
         Err(e) => return Err(e),
     }
-    c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}")}))?;
+    c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}{took}")}))?;
     c.tool("sync", json!({}))?;
     Ok(())
 }
 
 /// One git-project-mode turn of a project run (see the module's doc).
-fn git_project_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>) -> Result<(), String> {
-    read_task(c, agent, turn)?;
+fn git_project_turn(
+    c: &mut Client,
+    agent: usize,
+    turn: u32,
+    integrator: Option<usize>,
+    notes: &str,
+) -> Result<(), String> {
+    let task = read_task(c, agent, turn)?;
+    let took = take_an_item(c, agent, &task, integrator, notes)?;
     let updates_main = integrator.is_none_or(|n| n == agent);
     let branch = if updates_main { "main".to_string() } else { format!("agent-{agent}-turn-{turn}") };
     let status = c.tool("status", json!({}))?;
@@ -529,7 +541,7 @@ fn git_project_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<
     }
     if !updates_main {
         c.tool("request_integration", json!({"branch": branch, "summary": format!("agent {agent}'s turn {turn}")}))?;
-        c.tool("notes_write", json!({"text": format!("turn {turn}: asked for {module}")}))?;
+        c.tool("notes_write", json!({"text": format!("turn {turn}: asked for {module}{took}")}))?;
         c.tool("sync", json!({}))?;
         return Ok(());
     }
@@ -559,7 +571,7 @@ fn git_project_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<
     } else if synced["main"] != "updated" {
         return Err(format!("main wasn't updated: {synced}"));
     }
-    c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}")}))?;
+    c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}{took}")}))?;
     c.tool("sync", json!({}))?;
     Ok(())
 }
@@ -584,8 +596,45 @@ fn write_own_module(c: &mut Client, agent: usize, turn: u32) -> Result<String, S
     Ok(module)
 }
 
-/// Reads the whole task, page by page, and one item again, as the prompt says.
-fn read_task(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
+/// What a turn's notes say of the item an agent took: ` took:<id>`, or nothing.
+const TOOK: &str = " took:";
+
+/// One item for each agent but the run's one integrator, which takes none (task `cb6a40559593`). An agent whose
+/// notes say it took one checks that the task's index still shows it as the taker; one that holds none takes the
+/// first item the index shows no one has taken. Refused because another agent took it since the index was read
+/// (agents not in lockstep), it goes on without one. What its notes keep of it.
+fn take_an_item(
+    c: &mut Client,
+    agent: usize,
+    task: &Value,
+    integrator: Option<usize>,
+    notes: &str,
+) -> Result<String, String> {
+    if integrator == Some(agent) {
+        return Ok(String::new());
+    }
+    let me = format!("agent-{agent}");
+    let index: Vec<&Value> = task["items"].as_array().into_iter().flatten().collect();
+    if let Some(id) = notes.split_once(TOOK).map(|(_, rest)| rest.split_whitespace().next().unwrap_or_default()) {
+        let entry = index.iter().find(|i| i["id"] == id);
+        if !entry.is_some_and(|i| i["taken_by"] == me.as_str()) {
+            return Err(format!("the task's index doesn't show {me} as {id}'s taker: {entry:?}"));
+        }
+        return Ok(format!("{TOOK}{id}"));
+    }
+    let Some(free) = index.iter().filter(|i| i["taken_by"].is_null()).find_map(|i| i["id"].as_str()) else {
+        return Ok(String::new());
+    };
+    match c.tool("take_item", json!({"item": free})) {
+        Ok(taken) if taken["taken_by"] == me.as_str() => Ok(format!("{TOOK}{free}")),
+        Ok(other) => Err(format!("take_item gave {other}")),
+        Err(e) if e.contains("is taken by") => Ok(String::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Reads the whole task, page by page, and one item again, as the prompt says: page 1, with the index.
+fn read_task(c: &mut Client, agent: usize, turn: u32) -> Result<Value, String> {
     let task = c.tool("task", json!({}))?;
     if task["spec"].as_str().is_none_or(str::is_empty) {
         return Err("the task tool showed no spec".into());
@@ -607,7 +656,7 @@ fn read_task(c: &mut Client, agent: usize, turn: u32) -> Result<(), String> {
     if !item["text"].as_str().is_some_and(|t| t.starts_with(&format!("Item {id} ("))) {
         return Err(format!("the task tool showed item {id} as {item}"));
     }
-    Ok(())
+    Ok(task)
 }
 
 /// Git mode, Phase 2: writes `program` as `spec`'s definition on the current branch, in place of the one

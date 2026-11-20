@@ -783,11 +783,13 @@ mod macos_only {
             log.iter().filter(|e| e["event"] == "turn_error").collect::<Vec<_>>(),
             std::fs::read_to_string(cfg.root.join("turn-errors.txt")).unwrap_or_default()
         );
+        // And a take of an item another agent took since the index was read (task cb6a40559593).
         let failed: Vec<&Value> = log
             .iter()
-            .filter(|e| e["event"] == "tool_result" && e["data"]["ok"] != true && e["data"]["tool"] != "`integrate`")
+            .filter(|e| e["event"] == "tool_result" && e["data"]["ok"] != true)
+            .filter(|e| e["data"]["tool"] != "`integrate`" && e["data"]["tool"] != "`take_item`")
             .collect();
-        assert!(failed.is_empty(), "only an integration may be refused: {failed:?}");
+        assert!(failed.is_empty(), "only an integration or a take may be refused: {failed:?}");
         let merges = log.iter().filter(|e| e["event"] == "tool_result" && e["data"]["tool"] == "`merge`").count();
         assert!(merges > 0, "the agents' integrations met, and were merged");
 
