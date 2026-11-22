@@ -55,6 +55,29 @@ The owner's own approval is needed only for the list in AGENTS.md, section 1: a 
 
 On this machine, 127.0.0.1:7391, its files in `~/.bracken-team/manyroot/` (mode 0700), run at login by launchd (`scripts/services install`, `status`, `uninstall`), with the view on port 7392. The manager runs `scripts/team-server`: `token <identity>` (restarts the server: never during a counted run or merge), `key <identity>` (a new identity whose key only the server holds), `ready <identity>` (read-only check before a launch), `retire <identity>`. What each identity may sign is `scopes.toml` in the team directory. Every agent sets `BRACKEN_AGENT=<identity>`.
 
+## Typed claims
+
+Conventions on protocol v1 tags (task `8c9ad9bd4518`, synthesis 2.2 C1), each one-to-one with a field protocol v2 is to hold: `type:<name>` (one per claim), `<key>:<value>` (one value per key) and `ref:<role>=<full id>`, whose id the CLI also makes a parent. `bracken claim` checks every tag's syntax, and a typed claim's shape, before writing anything; reads only report what doesn't conform (`typed.problems` in `--json`), and validity never looks at tags. A typed claim also carries its type's plain tag, so `log --tag pr` and the scripts find it. One call writes the claim and its relations ([cli.md](cli.md), Typed claims):
+
+```sh
+scripts/bk claim "<file:line> <what breaks>" --type finding --attr severity=medium --attr label=confirmed --contradicts <pr> --as <you>
+scripts/bk claim "PR #<n> <branch> @ <sha>: <title>. Weave proposal <id>" --type pr --attr pr=<n> --attr branch=<branch> \
+  --attr sha=<sha> --attr weave=<id> --ref task=<task> --implements <task> --supersedes <old pr claim> --as <you>
+```
+
+| Type | Keys (value kind) | Written with |
+|---|---|---|
+| `pr` | `pr` (number), `branch`, `sha` (40 hex); optional `weave` (64 hex), `class` | a statement starting `PR #<pr> <branch> @ <sha>: `, naming `Weave proposal <weave>` when given |
+| `finding` | `severity` (low, medium, high, critical), `label` (confirmed, possible); optional `at` | `--contradicts <id>` |
+| `triage` | `disposition` (confirmed, rejected, deferred) | `--ref finding=<id>`; deferred: also `--ref task=<id>` |
+| `task` | optional `agent`, `class`, `branch` | tagged `deferred`: `--depends-on <finding>` |
+| `decision` | `source` (owner, manager), `date` (YYYY-MM-DD) | |
+| `experiment` | `metric`, `baseline`, `target` (numbers), `expires` (date) | a `rule:` line; any `metric:`, `baseline:`, `target:` or `expires:` line agrees with its key |
+| `metric` (plain tag `metrics`) | `week` (date of the Monday) | |
+| `note`, `question`, `answer`, `report`, `gotcha`, `preference`, `reference`, `process`, `misfire`, `plan` | none | |
+
+The team server judges `type:<name>` by its plain tag as well, so a scope forbidding `decision` forbids `type:decision`. Until the typed-gate PR, `scripts/merge` and `scripts/metrics` read the statement text, which the shapes keep in step with the tags.
+
 ## Weave shadow (stages 1 and 2a)
 
 After each merge, once it's in the main checkout and the pinned binary is upgraded, the manager runs `scripts/weave-shadow --proposal <id> <merged sha>` with the `Weave proposal` the PR's last `pr` claim names (none: no `--proposal`). `outcome conflict` needs nothing. "Stop and report it" means Weave's merge differs from git's: tell the owner, with the paths, and only then rerun with `--mismatched`; never force a merge to match. Any other non-zero exit: stop the shadow and tell the owner. `scripts/weave-backup --owner-decision <approval> <dest>` copies the Weave Ground only to a destination the owner approved. The Weave gate is on while a current manager claim tagged `weave-gate` reads `Weave gate: on` (owner approval `e8fd45c83ba6`).

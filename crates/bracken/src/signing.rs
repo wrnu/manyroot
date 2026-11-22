@@ -177,8 +177,11 @@ impl Scope {
             Body::Relation { kind, .. } if !self.relations.contains(kind) => {
                 Some(format!("its scope doesn't include {kind} relations"))
             }
+            // A tag is judged by each of its names: `type:decision` is `decision` too (crate::typed).
             Body::Claim { tags, .. } => tags.iter().find_map(|t| {
-                let allowed = self.tags.as_ref().is_none_or(|a| a.contains(t)) && !self.forbidden_tags.contains(t);
+                let names = crate::typed::scope_names(t);
+                let allowed = self.tags.as_ref().is_none_or(|a| names.iter().any(|n| a.iter().any(|x| x == n)))
+                    && !names.iter().any(|n| self.forbidden_tags.iter().any(|x| x == n));
                 (!allowed).then(|| format!("its scope doesn't allow the tag {t:?}"))
             }),
             _ => None,
@@ -392,6 +395,9 @@ mod tests {
         let b = scope_of(text, "b").unwrap().unwrap();
         assert_eq!(b.refuses(&claim(&["note", "pr"])), None);
         assert!(b.refuses(&claim(&["note", "decision"])).unwrap().contains("\"decision\""));
+        // A type is judged as its plain tag too, so typing a claim can't get past a forbidden tag.
+        assert!(b.refuses(&claim(&["type:decision"])).unwrap().contains("\"type:decision\""));
+        assert_eq!(b.refuses(&claim(&["type:pr", "pr", "pr:3"])), None);
         let id = ContributionId([1; 32]);
         let relation = |kind| Body::Relation { from: id, kind, to: id, note: String::new() };
         assert_eq!(b.refuses(&relation(RelationKind::Implements)), None);
@@ -401,5 +407,8 @@ mod tests {
         let t = scope_of(text, "t").unwrap().unwrap();
         assert_eq!(t.refuses(&claim(&["note"])), None);
         assert!(t.refuses(&claim(&["pr"])).is_some());
+        // An allow-list allows a type it names by its plain tag.
+        assert_eq!(t.refuses(&claim(&["type:note", "note"])), None);
+        assert!(t.refuses(&claim(&["type:pr"])).is_some());
     }
 }

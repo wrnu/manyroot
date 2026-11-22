@@ -195,6 +195,28 @@ A write command signs with the identity's file in `identities/` if there is one.
 that server and checks the signature it gets back before adding the contribution; `scripts/bk` sets both
 for its writes. The contribution is byte for byte what the key file would sign.
 
+## Typed claims
+
+A claim's tags take three forms besides plain ones (`note`), each mapping one-to-one onto a field protocol v2
+is to hold: `type:<name>` (at most one), `<key>:<value>` (one value per key; `type` and `ref` aren't keys)
+and `ref:<role>=<id>` (the full id). `claim` refuses, writing nothing, a tag with a comma, a space, a control
+character or a capital letter, a malformed typed tag, two types or two values for one key. `--type <name>`
+adds `type:<name>` and the type's plain tag, and checks the type's shape: the keys it needs, their values'
+kinds, and the relations it is written with. A type `claim` doesn't know is refused, to catch a misspelt one.
+`--attr key=value` adds `key:value`; `--ref role=<id>` (a unique prefix will do) adds `ref:role=<full id>`
+and makes the id a parent, so the cited contribution is causally before the claim. `--contradicts`,
+`--supports`, `--implements`, `--refines`, `--depends-on` and `--tests` (each repeatable) write relations
+from the claim in the same call, after it, each printed on its own line.
+
+```sh
+bracken claim "x.rs:3 drops the error" --type finding --attr severity=medium --attr label=confirmed --contradicts $PR
+```
+
+These are client checks: validity never looks at tags, so a contribution written another way stays valid.
+`show`, `log` and the other `--json` reads give a claim with any typed tag a `typed` field, `{"type", "data",
+"refs": [{"role", "id"}], "problems"}`, where `problems` lists what doesn't conform (a reference that isn't a
+parent included), and refuse nothing. The shapes are listed in [development.md](development.md), Typed claims.
+
 ## Intents
 
 **Intents** are a convention on ordinary contributions, not part of the protocol. An intent is a
