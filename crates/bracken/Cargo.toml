@@ -28,3 +28,9 @@ rustix = { version = "1.1", features = ["event"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+
+# The Ground benchmark (task 7a3d17f979c3): `cargo bench -p bracken --bench ground -- --help`.
+[[bench]]
+name = "ground"
+path = "benches/ground/main.rs"
+harness = false
