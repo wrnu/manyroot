@@ -84,7 +84,9 @@
 # Before the checks, it prints one 'note  experiments' line naming every expired experiment (a current claim
 # tagged experiment, AGENTS.md, Process changes and experiments) that no current manager decision supports:
 # its rule has lapsed. It expires on its 'expires: <YYYY-MM-DD>' line, or 14 days after it was written if it
-# has none, and never later than 28 days after. The line never blocks the merge (task 9b65c13e9d66).
+# has none, and never later than 28 days after; one typed experiment, on its expires key. The line alone
+# never blocks the merge (task 9b65c13e9d66); a check 'experiments' fails it when a lapsed experiment's id
+# is still cited in the head's AGENTS.md (decision ff456e4e2fcc).
 # A batch pass (scripts/verify-seq --batch, decision db6f7705c0a4) is a manager pass whose method is
 # 'scripts/test-table[ --split] @ <sha> batch <batch claim> on <main> tree <key> run <evidence>'. It
 # counts only if the batch claim is a current manager claim tagged batch that lists this PR, claim and
@@ -317,6 +319,9 @@ expired_experiments() {
 }
 experiments=$(expired_experiments)
 [ -z "$experiments" ] || printf '%-4s  %-12s %s\n' note experiments "$experiments"
+# The lapsed ones' 12-digit ids, for the check against the head's AGENTS.md below.
+lapsed_ids=()
+for e in $(grep -o '[0-9a-f]\{12\} (ended' <<<"$experiments" | cut -c1-12); do lapsed_ids+=("$e"); done
 
 origin=$(git -C "$main" config --get remote.origin.url)
 # Not printed: an origin URL can carry a password.
@@ -452,6 +457,22 @@ fi
 # 5. main.
 git -C "$main" fetch -q origin main "refs/pull/$pr/head" || fail "couldn't fetch main and PR #$pr from origin"
 tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no origin/main"
+
+# A lapsed experiment whose rule is still cited in AGENTS.md fails the gate (decision ff456e4e2fcc, task
+# 8c9ad9bd4518 step 3): a rule that lapsed must leave the rules, or a decision keep it. One not cited stays the
+# note above. Read from the head's own AGENTS.md, as it is what merges; a head without one cites nothing.
+if [ ${#lapsed_ids[@]} -gt 0 ] && git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+  agents_md=''
+  if git -C "$main" cat-file -e "$sha:AGENTS.md" 2>/dev/null; then
+    agents_md=$(git -C "$main" show "$sha:AGENTS.md") || fail "couldn't read AGENTS.md at $sha"
+  fi
+  cited=()
+  for e in "${lapsed_ids[@]}"; do
+    if grep -qF -- "$e" <<<"$agents_md"; then cited+=("$e"); fi
+  done
+  [ ${#cited[@]} -eq 0 ] ||
+    check FAIL experiments "lapsed, and still cited in AGENTS.md at $sha: ${cited[*]}: take each out of AGENTS.md (its rule has lapsed), or keep it with a manager decision citing the metrics that supports it"
+fi
 
 # The manager's passes of scripts/test-table naming the sha, one '<main sha>\x1f<key>\x1f<suffix>' line
 # each, split on the unit separator: a tab is whitespace to read, so an empty main and key would collapse

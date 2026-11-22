@@ -1343,3 +1343,71 @@ fn gate_replay_refuses_an_old_ref_main_never_ran() {
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     assert!(text(&out).contains("runs only as manager"), "{}", text(&out));
 }
+
+/// A lapsed experiment still cited in the head's AGENTS.md fails the gate, a typed one by its expires key
+/// included (decision ff456e4e2fcc, task 8c9ad9bd4518 step 3); one cited but kept by a manager decision, or
+/// lapsed but cited nowhere, doesn't fail it, and the second is only named, as before.
+#[test]
+fn merge_fails_while_a_lapsed_experiment_is_cited_in_agents_md() {
+    for scripts in SCRIPTS {
+        let ids = std::cell::RefCell::new(Vec::new());
+        let at_base = |dir: &Path| {
+            let first = |out: String| out.lines().next().unwrap().to_owned();
+            let typed = first(bk(
+                dir,
+                &[
+                    "claim",
+                    "Experiment (manager): typed\nrule: every performance claim cites an A/B",
+                    "--type",
+                    "experiment",
+                    "--attr",
+                    "metric=perf_claims_without_ab",
+                    "--attr",
+                    "baseline=14",
+                    "--attr",
+                    "target=0",
+                    "--attr",
+                    "expires=2020-01-01",
+                    "--as",
+                    "manager",
+                ],
+            ));
+            let plain = |rule: &str, expires: &str| {
+                let text = format!(
+                    "Experiment (manager): {rule}\nrule: {rule}\nmetric: prs_merged\nbaseline: 3\ntarget: 5\nexpires: {expires}"
+                );
+                first(bk(dir, &["claim", &text, "--tag", "experiment", "--as", "manager"]))
+            };
+            let untyped = plain("untyped", "2020-01-02");
+            let kept = plain("kept", "2020-01-03");
+            let uncited = plain("uncited", "2020-01-04");
+            let decision = first(bk(
+                dir,
+                &["claim", "Decision (manager): kept, metrics met", "--tag", "decision", "--as", "manager"],
+            ));
+            bk(dir, &["relate", &decision, "supports", &kept, "--as", "manager"]);
+            let cite = format!("Running: `{}`, `{}` and `{}`.\n", &typed[..12], &untyped[..12], &kept[..12]);
+            std::fs::write(dir.join("AGENTS.md"), cite).unwrap();
+            ids.borrow_mut().extend([typed, untyped, kept, uncited]);
+        };
+        let change = |dir: &Path| std::fs::write(dir.join("code.txt"), "a change\n").unwrap();
+        let (_tmp, _dir, mut merge) = merge_dry_run_command(scripts, at_base, change, |_| {}, None);
+        let out = merge.output().unwrap();
+        let said = text(&out);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {said}");
+        let ids = ids.borrow();
+        let (typed, untyped, kept, uncited) = (&ids[0][..12], &ids[1][..12], &ids[2][..12], &ids[3][..12]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let line = |status: &str| {
+            let mut found =
+                stdout.lines().filter(|l| l.starts_with(status) && l.split_whitespace().nth(1) == Some("experiments"));
+            found.next().unwrap_or_default().to_owned()
+        };
+        let failed = line("FAIL");
+        assert!(failed.contains("still cited in AGENTS.md"), "{scripts}: {said}");
+        assert!(failed.contains(typed) && failed.contains(untyped), "{scripts}: {failed}");
+        assert!(!failed.contains(kept) && !failed.contains(uncited), "{scripts}: {failed}");
+        let note = line("note");
+        assert!(note.contains(&format!("{uncited} (ended 2020-01-04)")), "{scripts}: {said}");
+    }
+}

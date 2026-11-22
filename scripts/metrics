@@ -2,12 +2,17 @@
 # metrics: the week's process metrics, and every experiment's state, from the Ground and git (task
 # 9b65c13e9d66, decision 9be9ab6b1b1f; AGENTS.md, Process changes and experiments).
 #
-#   metrics [--week <Monday, YYYY-MM-DD>] [--today <YYYY-MM-DD>] [--ref <git ref>] [--json]
+#   metrics [--week <Monday, YYYY-MM-DD>] [--today <YYYY-MM-DD>] [--ref <git ref>] [--json | --post]
 #
-# Read-only: it reads `scripts/bk log --json` and `git log <ref> --first-parent`, fetches nothing and writes
-# nothing. It prints one claim statement, which the manager records:
+# It reads `scripts/bk log --json` and `git log <ref> --first-parent` and fetches nothing. It prints one
+# claim statement; with --post it also records it, as the runner identity (decision ff456e4e2fcc), a claim
+# typed metric (bracken claim --type metric) whose keys are the week and every number below, and prints
+# its id. The manager runs that weekly:
 #
-#   scripts/bk claim "$(scripts/metrics)" --tag metrics --as <you>
+#   scripts/metrics --post
+#
+# --post writes only that one claim, through scripts/bk as runner, and refuses, writing nothing, if runner
+# has no team token. Without --post it writes nothing.
 #
 # --week is the Monday (UTC) the week starts; by default the last complete week before --today (by default,
 # today). --ref is the main line (origin/main, or main where there's no origin/main). --json prints the
@@ -32,27 +37,45 @@
 #   builder_pass_minutes  for the builders' pr claims written in the week whose head this checkout holds, the minutes
 #                         from the head commit's committer time to the last pass its claim's author recorded
 #                         on it; the median (null when there are none)
+#   escapes_14d           a heuristic proxy for defects that escaped review (research-d, step A): finding
+#                         claims written in the week that the manager confirmed (latest evidence pass) and
+#                         that name a file a PR merged 1 to 14 days before them changed, counted once each,
+#                         leaving out a PR the finding's own pr claim (what it contradicts) is for, as that
+#                         one was still under review; plus revert commits in the week that change such a
+#                         file. A finding names a file by its typed at key (path:line) or any path:line in
+#                         its statement (a path holding a '/' or a '.'), matched to the merge's changed
+#                         paths exactly
+#   perf_claims_without_ab
+#                         a heuristic proxy (experiment 5cae9af16145): pr and report claims written in the
+#                         week whose statement gives a timing, a number followed by ms, µs or s, or p50 or
+#                         p95, and doesn't say A/B or back to back
+#
+# A pr claim typed pr (claim --type pr) whose typed fields conform is read from them; one typed anything else
+# isn't read as a pr claim; an untyped one from its statement, as before.
 #
 # An experiment is a current claim tagged experiment with lines 'rule:', 'metric:' (a key above),
-# 'baseline:', 'target:' and 'expires: <YYYY-MM-DD>'. With no expires line it ends 14 days after it was
+# 'baseline:', 'target:' and 'expires: <YYYY-MM-DD>', or one typed experiment (claim --type experiment)
+# whose typed fields conform, read from its metric, baseline, target and expires keys and its 'rule:' line. With no expires line it ends 14 days after it was
 # written, and never later than 28 days after. Past its end it has lapsed, unless a current manager
 # decision supports it (scripts/merge names the lapsed ones too). Each is listed with its days left, or
 # lapsed or kept, and any field it lacks.
 set -euo pipefail
 
-usage() { echo 'usage: metrics [--week <YYYY-MM-DD>] [--today <YYYY-MM-DD>] [--ref <git ref>] [--json]' >&2; exit 2; }
+usage() { echo 'usage: metrics [--week <YYYY-MM-DD>] [--today <YYYY-MM-DD>] [--ref <git ref>] [--json | --post]' >&2; exit 2; }
 fail() { echo "metrics: $*" >&2; exit 1; }
 
-week='' today='' ref='' json=false
+week='' today='' ref='' json=false post=false
 while [ $# -gt 0 ]; do
   case "$1" in
     --week) [ $# -ge 2 ] || usage; week=$2; shift 2 ;;
     --today) [ $# -ge 2 ] || usage; today=$2; shift 2 ;;
     --ref) [ $# -ge 2 ] || usage; ref=$2; shift 2 ;;
     --json) json=true; shift ;;
+    --post) post=true; shift ;;
     *) usage ;;
   esac
 done
+! $json || ! $post || usage
 for d in "$week" "$today"; do
   [ -z "$d" ] || [[ $d =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || fail "'$d' isn't a date (YYYY-MM-DD)"
 done
@@ -70,20 +93,34 @@ trap 'rm -r "$tmp"' EXIT
 "$here/bk" log --tag experiment --current --json >"$tmp/experiments.json" || fail "couldn't read the experiments"
 "$here/bk" log --tag decision --current --json >"$tmp/decisions.json" || fail "couldn't read the decisions"
 git -C "$repo" log "$ref" --first-parent --format='%ct%x09%s' >"$tmp/main.txt"
+# Each first-parent commit's time, subject and the paths it changed, for escapes_14d.
+git -C "$repo" log "$ref" --first-parent -m --name-only --format='@@C%x09%ct%x09%s' >"$tmp/changes.txt"
+# Typed readings, shared by both jq programs: a claim typed exactly <type> whose typed fields conform, a pr
+# claim's number and branch or sha from its typed fields or, untyped, its statement as before.
+typed='def typed_is($t): (.typed.type? // null) == $t and (.typed.problems // [""]) == [];
+def untyped: (.typed.type? // null) == null;
+def pr_nb: if typed_is("pr") then {n: .typed.data.pr, branch: .typed.data.branch}
+  elif untyped then ((.body.statement // "") | capture("^PR #(?<n>[0-9]+) (?<branch>[^ ]+) @ ")) // null else null end;
+def pr_sha: if typed_is("pr") then .typed.data.sha
+  elif untyped then ((.body.statement // "") | capture("^PR #[0-9]+ [^ ]+ @ (?<sha>[0-9a-f]{40}):") | .sha) // null
+  else null end;
+'
 # Each pr claim's head commit time, for the heads this checkout holds (others are left out).
-jq -r '.[] | select(.kind == "claim" and ((.body.tags // []) | index("pr"))) | .body.statement // ""
-  | capture("^PR #[0-9]+ [^ ]+ @ (?<sha>[0-9a-f]{40}):") | .sha' "$tmp/all.json" | sort -u |
+jq -r "$typed"'.[] | select(.kind == "claim" and ((.body.tags // []) | index("pr"))) | pr_sha // empty' "$tmp/all.json" | sort -u |
   git -C "$repo" cat-file --batch-check='%(objectname) %(objecttype)' | awk '$2 == "commit" { print $1 }' |
   git -C "$repo" log --no-walk=unsorted --stdin --format='%H%x09%ct' >"$tmp/heads.txt"
 
-jq -nr --arg week "$week" --arg today "$today" --arg ref "$ref" --argjson as_json "$json" \
+# compute <as JSON, true or false>: the metrics, as the claim statement or the JSON object.
+compute() {
+jq -nr --arg week "$week" --arg today "$today" --arg ref "$ref" --argjson as_json "$1" \
   --slurpfile all "$tmp/all.json" --slurpfile exps "$tmp/experiments.json" --slurpfile decs "$tmp/decisions.json" \
-  --rawfile main "$tmp/main.txt" --rawfile heads "$tmp/heads.txt" '
+  --rawfile main "$tmp/main.txt" --rawfile heads "$tmp/heads.txt" --rawfile changes "$tmp/changes.txt" "$typed"'
 def day: . / 86400 | floor;
 def date_s: . * 86400 | todate[0:10];
 def of_date: . + "T00:00:00Z" | fromdateiso8601 | day;
 def ratio($n; $d): if $d == 0 then null else ($n / $d * 10 | round / 10) end;
 def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \\t]*$") | .captures[0].string] | first // null;
+def xfield($k): if typed_is("experiment") and $k != "rule" then .typed.data[$k] else field($k) end;
 ($all[0]) as $all | ($exps[0]) as $exps | ($decs[0]) as $decs
 | (if $today == "" then now | day else $today | of_date end) as $t
 | (if $week == "" then $t - (($t + 3) % 7) - 7 else $week | of_date end) as $w
@@ -106,7 +143,7 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
 | ($all | map(select(.kind == "retract") | .body.target)) as $gone
 | ([$numbers[] as $num
     | [$claims[] | select((.body.tags // []) | index("pr"))
-        | ((.body.statement // "") | capture("^PR #(?<n>[0-9]+) (?<branch>[^ ]+) @ ") // null) as $m
+        | pr_nb as $m
         | select($m != null and $m.n == $num) | . + {branch: $m.branch}] as $mine
     | ([$mine[] | .id as $id | select(any($evidence[]; .body.target == $id and .author_name == "manager"
           and ((.body.method // "") | startswith("merge gate @")) and (.id as $e | any($gone[]; . == $e) | not)))]
@@ -120,11 +157,11 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
     and (.body.from as $f | any($decision_ids[]; . == $f))) | .body.to)) as $supported
 | ["prs_merged", "reverts", "follow_up_fixes", "findings_real", "findings_rejected", "findings_untriaged",
    "findings_real_per_pr", "findings_rejected_per_pr", "review_rounds_per_pr", "gate_misfires", "owner_asks_gated",
-   "owner_asks_other", "experiments_active", "builder_pass_minutes"] as $keys
+   "owner_asks_other", "experiments_active", "builder_pass_minutes", "escapes_14d", "perf_claims_without_ab"] as $keys
 | ($heads | split("\n") | map(select(length > 0) | split("\t") | {key: .[0], value: (.[1] | tonumber)}) | from_entries) as $head_time
 | ([$claims[] | select(((.body.tags // []) | index("pr")) and inweek) | . as $pr
-    | ((.body.statement // "") | capture("^PR #[0-9]+ [^ ]+ @ (?<sha>[0-9a-f]{40}):") | .sha) as $sha
-    | select($head_time[$sha] != null)
+    | pr_sha as $sha
+    | select($sha != null and $head_time[$sha] != null)
     | select(($pr.author_name // "") | startswith("builder"))
     | [$evidence[] | select(.body.target == $pr.id and .body.verdict == "pass" and .author_name == $pr.author_name
         and (.id as $i | any($retracted[]; . == $i) | not)) | .timestamp_ms] as $passes
@@ -134,14 +171,36 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
    else ($pass_minutes | length) as $l
      | (if $l % 2 == 1 then $pass_minutes[($l - 1) / 2] else ($pass_minutes[$l / 2 - 1] + $pass_minutes[$l / 2]) / 2 end)
      | . * 10 | round / 10 end) as $builder_pass_minutes
+# escapes_14d (see the header): the merges on main by day with the paths they changed, then the
+# confirmed findings and reverts of the week that touch a path a merge 1 to 14 days before them changed.
+| ($changes | split("\n") | reduce .[] as $l ([];
+    if ($l | startswith("@@C\t")) then . + [($l | split("\t")) as $f | {d: ($f[1] | tonumber | day), s: ($f[2:] | join("\t")), files: []}]
+    elif ($l | length) > 0 and length > 0 then .[-1].files += [$l] else . end)) as $hist
+| ($hist | map(select(.s | test("\\(#[0-9]+\\)$")) | . + {n: (.s | capture("\\(#(?<n>[0-9]+)\\)$").n)})) as $merges
+| def escaped($d; $paths; $own): any($merges[]; .d >= $d - 14 and .d <= $d - 1 and (.n as $n | $own | index($n) | not)
+    and (.files as $f | any($paths[]; . as $p | $f | index($p))));
+  ($claims | map({key: .id, value: .}) | from_entries) as $by_id
+| ($all | map(select(.kind == "relation" and .body.kind == "contradicts")) | group_by(.body.from)
+    | map({key: .[0].body.from, value: [.[].body.to]}) | from_entries) as $contradicts
+| ([$claims[] | select(((.body.tags // []) | index("finding")) and inweek and ($triage[.id] // "") == "pass")
+    | ([((.typed.data.at? // "") | sub(":[0-9].*$"; "") | select(length > 0)),
+        ((.body.statement // "") | scan("(?<p>[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_-]+\\.[A-Za-z0-9]+):[0-9]+") | .[0])]
+       | unique) as $paths
+    | [($contradicts[.id] // [])[] | $by_id[.] // empty | pr_nb | .n // empty] as $own
+    | select(escaped(.timestamp_ms / 1000 | day; $paths; $own))] | length) as $escaped_findings
+| ($hist | map(select(.d >= $w and .d < $e and (.s | test("^Revert"; "i")) and escaped(.d; .files; [])))
+    | length) as $escaped_reverts
+| ($claims | map(select((((.body.tags // []) | index("pr")) or ((.body.tags // []) | index("report"))) and inweek)
+    | select((.body.statement // "") | test("\\b[0-9]+(\\.[0-9]+)? ?(ms|µs|s)\\b|\\bp(50|95)\\b"; "i"))
+    | select((.body.statement // "") | test("A/B|back[- ]to[- ]back"; "i") | not)) | length) as $perf_without_ab
 | ($exps | map(select(.kind == "claim" and .retracted == false and ((.body.tags // []) | index("experiment"))))
-   | map((.timestamp_ms / 1000 | day) as $start | field("expires") as $given
+   | map((.timestamp_ms / 1000 | day) as $start | xfield("expires") as $given
      | (if $given and ($given | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}$")) then $given | of_date else $start + 14 end) as $want
      | ([$want, $start + 28] | min) as $ends
-     | {id: .id[:12], metric: field("metric"), ends: ($ends | date_s), days_left: ($ends - $t),
+     | {id: .id[:12], metric: xfield("metric"), ends: ($ends | date_s), days_left: ($ends - $t),
         state: (if $ends >= $t then "active" elif (.id as $i | any($supported[]; . == $i)) then "kept" else "lapsed" end),
-        missing: ([("rule", "metric", "baseline", "target") as $k | select((field($k) // "") == "") | $k]
-          + (if (field("metric") // "") as $m | $m != "" and ($keys | index($m) | not) then ["a known metric"] else [] end))})) as $experiments
+        missing: ([("rule", "metric", "baseline", "target") as $k | select((xfield($k) // "") == "") | $k]
+          + (if (xfield("metric") // "") as $m | $m != "" and ($keys | index($m) | not) then ["a known metric"] else [] end))})) as $experiments
 | {week: ($w | date_s),
    prs_merged: $n,
    reverts: ($commits | map(select(.s | test("^Revert"; "i"))) | length),
@@ -158,6 +217,8 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
    owner_asks_other: ($claims | map(select(((.body.tags // []) | index("owner-ask")) and inweek)) | length),
    experiments_active: ($experiments | map(select(.state == "active")) | length),
    builder_pass_minutes: $builder_pass_minutes,
+   escapes_14d: ($escaped_findings + $escaped_reverts),
+   perf_claims_without_ab: $perf_without_ab,
    experiments: $experiments}
 | .findings_real_per_pr = ratio(.findings_real; $n) | .findings_rejected_per_pr = ratio(.findings_rejected; $n)
 | if $as_json then . else
@@ -168,6 +229,7 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
     + " | review rounds per PR \(.review_rounds_per_pr | show) | gate misfires \(.gate_misfires)"
     + " | owner asks \(.owner_asks_gated) gated / \(.owner_asks_other) other"
     + " | builder pass minutes (median) \(.builder_pass_minutes | show)"
+    + " | escapes in 14 days \(.escapes_14d) (proxy) | perf claims without an A/B \(.perf_claims_without_ab) (proxy)"
     + " | experiments: " + (if (.experiments | length) == 0 then "none" else
         (.experiments | map("\(.id) \(.metric // "no metric") "
           + (if .state == "active" then "\(.days_left) days left" elif .state == "kept" then "kept by a decision"
@@ -175,3 +237,17 @@ def field($k): [(.body.statement // "") | match("(?m)^" + $k + ":[ \\t]*(.*?)[ \
           + (if (.missing | length) > 0 then " (lacks \(.missing | join(", ")))" else "" end)) | join("; ")) end)
     + " | Method: scripts/metrics (task 9b65c13e9d66), weeks from Monday UTC, \($ref)."
   end'
+}
+
+if ! $post; then
+  compute "$json"
+  exit
+fi
+# --post: the statement, and as a claim typed metric, its week and every number as a key, signed by runner.
+text=$(compute false)
+data=$(compute true)
+attrs=(--attr "week=$(jq -r .week <<<"$data")")
+while IFS= read -r kv; do attrs+=(--attr "$kv"); done < <(jq -r 'to_entries[] | select(.value | type == "number") | "\(.key)=\(.value)"' <<<"$data")
+printf '%s\n' "$text"
+BRACKEN_AGENT=runner "$here/bk" claim "$text" --type metric "${attrs[@]}" --as runner ||
+  fail "the metrics claim wasn't recorded as runner (see above); nothing else was written"
