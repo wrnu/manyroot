@@ -67,6 +67,32 @@ fn a_copy_of_a_replica_leaves_its_keys_and_cache_behind() {
     assert_eq!(Store::open(&to).expect("opens").graph().len(), 20);
 }
 
+/// Finding `ed3a2400ddab`: a symlinked `ground.json`, `agents/` or `objects/` (here, pointing at the keys)
+/// refuses the copy before anything is copied.
+#[cfg(unix)]
+#[test]
+fn a_copy_refuses_a_symlinked_manifest_or_directory() {
+    use std::os::unix::fs::symlink;
+    for linked in ["ground.json", "agents", "objects"] {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let from = tmp.path().join("from");
+        synth::build(&from, &synth::Spec { contributions: 5, bytes: 0, agents: 1, seed: 3 }).expect("builds");
+        let moved = tmp.path().join(format!("real-{linked}"));
+        fs::rename(from.join(linked), &moved).expect("move aside");
+        let target = if linked == "ground.json" {
+            let key = fs::read_dir(from.join("identities")).expect("keys").next().expect("a key").expect("entry");
+            key.path()
+        } else {
+            from.join("identities")
+        };
+        symlink(&target, from.join(linked)).expect("symlink");
+        let to = tmp.path().join("to");
+        let err = measure::copy_replica(&from, &to).expect_err(&format!("a symlinked {linked} is refused"));
+        assert!(err.to_string().contains("symlink"), "{linked}: {err:#}");
+        assert!(!to.exists(), "{linked}: nothing was copied");
+    }
+}
+
 #[test]
 fn percentiles_are_nearest_rank() {
     let ms = |v: &[u64]| v.iter().map(|n| std::time::Duration::from_millis(*n)).collect::<Vec<_>>();

@@ -94,16 +94,31 @@ pub fn tree_bytes(dir: &Path) -> Result<u64> {
 }
 
 /// Copies a replica's `ground.json`, `agents/` and `objects/` into `to`, never `identities/` or `cache/`:
-/// the benchmark of a real Ground holds no keys. Regular files only, skipping names starting with a dot
-/// (another process's write in flight); a symlink anywhere refuses the copy.
+/// the benchmark of a real Ground holds no keys. Nothing is followed through a link (finding
+/// `ed3a2400ddab`): `ground.json` must be a regular file and `agents/` and `objects/`, if present, real
+/// directories, all checked with `symlink_metadata` before anything is copied, and inside them only regular
+/// files and real directories are copied, skipping names starting with a dot (another process's write in
+/// flight). A symlink anywhere, or anything else, refuses the copy.
 pub fn copy_replica(from: &Path, to: &Path) -> Result<()> {
-    ensure!(from.join("ground.json").is_file(), "{} holds no ground.json", from.display());
-    fs::create_dir_all(to)?;
-    fs::copy(from.join("ground.json"), to.join("ground.json"))?;
+    let manifest = from.join("ground.json");
+    let meta = fs::symlink_metadata(&manifest).with_context(|| format!("{} holds no ground.json", from.display()))?;
+    ensure!(meta.file_type().is_file(), "{} isn't a regular file (or is a symlink)", manifest.display());
+    let mut subs = Vec::new();
     for sub in ["agents", "objects"] {
-        if from.join(sub).exists() {
-            copy_tree(&from.join(sub), &to.join(sub))?;
+        let path = from.join(sub);
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            Ok(m) => {
+                ensure!(m.file_type().is_dir(), "{} isn't a directory (or is a symlink)", path.display());
+                subs.push(sub);
+            }
         }
+    }
+    fs::create_dir_all(to)?;
+    fs::copy(&manifest, to.join("ground.json"))?;
+    for sub in subs {
+        copy_tree(&from.join(sub), &to.join(sub))?;
     }
     Ok(())
 }
