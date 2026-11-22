@@ -212,8 +212,12 @@ impl Store {
             let mut rest: Vec<(ContributionId, PathBuf, bool)> =
                 on_disk.into_iter().map(|(id, (p, regular))| (id, p, regular)).collect();
             rest.sort();
+            let mut fresh = Vec::new();
             for (_, path, regular) in rest {
-                let c = read_regular_object(objects.as_ref(), dir, path, regular)?;
+                fresh.push(read_regular_object(objects.as_ref(), dir, path, regular)?);
+            }
+            let signatures = verify_signatures(&fresh);
+            for c in fresh {
                 pool.insert(c.id(), (c, false));
             }
             // `Graph::import_with`'s walk, Kahn's algorithm with ready ids taken smallest first, over the
@@ -236,7 +240,7 @@ impl Store {
                 let (c, is_trusted) = pool.remove(&id).expect("ready ids are pending");
                 if is_trusted {
                     graph.insert_checked(c);
-                } else if let Err(why) = graph.insert(c) {
+                } else if let Err(why) = graph.insert_presigned(c, signatures[&id]) {
                     return Err(StoreError::Corrupt { path: object_path(dir, &id), reason: why.to_string() });
                 }
                 for child in waiting_on.remove(&id).unwrap_or_default() {
@@ -257,7 +261,8 @@ impl Store {
             return Ok(Store { dir: dir.to_owned(), info, graph });
         }
 
-        let report = graph.import(batch);
+        let signatures = verify_signatures(&batch);
+        let report = graph.import_presigned(batch, &signatures);
         if let Some((id, why)) = report.rejected.first() {
             return Err(StoreError::Corrupt { path: object_path(dir, id), reason: why.to_string() });
         }
@@ -518,6 +523,24 @@ fn merge(into: &mut ImportReport, from: ImportReport) {
     into.already_present += from.already_present;
     into.rejected.extend(from.rejected);
     into.unresolved.extend(from.unresolved);
+}
+
+/// Each contribution's [`Contribution::signature_is_valid`], worked out on every core at once: the
+/// strict Ed25519 check one at a time is most of a full open (task `7a3d17f979c3`). The graph then checks
+/// every rule in order with these answers, so the verdicts are those of checking one at a time.
+fn verify_signatures(contributions: &[Contribution]) -> HashMap<ContributionId, bool> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    if threads == 1 || contributions.len() < 64 {
+        return contributions.iter().map(|c| (c.id(), c.signature_is_valid())).collect();
+    }
+    let chunk = contributions.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let parts: Vec<_> = contributions
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || part.iter().map(|c| (c.id(), c.signature_is_valid())).collect::<Vec<_>>()))
+            .collect();
+        parts.into_iter().flat_map(|h| h.join().expect("verifying a signature doesn't panic")).collect()
+    })
 }
 
 /// Files the store reads whole other than objects (`ground.json`, agent entries, identity files) are
