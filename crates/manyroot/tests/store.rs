@@ -575,3 +575,55 @@ fn a_parallel_full_open_reports_the_first_damaged_object_in_listing_order() {
         Ok(_) => panic!("opened a damaged replica"),
     }
 }
+
+/// Security's note on PR #60: a bad signature put through the parallel path (64 or more objects to read
+/// and verify) is refused with the error the sequential path gives: the first refusal of a one-at-a-time
+/// `Graph::import` of the same objects, for a full open and for a trusting open's objects that the trusted
+/// set lacks.
+#[test]
+fn a_bad_signature_on_the_parallel_path_is_refused_as_the_sequential_path_refuses_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("g");
+    let mut s = Store::init(&dir, "t").expect("a Ground");
+    let who = s.create_identity("w").expect("a key");
+    for i in 0..300 {
+        s.contribute(&who, Body::Claim { statement: format!("c{i}"), tags: vec![] }).expect("adds");
+    }
+    let order = s.graph().topo_order();
+    let object = |id: &ContributionId| {
+        let hex = id.to_hex();
+        dir.join("objects").join(&hex[..2]).join(&hex[2..])
+    };
+    // The signature is the encoding's last field: flipping its last byte keeps the encoding canonical
+    // and the id, and breaks the signature. Three of them, among the later two hundred.
+    let bad: Vec<ContributionId> = [120, 180, 299].iter().map(|i| order[*i]).collect();
+    for id in &bad {
+        let mut bytes = std::fs::read(object(id)).expect("present");
+        *bytes.last_mut().expect("not empty") ^= 1;
+        let c = Contribution::decode(&bytes).expect("still decodes");
+        assert_eq!(c.id(), *id);
+        assert!(!c.signature_is_valid());
+        std::fs::write(object(id), &bytes).expect("written");
+    }
+    // The sequential oracle: every object, checked one at a time by a plain import.
+    let all: Vec<Contribution> = order
+        .iter()
+        .map(|id| Contribution::decode(&std::fs::read(object(id)).expect("present")).expect("decodes"))
+        .collect();
+    let report = Graph::new(s.info().ground).import(all.clone());
+    let (first, why) = report.rejected.first().expect("the sequential path refuses one").clone();
+    assert_eq!(why, RuleViolation::BadSignature);
+    assert!(bad.contains(&first));
+    let refused = |r: Result<Store, StoreError>, when: &str| match r {
+        Err(StoreError::Corrupt { path, reason }) => {
+            assert_eq!(path, object(&first), "{when}: the sequential path's first refusal");
+            assert_eq!(reason, RuleViolation::BadSignature.to_string(), "{when}");
+        }
+        Err(other) => panic!("{when}: expected Corrupt, got {other:?}"),
+        Ok(_) => panic!("{when}: opened a replica with a bad signature"),
+    };
+    refused(Store::open(&dir), "a full open");
+    // A trusting open that trusts the first hundred: the other two hundred are read and verified in
+    // parallel, and checked in the import's order.
+    refused(Store::open_trusting(&dir, all[..100].to_vec()), "a trusting open");
+}
