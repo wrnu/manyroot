@@ -76,7 +76,24 @@ scripts/bk claim "PR #<n> <branch> @ <sha>: <title>. Weave proposal <id>" --type
 | `metric` (plain tag `metrics`) | `week` (date of the Monday) | |
 | `note`, `question`, `answer`, `report`, `gotcha`, `preference`, `reference`, `process`, `misfire`, `plan` | none | |
 
-The team server judges `type:<name>` by its plain tag as well, so a scope forbidding `decision` forbids `type:decision`. `scripts/merge` and `scripts/weave-gate` read a claim typed exactly `pr` from its typed fields (refusing one whose fields don't conform, and treating any other type, `bracken.pr` included, as not a pr claim), and an untyped one from its statement, as before; `scripts/merge` reads an experiment typed `experiment` by its `expires` key, and makes its Ground reads in one `bracken batch`. `scripts/gate-replay` replays the last merges under an older ref's scripts and this checkout's and diffs every verdict (the manager's to run). `scripts/metrics` still reads statements.
+The team server judges `type:<name>` by its plain tag as well, so a scope forbidding `decision` forbids `type:decision`. `scripts/merge` and `scripts/weave-gate` read a claim typed exactly `pr` from its typed fields (refusing one whose fields don't conform, and treating any other type, `bracken.pr` included, as not a pr claim), and an untyped one from its statement, as before; `scripts/merge` reads an experiment typed `experiment` by its `expires` key, and makes its Ground reads in one `bracken batch`. `scripts/gate-replay` replays the last merges under an older ref's scripts and this checkout's and diffs every verdict (the manager's to run). `scripts/metrics` reads typed pr and experiment claims the same way.
+
+**Experiments and metrics** (task `8c9ad9bd4518` step 3, decision `ff456e4e2fcc`). An experiment is a claim typed `experiment`. `scripts/merge` fails (check `experiments`) unless every experiment AGENTS.md cites, in the tree the merge leaves, by any id prefix of 8 or more hex digits in any case (and every id on its `Running:` line), is current and unexpired or kept by a manager decision; a lapsed or malformed one cited nowhere is only named. It also fails when the experiments can't be read. The weekly metrics are a claim typed `metric`, written by `scripts/metrics --post` as the `runner` identity, whose key the team server holds; `--post` reads only as `runner`, pulling from the team server, and stops before any read if `runner` has no token. `escapes_14d` and `perf_claims_without_ab` are heuristic proxies (the script's header says how each matches). `runner`'s entry in the team server's `scopes.toml` (as `scripts/team-server`'s first scopes write it) forbids every typed shape but `metric`, which a unit test in `crates/bracken/src/signing.rs` holds it to:
+
+```toml
+[scope.runner]
+kinds = ["claim", "evidence"]
+forbidden_tags = ["pr", "finding", "triage", "task", "decision", "experiment", "note", "question", "answer", "report", "gotcha", "preference", "reference", "process", "misfire", "plan", "approval", "owner-review", "owner-ask", "weave-gate", "batch", "deferred"]
+```
+
+The first typed experiment, process idea `5cae9af16145`, retiring nothing (it adds no rule here); the manager writes it once this lands (`tests/scripts/metrics.rs` writes the same record in a throwaway Ground):
+
+```sh
+scripts/bk claim "Experiment (manager, <date>), adopting process idea 5cae9af16145.
+rule: any performance claim in a pr or report claim cites a back-to-back A/B of main's binary and the head on the same Grounds" \
+  --type experiment --attr metric=perf_claims_without_ab --attr baseline=14 --attr target=0 --attr expires=<date + 14 days> \
+  --refines 5cae9af16145 --as manager
+```
 
 ## Weave shadow (stages 1 and 2a)
 

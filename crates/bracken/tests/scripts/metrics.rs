@@ -148,3 +148,137 @@ fn metrics_counts_the_week_and_the_experiments_and_writes_nothing() {
     let empty: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(empty["prs_merged"] == 0 && empty["review_rounds_per_pr"].is_null(), "{empty}");
 }
+
+/// The two heuristic proxies and --post (task 8c9ad9bd4518 step 3, decision ff456e4e2fcc). escapes_14d: a
+/// confirmed finding naming two paths that PR #5 changed three days before counts once; one whose own pr claim
+/// is PR #5's doesn't, nor one never triaged; a revert today of a path #5 changed counts. perf_claims_without_ab:
+/// a report giving a time counts, one citing an A/B doesn't. The first typed experiment (process idea
+/// 5cae9af16145, as docs/development.md writes it) reads with its metric and lacks nothing. --post records the
+/// text as a claim typed metric as runner, and without a runner identity fails and writes nothing.
+#[test]
+fn metrics_counts_escapes_and_perf_claims_and_posts_as_runner() {
+    let metrics = repo_root().join("scripts/metrics");
+    let (_tmp, dir) = repo(&[("scripts/metrics", &metrics)], ".bracken/\n", |_| {});
+    let commit = |subject: &str, files: &[&str], days_ago: u64| {
+        for f in files {
+            put(&dir, f, subject);
+        }
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        let date = format!("@{} +0000", now - days_ago * 86400);
+        assert!(run(&dir, "git", &["add", "-A"]).status.success());
+        let out = command(&dir, "git", &["commit", "-qm", subject]).env("GIT_COMMITTER_DATE", &date).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    commit("Change a and b (#5)", &["src/a.rs", "src/b.rs"], 3);
+    commit("Revert \"Change a and b\"", &["src/a.rs"], 0);
+    bk(&dir, &["init", "--name", "metrics"]);
+    for who in ["manager", "builder", "reviewer"] {
+        bk(&dir, &["id", "new", who]);
+    }
+    let claim = |text: &str, tag: &str, who: &str| bk(&dir, &["claim", text, "--tag", tag, "--as", who]);
+    let own = claim("PR #5 ab @ 5555: change a and b", "pr", "builder");
+    let later = claim("PR #6 c @ 6666: something else", "pr", "builder");
+    let finding = |text: &str, on: &str, triage: Option<&str>| {
+        let id = claim(text, "finding", "reviewer");
+        bk(&dir, &["relate", &id, "contradicts", on, "--as", "reviewer"]);
+        if let Some(v) = triage {
+            bk(&dir, &["evidence", &id, v, "--method", "triage", "--as", "manager"]);
+        }
+    };
+    finding("src/a.rs:3 and src/b.rs:1 break it", &later, Some("pass"));
+    finding("src/a.rs:4 breaks it", &own, Some("pass"));
+    finding("src/b.rs:2 breaks it", &later, None);
+    claim("Report: the open took 12 s", "report", "builder");
+    claim("Report: 12 s, from a back-to-back A/B against main's binary", "report", "builder");
+    let idea = claim("Process idea: performance claims cite an A/B", "process", "builder");
+    let expires = date_from_now(14);
+    let first = bk(
+        &dir,
+        &[
+            "claim",
+            "Experiment (manager, today), adopting process idea 5cae9af16145.\nrule: any performance claim in a pr or report claim cites a back-to-back A/B of main's binary and the head on the same Grounds",
+            "--type",
+            "experiment",
+            "--attr",
+            "metric=perf_claims_without_ab",
+            "--attr",
+            "baseline=14",
+            "--attr",
+            "target=0",
+            "--attr",
+            &format!("expires={expires}"),
+            "--refines",
+            &idea,
+            "--as",
+            "manager",
+        ],
+    );
+
+    // An expires date that isn't a real day is one the experiment lacks, and stops nothing (finding
+    // 10febee32fff).
+    let bad = claim(
+        "Experiment (manager): bad date\nrule: x\nmetric: prs_merged\nbaseline: 1\ntarget: 2\nexpires: 2026-13-45",
+        "experiment",
+        "manager",
+    );
+
+    let today = date_from_now(7);
+    let out = run(&dir, "scripts/metrics", &["--today", &today, "--json"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let got: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let all = got["experiments"].as_array().unwrap();
+    let malformed = all.iter().find(|e| e["id"] == bad[..12]).unwrap_or_else(|| panic!("{got}"));
+    assert_eq!(malformed["missing"], serde_json::json!(["a real expires date"]), "{got}");
+    assert_eq!(got["escapes_14d"], 2, "{got}");
+    assert_eq!(got["perf_claims_without_ab"], 1, "{got}");
+    let all = got["experiments"].as_array().unwrap();
+    let state = all.iter().find(|e| e["id"] == first[..12]).unwrap_or_else(|| panic!("{got}"));
+    assert_eq!(state["metric"], "perf_claims_without_ab", "{got}");
+    assert_eq!(state["missing"], serde_json::json!([]), "{got}");
+    assert_eq!(state["days_left"], 7, "{got}");
+
+    let before = bk(&dir, &["log", "--json"]);
+    let out = run(&dir, "scripts/metrics", &["--today", &today, "--post", "--json"]);
+    assert!(!out.status.success(), "--post with --json");
+    // With no runner identity, --post fails before it reads or prints anything (finding 63d236b05b66).
+    let out = run(&dir, "scripts/metrics", &["--today", &today, "--post"]);
+    assert!(!out.status.success() && out.stdout.is_empty(), "posted without a runner: {}", text(&out));
+    assert!(text(&out).contains("nothing was read or written"), "{}", text(&out));
+    assert_eq!(bk(&dir, &["log", "--json"]), before, "a failed --post wrote to the Ground");
+    // With a team server, the caller's token is never used: the manager's own token there, and none of
+    // runner's, fails before any read; with runner's, every read must pull as runner, so an unreachable
+    // server fails it too, printing nothing.
+    let team = _tmp.path().join("team");
+    std::fs::create_dir_all(team.join("tokens")).unwrap();
+    std::fs::write(team.join("url"), "http://127.0.0.1:9").unwrap();
+    std::fs::write(team.join("tokens/manager"), "not-a-token").unwrap();
+    std::fs::write(dir.join(".bracken-team"), team.to_str().unwrap()).unwrap();
+    let as_manager = |dir: &Path| {
+        command(dir, "scripts/metrics", &["--today", &today, "--post"])
+            .env("BRACKEN_AGENT", "manager")
+            .output()
+            .unwrap()
+    };
+    let out = as_manager(&dir);
+    assert!(!out.status.success() && out.stdout.is_empty(), "{}", text(&out));
+    assert!(text(&out).contains("runner has no team token, so nothing was read or written"), "{}", text(&out));
+    std::fs::write(team.join("tokens/runner"), "not-a-token").unwrap();
+    let out = as_manager(&dir);
+    assert!(!out.status.success() && out.stdout.is_empty(), "{}", text(&out));
+    assert!(text(&out).contains("couldn't read the Ground"), "{}", text(&out));
+    std::fs::remove_file(dir.join(".bracken-team")).unwrap();
+    assert_eq!(bk(&dir, &["log", "--json"]), before, "a failed --post wrote to the Ground");
+    bk(&dir, &["id", "new", "runner"]);
+    let out = run(&dir, "scripts/metrics", &["--today", &today, "--post"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let log: serde_json::Value = serde_json::from_str(&bk(&dir, &["log", "--json"])).unwrap();
+    let posted: Vec<_> = log.as_array().unwrap().iter().filter(|c| c["typed"]["type"] == "metric").collect();
+    assert_eq!(posted.len(), 1, "{log}");
+    let c = posted[0];
+    assert_eq!(c["author_name"], "runner", "{c}");
+    assert_eq!(c["typed"]["problems"], serde_json::json!([]), "{c}");
+    assert_eq!(c["typed"]["data"]["escapes_14d"], "2", "{c}");
+    assert!(c["typed"]["data"]["week"].as_str().is_some_and(|w| w.len() == 10), "{c}");
+    assert!(c["body"]["statement"].as_str().unwrap().starts_with("Metrics, week of "), "{c}");
+}

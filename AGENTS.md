@@ -83,8 +83,8 @@ A head changing `research/` (a sibling workspace `cargo test --workspace` never 
 
 ## 6. Process changes and experiments
 
-- A process change is a claim `--tag experiment` with lines `rule:`, `metric:` (a key `scripts/metrics --json` prints), `baseline:`, `target:` and `expires: <YYYY-MM-DD>` (default 14 days, at most 28). When it expires it lapses (`scripts/merge` names it) unless a manager `decision`, citing the metrics that show the target met, `supports` it.
+- A process change is a claim `--type experiment`: a `rule:` line, `--attr` `metric=` (a key `scripts/metrics --json` prints), `baseline=`, `target=`, `expires=<YYYY-MM-DD>` (at most 28 days). Past it, it lapses unless a manager `decision`, citing the metrics that show the target met, `supports` it; `scripts/merge` fails while a lapsed one is cited here.
 - **One rule in, one rule out:** an experiment that adds a rule names the rule it retires, and this file stays under 12 KB (a test checks).
-- Weekly, the manager records `scripts/metrics`' output: `scripts/bk claim "$(scripts/metrics)" --tag metrics --as <you>`.
+- Weekly, the manager runs `scripts/metrics --post`, which records them as `runner`.
 - Anyone proposes with a `process` claim; the manager decides.
 - Running: `08fc19239548` (builders record no local fast nextest pass; metric `builder_pass_minutes`, until 2026-12-03).

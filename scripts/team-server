@@ -187,6 +187,14 @@ first_scopes() {
 kinds = ["claim", "relation", "evidence", "retract"]
 relations = ["supports", "contradicts", "depends_on", "refines", "supersedes", "implements", "tests"]
 forbidden_tags = ["approval", "decision", "task", "owner-review", "weave-gate"]
+
+# The runner (decision ff456e4e2fcc): the weekly typed metric claims, through scripts/metrics --post, and
+# experiment results as evidence. No tags allow-list, as a metric claim carries key:value tags; instead every
+# typed shape but metric is forbidden, with the gate's other tags (finding baeb854c4b62). A unit test in
+# crates/bracken/src/typed.rs fails while a shape is missing here, so a new shape is forbidden by default.
+[scope.runner]
+kinds = ["claim", "evidence"]
+forbidden_tags = ["pr", "finding", "triage", "task", "decision", "experiment", "note", "question", "answer", "report", "gotcha", "preference", "reference", "process", "misfire", "plan", "approval", "owner-review", "owner-ask", "weave-gate", "batch", "deferred"]
 TOML
 }
 
