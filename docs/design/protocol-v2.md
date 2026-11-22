@@ -105,7 +105,7 @@ content = {
 body = claim / artifact / relation / evidence / retract
 
 claim    = { 0: 0, ? 1: type, 2: text,                    ; statement
-             ? 3: [* tag], ? 4: refs, ? 5: data }
+             ? 3: [+ tag], ? 4: refs, ? 5: data }
 artifact = { 0: 1, ? 1: type, 2: text,                    ; name
              6: tstr,                                     ; media_type
              (7: bstr // 14: payload),                    ; inline content, or a payload
@@ -122,7 +122,7 @@ evidence = { 0: 3, ? 1: type, 9: contribution-id,         ; target
 retract  = { 0: 4, 9: contribution-id, 2: tstr }          ; target, reason
 
 payload  = { 0: bstr .size 32,                            ; hash: BLAKE3 of the payload bytes
-             1: uint }                                    ; size in bytes
+             1: uint .le 16777216 }                       ; size in bytes, at most 16 MiB
 
 rel-kind = 0..7  ; supports, contradicts, depends_on, refines, supersedes, implements, tests, relates
 verdict  = 0..2  ; pass, fail, inconclusive
@@ -130,9 +130,9 @@ text     = tstr  ; not blank (protocol.md, Validity rule 8)
 type     = tstr .regexp "[a-z][a-z0-9-]*(\\.[a-z0-9-]+)+(@[1-9][0-9]*)?"
                  ; "bracken.finding", "ledger.entry@2"; at most 128 bytes
 tag      = tstr .regexp "[a-z0-9][a-z0-9._-]*"            ; at most 64 bytes; no commas, spaces or colons
-refs     = [+ [role, contribution-id]]                    ; strictly ascending by (role, id)
+refs     = [+ [role, contribution-id]]                    ; strictly ascending, ordered as in 3.3
 role     = tstr .regexp "[a-z][a-z0-9_-]*"                ; at most 64 bytes
-data     = data-value
+data     = { + data-key => data-value }                   ; a non-empty map at the top
 data-value = int / bstr / tstr / bool / null / decimal
            / [* data-value] / { * data-key => data-value }
 data-key = uint / tstr
@@ -145,15 +145,27 @@ Retract carries no `type`, `refs` or `data`: it means exactly one thing.
 
 - **Payloads.** Artifact content is inline (`7`) or out of line (`14`),
   exactly one of them (section 4).
-- **`refs` non-empty when present**, and roles have a syntax rather than
-  only "non-blank", so a role can't be confused with a tag or a type.
+- **One encoding for "none".** `tags`, `refs` and `data` are absent when
+  empty, never an empty array or map, so a contribution without them has
+  one encoding: `[+ tag]`, `[+ ...]` and a non-empty top-level map. (A
+  `[* tag]` would let a claim without tags be written two ways, with two
+  ids.)
+- **The order of `refs`** is CDE's order: pairs strictly ascending by the
+  bytewise comparison of each `[role, id]` pair's CDE encoding. Since a
+  text string's encoding starts with its length, a shorter role sorts
+  before a longer one, whatever their letters (roles `a`, `b`, `ab` sort
+  `a`, `b`, `ab`), and pairs with the same role sort by id. A vector pins
+  this (section 8). Roles have a syntax rather than only "non-blank", so a
+  role can't be confused with a tag or a type.
 - **`data` is restricted.** Report A had `data = any`. Floats are left out
   (NaN payloads and `-0.0` have several encodings, and CDE's float rules
   are where independent implementations most often differ); exact
   quantities use integers or the decimal tag 4, which a ledger needs
   anyway. No other tags, no `undefined`, no simple values but booleans and
-  null. Map keys are integers or text. Nesting is at most 16 levels deep.
-  Each of these is a proposal for the freeze (section 8).
+  null. Map keys are unsigned integers or text, as in the CDDL (no
+  negative or other keys). Nesting is at most 16 levels deep, the top-level
+  map counting as level 1. Each of these is a proposal for the freeze
+  (section 9).
 - **Length bounds** on `type`, tags and roles, so an index key is bounded.
 - **The type version** is `@1` and up, never `@0` or a leading zero, so one
   version has one spelling.
@@ -186,9 +198,17 @@ bytes, 32 bytes, the id algorithm: the agility invariant covers it).
 - **A blob is checked on arrival.** A replica stores or serves a blob only
   if its BLAKE3 equals `hash` and its length equals `size`; anything else
   is refused as a blob, which never affects any contribution.
-- **Size.** The record keeps v1's 16 MiB limit. A payload in v2 is also at
-  most 16 MiB, so one blob always fits a sync message; chunked payloads for
-  larger content are an open question (section 8).
+- **Size.** The record keeps v1's 16 MiB limit. A payload's `size` is at
+  most 16 MiB too, and that is a validity rule (5.1, rule 9), so no valid
+  record can make a replica expect a larger blob. Payloads over 16 MiB are
+  an open question (section 9).
+- **Blob transfer doesn't depend on `batch_bytes`.** A blob travels in
+  chunks of at most 1 MiB, and a chunk message always fits a peer's message
+  limit, which is never under a full id list, 65 536 × 34 + 64 bytes
+  (protocol.md, Sync), about 2.1 MiB. So every replica can receive every
+  valid payload, however small its `batch_bytes`. The receiver knows the
+  size from the record, takes chunks in order, refuses a chunk past `size`,
+  and checks the hash once the last chunk arrives.
 - **Inline or out of line** is the writer's choice. A Bracken default might
   put content over 64 KiB out of line. Content that may ever need erasure
   must be out of line from the start (4.3).
@@ -203,15 +223,29 @@ stay valid and replicate as before.
   `["erases", <artifact id>]` (so the artifact is a parent) and a statement
   of the reason. The `manyroot.` namespace is reserved for types this
   specification defines.
-- **Who counts.** An erase request by the artifact's own author always
-  counts. Who else may erase (a data-protection steward, say) is the
-  Ground's policy, like acceptance: it never decides validity.
-- **What a conforming replica does** with a request that counts: deletes
-  the blob, stops serving it, and refuses to store it again while the
-  request stands. Reads show the artifact with "payload erased" and its
-  hash and size. If the request is retracted, replicas may accept the
-  bytes again from anyone who still holds them; nothing obliges anyone to
-  supply them.
+- **Who counts.** Only the artifact's own author: a request by anyone else
+  counts for nothing, under every policy. Erasure by a steward is an open
+  question (section 9), not part of this design.
+- **It acts on one artifact, not on a hash.** Blobs are stored by hash, and
+  two artifacts may commit to the same hash (the same public file, or a
+  copy). An erase request erases *that artifact's* payload: the artifact
+  reads "payload erased" with its hash and size, and the replica no longer
+  serves the bytes for it. The replica deletes the blob and refuses to
+  store it again only once **every** non-retracted artifact it holds that
+  commits to that hash has an erase request by its own author. While any
+  other artifact commits to the hash without one, the bytes stay stored
+  and served through that artifact. So nobody can erase bytes another
+  author still publishes.
+- **The cost of that rule.** Anyone who knows a hash can write an artifact
+  committing to it, and so keep the bytes served after their author erased
+  them. That matters only if they can get the bytes: with a random nonce in
+  the bytes (4.3) the hash can't be guessed back, so only someone who
+  already held the bytes can serve them, and a copy they hold can't be
+  recalled anyway. Erasable data without a nonce has no such protection,
+  which is why 4.3 asks for one.
+- **Retraction.** If the request is retracted, the artifact's payload is no
+  longer erased: replicas may accept the bytes again from anyone who still
+  holds them, and nothing obliges anyone to supply them.
 - **Acceptance is unchanged.** Erasure changes no status: the artifact,
   its evidence and its relations read as before. A policy may of course
   decide that evidence over erased bytes can no longer be re-checked.
@@ -241,7 +275,7 @@ These limits belong in front of any domain that adopts it.
   bytes inside the payload bytes (for example, a media type whose format
   has a nonce field), so the hash reveals nothing once the bytes are gone.
   Whether the protocol should frame every payload with a salt is an open
-  question (section 8): it would stop dedup of public content by hash.
+  question (section 9): it would stop dedup of public content by hash.
 - **Not legal advice.** Whether this meets a given deletion right is for
   the domain's own counsel.
 
@@ -267,9 +301,11 @@ contribution is validated by v1's rules, unchanged.
 7. A retract's target has the same `author`.
 8. A claim's `statement`, an artifact's `name` and an evidence's `method`
    are not blank, as in v1 rule 8 (the same 25 White_Space characters).
-9. `type`, tags and roles match their syntax and length bounds; `refs` are
-   strictly ascending by `(role, id)`; `data` keeps to 3.3's kinds and
-   depth; an artifact has exactly one of inline content and a payload.
+9. `type`, tags and roles match their syntax and length bounds; `tags`,
+   `refs` and `data` are absent rather than empty; `refs` are strictly
+   ascending in 3.3's order; `data` is a map and keeps to 3.3's kinds, keys
+   and depth; an artifact has exactly one of inline content and a payload,
+   and a payload's `size` is at most 16 MiB.
 
 Every rule still depends only on the contribution and its parents. Either
 version may have parents of either version: a v2 contribution usually has
@@ -318,11 +354,25 @@ something refuses it rather than misreading it.
    that readers are given as local configuration (weave-marker.md, option
    A). The opt-in uses that model: it counts only when signed by the root
    identity the reader is configured with. Making the root part of the
-   Ground itself is an open question (section 8).
-3. **Writers emit v2 only after an opt-in that counts.** This is a writer
-   rule, not validity: a v2 replica accepts a valid v2 contribution whether
-   or not the Ground opted in, so validity still depends only on the
-   contribution and its parents.
+   Ground itself is an open question (section 9).
+3. **v2 replicas admit v2 only after the opt-in.** A v2 replica stores a v2
+   contribution only if an opt-in that counts is in its ancestry; otherwise
+   it refuses it, listed in `rejected` like any refused contribution
+   (protocol.md, Sync), and nothing after it can be added either, since its
+   parent is missing. A replica configured with no root admits no v2 at
+   all. Without this rule one v2 contribution, by anyone, would carry every
+   later contribution that lists it as a parent out of v1 replicas' reach
+   (6.2), cutting them off from the Ground's new work. Writers emit v2 only
+   after the opt-in too.
+   This is admission, not validity: it depends on the root the reader is
+   configured with, so by protocol.md's invariant it can't be a validity
+   rule, and a v2 contribution stays valid. Checking the ancestry, rather
+   than whether the replica happens to hold an opt-in, gives every replica
+   with the same root the same answer whatever order contributions arrive
+   in. Retracting an opt-in doesn't turn v2 off again: contributions
+   already admitted stay, and whether a retraction should stop new ones is
+   an open question (section 9). If the root became part of the Ground
+   (open question 9), this rule could move into validity.
 
 ### 6.2 Mixed sessions
 
@@ -339,9 +389,10 @@ something refuses it rather than misreading it.
   by its first bytes: a v1 contribution is a map whose first key is the
   text `content`, a v2 one a map whose first key is 0.
 - **Payloads** travel separately from records, between v2 replicas only,
-  with two messages under the `v2` feature: a request for blobs by hash, and
-  a reply carrying one blob. Their exact shape is for the freeze. Records
-  sync without their blobs, and a replica may fetch blobs lazily.
+  with two messages under the `v2` feature: a request for a blob by hash,
+  and replies carrying it in chunks of at most 1 MiB (4.1), whatever the
+  peers' `batch_bytes`. Their exact shape is for the freeze. Records sync
+  without their blobs, and a replica may fetch blobs lazily.
 
 ### 6.3 What a v1 replica actually does with a v2 contribution
 
@@ -365,7 +416,7 @@ signal** to a v1 replica when a sender ignores that rule is the session
 error (or the import error, or "not a bundle" for `MRBUNDL2`). Nothing is
 ever misread. A tolerant v1 reader that listed unknown-version entries in
 `rejected` and went on is an open question, not part of this design: it
-would change v1's behaviour (section 8).
+would change v1's behaviour (section 9).
 
 ## 7. How the typed v1 conventions map onto v2
 
@@ -399,16 +450,20 @@ Pinned in `protocol_guard.rs` next to v1's, which never change; a
 - **Golden.** One v2 contribution of every body kind, every relation kind
   (`relates` included) and every verdict (`inconclusive` included); a
   typed claim with refs and `data` (every data kind: int, decimal, bytes,
-  text, bool, null, array, map with uint and text keys); an artifact
+  text, bool, null, array, map with uint and text keys); refs whose roles
+  differ in length (`a`, `b`, `ab`), pinning their order; an artifact
   inline and one with a payload; evidence with `method_ref`. Encoding, id
   and signature in hex, as in v1.
 - **Negative.** Non-CDE forms (a non-shortest integer or length, unsorted
   map keys, a duplicate key, indefinite length, trailing bytes); an unknown
   key in content, in each body and in a payload; a float, an unknown tag,
-  `undefined` and depth 17 in `data`; refs unsorted, duplicated, empty, or
+  `undefined`, a negative-integer map key, depth 17, an empty top-level map
+  and a top-level value that isn't a map in `data`; an empty `tags` array; refs
+  unsorted (`ab` before `b`), duplicated, empty, or
   not in parents; `method_ref` not in parents, and equal to the target;
   bad and over-long `type`, tag and role; an artifact with both inline
-  content and a payload, and with neither; a payload hash of 31 bytes;
+  content and a payload, and with neither; a payload hash of 31 bytes, and
+  a payload `size` of 16 MiB + 1;
   a v1 signing context on a v2 contribution and the v2 context on a v1
   one; `protocol: 3`; a v2-encoded contribution saying `protocol: 1`; a
   retract with a `type`; and the size boundary at 16 MiB.
@@ -422,10 +477,19 @@ Pinned in `protocol_guard.rs` next to v1's, which never change; a
   request and reply messages; a mixed session in which the v1 side
   receives only the all-v1 part.
 - **Payloads and erasure.** A payload artifact valid with its blob absent;
-  a blob of the wrong hash or size refused without touching the record; an
-  author's erase request removing the blob and refusing it again; another
-  author's request not counting under the default; a retracted request
+  a blob of the wrong hash or size refused without touching the record; a
+  16 MiB blob reaching a peer with the smallest `batch_bytes` (44) in
+  chunks; an author's erase request removing the blob and refusing it
+  again; another author's request on that artifact counting for nothing;
+  two artifacts by different authors committing to one hash, where one
+  author's request erases only their artifact's payload and the bytes stay
+  served for the other, until both have erased; a retracted request
   letting the blob back.
+- **Opt-in.** A v2 contribution with no opt-in in its ancestry refused by a
+  v2 replica and listed in `rejected`, and its child refused for a missing
+  parent; an opt-in signed by a key other than the configured root not
+  counting; a replica with no configured root refusing every v2
+  contribution.
 - **Reference policy.** `inconclusive` never accepting or rejecting.
 
 ## 9. Open questions for the non-code pilot and the freeze
@@ -449,17 +513,19 @@ answer the first group; the rest are for the freeze.
    the format, or is an index over `(type, key fields)` enough?
 
 **For the freeze:**
-7. Payloads over 16 MiB: chunking (and FastCDC) in v2, or later?
+7. Payloads over 16 MiB (FastCDC, trees of chunks) in v2, or later?
 8. A protocol salt framing for payloads (4.3), against dedup by hash.
 9. The Ground's root in the core (6.1), or kept as reader configuration.
-10. Who besides the author may erase, and whether the default should be
-    configurable per Ground.
+10. Whether anyone besides the author (a data-protection steward) should
+    ever be able to erase, and how without reopening the third-party
+    erasure that 4.2 rules out.
 11. A tolerant v1 reader that lists unknown-version entries in `rejected`
     and imports the rest (6.3). It would change v1's behaviour, so it needs
     its own protocol review and the owner; not decided here.
 12. Whether the sync bookmark's replica-instance feature (synthesis G6)
     and the payload messages ship with v2 or separately.
-13. Type namespaces: is authority over a namespace purely a rulebook
+13. Whether retracting the opt-in should stop new v2 contributions (6.1).
+14. Type namespaces: is authority over a namespace purely a rulebook
     matter, as report A proposes, or does `manyroot.` need anything more
     than this document's reservation?
 
