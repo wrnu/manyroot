@@ -24,7 +24,7 @@ serde_json.workspace = true
 toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1", features = ["event"] }
+rustix = { version = "1.1", features = ["event", "fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true

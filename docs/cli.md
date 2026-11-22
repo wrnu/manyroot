@@ -98,10 +98,17 @@ Every read and write opens the replica through `cache/snapshot` in it (`.bracken
 contributions this replica's readers have already verified, in one file (owner decision `96e282819607`).
 A read lists `objects/`, adds the snapshot's contributions without reading their objects or checking
 them again, and reads and checks only the objects the snapshot lacks, every validity rule as a full open
-checks them (protocol.md, Validity). A command that writes rewrites the snapshot as it ends, so the
-reads after it find nothing new and write nothing; a read rewrites it only when objects arrived another
+checks them (protocol.md, Validity). A command that writes adds to the snapshot as it ends, so the
+reads after it find nothing new and write nothing; a read adds to it only when objects arrived another
 way, such as a git pull. At this repository's size that skips the signature checks and per-file reads
 that are most of a read's cost.
+
+- **Append-only.** The snapshot is a header and then segments, each a batch of contributions with its
+  own checksum. A command that added contributions appends one segment holding just those, so a write
+  costs about its own object's bytes, not the whole Ground's. When the segments after the first outgrow
+  it (and 1 MiB), the snapshot is rewritten as one segment. A segment that doesn't read back (a torn
+  append) ends the read there; the contributions after it are read from their objects and checked, and
+  the snapshot is rewritten whole. Repeats from two commands appending at once are dropped.
 
 - **The trade.** An object the snapshot holds isn't read again, so if its bytes are overwritten on disk
   later, or made unreadable, a cached read doesn't notice, where a full check refuses the replica. A
@@ -117,8 +124,9 @@ that are most of a read's cost.
   snapshot; it fails, as a full check does, if any object is damaged or overwritten, and also if an
   `agents/` entry could misname an agent (one not named for its own valid name, or a second name for a key).
 - **On disk.** `cache/` holds a `.gitignore` of `*`, so git never commits it, and nothing is written
-  outside it. The snapshot goes to a temporary file of its own, created fresh (never through a link),
-  then renamed into place. A `cache` that isn't a real directory is never written to. `bracken view`
+  outside it. A whole snapshot goes to a temporary file of its own, created fresh (never through a link),
+  then renamed into place; a segment is appended with one write to the snapshot opened without
+  following a link, and only if it is a regular file. A `cache` that isn't a real directory is never written to. `bracken view`
   reads through the snapshot but never writes it. The snapshot is never synced: each replica builds its
   own.
 
