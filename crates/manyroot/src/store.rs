@@ -143,8 +143,40 @@ impl Store {
     /// file, of another Ground, listed twice, or before one of its parents. So does a trusted parent that's missing.
     /// The caller then opens with [`Store::open`], which reports what's really wrong, if anything.
     pub fn open_trusting(dir: &Path, trusted: Vec<Contribution>) -> Result<Store, StoreError> {
+        Self::open_trusting_with(dir, |_, _| trusted)
+    }
+
+    /// [`Store::open_trusting`], with the trusted contributions from `load`, called once `objects/` is
+    /// listed and before any object is read. `load` gets the Ground's id and whether an id names an object
+    /// listed in `objects/` (in its canonical spelling, whatever its file type), so a caller reading its
+    /// own cache can stop at the first contribution the replica doesn't hold, bounding what it reads by
+    /// what `objects/` holds, without listing `objects/` a second time. Everything [`Store::open_trusting`]
+    /// says about the trusted contributions holds for what `load` returns; an empty list is a full open.
+    pub fn open_trusting_with(
+        dir: &Path,
+        load: impl FnOnce(GroundId, &dyn Fn(&ContributionId) -> bool) -> Vec<Contribution>,
+    ) -> Result<Store, StoreError> {
         let info = read_info(dir)?;
         let (objects, files) = object_files(dir)?;
+        // Name every object by the id its file name spells, only in its canonical (lowercase) spelling, as
+        // the full open's check of each path against its content does. A misnamed file matters only to a
+        // trusting open, below; a full open refuses it as it reads it.
+        let mut on_disk: HashMap<ContributionId, (PathBuf, bool)> = HashMap::new();
+        let mut misnamed = None;
+        for (path, regular) in &files {
+            let shard = path.parent().and_then(Path::file_name).and_then(|n| n.to_str()).unwrap_or_default();
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let id = format!("{shard}{name}").parse::<ContributionId>().ok().filter(|id| object_path(dir, id) == *path);
+            match id {
+                Some(id) => {
+                    on_disk.insert(id, (path.clone(), *regular));
+                }
+                None => {
+                    misnamed.get_or_insert_with(|| path.clone());
+                }
+            }
+        }
+        let trusted = load(info.ground, &|id| on_disk.contains_key(id));
         let mut graph = Graph::new(info.ground);
         let mut batch = Vec::new();
         if trusted.is_empty() {
@@ -152,18 +184,8 @@ impl Store {
                 batch.push(read_regular_object(objects.as_ref(), dir, path, regular)?);
             }
         } else {
-            // Name every object by the id its file name spells, only in its canonical (lowercase)
-            // spelling, as the full open's check of each path against its content does.
-            let mut on_disk: HashMap<ContributionId, (PathBuf, bool)> = HashMap::new();
-            for (path, regular) in files {
-                let shard = path.parent().and_then(Path::file_name).and_then(|n| n.to_str()).unwrap_or_default();
-                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-                let id =
-                    format!("{shard}{name}").parse::<ContributionId>().ok().filter(|id| object_path(dir, id) == path);
-                let Some(id) = id else {
-                    return Err(StoreError::Corrupt { path, reason: "not named by a contribution id".into() });
-                };
-                on_disk.insert(id, (path, regular));
+            if let Some(path) = misnamed {
+                return Err(StoreError::Corrupt { path, reason: "not named by a contribution id".into() });
             }
             let mut seen: HashSet<ContributionId> = HashSet::new();
             let mut pool: HashMap<ContributionId, (Contribution, bool)> = HashMap::new();
