@@ -28,6 +28,8 @@ The classes and the risky ones are defined in [development.md](development.md). 
 
 **After merging task 3b96803d923c** (`scripts/weave-propose` reads gh's JSON apart from its stderr, and `scripts/weave-gate` reads `weave green`'s the same way): no binary upgrade. Builders run the main checkout's copy, so the fix takes effect when the main checkout is on the merge. Until then, with gh 2.105.0 or later, `weave-propose` refuses every PR as a fork (gotcha `d532678d900c`): say so in the `pr` claim, and the merge falls back to the import. `weave-gate` still refuses when `weave green` warns on stderr that a record doesn't decode.
 
+**After merging task fdbc081f07db** (protocol.md reworded, and docs/design/protocol-v2.md added; owner decision `ea6f5419a31e`): no migration, no binary upgrade, no format change. protocol.md gains text only: the invariant that project rules never affect validity, Acceptance named as the reference policy, and the two agility invariants. No rule's meaning, no byte, id, signing context, golden vector or fixture changes, and v1 Grounds read exactly as before. Protocol v2 is a design on paper; its freeze needs the owner's own approval and its own migration note.
+
 ## Needs the owner's go
 
 Only these need the owner's own approval, which the owner signs with `scripts/owner-approve` in a terminal (AGENTS.md, section 1; task `9b65c13e9d66`, owner decision `c8bbb2886be3`):
