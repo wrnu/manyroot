@@ -203,6 +203,117 @@ fn the_shim_and_workers_refuse_to_start_with_any_environment() {
     assert!(String::from_utf8_lossy(&worker.stderr).contains("empty environment"));
 }
 
+/// The shim ends once the driver closes its side, though the harness still holds the shim's standard input open
+/// waiting for a reply: so a turn the driver stops serving at its deadline ends for the harness too, instead of
+/// leaving it, and the driver waiting on it, for ever (the hang in the manager's run, evidence `edc0b3fff53f`).
+#[test]
+fn the_shim_ends_when_the_driver_closes_though_its_input_stays_open() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let socket = dir.path().join("s.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).expect("a socket");
+    let mut shim = Command::new(bin())
+        .args(["shim", "--socket"])
+        .arg(&socket)
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("the shim starts");
+    let _input = shim.stdin.take().expect("its input, kept open");
+    let (conn, _) = listener.accept().expect("the shim connects");
+    drop(conn);
+    let started = std::time::Instant::now();
+    while shim.try_wait().expect("its status").is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            let _ = shim.kill();
+            panic!("the shim kept running after the driver closed its side");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// A turn past its time limit ends with a turn error, through the shim, and the run goes on to its end: the driver
+/// stops serving it, without a last reply, and nothing waits for one for ever. The limit is far shorter than any
+/// turn, so the turn always passes it, whether before its connection or during its calls; the shim's own test above
+/// pins the reply case.
+#[test]
+fn a_turn_past_its_limit_fails_instead_of_hanging() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let cfg = RunConfig {
+        root: dir.path().join("run"),
+        mode: "bracken",
+        agents: 1,
+        turns: 1,
+        worker_bin: bin(),
+        bracken: bracken(),
+        git: git_binary().expect("git"),
+        trace: false,
+        calls_per_turn: CALLS_PER_TURN,
+        turn_limit: std::time::Duration::from_millis(20),
+        plan: PlanInputs::default(),
+        sandbox: false,
+    };
+    let (done, ended) = std::sync::mpsc::channel();
+    let events_at = cfg.root.join("events.jsonl");
+    std::thread::spawn(move || {
+        let mock = MockBackend { task: Task::Phase1, seed: 3, shim: Some(bin()), ..MockBackend::default() };
+        let _ = done.send(run(&cfg, &mock).map(|_| ()));
+    });
+    let _ = ended.recv_timeout(std::time::Duration::from_secs(300)).expect("the run ended, with a stuck turn stopped");
+    let log = events(&events_at);
+    assert!(
+        log.iter().any(|e| e["event"] == "turn_error" && e["data"]["step"] == "play"),
+        "the turn past its limit failed: {log:?}"
+    );
+}
+
+/// Connects only once its turn's deadline has passed, and keeps what the connection came to.
+struct Late {
+    limit: std::time::Duration,
+    tried: std::sync::Mutex<Vec<Result<(), String>>>,
+}
+
+impl Backend for Late {
+    fn turn(&self, _agent: usize, _name: &str, _turn: u32, socket: &Path) -> Result<(), String> {
+        let started = std::time::Instant::now();
+        // Past the deadline for sure, then until the driver has given the socket up, for at most 10 s: a driver
+        // that keeps it until the player ends never does, and this connects into its backlog then.
+        std::thread::sleep(2 * self.limit);
+        while socket.exists() && started.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let tried = Client::connect(socket, None).map(|_| ());
+        self.tried.lock().expect("lock").push(tried.clone());
+        tried
+    }
+}
+
+/// A client that comes after its turn's deadline is refused at once: the driver gives its socket up when it stops
+/// waiting for a connection, before it waits for the player, so a late connection never waits unaccepted for a
+/// reply (finding dff42e94c7bb). The driver stops waiting at its deadline, so the client always comes late.
+#[test]
+fn a_client_after_the_turns_deadline_is_refused_at_once() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let limit = std::time::Duration::from_millis(50);
+    let cfg = RunConfig { turn_limit: limit, ..config(dir.path(), 1, 1) };
+    let backend = std::sync::Arc::new(Late { limit, tried: Default::default() });
+    let (done, ended) = std::sync::mpsc::channel();
+    let events_at = cfg.root.join("events.jsonl");
+    let late = backend.clone();
+    let started = std::time::Instant::now();
+    std::thread::spawn(move || {
+        let _ = done.send(run(&cfg, &*late).map(|_| ()));
+    });
+    let _ = ended.recv_timeout(std::time::Duration::from_secs(60)).expect("the run ended, the late client refused");
+    let tried = backend.tried.lock().expect("lock").clone();
+    assert!(matches!(tried.as_slice(), [Err(_)]), "the late connection was refused: {tried:?}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(60), "at once, not after a reply's wait");
+    let log = events(&events_at);
+    let errors: Vec<&Value> = log.iter().filter(|e| e["event"] == "turn_error").collect();
+    assert!(matches!(errors.as_slice(), [e] if e["data"]["step"] == "play"), "the turn failed: {errors:?}");
+}
+
 #[test]
 fn a_run_refuses_a_directory_that_exists() {
     let dir = tempfile::tempdir().expect("a temp dir");

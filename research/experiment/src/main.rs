@@ -17,7 +17,7 @@ use clap::{CommandFactory, Parser, Subcommand};
 
 use bracken_experiment::backend::{Caps, ModeTokenCap, RUN_TIME_CAP, RUN_TOKEN_CAP};
 use bracken_experiment::bracken_mode::AcceptRule;
-use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routing};
+use bracken_experiment::claude::{ClaudeBackend, ClaudeConfig, Expect, Pin, Routing, SignIn, Subscription};
 use bracken_experiment::driver::{
     CALLS_PER_TURN, ResultLimit, RunConfig, TURN_LIMIT, check_socket_room, git_binary, harness_tools, run,
 };
@@ -129,6 +129,20 @@ enum Cmd {
         /// and Pi with anthropic, send their model calls there, with its token.
         #[arg(long)]
         settings: Option<PathBuf>,
+        /// Claude Code: sign in with the owner's subscription in place of a gateway's --settings. A file holding
+        /// only the long-lived token `claude setup-token` prints, readable by its owner alone. It is read once,
+        /// into memory, and given to Claude Code in its environment alone; the plan records that a subscription
+        /// signed in, never the token.
+        #[arg(long, conflicts_with = "settings")]
+        claude_token_file: Option<PathBuf>,
+        /// Claude Code: the effort asked for [default: medium]. The plan records it.
+        #[arg(long, value_parser = bracken_experiment::claude::EFFORTS)]
+        effort: Option<String>,
+        /// Claude Code: its own stop for a turn (--max-budget-usd), on its API-equivalent estimate [default: 1
+        /// through a gateway; none with a subscription, where the token, time and call caps bind]. The plan
+        /// records it with the caps.
+        #[arg(long, value_name = "USD")]
+        turn_budget_usd: Option<f64>,
         /// Tests only: a system prompt file in place of the reviewed prompts built into the binary.
         #[arg(long)]
         prompt_file: Option<PathBuf>,
@@ -278,6 +292,9 @@ fn main() {
             pi_auth,
             pi_thinking,
             settings,
+            claude_token_file,
+            effort,
+            turn_budget_usd,
             prompt_file,
             model,
             task,
@@ -309,6 +326,9 @@ fn main() {
                 pi_auth,
                 pi_thinking,
                 settings,
+                claude_token_file,
+                effort,
+                turn_budget_usd,
             }
             .args()
             .unwrap_or_else(|e| refuse_run(&e)),
@@ -415,8 +435,26 @@ fn task_named(name: &str) -> Task {
 
 /// The harness `run` plays every turn with, what it pins, and where its model calls go.
 enum HarnessArgs {
-    Claude { binary: PathBuf, version: String, settings: PathBuf },
+    Claude { binary: PathBuf, version: String, sign_in: ClaudeSignIn, effort: String, budget: Option<f64> },
     Pi { prefix: PathBuf, version: String, thinking: Option<String>, provider: PiProvider },
+}
+
+/// Where Claude Code's sign-in comes from: a gateway's settings, or the owner's subscription token.
+enum ClaudeSignIn {
+    Settings(PathBuf),
+    TokenFile(PathBuf),
+}
+
+impl ClaudeSignIn {
+    /// Read now, into memory.
+    fn read(&self) -> Result<SignIn, String> {
+        match self {
+            ClaudeSignIn::Settings(p) => Routing::from_settings(p).map(SignIn::Gateway),
+            ClaudeSignIn::TokenFile(p) => {
+                Subscription::from_file(p).map(SignIn::Subscription).map_err(|e| format!("--claude-token-file: {e}"))
+            }
+        }
+    }
 }
 
 /// Pi's provider and where its key comes from.
@@ -436,6 +474,9 @@ struct HarnessOptions {
     pi_auth: Option<PathBuf>,
     pi_thinking: Option<String>,
     settings: Option<PathBuf>,
+    claude_token_file: Option<PathBuf>,
+    effort: Option<String>,
+    turn_budget_usd: Option<f64>,
 }
 
 /// The refusal of options `given` for something else: `--x is <theirs>, but <but>: drop it, or give <fix>`.
@@ -475,13 +516,34 @@ impl HarnessOptions {
                 ("--pi-thinking", o.pi_thinking.is_some()),
             ];
             not_for(&pi, "Pi's", "the harness is Claude Code", "--harness pi")?;
+            let sign_in = match (o.settings, o.claude_token_file) {
+                (Some(s), None) => ClaudeSignIn::Settings(s),
+                (None, Some(t)) => ClaudeSignIn::TokenFile(t),
+                (Some(_), Some(_)) => return Err("give --settings or --claude-token-file, not both".into()),
+                (None, None) => {
+                    return Err("Claude Code needs --settings, the file holding a gateway's routing entries, or \
+                                --claude-token-file, the owner's subscription token"
+                        .into());
+                }
+            };
+            if o.turn_budget_usd.is_some_and(|usd| !(usd.is_finite() && usd > 0.0)) {
+                return Err("--turn-budget-usd: give an amount above 0".into());
+            }
             return Ok(HarnessArgs::Claude {
                 binary: o.claude.expect("clap requires it"),
                 version: o.claude_version.expect("clap requires it"),
-                settings: o.settings.ok_or("Claude Code needs --settings, the file holding its routing entries")?,
+                sign_in,
+                effort: o.effort.unwrap_or_else(|| "medium".into()),
+                budget: o.turn_budget_usd,
             });
         }
-        let claude = [("--claude", o.claude.is_some()), ("--claude-version", o.claude_version.is_some())];
+        let claude = [
+            ("--claude", o.claude.is_some()),
+            ("--claude-version", o.claude_version.is_some()),
+            ("--claude-token-file", o.claude_token_file.is_some()),
+            ("--effort", o.effort.is_some()),
+            ("--turn-budget-usd", o.turn_budget_usd.is_some()),
+        ];
         not_for(&claude, "Claude Code's", "the harness is Pi", "--harness claude")?;
         let provider = if o.pi_provider.as_deref() == Some("openrouter") {
             let but = "Pi's provider is openrouter";
@@ -555,7 +617,27 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
     if a.prompt_file.is_some() {
         println!("the system prompt is from --prompt-file, not the reviewed prompts; the plan hashes it");
     }
-    let (expect, caps) = (Expect::pinned_2_1_311(&a.model), a.caps);
+    let (mut expect, mut caps) = (Expect::pinned_2_1_311(&a.model), a.caps);
+    if let HarnessArgs::Claude { sign_in, budget, effort, .. } = &a.harness {
+        expect.effort = effort.clone();
+        // The $ stop was for API spend: a subscription's runs stop at the token, time and call caps unless one is
+        // given (task b0a9769a48da).
+        caps.turn_budget_usd = match (budget, sign_in) {
+            (Some(usd), _) => Some(*usd),
+            (None, ClaudeSignIn::Settings(_)) => caps.turn_budget_usd,
+            (None, ClaudeSignIn::TokenFile(_)) => None,
+        };
+        let kind = match sign_in {
+            ClaudeSignIn::Settings(_) => "a gateway (--settings)",
+            ClaudeSignIn::TokenFile(_) => "the owner's subscription (--claude-token-file)",
+        };
+        match caps.turn_budget_usd {
+            Some(usd) => println!("Claude Code signs in through {kind}; each turn stops at its ${usd} estimate"),
+            None => {
+                println!("Claude Code signs in through {kind}; no $ stop per turn: the token, time and call caps bind")
+            }
+        }
+    }
     let pilot = Caps::pilot();
     if caps.run_tokens != pilot.run_tokens {
         println!("this {} run's token cap is {} (--mode-token-cap); the plan records it", a.mode, caps.run_tokens);
@@ -606,12 +688,16 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
         })
     };
     let outcome = match &a.harness {
-        HarnessArgs::Claude { binary, version, settings } => {
+        HarnessArgs::Claude { binary, version, sign_in, effort, .. } => {
+            let pin = Pin::of(binary, version)?;
+            // The start event its pinned version shows, and its sign-in, read now, into memory.
+            let expect = Expect::for_version(version, &expect.model, effort)?;
+            let sign_in = sign_in.read()?;
             let mut backend = ClaudeBackend::new(ClaudeConfig {
-                pin: Pin::of(binary, version)?,
+                pin,
                 expect,
                 caps,
-                routing: Routing::from_settings(settings)?,
+                sign_in,
                 dir: backend_dir,
                 shim: me.clone(),
                 prompt,

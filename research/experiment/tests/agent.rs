@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use bracken_experiment::claude::{Caps, ClaudeBackend, ClaudeConfig, Expect, Pin, RUN_TIME_CAP, Routing, Tokens};
+use bracken_experiment::claude::{
+    Caps, ClaudeBackend, ClaudeConfig, Expect, OAUTH_TOKEN, Pin, RUN_TIME_CAP, Routing, SUBSCRIPTION_HOST, SignIn,
+    Subscription, Tokens,
+};
 use bracken_experiment::driver::{
     Backend, CALLS_PER_TURN, MAX_RESULT_BYTES, MAX_RESULT_CHARS, ResultLimit, RunConfig, TURN_LIMIT, core_tools,
     git_binary, run,
@@ -142,11 +145,15 @@ impl Setup {
     }
 
     fn backend_in(&self, mode: &str, script: &str, caps: Caps, pin: Pin) -> ClaudeBackend {
+        self.backend_signed_in(mode, script, caps, pin, SignIn::Gateway(routing()))
+    }
+
+    fn backend_signed_in(&self, mode: &str, script: &str, caps: Caps, pin: Pin, sign_in: SignIn) -> ClaudeBackend {
         ClaudeBackend::new(ClaudeConfig {
             pin,
             expect: Expect::pinned_2_1_311("claude-opus-5-5"),
             caps,
-            routing: routing(),
+            sign_in,
             dir: self.dir.join("claude"),
             shim: bin(),
             prompt: script.to_string(),
@@ -574,6 +581,74 @@ fn routing_takes_only_the_routing_entries_and_never_shows_the_value() {
         let err = Routing::from_settings(&write(bad.clone())).expect_err("refused");
         assert!(!err.contains(FAKE_AUTH), "{err}");
     }
+}
+
+/// A fake subscription token: what `--claude-token-file` holds, in tests.
+const FAKE_TOKEN: &str = "fake-oauth-token-not-a-secret-0123456789";
+
+fn subscription() -> SignIn {
+    SignIn::Subscription(Subscription::new(FAKE_TOKEN.into()).expect("a token"))
+}
+
+/// A subscription token is read from a file its owner alone may read, trimmed, once; any other file is refused,
+/// and no error, nor the sign-in's `Debug`, shows the token (task `b0a9769a48da`).
+#[test]
+fn a_subscription_token_is_read_from_a_private_file_and_never_shown() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let write = |name: &str, text: &str, mode: u32| {
+        let p = tmp.path().join(name);
+        std::fs::write(&p, text).expect("write");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).expect("chmod");
+        p
+    };
+    let ok = Subscription::from_file(&write("ok", &format!("{FAKE_TOKEN}\n"), 0o600)).expect("taken");
+    let sign_in = SignIn::Subscription(ok);
+    assert_eq!((sign_in.kind(), sign_in.names()), ("subscription", &[OAUTH_TOKEN][..]));
+    assert!(!format!("{sign_in:?}").contains(FAKE_TOKEN), "{sign_in:?}");
+    assert_eq!(SignIn::Gateway(routing()).kind(), "gateway");
+    for (name, text, mode, says) in [
+        ("shared", FAKE_TOKEN.to_string(), 0o644, "chmod 600"),
+        ("group", FAKE_TOKEN.to_string(), 0o640, "chmod 600"),
+        ("two", format!("{FAKE_TOKEN} {FAKE_TOKEN}"), 0o600, "give it alone"),
+        ("lines", format!("{FAKE_TOKEN}\nmore-{FAKE_TOKEN}"), 0o600, "give it alone"),
+        ("short", "sk-short".to_string(), 0o600, "under 20 bytes"),
+        ("empty", String::new(), 0o600, "under 20 bytes"),
+        ("long", FAKE_TOKEN.repeat(200), 0o600, "too long"),
+        // JSON escapes these, so the transcript check couldn't find them as given (finding de508082cfc6).
+        ("quote", format!("{FAKE_TOKEN}\"x"), 0o600, "outside A-Z"),
+        ("backslash", format!("{FAKE_TOKEN}\\x"), 0o600, "outside A-Z"),
+    ] {
+        let err = Subscription::from_file(&write(name, &text, mode)).expect_err(name);
+        assert!(err.contains(says), "{name}: {err}");
+        assert!(!err.contains(FAKE_TOKEN) && !err.contains("sk-short"), "{name}: {err}");
+    }
+    // Never through a symbolic link, though it leads to a good file (finding 46569298796f); nor a directory.
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(tmp.path().join("ok"), &link).expect("a link");
+    let err = Subscription::from_file(&link).expect_err("a link");
+    assert!(err.contains("symbolic link"), "{err}");
+    let dir = tmp.path().join("dir");
+    std::fs::create_dir(&dir).expect("a directory");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(Subscription::from_file(&dir).expect_err("a directory").contains("isn't a file"));
+    let missing = Subscription::from_file(&tmp.path().join("missing")).expect_err("no file");
+    assert!(missing.contains("missing"), "{missing}");
+}
+
+/// The gate knows the start event of each pinned version, at the effort asked for, and no other version.
+#[test]
+fn the_expected_start_event_follows_the_pinned_version() {
+    let old = Expect::for_version("2.1.311", "claude-sonnet-5-5", "medium").expect("known");
+    let new = Expect::for_version("2.1.329", "claude-sonnet-5-5", "high").expect("known");
+    assert_eq!((old.model.as_str(), old.effort.as_str()), ("claude-sonnet-5-5", "medium"));
+    assert_eq!(new.effort, "high");
+    assert_eq!(old.skills, new.skills);
+    assert!(
+        new.plugins.contains(&"cc-plugin-privacy".to_string()) && !old.plugins.contains(&"cc-plugin-privacy".into())
+    );
+    assert_eq!(new.api_key_source, "none", "a subscription token, like a gateway's, shows none");
+    assert!(Expect::for_version("2.1.330", "claude-sonnet-5-5", "medium").is_err());
 }
 
 // ---- The real binary ----
@@ -1380,6 +1455,110 @@ mod macos_only {
         let t = s.transcript("agent-0", 1).expect("kept");
         assert!(t.contains("\"init\"") && t.contains("\"result\"") && !t.contains(FAKE_AUTH));
         assert!(t.contains(&format!("http://127.0.0.1:{}", backend.proxy_port())), "Claude Code is sent to the proxy");
+    }
+
+    /// A subscription sign-in (task `b0a9769a48da`): the turn's environment holds the token's one entry beside the
+    /// backend's base and Claude Code's own, and no gateway entry; the token is in no argument, no file the run
+    /// writes, no transcript and no plan, which records the sign-in's kind; and model calls may go only to the
+    /// subscription's host.
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn a_subscription_sign_in_sets_only_its_token_and_the_plan_records_its_kind() {
+        use bracken_experiment::backend::{BASE_ENV, Harness};
+        let s = Setup::new();
+        let pin = Pin::of(&fake(), "2.1.311").expect("pin");
+        let backend = s.backend_signed_in("bracken", "env-names\nargv\nsay\nresult 10", caps(), pin, subscription());
+        let record = backend.harness_record().clone();
+        assert_eq!(record["about"]["sign_in"], "subscription", "{record}");
+        let declared: Vec<&str> =
+            record["declared"].as_array().expect("declared").iter().filter_map(Value::as_str).collect();
+        let mut want: Vec<&str> = bracken_experiment::claude::ENV_NAMES.to_vec();
+        want.push(OAUTH_TOKEN);
+        assert_eq!(declared, want);
+        let route = backend.harness().route();
+        assert_eq!((route.host.as_str(), route.port), (SUBSCRIPTION_HOST, 443));
+
+        let cfg = RunConfig {
+            plan: PlanInputs { harness: record, ..PlanInputs::default() },
+            ..run_config(s.dir.join("run"), "bracken", 1, 1, true)
+        };
+        run(&cfg, &backend).expect("the run");
+        let t = s.transcript("agent-0", 1).expect("kept");
+        let event = |subtype: &str| -> Value {
+            let line = t.lines().find(|l| l.contains(&format!("\"subtype\":\"{subtype}\""))).expect(subtype);
+            serde_json::from_str(line).expect("JSON")
+        };
+        let names: Vec<String> = serde_json::from_value(event("env_names")["names"].clone()).expect("names");
+        let mut expected: Vec<String> = BASE_ENV.iter().chain(&want).map(|n| n.to_string()).collect();
+        expected.sort();
+        assert_eq!(names, expected, "the token's entry and nothing of a gateway's");
+        assert!(!event("argv").to_string().contains(FAKE_TOKEN));
+
+        // Nothing the run wrote holds the token: transcripts, usage rows, turn configurations, the plan, events.
+        let mut todo = vec![s.dir.clone()];
+        let mut read = 0;
+        while let Some(dir) = todo.pop() {
+            for entry in std::fs::read_dir(&dir).expect("a directory").flatten() {
+                let meta = std::fs::symlink_metadata(entry.path()).expect("meta");
+                if meta.is_dir() {
+                    todo.push(entry.path());
+                } else if meta.is_file()
+                    && let Ok(bytes) = std::fs::read(entry.path())
+                {
+                    read += 1;
+                    let held = bytes.windows(FAKE_TOKEN.len()).any(|w| w == FAKE_TOKEN.as_bytes());
+                    assert!(!held, "{} holds the token", entry.path().display());
+                }
+            }
+        }
+        assert!(read > 5, "the run's files were read: {read}");
+        let plan = std::fs::read_to_string(s.dir.join("run/plan.json")).expect("the plan");
+        assert!(
+            plan.contains("\"sign_in\":\"subscription\"") || plan.contains("\"sign_in\": \"subscription\""),
+            "{plan}"
+        );
+    }
+
+    /// The transcript check covers the subscription token as it covers a gateway's (task `b0a9769a48da`): printed
+    /// on the stream, it stops the run and the line isn't kept; on standard error, the turn's transcript is removed.
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn a_subscription_token_in_a_transcript_stops_the_run() {
+        let s = Setup::new();
+        let script = format!("env {OAUTH_TOKEN}\n{SLEEP}\nresult 10");
+        let pin = Pin::of(&fake(), "2.1.311").expect("pin");
+        let backend =
+            s.backend_signed_in("bracken", &script, Caps { turn_time: LONG_TURN, ..caps() }, pin, subscription());
+        let start = Instant::now();
+        let err = s.run(&backend, 1, 2).expect_err("the run stops");
+        assert!(err.contains("auth value") && !err.contains(FAKE_TOKEN), "{err}");
+        assert!(start.elapsed() < EARLY, "stopped at the line, not at the turn's end");
+        let t = s.transcript("agent-0", 1).expect("kept, without the line");
+        assert!(t.contains("\"init\"") && !t.contains(FAKE_TOKEN));
+
+        let s = Setup::new();
+        let pin = Pin::of(&fake(), "2.1.311").expect("pin");
+        let script = format!("say\nstderr-env {OAUTH_TOKEN}\nresult 10");
+        let backend = s.backend_signed_in("bracken", &script, caps(), pin, subscription());
+        assert!(s.run(&backend, 1, 1).is_err());
+        assert!(s.transcript("agent-0", 1).is_none(), "removed");
+    }
+
+    /// A gateway sign-in still sets its routing entries and no token entry (task `b0a9769a48da`).
+    #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
+    fn a_gateway_sign_in_sets_its_routing_entries_and_no_token() {
+        let s = Setup::new();
+        let backend = s.backend(&format!("env {OAUTH_TOKEN}\nenv ANTHROPIC_BASE_URL\nsay\nresult 10"), caps());
+        assert_eq!(backend.harness_record()["about"]["sign_in"], "gateway");
+        s.run(&backend, 1, 1).expect("the run");
+        let t = s.transcript("agent-0", 1).expect("kept");
+        let values: Vec<Value> = t
+            .lines()
+            .filter(|l| l.contains("\"subtype\":\"env\""))
+            .map(|l| serde_json::from_str::<Value>(l).expect("JSON")["value"].clone())
+            .collect();
+        assert_eq!(values, [Value::Null, json!(format!("https://{HOST}"))]);
     }
 
     #[test]

@@ -7,7 +7,9 @@
 //!   configuration (the system prompt, the shim's MCP entry and the settings),
 //!   and beyond the backend's base environment only Claude Code's
 //!   configuration and temporary directories inside the agent's own,
-//!   non-essential traffic off, and the owner's routing entries ([`ENV_NAMES`]).
+//!   non-essential traffic off ([`ENV_NAMES`]), and the run's sign-in
+//!   ([`SignIn`]): the owner's gateway routing entries, or the owner's
+//!   subscription token alone.
 //! - **The gate**: the first event must be `init`, showing exactly what the
 //!   plan expects.
 //! - **Its event stream** (`stream-json`): every assistant message's usage and
@@ -31,16 +33,141 @@ use crate::sandbox::{Profile, resolved};
 pub const ROUTING_KEYS: [&str; 3] =
     ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"];
 
-/// The environment entries Claude Code adds to the backend's base: its own directories, non-essential
-/// traffic off, and the routing entries.
-pub const ENV_NAMES: [&str; 6] = [
-    "CLAUDE_CONFIG_DIR",
-    "CLAUDE_CODE_TMPDIR",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
-    ROUTING_KEYS[0],
-    ROUTING_KEYS[1],
-    ROUTING_KEYS[2],
-];
+/// The environment entries Claude Code adds to the backend's base whatever its sign-in: its own directories and
+/// non-essential traffic off. The sign-in adds its own ([`SignIn::names`]).
+pub const ENV_NAMES: [&str; 3] =
+    ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_TMPDIR", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"];
+
+/// The one entry a subscription sign-in sets: the long-lived token `claude setup-token` prints, which Claude Code
+/// reads from here and uses non-interactively (checked on 2.1.329: no login prompt, `apiKeySource` `none`, and its
+/// only connection is to [`SUBSCRIPTION_HOST`]).
+pub const OAUTH_TOKEN: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// Where a subscription sign-in's model calls go: Claude Code's own default API host.
+pub const SUBSCRIPTION_HOST: &str = "api.anthropic.com";
+
+/// The largest token file read: a token is about a hundred bytes.
+const MAX_TOKEN_FILE: u64 = 4096;
+
+/// The shortest subscription token taken.
+const MIN_TOKEN: usize = 20;
+
+/// The owner's subscription token, held in memory only. Its `Debug` shows nothing of it.
+pub struct Subscription {
+    token: String,
+}
+
+impl std::fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Subscription")
+    }
+}
+
+impl Subscription {
+    /// The token in `path` (`--claude-token-file`): one line, the token alone, in a file only its owner may read.
+    /// Read once, into memory; nothing writes the file. Errors never quote it.
+    pub fn from_file(path: &Path) -> Result<Subscription, String> {
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let shown = path.display();
+        // Opened once, never through a symbolic link, never waiting on a FIFO, and checked by what was opened, so
+        // nothing swapped in between a check and the read passes (finding 46569298796f).
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
+        let file =
+            std::fs::OpenOptions::new().read(true).custom_flags(flags.bits() as i32).open(path).map_err(|e| match e
+                .raw_os_error()
+            {
+                Some(code) if code == rustix::io::Errno::LOOP.raw_os_error() => {
+                    format!("{shown} is a symbolic link: give the token file itself")
+                }
+                _ => format!("reading {shown}: {e}"),
+            })?;
+        let meta = file.metadata().map_err(|e| format!("reading {shown}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("{shown} isn't a file"));
+        }
+        if meta.mode() & 0o077 != 0 {
+            return Err(format!("{shown} may be read by others than its owner: chmod 600 it"));
+        }
+        let too_long = || format!("{shown} is over {MAX_TOKEN_FILE} bytes, too long to hold a token alone");
+        if meta.len() > MAX_TOKEN_FILE {
+            return Err(too_long());
+        }
+        // At most one byte past the bound, whatever the file grows to as it's read.
+        let mut bytes = Vec::new();
+        file.take(MAX_TOKEN_FILE + 1).read_to_end(&mut bytes).map_err(|e| format!("reading {shown}: {e}"))?;
+        if bytes.len() as u64 > MAX_TOKEN_FILE {
+            return Err(too_long());
+        }
+        let text = String::from_utf8(bytes).map_err(|_| format!("{shown} isn't text"))?;
+        Subscription::new(text.trim().to_string()).map_err(|e| format!("{shown}: {e}"))
+    }
+
+    /// A token as given: at least [`MIN_TOKEN`] bytes, each of A-Z, a-z, 0-9 and `._+/=-`, so JSON writes it as it is
+    /// and the transcript check finds it as it is (finding de508082cfc6). Errors never quote it.
+    pub fn new(token: String) -> Result<Subscription, String> {
+        if token.len() < MIN_TOKEN {
+            return Err(format!("the token is under {MIN_TOKEN} bytes"));
+        }
+        if !token.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+/=-".contains(&b)) {
+            return Err("the token holds a character outside A-Z, a-z, 0-9 and ._+/=-, so the run can't check \
+                        transcripts for it: give it alone"
+                .into());
+        }
+        Ok(Subscription { token })
+    }
+}
+
+/// How Claude Code signs in for a run's model calls: through the owner's gateway, by its routing entries
+/// (`--settings`), or with the owner's subscription token (`--claude-token-file`). The run's record and so its
+/// plan say which ([`SignIn::kind`]), never a value.
+#[derive(Debug)]
+pub enum SignIn {
+    Gateway(Routing),
+    Subscription(Subscription),
+}
+
+impl SignIn {
+    /// Which sign-in, as the plan records it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            SignIn::Gateway(_) => "gateway",
+            SignIn::Subscription(_) => "subscription",
+        }
+    }
+
+    /// The environment entries it sets, by name: the routing entries, or the token's one.
+    pub fn names(&self) -> &'static [&'static str] {
+        match self {
+            SignIn::Gateway(_) => &ROUTING_KEYS,
+            SignIn::Subscription(_) => std::slice::from_ref(&OAUTH_TOKEN),
+        }
+    }
+
+    /// The entries it sets, with their values: for the turn's environment alone.
+    fn env(&self) -> Vec<(&str, &str)> {
+        match self {
+            SignIn::Gateway(r) => r.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect(),
+            SignIn::Subscription(s) => vec![(OAUTH_TOKEN, s.token.as_str())],
+        }
+    }
+
+    /// Where its model calls go.
+    fn host(&self) -> (String, u16) {
+        match self {
+            SignIn::Gateway(r) => (r.host.clone(), r.port),
+            SignIn::Subscription(_) => (SUBSCRIPTION_HOST.into(), 443),
+        }
+    }
+
+    /// What no transcript or standard error may hold.
+    fn secret(&self) -> &str {
+        match self {
+            SignIn::Gateway(r) => r.secret(),
+            SignIn::Subscription(s) => &s.token,
+        }
+    }
+}
 
 /// The MCP server name the shim is registered under: its tools are `mcp__experiment__<tool>`.
 pub const SERVER: &str = "experiment";
@@ -155,14 +282,41 @@ impl Expect {
             plugins: vec!["cc-plugin-agents-md".into(), "cc-plugin-plugin-authoring".into()],
         }
     }
+
+    /// What Claude Code 2.1.329 shows with the turn configuration, as a gateway or a subscription token signs it in
+    /// alike: 2.1.311's, with one more bundled plugin (task `b0a9769a48da`, seen with no model call).
+    pub fn pinned_2_1_329(model: &str) -> Expect {
+        let mut e = Expect::pinned_2_1_311(model);
+        e.plugins = ["cc-plugin-agents-md", "cc-plugin-privacy", "cc-plugin-plugin-authoring"].map(String::from).into();
+        e
+    }
+
+    /// What the pinned `version` shows, for `model` at `effort`: only a version whose start event is known.
+    pub fn for_version(version: &str, model: &str, effort: &str) -> Result<Expect, String> {
+        let mut e = match version {
+            "2.1.311" => Expect::pinned_2_1_311(model),
+            "2.1.329" => Expect::pinned_2_1_329(model),
+            other => {
+                return Err(format!(
+                    "Claude Code {} isn't a version whose start event the gate knows (2.1.311, 2.1.329)",
+                    crate::args::short(other)
+                ));
+            }
+        };
+        e.effort = effort.into();
+        Ok(e)
+    }
 }
+
+/// The efforts `--effort` takes for Claude Code.
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// Everything the backend needs, fixed before the run.
 pub struct ClaudeConfig {
     pub pin: Pin,
     pub expect: Expect,
     pub caps: Caps,
-    pub routing: Routing,
+    pub sign_in: SignIn,
     /// The backend's own directory, outside every store: agents' Claude Code directories, turn
     /// configurations, transcripts and `usage.jsonl`. Must not exist yet.
     pub dir: PathBuf,
@@ -183,9 +337,11 @@ pub type ClaudeBackend = HarnessBackend<ClaudeCode>;
 
 impl HarnessBackend<ClaudeCode> {
     pub fn new(cfg: ClaudeConfig) -> Result<ClaudeBackend, String> {
-        let ClaudeConfig { pin, expect, caps, routing, dir, shim, prompt, turns, tools, upstream } = cfg;
+        let ClaudeConfig { pin, expect, caps, sign_in, dir, shim, prompt, turns, tools, upstream } = cfg;
         let backend = BackendConfig { caps: caps.clone(), dir, shim: shim.clone(), turns };
-        HarnessBackend::start(ClaudeCode { pin, expect, caps, routing, shim, prompt, tools, upstream }, backend)
+        let names = ENV_NAMES.iter().chain(sign_in.names()).copied().collect();
+        let harness = ClaudeCode { pin, expect, caps, sign_in, names, shim, prompt, tools, upstream };
+        HarnessBackend::start(harness, backend)
     }
 }
 
@@ -194,7 +350,9 @@ pub struct ClaudeCode {
     pin: Pin,
     expect: Expect,
     caps: Caps,
-    routing: Routing,
+    sign_in: SignIn,
+    /// [`ENV_NAMES`] and the sign-in's.
+    names: Vec<&'static str>,
     shim: PathBuf,
     prompt: String,
     tools: Vec<String>,
@@ -300,11 +458,12 @@ impl Harness for ClaudeCode {
     }
 
     fn route(&self) -> Route {
-        Route { host: self.routing.host.clone(), port: self.routing.port, connect: self.upstream }
+        let (host, port) = self.sign_in.host();
+        Route { host, port, connect: self.upstream }
     }
 
     fn secret(&self) -> &str {
-        self.routing.secret()
+        self.sign_in.secret()
     }
 
     fn pin(&self) -> &Pin {
@@ -316,11 +475,11 @@ impl Harness for ClaudeCode {
     }
 
     fn about(&self) -> Value {
-        json!({"result": "the harness's"})
+        json!({"result": "the harness's", "sign_in": self.sign_in.kind()})
     }
 
     fn env_names(&self) -> &[&str] {
-        &ENV_NAMES
+        &self.names
     }
 
     fn config(&self, _name: &str, socket: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
@@ -345,7 +504,8 @@ impl Harness for ClaudeCode {
         l.env("CLAUDE_CONFIG_DIR", resolved(&config)?)
             .env("CLAUDE_CODE_TMPDIR", turn.tmp)
             .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1");
-        for (k, v) in &self.routing.env {
+        // The sign-in's entries, in the environment alone: never an argument or a file the run writes.
+        for (k, v) in self.sign_in.env() {
             l.env(k, v);
         }
         Ok(l)

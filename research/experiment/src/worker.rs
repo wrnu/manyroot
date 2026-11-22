@@ -146,6 +146,11 @@ fn handle(store: &mut dyn Store, notes: &Path, task: Task, req: Request) -> Repl
                 .tree_files()
                 .map(|files| json!(files.into_iter().map(|(p, b)| json!([p, hex::encode(b)])).collect::<Vec<_>>())),
         ),
+        "main" => Reply::from(
+            store
+                .own_main()
+                .map(|files| json!(files.into_iter().map(|(p, b)| json!([p, hex::encode(b)])).collect::<Vec<_>>())),
+        ),
         "integrated" => Reply::from(store.integrated().map(|m| json!(m))),
         "line" => Reply::from(store.line_head()),
         "tool" => {

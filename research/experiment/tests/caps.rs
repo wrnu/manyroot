@@ -388,3 +388,58 @@ fn refuses_the_login(expires: u64) {
     }
     assert!(!dir.path().join("run").exists());
 }
+
+/// Claude Code signs in by a gateway's `--settings` or a subscription's `--claude-token-file`, one of them, and
+/// neither is Pi's; the $ stop per turn is optional, and Claude Code's alone (task `b0a9769a48da`). A token file
+/// others may read stops the run before anything is made, quoting nothing of it. The token is fake.
+#[test]
+fn run_takes_one_claude_sign_in_and_refuses_a_shared_token_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = Path::new(env!("CARGO_BIN_EXE_bracken-experiment"));
+    let claude = ["--claude", "/nonexistent", "--claude-version", "0"];
+    let pi = ["--harness", "pi", "--pi-prefix", "/nonexistent"];
+    let token = ["--claude-token-file", "/nonexistent"];
+    let cases: [(Vec<&str>, i32, &str); 5] = [
+        ([&claude[..], &token, &["--settings", "/nonexistent"]].concat(), 2, "cannot be used with"),
+        ([&pi[..], &token].concat(), 2, "--claude-token-file is Claude Code's, but the harness is Pi"),
+        ([&pi[..], &["--effort", "high", "--turn-budget-usd", "2"]].concat(), 2, "--effort and --turn-budget-usd are"),
+        ([&claude[..], &token, &["--turn-budget-usd", "0"]].concat(), 2, "--turn-budget-usd: give an amount above 0"),
+        ([&claude[..], &token, &["--effort", "huge"]].concat(), 2, "invalid value 'huge'"),
+    ];
+    for (args, code, says) in cases {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let out = Command::new(bin)
+            .args(["run", "--dir"])
+            .arg(dir.path().join("run"))
+            .args(["--mode", "git"])
+            .args(&args)
+            .output()
+            .expect("the binary runs");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(code), "{args:?}: {out:?}");
+        assert!(err.contains(says), "{args:?}: {err}");
+        assert!(!dir.path().join("run").exists());
+    }
+
+    let fake = "fake-oauth-token-not-a-secret-0123456789";
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let file = dir.path().join("token");
+    std::fs::write(&file, fake).expect("the token file");
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let me = std::fs::canonicalize(bin).expect("the binary");
+    let out = Command::new(bin)
+        .args(["run", "--dir"])
+        .arg(dir.path().join("run"))
+        .args(["--mode", "git", "--claude-version", "2.1.311", "--claude"])
+        .arg(&me)
+        .arg("--claude-token-file")
+        .arg(&file)
+        .output()
+        .expect("the binary runs");
+    let (stdout, stderr) = (String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stdout.contains("the owner's subscription (--claude-token-file); no $ stop per turn"), "{stdout}");
+    assert!(stderr.contains("--claude-token-file") && stderr.contains("chmod 600"), "{stderr}");
+    assert!(!stdout.contains(fake) && !stderr.contains(fake));
+    assert!(!dir.path().join("run").exists());
+}

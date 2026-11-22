@@ -1045,6 +1045,14 @@ impl Store for GitProjectStore {
         Ok(json!({"forked": false, "heads": [{"decision": commit, "manifest": tree}]}))
     }
 
+    /// A copy's own main, the branch it integrates onto (task `b0a9769a48da`).
+    fn own_main(&mut self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        if self.is_hub() {
+            return Err("the hub has no main of an agent's".into());
+        }
+        tree_at(&self.git.config.git.clone(), &self.work().join(".git"), MAIN)
+    }
+
     /// main's files as `(path, text)` pairs.
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String> {
         let files = tree_at(&self.git.config.git.clone(), &self.hub_repo(), MAIN)?;

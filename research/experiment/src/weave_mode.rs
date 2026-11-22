@@ -169,11 +169,11 @@ impl Mode for WeaveMode {
             ),
             tool(
                 "resolve",
-                "Settle a conflict at `path`. With `proposals`, one that integrating them (in that order) stopped at: `take` the line's side (into), the proposal's (from), your working tree's file at that path (tree), or delete it (delete); then integrate the same proposals. With none, one your merge reported: keep your working tree's file as you've settled it (tree, refused while it holds conflict markers) or delete it (delete)",
+                "Settle a conflict at `path`. With `proposals`, one that integrating them (in that order) stopped at: `take` the line's side (into), the proposal's (from), your working tree's file at that path (tree, refused while it holds conflict markers), or delete it (delete); then integrate the same proposals. To keep some of each side, take markers first: it settles nothing, but writes the file into your working tree with each conflicting region's three sides between markers (the line's, where they parted, the proposal's); edit it until no marker is left, then take tree, which puts your tree's file back as it was. With no proposals, one your merge reported: keep your working tree's file as you've settled it (tree, refused while it holds conflict markers) or delete it (delete)",
                 json!({
                     "proposals": {"type": "array", "items": id},
                     "path": path,
-                    "take": {"type": "string", "enum": ["into", "from", "tree", "delete"]},
+                    "take": {"type": "string", "enum": ["into", "from", "markers", "tree", "delete"]},
                 }),
                 &["path", "take"],
             ),
@@ -617,17 +617,28 @@ pub fn diff_page(files: &[FileDiff], page: usize, mut extra: Value) -> Result<Va
 /// show whole keeps its path (task `a5253414e178`); past the bound, the count of those left out. None if `v`
 /// lists no conflict.
 pub fn conflicts_error(v: &Value) -> Option<String> {
+    conflicts_error_with(v, &std::collections::BTreeMap::new())
+}
+
+/// [`conflicts_error`], showing each conflicted region's three sides where `views` has them, by path ([`regions`]):
+/// the line's (into), where they parted (base) and the proposal's (from) (task `b0a9769a48da`). A conflict whose
+/// view doesn't fit shows its regions' base lines instead, as before.
+pub fn conflicts_error_with(v: &Value, views: &std::collections::BTreeMap<String, Value>) -> Option<String> {
     let all = v["conflicts"].as_array().filter(|c| !c.is_empty())?;
     let side = |x: &Value| if x.is_null() { "deleted" } else { "present" };
     let mut rows = Vec::new();
     let (mut size, mut left) = (0, 0);
     for c in all {
         let offered: Vec<&Value> = c["offered"].as_array().into_iter().flatten().map(|o| &o["resolution"]).collect();
-        let whole = json!({"path": c["path"], "into": side(&c["into"]), "from": side(&c["from"]),
-                           "regions": c["text_conflicts"], "offered": offered});
+        let row = |regions: &Value| {
+            json!({"path": c["path"], "into": side(&c["into"]), "from": side(&c["from"]), "regions": regions,
+                   "offered": offered})
+        };
+        let viewed = c["path"].as_str().and_then(|p| views.get(p)).map(row);
+        let whole = row(&c["text_conflicts"]);
         let brief = json!({"path": c["path"], "into": side(&c["into"]), "from": side(&c["from"]),
                            "regions": "too many to show", "offered": offered.len()});
-        match [whole, brief].into_iter().find(|r| size + json_len(r) < LIST_BYTES) {
+        match viewed.into_iter().chain([whole, brief]).find(|r| size + json_len(r) < LIST_BYTES) {
             Some(r) => {
                 size += json_len(&r) + 1;
                 rows.push(r);
@@ -638,11 +649,47 @@ pub fn conflicts_error(v: &Value) -> Option<String> {
     let more = if left == 0 { String::new() } else { format!(" ({left} more not shown)") };
     Some(format!(
         "merging {} stopped at {} conflicts with no resolution, so nothing was written{more}: {}. Settle each with \
-         resolve, giving the same proposals, then integrate them again.",
+         resolve, giving the same proposals: take into or from for one side whole; or, to keep some of each, take \
+         markers, which writes the file with each conflicting region's three sides between markers into your \
+         working tree, edit it there until no marker is left, then take tree. Then integrate them again.",
         v["step"].as_str().unwrap_or("the proposals"),
         all.len(),
         Value::from(rows)
     ))
+}
+
+/// The marker lines of a three-way marked merge: bracken's `weave resolve --markers`, labelled into, base and from.
+const MARKS: [&str; 4] = ["<<<<<<< into", "||||||| base", "=======", ">>>>>>> from"];
+
+/// Whether `text` still holds a conflict marker's line: any line starting `<<<<<<<`, `|||||||` or `>>>>>>>`.
+pub fn holds_markers(text: &str) -> bool {
+    text.lines().any(|l| l.starts_with("<<<<<<<") || l.starts_with("|||||||") || l.starts_with(">>>>>>>"))
+}
+
+/// Each conflicting region of a three-way marked merge ([`MARKS`]), as its three sides' text, with the base
+/// lines bracken gave for it (`ranges`, in order): `[{"base_lines": [a, b], "into": .., "base": .., "from": ..}]`.
+/// None if the markers don't read as bracken writes them.
+pub fn regions(marked: &str, ranges: &Value) -> Option<Value> {
+    let mut out = Vec::new();
+    let (mut part, mut sides) = (None::<usize>, [String::new(), String::new(), String::new()]);
+    for line in marked.split_inclusive('\n') {
+        let bare = line.trim_end_matches('\n');
+        match (part, MARKS.iter().position(|m| *m == bare)) {
+            (None, Some(0)) => part = Some(0),
+            (Some(0), Some(1)) => part = Some(1),
+            (Some(1), Some(2)) => part = Some(2),
+            (Some(2), Some(3)) => {
+                let [into, base, from] = std::mem::take(&mut sides);
+                let at = ranges.get(out.len()).cloned().unwrap_or(Value::Null);
+                out.push(json!({"base_lines": at, "into": into, "base": base, "from": from}));
+                part = None;
+            }
+            (None, _) => {}
+            (Some(_), Some(_)) => return None,
+            (Some(k), None) => sides[k].push_str(line),
+        }
+    }
+    (part.is_none() && !out.is_empty()).then(|| Value::from(out))
 }
 
 /// Whether `path` is one an agent may name: a plain relative path of UTF-8 components, none empty, `.` or
@@ -882,7 +929,18 @@ impl WeaveStore {
     fn set_base(&mut self, id: &str) -> Result<(), String> {
         self.git(&["tag", "-f", "base"])?;
         self.save("base.txt", id)?;
+        self.clear_marks()?;
         self.clear_merge()
+    }
+
+    /// Forgets every path `resolve` wrote markers into: once the tree is replaced or committed, its files are no
+    /// longer what markers wrote, and resolve must never put back what the agent wrote since (finding 1d415d498eb4).
+    fn clear_marks(&self) -> Result<(), String> {
+        let path = self.config.dir.join("marked.json");
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| format!("removing marked.json: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Forgets a merge of the heads: its heads and its conflicted paths.
@@ -1406,6 +1464,7 @@ impl WeaveStore {
             }
         };
         self.git(&["commit", "-q", "--no-verify", "-m", "proposed"])?;
+        self.clear_marks()?;
         Ok(json!({"proposal": out["proposal"], "base": out["base"], "files": out["files"]}))
     }
 
@@ -1454,14 +1513,17 @@ impl WeaveStore {
             return Ok(json!({"decision": v["decision"], "parents": v["parents"]}));
         }
         argv.push("--proposals".into());
-        argv.extend(proposals);
+        argv.extend(proposals.iter().cloned());
+        let given = proposals;
         let out = self.bracken_output(&argv)?;
         if !out.status.success() {
-            // A merge that stops prints its conflicts on stdout: the agent needs them, not stderr's first words.
-            return Err(serde_json::from_slice::<Value>(&out.stdout)
-                .ok()
-                .and_then(|v| conflicts_error(&v))
-                .unwrap_or_else(|| failure("integrate", &out.stderr)));
+            // A merge that stops prints its conflicts on stdout: the agent needs them, not stderr's first words, and
+            // each text conflict's regions with their three sides (task b0a9769a48da).
+            let Some(v) = serde_json::from_slice::<Value>(&out.stdout).ok() else {
+                return Err(failure("integrate", &out.stderr));
+            };
+            let views = self.views(&given, &v);
+            return Err(conflicts_error_with(&v, &views).unwrap_or_else(|| failure("integrate", &out.stderr)));
         }
         let v: Value = serde_json::from_slice(&out.stdout).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
         Ok(json!({"decision": v["decision"], "parents": v["parents"], "proposals": v["proposals"]}))
@@ -1544,6 +1606,7 @@ impl WeaveStore {
         // No earlier merge of these heads may vouch for this one's conflicts while they're written: merge.txt
         // goes first and comes back last, after conflicts.txt (finding 1f85d3eb08d1).
         self.clear_merge()?;
+        self.clear_marks()?;
         // The merged files over the tree's own commit, unstaged: edits not yet proposed.
         let applied = self.git(&["read-tree", "--reset", "-u", &tree]).and_then(|_| self.git(&["reset", "-q"]));
         if let Err(e) = applied {
@@ -1629,11 +1692,17 @@ impl WeaveStore {
         Ok(out)
     }
 
-    /// The `resolve` tool: a resolution of the conflict at `path` that integrating `proposals` stopped at.
+    /// The `resolve` tool: a resolution of the conflict at `path` that integrating `proposals` stopped at. With
+    /// `markers`, no resolution: the conflict's three-way marked merge goes into the working tree at `path`, to edit
+    /// and then give back with `tree` (task `b0a9769a48da`); once any resolution of a path so marked is written, the
+    /// tree's file is put back as it was, so the agent's tree holds nothing it didn't write itself.
     fn resolve(&mut self, proposals: Vec<String>, path: &str, take: &str) -> Result<Value, String> {
         plain_path(path)?;
         if proposals.is_empty() {
             return self.settle(path, take);
+        }
+        if take == "markers" {
+            return self.mark(&proposals, path);
         }
         let me = self.config.identity.clone();
         let mut argv = vec!["weave".to_string(), "resolve".into(), format!("--as={me}"), "--json".into()];
@@ -1645,15 +1714,157 @@ impl WeaveStore {
                 if !std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
                     return Err(format!("no file {} in your tree", short(path)));
                 }
+                let bytes = std::fs::read(&file).map_err(|_| format!("no file {} in your tree", short(path)))?;
+                if holds_markers(&String::from_utf8_lossy(&bytes)) {
+                    return Err(format!("{} still holds conflict markers: settle them first", short(path)));
+                }
                 argv.extend([format!("--file={}", file.display()), format!("--repo={}", self.tree().display())]);
             }
-            other => return Err(format!("take {}: give into, from, tree or delete", short(other))),
+            other => return Err(format!("take {}: give into, from, markers, tree or delete", short(other))),
         }
         argv.push("--proposals".into());
         argv.extend(proposals);
         argv.extend(["--".into(), path.into()]);
         let out = self.bracken(&argv)?;
-        serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))
+        let mut v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
+        if self.unmark(path, take == "tree")? {
+            v["note"] = json!(format!(
+                "Your working tree's {} is back as it was before markers: the resolution holds what you settled.",
+                short(path)
+            ));
+        }
+        Ok(v)
+    }
+
+    /// The paths `resolve` wrote markers into ([`WeaveStore::mark`]), not yet resolved, each with the blake3 of
+    /// what it wrote: a JSON array of pairs.
+    fn marked(&self) -> Vec<(String, String)> {
+        std::fs::read_to_string(self.config.dir.join("marked.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_marked(&self, all: &[(String, String)]) -> Result<(), String> {
+        self.save("marked.json", &json!(all).to_string())
+    }
+
+    /// Whether the working tree's `path` is still exactly what markers wrote there.
+    fn still_marked(&self, path: &str) -> Result<bool, String> {
+        let Some((_, hash)) = self.marked().into_iter().find(|(p, _)| p == path) else { return Ok(false) };
+        let file = self.file(path)?;
+        Ok(std::fs::read(&file).is_ok_and(|b| blake3::hash(&b).to_hex().as_str() == hash))
+    }
+
+    /// The three-way marked merge of the conflict at `path` that integrating `proposals` stops at, as bracken
+    /// writes it, and its regions' base lines: written to a new file of the working tree's (bracken writes markers
+    /// only inside a checkout), read, and removed.
+    fn markers(&mut self, proposals: &[String], path: &str) -> Result<(String, Value), String> {
+        let tree = self.tree();
+        let temp = (0u32..)
+            .map(|k| tree.join(format!(".weave-markers-{k}.merge")))
+            .find(|p| std::fs::symlink_metadata(p).is_err())
+            .expect("a free name");
+        let mut argv = vec![
+            "weave".to_string(),
+            "resolve".into(),
+            format!("--markers={}", temp.display()),
+            format!("--repo={}", tree.display()),
+            "--json".into(),
+            "--proposals".into(),
+        ];
+        argv.extend(proposals.iter().cloned());
+        argv.extend(["--".into(), path.into()]);
+        let out = self.bracken(&argv);
+        let text = std::fs::read(&temp).map(|b| String::from_utf8_lossy(&b).into_owned());
+        let _ = std::fs::remove_file(&temp);
+        let v: Value = serde_json::from_slice(&out?).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
+        Ok((text.map_err(|e| format!("reading the markers: {e}"))?, v["text_conflicts"].clone()))
+    }
+
+    /// Each text conflict's regions with their three sides ([`regions`]), by path, for the conflicts `v` lists that
+    /// integrating `proposals` stopped at: at most 8, the rest shown as before.
+    fn views(&mut self, proposals: &[String], v: &Value) -> std::collections::BTreeMap<String, Value> {
+        let mut out = std::collections::BTreeMap::new();
+        let texts = v["conflicts"].as_array().into_iter().flatten().filter(|c| {
+            c["text_conflicts"].as_array().is_some_and(|r| !r.is_empty())
+                && !c["into"].is_null()
+                && !c["from"].is_null()
+        });
+        for c in texts.take(8) {
+            let Some(path) = c["path"].as_str() else { continue };
+            if plain_path(path).is_err() {
+                continue;
+            }
+            if let Ok((marked, ranges)) = self.markers(proposals, path)
+                && let Some(r) = regions(&marked, &ranges)
+            {
+                out.insert(path.to_string(), r);
+            }
+        }
+        out
+    }
+
+    /// `resolve` with `markers`: the conflict's marked merge written over the working tree's `path`, to edit. Refused
+    /// while the agent has edits there not yet proposed, which it would lose.
+    fn mark(&mut self, proposals: &[String], path: &str) -> Result<Value, String> {
+        let file = self.file(path)?;
+        let status = self.git(&["status", "--porcelain", "--untracked-files=all", "--", path])?;
+        // Edits there are the agent's, unless the file is exactly what markers last wrote (finding 1d415d498eb4).
+        if !status.is_empty() && !self.still_marked(path)? {
+            return Err(format!(
+                "you have edits to {} not yet proposed: propose them first, or resolve with take tree to give them",
+                short(path)
+            ));
+        }
+        let (marked, ranges) = self.markers(proposals, path).map_err(|e| {
+            format!("{e}. Only a conflict whose base and both sides are text has markers: take into, from or delete")
+        })?;
+        let regions = regions(&marked, &ranges).map_or(0, |r| r.as_array().map_or(0, Vec::len));
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        }
+        std::fs::write(&file, &marked).map_err(|e| format!("writing {}: {e}", short(path)))?;
+        let mut all: Vec<(String, String)> = self.marked().into_iter().filter(|(p, _)| p != path).collect();
+        all.push((path.to_string(), blake3::hash(marked.as_bytes()).to_hex().to_string()));
+        self.save_marked(&all)?;
+        Ok(json!({
+            "path": path,
+            "regions": regions,
+            "next": format!(
+                "Your working tree's {} now holds the merge, each of its {regions} conflicting regions as the line's \
+                 side (<<<<<<< into), where they parted (||||||| base) and the proposal's (======= to >>>>>>> from). \
+                 Edit it until no marker line is left, keeping what each side needs, then resolve it with take tree \
+                 and the same proposals.",
+                short(path)
+            ),
+        }))
+    }
+
+    /// If `resolve` wrote markers into `path` since the tree was last replaced or committed, puts the working tree's
+    /// file back as its last commit has it, and forgets it: whether it did. Only `tree`'s resolution, which takes the
+    /// file as edited, or a file still exactly as markers wrote it, is put back; any other edit there is the agent's
+    /// and stays (finding 1d415d498eb4).
+    fn unmark(&mut self, path: &str, took_tree: bool) -> Result<bool, String> {
+        let mut all = self.marked();
+        let Some(k) = all.iter().position(|(p, _)| p == path) else { return Ok(false) };
+        if !took_tree && !self.still_marked(path)? {
+            all.remove(k);
+            self.save_marked(&all)?;
+            return Ok(false);
+        }
+        let tracked = self.git_output(&["cat-file", "-e", &format!("HEAD:{path}")])?.status.success();
+        if tracked {
+            self.git(&["checkout", "-q", "HEAD", "--", path])?;
+        } else {
+            let file = self.file(path)?;
+            if std::fs::symlink_metadata(&file).is_ok() {
+                std::fs::remove_file(&file).map_err(|e| format!("removing {}: {e}", short(path)))?;
+            }
+        }
+        all.remove(k);
+        self.save_marked(&all)?;
+        Ok(true)
     }
 
     /// Settles a conflict the agent's merge reported at `path`: its working tree's file as it stands (`tree`),
@@ -1668,7 +1879,7 @@ impl WeaveStore {
             "tree" => {
                 let bytes = std::fs::read(&file).map_err(|_| format!("no file {} in your tree", short(path)))?;
                 let text = String::from_utf8_lossy(&bytes);
-                if text.lines().any(|l| l.starts_with("<<<<<<<") || l.starts_with(">>>>>>>")) {
+                if holds_markers(&text) {
                     return Err(format!("{} still holds conflict markers: settle them first", short(path)));
                 }
             }
@@ -1897,6 +2108,19 @@ impl Store for WeaveStore {
 
     /// The line's head as `(path, text)` pairs: on a forked line, its first head in `weave head`'s order.
     fn integrated(&mut self) -> Result<Vec<(String, String)>, String> {
+        let files = self.head_files()?;
+        Ok(files.into_iter().map(|(p, b)| (p, String::from_utf8_lossy(&b).into_owned())).collect())
+    }
+
+    /// The head of this replica's line, which this agent integrates onto (task `b0a9769a48da`).
+    fn own_main(&mut self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.head_files()
+    }
+}
+
+impl WeaveStore {
+    /// The line's head as `(path, bytes)` pairs: on a forked line, its first head in `weave head`'s order.
+    fn head_files(&mut self) -> Result<Vec<(String, Vec<u8>)>, String> {
         let heads = self.heads()?;
         let Some(manifest) = heads["heads"][0]["manifest"].as_str().map(str::to_string) else {
             return Ok(Vec::new());
@@ -1923,8 +2147,7 @@ impl Store for WeaveStore {
                 if meta.is_dir() {
                     todo.push((entry.path(), path));
                 } else if meta.is_file() {
-                    let bytes = std::fs::read(entry.path()).map_err(|e| e.to_string())?;
-                    out.push((path, String::from_utf8_lossy(&bytes).into_owned()));
+                    out.push((path, std::fs::read(entry.path()).map_err(|e| e.to_string())?));
                 }
             }
         }

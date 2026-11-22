@@ -12,6 +12,8 @@
 //! - `line <text>`: a raw line
 //! - `env <NAME>`: an event quoting environment variable `<NAME>`
 //! - `stderr-env <NAME>`: the same, on standard error
+//! - `env-names`: an event listing the names of its environment's variables, never a value
+//! - `argv`: an event quoting its arguments
 //! - `probe <json>`: tries each access in `<json>` and reports which were allowed, never what it read
 //! - `connect-loop <host:port> <file>`: forever, a `CONNECT` through `HTTPS_PROXY` every 100 ms,
 //!   appending `ok` or `no` to `<file>` (after writing its pid to `<file>.pid`)
@@ -80,6 +82,13 @@ fn main() {
             "line" => fake.raw(rest),
             "env" => fake.emit(&json!({"type": "system", "subtype": "env", "value": std::env::var(rest).ok()})),
             "stderr-env" => eprintln!("{}", std::env::var(rest).unwrap_or_default()),
+            "env-names" => {
+                let mut names: Vec<String> =
+                    std::env::vars_os().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+                names.sort();
+                fake.emit(&json!({"type": "system", "subtype": "env_names", "names": names}));
+            }
+            "argv" => fake.emit(&json!({"type": "system", "subtype": "argv", "args": args})),
             "probe" => {
                 fake.emit(&json!({"type": "probe", "results": probe(&serde_json::from_str(rest).expect("spec"))}))
             }

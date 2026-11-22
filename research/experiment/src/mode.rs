@@ -118,6 +118,12 @@ pub trait Store {
     fn tree_files(&mut self) -> Result<Vec<(String, Vec<u8>)>, String> {
         Err(not_this_mode())
     }
+    /// A copy of a project run only: the main it integrates onto, as `(path, bytes)` (task `b0a9769a48da`): the
+    /// head of its replica's line in Weave mode, its own `main` branch in git project mode. The driver runs the
+    /// public tests on it after each integration.
+    fn own_main(&mut self) -> Result<Vec<(String, Vec<u8>)>, String> {
+        Err(not_this_mode())
+    }
     /// What the measures need to know about a tool call that just succeeded, for the event log only
     /// (never the agent): `writes`, the `[function, definition]` pairs it created or changed;
     /// `blocks`, the definitions a verdict against them stops; `conflict`, a merge that stopped.

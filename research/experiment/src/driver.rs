@@ -375,6 +375,39 @@ struct Run<'a> {
     integrator: Option<usize>,
     /// Per agent, the turns it has ended, [`STOPPED`] once it plays no more; and the integrator's wait on them.
     turns_ended: (Mutex<Vec<u32>>, Condvar),
+    /// A project run's: per agent, what the public tests last showed of the main it integrates onto ([`MainCheck`]).
+    mains: Mutex<Vec<MainCheck>>,
+    /// The public tests the project's seed passes: every main's first baseline, run once, when first needed.
+    seed_passing: Mutex<Option<std::collections::BTreeSet<String>>>,
+}
+
+/// What the public tests showed of one agent's own main, the one it integrates onto (task `b0a9769a48da`): the
+/// tree last tested, by digest, and its summary; the tests its last sound main passed; and, while main is broken,
+/// those of them that fail on it now. Broken is a regression: a public test that passed before fails, or errors.
+#[derive(Default)]
+struct MainCheck {
+    digest: String,
+    summary: Value,
+    passing: Option<std::collections::BTreeSet<String>>,
+    broken: Vec<String>,
+    /// Why the public tests couldn't show the last main sound, if they couldn't: its tree unread, the runner
+    /// failing or the tests not reporting (agent code that exits, hangs or deletes them), or no baseline. Blocks as
+    /// a broken main does, until a run that reports shows it sound (finding 9798bc24d2f3).
+    untested: Option<String>,
+}
+
+impl MainCheck {
+    fn blocked(&self) -> bool {
+        !self.broken.is_empty() || self.untested.is_some()
+    }
+}
+
+/// How a call steps on the agent's own main ([`Run::main_step`]): not at all, or an integration onto it, then
+/// tested; `others` if it brings other agents' work in, which is refused while that main is broken.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MainStep {
+    None,
+    Integrates { others: bool },
 }
 
 /// What the driver holds of a project run (Weave mode, or git project mode).
@@ -514,6 +547,8 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         taken,
         integrator,
         turns_ended: (Mutex::new(vec![0; cfg.agents]), Condvar::new()),
+        mains: Mutex::new((0..cfg.agents).map(|_| MainCheck::default()).collect()),
+        seed_passing: Mutex::new(None),
     };
     run.snapshot(&mut run.hub(), None, "setup");
     // A wave due after turn 0 goes out before anyone plays.
@@ -849,17 +884,7 @@ impl Run<'_> {
         let p = self.project.as_ref().ok_or("not a project run")?;
         let reply = self.copy(i).ok(&Request { op: "tree".into(), ..Request::default() })?;
         let files: Vec<(String, String)> = serde_json::from_value(reply.result).map_err(|e| e.to_string())?;
-        let scratch = crate::python::Scratch::new()?;
-        let tree = scratch.dir.join("tree");
-        for (rel, bytes) in files {
-            crate::weave_mode::plain_path(&rel)?;
-            let file = tree.join(&rel);
-            if let Some(parent) = file.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
-            }
-            std::fs::write(&file, hex::decode(bytes).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-        }
-        let run = crate::python::run_tests(&p.python, &p.project, &tree)?;
+        let run = self.test_files(p, &files)?;
         let count = |o: &str| run.count(o);
         Ok(json!({
             "reported": run.reported,
@@ -870,6 +895,207 @@ impl Run<'_> {
             "tests": run.tests.iter().map(|(id, o)| json!({"test": id, "outcome": o})).collect::<Vec<_>>(),
             "output": run.output,
         }))
+    }
+
+    /// How the call `tool` with `args` steps on agent `i`'s own main (task `b0a9769a48da`), the same rule in both
+    /// project modes: an integration onto it is tested after, and one that brings others' work in is refused
+    /// while it is broken. In Weave mode, `integrate`: with proposals it brings others' work in; with none it
+    /// records the agent's own tree, a repair or a fork's settling. In git project mode, on the agent's `main`:
+    /// `merge` of anything but `origin/main` brings others' work in, and of `origin/main` catches up; every `commit`
+    /// changes it, so is tested too, as every Weave `integrate` is (finding dbec448397a2). Nothing outside a project
+    /// run.
+    fn main_step(&self, i: usize, tool: &str, args: &Value) -> Result<MainStep, String> {
+        if self.project.is_none() {
+            return Ok(MainStep::None);
+        }
+        match (self.mode.name(), tool) {
+            ("weave", "integrate") => {
+                let others = args["proposals"].as_array().is_some_and(|p| !p.is_empty());
+                Ok(MainStep::Integrates { others })
+            }
+            (crate::git_project::NAME, "merge" | "commit") => {
+                if tool == "merge" && args["abort"] == true {
+                    return Ok(MainStep::None);
+                }
+                let req =
+                    Request { op: "tool".into(), tool: Some("status".into()), args: json!({}), ..Request::default() };
+                let status = self.copy(i).ok(&req)?.result;
+                if status["branch"] != "main" {
+                    return Ok(MainStep::None);
+                }
+                Ok(MainStep::Integrates { others: tool == "merge" && args["ref"] != "origin/main" })
+            }
+            _ => Ok(MainStep::None),
+        }
+    }
+
+    /// Whether agent `i`'s own main is broken or untested, so integrating others' work onto it is refused.
+    fn main_blocked(&self, i: usize) -> bool {
+        self.mains.lock().unwrap_or_else(|e| e.into_inner())[i].blocked()
+    }
+
+    /// For a blocked main: tests an untested one again, and says whether it is still blocked.
+    fn retest_blocked(&self, i: usize) -> bool {
+        let untested = self.mains.lock().unwrap_or_else(|e| e.into_inner())[i].untested.is_some();
+        if untested {
+            self.check_main(i);
+        }
+        self.main_blocked(i)
+    }
+
+    /// Why an integration of others' work onto agent `i`'s blocked main is refused, and how to repair it.
+    fn broken_message(&self, i: usize) -> String {
+        let (broken, untested) = {
+            let mains = self.mains.lock().unwrap_or_else(|e| e.into_inner());
+            (mains[i].broken.clone(), mains[i].untested.clone())
+        };
+        match untested {
+            Some(why) if broken.is_empty() => self.untested_message(&why),
+            _ => self.message_for(&broken),
+        }
+    }
+
+    /// How to repair a main, in this mode.
+    fn repair_how(&self) -> &'static str {
+        if self.mode.name() == "weave" {
+            "update to the line's head, fix it in your working tree, run_tests, then integrate your tree with no \
+             proposals"
+        } else {
+            "on your main, fix it, run_tests, and commit"
+        }
+    }
+
+    /// What a main whose public tests didn't run, for `why`, is told.
+    fn untested_message(&self, why: &str) -> String {
+        format!(
+            "main is broken: the public tests didn't run to the end on it ({why}), as when the package's import \
+             exits, hangs or deletes the tests. Repair it before you integrate anything else: {}. Until then, \
+             integrating others' work onto it is refused.",
+            self.repair_how()
+        )
+    }
+
+    /// Records that agent `i`'s main couldn't be shown sound, for `why`: blocked, and its summary.
+    fn untested(&self, i: usize, why: String, output: Option<String>) -> Value {
+        let mut summary = json!({"broken": true, "untested": why, "note": self.untested_message(&why)});
+        if let Some(o) = output {
+            summary["output"] = json!(o);
+        }
+        let mut mains = self.mains.lock().unwrap_or_else(|e| e.into_inner());
+        // The digest is forgotten, so the same tree is tested again next time.
+        mains[i].digest.clear();
+        mains[i].untested = Some(why);
+        summary
+    }
+
+    /// Runs the public tests on agent `i`'s own main, if it changed since they last ran there, and says what they
+    /// show: the counts, and whether main is broken, a public test its last sound main passed failing now. A sound
+    /// main becomes the next baseline; a broken one stays broken until a later integration passes them all again.
+    /// A run that couldn't show it sound (no tree, the runner failing, the tests not reporting, no baseline) leaves
+    /// it untested, which blocks as broken does (finding 9798bc24d2f3).
+    fn check_main(&self, i: usize) -> Value {
+        let Some(p) = self.project.as_ref() else { return Value::Null };
+        let files = self
+            .copy(i)
+            .ok(&Request { op: "main".into(), ..Request::default() })
+            .and_then(|r| serde_json::from_value::<Vec<(String, String)>>(r.result).map_err(|e| e.to_string()));
+        let files = match files {
+            Ok(f) => f,
+            Err(e) => {
+                return self.untested(i, format!("main's tree couldn't be read: {}", crate::args::short(&e)), None);
+            }
+        };
+        let now = digest(serde_json::to_string(&files).unwrap_or_default().as_bytes());
+        {
+            let mains = self.mains.lock().unwrap_or_else(|e| e.into_inner());
+            if mains[i].digest == now {
+                return mains[i].summary.clone();
+            }
+        }
+        // A run that doesn't report is run once more before main is called untested: on a loaded machine one can end
+        // at its wall time with nothing wrong in the tree.
+        let tested = match self.test_files(p, &files) {
+            Ok(r) if r.reported => Ok(r),
+            _ => self.test_files(p, &files),
+        };
+        let run = match tested {
+            Ok(r) if r.reported => r,
+            Ok(r) => return self.untested(i, format!("they ended {:?} without reporting", r.exit), Some(r.output)),
+            Err(e) => return self.untested(i, crate::args::short(&e), None),
+        };
+        let passing: std::collections::BTreeSet<String> =
+            run.tests.iter().filter(|(_, o)| o == "pass").map(|(t, _)| t.clone()).collect();
+        let before = {
+            let held = self.mains.lock().unwrap_or_else(|e| e.into_inner())[i].passing.clone();
+            match held.or_else(|| self.seed_passing(p)) {
+                Some(b) => b,
+                None => {
+                    let why = "the seed's public tests didn't run, so main has nothing to be compared with".into();
+                    return self.untested(i, why, None);
+                }
+            }
+        };
+        let broken: Vec<String> = before.difference(&passing).cloned().collect();
+        let count = |o: &str| run.count(o);
+        let mut summary = json!({"passed": count("pass"), "failed": count("fail"), "errors": count("error"),
+                                 "broken": !broken.is_empty()});
+        if !broken.is_empty() {
+            summary["regressed"] = json!(broken.iter().take(10).collect::<Vec<_>>());
+            summary["note"] = json!(self.message_for(&broken));
+        }
+        let mut mains = self.mains.lock().unwrap_or_else(|e| e.into_inner());
+        let m = &mut mains[i];
+        m.digest = now;
+        m.summary = summary.clone();
+        if broken.is_empty() {
+            m.passing = Some(passing);
+        } else if m.passing.is_none() {
+            m.passing = Some(before);
+        }
+        m.broken = broken;
+        m.untested = None;
+        summary
+    }
+
+    /// What a main broken at the public tests `broken` is told: which, and how to repair it.
+    fn message_for(&self, broken: &[String]) -> String {
+        let shown: Vec<&str> = broken.iter().take(5).map(String::as_str).collect();
+        let how = self.repair_how();
+        format!(
+            "main is broken: {} public tests that passed on it before fail now ({}). Repair it before you integrate \
+             anything else: {how}. Until then, integrating others' work onto it is refused.",
+            broken.len(),
+            shown.join(", ")
+        )
+    }
+
+    /// The public tests the project's seed passes, run once it reports: none if it didn't, and then the next check
+    /// tries again (finding 9798bc24d2f3).
+    fn seed_passing(&self, p: &ProjectRun) -> Option<std::collections::BTreeSet<String>> {
+        let mut held = self.seed_passing.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(s) = held.as_ref() {
+            return Some(s.clone());
+        }
+        let run = crate::python::run_tests(&p.python, &p.project, &p.project.seed).ok().filter(|r| r.reported)?;
+        let passing: std::collections::BTreeSet<String> =
+            run.tests.iter().filter(|(_, o)| o == "pass").map(|(t, _)| t.clone()).collect();
+        *held = Some(passing.clone());
+        Some(passing)
+    }
+
+    /// `files`, as `(path, hex)` pairs, written to a scratch tree and given the project's public tests.
+    fn test_files(&self, p: &ProjectRun, files: &[(String, String)]) -> Result<crate::python::TestRun, String> {
+        let scratch = crate::python::Scratch::new()?;
+        let tree = scratch.dir.join("tree");
+        for (rel, bytes) in files {
+            crate::weave_mode::plain_path(rel)?;
+            let file = tree.join(rel);
+            if let Some(parent) = file.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+            }
+            std::fs::write(&file, hex::decode(bytes).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        }
+        crate::python::run_tests(&p.python, &p.project, &tree)
     }
 
     /// What the hub takes from agent `i`, and as whom.
@@ -961,12 +1187,13 @@ impl Run<'_> {
         let deadline = Instant::now() + self.cfg.turn_limit;
         let result = std::thread::scope(|scope| {
             let player = scope.spawn(|| backend.turn(i, &name, turn, socket));
-            let served = loop {
+            let listener = listener;
+            let accepted = loop {
                 match listener.accept() {
-                    Ok((stream, _)) => break self.serve(i, turn, stream, deadline, backend),
+                    Ok((stream, _)) => break Ok(Some(stream)),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         if player.is_finished() {
-                            break Ok(());
+                            break Ok(None);
                         }
                         if Instant::now() > deadline {
                             // Step 6 ends the agent's process here; the mock's thread is waited for.
@@ -976,6 +1203,16 @@ impl Run<'_> {
                     }
                     Err(e) => break Err(format!("accepting on {}: {e}", socket.display())),
                 }
+            };
+            // A turn takes one connection: the socket goes now, before the player is waited for, so one that comes
+            // later, or again, is refused at once instead of waiting unaccepted for ever (finding dff42e94c7bb), as
+            // a sync session's listeners go with its relay.
+            drop(listener);
+            let _ = std::fs::remove_file(socket);
+            let served = match accepted {
+                Ok(Some(stream)) => self.serve(i, turn, stream, deadline, backend),
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
             };
             let played = player.join().unwrap_or_else(|_| Err("the backend panicked".into()));
             served.and(played)
@@ -1102,10 +1339,39 @@ impl Run<'_> {
                 })
             })
         } else {
-            self.copy(i).ok(&Request { op: "tool".into(), tool: Some(tool), args, ..Request::default() }).map(|r| {
-                record = r.record;
-                r.result
-            })
+            match self.main_step(i, &tool, &args) {
+                Err(e) => Err(e),
+                // An untested main is tried again first: what stopped its tests may have passed.
+                Ok(MainStep::Integrates { others: true }) if self.main_blocked(i) && self.retest_blocked(i) => {
+                    self.events.log(Some(name), "main_broken_refusal", json!({"turn": turn, "tool": shown}));
+                    Err(self.broken_message(i))
+                }
+                Ok(step) => {
+                    let req = Request { op: "tool".into(), tool: Some(tool.clone()), args, ..Request::default() };
+                    let reply = self.copy(i).ok(&req).map(|r| {
+                        record = r.record;
+                        r.result
+                    });
+                    match (step, reply) {
+                        // A merge that stopped at conflicts changed nothing yet; its commit is tested, as Weave's
+                        // conflicting integrate is an error that changes nothing (finding dbec448397a2).
+                        (MainStep::Integrates { .. }, Ok(v)) if v["merged"] == false => Ok(v),
+                        (MainStep::Integrates { .. }, Ok(mut v)) => {
+                            let tested = self.check_main(i);
+                            self.events.log(
+                                Some(name),
+                                "main_tests",
+                                json!({"turn": turn, "tool": shown, "tests": tested}),
+                            );
+                            if let Some(o) = v.as_object_mut() {
+                                o.insert("main_tests".into(), tested);
+                            }
+                            Ok(v)
+                        }
+                        (_, reply) => reply,
+                    }
+                }
+            }
         };
         let mut result = result;
         if let (Some(taken), "task", Ok(v)) = (&self.taken, tool_name(params), &mut result) {

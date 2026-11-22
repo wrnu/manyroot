@@ -27,7 +27,10 @@
 //! line refuses leaves its proposal open.
 //!
 //! In both project modes, after reading the task, an agent takes the first item no one has taken (task
-//! `cb6a40559593`), unless it is the run's one integrator; it writes its own module whatever it holds.
+//! `cb6a40559593`), unless it is the run's one integrator; it writes its own module whatever it holds. Where
+//! [`MockBackend::breaks`] says, an agent also breaks the package's import, so the public tests fail: an agent
+//! whose integration then reports main broken checks that integrating others' work is refused, repairs main, and
+//! checks the repair reports it sound again, before it integrates anything else (task `b0a9769a48da`).
 //!
 //! In git project mode it reads the task the same way and writes the same module, on its own main where it
 //! may update main, else on a branch of the turn, from `origin/main`, whose integration it asks for. An agent
@@ -76,7 +79,18 @@ pub struct MockBackend {
     pub unknown: crate::backend::UnknownCalls,
     /// Each hint an agent was given: `(agent, turn, hint)`, on a tool result or opening its turn.
     pub hinted: std::sync::Mutex<Vec<(usize, u32, String)>>,
+    /// A project run's `(agent, turn)` that also breaks the package's import ([`BREAK_LINE`]), so main breaks once
+    /// it is integrated.
+    pub breaks: Option<(usize, u32)>,
+    /// What it appends to break it: [`BREAK_LINE`] unless given, such as [`EXIT_LINE`].
+    pub break_line: &'static str,
 }
+
+/// The line an agent that breaks main appends to its package's `__init__.py`, and its integrator takes out.
+pub const BREAK_LINE: &str = "raise ImportError(\"broken on purpose\")\n";
+
+/// A break the public tests can't report on: the import ends the test runner's process before it says anything.
+pub const EXIT_LINE: &str = "import os; os._exit(3)  # broken on purpose\n";
 
 /// The name the mock's agents call that the shim doesn't offer: the one e3wb's agent made up.
 pub const UNKNOWN_TOOL: &str = "mcp__experiment__give_up_item";
@@ -96,6 +110,8 @@ impl Default for MockBackend {
             unknown_each: 1,
             unknown: crate::backend::UnknownCalls::default(),
             hinted: std::sync::Mutex::new(Vec::new()),
+            breaks: None,
+            break_line: BREAK_LINE,
         }
     }
 }
@@ -122,9 +138,14 @@ impl Moves {
     }
 }
 
+/// The longest the mock waits for one reply: past any turn's limit, so a turn the driver stopped serving without a
+/// reply fails instead of waiting for ever.
+const REPLY_LIMIT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// A minimal MCP client over newline-delimited JSON-RPC.
 pub struct Client {
-    reader: BufReader<Box<dyn Read + Send>>,
+    /// The driver's lines, read on their own thread so a reply is waited for at most [`REPLY_LIMIT`].
+    lines: std::sync::mpsc::Receiver<std::io::Result<String>>,
     writer: Box<dyn Write + Send>,
     next: u64,
     /// Tool calls made so far.
@@ -134,13 +155,26 @@ pub struct Client {
     /// Text a result carried beyond its first block: a hint naming the tools.
     pub hints: Vec<String>,
     _child: Option<std::process::Child>,
+    /// The driver's socket, where the client is connected to it directly: shut down when the client is dropped,
+    /// since the reading thread holds it open too.
+    socket: Option<UnixStream>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(s) = &self.socket {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 impl Client {
     pub fn connect(socket: &Path, shim: Option<&Path>) -> Result<Client, String> {
+        let mut direct = None;
         let (reader, writer, child): (Box<dyn Read + Send>, Box<dyn Write + Send>, _) = match shim {
             None => {
                 let s = UnixStream::connect(socket).map_err(|e| socket_error("connecting to", socket, &e))?;
+                direct = Some(s.try_clone().map_err(|e| e.to_string())?);
                 (Box::new(s.try_clone().map_err(|e| e.to_string())?), Box::new(s), None)
             }
             Some(bin) => {
@@ -159,14 +193,27 @@ impl Client {
                 (Box::new(r), Box::new(w), Some(child))
             }
         };
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut line = String::new();
+                let read = reader.read_line(&mut line).map(|_| line);
+                let ended = !matches!(&read, Ok(l) if !l.is_empty());
+                if send.send(read).is_err() || ended {
+                    return;
+                }
+            }
+        });
         let mut c = Client {
-            reader: BufReader::new(reader),
+            lines,
             writer,
             next: 1,
             calls: 0,
             asked: Vec::new(),
             hints: Vec::new(),
             _child: child,
+            socket: direct,
         };
         c.request(
             "initialize",
@@ -184,8 +231,16 @@ impl Client {
         let id = self.next;
         self.next += 1;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
-        let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let line = match self.lines.recv_timeout(REPLY_LIMIT) {
+            Ok(Ok(line)) if !line.is_empty() => line,
+            Ok(Ok(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("the driver ended the connection before replying to {method}"));
+            }
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!("no reply to {method} within {} s", REPLY_LIMIT.as_secs()));
+            }
+        };
         let reply: Value = serde_json::from_str(&line).map_err(|e| format!("bad reply: {e}"))?;
         if reply["id"] != id {
             return Err("reply out of order".into());
@@ -383,11 +438,13 @@ impl MockBackend {
         let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
         let noted = notes["notes"].as_str().unwrap_or_default().to_string();
+        let breaks = (self.breaks == Some((agent, turn))).then_some(self.break_line);
+        let mended = self.break_line;
         if has("request_integration") {
-            return git_project_turn(c, agent, turn, self.integrator, &noted);
+            return git_project_turn(c, agent, turn, self.integrator, &noted, (breaks, mended));
         }
         if has("propose") {
-            return weave_turn(c, agent, turn, self.integrator, &noted);
+            return weave_turn(c, agent, turn, self.integrator, &noted, (breaks, mended));
         }
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
         if has("replace") && !has("pr_open") {
@@ -516,7 +573,14 @@ impl MockBackend {
 
 /// One Weave-mode turn of a project run (see the module's doc). With one `integrator`, any other agent only
 /// proposes, and the integrator integrates every open proposal, its own with them.
-fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>, notes: &str) -> Result<(), String> {
+fn weave_turn(
+    c: &mut Client,
+    agent: usize,
+    turn: u32,
+    integrator: Option<usize>,
+    notes: &str,
+    (breaks, mended): (Option<&str>, &str),
+) -> Result<(), String> {
     let task = read_task(c, agent, turn)?;
     let took = take_an_item(c, agent, &task, integrator, notes)?;
     let head = c.tool("head", json!({}))?;
@@ -536,7 +600,7 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>
     } else if heads.first().map(String::as_str) != head["base"].as_str() {
         c.tool("update", json!({}))?;
     }
-    let module = write_own_module(c, agent, turn)?;
+    let module = write_own_module(c, agent, turn, breaks)?;
     let proposed = c.tool("propose", json!({"summary": format!("agent {agent}'s module of turn {turn}")}))?;
     let proposal = proposed["proposal"].as_str().ok_or("propose gave no proposal")?.to_string();
     if integrator.is_some_and(|n| n != agent) {
@@ -557,7 +621,18 @@ fn weave_turn(c: &mut Client, agent: usize, turn: u32, integrator: Option<usize>
     }
     // Refused if the line forked under it: the proposal stays open, for later. Any other failure is the turn's,
     // so it names its real step (task 61c34b3c2704).
-    match c.tool("integrate", json!({"proposals": proposals, "note": format!("agent {agent}'s turn {turn}")})) {
+    let integrate = json!({"proposals": proposals, "note": format!("agent {agent}'s turn {turn}")});
+    match c.tool("integrate", integrate.clone()) {
+        Ok(done) if done["main_tests"]["broken"] == true => {
+            // Main broke: integrating more is refused until it is repaired, through the agent's own tree.
+            let refused = refused_while_broken(&done["main_tests"], c.tool("integrate", integrate))?;
+            c.tool("update", json!({}))?;
+            if refused && holds_break(c, mended)? {
+                unbreak(c, mended)?;
+                let repaired = c.tool("integrate", json!({"note": format!("agent {agent} repairs main")}))?;
+                sound_again(&repaired)?;
+            }
+        }
         Ok(_) => {
             c.tool("update", json!({}))?;
         }
@@ -576,6 +651,7 @@ fn git_project_turn(
     turn: u32,
     integrator: Option<usize>,
     notes: &str,
+    (breaks, mended): (Option<&str>, &str),
 ) -> Result<(), String> {
     let task = read_task(c, agent, turn)?;
     let took = take_an_item(c, agent, &task, integrator, notes)?;
@@ -590,8 +666,22 @@ fn git_project_turn(
     } else {
         c.tool("switch", json!({"branch": branch, "create": true}))?;
     }
-    let module = write_own_module(c, agent, turn)?;
-    c.tool("commit", json!({"message": format!("agent {agent}'s module of turn {turn}")}))?;
+    let module = write_own_module(c, agent, turn, breaks)?;
+    let committed = c.tool("commit", json!({"message": format!("agent {agent}'s module of turn {turn}")}))?;
+    if committed["main_tests"]["broken"] == true {
+        // Its own commit broke its main: every commit on main is tested, as every Weave integration is. Merging an
+        // open request is then refused until it is repaired.
+        let open = c.tool("requests", json!({}))?;
+        let mut refused = true;
+        if let Some(r) = open["requests"].as_array().and_then(|r| r.first()) {
+            refused = refused_while_broken(&committed["main_tests"], c.tool("merge", json!({"ref": r["branch"]})))?;
+        }
+        if refused && holds_break(c, mended)? {
+            unbreak(c, mended)?;
+            let repaired = c.tool("commit", json!({"message": format!("agent {agent} repairs main")}))?;
+            sound_again(&repaired)?;
+        }
+    }
     let diff = c.tool("diff", json!({"against": "origin/main"}))?;
     if !diff["files"].as_array().is_some_and(|f| f.iter().any(|f| f["path"] == module.as_str())) {
         return Err(format!("the diff against origin/main leaves out {module}: {diff}"));
@@ -616,6 +706,16 @@ fn git_project_turn(
             if merged["merged"] != true {
                 return Err(format!("merging {} conflicts: {merged}", r["branch"]));
             }
+            if merged["main_tests"]["broken"] == true {
+                // Main broke: merging more is refused until it is repaired, on main itself.
+                let refused =
+                    refused_while_broken(&merged["main_tests"], c.tool("merge", json!({"ref": r["branch"]})))?;
+                if refused && holds_break(c, mended)? {
+                    unbreak(c, mended)?;
+                    let repaired = c.tool("commit", json!({"message": format!("agent {agent} repairs main")}))?;
+                    sound_again(&repaired)?;
+                }
+            }
         }
     }
     let synced = c.tool("sync", json!({}))?;
@@ -633,9 +733,66 @@ fn git_project_turn(
     Ok(())
 }
 
+/// An integration tried while main is broken, as `report` said, must be refused as such: whether it was. Only where
+/// `report` said main was untested may it go through instead, once the driver's retest shows main sound (the run
+/// that didn't report may have been slow, not broken): then there's nothing to repair.
+fn refused_while_broken(report: &Value, tried: Result<Value, String>) -> Result<bool, String> {
+    match tried {
+        Err(e) if e.contains("main is broken") && e.contains("Repair it before you integrate anything else") => {
+            Ok(true)
+        }
+        Ok(v) if report["untested"].is_string() && v["main_tests"]["broken"] == false => Ok(false),
+        other => Err(format!("an integration onto a broken main wasn't refused as such: {other:?}")),
+    }
+}
+
+/// Whether the working tree's package holds the break `line`: a main reported broken without it was only reported
+/// untested by a slow run, with nothing to repair.
+fn holds_break(c: &mut Client, line: &str) -> Result<bool, String> {
+    let init = package_init(c)?;
+    let read = c.tool("read_file", json!({"path": init}))?;
+    let text: String =
+        read["text"].as_str().unwrap_or_default().lines().map(|l| format!("{}\n", l.get(7..).unwrap_or(""))).collect();
+    Ok(text.contains(line))
+}
+
+/// Takes the break `line` out of the working tree's package, and runs the public tests.
+fn unbreak(c: &mut Client, line: &str) -> Result<(), String> {
+    let init = package_init(c)?;
+    c.tool("edit_file", json!({"path": init, "old": line, "new": ""}))?;
+    let tests = c.tool("run_tests", json!({}))?;
+    if tests["reported"] == true && (tests["errors"] != 0 || tests["failed"] != 0) {
+        return Err(format!("the repaired tree still fails its public tests: {tests}"));
+    }
+    Ok(())
+}
+
+/// A repair's integration must not report main broken by its tests; a run too slow to report leaves it untested,
+/// which the next integration's retest settles.
+fn sound_again(repaired: &Value) -> Result<(), String> {
+    let t = &repaired["main_tests"];
+    if t["broken"] != false && !t["untested"].is_string() {
+        return Err(format!("the repair didn't report main sound: {repaired}"));
+    }
+    Ok(())
+}
+
+/// The package's `__init__.py` in the working tree.
+fn package_init(c: &mut Client) -> Result<String, String> {
+    let files = c.tool("list_files", json!({}))?;
+    files["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| f["path"].as_str())
+        .find(|p| p.ends_with("/__init__.py") && p.matches('/').count() == 1)
+        .map(str::to_string)
+        .ok_or_else(|| "no package in the tree".to_string())
+}
+
 /// Writes the agent's own module of this turn into the package, after looking at its tree, and runs the public
-/// tests: its path.
-fn write_own_module(c: &mut Client, agent: usize, turn: u32) -> Result<String, String> {
+/// tests: its path. If it `breaks`, it also appends that line to the package's `__init__.py`.
+fn write_own_module(c: &mut Client, agent: usize, turn: u32, breaks: Option<&str>) -> Result<String, String> {
     let files = c.tool("list_files", json!({}))?;
     let init = files["files"]
         .as_array()
@@ -649,6 +806,17 @@ fn write_own_module(c: &mut Client, agent: usize, turn: u32) -> Result<String, S
     let package = init.trim_end_matches("/__init__.py");
     let module = format!("{package}/by_agent_{agent}_turn_{turn}.py");
     c.tool("write_file", json!({"path": module, "text": format!("VALUE = {}\n", turn * 10 + agent as u32)}))?;
+    if let Some(line) = breaks {
+        let read = c.tool("read_file", json!({"path": init}))?;
+        // Each line as read_file numbers it: five places for its number, then two spaces.
+        let text: String = read["text"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .map(|l| format!("{}\n", l.get(7..).unwrap_or("")))
+            .collect();
+        c.tool("write_file", json!({"path": init, "text": format!("{text}{line}")}))?;
+    }
     c.tool("run_tests", json!({}))?;
     Ok(module)
 }

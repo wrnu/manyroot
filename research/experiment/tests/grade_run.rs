@@ -75,7 +75,7 @@ mod macos_only {
 
     use super::*;
     use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, git_binary, run};
-    use bracken_experiment::mock::MockBackend;
+    use bracken_experiment::mock::{BREAK_LINE, EXIT_LINE, MockBackend};
     use bracken_experiment::plan::{PlanInputs, ProjectPlan};
     use bracken_experiment::project::{Project, digest};
     use bracken_experiment::python::PythonPin;
@@ -178,7 +178,9 @@ mod macos_only {
             git: git_binary().expect("git"),
             trace: false,
             calls_per_turn: CALLS_PER_TURN,
-            turn_limit: TURN_LIMIT,
+            // Every change to an integrator's main runs the public tests in a container, which on a loaded
+            // machine can take minutes each: a turn's limit here is for a stuck turn, not a slow Docker.
+            turn_limit: 3 * TURN_LIMIT,
             plan: PlanInputs {
                 project: Some(ProjectPlan::of(&Project::load(project).expect("the project")).expect("its plan")),
                 python: Some(python),
@@ -564,6 +566,117 @@ mod macos_only {
         assert_eq!(end["at"], "end");
         let turn = end["grade"]["groups"].as_array().expect("groups").iter().find(|g| g["index"] == 3).expect("3");
         assert_eq!(turn["outcomes"], json!(["pass"]), "{mode}: the integrator's own last work is on main: {end}");
+    }
+
+    /// After each change to an agent's own main the driver runs the public tests on it, the same in both modes
+    /// (task `b0a9769a48da`, findings `9798bc24d2f3`, `dbec448397a2`): `breaker` breaks the package's import with
+    /// `line` in turn 1, a builder's work the integrator brings in or the integrator's own; the change that brings it
+    /// says main is broken (`untested` if the tests can't report); integrating others' work is then refused until
+    /// the integrator repairs main in its own tree, which the tests then show sound; and main ends without the break.
+    fn a_broken_main_is_repaired_before_anything_else_is_integrated(
+        mode: &'static str,
+        breaker: usize,
+        line: &'static str,
+    ) {
+        let Some(python) = pin() else { return };
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+        let (project, _) = project_and_store(&root);
+        // Traced, so a turn's error is kept whole in turn-errors.txt.
+        let cfg = RunConfig {
+            trace: true,
+            ..config_of(mode, "agent-2", python, root.join("run"), 3, 2, &project, false, false)
+        };
+        let mock = MockBackend {
+            seed: 1,
+            shim: Some(bin()),
+            lockstep: true,
+            integrator: Some(2),
+            breaks: Some((breaker, 1)),
+            break_line: line,
+            ..MockBackend::default()
+        };
+        let outcome = run(&cfg, &mock).expect("the run");
+        let text = std::fs::read_to_string(cfg.root.join("events.jsonl")).expect("the events");
+        let log: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).expect("an event")).collect();
+        let errors: Vec<&Value> = log.iter().filter(|e| e["event"] == "turn_error").collect();
+        let kept = std::fs::read_to_string(cfg.root.join("turn-errors.txt")).unwrap_or_default();
+        assert!(errors.is_empty(), "{mode}: no turn erred: {errors:?}\n{kept}");
+        let tested: Vec<&Value> = log.iter().filter(|e| e["event"] == "main_tests").collect();
+        assert!(tested.iter().all(|e| e["agent"] == "agent-2"), "{mode}: only the integrator integrates: {tested:?}");
+        // The break's report: regressed tests, or untested where the import ends the runner. A run this machine's
+        // load stops can report untested too, before or after; the driver's retest then clears it.
+        let real = |e: &&&Value| {
+            let t = &e["data"]["tests"];
+            t["broken"] == true && if line == EXIT_LINE { t["untested"].is_string() } else { t["regressed"].is_array() }
+        };
+        let broke = tested.iter().position(|e| real(&e)).expect("main broke");
+        assert!(
+            tested[..broke]
+                .iter()
+                .all(|e| e["data"]["tests"]["broken"] == false || e["data"]["tests"]["untested"].is_string())
+        );
+        let repaired = tested[broke + 1..].iter().find(|e| e["data"]["tests"]["broken"] == false).expect("a repair");
+        let refusals: Vec<&Value> = log.iter().filter(|e| e["event"] == "main_broken_refusal").collect();
+        assert!(!refusals.is_empty(), "{mode}: integrating onto the broken main was refused");
+        let seq = |e: &Value| e["seq"].as_u64().expect("a seq");
+        assert!(
+            refusals.iter().any(|r| seq(tested[broke]) < seq(r) && seq(r) < seq(repaired)),
+            "{mode}: in that order"
+        );
+        // Every refusal comes while main's last report was broken.
+        for r in &refusals {
+            let last = tested.iter().rfind(|e| seq(e) < seq(r)).expect("a report before it");
+            assert_eq!(last["data"]["tests"]["broken"], true, "{mode}: refused only while broken: {r}");
+        }
+        assert!(outcome.modules.iter().all(|(_, t)| !t.contains("broken on purpose")), "{mode}: main ends sound");
+        let work = format!("by_agent_{breaker}_turn_1");
+        assert!(outcome.modules.iter().any(|(p, _)| p.contains(&work)), "{mode}: the breaker's work stays");
+    }
+
+    #[test]
+    fn a_weave_integrator_repairs_a_broken_main_first() {
+        a_broken_main_is_repaired_before_anything_else_is_integrated("weave", 0, BREAK_LINE);
+    }
+
+    #[test]
+    fn a_git_project_integrator_repairs_a_broken_main_first() {
+        a_broken_main_is_repaired_before_anything_else_is_integrated(
+            bracken_experiment::git_project::NAME,
+            0,
+            BREAK_LINE,
+        );
+    }
+
+    /// An import that ends the test runner leaves main untested, which blocks as broken does (finding 9798bc24d2f3).
+    #[test]
+    fn a_weave_main_the_tests_cant_report_on_is_repaired_first() {
+        a_broken_main_is_repaired_before_anything_else_is_integrated("weave", 0, EXIT_LINE);
+    }
+
+    #[test]
+    fn a_git_project_main_the_tests_cant_report_on_is_repaired_first() {
+        a_broken_main_is_repaired_before_anything_else_is_integrated(
+            bracken_experiment::git_project::NAME,
+            0,
+            EXIT_LINE,
+        );
+    }
+
+    /// The integrator's own change to main is tested as any other is, in both modes (finding dbec448397a2): its own
+    /// proposal in Weave, its own commit on main in git.
+    #[test]
+    fn a_weave_integrators_own_break_is_caught() {
+        a_broken_main_is_repaired_before_anything_else_is_integrated("weave", 2, BREAK_LINE);
+    }
+
+    #[test]
+    fn a_git_project_integrators_own_break_is_caught() {
+        a_broken_main_is_repaired_before_anything_else_is_integrated(
+            bracken_experiment::git_project::NAME,
+            2,
+            BREAK_LINE,
+        );
     }
 
     #[test]

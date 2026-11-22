@@ -1277,21 +1277,41 @@ fn read_stderr(stderr: std::process::ChildStderr) -> Receiver<Vec<u8>> {
     rx
 }
 
-/// A turn's transcript: written as the stream arrives, refusing any line holding the secret,
-/// and checked again whole before it is kept.
-struct Transcript<'a> {
+/// A turn's transcript: written as the stream arrives, refusing any line holding the secret, and checked again whole
+/// before it is kept. The secret is looked for as given and as a JSON string holds it, escaped, and with `/` escaped
+/// too, as some writers do, since the stream is JSON (finding de508082cfc6).
+struct Transcript {
     path: PathBuf,
     file: File,
-    secret: &'a str,
+    forms: Vec<String>,
 }
 
-impl<'a> Transcript<'a> {
-    fn create(path: &Path, secret: &'a str) -> Result<Transcript<'a>, String> {
-        Ok(Transcript { path: path.to_path_buf(), file: private_file(path)?, secret })
+/// `secret` as given, and as a JSON string's text: escaped, and escaped with `/` as `\/` too; each once.
+fn secret_forms(secret: &str) -> Vec<String> {
+    let json = serde_json::to_string(secret).unwrap_or_default();
+    let escaped = json.get(1..json.len().saturating_sub(1)).unwrap_or_default().to_string();
+    let mut forms = vec![secret.to_string()];
+    for f in [escaped.clone(), escaped.replace('/', "\\/")] {
+        if !forms.contains(&f) {
+            forms.push(f);
+        }
+    }
+    forms
+}
+
+impl Transcript {
+    fn create(path: &Path, secret: &str) -> Result<Transcript, String> {
+        Ok(Transcript { path: path.to_path_buf(), file: private_file(path)?, forms: secret_forms(secret) })
+    }
+
+    /// Whether `b` holds any form of the secret; an empty secret can't be looked for, so counts as held, never a
+    /// panic on windows(0).
+    fn holds(&self, b: &[u8]) -> bool {
+        self.forms.iter().any(|f| f.is_empty() || b.windows(f.len()).any(|w| w == f.as_bytes()))
     }
 
     fn line(&mut self, line: &str) -> Result<(), String> {
-        if line.contains(self.secret) {
+        if self.holds(line.as_bytes()) {
             return Err("the event stream held the auth value".into());
         }
         writeln!(self.file, "{line}").map_err(|e| format!("writing the transcript: {e}"))
@@ -1300,10 +1320,7 @@ impl<'a> Transcript<'a> {
     /// Keeps the transcript, with `stderr` beside it, only if neither holds the secret; else removes it.
     fn finish(mut self, stderr: &[u8]) -> Result<(), String> {
         let written = self.file.flush().and_then(|()| std::fs::read(&self.path));
-        // An empty secret can't be looked for: counted as leaked, never a panic on windows(0).
-        let leaked =
-            |b: &[u8]| self.secret.is_empty() || b.windows(self.secret.len()).any(|w| w == self.secret.as_bytes());
-        if !written.is_ok_and(|b| !leaked(&b) && !leaked(stderr)) {
+        if !written.is_ok_and(|b| !self.holds(&b) && !self.holds(stderr)) {
             let _ = std::fs::remove_file(&self.path);
             return Err("a transcript held the auth value, or couldn't be read back; it was removed".into());
         }
@@ -1405,6 +1422,19 @@ mod tests {
 
     /// What a harness could do if Pin's fields were its to set (finding ab0192deac8f): the check
     /// refuses either, though each pin's own file and hash still match.
+    /// The transcript check looks for the secret as given and as JSON would escape it (finding de508082cfc6).
+    #[test]
+    fn a_secret_is_looked_for_as_json_escapes_it_too() {
+        assert_eq!(secret_forms("plain-0123456789"), ["plain-0123456789"]);
+        assert_eq!(secret_forms("a/b+c=d"), ["a/b+c=d", "a\\/b+c=d"]);
+        assert_eq!(secret_forms("q\"b\\s"), ["q\"b\\s", "q\\\"b\\\\s"]);
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let mut t = Transcript::create(&tmp.path().join("t.jsonl"), "tok/en-0123456789").expect("a transcript");
+        assert!(t.line(r#"{"value":"tok\/en-0123456789"}"#).is_err(), "the escaped form is found");
+        t.line(r#"{"value":"nothing"}"#).expect("kept");
+        assert!(t.finish(b"tok/en-0123456789").is_err(), "standard error is checked too");
+    }
+
     #[test]
     fn a_pin_whose_program_left_its_install_fails_its_check() {
         let tmp = tempfile::tempdir().expect("a temp dir");

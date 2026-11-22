@@ -62,7 +62,9 @@ pub fn turn_message(turn: u32, turns: u32, name: &str) -> String {
 /// agent (task `5b2f7f4a6b7f`); the plan hashes it.
 pub const INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents take the items and propose their \
      work, and only you integrate onto main, so review their proposals, integrate what's sound and settle any \
-     conflict. You take no items yourself. Nor do you write any item's code. Each of your turns starts once every \
+     conflict. You take no items yourself. You may write code, but only to reconcile a conflict or to repair \
+     main. After each integration, its result shows main's public tests: while a test that passed on main before fails, \
+     main is broken, and you repair it before you integrate anything else. Each of your turns starts once every \
      other agent has ended that turn, so in each integrate every proposal open then, and end the turn when none is \
      left. Your last turn starts only once every other agent's last turn has ended, so in it integrate every \
      proposal still open.";
@@ -76,8 +78,10 @@ pub const BUILDER_ROLE: &str = "{integrator} is the run's one integrator: propos
 /// Git project mode's [`INTEGRATOR_ROLE`], in git's words (task `6bd13d994a03`). The plan hashes it.
 pub const GIT_INTEGRATOR_ROLE: &str = "You are the run's one integrator: the other agents take the items, push their \
      work on branches and ask for its integration, and only you update main, so review their requests, merge what's \
-     sound into your main, settle any conflict, and sync. You take no items yourself. Nor do you write any item's \
-     code. Each of your turns starts once every other agent has ended that turn, so in each merge every request \
+     sound into your main, settle any conflict, and sync. You take no items yourself. You may write code, but \
+     only to reconcile a conflict or to repair main. After each integration, its result shows main's public tests: while a \
+     test that passed on main before fails, main is broken, and you repair it before you integrate anything else. \
+     Each of your turns starts once every other agent has ended that turn, so in each merge every request \
      open then, sync, and end the turn when none is left. Your last turn starts only once every other agent's last \
      turn has ended, so in it merge every request still open.";
 
@@ -271,7 +275,16 @@ mod tests {
             assert!(builder.contains("{integrator}'s last turn comes after your last"), "{mode}");
             // Integration as work arrives, not only in the last turn (task 61911c91247f).
             assert!(integrator.contains("Each of your turns starts once every other agent has ended that turn"));
-            assert!(integrator.contains("Nor do you write any item's code."), "{mode}");
+            // The integrator may write code to reconcile or repair, and repairs a broken main first, in the same
+            // words in both modes (task b0a9769a48da).
+            for rule in [
+                "You may write code, but only to reconcile a conflict or to repair main.",
+                "After each integration, its result shows main's public tests: while a test that passed on main \
+                 before fails, main is broken, and you repair it before you integrate anything else.",
+            ] {
+                assert_eq!(integrator.matches(rule).count(), 1, "{mode}: {rule}");
+            }
+            assert!(!integrator.contains("write any item's code"), "{mode}");
             assert!(builder.contains("after each of your turns") && builder.contains("as soon as"), "{mode}");
         }
     }
