@@ -142,6 +142,19 @@ impl Graph {
     /// Checks every protocol rule. Rules only look at `c` and its parents, so
     /// any two replicas holding those parents reach the same answer.
     pub fn check(&self, c: &Contribution) -> Result<(), RuleViolation> {
+        self.check_rules(c, || c.signature_is_valid())
+    }
+
+    /// [`Graph::check`] with `c`'s signature verified in advance: `signature_valid` must be
+    /// `c.signature_is_valid()`, worked out elsewhere (on another thread, say). The rules and the order
+    /// they're checked in are [`Graph::check`]'s, so the verdict is too (task `7a3d17f979c3`).
+    pub(crate) fn check_presigned(&self, c: &Contribution, signature_valid: bool) -> Result<(), RuleViolation> {
+        self.check_rules(c, || signature_valid)
+    }
+
+    /// Every protocol rule, in order, with the signature's validity from `signature_valid`, asked at the
+    /// rule's place in the order and only if every rule before it holds.
+    fn check_rules(&self, c: &Contribution, signature_valid: impl FnOnce() -> bool) -> Result<(), RuleViolation> {
         let content = c.content();
         if content.protocol != PROTOCOL_VERSION {
             return Err(RuleViolation::UnsupportedProtocol(content.protocol));
@@ -153,7 +166,7 @@ impl Graph {
         if size > MAX_CONTRIBUTION_BYTES {
             return Err(RuleViolation::TooLarge(size));
         }
-        if !c.signature_is_valid() {
+        if !signature_valid() {
             return Err(RuleViolation::BadSignature);
         }
         if !content.parents.windows(2).all(|w| w[0] < w[1]) {
@@ -191,6 +204,16 @@ impl Graph {
         Ok(true)
     }
 
+    /// [`Graph::insert`] with the signature verified in advance, as [`Graph::check_presigned`] takes it.
+    pub(crate) fn insert_presigned(&mut self, c: Contribution, signature_valid: bool) -> Result<bool, RuleViolation> {
+        if self.contains(&c.id()) {
+            return Ok(false);
+        }
+        self.check_presigned(&c, signature_valid)?;
+        self.insert_checked(c);
+        Ok(true)
+    }
+
     pub(crate) fn insert_checked(&mut self, c: Contribution) {
         let id = c.id();
         for p in c.parents() {
@@ -211,7 +234,31 @@ impl Graph {
     pub fn import_with<E>(
         &mut self,
         batch: impl IntoIterator<Item = Contribution>,
+        on_add: impl FnMut(&Contribution) -> Result<(), E>,
+    ) -> Result<ImportReport, E> {
+        self.import_checking(batch, on_add, |c| c.signature_is_valid())
+    }
+
+    /// [`Graph::import`] with signatures verified in advance: `signatures` must map each contribution's
+    /// id to its `signature_is_valid()`. One it doesn't name is verified here.
+    pub(crate) fn import_presigned(
+        &mut self,
+        batch: impl IntoIterator<Item = Contribution>,
+        signatures: &HashMap<ContributionId, bool>,
+    ) -> ImportReport {
+        let Ok(report) = self.import_checking(
+            batch,
+            |_| Ok::<(), std::convert::Infallible>(()),
+            |c| signatures.get(&c.id()).copied().unwrap_or_else(|| c.signature_is_valid()),
+        );
+        report
+    }
+
+    fn import_checking<E>(
+        &mut self,
+        batch: impl IntoIterator<Item = Contribution>,
         mut on_add: impl FnMut(&Contribution) -> Result<(), E>,
+        signature_valid: impl Fn(&Contribution) -> bool,
     ) -> Result<ImportReport, E> {
         let mut report = ImportReport::default();
         let mut pending: HashMap<ContributionId, Contribution> = HashMap::new();
@@ -241,7 +288,7 @@ impl Graph {
 
         while let Some(id) = ready.pop_first() {
             let c = pending.remove(&id).expect("ready ids are pending");
-            if let Err(violation) = self.check(&c) {
+            if let Err(violation) = self.check_rules(&c, || signature_valid(&c)) {
                 report.rejected.push((id, violation));
                 continue;
             }
@@ -358,6 +405,197 @@ impl Graph {
             [one] => Ok(**one),
             [] => Err(err(ResolveErrorKind::NotFound)),
             many => Err(err(ResolveErrorKind::Ambiguous(many.len()))),
+        }
+    }
+}
+
+/// The presigned checks against [`Graph::check`] as it was before the split, kept here verbatim as the
+/// oracle (task `7a3d17f979c3`, answer `c2ee65bd2a5e`): on random and adversarial contributions (a bad
+/// signature alongside every other rule's break, unsorted and missing parents, unlisted references,
+/// another Ground or protocol, retractions by others, empty fields, self relations), every verdict is
+/// the same, and so is every import report.
+#[cfg(test)]
+mod presigned_oracle {
+    use super::*;
+    use crate::contribution::{ContributionContent, RelationKind, Verdict};
+    use crate::id::Signature;
+    use crate::identity::Identity;
+
+    /// `Graph::check` before task 7a3d17f979c3, word for word but for `self`.
+    fn old_check(g: &Graph, c: &Contribution) -> Result<(), RuleViolation> {
+        let content = c.content();
+        if content.protocol != PROTOCOL_VERSION {
+            return Err(RuleViolation::UnsupportedProtocol(content.protocol));
+        }
+        if content.ground != g.ground {
+            return Err(RuleViolation::WrongGround { expected: g.ground, found: content.ground });
+        }
+        let size = c.encoded_len();
+        if size > MAX_CONTRIBUTION_BYTES {
+            return Err(RuleViolation::TooLarge(size));
+        }
+        if !c.signature_is_valid() {
+            return Err(RuleViolation::BadSignature);
+        }
+        if !content.parents.windows(2).all(|w| w[0] < w[1]) {
+            return Err(RuleViolation::ParentsNotCanonical);
+        }
+        if let Some(missing) = content.parents.iter().find(|p| !g.contains(p)) {
+            return Err(RuleViolation::MissingParent(*missing));
+        }
+        for r in content.body.references() {
+            if content.parents.binary_search(&r).is_err() {
+                return Err(RuleViolation::UnlistedReference(r));
+            }
+        }
+        match &content.body {
+            Body::Claim { statement, .. } if statement.trim().is_empty() => {
+                Err(RuleViolation::Empty("claim statement"))
+            }
+            Body::Artifact { name, .. } if name.trim().is_empty() => Err(RuleViolation::Empty("artifact name")),
+            Body::Evidence { method, .. } if method.trim().is_empty() => Err(RuleViolation::Empty("evidence method")),
+            Body::Relation { from, to, .. } if from == to => Err(RuleViolation::SelfRelation),
+            Body::Retract { target, .. } if g.contributions[target].author() != content.author => {
+                Err(RuleViolation::RetractByOther(*target))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct Wire<'a> {
+        content: &'a ContributionContent,
+        signature: &'a Signature,
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((self.0 >> 33) as usize) % n.max(1)
+        }
+    }
+
+    /// A contribution built field by field, so any rule can be broken, then encoded and decoded as a
+    /// replica would read it. `None` if what was built doesn't decode (it can't reach a graph).
+    fn build(content: ContributionContent, signer: &Identity) -> Option<Contribution> {
+        let signature = signer.sign(&content.id());
+        let mut bytes = Vec::new();
+        ciborium::into_writer(&Wire { content: &content, signature: &signature }, &mut bytes).expect("a Vec");
+        Contribution::decode(&bytes).ok()
+    }
+
+    fn adversarial(rng: &mut Rng, g: &Graph, ids: &[ContributionId], people: &[Identity], t: u64) -> Contribution {
+        loop {
+            let author = &people[rng.below(people.len())];
+            let pick = |rng: &mut Rng| ids[rng.below(ids.len())];
+            let mut parents: Vec<ContributionId> = (0..rng.below(4)).map(|_| pick(rng)).collect();
+            let body = match rng.below(9) {
+                0 => Body::Claim {
+                    statement: if rng.below(5) == 0 { " ".into() } else { format!("c{t}") },
+                    tags: vec![],
+                },
+                1 => Body::Artifact {
+                    name: if rng.below(5) == 0 { String::new() } else { format!("a{t}") },
+                    media_type: "x".into(),
+                    content: vec![t as u8; rng.below(64)],
+                },
+                2 | 3 => {
+                    let (from, to) = (pick(rng), if rng.below(6) == 0 { ids[0] } else { pick(rng) });
+                    Body::Relation { from, kind: RelationKind::Supersedes, to, note: String::new() }
+                }
+                4 | 5 => Body::Evidence {
+                    target: pick(rng),
+                    verdict: Verdict::Pass,
+                    method: if rng.below(6) == 0 { String::new() } else { "m".into() },
+                    details: String::new(),
+                },
+                6 => Body::Retract { target: pick(rng), reason: String::new() },
+                _ => Body::Claim { statement: format!("c{t}"), tags: vec!["x".into()] },
+            };
+            // Usually well formed: references listed, parents sorted and unique.
+            if rng.below(6) != 0 {
+                parents.extend(body.references());
+            }
+            if rng.below(8) != 0 {
+                parents.sort();
+                parents.dedup();
+            }
+            if rng.below(12) == 0 {
+                parents.push(ContributionId([rng.below(256) as u8; 32])); // a parent nobody holds
+            }
+            let protocol = if rng.below(25) == 0 { 2 } else { PROTOCOL_VERSION };
+            let ground = if rng.below(25) == 0 { GroundId([9; 32]) } else { g.ground };
+            let content =
+                ContributionContent { protocol, ground, author: author.agent_id(), parents, timestamp_ms: t, body };
+            // Sometimes signed by someone else: a bad signature.
+            let signer = if rng.below(8) == 0 { &people[(rng.below(people.len()) + 1) % people.len()] } else { author };
+            if let Some(c) = build(content, signer) {
+                return c;
+            }
+        }
+    }
+
+    #[test]
+    fn presigned_verdicts_and_imports_are_the_old_checks() {
+        let people: Vec<Identity> = (0..3).map(|i| Identity::generate(&format!("p{i}")).expect("a key")).collect();
+        let (mut checked, mut refused) = (0, 0);
+        let mut kinds = BTreeSet::new();
+        for seed in 1..=8u64 {
+            let mut rng = Rng(seed);
+            let mut g = Graph::new(GroundId([1; 32]));
+            let root =
+                Contribution::create(g.ground, &people[0], [], 0, Body::Claim { statement: "r".into(), tags: vec![] });
+            let mut ids = vec![root.id()];
+            g.insert(root).expect("valid");
+            let mut batch = Vec::new();
+            for t in 1..400u64 {
+                let c = adversarial(&mut rng, &g, &ids, &people, t);
+                let old = old_check(&g, &c);
+                assert_eq!(g.check(&c), old, "seed {seed}, t {t}: check");
+                assert_eq!(g.check_presigned(&c, c.signature_is_valid()), old, "seed {seed}, t {t}: presigned");
+                checked += 1;
+                if let Err(why) = &old {
+                    refused += 1;
+                    kinds.insert(format!("{why:?}").split(['(', ' ', '{']).next().unwrap_or_default().to_owned());
+                }
+                batch.push(c.clone());
+                if old.is_ok() && rng.below(2) == 0 {
+                    ids.push(c.id());
+                    g.insert(c).expect("valid");
+                }
+            }
+            // Whole imports, in any order, into a graph holding only the root: the same report.
+            let fresh = || {
+                let mut h = Graph::new(g.ground);
+                h.insert(g.get(&ids[0]).expect("root").clone()).expect("valid");
+                h
+            };
+            batch.reverse();
+            let (mut a, mut b) = (fresh(), fresh());
+            let old = a.import(batch.clone());
+            let signatures: HashMap<ContributionId, bool> =
+                batch.iter().map(|c| (c.id(), c.signature_is_valid())).collect();
+            let new = b.import_presigned(batch, &signatures);
+            assert_eq!(new.added, old.added, "seed {seed}");
+            assert_eq!(new.rejected, old.rejected, "seed {seed}");
+            assert_eq!(new.unresolved, old.unresolved, "seed {seed}");
+            assert_eq!(new.already_present, old.already_present, "seed {seed}");
+            assert_eq!(b.topo_order(), a.topo_order(), "seed {seed}");
+        }
+        assert!(refused > checked / 5 && refused < checked, "both verdicts tested: {refused} of {checked} refused");
+        for kind in [
+            "UnsupportedProtocol",
+            "WrongGround",
+            "BadSignature",
+            "ParentsNotCanonical",
+            "MissingParent",
+            "UnlistedReference",
+            "SelfRelation",
+            "RetractByOther",
+            "Empty",
+        ] {
+            assert!(kinds.contains(kind), "no {kind} among {kinds:?}");
         }
     }
 }
