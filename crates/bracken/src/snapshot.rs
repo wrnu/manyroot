@@ -24,8 +24,11 @@
 //! that writes the snapshot, a read included, rewrites it as one segment, so the file stays at most about
 //! twice the Ground and the rewrites cost a constant number of bytes per byte added, amortised.
 //!
-//! **Reading is bounded by `objects/`** (finding `ed533a35b961`): the snapshot is read as a stream, one
-//! contribution at a time, each at most a contribution's largest size, and the read stops at the first
+//! **Reading is bounded by `objects/`** (finding `ed533a35b961`): the snapshot is read as a stream of
+//! entries, each framed with its id, length and own hash (`BKSNAP3`). Each id is checked before its
+//! encoding is read, an encoding is at most a contribution's largest size, and encodings are hashed and
+//! decoded in parallel in bounded batches, each by [`Contribution::decode`] (one canonical encoding) to a
+//! contribution with its framed id. The read stops at the first
 //! contribution the replica holds no object for (the whole snapshot is then set aside for a full open),
 //! at a repeat or an empty segment, or at a segment whose framing or checksum doesn't hold (a torn
 //! append). So every contribution read, kept or buffered in a segment, is a distinct object of the
@@ -57,7 +60,7 @@ use manyroot::{Contribution, ContributionId, GroundId, Store};
 
 use cache::Cache;
 
-const MAGIC: &[u8; 8] = b"BKSNAP2\0";
+const MAGIC: &[u8; 8] = b"BKSNAP3\0";
 const HEADER_BYTES: u64 = MAGIC.len() as u64 + 32;
 const CHECKSUM_BYTES: u64 = 32;
 const SNAPSHOT: &str = "snapshot";
@@ -187,19 +190,30 @@ fn header(ground: GroundId) -> Vec<u8> {
     out
 }
 
-/// One segment: its length (u64), then the number of contributions (u64) and each one's length (u32) and
-/// encoding, then a blake3 checksum of everything before it in the segment.
+/// One segment: its length (u64), then the number of contributions (u64) and for each its id, its
+/// encoding's length (u32) and blake3 hash, and the encoding; then a blake3 checksum of everything in the
+/// segment before it except the encodings, which their own hashes cover. So a read can check an entry's
+/// id against the replica before reading its encoding, and hash and decode encodings in parallel.
 fn segment(contributions: &[&Contribution]) -> Vec<u8> {
     let mut body = u64::try_from(contributions.len()).expect("fits").to_le_bytes().to_vec();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&body);
     for c in contributions {
         let bytes = c.encode();
-        body.extend_from_slice(&u32::try_from(bytes.len()).expect("a contribution is at most 16 MiB").to_le_bytes());
+        let mut head = c.id().as_bytes().to_vec();
+        head.extend_from_slice(&u32::try_from(bytes.len()).expect("a contribution is at most 16 MiB").to_le_bytes());
+        head.extend_from_slice(blake3::hash(&bytes).as_bytes());
+        hasher.update(&head);
+        body.extend_from_slice(&head);
         body.extend_from_slice(&bytes);
     }
-    let mut out = u64::try_from(body.len()).expect("fits").to_le_bytes().to_vec();
+    let len = u64::try_from(body.len()).expect("fits").to_le_bytes();
+    let mut sums = blake3::Hasher::new();
+    sums.update(&len);
+    sums.update(hasher.finalize().as_bytes());
+    let mut out = len.to_vec();
     out.extend_from_slice(&body);
-    let sum = *blake3::hash(&out).as_bytes();
-    out.extend_from_slice(&sum);
+    out.extend_from_slice(sums.finalize().as_bytes());
     out
 }
 
@@ -245,8 +259,50 @@ fn read_u64(r: &mut impl Read) -> Option<u64> {
     Some(u64::from_le_bytes(b))
 }
 
+/// The bytes of one entry's framing: its id, length and hash.
+const ENTRY_HEAD_BYTES: u64 = 32 + 4 + 32;
+
+/// Encodings are decoded in batches of about this many bytes, in parallel, so what a read buffers before
+/// checking it is bounded. Smaller under test, so the tests cross batches.
+const BATCH_BYTES: usize = if cfg!(test) { 1 << 20 } else { 64 << 20 };
+
+/// An entry read but not yet checked: its id and hash as framed, and its encoding.
+type Raw = (ContributionId, [u8; 32], Vec<u8>);
+
+/// Hashes and decodes `raw` across threads: each encoding must hash to its framed hash and decode, as
+/// [`Contribution::decode`] decodes (one canonical encoding), to a contribution with its framed id.
+fn decode_batch(raw: Vec<Raw>) -> Result<Vec<Contribution>, Stop> {
+    let one = |(id, sum, bytes): &Raw| -> Result<Contribution, Stop> {
+        if blake3::hash(bytes).as_bytes() != sum {
+            return Err(Stop::Torn);
+        }
+        let c = Contribution::decode(bytes).map_err(|_| Stop::Torn)?;
+        if c.id() != *id {
+            return Err(Stop::Torn);
+        }
+        Ok(c)
+    };
+    let total: usize = raw.iter().map(|(_, _, b)| b.len()).sum();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    if threads == 1 || total < (1 << 20) {
+        return raw.iter().map(one).collect();
+    }
+    let chunk = raw.len().div_ceil(threads).max(1);
+    let parts: Vec<Result<Vec<Contribution>, Stop>> = std::thread::scope(|scope| {
+        let handles: Vec<_> =
+            raw.chunks(chunk).map(|part| scope.spawn(move || part.iter().map(one).collect())).collect();
+        handles.into_iter().map(|h| h.join().unwrap_or(Err(Stop::Torn))).collect()
+    });
+    let mut out = Vec::with_capacity(raw.len());
+    for part in parts {
+        out.extend(part?);
+    }
+    Ok(out)
+}
+
 /// Reads the segment at the start of `r`, at most `remaining` bytes, refusing a contribution already in
-/// `seen`, and an empty segment unless it is the `first`; returns its contributions and its length.
+/// `seen`, and an empty segment unless it is the `first`; returns its contributions and its length. Each
+/// entry's id is checked (a repeat, or one the replica holds no object for) before its encoding is read.
 fn read_segment(
     r: &mut impl Read,
     remaining: u64,
@@ -257,48 +313,60 @@ fn read_segment(
     let len = read_u64(r).ok_or(Stop::Torn)?;
     let total = len.checked_add(8 + CHECKSUM_BYTES).filter(|t| *t <= remaining).ok_or(Stop::Torn)?;
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&len.to_le_bytes());
     let count = read_u64(r).ok_or(Stop::Torn)?;
     hasher.update(&count.to_le_bytes());
     let mut left = len.checked_sub(8).ok_or(Stop::Torn)?;
-    // Only an empty Ground's snapshot has an empty segment, its first; nor can more contributions than
-    // 4-byte lengths fit.
-    if (count == 0 && !first) || count > left / 4 {
+    // Only an empty Ground's snapshot has an empty segment, its first; nor can more entries than their
+    // framing fit.
+    if (count == 0 && !first) || count > left / ENTRY_HEAD_BYTES {
         return Err(Stop::Torn);
     }
     let mut out = Vec::new();
     let mut ids = HashSet::new();
+    let mut batch: Vec<Raw> = Vec::new();
+    let mut batched = 0usize;
     for _ in 0..count {
-        let mut n = [0u8; 4];
-        r.read_exact(&mut n).map_err(|_| Stop::Torn)?;
-        hasher.update(&n);
-        let n = u32::from_le_bytes(n);
-        left = left.checked_sub(4).ok_or(Stop::Torn)?;
+        let mut head = [0u8; ENTRY_HEAD_BYTES as usize];
+        r.read_exact(&mut head).map_err(|_| Stop::Torn)?;
+        hasher.update(&head);
+        left = left.checked_sub(ENTRY_HEAD_BYTES).ok_or(Stop::Torn)?;
+        let id = ContributionId(head[..32].try_into().expect("32 bytes"));
+        let n = u32::from_le_bytes(head[32..36].try_into().expect("4 bytes"));
+        let sum: [u8; 32] = head[36..].try_into().expect("32 bytes");
         if n as usize > MAX_CONTRIBUTION_BYTES || u64::from(n) > left {
             return Err(Stop::Torn);
         }
         left -= u64::from(n);
-        let mut bytes = vec![0u8; n as usize];
-        r.read_exact(&mut bytes).map_err(|_| Stop::Torn)?;
-        hasher.update(&bytes);
-        let c = Contribution::decode(&bytes).map_err(|_| Stop::Torn)?;
-        let id = c.id();
         if seen.contains(&id) || !ids.insert(id) {
             return Err(Stop::Torn);
         }
-        // At the first contribution the replica holds no object for, stop: nothing after it is read
-        // (findings 937b52d0164e, 4dc0418ed33c), so what a segment buffers is bounded by objects/.
+        // At the first contribution the replica holds no object for, stop: its encoding and nothing after
+        // it is read (findings 937b52d0164e, 4dc0418ed33c), so what a segment buffers is bounded by objects/.
         if !on_disk(&id) {
             return Err(Stop::Missing);
         }
-        out.push(c);
+        let mut bytes = Vec::with_capacity(n as usize);
+        r.by_ref().take(u64::from(n)).read_to_end(&mut bytes).map_err(|_| Stop::Torn)?;
+        if bytes.len() != n as usize {
+            return Err(Stop::Torn);
+        }
+        batched += bytes.len();
+        batch.push((id, sum, bytes));
+        if batched >= BATCH_BYTES {
+            out.extend(decode_batch(std::mem::take(&mut batch))?);
+            batched = 0;
+        }
     }
+    out.extend(decode_batch(batch)?);
     if left != 0 {
         return Err(Stop::Torn);
     }
     let mut sum = [0u8; CHECKSUM_BYTES as usize];
     r.read_exact(&mut sum).map_err(|_| Stop::Torn)?;
-    if *hasher.finalize().as_bytes() != sum {
+    let mut sums = blake3::Hasher::new();
+    sums.update(&len.to_le_bytes());
+    sums.update(hasher.finalize().as_bytes());
+    if *sums.finalize().as_bytes() != sum {
         return Err(Stop::Torn);
     }
     Ok((out, total))
@@ -683,8 +751,10 @@ mod tests {
         flipped[60] ^= 1;
         assert!(decode_bytes(&flipped).is_err());
         let mut old = bytes.clone();
-        old[..8].copy_from_slice(b"BKSNAP1\0");
-        assert!(decode_bytes(&old).is_err(), "the whole-file version isn't read");
+        for version in [b"BKSNAP1\0", b"BKSNAP2\0"] {
+            old[..8].copy_from_slice(version);
+            assert!(decode_bytes(&old).is_err(), "an earlier version isn't read");
+        }
         assert!(decode(&bytes[..], bytes.len() as u64, GroundId([8; 32]), &|_| true).is_err(), "another Ground's");
         assert!(decode(&bytes[..], bytes.len() as u64, G, &|_| false).is_err(), "names an object that's gone");
         let empty = decode_bytes(&encode(G, &[])).expect("an empty Ground's snapshot reads");
@@ -725,12 +795,47 @@ mod tests {
         }
         // An entry length past the segment, and past the largest contribution.
         let mut entry = header(G);
-        let body_len = 8u64 + 4;
+        let body_len = 8u64 + ENTRY_HEAD_BYTES;
         entry.extend_from_slice(&body_len.to_le_bytes());
         entry.extend_from_slice(&1u64.to_le_bytes());
+        entry.extend_from_slice(cs[0].id().as_bytes());
         entry.extend_from_slice(&u32::MAX.to_le_bytes());
-        entry.extend_from_slice(&[0u8; 32]);
+        entry.extend_from_slice(&[0u8; 64]);
         assert!(decode_bytes(&entry).is_err());
+    }
+
+    /// The v3 framing: every byte of an encoding is covered by its own hash (a damaged signature is caught,
+    /// though it leaves the id alone), a framed id must be the encoding's, and big segments decode in
+    /// parallel batches to exactly what was written.
+    #[test]
+    fn each_entry_is_checked_against_its_hash_and_id() {
+        let who = Identity::generate("t").expect("a key");
+        let cs: Vec<Contribution> = (0..12u8)
+            .map(|i| {
+                let body =
+                    Body::Artifact { name: format!("a{i}"), media_type: "x".into(), content: vec![i; 300 << 10] };
+                Contribution::create(G, &who, [], u64::from(i), body)
+            })
+            .collect();
+        let bytes = encode(G, &refs(&cs));
+        let d = decode_bytes(&bytes).expect("reads, across batches");
+        assert!(d.clean);
+        assert_eq!(ids(&d.contributions), ids(&cs), "the same contributions, in the same order");
+        assert!(d.contributions.iter().zip(&cs).all(|(a, b)| a.encode() == b.encode()));
+
+        // The last byte of the first encoding is in its signature: the id doesn't change, its hash does.
+        let first_end = HEADER_BYTES as usize + 16 + ENTRY_HEAD_BYTES as usize + cs[0].encode().len();
+        let mut damaged = bytes.clone();
+        damaged[first_end - 1] ^= 1;
+        assert!(decode_bytes(&damaged).is_err(), "a damaged signature is caught");
+
+        // A framed id that isn't its encoding's: one the replica holds (the membership check passes) and
+        // the segment doesn't, so only the decoded id can tell.
+        let other = Contribution::create(G, &who, [], 99, Body::Claim { statement: "x".into(), tags: vec![] });
+        let mut swapped = bytes.clone();
+        let at = HEADER_BYTES as usize + 16;
+        swapped[at..at + 32].copy_from_slice(other.id().as_bytes());
+        assert!(decode_bytes(&swapped).is_err(), "a framed id must be the encoding's");
     }
 
     /// Findings `937b52d0164e` and `4dc0418ed33c`: the read stops at the first contribution the replica
