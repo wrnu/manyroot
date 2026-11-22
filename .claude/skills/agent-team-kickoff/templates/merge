@@ -84,9 +84,12 @@
 # Before the checks, it prints one 'note  experiments' line naming every expired experiment (a current claim
 # tagged experiment, AGENTS.md, Process changes and experiments) that no current manager decision supports:
 # its rule has lapsed. It expires on its 'expires: <YYYY-MM-DD>' line, or 14 days after it was written if it
-# has none, and never later than 28 days after; one typed experiment, on its expires key. The line alone
-# never blocks the merge (task 9b65c13e9d66); a check 'experiments' fails it when a lapsed experiment's id
-# is still cited in the head's AGENTS.md (decision ff456e4e2fcc).
+# has none, and never later than 28 days after; one typed experiment, on its expires key. A second note
+# names any whose expires date isn't a real date. The notes alone never block the merge (task
+# 9b65c13e9d66); check 'experiments' fails it when AGENTS.md, as the merge leaves it, cites an experiment
+# (by any id prefix of 8 or more hex digits, in any case) that isn't current and unexpired: lapsed,
+# malformed, retracted, superseded, missing, ambiguous or not an experiment; or when the experiments can't
+# be read (decision ff456e4e2fcc).
 # A batch pass (scripts/verify-seq --batch, decision db6f7705c0a4) is a manager pass whose method is
 # 'scripts/test-table[ --split] @ <sha> batch <batch claim> on <main> tree <key> run <evidence>'. It
 # counts only if the batch claim is a current manager claim tagged batch that lists this PR, claim and
@@ -273,7 +276,8 @@ reads=$(bk_reads "$(req log --tag experiment --current --json)" \
   "$(req log --tag decision --current --json)" \
   "$(req show "$claim" ${policy[@]+"${policy[@]}"} --min-passes "$min_passes" --json)" \
   "$(req log --tag pr --current --json)" "$(req findings "$claim" --triager "$triager" --json)" \
-  "$(req log --tag owner-review --current --json)" "$(req log --tag approval --current --json)") ||
+  "$(req log --tag owner-review --current --json)" "$(req log --tag approval --current --json)" \
+  "$(req log --tag experiment --json)") ||
   fail "can't pull from the team server, so the gate won't decide on a replica that may be behind"
 if [ -f "$main/.bracken-team" ]; then
   echo "team server: every read pulls from $(cat "$(cat "$main/.bracken-team")/url")"
@@ -281,47 +285,62 @@ else
   echo "team server: none set up (no .bracken-team); reading the local replica"
 fi
 
-# Expired experiments (see the header): one line, never a failed check. An experiment typed exactly
-# experiment whose typed fields conform (claim --type experiment) ends on its expires key; any other is read
-# from its statement's 'expires:' line, as before.
-expired_experiments() {
-  local exps decisions today lapsed=() expired=() e about shows n=0 asks=()
-  exps=$(nth 1) || { echo "couldn't read the experiment claims"; return; }
-  decisions=$(nth 2) || decisions='[]'
-  today=$(date -u +%Y-%m-%d)
-  for e in $(jq -r --arg today "$today" "$live"'
-    .[] | select(.kind == "claim" and live and (.body.tags | index("experiment")))
-    | (.timestamp_ms / 1000 | floor) as $start
-    | (if (.typed.type? // null) == "experiment" and (.typed.problems // [""]) == [] then .typed.data.expires
-       else [(.body.statement // "") | match("(?m)^expires:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]*$") | .captures[0].string]
-        | first // null end) as $given
-    | ([if $given then ($given + "T00:00:00Z" | fromdateiso8601) else $start + 14 * 86400 end, $start + 28 * 86400]
-        | min | todate[0:10]) as $ends
-    | select($ends < $today) | "\(.id):\($ends)"' <<<"$exps"); do
-    expired+=("$e")
-    asks+=("$(req show "${e%%:*}" --json)")
-  done
-  [ ${#expired[@]} -gt 0 ] || return 0
-  # Their referrers, in one read.
-  shows=$(bk_reads "${asks[@]}")
+# Experiments (see the header). Each current, live claim tagged experiment is read on its own, one line
+# '<full id> <state> <detail>': active or expired with the day it ends, or malformed with why. An experiment
+# typed exactly experiment whose typed fields conform (claim --type experiment) ends on its expires key; any
+# other on its statement's 'expires:' line, as before. A date that isn't a real one makes only that one
+# malformed (findings bdee6db8dfcf, 10febee32fff). Anything that can't be read fails check 'experiments'
+# below, never reads as no experiments.
+exp_fail='' exp_states='' lapsed_ids=() malformed=()
+today=$(date -u +%Y-%m-%d)
+if ! exps=$(nth 1) || ! exp_all=$(nth 8); then
+  exp_fail="couldn't read the experiment claims"
+elif ! exp_states=$(jq -r --arg today "$today" "$live"'
+  .[] | select(.kind == "claim" and live and ((.body.tags // []) | index("experiment")))
+  | (.timestamp_ms / 1000 | floor) as $start
+  | (if (.typed.type? // null) == "experiment" and (.typed.problems // [""]) == [] then .typed.data.expires
+     else [(.body.statement // "") | match("(?m)^expires:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]*$") | .captures[0].string]
+      | first // null end) as $given
+  | (if $given == null then $start + 14 * 86400
+     else (try ($given + "T00:00:00Z" | fromdateiso8601) catch null)
+       | if . != null and (todate[0:10]) == $given then . else null end end) as $t
+  | if $t == null then "\(.id) malformed its expires date \($given) isn'"'"'t a real date"
+    else ([$t, $start + 28 * 86400] | min | todate[0:10]) as $ends
+      | "\(.id) \(if $ends < $today then "expired" else "active" end) \($ends)" end' <<<"$exps"); then
+  exp_fail="couldn't read the experiments' dates"
+fi
+# Kept: an expired one a current manager decision supports (its statement cites the metrics that met the
+# target). The rest have lapsed.
+expired=() asks=()
+while read -r e state detail; do
+  case "$state" in
+    expired) expired+=("$e:$detail") asks+=("$(req show "$e" --json)") ;;
+    malformed) malformed+=("${e:0:12} ($detail)") ;;
+  esac
+done <<<"$exp_states"
+if [ -z "$exp_fail" ] && [ ${#expired[@]} -gt 0 ]; then
+  decisions=$(nth 2) && shows=$(bk_reads "${asks[@]}") || exp_fail="couldn't read the decisions about the expired experiments"
+  n=0
   for e in "${expired[@]}"; do
+    [ -z "$exp_fail" ] || break
     n=$((n + 1))
-    # Kept: a current manager decision supports it (its statement cites the metrics that met the target).
-    about=$(sed -n "${n}p" <<<"$shows" | jq -ce 'select(.ok == true) | .result') || about='{"referrers": []}'
+    about=$(sed -n "${n}p" <<<"$shows" | jq -ce 'select(.ok == true) | .result') || {
+      exp_fail="couldn't read what refers to experiment ${e:0:12}"
+      break
+    }
     jq -e --argjson decisions "$decisions" "$live"'
       ([$decisions[] | select(.kind == "claim" and .author_name == "manager" and live) | .id]) as $d
       | any(.referrers[]; .kind == "relation" and .retracted == false and .author_name == "manager"
         and .body.kind == "supports" and (.body.from as $f | any($d[]; . == $f)))' <<<"$about" >/dev/null ||
-      lapsed+=("${e:0:12} (ended ${e##*:})")
+      lapsed_ids+=("$e")
   done
-  [ ${#lapsed[@]} -eq 0 ] ||
-    echo "expired, so their rules have lapsed unless a manager decision citing the metrics supports them: ${lapsed[*]}"
-}
-experiments=$(expired_experiments)
-[ -z "$experiments" ] || printf '%-4s  %-12s %s\n' note experiments "$experiments"
-# The lapsed ones' 12-digit ids, for the check against the head's AGENTS.md below.
-lapsed_ids=()
-for e in $(grep -o '[0-9a-f]\{12\} (ended' <<<"$experiments" | cut -c1-12); do lapsed_ids+=("$e"); done
+fi
+lapsed=()
+for e in ${lapsed_ids[@]+"${lapsed_ids[@]}"}; do lapsed+=("${e:0:12} (ended ${e##*:})"); done
+[ ${#lapsed[@]} -eq 0 ] || printf '%-4s  %-12s %s\n' note experiments \
+  "expired, so their rules have lapsed unless a manager decision citing the metrics supports them: ${lapsed[*]}"
+[ ${#malformed[@]} -eq 0 ] || printf '%-4s  %-12s %s\n' note experiments \
+  "malformed, so when they end can't be read: ${malformed[*]}"
 
 origin=$(git -C "$main" config --get remote.origin.url)
 # Not printed: an origin URL can carry a password.
@@ -458,21 +477,69 @@ fi
 git -C "$main" fetch -q origin main "refs/pull/$pr/head" || fail "couldn't fetch main and PR #$pr from origin"
 tip=$(git -C "$main" rev-parse --verify -q "origin/main^{commit}") || fail "no origin/main"
 
-# A lapsed experiment whose rule is still cited in AGENTS.md fails the gate (decision ff456e4e2fcc, task
-# 8c9ad9bd4518 step 3): a rule that lapsed must leave the rules, or a decision keep it. One not cited stays the
-# note above. Read from the head's own AGENTS.md, as it is what merges; a head without one cites nothing.
-if [ ${#lapsed_ids[@]} -gt 0 ] && git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
+# Experiments AGENTS.md cites (decision ff456e4e2fcc, task 8c9ad9bd4518 step 3): in AGENTS.md as the merge
+# leaves it (git merge-tree of main and the head, as check 6b reads; finding 7a98b2f925a6), every word of 8
+# to 64 hex digits, in any case, that is a prefix of an experiment's id (any claim ever tagged experiment,
+# retracted and superseded ones included), and every one on a 'Running:' line, must resolve to one current,
+# unexpired experiment, or one an expired one a manager decision keeps. One that is lapsed, malformed,
+# retracted, superseded (named with what supersedes it), missing, an ambiguous prefix or not an experiment
+# fails (findings c010f3be17c0, 68470890d973, affa2403b450, 0d4748825f9c). A rule that lapsed must leave the
+# rules, or a decision keep it; a lapsed experiment cited nowhere stays the note above.
+cite_check() {
+  local merged agents_md words running w cands asks=() toks=() shows n=0 r id why problems=() current=()
+  [ -z "$exp_fail" ] || { check FAIL experiments "$exp_fail, so what AGENTS.md cites can't be judged"; return; }
+  git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null ||
+    { check FAIL experiments "$sha isn't on origin, so the AGENTS.md the merge leaves can't be read"; return; }
+  merged=$(git -C "$main" merge-tree --write-tree --no-messages "$tip" "$sha" 2>/dev/null | head -n 1) &&
+    [ -n "$merged" ] ||
+    { check FAIL experiments "$sha doesn't merge cleanly onto main ($tip), so the AGENTS.md it leaves can't be read"; return; }
   agents_md=''
-  if git -C "$main" cat-file -e "$sha:AGENTS.md" 2>/dev/null; then
-    agents_md=$(git -C "$main" show "$sha:AGENTS.md") || fail "couldn't read AGENTS.md at $sha"
+  if git -C "$main" cat-file -e "$merged:AGENTS.md" 2>/dev/null; then
+    agents_md=$(git -C "$main" show "$merged:AGENTS.md") ||
+      { check FAIL experiments "couldn't read AGENTS.md in the merged tree $merged"; return; }
   fi
-  cited=()
-  for e in "${lapsed_ids[@]}"; do
-    if grep -qF -- "$e" <<<"$agents_md"; then cited+=("$e"); fi
+  words=$(grep -oiwE '[0-9a-f]{8,64}' <<<"$agents_md" | tr 'A-F' 'a-f' | sort -u) || true
+  running=$(grep -iE '^[-*[:space:]]*running:' <<<"$agents_md" | grep -oiwE '[0-9a-f]{8,64}' | tr 'A-F' 'a-f' | sort -u) || true
+  for w in $words; do
+    cands=$(jq -r --arg w "$w" '[.[] | select(.kind == "claim" and ((.body.tags // []) | index("experiment"))
+      and (.id | startswith($w)))] | length' <<<"$exp_all") ||
+      { check FAIL experiments "couldn't match AGENTS.md's ids to the experiments"; return; }
+    if [ "$cands" -gt 0 ] || grep -qxF -- "$w" <<<"$running"; then
+      toks+=("$w")
+      asks+=("$(req show "$w" --json)")
+    fi
   done
-  [ ${#cited[@]} -eq 0 ] ||
-    check FAIL experiments "lapsed, and still cited in AGENTS.md at $sha: ${cited[*]}: take each out of AGENTS.md (its rule has lapsed), or keep it with a manager decision citing the metrics that supports it"
-fi
+  [ ${#toks[@]} -gt 0 ] || return 0
+  shows=$(bk_reads "${asks[@]}") || { check FAIL experiments "couldn't read the experiments AGENTS.md cites"; return; }
+  for w in "${toks[@]}"; do
+    n=$((n + 1))
+    r=$(sed -n "${n}p" <<<"$shows")
+    if ! jq -e '.ok == true' <<<"$r" >/dev/null 2>&1; then
+      why=$(jq -r '.error // "no answer"' <<<"$r" 2>/dev/null | head -n 1 | LC_ALL=C tr -d '\000-\037\177' | cut -c 1-160)
+      problems+=("$w doesn't name one contribution, missing or an ambiguous prefix (${why:-no answer})")
+      continue
+    fi
+    id=$(jq -r '.result.id' <<<"$r")
+    why=$(jq -r --arg id "$id" --arg states "$exp_states" --arg lapsed "${lapsed_ids[*]-}" '.result
+      | ($states | split("\n") | map(select(startswith($id + " ")) | split(" ")) | first) as $s
+      | if .kind != "claim" or (((.body.tags // []) | index("experiment")) | not) then "isn'"'"'t an experiment"
+        elif .retracted then "is retracted"
+        elif $s == null then
+          ([.referrers[] | select(.kind == "relation" and .retracted == false and .body.kind == "supersedes"
+             and .body.to == $id) | .body.from[:12]] | unique) as $by
+          | "is superseded" + (if ($by | length) > 0 then " by \($by | join(", "))" else ", or not current" end)
+        elif $s[1] == "malformed" then "is malformed (\($s[2:] | join(" ")))"
+        elif $s[1] == "expired" and ($lapsed | split(" ") | index($id + ":" + $s[2])) then "lapsed (ended \($s[2]))"
+        else "" end' <<<"$r") || { check FAIL experiments "couldn't read experiment $w"; return; }
+    if [ -n "$why" ]; then problems+=("$w ${why}"); else current+=("${id:0:12}"); fi
+  done
+  if [ ${#problems[@]} -gt 0 ]; then
+    check FAIL experiments "AGENTS.md, as the merge leaves it ($merged), cites experiments that aren't current and unexpired: $(printf '%s; ' "${problems[@]}" | sed 's/; $//'): take each out of AGENTS.md or cite its current successor; a lapsed one stays only with a manager decision citing the metrics that supports it"
+  else
+    check ok experiments "AGENTS.md, as the merge leaves it, cites only current experiments: ${current[*]}"
+  fi
+}
+cite_check
 
 # The manager's passes of scripts/test-table naming the sha, one '<main sha>\x1f<key>\x1f<suffix>' line
 # each, split on the unit separator: a tab is whitespace to read, so an empty main and key would collapse

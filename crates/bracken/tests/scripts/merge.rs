@@ -1344,70 +1344,243 @@ fn gate_replay_refuses_an_old_ref_main_never_ran() {
     assert!(text(&out).contains("runs only as manager"), "{}", text(&out));
 }
 
-/// A lapsed experiment still cited in the head's AGENTS.md fails the gate, a typed one by its expires key
-/// included (decision ff456e4e2fcc, task 8c9ad9bd4518 step 3); one cited but kept by a manager decision, or
-/// lapsed but cited nowhere, doesn't fail it, and the second is only named, as before.
+/// Experiments for the citation tests: an untyped one (`expires` empty for none) and a typed one, each
+/// returning its full id.
+fn untyped_experiment(dir: &Path, rule: &str, expires: &str, who: &str) -> String {
+    let mut text = format!("Experiment ({who}): {rule}\nrule: {rule}\nmetric: prs_merged\nbaseline: 3\ntarget: 5");
+    if !expires.is_empty() {
+        text += &format!("\nexpires: {expires}");
+    }
+    bk(dir, &["claim", &text, "--tag", "experiment", "--as", who])
+}
+
+fn typed_experiment(dir: &Path, rule: &str, expires: &str) -> String {
+    let text = format!("Experiment (manager): {rule}\nrule: {rule}");
+    let expires = format!("expires={expires}");
+    bk(
+        dir,
+        &[
+            "claim",
+            &text,
+            "--type",
+            "experiment",
+            "--attr",
+            "metric=perf_claims_without_ab",
+            "--attr",
+            "baseline=14",
+            "--attr",
+            "target=0",
+            "--attr",
+            &expires,
+            "--as",
+            "manager",
+        ],
+    )
+}
+
+/// merge's lines for check or note `experiments` with the given status.
+fn experiments_lines(out: &Output, status: &str) -> Vec<String> {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with(status) && l.split_whitespace().nth(1) == Some("experiments"))
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Every experiment AGENTS.md cites must be current and unexpired (decision ff456e4e2fcc; task 8c9ad9bd4518
+/// step 3, round 1's findings). Cited by a full 12-digit id, an 8-digit prefix or in upper case: a typed and
+/// an untyped lapsed one fail; so do one whose expires date isn't a real date, one superseded (named with
+/// what superseded it), one retracted, a decision and an id naming nothing on the 'Running:' line. A
+/// malformed experiment written first doesn't hide the ones after it. One kept by a manager decision and an
+/// active one pass; a lapsed one cited nowhere, and the malformed one, are only named in the notes. Cited
+/// only active ones, the check passes and names them.
 #[test]
-fn merge_fails_while_a_lapsed_experiment_is_cited_in_agents_md() {
+fn merge_fails_unless_every_experiment_agents_md_cites_is_current() {
     for scripts in SCRIPTS {
-        let ids = std::cell::RefCell::new(Vec::new());
+        let ids = std::cell::RefCell::new(std::collections::HashMap::new());
         let at_base = |dir: &Path| {
-            let first = |out: String| out.lines().next().unwrap().to_owned();
-            let typed = first(bk(
-                dir,
-                &[
-                    "claim",
-                    "Experiment (manager): typed\nrule: every performance claim cites an A/B",
-                    "--type",
-                    "experiment",
-                    "--attr",
-                    "metric=perf_claims_without_ab",
-                    "--attr",
-                    "baseline=14",
-                    "--attr",
-                    "target=0",
-                    "--attr",
-                    "expires=2020-01-01",
-                    "--as",
-                    "manager",
-                ],
-            ));
-            let plain = |rule: &str, expires: &str| {
-                let text = format!(
-                    "Experiment (manager): {rule}\nrule: {rule}\nmetric: prs_merged\nbaseline: 3\ntarget: 5\nexpires: {expires}"
-                );
-                first(bk(dir, &["claim", &text, "--tag", "experiment", "--as", "manager"]))
-            };
-            let untyped = plain("untyped", "2020-01-02");
-            let kept = plain("kept", "2020-01-03");
-            let uncited = plain("uncited", "2020-01-04");
-            let decision = first(bk(
-                dir,
-                &["claim", "Decision (manager): kept, metrics met", "--tag", "decision", "--as", "manager"],
-            ));
+            let mut ids = ids.borrow_mut();
+            // First, so a jq that stopped at it would miss every one after it (finding bdee6db8dfcf).
+            ids.insert("malformed", untyped_experiment(dir, "bad date", "2026-13-45", "builder"));
+            ids.insert("typed", typed_experiment(dir, "typed", "2020-01-01"));
+            ids.insert("untyped", untyped_experiment(dir, "untyped", "2020-01-02", "manager"));
+            let kept = untyped_experiment(dir, "kept", "2020-01-03", "manager");
+            let decision =
+                bk(dir, &["claim", "Decision (manager): kept, metrics met", "--tag", "decision", "--as", "manager"]);
             bk(dir, &["relate", &decision, "supports", &kept, "--as", "manager"]);
-            let cite = format!("Running: `{}`, `{}` and `{}`.\n", &typed[..12], &untyped[..12], &kept[..12]);
+            ids.insert("kept", kept);
+            ids.insert("decision", decision);
+            ids.insert("uncited", untyped_experiment(dir, "uncited", "2020-01-04", "manager"));
+            ids.insert("active", untyped_experiment(dir, "active", "", "manager"));
+            ids.insert("superseded", untyped_experiment(dir, "superseded", "", "manager"));
+            ids.insert("retracted", untyped_experiment(dir, "retracted", "", "manager"));
+            let i = |k: &str| ids[k][..12].to_owned();
+            let cite = format!(
+                "# Agent guide\n\n- Running: `{}` (typed), `{}`, `{}`, `{}`, `{}`, `deadbeef01`.\n\
+                 - Also `{}` and {} and ({}).\n",
+                i("typed"),
+                &ids["untyped"][..8],
+                i("kept"),
+                i("active"),
+                i("decision"),
+                i("malformed"),
+                i("superseded").to_uppercase(),
+                i("retracted"),
+            );
             std::fs::write(dir.join("AGENTS.md"), cite).unwrap();
-            ids.borrow_mut().extend([typed, untyped, kept, uncited]);
         };
         let change = |dir: &Path| std::fs::write(dir.join("code.txt"), "a change\n").unwrap();
-        let (_tmp, _dir, mut merge) = merge_dry_run_command(scripts, at_base, change, |_| {}, None);
+        let (_tmp, dir, mut merge) = merge_dry_run_command(scripts, at_base, change, |_| {}, None);
+        let ids = ids.into_inner();
+        let i = |k: &str| ids[k][..12].to_owned();
+        let note = bk(
+            &dir,
+            &["claim", "Note: replaced", "--tag", "note", "--supersedes", &ids["superseded"], "--as", "manager"],
+        );
+        bk(&dir, &["retract", &ids["retracted"], "--as", "manager"]);
+
         let out = merge.output().unwrap();
         let said = text(&out);
         assert_eq!(out.status.code(), Some(1), "{scripts}: {said}");
-        let ids = ids.borrow();
-        let (typed, untyped, kept, uncited) = (&ids[0][..12], &ids[1][..12], &ids[2][..12], &ids[3][..12]);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let line = |status: &str| {
-            let mut found =
-                stdout.lines().filter(|l| l.starts_with(status) && l.split_whitespace().nth(1) == Some("experiments"));
-            found.next().unwrap_or_default().to_owned()
-        };
-        let failed = line("FAIL");
-        assert!(failed.contains("still cited in AGENTS.md"), "{scripts}: {said}");
-        assert!(failed.contains(typed) && failed.contains(untyped), "{scripts}: {failed}");
-        assert!(!failed.contains(kept) && !failed.contains(uncited), "{scripts}: {failed}");
-        let note = line("note");
-        assert!(note.contains(&format!("{uncited} (ended 2020-01-04)")), "{scripts}: {said}");
+        let failed = experiments_lines(&out, "FAIL");
+        assert_eq!(failed.len(), 1, "{scripts}: {said}");
+        let failed = &failed[0];
+        for part in [
+            format!("{} lapsed (ended 2020-01-01)", i("typed")),
+            format!("{} lapsed (ended 2020-01-02)", &ids["untyped"][..8]),
+            format!("{} is malformed (its expires date 2026-13-45 isn't a real date)", i("malformed")),
+            format!("{} is superseded by {}", i("superseded"), &note[..12]),
+            format!("{} is retracted", i("retracted")),
+            format!("{} isn't an experiment", i("decision")),
+            "deadbeef01 doesn't name one contribution".to_owned(),
+        ] {
+            assert!(failed.contains(&part), "{scripts}: lacks {part:?}: {failed}");
+        }
+        for fine in ["kept", "active", "uncited"] {
+            assert!(!failed.contains(&i(fine)), "{scripts}: {fine}: {failed}");
+        }
+        let notes = experiments_lines(&out, "note").join("\n");
+        for (k, ended) in [("typed", "2020-01-01"), ("untyped", "2020-01-02"), ("uncited", "2020-01-04")] {
+            assert!(notes.contains(&format!("{} (ended {ended})", i(k))), "{scripts}: {k}: {notes}");
+        }
+        assert!(notes.contains(&format!("malformed, so when they end can't be read: {}", i("malformed"))), "{notes}");
+        assert!(!notes.contains(&i("kept")), "{scripts}: {notes}");
+
+        // Citing only the active one passes, and says so.
+        std::fs::write(dir.join("AGENTS.md"), format!("Running: `{}`.\n", i("active"))).unwrap();
+        git_ok(&dir, &["switch", "-q", "pr"]);
+        std::fs::write(dir.join("AGENTS.md"), format!("Running: `{}`.\n", i("active"))).unwrap();
+        git_ok(&dir, &["commit", "-qam", "cite only the active one"]);
+        let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "HEAD"]).stdout).unwrap().trim().to_owned();
+        git_ok(&dir, &["switch", "-q", "main"]);
+        let forge = _tmp.path().join("forge.git");
+        git_ok(&dir, &["push", "-qf", forge.to_str().unwrap(), "pr:refs/pull/1/head"]);
+        let pr = format!(
+            r#"{{"head":{{"sha":"{sha}"}},"state":"open","merged":false,"base":{{"ref":"main"}},"title":"t"}}"#
+        );
+        write_executable(&_tmp.path().join("stubs/gh"), &format!("#!/bin/sh\necho '{pr}'\n"));
+        let claim = bk(&dir, &["claim", &format!("PR #1 pr @ {sha}: a change"), "--tag", "pr", "--as", "builder"]);
+        bk(&dir, &["evidence", &claim, "pass", "--method", "checked", "--as", "val"]);
+        let path = std::env::var("PATH").unwrap();
+        let out = command(
+            &dir,
+            "scripts/merge",
+            &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"],
+        )
+        .env("PATH", format!("{}:{path}", _tmp.path().join("stubs").display()))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+        let said = text(&out);
+        let ok = experiments_lines(&out, "ok");
+        assert!(out.status.success(), "{scripts}: {said}");
+        assert_eq!(
+            ok,
+            [format!(
+                "ok    experiments  AGENTS.md, as the merge leaves it, cites only current experiments: {}",
+                i("active")
+            )],
+            "{scripts}: {said}"
+        );
+    }
+}
+
+/// The citation check reads AGENTS.md from the tree the merge leaves, main's tip merged with the head, not
+/// the head's own (finding 7a98b2f925a6): main citing a lapsed experiment after the head branched fails it;
+/// main dropping the citation the head's base had passes it.
+#[test]
+fn merge_reads_the_cited_experiments_from_the_merged_tree() {
+    for scripts in SCRIPTS {
+        for main_cites in [true, false] {
+            let id = std::cell::RefCell::new(String::new());
+            let at_base = |dir: &Path| {
+                let e = untyped_experiment(dir, "lapsed", "2020-01-01", "manager");
+                let base =
+                    if main_cites { "# Agent guide\n".to_owned() } else { format!("Running: `{}`.\n", &e[..12]) };
+                std::fs::write(dir.join("AGENTS.md"), base).unwrap();
+                *id.borrow_mut() = e;
+            };
+            let change = |dir: &Path| std::fs::write(dir.join("code.txt"), "a change\n").unwrap();
+            let on_main = |dir: &Path| {
+                let e = id.borrow();
+                let now = if main_cites { format!("Running: `{}`.\n", &e[..12]) } else { "# Agent guide\n".to_owned() };
+                std::fs::write(dir.join("AGENTS.md"), now).unwrap();
+            };
+            let (_tmp, _dir, mut merge) = merge_dry_run_command(scripts, at_base, change, on_main, None);
+            let out = merge.output().unwrap();
+            let said = text(&out);
+            let e = id.borrow()[..12].to_owned();
+            let failed = experiments_lines(&out, "FAIL");
+            if main_cites {
+                assert!(
+                    failed.len() == 1 && failed[0].contains(&format!("{e} lapsed (ended 2020-01-01)")),
+                    "{scripts}: {said}"
+                );
+            } else {
+                assert!(failed.is_empty(), "{scripts}: main dropped the citation: {said}");
+            }
+        }
+    }
+}
+
+/// Experiments that can't be read fail check 'experiments', never read as none (finding 10febee32fff): a
+/// bracken whose read of every experiment claim fails, through one batch or one read each.
+#[test]
+fn merge_fails_when_the_experiments_cant_be_read() {
+    for scripts in SCRIPTS {
+        let change = |dir: &Path| std::fs::write(dir.join("code.txt"), "a change\n").unwrap();
+        let (tmp, _dir, mut merge) = merge_dry_run_command(scripts, |_| {}, change, |_| {}, None);
+        let wrapper = tmp.path().join("stubs/no-experiments-bracken");
+        write_executable(
+            &wrapper,
+            r#"#!/usr/bin/env bash
+set -o pipefail
+want='["log","--tag","experiment","--json"]'
+if [ "${1:-}" = batch ]; then
+  [ -z "${NO_BATCH:-}" ] || exit 2
+  [ "${2:-}" != --help ] || exec "$REAL_BRACKEN" "$@"
+  while IFS= read -r r; do
+    if [ "$(jq -c . <<<"$r")" = "$want" ]; then jq -cn '{ok: false, error: "stub"}'; else "$REAL_BRACKEN" batch <<<"$r"; fi
+  done
+  exit 0
+fi
+[ "$*" != "log --tag experiment --json" ] || exit 1
+exec "$REAL_BRACKEN" "$@"
+"#,
+        );
+        merge.env("BRACKEN_BIN", &wrapper);
+        for no_batch in [false, true] {
+            if no_batch {
+                merge.env("NO_BATCH", "1");
+            }
+            let out = merge.output().unwrap();
+            let said = text(&out);
+            assert_eq!(out.status.code(), Some(1), "{scripts}: no batch {no_batch}: {said}");
+            let failed = experiments_lines(&out, "FAIL");
+            assert!(
+                failed.len() == 1 && failed[0].contains("couldn't read the experiment claims"),
+                "{scripts}: no batch {no_batch}: {said}"
+            );
+        }
     }
 }

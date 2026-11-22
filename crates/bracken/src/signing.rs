@@ -361,6 +361,29 @@ mod tests {
         Body::Claim { statement: "s".into(), tags: tags.iter().map(|t| (*t).to_owned()).collect() }
     }
 
+    /// The runner's scope in the scopes file scripts/team-server writes (decision ff456e4e2fcc) refuses every
+    /// typed shape but metric, by its type tag and its plain tag, so a new shape is refused until it is
+    /// allowed on purpose (finding baeb854c4b62); it signs the metric claim scripts/metrics --post writes.
+    #[test]
+    fn the_runner_scope_refuses_every_shape_but_metric() {
+        let script = include_str!("../../../scripts/team-server");
+        let start = script.find("first_scopes() {\n  cat <<'TOML'\n").expect("team-server's first_scopes heredoc");
+        let body = &script[start..];
+        let body = &body[body.find('\n').unwrap() + 1..];
+        let body = &body[body.find('\n').unwrap() + 1..];
+        let toml = &body[..body.find("\nTOML\n").expect("the heredoc's end")];
+        let runner = scope_of(toml, "runner").unwrap().expect("a runner scope");
+        for shape in crate::typed::SHAPES.iter().filter(|s| s.name != "metric") {
+            let typed = format!("type:{}", shape.name);
+            assert!(runner.refuses(&claim(&[&typed])).is_some(), "runner may write {typed}");
+            if let Some(plain) = shape.legacy {
+                assert!(runner.refuses(&claim(&[plain])).is_some(), "runner may write {plain}");
+            }
+        }
+        let metric = claim(&["type:metric", "metrics", "week:2026-11-16", "escapes_14d:2", "prs_merged:3"]);
+        assert_eq!(runner.refuses(&metric), None);
+    }
+
     #[test]
     fn a_scope_is_found_by_name_then_by_the_longest_pattern() {
         let text = r#"

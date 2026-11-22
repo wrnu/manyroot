@@ -215,10 +215,21 @@ fn metrics_counts_escapes_and_perf_claims_and_posts_as_runner() {
         ],
     );
 
+    // An expires date that isn't a real day is one the experiment lacks, and stops nothing (finding
+    // 10febee32fff).
+    let bad = claim(
+        "Experiment (manager): bad date\nrule: x\nmetric: prs_merged\nbaseline: 1\ntarget: 2\nexpires: 2026-13-45",
+        "experiment",
+        "manager",
+    );
+
     let today = date_from_now(7);
     let out = run(&dir, "scripts/metrics", &["--today", &today, "--json"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let got: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let all = got["experiments"].as_array().unwrap();
+    let malformed = all.iter().find(|e| e["id"] == bad[..12]).unwrap_or_else(|| panic!("{got}"));
+    assert_eq!(malformed["missing"], serde_json::json!(["a real expires date"]), "{got}");
     assert_eq!(got["escapes_14d"], 2, "{got}");
     assert_eq!(got["perf_claims_without_ab"], 1, "{got}");
     let all = got["experiments"].as_array().unwrap();
@@ -230,8 +241,33 @@ fn metrics_counts_escapes_and_perf_claims_and_posts_as_runner() {
     let before = bk(&dir, &["log", "--json"]);
     let out = run(&dir, "scripts/metrics", &["--today", &today, "--post", "--json"]);
     assert!(!out.status.success(), "--post with --json");
+    // With no runner identity, --post fails before it reads or prints anything (finding 63d236b05b66).
     let out = run(&dir, "scripts/metrics", &["--today", &today, "--post"]);
-    assert!(!out.status.success(), "posted without a runner: {}", text(&out));
+    assert!(!out.status.success() && out.stdout.is_empty(), "posted without a runner: {}", text(&out));
+    assert!(text(&out).contains("nothing was read or written"), "{}", text(&out));
+    assert_eq!(bk(&dir, &["log", "--json"]), before, "a failed --post wrote to the Ground");
+    // With a team server, the caller's token is never used: the manager's own token there, and none of
+    // runner's, fails before any read; with runner's, every read must pull as runner, so an unreachable
+    // server fails it too, printing nothing.
+    let team = _tmp.path().join("team");
+    std::fs::create_dir_all(team.join("tokens")).unwrap();
+    std::fs::write(team.join("url"), "http://127.0.0.1:9").unwrap();
+    std::fs::write(team.join("tokens/manager"), "not-a-token").unwrap();
+    std::fs::write(dir.join(".bracken-team"), team.to_str().unwrap()).unwrap();
+    let as_manager = |dir: &Path| {
+        command(dir, "scripts/metrics", &["--today", &today, "--post"])
+            .env("BRACKEN_AGENT", "manager")
+            .output()
+            .unwrap()
+    };
+    let out = as_manager(&dir);
+    assert!(!out.status.success() && out.stdout.is_empty(), "{}", text(&out));
+    assert!(text(&out).contains("runner has no team token, so nothing was read or written"), "{}", text(&out));
+    std::fs::write(team.join("tokens/runner"), "not-a-token").unwrap();
+    let out = as_manager(&dir);
+    assert!(!out.status.success() && out.stdout.is_empty(), "{}", text(&out));
+    assert!(text(&out).contains("couldn't read the Ground"), "{}", text(&out));
+    std::fs::remove_file(dir.join(".bracken-team")).unwrap();
     assert_eq!(bk(&dir, &["log", "--json"]), before, "a failed --post wrote to the Ground");
     bk(&dir, &["id", "new", "runner"]);
     let out = run(&dir, "scripts/metrics", &["--today", &today, "--post"]);
