@@ -111,8 +111,8 @@ that are most of a read's cost.
   largest size, and every one must name an object `objects/` lists, so a read decodes at most what the
   replica holds. A segment whose framing or checksum doesn't hold (a torn append), an empty one, or one
   repeating a contribution ends the read there: the contributions after it are read from their objects
-  and checked, and the snapshot is rewritten whole. One naming an object that's gone sets the snapshot
-  aside for a full check.
+  and checked, and the snapshot is rewritten whole. The read stops at the first contribution naming an
+  object that's gone, reading nothing after it, and the snapshot is set aside for a full check.
 - **The trade.** An object the snapshot holds isn't read again, so if its bytes are overwritten on disk
   later, or made unreadable, a cached read doesn't notice, where a full check refuses the replica. A
   deleted object is noticed, since every read lists `objects/`, and so is one replaced by a link, a

@@ -28,8 +28,8 @@
 //! contribution at a time, each at most a contribution's largest size, and the read stops at the first
 //! contribution the replica holds no object for (the whole snapshot is then set aside for a full open),
 //! at a repeat or an empty segment, or at a segment whose framing or checksum doesn't hold (a torn
-//! append). So every contribution kept is a distinct object of the replica, and what a read decodes is
-//! at most what `objects/` holds plus one segment's worth. A read that stopped early keeps what came
+//! append). So every contribution read, kept or buffered in a segment, is a distinct object of the
+//! replica, and what a read decodes is at most what `objects/` holds plus one contribution. A read that stopped early keeps what came
 //! before, reads the rest from the objects, and rewrites the snapshot whole. Two processes appending at
 //! once each append with one `O_APPEND` write; a rewrite renames a new file into place, so an append
 //! racing it can land on the old file and be lost, which costs only a re-read of those objects next time.
@@ -233,7 +233,9 @@ fn read_snapshot(dir: &Path, ground: GroundId, on_disk: &dyn Fn(&ContributionId)
 enum Stop {
     /// Torn, damaged, empty or repeating: the read ends before it.
     Torn,
-    /// Whole, but names a contribution the replica holds no object for: the snapshot is set aside.
+    /// Names a contribution the replica holds no object for: the read stops there, and the snapshot is
+    /// set aside. (A damaged id lands here too, before its segment's checksum is read: it costs only the
+    /// full open a torn segment would have cost from that point.)
     Missing,
 }
 
@@ -266,7 +268,6 @@ fn read_segment(
     }
     let mut out = Vec::new();
     let mut ids = HashSet::new();
-    let mut missing = false;
     for _ in 0..count {
         let mut n = [0u8; 4];
         r.read_exact(&mut n).map_err(|_| Stop::Torn)?;
@@ -285,7 +286,11 @@ fn read_segment(
         if seen.contains(&id) || !ids.insert(id) {
             return Err(Stop::Torn);
         }
-        missing |= !on_disk(&id);
+        // At the first contribution the replica holds no object for, stop: nothing after it is read
+        // (findings 937b52d0164e, 4dc0418ed33c), so what a segment buffers is bounded by objects/.
+        if !on_disk(&id) {
+            return Err(Stop::Missing);
+        }
         out.push(c);
     }
     if left != 0 {
@@ -295,9 +300,6 @@ fn read_segment(
     r.read_exact(&mut sum).map_err(|_| Stop::Torn)?;
     if *hasher.finalize().as_bytes() != sum {
         return Err(Stop::Torn);
-    }
-    if missing {
-        return Err(Stop::Missing);
     }
     Ok((out, total))
 }
@@ -729,6 +731,42 @@ mod tests {
         entry.extend_from_slice(&u32::MAX.to_le_bytes());
         entry.extend_from_slice(&[0u8; 32]);
         assert!(decode_bytes(&entry).is_err());
+    }
+
+    /// Findings `937b52d0164e` and `4dc0418ed33c`: the read stops at the first contribution the replica
+    /// holds no object for, reading and checking nothing after it, even within its segment.
+    #[test]
+    fn the_read_stops_at_the_first_contribution_without_an_object() {
+        struct Counted<'a>(&'a [u8], std::rc::Rc<std::cell::Cell<usize>>);
+        impl Read for Counted<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.read(buf)?;
+                self.1.set(self.1.get() + n);
+                Ok(n)
+            }
+        }
+        let cs = chain(1);
+        let who = Identity::generate("t").expect("a key");
+        let big: Vec<Contribution> = (0..8u8)
+            .map(|i| {
+                let body = Body::Artifact { name: format!("a{i}"), media_type: "x".into(), content: vec![i; 1 << 20] };
+                Contribution::create(G, &who, [], u64::from(i), body)
+            })
+            .collect();
+        // A planted segment: one contribution the replica lacks, then 8 MiB the read must never reach.
+        let mut planted: Vec<&Contribution> = vec![&cs[0]];
+        planted.extend(big.iter());
+        let bytes = encode(G, &planted);
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        let checks = std::cell::Cell::new(0);
+        let on_disk = |_: &ContributionId| {
+            checks.set(checks.get() + 1);
+            false
+        };
+        let reader = BufReader::with_capacity(4096, Counted(&bytes, read.clone()));
+        assert!(decode(reader, bytes.len() as u64, G, &on_disk).is_err(), "set aside");
+        assert_eq!(checks.get(), 1, "one membership check, then the read stops");
+        assert!(read.get() < 8192, "read {} of {} bytes", read.get(), bytes.len());
     }
 
     /// Finding `ed533a35b961`: repeats and empty segments end the read, so they can't inflate it or the
