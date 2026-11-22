@@ -57,7 +57,7 @@ On this machine, 127.0.0.1:7391, its files in `~/.bracken-team/manyroot/` (mode 
 
 ## Typed claims
 
-Conventions on protocol v1 tags (task `8c9ad9bd4518`, synthesis 2.2 C1), each one-to-one with a field protocol v2 is to hold: `type:<name>` (one per claim), `<key>:<value>` (one value per key) and `ref:<role>=<full id>`, whose id the CLI also makes a parent. `bracken claim` checks every tag's syntax, and a typed claim's shape, before writing anything; reads only report what doesn't conform (`typed.problems` in `--json`), and validity never looks at tags. A typed claim also carries its type's plain tag, so `log --tag pr` and the scripts find it. One call writes the claim and its relations ([cli.md](cli.md), Typed claims):
+Conventions on protocol v1 tags (task `8c9ad9bd4518`, synthesis 2.2 C1), each one-to-one with a field protocol v2 is to hold: `type:<name>` (one per claim), `<key>:<value>` (one value per key) and `ref:<role>=<full id>`, whose id the CLI also makes a parent. `bracken claim` checks every tag's syntax, and a typed claim's shape, before writing anything; reads only report what doesn't conform (`typed.problems` in `--json`), and validity never looks at tags. A typed claim also carries its type's plain tag, however the type is given, so `log --tag pr` and the scripts find it. One call writes the claim and its relations ([cli.md](cli.md), Typed claims):
 
 ```sh
 scripts/bk claim "<file:line> <what breaks>" --type finding --attr severity=medium --attr label=confirmed --contradicts <pr> --as <you>
@@ -67,7 +67,7 @@ scripts/bk claim "PR #<n> <branch> @ <sha>: <title>. Weave proposal <id>" --type
 
 | Type | Keys (value kind) | Written with |
 |---|---|---|
-| `pr` | `pr` (number), `branch`, `sha` (40 hex); optional `weave` (64 hex), `class` | a statement starting `PR #<pr> <branch> @ <sha>: `, naming `Weave proposal <weave>` when given |
+| `pr` | `pr` (number), `branch`, `sha` (40 hex); optional `weave` (64 hex), `class` | a statement starting `PR #<pr> <branch> @ <sha>: ` and, with `weave`, ending `Weave proposal <weave>`; a statement naming a proposal gives it as `weave`, the one scripts/weave-gate reads |
 | `finding` | `severity` (low, medium, high, critical), `label` (confirmed, possible); optional `at` | `--contradicts <id>` |
 | `triage` | `disposition` (confirmed, rejected, deferred) | `--ref finding=<id>`; deferred: also `--ref task=<id>` |
 | `task` | optional `agent`, `class`, `branch` | tagged `deferred`: `--depends-on <finding>` |

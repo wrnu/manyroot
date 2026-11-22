@@ -179,6 +179,55 @@ fn a_refused_write_writes_nothing_and_says_what_to_fix() {
     assert_eq!(count(dir), before, "a refused write wrote something");
 }
 
+/// A type given as `--tag type:<name>` carries its plain tag as `--type` does, so readers of plain tags
+/// find it (finding 9ffe5c0c74ff).
+#[test]
+fn a_type_given_as_a_tag_carries_its_plain_tag() {
+    let tmp = ground();
+    let dir = tmp.path();
+    let pr = format!("PR #3 b @ {SHA}: t");
+    let sha = format!("sha:{SHA}");
+    let cases: &[(&str, &[&str], &str)] = &[
+        (&pr, &["type:pr", "pr:3", "branch:b", &sha], "pr"),
+        ("A task", &["type:task"], "task"),
+        ("rule: r", &["type:experiment", "metric:m", "baseline:1", "target:2", "expires:2026-12-01"], "experiment"),
+        ("Metrics", &["type:metric", "week:2026-11-16"], "metrics"),
+    ];
+    for (statement, tags, plain) in cases {
+        let mut args = vec!["claim", statement];
+        for t in *tags {
+            args.extend(["--tag", t]);
+        }
+        args.extend(["--as", "alice"]);
+        let id = ok(dir, &args);
+        let found = json(dir, &["log", "--tag", plain, "--json"]);
+        assert!(found.as_array().unwrap().iter().any(|c| c["id"] == id.as_str()), "{plain}: {found}");
+        assert_eq!(json(dir, &["show", &id, "--json"])["typed"]["problems"], serde_json::json!([]), "{plain}");
+    }
+}
+
+/// Reading typed tags stays linear in a claim's tag count: tags come from anyone, and every `--json` read
+/// reads them (findings ddd0f2e67b5d, 2f7ae1d99d44). Quadratic, 200k tags took minutes.
+#[test]
+fn a_claim_with_a_great_many_tags_reads_in_bounded_time() {
+    let tmp = ground();
+    let dir = tmp.path();
+    let mut store = Store::open(&dir.join(".bracken")).expect("store");
+    let alice = store.identity("alice").expect("alice");
+    let mut tags: Vec<String> = (0..200_000).map(|n| format!("t{n}")).collect();
+    tags.extend((0..1000).map(|n| format!("Bad{n}")));
+    tags.push("type:pr".into());
+    let id = store.contribute(&alice, Body::Claim { statement: "x".into(), tags }).expect("valid").to_hex();
+    drop(store);
+    let start = std::time::Instant::now();
+    let c = json(dir, &["show", &id, "--json"]);
+    ok(dir, &["log", "--json"]);
+    let took = start.elapsed();
+    assert!(took < std::time::Duration::from_secs(60), "two reads took {took:?}");
+    let problems = c["typed"]["problems"].as_array().unwrap();
+    assert!(problems.len() <= 21 && problems.last().unwrap().as_str().unwrap().ends_with("more"), "{problems:?}");
+}
+
 #[test]
 fn untyped_claims_keep_working() {
     let tmp = ground();

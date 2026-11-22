@@ -1298,14 +1298,23 @@ fn claim_tags(
         tags.push(format!("ref:{role}={}", id.to_hex()));
         parents.push(id);
     }
-    // A reference given as a tag is a parent too.
+    // A reference given as a tag is a parent too, and a type given as a tag carries its plain tag, as with
+    // --type and --ref.
+    let mut legacy = None;
     for tag in &tags {
-        if let Ok(typed::Tag::Ref(_, hex)) = typed::parse(tag) {
-            let id = resolve(s, hex).with_context(|| format!("--tag {tag}"))?;
-            if !parents.contains(&id) {
-                parents.push(id);
+        match typed::parse(tag) {
+            Ok(typed::Tag::Ref(_, hex)) => {
+                let id = resolve(s, hex).with_context(|| format!("--tag {tag}"))?;
+                if !parents.contains(&id) {
+                    parents.push(id);
+                }
             }
+            Ok(typed::Tag::Type(ty)) => legacy = legacy.or(typed::shape(ty).and_then(|s| s.legacy)),
+            _ => {}
         }
+    }
+    if let Some(legacy) = legacy {
+        add(legacy.to_owned(), &mut tags);
     }
     Ok((tags, parents))
 }

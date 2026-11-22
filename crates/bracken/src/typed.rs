@@ -17,14 +17,25 @@
 //! Claims written before these conventions keep working: a plain `finding` tag means what it meant, and a
 //! typed claim also carries its type's plain tag ([`Shape::legacy`]), so every reader of plain tags finds it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
-use manyroot::RelationKind;
+use manyroot::{ContributionId, RelationKind};
 use serde_json::{Value, json};
 
 /// A tag's longest name or key, and its longest value.
 const MAX_NAME: usize = 64;
 const MAX_VALUE: usize = 256;
+/// How much of an untrusted tag a message quotes, and how many problems a reading lists.
+const QUOTED: usize = 80;
+const MAX_PROBLEMS: usize = 20;
+
+/// An untrusted tag, quoted for a message: escaped, and cut to [`QUOTED`] characters.
+fn shown(tag: &str) -> String {
+    match tag.char_indices().nth(QUOTED) {
+        Some((at, _)) => format!("{:?}…", &tag[..at]),
+        None => format!("{tag:?}"),
+    }
+}
 
 /// One tag, by its form.
 #[derive(Debug, PartialEq, Eq)]
@@ -40,40 +51,64 @@ pub fn parse(tag: &str) -> Result<Tag<'_>, String> {
     if tag.is_empty() {
         return Err("a tag can't be empty".into());
     }
+    // Checked first, so a well-formed tag costs no quoting.
+    if let Some(ok) = well_formed(tag) {
+        return Ok(ok);
+    }
+    let q = shown(tag);
     if tag.contains(',') {
-        return Err(format!("{tag:?} holds a comma: give each tag its own --tag"));
+        return Err(format!("{q} holds a comma: give each tag its own --tag"));
     }
     if tag.chars().any(|c| c.is_whitespace() || c.is_control()) {
-        return Err(format!("{tag:?} holds a space or a control character"));
+        return Err(format!("{q} holds a space or a control character"));
     }
     let Some((key, value)) = tag.split_once(':') else {
         return plain(tag).then_some(Tag::Plain(tag)).ok_or_else(|| {
             format!(
-                "{tag:?} isn't a tag: a plain tag is lowercase letters, digits, '-', '_' and '.', starting with a \
+                "{q} isn't a tag: a plain tag is lowercase letters, digits, '-', '_' and '.', starting with a \
                  letter or digit, at most {MAX_NAME} characters"
             )
         });
     };
     match key {
-        "type" => type_name(value).then_some(Tag::Type(value)).ok_or_else(|| {
-            format!("{tag:?}: a type is lowercase words of letters, digits, '-' and '_', joined by '.'")
-        }),
+        "type" => type_name(value)
+            .then_some(Tag::Type(value))
+            .ok_or_else(|| format!("{q}: a type is lowercase words of letters, digits, '-' and '_', joined by '.'")),
         "ref" => {
-            let (role, id) = value.split_once('=').ok_or_else(|| format!("{tag:?}: a reference is ref:<role>=<id>"))?;
+            let (role, id) = value.split_once('=').ok_or_else(|| format!("{q}: a reference is ref:<role>=<id>"))?;
             if !name(role) {
-                return Err(format!("{tag:?}: a role is a lowercase name"));
+                return Err(format!("{q}: a role is a lowercase name"));
             }
             if !(id.len() == 64 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
-                return Err(format!("{tag:?}: a reference holds the full 64-digit id (--ref resolves a prefix)"));
+                return Err(format!("{q}: a reference holds the full 64-digit id (--ref resolves a prefix)"));
             }
             Ok(Tag::Ref(role, id))
         }
         _ if !name(key) => Err(format!(
-            "{tag:?}: a key is a lowercase letter, then lowercase letters, digits, '-', '_' and '.', at most \
+            "{q}: a key is a lowercase letter, then lowercase letters, digits, '-', '_' and '.', at most \
              {MAX_NAME} characters"
         )),
-        _ if value.is_empty() || value.len() > MAX_VALUE => Err(format!("{tag:?}: a value is 1 to {MAX_VALUE} bytes")),
+        _ if value.is_empty() || value.len() > MAX_VALUE => Err(format!("{q}: a value is 1 to {MAX_VALUE} bytes")),
         _ => Ok(Tag::Attr(key, value)),
+    }
+}
+
+/// The tag's reading if it is well formed, the common case, without building any message.
+fn well_formed(tag: &str) -> Option<Tag<'_>> {
+    if tag.contains(',') || tag.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    let Some((key, value)) = tag.split_once(':') else {
+        return plain(tag).then_some(Tag::Plain(tag));
+    };
+    match key {
+        "type" => type_name(value).then_some(Tag::Type(value)),
+        "ref" => {
+            let (role, id) = value.split_once('=')?;
+            let hex = id.len() == 64 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            (name(role) && hex).then_some(Tag::Ref(role, id))
+        }
+        _ => (name(key) && !value.is_empty() && value.len() <= MAX_VALUE).then_some(Tag::Attr(key, value)),
     }
 }
 
@@ -116,14 +151,47 @@ impl Typed {
     }
 }
 
-/// Reads tags by form, never refusing: what breaks a rule is left out and listed.
-pub fn read(tags: &[String]) -> (Typed, Vec<String>) {
+/// Problems, at most [`MAX_PROBLEMS`] of them listed, then how many more there were.
+#[derive(Debug, Default)]
+pub struct Problems {
+    listed: Vec<String>,
+    more: usize,
+}
+
+impl Problems {
+    fn push(&mut self, p: String) {
+        if self.listed.len() < MAX_PROBLEMS { self.listed.push(p) } else { self.more += 1 }
+    }
+
+    fn extend(&mut self, ps: impl IntoIterator<Item = String>) {
+        for p in ps {
+            self.push(p);
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.listed.is_empty()
+    }
+
+    /// The listed problems, and a last line counting the rest.
+    pub fn into_vec(mut self) -> Vec<String> {
+        if self.more > 0 {
+            self.listed.push(format!("and {} more", self.more));
+        }
+        self.listed
+    }
+}
+
+/// Reads tags by form, never refusing: what breaks a rule is left out and listed. Linear in the number of
+/// tags, as it runs on every claim a `--json` read prints, and tags come from anyone.
+pub fn read(tags: &[String]) -> (Typed, Problems) {
     let mut t = Typed::default();
-    let mut problems = Vec::new();
+    let mut problems = Problems::default();
+    let (mut plain, mut refs) = (HashSet::new(), HashSet::new());
     for tag in tags {
         match parse(tag) {
             Err(e) => problems.push(e),
-            Ok(Tag::Plain(p)) if t.plain.iter().any(|q| q == p) => problems.push(format!("{p:?} is given twice")),
+            Ok(Tag::Plain(p)) if !plain.insert(p) => problems.push(format!("{p:?} is given twice")),
             Ok(Tag::Plain(p)) => t.plain.push(p.to_owned()),
             Ok(Tag::Type(ty)) => match &t.ty {
                 Some(first) if first == ty => problems.push(format!("type:{ty} is given twice")),
@@ -136,7 +204,7 @@ pub fn read(tags: &[String]) -> (Typed, Vec<String>) {
                     t.data.insert(k.to_owned(), v.to_owned());
                 }
             },
-            Ok(Tag::Ref(role, id)) if t.refs.iter().any(|(r, i)| r == role && i == id) => {
+            Ok(Tag::Ref(role, id)) if !refs.insert((role, id)) => {
                 problems.push(format!("ref:{role}={id} is given twice"))
             }
             Ok(Tag::Ref(role, id)) => t.refs.push((role.to_owned(), id.to_owned())),
@@ -267,12 +335,29 @@ fn pr_statement(t: &Typed, statement: &str) -> Vec<String> {
     if !statement.starts_with(&start) {
         problems.push(format!("a pr claim's statement starts {start:?}, as its tags say"));
     }
-    if let Some(w) = t.data.get("weave")
-        && !statement.contains(&format!("Weave proposal {w}"))
-    {
-        problems.push(format!("the statement names the Weave proposal its weave key gives: \"Weave proposal {w}\""));
+    // scripts/weave-gate reads the first 'Weave proposal <64 hex>' in the statement.
+    match (t.data.get("weave"), weave_proposal(statement)) {
+        (Some(w), _) if !statement.trim_end().ends_with(&format!("Weave proposal {w}")) => {
+            problems.push(format!("the statement ends \"Weave proposal {w}\", as its weave key says"))
+        }
+        (Some(w), Some(named)) if named != w => {
+            problems.push(format!("the statement names Weave proposal {named} first, but its weave key is {w}"))
+        }
+        (None, Some(named)) => {
+            problems.push(format!("the statement names Weave proposal {named}: give it as --attr weave={named}"))
+        }
+        _ => {}
     }
     problems
+}
+
+/// The proposal scripts/weave-gate reads: the first `Weave proposal ` followed by 64 lowercase hex digits.
+fn weave_proposal(statement: &str) -> Option<&str> {
+    const MARK: &str = "Weave proposal ";
+    statement.match_indices(MARK).find_map(|(at, _)| {
+        let id = statement.get(at + MARK.len()..at + MARK.len() + 64)?;
+        id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)).then_some(id)
+    })
 }
 
 /// An experiment states its rule in a `rule:` line. Any `metric:`, `baseline:`, `target:` or `expires:`
@@ -402,12 +487,11 @@ pub fn shape(ty: &str) -> Option<&'static Shape> {
 
 /// What a claim's statement and tags break, read as a reader reads them: relations aren't looked at, since
 /// they're separate contributions. Empty if it conforms.
-pub fn problems(statement: &str, tags: &[String]) -> Vec<String> {
-    let (t, mut problems) = read(tags);
+fn typed_problems(t: &Typed, mut problems: Problems, statement: &str) -> Problems {
     if let Some(ty) = &t.ty {
         match shape(ty) {
             None => problems.push(format!("no shape for type {ty}")),
-            Some(s) => problems.extend(shape_problems(s, &t, statement)),
+            Some(s) => problems.extend(shape_problems(s, t, statement)),
         }
     }
     problems
@@ -415,6 +499,12 @@ pub fn problems(statement: &str, tags: &[String]) -> Vec<String> {
 
 fn shape_problems(s: &Shape, t: &Typed, statement: &str) -> Vec<String> {
     let mut problems = Vec::new();
+    // Readers of plain tags (log --tag, scripts/merge, scripts/metrics) find a typed claim by its plain tag.
+    if let Some(legacy) = s.legacy
+        && !t.plain.iter().any(|p| p == legacy)
+    {
+        problems.push(format!("a {} also carries the plain tag {legacy} (--type adds it)", s.name));
+    }
     for k in s.keys {
         match t.data.get(k.name) {
             None if k.required => problems.push(format!(
@@ -467,7 +557,7 @@ pub fn check_write(statement: &str, tags: &[String], relations: &[RelationKind])
     {
         problems.push("a deferred task is written with the finding it defers: --depends-on <finding>".into());
     }
-    if problems.is_empty() { Ok(t) } else { Err(problems.join("; ")) }
+    if problems.is_empty() { Ok(t) } else { Err(problems.into_vec().join("; ")) }
 }
 
 /// The names a signing scope judges a tag by: the tag itself, and for `type:<name>` the type's name and its
@@ -483,20 +573,23 @@ pub fn scope_names(tag: &str) -> Vec<&str> {
     names
 }
 
-/// The typed reading of a claim for `--json`, or `None` when its tags are all plain: `{"type", "data",
-/// "refs": [{"role", "id"}], "problems"}`, where problems also names a reference that isn't a parent.
-pub fn json(statement: &str, tags: &[String], parents: &[manyroot::ContributionId]) -> Option<Value> {
-    let (t, _) = read(tags);
-    let malformed = tags.iter().any(|tag| tag.contains(':') && parse(tag).is_err());
-    if !t.any() && !malformed {
+/// The typed reading of a claim for `--json`, or `None` when its tags are all plain and well formed:
+/// `{"type", "data", "refs": [{"role", "id"}], "problems"}`, where problems also names a reference that isn't
+/// a parent. At most [`MAX_PROBLEMS`] are listed, then a count of the rest; linear in the tags and parents.
+pub fn json(statement: &str, tags: &[String], parents: &[ContributionId]) -> Option<Value> {
+    let (t, problems) = read(tags);
+    if !t.any() && problems.is_empty() {
         return None;
     }
-    let mut problems = problems(statement, tags);
+    let mut problems = typed_problems(&t, problems, statement);
+    // Parents are strictly ascending (protocol rule 4), so each reference is a binary search.
     for (role, id) in &t.refs {
-        if !parents.iter().any(|p| p.to_hex() == *id) {
+        let parent = id.parse::<ContributionId>().is_ok_and(|id| parents.binary_search(&id).is_ok());
+        if !parent {
             problems.push(format!("ref:{role}={id} isn't a parent"));
         }
     }
+    let problems = problems.into_vec();
     let refs: Vec<Value> = t.refs.iter().map(|(role, id)| json!({"role": role, "id": id})).collect();
     Some(json!({"type": t.ty, "data": t.data, "refs": refs, "problems": problems}))
 }
@@ -538,12 +631,13 @@ mod tests {
 
     #[test]
     fn one_type_one_value_per_key() {
-        let (_, p) = read(&tags(&["type:pr", "type:finding"]));
+        let p = read(&tags(&["type:pr", "type:finding"])).1.into_vec();
         assert_eq!(p.len(), 1, "{p:?}");
-        let (_, p) = read(&tags(&["severity:low", "severity:high"]));
+        let p = read(&tags(&["severity:low", "severity:high"])).1.into_vec();
         assert_eq!(p.len(), 1, "{p:?}");
         let id = "b".repeat(64);
         let (t, p) = read(&tags(&[&format!("ref:x={id}"), &format!("ref:y={id}")]));
+        let p = p.into_vec();
         assert!(p.is_empty() && t.refs.len() == 2, "{p:?}");
     }
 
@@ -569,19 +663,63 @@ mod tests {
         assert!(e.contains("PR #7 typed-x"), "{e}");
         let e = check_write("x", &tags(&["type:finding", "severity:huge"]), &[]).unwrap_err();
         assert!(e.contains("severity") && e.contains("label") && e.contains("--contradicts"), "{e}");
-        let f = tags(&["type:finding", "severity:low", "label:possible"]);
+        let f = tags(&["type:finding", "finding", "severity:low", "label:possible"]);
         assert!(check_write("x", &f, &[RelationKind::Contradicts]).is_ok());
         assert!(check_write("x", &tags(&["type:fidning"]), &[]).unwrap_err().contains("no type fidning"));
-        let exp = tags(&["type:experiment", "metric:m", "baseline:67", "target:15", "expires:2026-12-03"]);
+        let exp =
+            tags(&["type:experiment", "experiment", "metric:m", "baseline:67", "target:15", "expires:2026-12-03"]);
         assert!(check_write("rule: r\nexpires: 2026-12-03", &exp, &[]).is_ok());
         assert!(check_write("rule: r\nexpires: 2026-12-04", &exp, &[]).unwrap_err().contains("expires"));
         assert!(check_write("no rule", &exp, &[]).unwrap_err().contains("rule"));
         let t = tags(&["type:triage", "disposition:deferred", &format!("ref:finding={}", "d".repeat(64))]);
         assert!(check_write("x", &t, &[]).unwrap_err().contains("--ref task"));
-        assert!(check_write("x", &tags(&["type:task", "deferred"]), &[]).is_err());
-        assert!(check_write("x", &tags(&["type:task", "deferred"]), &[RelationKind::DependsOn]).is_ok());
+        assert!(check_write("x", &tags(&["type:task", "task", "deferred"]), &[]).is_err());
+        assert!(check_write("x", &tags(&["type:task", "task", "deferred"]), &[RelationKind::DependsOn]).is_ok());
         // Untyped claims are checked for syntax only.
         assert!(check_write("x", &tags(&["finding", "task"]), &[]).is_ok());
+        // A typed claim carries its plain tag, however its type was given (finding 9ffe5c0c74ff).
+        let e = check_write(
+            &format!("PR #7 typed-x @ {sha}: Title"),
+            &pr[2..].iter().chain(&pr[..1]).cloned().collect::<Vec<_>>(),
+            &[],
+        );
+        assert!(e.unwrap_err().contains("plain tag pr"));
+        let m = tags(&["type:metric", "week:2026-11-16"]);
+        assert!(check_write("x", &m, &[]).unwrap_err().contains("plain tag metrics"));
+    }
+
+    /// The pr shape and scripts/weave-gate read the same proposal (finding 9e72539b7d8e).
+    #[test]
+    fn a_pr_claim_names_its_weave_proposal_as_weave_gate_reads_it() {
+        let (sha, w, other) = ("c".repeat(40), "a".repeat(64), "b".repeat(64));
+        let mut pr = tags(&["type:pr", "pr", "pr:7", "branch:x", &format!("sha:{sha}")]);
+        let start = format!("PR #7 x @ {sha}: T.");
+        // Named in the text, but no weave key.
+        let e = check_write(&format!("{start} Weave proposal {w}"), &pr, &[]).unwrap_err();
+        assert!(e.contains(&format!("--attr weave={w}")), "{e}");
+        pr.push(format!("weave:{w}"));
+        assert!(check_write(&format!("{start} Weave proposal {w}"), &pr, &[]).is_ok());
+        assert!(check_write(&format!("{start} Weave proposal {w}\n"), &pr, &[]).is_ok());
+        // Not at the end.
+        assert!(check_write(&format!("{start} Weave proposal {w} and more"), &pr, &[]).is_err());
+        // weave-gate reads the first one, which isn't the key's.
+        let e = check_write(&format!("{start} Weave proposal {other}. Weave proposal {w}"), &pr, &[]).unwrap_err();
+        assert!(e.contains("names Weave proposal bbbb"), "{e}");
+        // Missing from the text.
+        assert!(check_write(&start, &pr, &[]).is_err());
+        let text = format!("Weave proposal xyz, Weave proposal {w}");
+        assert_eq!(weave_proposal(&text), Some(w.as_str()));
+    }
+
+    #[test]
+    fn hostile_tags_are_quoted_short_and_problems_are_capped() {
+        let long = format!("X{}", "y".repeat(10_000));
+        let e = parse(&long).unwrap_err();
+        assert!(e.len() < 400, "{} bytes", e.len());
+        let many: Vec<String> = (0..1000).map(|n| format!("Bad{n}")).collect();
+        let p = read(&many).1.into_vec();
+        assert_eq!(p.len(), MAX_PROBLEMS + 1);
+        assert_eq!(p.last().map(String::as_str), Some("and 980 more"));
     }
 
     #[test]

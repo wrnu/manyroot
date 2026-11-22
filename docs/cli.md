@@ -201,12 +201,14 @@ A claim's tags take three forms besides plain ones (`note`), each mapping one-to
 is to hold: `type:<name>` (at most one), `<key>:<value>` (one value per key; `type` and `ref` aren't keys)
 and `ref:<role>=<id>` (the full id). `claim` refuses, writing nothing, a tag with a comma, a space, a control
 character or a capital letter, a malformed typed tag, two types or two values for one key. `--type <name>`
-adds `type:<name>` and the type's plain tag, and checks the type's shape: the keys it needs, their values'
+(or `--tag type:<name>`) adds `type:<name>` and the type's plain tag, and checks the type's shape: the keys it needs, their values'
 kinds, and the relations it is written with. A type `claim` doesn't know is refused, to catch a misspelt one.
 `--attr key=value` adds `key:value`; `--ref role=<id>` (a unique prefix will do) adds `ref:role=<full id>`
 and makes the id a parent, so the cited contribution is causally before the claim. `--contradicts`,
 `--supports`, `--implements`, `--refines`, `--depends-on` and `--tests` (each repeatable) write relations
-from the claim in the same call, after it, each printed on its own line.
+from the claim in the same call, after it, each printed on its own line. They are separate contributions:
+if one fails, the claim and the relations before it stay (the Ground is append-only), the command exits 1
+naming the claim, and the rest can be written with `relate`.
 
 ```sh
 bracken claim "x.rs:3 drops the error" --type finding --attr severity=medium --attr label=confirmed --contradicts $PR
@@ -215,7 +217,8 @@ bracken claim "x.rs:3 drops the error" --type finding --attr severity=medium --a
 These are client checks: validity never looks at tags, so a contribution written another way stays valid.
 `show`, `log` and the other `--json` reads give a claim with any typed tag a `typed` field, `{"type", "data",
 "refs": [{"role", "id"}], "problems"}`, where `problems` lists what doesn't conform (a reference that isn't a
-parent included), and refuse nothing. The shapes are listed in [development.md](development.md), Typed claims.
+parent included), at most 20 and then a count of the rest, and refuse nothing. A claim whose plain tags
+break the syntax gets the field too. Reading tags is linear in their number. The shapes are listed in [development.md](development.md), Typed claims.
 
 ## Intents
 
