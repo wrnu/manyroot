@@ -576,54 +576,92 @@ fn a_parallel_full_open_reports_the_first_damaged_object_in_listing_order() {
     }
 }
 
-/// Security's note on PR #60: a bad signature put through the parallel path (64 or more objects to read
-/// and verify) is refused with the error the sequential path gives: the first refusal of a one-at-a-time
-/// `Graph::import` of the same objects, for a full open and for a trusting open's objects that the trusted
-/// set lacks.
+/// Security's note on PR #60 and finding `cf312b9e1411`: a bad signature put through the parallel path
+/// (64 or more objects to read and verify) is refused with the error the sequential path gives, the
+/// first refusal of a one-at-a-time `Graph::import` of the same objects. The contributions are independent
+/// (no parents), so no refusal hides another, and the bad ones are spread over the listing, the last
+/// object included, so they fall in several of the parallel parts, the last part among them whatever the
+/// number of cores. Each is refused alone, by a full open and by a trusting open whose untrusted objects
+/// hold it, and all together as the sequential import refuses them.
 #[test]
 fn a_bad_signature_on_the_parallel_path_is_refused_as_the_sequential_path_refuses_it() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let dir = tmp.path().join("g");
     let mut s = Store::init(&dir, "t").expect("a Ground");
     let who = s.create_identity("w").expect("a key");
+    let ground = s.info().ground;
     for i in 0..300 {
-        s.contribute(&who, Body::Claim { statement: format!("c{i}"), tags: vec![] }).expect("adds");
+        let c = Contribution::create(ground, &who, [], i, Body::Claim { statement: format!("c{i}"), tags: vec![] });
+        s.add(c).expect("adds");
     }
-    let order = s.graph().topo_order();
+    assert_eq!(s.graph().heads().count(), 300, "independent contributions");
     let object = |id: &ContributionId| {
         let hex = id.to_hex();
         dir.join("objects").join(&hex[..2]).join(&hex[2..])
     };
+    // The listing order, as readdir gives it, which is the order the parallel parts split.
+    let mut listed: Vec<ContributionId> = Vec::new();
+    for shard in std::fs::read_dir(dir.join("objects")).expect("objects") {
+        let shard = shard.expect("entry");
+        for f in std::fs::read_dir(shard.path()).expect("shard") {
+            let name =
+                format!("{}{}", shard.file_name().to_string_lossy(), f.expect("entry").file_name().to_string_lossy());
+            listed.push(name.parse().expect("an id"));
+        }
+    }
+    assert_eq!(listed.len(), 300);
+    // One in each sixth of the listing, and the last object: several parts, the last always among them.
+    let bad: Vec<ContributionId> = [0, 50, 110, 170, 230, 299].iter().map(|i| listed[*i]).collect();
+    let good: Vec<Contribution> = listed
+        .iter()
+        .map(|id| Contribution::decode(&std::fs::read(object(id)).expect("present")).expect("decodes"))
+        .collect();
     // The signature is the encoding's last field: flipping its last byte keeps the encoding canonical
-    // and the id, and breaks the signature. Three of them, among the later two hundred.
-    let bad: Vec<ContributionId> = [120, 180, 299].iter().map(|i| order[*i]).collect();
-    for id in &bad {
+    // and the id, and breaks the signature.
+    let tamper = |id: &ContributionId| {
         let mut bytes = std::fs::read(object(id)).expect("present");
         *bytes.last_mut().expect("not empty") ^= 1;
         let c = Contribution::decode(&bytes).expect("still decodes");
         assert_eq!(c.id(), *id);
         assert!(!c.signature_is_valid());
         std::fs::write(object(id), &bytes).expect("written");
-    }
+    };
+    let restore = |id: &ContributionId| {
+        let c = good.iter().find(|c| c.id() == *id).expect("one of them");
+        std::fs::write(object(id), c.encode()).expect("written");
+    };
     // The sequential oracle: every object, checked one at a time by a plain import.
-    let all: Vec<Contribution> = order
-        .iter()
-        .map(|id| Contribution::decode(&std::fs::read(object(id)).expect("present")).expect("decodes"))
-        .collect();
-    let report = Graph::new(s.info().ground).import(all.clone());
-    let (first, why) = report.rejected.first().expect("the sequential path refuses one").clone();
-    assert_eq!(why, RuleViolation::BadSignature);
-    assert!(bad.contains(&first));
-    let refused = |r: Result<Store, StoreError>, when: &str| match r {
+    let oracle = || {
+        let all: Vec<Contribution> = listed
+            .iter()
+            .map(|id| Contribution::decode(&std::fs::read(object(id)).expect("present")).expect("decodes"))
+            .collect();
+        Graph::new(ground).import(all).rejected.first().expect("the sequential path refuses one").clone()
+    };
+    let refused = |r: Result<Store, StoreError>, want: &ContributionId, when: &str| match r {
         Err(StoreError::Corrupt { path, reason }) => {
-            assert_eq!(path, object(&first), "{when}: the sequential path's first refusal");
+            assert_eq!(path, object(want), "{when}: the sequential path's first refusal");
             assert_eq!(reason, RuleViolation::BadSignature.to_string(), "{when}");
         }
         Err(other) => panic!("{when}: expected Corrupt, got {other:?}"),
         Ok(_) => panic!("{when}: opened a replica with a bad signature"),
     };
-    refused(Store::open(&dir), "a full open");
-    // A trusting open that trusts the first hundred: the other two hundred are read and verified in
-    // parallel, and checked in the import's order.
-    refused(Store::open_trusting(&dir, all[..100].to_vec()), "a trusting open");
+    // Trusted: a hundred that are never tampered, so the other two hundred, every bad one among them,
+    // are read and verified in parallel.
+    let trusted: Vec<Contribution> = good.iter().filter(|c| !bad.contains(&c.id())).take(100).cloned().collect();
+    for (n, id) in bad.iter().enumerate() {
+        tamper(id);
+        let (first, why) = oracle();
+        assert_eq!((first, why), (*id, RuleViolation::BadSignature), "bad signature {n} alone");
+        refused(Store::open(&dir), id, &format!("bad signature {n} alone, a full open"));
+        refused(Store::open_trusting(&dir, trusted.clone()), id, &format!("bad signature {n} alone, a trusting open"));
+        restore(id);
+    }
+    assert_eq!(Store::open(&dir).expect("restored").graph().len(), 300);
+    for id in &bad {
+        tamper(id);
+    }
+    let (first, _) = oracle();
+    refused(Store::open(&dir), &first, "all together, a full open");
+    refused(Store::open_trusting(&dir, trusted), &first, "all together, a trusting open");
 }
