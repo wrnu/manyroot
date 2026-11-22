@@ -566,6 +566,62 @@ mod macos_only {
         assert_eq!(turn["outcomes"], json!(["pass"]), "{mode}: the integrator's own last work is on main: {end}");
     }
 
+    /// After each integration the driver runs the public tests on the integrator's main, in both modes (task
+    /// `b0a9769a48da`): a builder breaks the package's import in turn 1; the integration that brings it in says main
+    /// is broken; integrating more is refused until the integrator repairs it in its own tree, whose integration says
+    /// main is sound; and main ends without the break.
+    fn a_broken_main_is_repaired_before_anything_else_is_integrated(mode: &'static str) {
+        let Some(python) = pin() else { return };
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+        let (project, _) = project_and_store(&root);
+        // Traced, so a turn's error is kept whole in turn-errors.txt.
+        let cfg = RunConfig {
+            trace: true,
+            ..config_of(mode, "agent-2", python, root.join("run"), 3, 2, &project, false, false)
+        };
+        let mock = MockBackend {
+            seed: 1,
+            shim: Some(bin()),
+            lockstep: true,
+            integrator: Some(2),
+            breaks: Some((0, 1)),
+            ..MockBackend::default()
+        };
+        let outcome = run(&cfg, &mock).expect("the run");
+        let text = std::fs::read_to_string(cfg.root.join("events.jsonl")).expect("the events");
+        let log: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).expect("an event")).collect();
+        let errors: Vec<&Value> = log.iter().filter(|e| e["event"] == "turn_error").collect();
+        let kept = std::fs::read_to_string(cfg.root.join("turn-errors.txt")).unwrap_or_default();
+        assert!(errors.is_empty(), "{mode}: no turn erred: {errors:?}\n{kept}");
+        let tested: Vec<&Value> = log.iter().filter(|e| e["event"] == "main_tests").collect();
+        assert!(tested.iter().all(|e| e["agent"] == "agent-2"), "{mode}: only the integrator integrates: {tested:?}");
+        let broke = tested.iter().position(|e| e["data"]["tests"]["broken"] == true).expect("main broke");
+        assert!(tested[broke]["data"]["tests"]["regressed"].as_array().is_some_and(|r| !r.is_empty()));
+        assert!(tested[..broke].iter().all(|e| e["data"]["tests"]["broken"] == false), "{mode}: {tested:?}");
+        let repaired = tested[broke + 1..].first().expect("a repair");
+        assert_eq!(repaired["data"]["tests"]["broken"], false, "{mode}: {repaired}");
+        let refusals: Vec<&Value> = log.iter().filter(|e| e["event"] == "main_broken_refusal").collect();
+        assert_eq!(refusals.len(), 1, "{mode}: {refusals:?}");
+        let seq = |e: &Value| e["seq"].as_u64().expect("a seq");
+        assert!(seq(tested[broke]) < seq(refusals[0]) && seq(refusals[0]) < seq(repaired), "{mode}: in that order");
+        assert!(outcome.modules.iter().all(|(_, t)| !t.contains("broken on purpose")), "{mode}: main ends sound");
+        assert!(
+            outcome.modules.iter().any(|(p, _)| p.contains("by_agent_0_turn_1")),
+            "{mode}: the builder's work stays"
+        );
+    }
+
+    #[test]
+    fn a_weave_integrator_repairs_a_broken_main_first() {
+        a_broken_main_is_repaired_before_anything_else_is_integrated("weave");
+    }
+
+    #[test]
+    fn a_git_project_integrator_repairs_a_broken_main_first() {
+        a_broken_main_is_repaired_before_anything_else_is_integrated(bracken_experiment::git_project::NAME);
+    }
+
     #[test]
     fn a_weave_run_divides_the_items_and_its_integrator_plays_last() {
         a_run_divides_the_items_and_its_integrator_plays_last("weave");
