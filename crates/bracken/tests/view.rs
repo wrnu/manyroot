@@ -233,7 +233,13 @@ fn view_serves_on_127_0_0_1_only() {
 #[test]
 fn every_endpoint_is_read_only_and_carries_the_csp() {
     let dir = ground();
-    let claim = ok(&dir, &["claim", HOSTILE, "--tag", HOSTILE, "--as", "alice"]);
+    // `bracken claim` refuses such a tag (task 8c9ad9bd4518), so it comes as another client would write it.
+    let claim = {
+        let mut store = manyroot::Store::open(&dir).unwrap();
+        let alice = store.identity("alice").unwrap();
+        let body = manyroot::Body::Claim { statement: HOSTILE.into(), tags: vec![HOSTILE.into()] };
+        store.contribute(&alice, body).unwrap().to_hex()
+    };
     std::fs::write(dir.join("../f"), HOSTILE).unwrap();
     let art = ok(
         &dir,

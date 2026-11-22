@@ -29,6 +29,15 @@ fn bracken_fails(dir: &Path, args: &[&str]) -> String {
     String::from_utf8(out.stderr).unwrap()
 }
 
+/// A claim written through the library, as another client could write it: `bracken claim` refuses tags with
+/// control characters (task 8c9ad9bd4518), and these tests are about how reads print them.
+fn raw_claim(dir: &Path, who: &str, statement: &str, tags: &[&str]) -> String {
+    let mut store = manyroot::Store::open(&dir.join(".bracken")).unwrap();
+    let who = store.identity(who).unwrap();
+    let body = manyroot::Body::Claim { statement: statement.into(), tags: tags.iter().map(|t| (*t).into()).collect() };
+    store.contribute(&who, body).unwrap().to_hex()
+}
+
 fn json(dir: &Path, args: &[&str]) -> Value {
     serde_json::from_str(&bracken(dir, args)).unwrap()
 }
@@ -893,7 +902,7 @@ fn status_escapes_control_characters_in_what_it_prints() {
     bracken(dir, &["id", "new", "alice"]);
     bracken(dir, &["id", "new", "mallory"]);
     let forged = "spec\r\u{1b}[2Kaccepted  fake\u{b}\u{c}\u{85}\u{2028}\u{2029}\nsecond line";
-    let spec = bracken(dir, &["claim", forged, "--tag", "t\u{1b}[31m", "--as", "alice"]);
+    let spec = raw_claim(dir, "alice", forged, &["t\u{1b}[31m"]);
     let idle = bracken(dir, &["claim", "idle\u{2028}spec", "--as", "mallory"]);
     std::fs::write(dir.join("f"), "x").unwrap();
     bracken(dir, &["artifact", "f", "--name", "impl\u{1b}]0;title\u{7}.rs", "--implements", &spec, "--as", "mallory"]);
@@ -1313,7 +1322,7 @@ fn log_lines_escape_control_characters_from_other_agents_text() {
     let mut last = String::new();
     for (c, _) in kinds {
         // Not first, so the compact form, which keeps a statement's first line, still has the character.
-        last = bracken(dir, &["claim", &format!("ok{}", forged(c)), "--tag", &format!("t{c}x"), "--as", "mallory"]);
+        last = raw_claim(dir, "mallory", &format!("ok{}", forged(c)), &[&format!("t{c}x")]);
     }
     let note = format!("n{}", forged('\r'));
     let first = bracken(dir, &["log", "--json"]);
@@ -1534,7 +1543,7 @@ fn show_conflicts_and_accepted_escape_other_agents_text() {
     let hostile = |what: &str| {
         format!("{what}\r\u{1b}[2K\n00000000  claim  manager  forged\u{b}\u{c}\u{85}\u{2028}\u{2029}\u{202e}x")
     };
-    let a = bracken(dir, &["claim", &hostile("a"), "--tag", &hostile("tag"), "--as", "mallory"]);
+    let a = raw_claim(dir, "mallory", &hostile("a"), &[&hostile("tag")]);
     let b = bracken(dir, &["claim", &hostile("b"), "--as", "mallory"]);
     let rel = bracken(dir, &["relate", &b, "contradicts", &a, "--note", &hostile("note"), "--as", "mallory"]);
     std::fs::write(dir.join("f.txt"), "content\n").unwrap();

@@ -24,6 +24,7 @@ mod serve;
 mod signing;
 mod snapshot;
 mod terminal;
+mod typed;
 mod verify;
 mod view;
 mod wire;
@@ -67,6 +68,40 @@ struct Output {
     json: bool,
 }
 
+/// Relations a claim is written with, from it to each id, in the same call. Each is repeatable.
+#[derive(Args)]
+struct ClaimRelations {
+    #[arg(long, value_name = "ID")]
+    contradicts: Vec<String>,
+    #[arg(long, value_name = "ID")]
+    supports: Vec<String>,
+    #[arg(long, value_name = "ID")]
+    implements: Vec<String>,
+    #[arg(long, value_name = "ID")]
+    refines: Vec<String>,
+    #[arg(long = "depends-on", value_name = "ID")]
+    depends_on: Vec<String>,
+    #[arg(long, value_name = "ID")]
+    tests: Vec<String>,
+}
+
+impl ClaimRelations {
+    fn all(self) -> Vec<(RelationKind, String)> {
+        let ClaimRelations { contradicts, supports, implements, refines, depends_on, tests } = self;
+        [
+            (RelationKind::Contradicts, contradicts),
+            (RelationKind::Supports, supports),
+            (RelationKind::Implements, implements),
+            (RelationKind::Refines, refines),
+            (RelationKind::DependsOn, depends_on),
+            (RelationKind::Tests, tests),
+        ]
+        .into_iter()
+        .flat_map(|(kind, ids)| ids.into_iter().map(move |id| (kind, id)))
+        .collect()
+    }
+}
+
 #[derive(Args)]
 struct PolicyArgs {
     /// Independent validators that must report a pass.
@@ -96,13 +131,30 @@ enum Command {
     #[command(subcommand)]
     Id(IdCommand),
     /// Contribute a claim: an idea, hypothesis, requirement, observation or decision.
+    ///
+    /// Tags are plain (`note`), `key:value`, `type:<name>` or `ref:<role>=<id>`, and their syntax is checked
+    /// before anything is written. A typed claim (`--type`) is also checked against its type's shape: the
+    /// keys it needs, their values' kinds, and the relations it is written with (docs/cli.md, Typed claims).
     Claim {
         statement: String,
         #[arg(long = "tag")]
         tags: Vec<String>,
+        /// The claim's type, such as pr, finding, task, decision or experiment: records `type:<NAME>` and
+        /// the type's plain tag, and checks the type's shape.
+        #[arg(long = "type", value_name = "NAME")]
+        ty: Option<String>,
+        /// An attribute, recorded as the tag `KEY:VALUE`. Repeatable.
+        #[arg(long = "attr", value_name = "KEY=VALUE")]
+        attrs: Vec<String>,
+        /// A typed reference, recorded as the tag `ref:ROLE=<full id>`; the id (a unique prefix will do)
+        /// also becomes one of the claim's parents. Repeatable.
+        #[arg(long = "ref", value_name = "ROLE=ID")]
+        refs: Vec<String>,
         /// One of your own claims that this one replaces; records the supersedes relation too. Repeatable.
         #[arg(long, value_name = "ID")]
         supersedes: Vec<String>,
+        #[command(flatten)]
+        relations: ClaimRelations,
         #[command(flatten)]
         out: Output,
     },
@@ -564,18 +616,29 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
                 }
             }
         }
-        Command::Claim { statement, tags, supersedes, out } => {
+        Command::Claim { statement, tags, ty, attrs, refs, supersedes, relations, out } => {
             let who = any_signer(&s, agent)?;
             let names = Names::load(&s)?;
+            // Everything is resolved and checked first, so a refused claim writes nothing.
             let old = supersedes.iter().map(|id| own_claim(&s, &names, &*who, id)).collect::<Result<BTreeSet<_>>>()?;
+            let mut links = Vec::new();
+            for (kind, id) in relations.all() {
+                links.push((
+                    kind,
+                    resolve(&s, &id).with_context(|| format!("--{} {id}", kind.as_str().replace('_', "-")))?,
+                ));
+            }
+            let (tags, parents) = claim_tags(&s, tags, ty, attrs, refs)?;
+            let kinds: Vec<RelationKind> = links.iter().map(|(k, _)| *k).collect();
+            typed::check_write(&statement, &tags, &kinds).map_err(|e| anyhow::anyhow!("not recorded: {e}"))?;
             let mut w = Writes::new(out.json);
-            let new = w.add(&mut s, &*who, Body::Claim { statement, tags })?;
-            for to in old {
-                let note = String::new();
-                let relation = Body::Relation { from: new, kind: RelationKind::Supersedes, to, note };
+            let new = w.add_with_parents(&mut s, &*who, Body::Claim { statement, tags }, &parents)?;
+            let old = old.into_iter().map(|to| (RelationKind::Supersedes, to));
+            for (kind, to) in old.chain(links) {
+                let relation = Body::Relation { from: new, kind, to, note: String::new() };
                 if let Err(e) = w.add(&mut s, &*who, relation) {
                     w.finish_failed();
-                    return Err(e.context(format!("claim {new} was recorded, but not all its supersedes relations")));
+                    return Err(e.context(format!("claim {new} was recorded, but not all its {kind} relations")));
                 }
             }
             w.finish();
@@ -1109,12 +1172,23 @@ impl Writes {
     }
 
     fn add(&mut self, s: &mut Store, who: &dyn Signer, body: Body) -> Result<ContributionId> {
+        self.add_with_parents(s, who, body, &[])
+    }
+
+    /// [`Writes::add`], with `parents` as parents too, beside the causal heads.
+    fn add_with_parents(
+        &mut self,
+        s: &mut Store,
+        who: &dyn Signer,
+        body: Body,
+        parents: &[ContributionId],
+    ) -> Result<ContributionId> {
         let kind = body.kind().as_str();
         let relation = match &body {
             Body::Relation { kind, .. } => Some(kind.as_str()),
             _ => None,
         };
-        let id = contribute(s, who, body)?;
+        let id = contribute_with_parents(s, who, body, parents)?;
         let mut row = json!({"id": id, "kind": kind});
         if let Some(r) = relation {
             row["relation"] = json!(r);
@@ -1153,6 +1227,16 @@ impl Writes {
 /// attached as details or as an artifact, or a key pasted into text. A key re-encoded (base64)
 /// gets through.
 fn contribute(s: &mut Store, who: &dyn Signer, body: Body) -> Result<ContributionId> {
+    contribute_with_parents(s, who, body, &[])
+}
+
+/// [`contribute`], with `parents` as parents too, beside the causal heads.
+fn contribute_with_parents(
+    s: &mut Store,
+    who: &dyn Signer,
+    body: Body,
+    parents: &[ContributionId],
+) -> Result<ContributionId> {
     let fields: Vec<&[u8]> = match &body {
         Body::Claim { statement, tags } => {
             std::iter::once(statement.as_bytes()).chain(tags.iter().map(|t| t.as_bytes())).collect()
@@ -1168,7 +1252,71 @@ fn contribute(s: &mut Store, who: &dyn Signer, body: Body) -> Result<Contributio
             bail!("this contribution contains the private key of identity {name:?}; it can't go into the Ground");
         }
     }
-    Ok(s.contribute_with(who, body)?)
+    if parents.is_empty() {
+        return Ok(s.contribute_with(who, body)?);
+    }
+    // As Store::contribute_with, with the extra parents: protocol v1 allows any present contribution as a
+    // parent, and Contribution::create_with sorts and dedups them with the heads.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+    let all: Vec<ContributionId> = s.graph().heads().chain(parents.iter().copied()).collect();
+    let c = Contribution::create_with(s.info().ground, who, all, now, body)?;
+    let id = c.id();
+    s.add(c)?;
+    Ok(id)
+}
+
+/// A claim's tags as given, then those `--type`, `--attr` and `--ref` add, and the ids its references
+/// name, which become parents. `--type` adds `type:<name>` and the type's plain tag, unless given already.
+fn claim_tags(
+    s: &Store,
+    mut tags: Vec<String>,
+    ty: Option<String>,
+    attrs: Vec<String>,
+    refs: Vec<String>,
+) -> Result<(Vec<String>, Vec<ContributionId>)> {
+    let add = |tag: String, tags: &mut Vec<String>| {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    };
+    if let Some(ty) = ty {
+        add(format!("type:{ty}"), &mut tags);
+        if let Some(legacy) = typed::shape(&ty).and_then(|s| s.legacy) {
+            add(legacy.to_owned(), &mut tags);
+        }
+    }
+    for a in attrs {
+        let (k, v) = a.split_once('=').with_context(|| format!("--attr {a}: give KEY=VALUE"))?;
+        ensure!(k != "type" && k != "ref", "--attr {a}: use --type or --ref for that");
+        ensure!(!k.contains(':'), "--attr {a}: a key holds no ':'");
+        tags.push(format!("{k}:{v}"));
+    }
+    let mut parents = Vec::new();
+    for r in refs {
+        let (role, id) = r.split_once('=').with_context(|| format!("--ref {r}: give ROLE=ID"))?;
+        let id = resolve(s, id).with_context(|| format!("--ref {r}"))?;
+        tags.push(format!("ref:{role}={}", id.to_hex()));
+        parents.push(id);
+    }
+    // A reference given as a tag is a parent too, and a type given as a tag carries its plain tag, as with
+    // --type and --ref.
+    let mut legacy = None;
+    for tag in &tags {
+        match typed::parse(tag) {
+            Ok(typed::Tag::Ref(_, hex)) => {
+                let id = resolve(s, hex).with_context(|| format!("--tag {tag}"))?;
+                if !parents.contains(&id) {
+                    parents.push(id);
+                }
+            }
+            Ok(typed::Tag::Type(ty)) => legacy = legacy.or(typed::shape(ty).and_then(|s| s.legacy)),
+            _ => {}
+        }
+    }
+    if let Some(legacy) = legacy {
+        add(legacy.to_owned(), &mut tags);
+    }
+    Ok((tags, parents))
 }
 
 /// Each local identity's name and secret key, as lowercase hex and as bytes. Read from the
@@ -2224,8 +2372,10 @@ fn body_json(body: &Body) -> Value {
     }
 }
 
+/// A contribution as JSON. A claim with any typed tag also gets "typed": its type, data and references, and
+/// what of them doesn't conform (`typed::json`).
 fn contribution_json(g: &Graph, names: &Names, c: &Contribution) -> Value {
-    json!({
+    let mut v = json!({
         "id": c.id(),
         "kind": c.body().kind(),
         "author": c.author(),
@@ -2234,7 +2384,13 @@ fn contribution_json(g: &Graph, names: &Names, c: &Contribution) -> Value {
         "timestamp_ms": c.content().timestamp_ms,
         "retracted": g.is_retracted(&c.id()),
         "body": body_json(c.body()),
-    })
+    });
+    if let Body::Claim { statement, tags } = c.body()
+        && let Some(t) = typed::json(statement, tags, c.parents())
+    {
+        v["typed"] = t;
+    }
+    v
 }
 
 /// `show --json`: the contribution, its assessment, everything referring to it, and its live intents.
