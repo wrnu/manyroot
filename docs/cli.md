@@ -106,10 +106,13 @@ that are most of a read's cost.
 - **Append-only.** The snapshot is a header and then segments, each a batch of contributions with its
   own checksum. A command that added contributions appends one segment holding just those, so a write
   costs about its own object's bytes, not the whole Ground's. When the segments after the first outgrow
-  it (and 1 MiB), the snapshot is rewritten as one segment. A segment that doesn't read back (a torn
-  append) ends the read there; the contributions after it are read from their objects and checked, and
-  the snapshot is rewritten whole. Repeats from two commands appending at once are dropped.
-
+  it (and 1 MiB), the next command that writes the snapshot, a read included, rewrites it as one segment.
+- **Bounded reads.** The snapshot is read one contribution at a time, each at most a contribution's
+  largest size, and every one must name an object `objects/` lists, so a read decodes at most what the
+  replica holds. A segment whose framing or checksum doesn't hold (a torn append), an empty one, or one
+  repeating a contribution ends the read there: the contributions after it are read from their objects
+  and checked, and the snapshot is rewritten whole. One naming an object that's gone sets the snapshot
+  aside for a full check.
 - **The trade.** An object the snapshot holds isn't read again, so if its bytes are overwritten on disk
   later, or made unreadable, a cached read doesn't notice, where a full check refuses the replica. A
   deleted object is noticed, since every read lists `objects/`, and so is one replaced by a link, a
@@ -124,10 +127,11 @@ that are most of a read's cost.
   snapshot; it fails, as a full check does, if any object is damaged or overwritten, and also if an
   `agents/` entry could misname an agent (one not named for its own valid name, or a second name for a key).
 - **On disk.** `cache/` holds a `.gitignore` of `*`, so git never commits it, and nothing is written
-  outside it. A whole snapshot goes to a temporary file of its own, created fresh (never through a link),
-  then renamed into place; a segment is appended with one write to the snapshot opened without
-  following a link, and only if it is a regular file. A `cache` that isn't a real directory is never written to. `bracken view`
-  reads through the snapshot but never writes it. The snapshot is never synced: each replica builds its
+  outside it. `cache/` is opened once without following a link, and everything in it is opened relative
+  to it, without following a link or waiting on a FIFO, its type checked on the open file before a byte
+  is read or written. A whole snapshot goes to a temporary file of its own, created fresh, then renamed
+  into place; a segment is appended with one write. A `cache` that isn't a real directory is never read
+  or written: the read is a full check. `bracken view` reads through the snapshot but never writes it. The snapshot is never synced: each replica builds its
   own.
 
 ## The web view

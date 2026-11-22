@@ -76,6 +76,14 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-11-22: the verified snapshot appends segments (task 7a3d17f979c3, PR #56)
+
+What changed: `.bracken/cache/snapshot`, the replica's own derived cache (decision `96e282819607`), never committed or synced, moves from one whole-file encoding (`BKSNAP1`) to a header and checksummed segments (`BKSNAP2`), appended per write and compacted when the tail outgrows the first segment (docs/cli.md, The verified snapshot). No protocol change: no encoding, id, signing, validity, bundle or sync format, vector or fixture changes. Objects, `ground.json` and `agents/` are untouched. `manyroot` gains `Store::open_trusting_with`; `Store::open_trusting` behaves as before.
+
+Existing Grounds open unchanged. A new binary doesn't read a `BKSNAP1` snapshot, so the **first command on each replica after the upgrade does one full check** (every object read and its signature checked, about 10–13 s on this repository's Ground, 40 s at 50,000 objects / 200 MiB) and rewrites the snapshot as `BKSNAP2`. After that every command reads through it as before. Nothing to run by hand; `bracken verify` does the same at a time of your choosing.
+
+**An older binary on the same replica stays correct.** It doesn't read `BKSNAP2` either, so it falls back to its own full check and rewrites the snapshot as `BKSNAP1` by its temp-file rename; the newer binary then does the same in reverse. Each switch between versions costs one full check, and neither binary ever trusts the other's file. So during the pinned-binary upgrade, a builder's own `target/debug/bracken` or an older `.bracken-bin` on the main Ground only costs time. Upgrade the pinned binary after the merge as usual (crates/bracken and crates/manyroot changed). Rollback: reinstall the previous binary; its first command does one full check.
+
 ### 2026-11-19: one AGENTS.md, no delegated approvals, process changes as experiments (task 9b65c13e9d66)
 
 Process and merge-gate tooling, no format, record or fixture change; every Ground opens and reads as before,
