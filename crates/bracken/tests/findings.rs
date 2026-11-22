@@ -121,7 +121,8 @@ fn scripts_merge_reads_findings_and_keeps_no_copy() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     for script in ["scripts/merge", ".claude/skills/agent-team-kickoff/templates/merge"] {
         let text = std::fs::read_to_string(root.join(script)).expect("readable");
-        assert!(text.contains(r#"bk findings "$full" --triager "$triager" --json"#), "{script} reads findings");
+        // Through bk_reads, one batch for the gate's reads (task 8c9ad9bd4518).
+        assert!(text.contains(r#"req findings "$claim" --triager "$triager" --json"#), "{script} reads findings");
         assert!(!text.contains("current_tasks=") && !text.contains("verdicts="), "{script} keeps no copy of its rules");
     }
 }

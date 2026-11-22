@@ -15,7 +15,10 @@
 #
 # Checks, in order, and reports each:
 #   1. the pr claim is current (not retracted, and superseded by no one whose supersede counts: its
-#      author, manager or owner) and starts "PR #<n> <branch> @ <full sha>:";
+#      author, manager or owner) and is for PR #<n>: a claim typed pr (claim --type pr) by its typed pr,
+#      branch and sha, which must conform (bracken's typed.problems empty); a claim typed anything else,
+#      a namespaced type such as bracken.pr included, isn't a pr claim; an untyped one by its statement,
+#      "PR #<n> <branch> @ <full sha>:", as before (task 8c9ad9bd4518, step 2);
 #   2. under the given policy, `scripts/bk show <claim>` reports it accepted;
 #   3. every finding that contradicts the claim has the manager's evidence, and
 #      every confirmed one (a pass) is deferred by the manager: a current task tagged deferred,
@@ -116,7 +119,8 @@
 # GH_TOKEN, GITHUB_TOKEN and the enterprise token variables unset, so a token in the caller's
 # environment is never used, and GH_DEBUG unset, so gh logs no HTTP traffic.
 # With the team server set up (scripts/team-server), every read pulls from it first, and the
-# gate refuses if it can't.
+# gate refuses if it can't. The checks' Ground reads are made up front, in one `bracken batch` (one pull,
+# one full check), or, with a pinned bracken that has no batch, one bk per read.
 # Needs gh and jq.
 set -euo pipefail
 # Never trace or auto-export (both can be inherited through SHELLOPTS).
@@ -153,6 +157,41 @@ ignored_supersedes() {
     | "\(.id[:12]) by \(.author_name // .author[:12])"] | join(", ")' <<<"$1") || who='(unreadable)'
   [ -z "$who" ] ||
     printf '%-4s  %-12s %s\n' note ignored "$3 ${2:0:12} is superseded by $who: ignored, since only its author, manager or owner can supersede it here (finding 20a7646f3579)"
+}
+
+# req <arg>...: one read request for bk_reads, the read's arguments as a JSON array (NUL-split, so any jq
+# reads it the same and no argument is taken for one of jq's own options).
+req() { printf '%s\0' "$@" | jq -Rsc 'split("\u0000")[:-1]'; }
+# bk_reads <request>...: one JSON line per request, in order, {"ok": true, "result": <its --json output>} or
+# {"ok": false, "error": ...}: through one `bk batch`, so one pull and one full check for them all (task
+# 8c9ad9bd4518, step 2), or, with a pinned bracken that has no batch yet, one bk per request.
+bk_reads() {
+  local r out a args
+  if bk batch --help >/dev/null 2>&1; then
+    printf '%s\n' "$@" | bk batch
+    return
+  fi
+  for r in "$@"; do
+    args=()
+    while IFS= read -r -d '' a; do args+=("$a"); done < <(jq -j '.[] | ., "\u0000"' <<<"$r")
+    # Exactly one JSON document, as batch gives: anything else is a failed read.
+    if out=$(bk "${args[@]}" 2>/dev/null) && jq -se 'length == 1' <<<"$out" >/dev/null 2>&1; then
+      jq -c '{ok: true, result: .}' <<<"$out"
+    else
+      jq -cn --arg r "$r" '{ok: false, error: ("bk " + $r + " failed")}'
+    fi
+  done
+}
+# nth <n>: request <n>'s result from $reads, or a failed return.
+nth() { sed -n "$1p" <<<"$reads" | jq -ce 'select(.ok == true) | .result'; }
+# pr_typed <show json>: how to read a pr claim. 'untyped' (read its statement, as before); 'pr <n> <branch>
+# <sha>' from a claim typed exactly pr (claim --type pr) whose typed fields conform; or 'bad <why>'. A
+# namespaced type such as bracken.pr isn't pr (the shapes name exact types).
+pr_typed() {
+  jq -r 'if (.typed.type? // null) == null then "untyped"
+    elif .typed.type != "pr" then "bad it is typed \(.typed.type), not pr"
+    elif (.typed.problems // ["no problems field"]) != [] then "bad its typed fields don'"'"'t conform: \(.typed.problems | join("; "))"
+    else "pr \(.typed.data.pr) \(.typed.data.branch) \(.typed.data.sha)" end' <<<"$1"
 }
 
 # read_batch <id>: the batch claim, if it is current, the manager's, tagged batch, and well formed. Sets
@@ -225,28 +264,49 @@ main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-d
 # snapshot); only these, never the tests it runs (finding 607273d1d193).
 bk() { BK_PULL=required BRACKEN_FULL_CHECK=1 BRACKEN_AGENT=${agent:-manager} "$here/bk" "$@"; }
 bk heads >/dev/null || fail "can't pull from the team server, so the gate won't decide on a replica that may be behind"
+# Who triages findings and defers them (check 3).
+triager=manager
+# Every other read the checks need, up front in one bk: one more pull, one full check, one state of the Ground.
+reads=$(bk_reads "$(req log --tag experiment --current --json)" \
+  "$(req log --tag decision --current --json)" \
+  "$(req show "$claim" ${policy[@]+"${policy[@]}"} --min-passes "$min_passes" --json)" \
+  "$(req log --tag pr --current --json)" "$(req findings "$claim" --triager "$triager" --json)" \
+  "$(req log --tag owner-review --current --json)" "$(req log --tag approval --current --json)") ||
+  fail "can't pull from the team server, so the gate won't decide on a replica that may be behind"
 if [ -f "$main/.bracken-team" ]; then
   echo "team server: every read pulls from $(cat "$(cat "$main/.bracken-team")/url")"
 else
   echo "team server: none set up (no .bracken-team); reading the local replica"
 fi
 
-# Expired experiments (see the header): one line, never a failed check.
+# Expired experiments (see the header): one line, never a failed check. An experiment typed exactly
+# experiment whose typed fields conform (claim --type experiment) ends on its expires key; any other is read
+# from its statement's 'expires:' line, as before.
 expired_experiments() {
-  local exps today lapsed=() e about
-  exps=$(bk log --tag experiment --current --json 2>/dev/null) || { echo "couldn't read the experiment claims"; return; }
+  local exps decisions today lapsed=() expired=() e about shows n=0 asks=()
+  exps=$(nth 1) || { echo "couldn't read the experiment claims"; return; }
+  decisions=$(nth 2) || decisions='[]'
   today=$(date -u +%Y-%m-%d)
   for e in $(jq -r --arg today "$today" "$live"'
     .[] | select(.kind == "claim" and live and (.body.tags | index("experiment")))
     | (.timestamp_ms / 1000 | floor) as $start
-    | ([(.body.statement // "") | match("(?m)^expires:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]*$") | .captures[0].string]
-        | first // null) as $given
+    | (if (.typed.type? // null) == "experiment" and (.typed.problems // [""]) == [] then .typed.data.expires
+       else [(.body.statement // "") | match("(?m)^expires:[ \t]*([0-9]{4}-[0-9]{2}-[0-9]{2})[ \t]*$") | .captures[0].string]
+        | first // null end) as $given
     | ([if $given then ($given + "T00:00:00Z" | fromdateiso8601) else $start + 14 * 86400 end, $start + 28 * 86400]
         | min | todate[0:10]) as $ends
     | select($ends < $today) | "\(.id):\($ends)"' <<<"$exps"); do
+    expired+=("$e")
+    asks+=("$(req show "${e%%:*}" --json)")
+  done
+  [ ${#expired[@]} -gt 0 ] || return 0
+  # Their referrers, in one read.
+  shows=$(bk_reads "${asks[@]}")
+  for e in "${expired[@]}"; do
+    n=$((n + 1))
     # Kept: a current manager decision supports it (its statement cites the metrics that met the target).
-    about=$(bk show "${e%%:*}" --json 2>/dev/null) || about='{"referrers": []}'
-    jq -e --argjson decisions "$(bk log --tag decision --current --json 2>/dev/null || echo '[]')" "$live"'
+    about=$(sed -n "${n}p" <<<"$shows" | jq -ce 'select(.ok == true) | .result') || about='{"referrers": []}'
+    jq -e --argjson decisions "$decisions" "$live"'
       ([$decisions[] | select(.kind == "claim" and .author_name == "manager" and live) | .id]) as $d
       | any(.referrers[]; .kind == "relation" and .retracted == false and .author_name == "manager"
         and .body.kind == "supports" and (.body.from as $f | any($d[]; . == $f)))' <<<"$about" >/dev/null ||
@@ -300,14 +360,24 @@ check() { # check <ok|FAIL> <name> <detail>
 }
 
 # 1. The claim.
-shown=$(bk show "$claim" "${policy[@]}" --min-passes "$min_passes" --json 2>/dev/null) || fail "no contribution $claim in the Ground"
-statement=$(jq -r '.body.statement // empty' <<<"$shown")
+shown=$(nth 3) || fail "no contribution $claim in the Ground"
 full=$(jq -r '.id' <<<"$shown")
-[[ $statement =~ ^PR\ \#([0-9]+)\ ([^ ]+)\ @\ ([0-9a-f]{40}): ]] || fail "$claim isn't a pr claim ('PR #<n> <branch> @ <sha>: ...')"
-[ "${BASH_REMATCH[1]}" = "$pr" ] || fail "$claim is for PR #${BASH_REMATCH[1]}, not #$pr"
-branch=${BASH_REMATCH[2]}
-sha=${BASH_REMATCH[3]}
-current=$(bk log --tag pr --current --json) || fail "couldn't read the current pr claims"
+# A typed pr claim is read from its typed fields; an untyped one from its statement, as before.
+typed=$(pr_typed "$shown")
+case "$typed" in
+  untyped)
+    statement=$(jq -r '.body.statement // empty' <<<"$shown")
+    [[ $statement =~ ^PR\ \#([0-9]+)\ ([^ ]+)\ @\ ([0-9a-f]{40}): ]] || fail "$claim isn't a pr claim ('PR #<n> <branch> @ <sha>: ...')"
+    claimed_pr=${BASH_REMATCH[1]} branch=${BASH_REMATCH[2]} sha=${BASH_REMATCH[3]}
+    ;;
+  pr\ *)
+    read -r _ claimed_pr branch sha <<<"$typed"
+    [[ $claimed_pr =~ ^[0-9]+$ && $sha =~ ^[0-9a-f]{40}$ && -n $branch ]] || fail "$claim's typed pr fields aren't a PR number, branch and sha"
+    ;;
+  *) fail "$claim isn't a pr claim: ${typed#bad }" ;;
+esac
+[ "$claimed_pr" = "$pr" ] || fail "$claim is for PR #$claimed_pr, not #$pr"
+current=$(nth 4) || fail "couldn't read the current pr claims"
 # log --current keeps a claim someone else superseded, marked; that one isn't current either if the
 # manager or the owner superseded it (a takeover, finding 29a53011dacb). Anyone else's is ignored, and
 # reported (finding 20a7646f3579).
@@ -333,8 +403,7 @@ fi
 # isn't retracted and whose link still counts (live, or retracted by someone other than the finding's
 # author and the triager), each triaged from the triager's live evidence. Untriaged and confirmed
 # findings block; a confirmed one deferred to a current task of the triager's doesn't.
-triager=manager
-found=$(bk findings "$full" --triager "$triager" --json) ||
+found=$(nth 5) ||
   fail "couldn't read the findings against $full, so the findings check can't decide"
 # The read's shape first, in one jq: a jq error inside the for lists below would go unnoticed, since
 # errexit doesn't cover a command substitution there (finding d9682243cef7). Slurped (-s), so it judges
@@ -536,8 +605,12 @@ reuses_a_pass() {
   jq -e --arg k "$2" '.kind == "evidence" and .retracted == false and .author_name == "manager"
     and .body.verdict == "pass" and (.body.method | test("^scripts/test-table( --split)? @ [0-9a-f]{40} on [0-9a-f]{40} tree " + $k + "$"))' \
     <<<"$about" >/dev/null || return 1
-  target=$(jq -r .body.target <<<"$about")
-  bk show "$target" --json 2>/dev/null | jq -e --arg pr "PR #$pr " '(.body.statement // "") | startswith($pr)' >/dev/null
+  target=$(bk show "$(jq -r .body.target <<<"$about")" --json 2>/dev/null) || return 1
+  case "$(pr_typed "$target")" in
+    untyped) jq -e --arg pr "PR #$pr " '(.body.statement // "") | startswith($pr)' <<<"$target" >/dev/null ;;
+    "pr $pr "*) ;;
+    *) return 1 ;;
+  esac
 }
 docs_only=false
 if ! git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null; then
@@ -701,7 +774,7 @@ else
     # A full id or sha, named as a word of its own: not part of a longer hex string.
     named() { printf '(^|[^0-9a-f])%s([^0-9a-f]|$)' "$1"; }
     if [ -n "$frozen_paths" ]; then
-      reviews=$(bk log --tag owner-review --current --json) || fail "couldn't read the current owner-review claims"
+      reviews=$(nth 6) || fail "couldn't read the current owner-review claims"
       review=$(jq -r --arg id "$(named "$full")" --arg sha "$(named "$sha")" "$live"' [.[] | select(.kind == "claim"
         and .author_name == "manager" and live
         and (.body.tags | index("owner-review"))
@@ -714,7 +787,7 @@ else
       fi
     fi
     if [ -n "$owner_paths" ]; then
-      approvals=$(bk log --tag approval --current --json) || fail "couldn't read the current approvals"
+      approvals=$(nth 7) || fail "couldn't read the current approvals"
       # The owner's own go (question 3): one the owner ran, never one tagged delegated,
       # naming this pr claim and supporting it by the owner's own relation. The claim names the sha.
       approval=''
@@ -798,7 +871,7 @@ fi
 # 7. The owner's own approval, when the class needs it.
 owner_case="not required for this class"
 if $owner_approval; then
-  approvals=$(bk log --tag approval --current --json) || fail "couldn't read the current approvals"
+  approvals=$(nth 7) || fail "couldn't read the current approvals"
   approved=""
   for a in $(jq -r --arg t "$full" '.referrers[] | select(.kind == "relation" and .retracted == false
     and .author_name == "owner" and .body.kind == "supports" and .body.to == $t) | .body.from' <<<"$shown"); do

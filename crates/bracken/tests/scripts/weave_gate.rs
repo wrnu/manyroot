@@ -190,6 +190,28 @@ impl Batch {
         claim
     }
 
+    /// PR #n's claim again, typed pr (claim --type pr), with the proposal as its weave key when `named`, and
+    /// val's pass: its id. Its statement names no proposal unless the key does, as the pr shape requires.
+    fn typed_with_proposal(&self, n: usize, named: bool) -> String {
+        let proposal = format!("{:064x}", 0xbbb0 + n);
+        let w = self.weave_dir();
+        let known = std::fs::read_to_string(w.join("proposals")).unwrap_or_default();
+        std::fs::write(w.join("proposals"), format!("{known}{proposal}\n")).unwrap();
+        let sha = &self.shas[n - 1];
+        let tail = if named { format!(" Weave proposal {proposal}") } else { String::new() };
+        let statement = format!("PR #{n} pr{n} @ {sha}: change {n}.{tail}");
+        let (pr, branch, at) = (format!("pr={n}"), format!("branch=pr{n}"), format!("sha={sha}"));
+        let weave = format!("weave={proposal}");
+        let mut args = vec!["claim", &statement, "--type", "pr", "--attr", &pr, "--attr", &branch, "--attr", &at];
+        if named {
+            args.extend(["--attr", &weave]);
+        }
+        args.extend(["--supersedes", &self.claims[n - 1], "--as", "builder"]);
+        let claim = bk(&self.dir, &args).lines().next().unwrap().to_owned();
+        bk(&self.dir, &["evidence", &claim, "pass", "--method", "checked", "--as", "val"]);
+        claim
+    }
+
     fn gate(&self, statement: &str) -> String {
         bk(&self.dir, &["claim", statement, "--tag", "weave-gate", "--as", "manager"])
             .lines()
@@ -381,6 +403,37 @@ fn weave_results_on_the_merge_count_in_place_of_the_table() {
             "{scripts}: {scope}"
         );
         assert!(check_line(&out, "main").starts_with("ok"), "{scripts}: {}", text(&out));
+        assert_eq!(b.merged(), vec![1], "{scripts}");
+    }
+}
+
+/// A typed pr claim (claim --type pr) is read from its typed fields (task 8c9ad9bd4518, step 2): its weave key
+/// is the proposal record and check use, so Weave's results count for it as for an untyped claim naming the
+/// proposal; with no weave key it names none, and git's counted run it is.
+#[test]
+fn a_typed_pr_claims_weave_key_is_its_proposal() {
+    for scripts in SCRIPTS {
+        let b = fixture(scripts, &|_, _| {});
+        b.gate("Weave gate: on");
+        b.main_moves("z.rs");
+        let bare = b.typed_with_proposal(2, false);
+        let out = b.record(&bare, 2);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("names no 'Weave proposal"), "{scripts}: {}", text(&out));
+
+        let claim = b.typed_with_proposal(1, true);
+        let shown: serde_json::Value = serde_json::from_str(&bk(&b.dir, &["show", &claim, "--json"])).unwrap();
+        assert_eq!(shown["typed"]["type"], "pr", "{scripts}: {shown}");
+        let out = b.record(&claim, 1);
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert_eq!(b.pointers(&claim).len(), 1, "{scripts}");
+        let out = b.merge_one(1, &claim, false);
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        let scope = check_line(&out, "scope");
+        assert!(
+            scope.starts_with("ok") && scope.contains("line main's Weave results on blake3:"),
+            "{scripts}: {scope}"
+        );
         assert_eq!(b.merged(), vec![1], "{scripts}");
     }
 }

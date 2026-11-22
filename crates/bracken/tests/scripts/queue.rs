@@ -314,23 +314,30 @@ fn merge_batch_refuses_when_a_findings_read_fails() {
         assert!(b.verify(&[1, 2]).status.success(), "{scripts}");
         let finding = bk(&b.dir, &["claim", "member 2 breaks x", "--tag", "finding", "--as", "val"]);
         bk(&b.dir, &["relate", &finding, "contradicts", &b.claims[1], "--as", "val"]);
-        // bracken, failing the `findings` read alone, as a pull that drops would.
+        // bracken, failing the `findings` read alone, as a pull that drops would: in a `batch` (its request
+        // fails) or, with NO_BATCH, as one bracken per read.
         let wrapper = b.tmp.path().join("stubs/failing-bracken");
         write_executable(
             &wrapper,
-            "#!/usr/bin/env bash\nset -o pipefail\nfor a in \"$@\"; do [ \"$a\" != findings ] || { echo 'pull dropped' >&2; exit 1; }; done\n\
-             \"$REAL_BRACKEN\" \"$@\" | cat\n",
+            &format!("{}{}", crate::merge::BATCH_STUB, "answer() { echo 'pull dropped' >&2; return 1; }\nrun \"$@\"\n"),
         );
-        for (form, args) in
-            [("batch", vec!["--batch", &b.batch_claim()[..12]]), ("plain", vec!["2", &b.claims[1][..12]])]
-        {
-            let mut all = args.clone();
-            all.extend(["--validator", "val", "--min-passes", "1", "--as", "manager"]);
-            let out = b.command("scripts/merge", &all).env("BRACKEN_BIN", &wrapper).output().unwrap();
-            let said = text(&out);
-            assert_eq!(out.status.code(), Some(1), "{scripts}: {form}: {said}");
-            assert!(said.contains("couldn't read the findings against"), "{scripts}: {form}: {said}");
-            assert!(b.merged().is_empty(), "{scripts}: {form}: merged past an unread finding");
+        for no_batch in [true, false] {
+            for (form, args) in
+                [("batch", vec!["--batch", &b.batch_claim()[..12]]), ("plain", vec!["2", &b.claims[1][..12]])]
+            {
+                let mut all = args.clone();
+                all.extend(["--validator", "val", "--min-passes", "1", "--as", "manager"]);
+                let mut command = b.command("scripts/merge", &all);
+                command.env("BRACKEN_BIN", &wrapper);
+                if no_batch {
+                    command.env("NO_BATCH", "1");
+                }
+                let out = command.output().unwrap();
+                let said = text(&out);
+                assert_eq!(out.status.code(), Some(1), "{scripts}: {form}: no batch {no_batch}: {said}");
+                assert!(said.contains("couldn't read the findings against"), "{scripts}: {form}: {said}");
+                assert!(b.merged().is_empty(), "{scripts}: {form}: merged past an unread finding");
+            }
         }
     }
 }

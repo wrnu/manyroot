@@ -208,6 +208,19 @@ A write command signs with the identity's file in `identities/` if there is one.
 that server and checks the signature it gets back before adding the contribution; `scripts/bk` sets both
 for its writes. The contribution is byte for byte what the key file would sign.
 
+## Batch reads
+
+`bracken batch` runs many reads on one opening of the replica, for scripts that would otherwise start
+`bracken` once per lookup (`scripts/merge` does: one pull and one full check for all its reads). Each line
+of stdin is one request, a JSON array of the arguments after `bracken` of `log`, `show`, `findings` or
+`heads`, with `--json`, and no `--dir` or `--as` (batch's own apply). It prints one JSON line per request, in
+order: `{"ok": true, "result": <what that read prints alone>}` or `{"ok": false, "error": "<why>"}`, and
+skips blank lines. A failed request fails alone; batch exits 0 unless it can't read stdin.
+
+```sh
+printf '%s\n' '["show", "'$PR'", "--json"]' '["log", "--tag", "pr", "--current", "--json"]' | bracken batch
+```
+
 ## Typed claims
 
 A claim's tags take three forms besides plain ones (`note`), each mapping one-to-one onto a field protocol v2
