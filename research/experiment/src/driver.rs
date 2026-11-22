@@ -1187,12 +1187,13 @@ impl Run<'_> {
         let deadline = Instant::now() + self.cfg.turn_limit;
         let result = std::thread::scope(|scope| {
             let player = scope.spawn(|| backend.turn(i, &name, turn, socket));
-            let served = loop {
+            let listener = listener;
+            let accepted = loop {
                 match listener.accept() {
-                    Ok((stream, _)) => break self.serve(i, turn, stream, deadline, backend),
+                    Ok((stream, _)) => break Ok(Some(stream)),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         if player.is_finished() {
-                            break Ok(());
+                            break Ok(None);
                         }
                         if Instant::now() > deadline {
                             // Step 6 ends the agent's process here; the mock's thread is waited for.
@@ -1202,6 +1203,16 @@ impl Run<'_> {
                     }
                     Err(e) => break Err(format!("accepting on {}: {e}", socket.display())),
                 }
+            };
+            // A turn takes one connection: the socket goes now, before the player is waited for, so one that comes
+            // later, or again, is refused at once instead of waiting unaccepted for ever (finding dff42e94c7bb), as
+            // a sync session's listeners go with its relay.
+            drop(listener);
+            let _ = std::fs::remove_file(socket);
+            let served = match accepted {
+                Ok(Some(stream)) => self.serve(i, turn, stream, deadline, backend),
+                Ok(None) => Ok(()),
+                Err(e) => Err(e),
             };
             let played = player.join().unwrap_or_else(|_| Err("the backend panicked".into()));
             served.and(played)
