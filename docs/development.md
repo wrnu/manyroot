@@ -76,7 +76,7 @@ scripts/bk claim "PR #<n> <branch> @ <sha>: <title>. Weave proposal <id>" --type
 | `metric` (plain tag `metrics`) | `week` (date of the Monday) | |
 | `note`, `question`, `answer`, `report`, `gotcha`, `preference`, `reference`, `process`, `misfire`, `plan` | none | |
 
-The team server judges `type:<name>` by its plain tag as well, so a scope forbidding `decision` forbids `type:decision`. Until the typed-gate PR, `scripts/merge` and `scripts/metrics` read the statement text, which the shapes keep in step with the tags.
+The team server judges `type:<name>` by its plain tag as well, so a scope forbidding `decision` forbids `type:decision`. `scripts/merge` and `scripts/weave-gate` read a claim typed exactly `pr` from its typed fields (refusing one whose fields don't conform, and treating any other type, `bracken.pr` included, as not a pr claim), and an untyped one from its statement, as before; `scripts/merge` reads an experiment typed `experiment` by its `expires` key, and makes its Ground reads in one `bracken batch`. `scripts/gate-replay` replays the last merges under an older ref's scripts and this checkout's and diffs every verdict (the manager's to run). `scripts/metrics` still reads statements.
 
 ## Weave shadow (stages 1 and 2a)
 

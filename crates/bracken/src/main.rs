@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -232,6 +232,12 @@ enum Command {
         #[command(flatten)]
         out: Output,
     },
+    /// Run many reads on one opening of the replica, for scripts that would otherwise start bracken once
+    /// per lookup. Each line of stdin is one request: a JSON array of the arguments after `bracken` of
+    /// `log`, `show`, `findings` or `heads`, with `--json` (and no --dir or --as, which are batch's own).
+    /// Prints one JSON line per request, in order: `{"ok": true, "result": <its --json output>}`, or
+    /// `{"ok": false, "error": "<why>"}`. Blank lines are skipped.
+    Batch,
     /// List contributions in causal order.
     Log {
         #[arg(long)]
@@ -762,190 +768,16 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
             w.add(&mut s, &*who, Body::Retract { target, reason })?;
             w.finish();
         }
-        Command::Log { kind, tag, author, current, since, limit, compact, full, open, triager, out } => {
-            ensure!(
-                !full || since.is_some() || tag.is_some() || open,
-                "--full only undoes the compact form of --since, --tag or --open"
-            );
-            let compact = compact || ((since.is_some() || tag.is_some() || open) && !full);
-            let names = Names::load(&s)?;
-            let author = author.map(|a| names.resolve(&a)).transpose()?;
-            let g = s.graph();
-            let since_filter = since.as_deref().map(|c| listing::Since::parse(g, c)).transpose()?;
-            let order = g.topo_order();
-            let view = (current || open).then(|| CurrentView::new(g, &order));
-            let triager = if open {
-                Some(names.resolve(&triager).with_context(|| format!("--open: who triages? no identity {triager}"))?)
-            } else {
-                None
-            };
-            let rows: Vec<&Contribution> = order
-                .iter()
-                // --open alone keeps a finding its author superseded, as scripts/merge does: it hides only
-                // the retracted.
-                .filter(|id| !current || view.as_ref().is_none_or(|v| !v.hidden.contains(id)))
-                .map(|id| g.get(id).expect("ordered ids exist"))
-                .filter(|c| since_filter.as_ref().is_none_or(|s| s.admits(c)))
-                .filter(|c| {
-                    triager.is_none_or(|t| open_finding(g, view.as_ref().expect("--open builds the view"), t, c))
-                })
-                .filter(|c| kind.is_none_or(|k| c.body().kind() == k))
-                .filter(|c| author.is_none_or(|a| c.author() == a))
-                .filter(|c| {
-                    tag.as_ref().is_none_or(|t| matches!(c.body(), Body::Claim { tags, .. } if tags.contains(t)))
-                })
-                .collect();
-            let omitted = limit.map_or(0, |n| rows.len().saturating_sub(n));
-            let rows = &rows[omitted..];
-            // What's new since a cursor, personal to the caller: what concerns them first.
-            let (me, note) = if since.is_some() { caller(&names, agent) } else { (None, None) };
-            let for_you_ids: Vec<ContributionId> =
-                me.map(|me| rows.iter().filter(|c| concerns(g, me, c)).map(|c| c.id()).collect()).unwrap_or_default();
-            let for_you: HashSet<ContributionId> = for_you_ids.iter().copied().collect();
-            if out.json {
-                let rows: Vec<Value> = rows
-                    .iter()
-                    .map(|c| {
-                        let mut v = contribution_json(g, &names, c);
-                        if let Some(view) = &view {
-                            v["superseded_by_others"] = view
-                                .by_others(&c.id())
-                                .iter()
-                                .map(|(s, a)| json!({"id": s, "author": a, "author_name": names.0.get(a)}))
-                                .collect();
-                        }
-                        v
-                    })
-                    .collect();
-                if since.is_some() || limit.is_some() {
-                    let mut v = json!({"contributions": rows, "cursor": listing::cursor(g), "omitted": omitted});
-                    if me.is_some() {
-                        v["for_you"] = json!(for_you_ids);
-                    }
-                    print_json(&v);
-                } else {
-                    print_json(&rows);
-                }
-            } else {
-                let prefixes =
-                    compact.then(|| listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS));
-                if let Some(note) = note {
-                    println!("{note}");
-                }
-                let (first, then): (Vec<&Contribution>, Vec<&Contribution>) =
-                    rows.iter().partition(|c| for_you.contains(&c.id()));
-                let headed = !first.is_empty();
-                if headed {
-                    println!("for you:");
-                }
-                for (n, &c) in first.iter().chain(&then).enumerate() {
-                    if headed && n == first.len() && !then.is_empty() {
-                        println!("everything else:");
-                    }
-                    let mut text = match &prefixes {
-                        Some(p) => compact_line(g, &names, p, c),
-                        None => line(g, &names, c),
-                    };
-                    let by_others = view.as_ref().map_or(&[][..], |v| v.by_others(&c.id()));
-                    if compact && !by_others.is_empty() {
-                        // The text gives way to the marks, so they're never what's cut.
-                        let marks = compact_marks(&names, by_others);
-                        text = listing::cap_to(text, listing::COMPACT_LINE_CHARS - marks.chars().count());
-                        text.push_str(&marks);
-                    } else {
-                        for (by, author) in by_others {
-                            text.push_str(&superseded_by_suffix(&names, by, author));
-                        }
-                    }
-                    println!("{text}");
-                }
-                if omitted > 0 {
-                    println!("omitted: {omitted} earlier (--limit)");
-                }
-                if since.is_some() {
-                    println!("cursor: {}", listing::cursor(g));
-                }
-            }
+        command @ (Command::Log { .. } | Command::Findings { .. } | Command::Show { .. } | Command::Heads { .. }) => {
+            run_read(&s, agent, command)?
         }
-        Command::Findings { claim, triager, out } => {
-            let names = Names::load(&s)?;
-            let triager_key = names.resolve(&triager).with_context(|| format!("who triages? no identity {triager}"))?;
-            let g = s.graph();
-            let claim = resolve(&s, &claim)?;
-            let view = CurrentView::new(g, &g.topo_order());
-            let found = findings_against(g, &view, triager_key, &claim);
-            let blocking = found.iter().filter(|(_, t)| t.blocks()).count();
-            if out.json {
-                let findings: Vec<Value> = found
-                    .iter()
-                    .map(|(f, t)| {
-                        let task = if let Triage::Deferred(task) = t { Some(*task) } else { None };
-                        json!({"id": f, "triage": t.name(), "task": task, "blocks": t.blocks()})
-                    })
-                    .collect();
-                print_json(&json!({
-                    "claim": claim,
-                    "triager": triager_key,
-                    "triager_name": names.0.get(&triager_key),
-                    "findings": findings,
-                    "blocking": blocking,
-                }));
-            } else {
-                let prefixes = listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS);
-                for (f, t) in &found {
-                    let task =
-                        if let Triage::Deferred(task) = t { format!(" -> {}", prefixes[task]) } else { String::new() };
-                    let mark = if t.blocks() { "blocks" } else { "ok" };
-                    println!("{} {mark} {}{task}", prefixes[f], t.name());
-                }
-                println!("{} against {}, {blocking} blocking", found.len(), prefixes[&claim]);
-            }
-        }
-        Command::Show { id, policy, out } => {
-            let names = Names::load(&s)?;
-            let policy = policy.build(&names)?;
-            let g = s.graph();
-            let c = g.get(&resolve(&s, &id)?).expect("resolved ids exist");
-            if out.json {
-                let view = CurrentView::new(g, &g.topo_order());
-                print_json(&show_json(g, &names, &policy, &view, c, now_ms()));
-            } else {
-                let assessment = policy.assess(g, &c.id());
-                let referrers: Vec<&Contribution> = g.referrers(&c.id()).collect();
-                let intents = live_intents(g, &CurrentView::new(g, &g.topo_order()), &c.id(), now_ms());
-                print_show(g, &names, c, assessment.as_ref(), &referrers);
-                if !intents.is_empty() {
-                    println!();
-                    println!("live intents:");
-                    for i in &intents {
-                        println!("{}", terminal::printable(&intent_line(&names, i, now_ms())));
-                    }
-                }
-            }
-        }
+        Command::Batch => run_batch(&s, agent)?,
         Command::Cat { id } => {
             let id = resolve(&s, &id)?;
             let Body::Artifact { content, .. } = s.graph().get(&id).expect("resolved ids exist").body() else {
                 bail!("{id} is not an artifact");
             };
             write_stdout(content);
-        }
-        Command::Heads { compact, out } => {
-            let names = Names::load(&s)?;
-            let g = s.graph();
-            let heads: Vec<&Contribution> = g.heads().map(|id| g.get(&id).expect("heads exist")).collect();
-            if out.json {
-                print_json(&heads.iter().map(|c| contribution_json(g, &names, c)).collect::<Vec<_>>());
-            } else {
-                let prefixes =
-                    compact.then(|| listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS));
-                for c in heads {
-                    match &prefixes {
-                        Some(p) => println!("{}", compact_line(g, &names, p, c)),
-                        None => println!("{}", line(g, &names, c)),
-                    }
-                }
-            }
         }
         Command::Conflicts { out } => {
             let names = Names::load(&s)?;
@@ -1155,6 +987,242 @@ fn read_details(path: &Path) -> Result<String> {
         bail!("{} is over the {limit}-byte contribution limit", path.display());
     }
     String::from_utf8(bytes).with_context(|| format!("{} isn't UTF-8 text", path.display()))
+}
+
+/// `batch`: each request on stdin run by [`run_read`], its output captured and printed as one JSON line.
+fn run_batch(s: &Store, agent: Option<&str>) -> Result<()> {
+    for line in io::stdin().lock().lines() {
+        let line = line.context("reading the requests on stdin")?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row = match batch_read(s, agent, &line) {
+            Ok(result) => json!({"ok": true, "result": result}),
+            Err(e) => json!({"ok": false, "error": format!("{e:#}")}),
+        };
+        println!("{}", serde_json::to_string(&row).expect("values serialize"));
+    }
+    Ok(())
+}
+
+/// One `batch` request: its arguments, checked to be a JSON read, run and its output read back.
+fn batch_read(s: &Store, agent: Option<&str>, line: &str) -> Result<Value> {
+    let args: Vec<String> = serde_json::from_str(line).context("a request is a JSON array of strings")?;
+    ensure!(
+        !args.iter().any(|a| a == "--dir" || a.starts_with("--dir=") || a == "--as" || a.starts_with("--as=")),
+        "--dir and --as are batch's own"
+    );
+    let cli = Cli::try_parse_from(std::iter::once("bracken".to_owned()).chain(args))
+        .map_err(|e| anyhow::anyhow!("{}", e.to_string().lines().next().unwrap_or("not a command")))?;
+    let json = match &cli.command {
+        Command::Log { out, .. }
+        | Command::Show { out, .. }
+        | Command::Findings { out, .. }
+        | Command::Heads { out, .. } => out.json,
+        _ => bail!("batch runs log, show, findings and heads"),
+    };
+    ensure!(json, "a batch request reads with --json");
+    let out = capture(|| run_read(s, agent, cli.command))?;
+    serde_json::from_slice(&out).context("its output isn't JSON")
+}
+
+thread_local! {
+    /// Where [`write_stdout`] writes instead of stdout, while [`capture`] runs.
+    static CAPTURE: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with what it prints to stdout kept, and returns that.
+fn capture(f: impl FnOnce() -> Result<()>) -> Result<Vec<u8>> {
+    CAPTURE.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    let result = f();
+    let out = CAPTURE.with(|c| c.borrow_mut().take()).unwrap_or_default();
+    result.map(|()| out)
+}
+
+/// The reads `batch` runs too: `log`, `findings`, `show` and `heads`, on a replica already open.
+fn run_read(s: &Store, agent: Option<&str>, command: Command) -> Result<()> {
+    match command {
+        Command::Log { kind, tag, author, current, since, limit, compact, full, open, triager, out } => {
+            ensure!(
+                !full || since.is_some() || tag.is_some() || open,
+                "--full only undoes the compact form of --since, --tag or --open"
+            );
+            let compact = compact || ((since.is_some() || tag.is_some() || open) && !full);
+            let names = Names::load(s)?;
+            let author = author.map(|a| names.resolve(&a)).transpose()?;
+            let g = s.graph();
+            let since_filter = since.as_deref().map(|c| listing::Since::parse(g, c)).transpose()?;
+            let order = g.topo_order();
+            let view = (current || open).then(|| CurrentView::new(g, &order));
+            let triager = if open {
+                Some(names.resolve(&triager).with_context(|| format!("--open: who triages? no identity {triager}"))?)
+            } else {
+                None
+            };
+            let rows: Vec<&Contribution> = order
+                .iter()
+                // --open alone keeps a finding its author superseded, as scripts/merge does: it hides only
+                // the retracted.
+                .filter(|id| !current || view.as_ref().is_none_or(|v| !v.hidden.contains(id)))
+                .map(|id| g.get(id).expect("ordered ids exist"))
+                .filter(|c| since_filter.as_ref().is_none_or(|s| s.admits(c)))
+                .filter(|c| {
+                    triager.is_none_or(|t| open_finding(g, view.as_ref().expect("--open builds the view"), t, c))
+                })
+                .filter(|c| kind.is_none_or(|k| c.body().kind() == k))
+                .filter(|c| author.is_none_or(|a| c.author() == a))
+                .filter(|c| {
+                    tag.as_ref().is_none_or(|t| matches!(c.body(), Body::Claim { tags, .. } if tags.contains(t)))
+                })
+                .collect();
+            let omitted = limit.map_or(0, |n| rows.len().saturating_sub(n));
+            let rows = &rows[omitted..];
+            // What's new since a cursor, personal to the caller: what concerns them first.
+            let (me, note) = if since.is_some() { caller(&names, agent) } else { (None, None) };
+            let for_you_ids: Vec<ContributionId> =
+                me.map(|me| rows.iter().filter(|c| concerns(g, me, c)).map(|c| c.id()).collect()).unwrap_or_default();
+            let for_you: HashSet<ContributionId> = for_you_ids.iter().copied().collect();
+            if out.json {
+                let rows: Vec<Value> = rows
+                    .iter()
+                    .map(|c| {
+                        let mut v = contribution_json(g, &names, c);
+                        if let Some(view) = &view {
+                            v["superseded_by_others"] = view
+                                .by_others(&c.id())
+                                .iter()
+                                .map(|(s, a)| json!({"id": s, "author": a, "author_name": names.0.get(a)}))
+                                .collect();
+                        }
+                        v
+                    })
+                    .collect();
+                if since.is_some() || limit.is_some() {
+                    let mut v = json!({"contributions": rows, "cursor": listing::cursor(g), "omitted": omitted});
+                    if me.is_some() {
+                        v["for_you"] = json!(for_you_ids);
+                    }
+                    print_json(&v);
+                } else {
+                    print_json(&rows);
+                }
+            } else {
+                let prefixes =
+                    compact.then(|| listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS));
+                if let Some(note) = note {
+                    println!("{note}");
+                }
+                let (first, then): (Vec<&Contribution>, Vec<&Contribution>) =
+                    rows.iter().partition(|c| for_you.contains(&c.id()));
+                let headed = !first.is_empty();
+                if headed {
+                    println!("for you:");
+                }
+                for (n, &c) in first.iter().chain(&then).enumerate() {
+                    if headed && n == first.len() && !then.is_empty() {
+                        println!("everything else:");
+                    }
+                    let mut text = match &prefixes {
+                        Some(p) => compact_line(g, &names, p, c),
+                        None => line(g, &names, c),
+                    };
+                    let by_others = view.as_ref().map_or(&[][..], |v| v.by_others(&c.id()));
+                    if compact && !by_others.is_empty() {
+                        // The text gives way to the marks, so they're never what's cut.
+                        let marks = compact_marks(&names, by_others);
+                        text = listing::cap_to(text, listing::COMPACT_LINE_CHARS - marks.chars().count());
+                        text.push_str(&marks);
+                    } else {
+                        for (by, author) in by_others {
+                            text.push_str(&superseded_by_suffix(&names, by, author));
+                        }
+                    }
+                    println!("{text}");
+                }
+                if omitted > 0 {
+                    println!("omitted: {omitted} earlier (--limit)");
+                }
+                if since.is_some() {
+                    println!("cursor: {}", listing::cursor(g));
+                }
+            }
+        }
+        Command::Findings { claim, triager, out } => {
+            let names = Names::load(s)?;
+            let triager_key = names.resolve(&triager).with_context(|| format!("who triages? no identity {triager}"))?;
+            let g = s.graph();
+            let claim = resolve(s, &claim)?;
+            let view = CurrentView::new(g, &g.topo_order());
+            let found = findings_against(g, &view, triager_key, &claim);
+            let blocking = found.iter().filter(|(_, t)| t.blocks()).count();
+            if out.json {
+                let findings: Vec<Value> = found
+                    .iter()
+                    .map(|(f, t)| {
+                        let task = if let Triage::Deferred(task) = t { Some(*task) } else { None };
+                        json!({"id": f, "triage": t.name(), "task": task, "blocks": t.blocks()})
+                    })
+                    .collect();
+                print_json(&json!({
+                    "claim": claim,
+                    "triager": triager_key,
+                    "triager_name": names.0.get(&triager_key),
+                    "findings": findings,
+                    "blocking": blocking,
+                }));
+            } else {
+                let prefixes = listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS);
+                for (f, t) in &found {
+                    let task =
+                        if let Triage::Deferred(task) = t { format!(" -> {}", prefixes[task]) } else { String::new() };
+                    let mark = if t.blocks() { "blocks" } else { "ok" };
+                    println!("{} {mark} {}{task}", prefixes[f], t.name());
+                }
+                println!("{} against {}, {blocking} blocking", found.len(), prefixes[&claim]);
+            }
+        }
+        Command::Show { id, policy, out } => {
+            let names = Names::load(s)?;
+            let policy = policy.build(&names)?;
+            let g = s.graph();
+            let c = g.get(&resolve(s, &id)?).expect("resolved ids exist");
+            if out.json {
+                let view = CurrentView::new(g, &g.topo_order());
+                print_json(&show_json(g, &names, &policy, &view, c, now_ms()));
+            } else {
+                let assessment = policy.assess(g, &c.id());
+                let referrers: Vec<&Contribution> = g.referrers(&c.id()).collect();
+                let intents = live_intents(g, &CurrentView::new(g, &g.topo_order()), &c.id(), now_ms());
+                print_show(g, &names, c, assessment.as_ref(), &referrers);
+                if !intents.is_empty() {
+                    println!();
+                    println!("live intents:");
+                    for i in &intents {
+                        println!("{}", terminal::printable(&intent_line(&names, i, now_ms())));
+                    }
+                }
+            }
+        }
+        Command::Heads { compact, out } => {
+            let names = Names::load(s)?;
+            let g = s.graph();
+            let heads: Vec<&Contribution> = g.heads().map(|id| g.get(&id).expect("heads exist")).collect();
+            if out.json {
+                print_json(&heads.iter().map(|c| contribution_json(g, &names, c)).collect::<Vec<_>>());
+            } else {
+                let prefixes =
+                    compact.then(|| listing::unique_prefixes(g.iter().map(|c| c.id()), listing::COMPACT_ID_DIGITS));
+                for c in heads {
+                    match &prefixes {
+                        Some(p) => println!("{}", compact_line(g, &names, p, c)),
+                        None => println!("{}", line(g, &names, c)),
+                    }
+                }
+            }
+        }
+        _ => unreachable!("run_read runs only log, findings, show and heads"),
+    }
+    Ok(())
 }
 
 /// What one write command recorded, the primary record first (task `d4e958fd6719`): one labelled line
@@ -2520,6 +2588,10 @@ fn print_conflicts(g: &Graph, names: &Names, conflicts: &[Conflict], as_json: bo
 /// Commands finish writing to the Ground before they print, so stopping here never leaves a
 /// write half-done.
 fn write_stdout(bytes: &[u8]) {
+    let captured = CAPTURE.with(|c| c.borrow_mut().as_mut().map(|buf| buf.extend_from_slice(bytes)).is_some());
+    if captured {
+        return;
+    }
     if let Err(e) = io::stdout().write_all(bytes) {
         if e.kind() == io::ErrorKind::BrokenPipe {
             std::process::exit(BROKEN_PIPE_STATUS.load(Ordering::Relaxed));

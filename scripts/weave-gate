@@ -32,7 +32,8 @@
 # gtimeout) aren't on PATH. It falls back the same way, before anything runs, when:
 #   - the head doesn't merge cleanly onto main;
 #   - the pr claim names no 'Weave proposal <64 hex>' that the Weave Ground holds (weave-shadow --proposal
-#     needs it after the merge: it checks Weave's own merge against git's);
+#     needs it after the merge: it checks Weave's own merge against git's). A claim typed pr names it by
+#     its weave key, an untyped one by the first in its statement (pr_claim, below);
 #   - the head changes scripts/test-table, its template copy, or Cargo.lock: the policy pins main's
 #     test-table, so the head's own copy would be untested, and the vendor directory is main's;
 #   - git's merge holds what weave import leaves out and weave verify doesn't compare (finding
@@ -176,7 +177,34 @@ switch() {
   return 1
 }
 
-# fallback <base> <sha> <statement>: sets why and returns 0 if the head must take git's counted run.
+# pr_claim <show json>: sets claim_pr, claim_sha and claim_proposal (empty if it names none) from a pr claim,
+# or why and returns 1. A claim typed exactly pr (claim --type pr) whose typed fields conform is read from
+# them, its proposal the weave key; a namespaced type such as bracken.pr isn't pr. An untyped claim is read
+# from its statement, as before: 'PR #<n> <branch> @ <sha>:', and the first 'Weave proposal <64 hex>'.
+pr_claim() {
+  local typed statement
+  typed=$(jq -r 'if (.typed.type? // null) == null then "untyped"
+    elif .typed.type != "pr" then "bad it is typed \(.typed.type), not pr"
+    elif (.typed.problems // ["no problems field"]) != [] then "bad its typed fields don'"'"'t conform"
+    else "pr \(.typed.data.pr) \(.typed.data.sha) \(.typed.data.weave // "")" end' <<<"$1") ||
+    { why="its JSON doesn't read"; return 1; }
+  case "$typed" in
+    untyped)
+      statement=$(jq -r '.body.statement // empty' <<<"$1")
+      [[ $statement =~ ^PR\ \#([0-9]+)\ [^\ ]+\ @\ ([0-9a-f]{40}): ]] || { why="it isn't a pr claim"; return 1; }
+      claim_pr=${BASH_REMATCH[1]} claim_sha=${BASH_REMATCH[2]} claim_proposal=''
+      if [[ $statement =~ Weave\ proposal\ ([0-9a-f]{64}) ]]; then claim_proposal=${BASH_REMATCH[1]}; fi
+      ;;
+    pr\ *)
+      read -r _ claim_pr claim_sha claim_proposal <<<"$typed"
+      [[ $claim_pr =~ ^[0-9]+$ && $claim_sha =~ ^[0-9a-f]{40}$ && $claim_proposal =~ ^([0-9a-f]{64})?$ ]] ||
+        { why="its typed pr fields aren't a PR number, sha and proposal"; return 1; }
+      ;;
+    *) why=${typed#bad }; return 1 ;;
+  esac
+}
+
+# fallback <base> <sha> <proposal>: sets why and returns 0 if the head must take git's counted run.
 fallback() {
   local changed p proposal
   changed=$(git -C "$main" diff --no-renames --name-only "$1" "$2") || { why="git diff $1 $2 failed"; return 0; }
@@ -186,8 +214,8 @@ fallback() {
       return 0
     fi
   done
-  [[ $3 =~ Weave\ proposal\ ([0-9a-f]{64}) ]] || { why="the pr claim names no 'Weave proposal <64 hex>'"; return 0; }
-  proposal=${BASH_REMATCH[1]}
+  [ -n "$3" ] || { why="the pr claim names no 'Weave proposal <64 hex>'"; return 0; }
+  proposal=$3
   wv show "$proposal" --json >/dev/null 2>&1 || { why="the Weave Ground holds no proposal ${proposal:0:12}"; return 0; }
   return 1
 }
@@ -345,15 +373,13 @@ case "${1:-}" in
     fi
     shown=$(bk show "$claim" --json) || fail "no contribution $claim in the Ground"
     full=$(jq -r .id <<<"$shown")
-    statement=$(jq -r '.body.statement // empty' <<<"$shown")
-    [[ $statement =~ ^PR\ \#([0-9]+)\ [^\ ]+\ @\ ([0-9a-f]{40}): ]] && [ "${BASH_REMATCH[2]}" = "$sha" ] ||
-      fail "$claim isn't a pr claim for $sha"
-    pr=${BASH_REMATCH[1]}
+    pr_claim "$shown" && [ "$claim_sha" = "$sha" ] || fail "$claim isn't a pr claim for $sha"
+    pr=$claim_pr
     git -C "$main" fetch -q origin main "refs/pull/$pr/head" 2>/dev/null || true
     tip=$(git -C "$main" rev-parse --verify -q "${ON:-origin/main}^{commit}") || fail "no commit ${ON:-origin/main}"
     git -C "$main" cat-file -e "$sha^{commit}" 2>/dev/null || fail "$sha isn't in the main checkout (fetch PR #$pr)"
     base=$(git -C "$main" merge-base "$tip" "$sha") || fail "$sha and main $tip share no history"
-    if fallback "$base" "$sha" "$statement"; then
+    if fallback "$base" "$sha" "$claim_proposal"; then
       echo "weave-gate: PR #$pr @ ${sha:0:12}: $why; run git's counted run" >&2
       exit 1
     fi
@@ -426,9 +452,10 @@ case "${1:-}" in
     jq -e --arg c "$claim" --arg m "$want" '.kind == "evidence" and .retracted == false and .author_name == "manager"
       and .body.verdict == "pass" and .body.target == $c and .body.method == $m' <<<"$about" >/dev/null ||
       { echo "pointer ${pointer:0:12} isn't a current manager pass '$want' on this claim"; exit 1; }
-    statement=$(bk show "$claim" --json | jq -r '.body.statement // empty') || { echo "can't read the pr claim"; exit 1; }
+    shown=$(bk show "$claim" --json) || { echo "can't read the pr claim"; exit 1; }
+    pr_claim "$shown" || { echo "the pr claim doesn't read: $why"; exit 1; }
     base=$(git -C "$main" merge-base "$on" "$sha") || { echo "main $on and $sha share no history"; exit 1; }
-    if fallback "$base" "$sha" "$statement"; then echo "$why"; exit 1; fi
+    if fallback "$base" "$sha" "$claim_proposal"; then echo "$why"; exit 1; fi
     m=$(merged "$on" "$sha") || { echo "$sha doesn't merge cleanly onto main $on"; exit 1; }
     commit=${m% *}
     [ "${m#* }" = "$key" ] ||

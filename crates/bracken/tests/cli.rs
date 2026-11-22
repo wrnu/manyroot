@@ -2170,3 +2170,59 @@ fn verify_fails_on_an_agent_entry_that_could_misname_an_agent() {
     std::fs::remove_file(agents.join("zzz.json")).unwrap();
     bracken(dir, &["verify"]);
 }
+
+/// `batch` runs many reads on one opening of the replica (task 8c9ad9bd4518, step 2): each request's result
+/// is what the same read prints alone, a request that fails fails alone, and only JSON reads run.
+#[test]
+fn batch_answers_each_read_as_the_read_alone_would() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "alice"]);
+    bracken(dir, &["id", "new", "val"]);
+    let pr = bracken(dir, &["claim", "PR #1 b @ 0000: t", "--tag", "pr", "--as", "alice"]);
+    let finding = bracken(dir, &["claim", "x breaks", "--tag", "finding", "--as", "val"]);
+    bracken(dir, &["relate", &finding, "contradicts", &pr, "--as", "val"]);
+    bracken(dir, &["evidence", &pr, "pass", "--method", "read", "--as", "val"]);
+    let reads: Vec<Vec<&str>> = vec![
+        vec!["show", &pr[..10], "--validator", "val", "--min-passes", "1", "--json"],
+        vec!["log", "--tag", "pr", "--current", "--json"],
+        vec!["findings", &pr, "--triager", "val", "--json"],
+        vec!["heads", "--json"],
+        vec!["log", "--json", "--limit", "2"],
+    ];
+    let mut input: String = reads.iter().map(|r| serde_json::to_string(r).unwrap() + "\n\n").collect();
+    for bad in [r#"["log"]"#, r#"["claim", "x", "--json"]"#, "not json", r#"["show", "ffffffff", "--json"]"#] {
+        input.push_str(bad);
+        input.push('\n');
+    }
+    input.push_str(r#"["heads", "--json", "--as", "val"]"#);
+    input.push('\n');
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
+        .arg("batch")
+        .current_dir(dir)
+        .env_remove("BRACKEN_DIR")
+        .env_remove("BRACKEN_AGENT")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let lines: Vec<Value> =
+        String::from_utf8(out.stdout).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    assert_eq!(lines.len(), reads.len() + 5, "one line per request, blank lines skipped: {lines:?}");
+    for (read, line) in reads.iter().zip(&lines) {
+        assert_eq!(line["ok"], true, "{read:?}: {line}");
+        // show's intents and heads are the same in a moment; nothing here has an intent or moves.
+        assert_eq!(line["result"], json(dir, read), "{read:?}");
+    }
+    let errors: Vec<&str> = lines[reads.len()..].iter().map(|l| l["error"].as_str().unwrap()).collect();
+    assert!(errors[0].contains("with --json"), "{errors:?}");
+    assert!(errors[1].contains("runs log, show, findings and heads"), "{errors:?}");
+    assert!(errors[2].contains("JSON array"), "{errors:?}");
+    assert!(errors[3].contains("ffffffff"), "{errors:?}");
+    assert!(errors[4].contains("--dir and --as"), "{errors:?}");
+    assert_eq!(bracken(dir, &["log", "--kind", "claim", "--json"]).matches("\"id\"").count(), 2, "batch wrote nothing");
+}

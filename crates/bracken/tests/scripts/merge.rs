@@ -2,6 +2,30 @@
 
 use crate::support::*;
 
+/// The head of a stub bracken whose `findings` read answers with its `answer` function, which the test
+/// appends with the line `run "$@"`. scripts/merge reads through one `batch` where bracken has it: the stub
+/// then answers each findings request itself, and passes every other request to the real batch. With
+/// NO_BATCH set it has no batch, so merge reads one bracken per read, and the stub answers `findings` alone.
+pub const BATCH_STUB: &str = r#"#!/usr/bin/env bash
+set -o pipefail
+run() {
+  if [ "${1:-}" = batch ]; then
+    [ -z "${NO_BATCH:-}" ] || exit 2
+    [ "${2:-}" != --help ] || exec "$REAL_BRACKEN" "$@"
+    while IFS= read -r r; do
+      if jq -e 'index("findings")' <<<"$r" >/dev/null; then
+        if out=$(answer); then jq -c '{ok: true, result: .}' <<<"$out"; else jq -cn '{ok: false, error: "stub"}'; fi
+      else
+        "$REAL_BRACKEN" batch <<<"$r"
+      fi
+    done
+    exit 0
+  fi
+  for a in "$@"; do [ "$a" != findings ] || { answer; exit; }; done
+  exec "$REAL_BRACKEN" "$@"
+}
+"#;
+
 /// merge reaches GitHub only through gh's own credential store: it never handles a token, and gh runs
 /// with GH_TOKEN, GITHUB_TOKEN, the enterprise token variables and GH_DEBUG unset, so a token the caller
 /// exports is never used or logged. The `gh` stub records its arguments and every such variable it sees;
@@ -133,6 +157,62 @@ fn merge_dry_run_command(
         command(&dir, "scripts/merge", &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"]);
     merge.env("PATH", format!("{}:{path}", tmp.path().join("stubs").display())).env("GIT_CONFIG_NOSYSTEM", "1");
     (tmp, dir, merge)
+}
+
+/// The gate reads a typed pr claim from its typed fields (task 8c9ad9bd4518, step 2): a claim typed pr is
+/// judged as its untyped twin is, check for check; a claim typed anything else isn't a pr claim, whatever its
+/// statement and tags say.
+#[test]
+fn merge_reads_a_typed_pr_claim_from_its_typed_fields() {
+    for scripts in SCRIPTS {
+        let (tmp, dir, mut untyped) = merge_dry_run_command(scripts, |_| {}, |_| {}, |_| {}, None);
+        let base = untyped.output().unwrap();
+        assert!(base.status.success(), "{scripts}: {}", text(&base));
+        let sha = String::from_utf8(run(&dir, "git", &["rev-parse", "pr"]).stdout).unwrap().trim().to_owned();
+        let path = std::env::var("PATH").unwrap();
+        let dry = |claim: &str| {
+            command(&dir, "scripts/merge", &["1", &claim[..12], "--validator", "val", "--min-passes", "1", "--dry-run"])
+                .env("PATH", format!("{}:{path}", tmp.path().join("stubs").display()))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .unwrap()
+        };
+        let typed = |ty: &str, tags: &[&str]| {
+            let statement = format!("PR #1 pr @ {sha}: a change");
+            let at = format!("sha={sha}");
+            let mut args = vec!["claim", &statement, "--type", ty];
+            if ty == "pr" {
+                args.extend(["--attr", "pr=1", "--attr", "branch=pr", "--attr", &at]);
+            }
+            for t in tags {
+                args.extend(["--tag", t]);
+            }
+            args.extend(["--as", "builder"]);
+            let claim = bk(&dir, &args).lines().next().unwrap().to_owned();
+            bk(&dir, &["evidence", &claim, "pass", "--method", "checked", "--as", "val"]);
+            claim
+        };
+        // Check for check, as the untyped claim: every line's verdict and name.
+        let verdicts = |out: &Output| -> Vec<String> {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter(|l| l.starts_with("ok ") || l.starts_with("FAIL "))
+                .map(|l| l.split_whitespace().take(2).collect::<Vec<_>>().join(" "))
+                .collect()
+        };
+        let out = dry(&typed("pr", &[]));
+        assert!(out.status.success(), "{scripts}: {}", text(&out));
+        assert_eq!(verdicts(&out), verdicts(&base), "{scripts}: {}", text(&out));
+        assert!(
+            text(&out).contains(&format!("is the current pr claim for #1: pr @ {sha}")),
+            "{scripts}: {}",
+            text(&out)
+        );
+
+        let out = dry(&typed("note", &["pr"]));
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {}", text(&out));
+        assert!(text(&out).contains("isn't a pr claim: it is typed note, not pr"), "{scripts}: {}", text(&out));
+    }
 }
 
 /// merge runs scripts/ground-guards on the PR's head: a clean head passes, and a head that commits a key
@@ -1042,13 +1122,11 @@ fn merge_decides_findings_through_the_binary_and_refuses_another_shape() {
         assert!(out.status.success(), "{scripts}: deferred: {said}");
         assert!(said.contains(&format!("confirmed and deferred: {f}->{}", &task[..12])), "{scripts}: {said}");
 
-        // The same Ground, but `findings --json` answers in another shape: refused every time.
+        // The same Ground, but `findings --json` answers in another shape: refused every time. merge reads
+        // through one `batch` where bracken has it, else one bracken per read: the stub answers `findings`
+        // either way, and with NO_BATCH set has no batch.
         let wrapper = b.tmp.path().join("stubs/shaped-bracken");
-        write_executable(
-            &wrapper,
-            "#!/usr/bin/env bash\nfor a in \"$@\"; do [ \"$a\" != findings ] || { cat \"$T/shape\"; exit 0; }; done\n\
-             exec \"$REAL_BRACKEN\" \"$@\"\n",
-        );
+        write_executable(&wrapper, &format!("{BATCH_STUB}{}", "answer() { cat \"$T/shape\"; }\nrun \"$@\"\n"));
         let id = "a".repeat(64);
         for shape in [
             r#"{"findings":5,"blocking":0}"#.to_owned(),
@@ -1074,10 +1152,25 @@ fn merge_decides_findings_through_the_binary_and_refuses_another_shape() {
             std::fs::write(b.tmp.path().join("shape"), &shape).unwrap();
             let mut all = vec!["1", &claim[..12], "--dry-run"];
             all.extend(["--validator", "val", "--min-passes", "1", "--as", "manager"]);
-            let out = b.command("scripts/merge", &all).env("BRACKEN_BIN", &wrapper).output().unwrap();
-            let said = text(&out);
-            assert_eq!(out.status.code(), Some(1), "{scripts}: {shape}: {said}");
-            assert!(said.contains("isn't in the shape this check reads"), "{scripts}: {shape}: {said}");
+            // Two documents are no one read's answer: one bracken per read refuses them as a failed read,
+            // and batch's one line per request can't carry them.
+            let one_document = !shape.contains('\n');
+            for no_batch in [true, false] {
+                if !one_document && !no_batch {
+                    continue;
+                }
+                let mut command = b.command("scripts/merge", &all);
+                command.env("BRACKEN_BIN", &wrapper);
+                if no_batch {
+                    command.env("NO_BATCH", "1");
+                }
+                let out = command.output().unwrap();
+                let said = text(&out);
+                assert_eq!(out.status.code(), Some(1), "{scripts}: {shape}: no batch {no_batch}: {said}");
+                let why =
+                    if one_document { "isn't in the shape this check reads" } else { "couldn't read the findings" };
+                assert!(said.contains(why), "{scripts}: {shape}: no batch {no_batch}: {said}");
+            }
         }
         assert!(b.merged().is_empty(), "{scripts}: a dry run merged");
     }

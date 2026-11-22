@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# gate-replay: the merge gate replayed on the last merges, under an older ref's scripts and this checkout's,
+# and whether every verdict is the same (task 8c9ad9bd4518: a change to how the gate reads must not change
+# what it decides).
+#
+#   gate-replay [--last N] [--old <ref>]
+#
+# For each of the last N merged PRs (default 30), by the manager's live 'merge gate @ <sha>' passes in the
+# Ground, newest last, it runs the old ref's scripts/merge (default origin/main, checked out detached in a
+# temporary worktree) and this checkout's, each '<pr> <claim> <policy> --dry-run' with the PR, pr claim and
+# policy that pass recorded, and compares their exit codes and every line they print. It prints 'same #<n>'
+# or the PR's diff, and a last line counting both; it exits 0 only if every one is the same. The PRs are
+# merged, so both runs fail at least the GitHub check: the point is that they fail and pass alike.
+#
+# merge runs only as manager and reads with the manager's team token, so this is the manager's to run; it
+# needs what merge needs (gh, jq, the team server). A dry run records nothing and only GETs from GitHub.
+set -euo pipefail
+set +ax
+fail() { echo "gate-replay: $*" >&2; exit 1; }
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-dir)")
+last=30 old=origin/main
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --last) [ $# -ge 2 ] && [[ $2 =~ ^[1-9][0-9]{0,3}$ ]] || fail "--last takes a count"; last=$2; shift 2 ;;
+    --old) [ $# -ge 2 ] || fail "--old takes a ref"; old=$2; shift 2 ;;
+    *) fail "usage: gate-replay [--last N] [--old <ref>]" ;;
+  esac
+done
+[ "${BRACKEN_AGENT:-manager}" = manager ] || fail "merge runs only as manager, so this does too (BRACKEN_AGENT is ${BRACKEN_AGENT})"
+command -v jq >/dev/null || fail "needs jq"
+commit=$(git -C "$main" rev-parse --verify -q "$old^{commit}") || fail "no commit $old"
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/gate-replay.XXXXXX")
+cleanup() {
+  git -C "$main" worktree remove --force "$scratch/old" >/dev/null 2>&1 || true
+  rmdir "$scratch" 2>/dev/null || true
+}
+trap cleanup EXIT
+git -C "$main" worktree add -q --detach "$scratch/old" "$commit" || fail "can't check out $old"
+
+# The merges: each live manager 'merge gate @ <sha>' pass, its pr claim, and the PR and policy its details
+# name, the last per PR, in causal order.
+merges=$(BRACKEN_AGENT=manager "$here/bk" log --kind evidence --json | jq -r --argjson last "$last" '
+  [.[] | select(.author_name == "manager" and .retracted == false and (.body.method | startswith("merge gate @ ")))
+   | (.body.details | capture("current pr claim for #(?<pr>[0-9]+)")?.pr) as $pr
+   | (.body.details | capture("accepted under (?<p>(--validator [a-z0-9_-]+ )+--min-passes [0-9]+)")?.p) as $p
+   | select($pr != null and $p != null) | {pr: $pr, claim: .body.target, policy: $p}]
+  | reverse | reduce .[] as $m ({seen: {}, out: []};
+      if .seen[$m.pr] then . else .seen[$m.pr] = true | .out += [$m] end)
+  | .out[:$last] | reverse | .[] | "\(.pr) \(.claim) \(.policy)"') || fail "can't read the merge gate's passes"
+[ -n "$merges" ] || fail "no merge gate passes to replay"
+
+same=0 differ=0
+while read -r pr claim policy; do
+  read -ra p <<<"$policy"
+  # Each run's output and exit, '-' joined to keep the exit apart from the text.
+  a=$(cd "$main" && BRACKEN_AGENT=manager "$scratch/old/scripts/merge" "$pr" "$claim" "${p[@]}" --dry-run 2>&1 </dev/null; echo "-exit $?")
+  b=$(cd "$main" && BRACKEN_AGENT=manager "$here/merge" "$pr" "$claim" "${p[@]}" --dry-run 2>&1 </dev/null; echo "-exit $?")
+  if [ "$a" = "$b" ]; then
+    same=$((same + 1))
+    echo "same #$pr ($(tail -1 <<<"$a"))"
+  else
+    differ=$((differ + 1))
+    echo "DIFFERS #$pr (claim ${claim:0:12}):"
+    diff <(printf '%s\n' "$a") <(printf '%s\n' "$b") | sed 's/^/  /' || true
+  fi
+done <<<"$merges"
+echo "gate-replay: $same the same, $differ different, old $old (${commit:0:12}), new $here"
+[ "$differ" -eq 0 ]
