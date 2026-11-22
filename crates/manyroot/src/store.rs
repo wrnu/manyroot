@@ -178,11 +178,8 @@ impl Store {
         }
         let trusted = load(info.ground, &|id| on_disk.contains_key(id));
         let mut graph = Graph::new(info.ground);
-        let mut batch = Vec::new();
-        if trusted.is_empty() {
-            for (path, regular) in files {
-                batch.push(read_regular_object(objects.as_ref(), dir, path, regular)?);
-            }
+        let batch = if trusted.is_empty() {
+            read_objects(objects.as_ref(), dir, files)?
         } else {
             if let Some(path) = misnamed {
                 return Err(StoreError::Corrupt { path, reason: "not named by a contribution id".into() });
@@ -212,10 +209,7 @@ impl Store {
             let mut rest: Vec<(ContributionId, PathBuf, bool)> =
                 on_disk.into_iter().map(|(id, (p, regular))| (id, p, regular)).collect();
             rest.sort();
-            let mut fresh = Vec::new();
-            for (_, path, regular) in rest {
-                fresh.push(read_regular_object(objects.as_ref(), dir, path, regular)?);
-            }
+            let fresh = read_objects(objects.as_ref(), dir, rest.into_iter().map(|(_, p, r)| (p, r)).collect())?;
             let signatures = verify_signatures(&fresh);
             for c in fresh {
                 pool.insert(c.id(), (c, false));
@@ -259,7 +253,7 @@ impl Store {
                 });
             }
             return Ok(Store { dir: dir.to_owned(), info, graph });
-        }
+        };
 
         let signatures = verify_signatures(&batch);
         let report = graph.import_presigned(batch, &signatures);
@@ -523,6 +517,39 @@ fn merge(into: &mut ImportReport, from: ImportReport) {
     into.already_present += from.already_present;
     into.rejected.extend(from.rejected);
     into.unresolved.extend(from.unresolved);
+}
+
+/// [`read_regular_object`] for each of `files`, on every core at once, and the first failure in `files`
+/// order, which is the one reading them one at a time would give (task `7a3d17f979c3`): reading and
+/// decoding one file per contribution is most of a full open after the signatures.
+fn read_objects(objects: Option<&Dir>, dir: &Path, files: ObjectFiles) -> Result<Vec<Contribution>, StoreError> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(16);
+    if threads == 1 || files.len() < 64 {
+        return files.into_iter().map(|(path, regular)| read_regular_object(objects, dir, path, regular)).collect();
+    }
+    let chunk = files.len().div_ceil(threads);
+    let mut parts: Vec<Vec<(PathBuf, bool)>> = Vec::new();
+    let mut files = files.into_iter().peekable();
+    while files.peek().is_some() {
+        parts.push(files.by_ref().take(chunk).collect());
+    }
+    let read: Vec<Result<Vec<Contribution>, StoreError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = parts
+            .into_iter()
+            .map(|part| {
+                // Each part stops at its own first failure; the parts are taken in order below.
+                scope.spawn(move || {
+                    part.into_iter().map(|(path, regular)| read_regular_object(objects, dir, path, regular)).collect()
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("reading an object doesn't panic")).collect()
+    });
+    let mut out = Vec::new();
+    for part in read {
+        out.extend(part?);
+    }
+    Ok(out)
 }
 
 /// Each contribution's [`Contribution::signature_is_valid`], worked out on every core at once: the

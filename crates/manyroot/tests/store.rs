@@ -540,3 +540,38 @@ fn a_key_being_saved_is_never_seen_half_written() {
     let names = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned());
     assert!(names.into_iter().all(|n| n.ends_with(".json")), "no temporary file left");
 }
+
+/// Task `7a3d17f979c3`: a full open reads objects and verifies signatures on every core, and still
+/// reports what reading them one at a time in listing order reports: the first damaged object in
+/// `objects/`' listing, whichever thread read it, and the same graph when nothing is damaged.
+#[test]
+fn a_parallel_full_open_reports_the_first_damaged_object_in_listing_order() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("g");
+    let mut s = Store::init(&dir, "t").expect("a Ground");
+    let who = s.create_identity("w").expect("a key");
+    for i in 0..400 {
+        s.contribute(&who, Body::Claim { statement: format!("c{i}"), tags: vec![] }).expect("adds");
+    }
+    let before = s.graph().topo_order();
+    assert_eq!(Store::open(&dir).expect("valid").graph().topo_order(), before);
+    // The listing order, as readdir gives it.
+    let mut listed = Vec::new();
+    for shard in std::fs::read_dir(dir.join("objects")).expect("objects") {
+        let shard = shard.expect("entry").path();
+        for f in std::fs::read_dir(&shard).expect("shard") {
+            listed.push(f.expect("entry").path());
+        }
+    }
+    // Damage every fifth object, from the end of the listing back.
+    let damaged: Vec<_> = listed.iter().rev().step_by(5).cloned().collect();
+    for path in &damaged {
+        std::fs::write(path, b"not cbor").expect("damaged");
+    }
+    let first = listed.iter().find(|p| damaged.contains(p)).expect("one damaged").clone();
+    match Store::open(&dir) {
+        Err(StoreError::Corrupt { path, .. }) => assert_eq!(path, first, "the first damaged in listing order"),
+        Err(other) => panic!("expected Corrupt, got {other:?}"),
+        Ok(_) => panic!("opened a damaged replica"),
+    }
+}
