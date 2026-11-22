@@ -282,3 +282,32 @@ fn an_overwritten_trusted_object_goes_unnoticed_where_store_open_catches_it() {
     let opened = Store::open_trusting(&dir, trusted).expect("the trusting open doesn't");
     assert_same(opened.graph(), &g);
 }
+
+/// `Store::open_trusting_with` (task `7a3d17f979c3`): the loader runs once, after the listing, with the
+/// Ground's id and a membership test that names exactly the listed objects; what it returns is trusted
+/// as `open_trusting` trusts it, and an empty list is the full open.
+#[test]
+fn open_trusting_with_hands_the_loader_the_listing() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let dir = tmp.path().join("g");
+    let (store, _) = replica(&dir, 11, 60);
+    let g = Store::open(&dir).expect("valid").graph().clone();
+    let all = closed(&g, &g.heads().collect::<Vec<_>>());
+    let ground = store.info().ground;
+    let gone = all.last().expect("some").id();
+    fs::remove_file(object(&dir, &gone)).expect("removed");
+    let mut calls = 0;
+    let opened = Store::open_trusting_with(&dir, |g_id, on_disk| {
+        calls += 1;
+        assert_eq!(g_id, ground);
+        assert!(!on_disk(&gone), "a deleted object isn't listed");
+        assert!(all.iter().filter(|c| c.id() != gone).all(|c| on_disk(&c.id())), "every other object is");
+        all[..all.len() - 1].to_vec()
+    })
+    .expect("fits");
+    assert_eq!(calls, 1);
+    let full = Store::open(&dir).expect("valid");
+    assert_eq!(opened.graph().topo_order(), full.graph().topo_order());
+    let empty = Store::open_trusting_with(&dir, |_, _| Vec::new()).expect("a full open");
+    assert_eq!(empty.graph().topo_order(), full.graph().topo_order());
+}

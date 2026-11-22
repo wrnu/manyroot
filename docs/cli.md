@@ -98,11 +98,22 @@ Every read and write opens the replica through `cache/snapshot` in it (`.bracken
 contributions this replica's readers have already verified, in one file (owner decision `96e282819607`).
 A read lists `objects/`, adds the snapshot's contributions without reading their objects or checking
 them again, and reads and checks only the objects the snapshot lacks, every validity rule as a full open
-checks them (protocol.md, Validity). A command that writes rewrites the snapshot as it ends, so the
-reads after it find nothing new and write nothing; a read rewrites it only when objects arrived another
+checks them (protocol.md, Validity). A command that writes adds to the snapshot as it ends, so the
+reads after it find nothing new and write nothing; a read adds to it only when objects arrived another
 way, such as a git pull. At this repository's size that skips the signature checks and per-file reads
 that are most of a read's cost.
 
+- **Append-only.** The snapshot is a header and then segments, each a batch of contributions with its
+  own checksum. A command that added contributions appends one segment holding just those, so a write
+  costs about its own object's bytes, not the whole Ground's. When the segments after the first outgrow
+  it (and 1 MiB), the next command that writes the snapshot, a read included, rewrites it as one segment.
+- **Bounded reads.** Each entry in the snapshot is framed with its id, length and own hash. The id must
+  name an object `objects/` lists before the entry's encoding is read, and an encoding is at most a
+  contribution's largest size, so a read decodes at most what the replica holds. Encodings are hashed
+  and decoded in parallel, in batches of about 64 MiB, each to a contribution with its framed id. A segment whose framing or checksum doesn't hold (a torn append), an empty one, or one
+  repeating a contribution ends the read there: the contributions after it are read from their objects
+  and checked, and the snapshot is rewritten whole. The read stops at the first contribution naming an
+  object that's gone, reading nothing after it, and the snapshot is set aside for a full check.
 - **The trade.** An object the snapshot holds isn't read again, so if its bytes are overwritten on disk
   later, or made unreadable, a cached read doesn't notice, where a full check refuses the replica. A
   deleted object is noticed, since every read lists `objects/`, and so is one replaced by a link, a
@@ -117,9 +128,11 @@ that are most of a read's cost.
   snapshot; it fails, as a full check does, if any object is damaged or overwritten, and also if an
   `agents/` entry could misname an agent (one not named for its own valid name, or a second name for a key).
 - **On disk.** `cache/` holds a `.gitignore` of `*`, so git never commits it, and nothing is written
-  outside it. The snapshot goes to a temporary file of its own, created fresh (never through a link),
-  then renamed into place. A `cache` that isn't a real directory is never written to. `bracken view`
-  reads through the snapshot but never writes it. The snapshot is never synced: each replica builds its
+  outside it. `cache/` is opened once without following a link, and everything in it is opened relative
+  to it, without following a link or waiting on a FIFO, its type checked on the open file before a byte
+  is read or written. A whole snapshot goes to a temporary file of its own, created fresh, then renamed
+  into place; a segment is appended with one write. A `cache` that isn't a real directory is never read
+  or written: the read is a full check. `bracken view` reads through the snapshot but never writes it. The snapshot is never synced: each replica builds its
   own.
 
 ## The web view

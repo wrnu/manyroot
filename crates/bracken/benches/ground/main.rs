@@ -4,6 +4,7 @@
 //! ```text
 //! cargo bench -p bracken --bench ground -- [--synthetic N] [--mib M] [--copy <replica>] [--reads R]
 //!                                          [--writes W] [--verifies V] [--work <dir>] [--keep] [--json <file>]
+//!                                          [--bracken <binary>]
 //! ```
 //!
 //! With no arguments it builds a small synthetic Ground (2,000 contributions, 4 MiB), quickly. Wave 2 E's
@@ -65,6 +66,9 @@ struct Args {
     /// Keep the Grounds after the run.
     #[arg(long)]
     keep: bool,
+    /// Time this `bracken` binary instead of the one this package builds (main's, say, to compare).
+    #[arg(long, value_name = "BINARY")]
+    bracken: Option<PathBuf>,
     /// Also write the results as JSON here.
     #[arg(long, value_name = "FILE")]
     json: Option<PathBuf>,
@@ -76,7 +80,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.reads > 0 && args.verifies > 0, "--reads and --verifies must be at least 1");
-    let bin = PathBuf::from(env!("CARGO_BIN_EXE_bracken"));
+    let bin = args.bracken.clone().unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_bracken")));
     let work = match &args.work {
         Some(w) => w.clone(),
         None => std::env::temp_dir().join("bracken-scratch").join("ground-bench"),

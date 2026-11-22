@@ -1186,13 +1186,15 @@ fn run_read(s: &Store, agent: Option<&str>, command: Command) -> Result<()> {
             let policy = policy.build(&names)?;
             let g = s.graph();
             let c = g.get(&resolve(s, &id)?).expect("resolved ids exist");
+            // Only the contributions about this one are asked whether they're current, so no view of the
+            // whole graph is built (task 7a3d17f979c3).
+            let view = HiddenOne::new(g);
             if out.json {
-                let view = CurrentView::new(g, &g.topo_order());
                 print_json(&show_json(g, &names, &policy, &view, c, now_ms()));
             } else {
                 let assessment = policy.assess(g, &c.id());
                 let referrers: Vec<&Contribution> = g.referrers(&c.id()).collect();
-                let intents = live_intents(g, &CurrentView::new(g, &g.topo_order()), &c.id(), now_ms());
+                let intents = live_intents(g, &view, &c.id(), now_ms());
                 print_show(g, &names, c, assessment.as_ref(), &referrers);
                 if !intents.is_empty() {
                     println!();
@@ -1990,7 +1992,7 @@ struct Intent<'a> {
 }
 
 /// The live intents on `target`, oldest first.
-fn live_intents<'a>(g: &'a Graph, view: &CurrentView, target: &ContributionId, now: u64) -> Vec<Intent<'a>> {
+fn live_intents<'a>(g: &'a Graph, view: &impl Hidden, target: &ContributionId, now: u64) -> Vec<Intent<'a>> {
     let relations = |kind: RelationKind| {
         g.referrers(target).filter_map(move |r| match r.body() {
             Body::Relation { from, kind: k, to, .. } if *k == kind && to == target => Some((r, *from)),
@@ -1998,7 +2000,7 @@ fn live_intents<'a>(g: &'a Graph, view: &CurrentView, target: &ContributionId, n
         })
     };
     let mut intents: Vec<Intent> = relations(RelationKind::Refines)
-        .filter(|(r, _)| !view.hidden.contains(&r.id()))
+        .filter(|(r, _)| !view.is_hidden(&r.id()))
         .filter_map(|(r, from)| {
             // Current already: a relation that refers to a hidden (retracted, superseded) claim is hidden too.
             let claim = g.get(&from)?;
@@ -2254,6 +2256,61 @@ impl CurrentView {
     }
 }
 
+/// Whether a contribution is hidden from the current view (what `log --current` omits).
+trait Hidden {
+    fn is_hidden(&self, id: &ContributionId) -> bool;
+}
+
+impl Hidden for CurrentView {
+    fn is_hidden(&self, id: &ContributionId) -> bool {
+        self.hidden.contains(id)
+    }
+}
+
+/// [`CurrentView`]'s `hidden`, decided only for the contributions asked about and what they refer to,
+/// remembered as it goes: what `show` needs for one contribution, without a view of the whole graph.
+/// The same rule: retracted, a subject with a supersession that counts, or referring to anything hidden.
+struct HiddenOne<'a> {
+    g: &'a Graph,
+    memo: std::cell::RefCell<HashMap<ContributionId, bool>>,
+}
+
+impl<'a> HiddenOne<'a> {
+    fn new(g: &'a Graph) -> HiddenOne<'a> {
+        HiddenOne { g, memo: Default::default() }
+    }
+}
+
+impl Hidden for HiddenOne<'_> {
+    fn is_hidden(&self, id: &ContributionId) -> bool {
+        let g = self.g;
+        let mut memo = self.memo.borrow_mut();
+        // Depth-first over references (parents, so it ends), deciding each after what it refers to.
+        let mut stack = vec![*id];
+        while let Some(&top) = stack.last() {
+            if memo.contains_key(&top) {
+                stack.pop();
+                continue;
+            }
+            let c = g.get(&top).expect("asked about, or referred to, so in the graph");
+            if g.is_retracted(&top) || (c.body().is_subject() && !open_supersessors(g, &top).is_empty()) {
+                memo.insert(top, true);
+                stack.pop();
+                continue;
+            }
+            let references = c.body().references();
+            if let Some(next) = references.iter().find(|r| !memo.contains_key(r)) {
+                stack.push(*next);
+                continue;
+            }
+            let hidden = references.iter().any(|r| memo[r]);
+            memo.insert(top, hidden);
+            stack.pop();
+        }
+        memo[id]
+    }
+}
+
 /// Syncs with a server and reports the session: what each side refused, and what each received.
 /// Fails if either side refused anything or was left with contributions missing ancestors.
 ///
@@ -2463,7 +2520,7 @@ fn contribution_json(g: &Graph, names: &Names, c: &Contribution) -> Value {
 
 /// `show --json`: the contribution, its assessment, everything referring to it, and its live intents.
 /// `view` is the replica's current view, which a caller answering many requests works out once.
-fn show_json(g: &Graph, names: &Names, policy: &Policy, view: &CurrentView, c: &Contribution, now: u64) -> Value {
+fn show_json(g: &Graph, names: &Names, policy: &Policy, view: &impl Hidden, c: &Contribution, now: u64) -> Value {
     let mut v = contribution_json(g, names, c);
     v["assessment"] = json!(policy.assess(g, &c.id()));
     v["referrers"] = g.referrers(&c.id()).map(|r| contribution_json(g, names, r)).collect();
@@ -2608,6 +2665,68 @@ fn print_json(v: &impl serde::Serialize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `show`'s one-contribution answer against the whole view, the oracle (task `7a3d17f979c3`): on
+    /// random graphs with retractions, supersessions by the author and by others, and relations and
+    /// evidence about superseded and retracted work, every contribution is hidden exactly when
+    /// `CurrentView` hides it, asked in any order, with a fresh memo or a shared one.
+    #[test]
+    fn hidden_one_agrees_with_the_current_view() {
+        let ground: GroundId = "0".repeat(64).parse().expect("a test ground");
+        let people: Vec<Identity> = (0..3).map(|i| Identity::generate(&format!("p{i}")).expect("a key")).collect();
+        for seed in 1..=12u64 {
+            let mut rng = seed;
+            let mut next = |n: usize| {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((rng >> 33) as usize) % n.max(1)
+            };
+            let mut g = Graph::new(ground);
+            let mut ids: Vec<ContributionId> = Vec::new();
+            for t in 0..300u64 {
+                let who = &people[next(people.len())];
+                let pick = |n: usize| ids[ids.len() - 1 - n % ids.len().min(40)];
+                let body = match (ids.len(), next(10)) {
+                    (0..=1, _) | (_, 0..=2) => Body::Claim { statement: format!("c{t}"), tags: vec![] },
+                    (_, 3) => Body::Evidence {
+                        target: pick(next(1000)),
+                        verdict: Verdict::Pass,
+                        method: "m".into(),
+                        details: String::new(),
+                    },
+                    (_, 4..=7) => {
+                        let (from, to) = (pick(next(1000)), pick(next(1000)));
+                        if from == to {
+                            continue;
+                        }
+                        let kind = [RelationKind::Supersedes, RelationKind::Refines, RelationKind::Implements][next(3)];
+                        Body::Relation { from, kind, to, note: String::new() }
+                    }
+                    _ => {
+                        let own: Vec<_> =
+                            ids.iter().filter(|id| g.get(id).expect("present").author() == who.agent_id()).collect();
+                        if own.is_empty() {
+                            continue;
+                        }
+                        Body::Retract { target: *own[next(own.len())], reason: String::new() }
+                    }
+                };
+                let heads: Vec<ContributionId> = g.heads().collect();
+                let c = Contribution::create(ground, who, heads, t, body);
+                ids.push(c.id());
+                g.insert(c).expect("valid");
+            }
+            let view = CurrentView::new(&g, &g.topo_order());
+            assert!(!view.hidden.is_empty(), "seed {seed}: the test hides something");
+            let shared = HiddenOne::new(&g);
+            let mut order = ids.clone();
+            order.reverse();
+            for id in &order {
+                let want = view.hidden.contains(id);
+                assert_eq!(shared.is_hidden(id), want, "seed {seed}, {id}");
+                assert_eq!(HiddenOne::new(&g).is_hidden(id), want, "seed {seed}, {id}, fresh");
+            }
+        }
+    }
 
     /// Finding `7ae8094d7f55`: W works blocked on one need, and R relations saying one contribution
     /// implements it. Each standing used to assess that contribution once per relation, every assessment
