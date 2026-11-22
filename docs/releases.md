@@ -78,6 +78,12 @@ Each protocol or storage change adds an entry here: what changed, whether existi
 
 The protocol guard (`crates/manyroot/tests/protocol_guard.rs`, see "Protocol guard" in [protocol.md](protocol.md)) fails on changes to what it pins (listed there). Updating its pinned values or rebuilding its fixture Ground is part of the protocol change, never a way to make the tests pass: it needs the same review and go (the manager's, logged as `owner-review`), and the entry here names the fixture that keeps the old format.
 
+### 2026-11-22: the snapshot's entries carry their id and hash, decoded in parallel (task 7a3d17f979c3, store-perf-3)
+
+What changed: the snapshot cache moves from `BKSNAP2` to `BKSNAP3`. Each entry is now framed with its id, its encoding's length and its own blake3 hash, and the segment checksum covers that framing. So a read checks every id against `objects/` before it reads the encoding, and hashes and decodes encodings in parallel, in batches of about 64 MiB. Every encoding is still decoded by `Contribution::decode`, which enforces the single canonical encoding, and its id must match the framed one. `bracken show` no longer builds the current view of the whole Ground; it decides only for the contributions it prints (`HiddenOne`, tested against `CurrentView`). No protocol change; objects, `ground.json` and `agents/` are untouched.
+
+Upgrade: as with `BKSNAP2` below, the **first command on each replica after the upgrade does one full check** and rewrites the snapshot as `BKSNAP3`. An older binary on the same replica, `BKSNAP2` or `BKSNAP1`, stays correct: each binary refuses the others' versions and falls back to its own full check, so every switch between versions costs one full check and nothing else. Upgrade the pinned binary after the merge (crates/bracken changed).
+
 ### 2026-11-22: the verified snapshot appends segments (task 7a3d17f979c3, PR #56)
 
 What changed: `.bracken/cache/snapshot`, the replica's own derived cache (decision `96e282819607`), never committed or synced, moves from one whole-file encoding (`BKSNAP1`) to a header and checksummed segments (`BKSNAP2`), appended per write and compacted when the tail outgrows the first segment (docs/cli.md, The verified snapshot). No protocol change: no encoding, id, signing, validity, bundle or sync format, vector or fixture changes. Objects, `ground.json` and `agents/` are untouched. `manyroot` gains `Store::open_trusting_with`; `Store::open_trusting` behaves as before.

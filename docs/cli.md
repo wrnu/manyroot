@@ -107,9 +107,10 @@ that are most of a read's cost.
   own checksum. A command that added contributions appends one segment holding just those, so a write
   costs about its own object's bytes, not the whole Ground's. When the segments after the first outgrow
   it (and 1 MiB), the next command that writes the snapshot, a read included, rewrites it as one segment.
-- **Bounded reads.** The snapshot is read one contribution at a time, each at most a contribution's
-  largest size, and every one must name an object `objects/` lists, so a read decodes at most what the
-  replica holds. A segment whose framing or checksum doesn't hold (a torn append), an empty one, or one
+- **Bounded reads.** Each entry in the snapshot is framed with its id, length and own hash. The id must
+  name an object `objects/` lists before the entry's encoding is read, and an encoding is at most a
+  contribution's largest size, so a read decodes at most what the replica holds. Encodings are hashed
+  and decoded in parallel, in batches of about 64 MiB, each to a contribution with its framed id. A segment whose framing or checksum doesn't hold (a torn append), an empty one, or one
   repeating a contribution ends the read there: the contributions after it are read from their objects
   and checked, and the snapshot is rewritten whole. The read stops at the first contribution naming an
   object that's gone, reading nothing after it, and the snapshot is set aside for a full check.
