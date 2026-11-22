@@ -264,11 +264,13 @@ main=$(dirname "$(git -C "$here" rev-parse --path-format=absolute --git-common-d
 # snapshot); only these, never the tests it runs (finding 607273d1d193).
 bk() { BK_PULL=required BRACKEN_FULL_CHECK=1 BRACKEN_AGENT=${agent:-manager} "$here/bk" "$@"; }
 bk heads >/dev/null || fail "can't pull from the team server, so the gate won't decide on a replica that may be behind"
+# Who triages findings and defers them (check 3).
+triager=manager
 # Every other read the checks need, up front in one bk: one more pull, one full check, one state of the Ground.
 reads=$(bk_reads "$(req log --tag experiment --current --json)" \
   "$(req log --tag decision --current --json)" \
   "$(req show "$claim" ${policy[@]+"${policy[@]}"} --min-passes "$min_passes" --json)" \
-  "$(req log --tag pr --current --json)" "$(req findings "$claim" --triager manager --json)" \
+  "$(req log --tag pr --current --json)" "$(req findings "$claim" --triager "$triager" --json)" \
   "$(req log --tag owner-review --current --json)" "$(req log --tag approval --current --json)") ||
   fail "can't pull from the team server, so the gate won't decide on a replica that may be behind"
 if [ -f "$main/.bracken-team" ]; then
@@ -401,7 +403,6 @@ fi
 # isn't retracted and whose link still counts (live, or retracted by someone other than the finding's
 # author and the triager), each triaged from the triager's live evidence. Untriaged and confirmed
 # findings block; a confirmed one deferred to a current task of the triager's doesn't.
-triager=manager
 found=$(nth 5) ||
   fail "couldn't read the findings against $full, so the findings check can't decide"
 # The read's shape first, in one jq: a jq error inside the for lists below would go unnoticed, since
