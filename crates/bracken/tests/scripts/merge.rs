@@ -1323,3 +1323,23 @@ fn merge_counts_another_writers_supersede_only_from_manager_or_owner() {
         assert!(check_line(&out, "frozen").starts_with("ok"), "{scripts}: the owner-review: {}", text(&out));
     }
 }
+
+/// gate-replay replays only scripts main has run: an --old that isn't origin/main or an ancestor of it is
+/// refused before anything runs (security note on PR #58), and so is an identity other than manager.
+#[test]
+fn gate_replay_refuses_an_old_ref_main_never_ran() {
+    let replay = repo_root().join("scripts/gate-replay");
+    let (tmp, dir) = repo(&[("scripts/gate-replay", &replay)], "", |_| {});
+    let forge = tmp.path().join("forge.git");
+    git_ok(&dir, &["init", "-q", "--bare", forge.to_str().unwrap()]);
+    git_ok(&dir, &["push", "-q", forge.to_str().unwrap(), "main"]);
+    git_ok(&dir, &["remote", "add", "origin", forge.to_str().unwrap()]);
+    git_ok(&dir, &["switch", "-qc", "side"]);
+    git_ok(&dir, &["commit", "-q", "--allow-empty", "-m", "never on main"]);
+    let out = command(&dir, "scripts/gate-replay", &["--old", "side"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("isn't origin/main or an ancestor of it"), "{}", text(&out));
+    let out = command(&dir, "scripts/gate-replay", &[]).env("BRACKEN_AGENT", "builder").output().unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(text(&out).contains("runs only as manager"), "{}", text(&out));
+}
