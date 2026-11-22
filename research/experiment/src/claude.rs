@@ -67,30 +67,52 @@ impl Subscription {
     /// The token in `path` (`--claude-token-file`): one line, the token alone, in a file only its owner may read.
     /// Read once, into memory; nothing writes the file. Errors never quote it.
     pub fn from_file(path: &Path) -> Result<Subscription, String> {
-        use std::os::unix::fs::MetadataExt;
+        use std::io::Read;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let shown = path.display();
-        let meta = std::fs::metadata(path).map_err(|e| format!("reading {shown}: {e}"))?;
+        // Opened once, never through a symbolic link, never waiting on a FIFO, and checked by what was opened, so
+        // nothing swapped in between a check and the read passes (finding 46569298796f).
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::NONBLOCK | rustix::fs::OFlags::CLOEXEC;
+        let file =
+            std::fs::OpenOptions::new().read(true).custom_flags(flags.bits() as i32).open(path).map_err(|e| match e
+                .raw_os_error()
+            {
+                Some(code) if code == rustix::io::Errno::LOOP.raw_os_error() => {
+                    format!("{shown} is a symbolic link: give the token file itself")
+                }
+                _ => format!("reading {shown}: {e}"),
+            })?;
+        let meta = file.metadata().map_err(|e| format!("reading {shown}: {e}"))?;
         if !meta.is_file() {
             return Err(format!("{shown} isn't a file"));
         }
         if meta.mode() & 0o077 != 0 {
             return Err(format!("{shown} may be read by others than its owner: chmod 600 it"));
         }
+        let too_long = || format!("{shown} is over {MAX_TOKEN_FILE} bytes, too long to hold a token alone");
         if meta.len() > MAX_TOKEN_FILE {
-            return Err(format!("{shown} is over {MAX_TOKEN_FILE} bytes, too long to hold a token alone"));
+            return Err(too_long());
         }
-        let bytes = std::fs::read(path).map_err(|e| format!("reading {shown}: {e}"))?;
+        // At most one byte past the bound, whatever the file grows to as it's read.
+        let mut bytes = Vec::new();
+        file.take(MAX_TOKEN_FILE + 1).read_to_end(&mut bytes).map_err(|e| format!("reading {shown}: {e}"))?;
+        if bytes.len() as u64 > MAX_TOKEN_FILE {
+            return Err(too_long());
+        }
         let text = String::from_utf8(bytes).map_err(|_| format!("{shown} isn't text"))?;
         Subscription::new(text.trim().to_string()).map_err(|e| format!("{shown}: {e}"))
     }
 
-    /// A token as given: printable ASCII without spaces, at least [`MIN_TOKEN`] bytes. Errors never quote it.
+    /// A token as given: at least [`MIN_TOKEN`] bytes, each of A-Z, a-z, 0-9 and `._+/=-`, so JSON writes it as it is
+    /// and the transcript check finds it as it is (finding de508082cfc6). Errors never quote it.
     pub fn new(token: String) -> Result<Subscription, String> {
         if token.len() < MIN_TOKEN {
             return Err(format!("the token is under {MIN_TOKEN} bytes"));
         }
-        if !token.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err("the token holds something other than printable ASCII without spaces: give it alone".into());
+        if !token.bytes().all(|b| b.is_ascii_alphanumeric() || b"._+/=-".contains(&b)) {
+            return Err("the token holds a character outside A-Z, a-z, 0-9 and ._+/=-, so the run can't check \
+                        transcripts for it: give it alone"
+                .into());
         }
         Ok(Subscription { token })
     }

@@ -615,11 +615,23 @@ fn a_subscription_token_is_read_from_a_private_file_and_never_shown() {
         ("short", "sk-short".to_string(), 0o600, "under 20 bytes"),
         ("empty", String::new(), 0o600, "under 20 bytes"),
         ("long", FAKE_TOKEN.repeat(200), 0o600, "too long"),
+        // JSON escapes these, so the transcript check couldn't find them as given (finding de508082cfc6).
+        ("quote", format!("{FAKE_TOKEN}\"x"), 0o600, "outside A-Z"),
+        ("backslash", format!("{FAKE_TOKEN}\\x"), 0o600, "outside A-Z"),
     ] {
         let err = Subscription::from_file(&write(name, &text, mode)).expect_err(name);
         assert!(err.contains(says), "{name}: {err}");
         assert!(!err.contains(FAKE_TOKEN) && !err.contains("sk-short"), "{name}: {err}");
     }
+    // Never through a symbolic link, though it leads to a good file (finding 46569298796f); nor a directory.
+    let link = tmp.path().join("link");
+    std::os::unix::fs::symlink(tmp.path().join("ok"), &link).expect("a link");
+    let err = Subscription::from_file(&link).expect_err("a link");
+    assert!(err.contains("symbolic link"), "{err}");
+    let dir = tmp.path().join("dir");
+    std::fs::create_dir(&dir).expect("a directory");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert!(Subscription::from_file(&dir).expect_err("a directory").contains("isn't a file"));
     let missing = Subscription::from_file(&tmp.path().join("missing")).expect_err("no file");
     assert!(missing.contains("missing"), "{missing}");
 }

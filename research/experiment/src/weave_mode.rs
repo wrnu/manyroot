@@ -929,7 +929,18 @@ impl WeaveStore {
     fn set_base(&mut self, id: &str) -> Result<(), String> {
         self.git(&["tag", "-f", "base"])?;
         self.save("base.txt", id)?;
+        self.clear_marks()?;
         self.clear_merge()
+    }
+
+    /// Forgets every path `resolve` wrote markers into: once the tree is replaced or committed, its files are no
+    /// longer what markers wrote, and resolve must never put back what the agent wrote since (finding 1d415d498eb4).
+    fn clear_marks(&self) -> Result<(), String> {
+        let path = self.config.dir.join("marked.json");
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| format!("removing marked.json: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Forgets a merge of the heads: its heads and its conflicted paths.
@@ -1453,6 +1464,7 @@ impl WeaveStore {
             }
         };
         self.git(&["commit", "-q", "--no-verify", "-m", "proposed"])?;
+        self.clear_marks()?;
         Ok(json!({"proposal": out["proposal"], "base": out["base"], "files": out["files"]}))
     }
 
@@ -1594,6 +1606,7 @@ impl WeaveStore {
         // No earlier merge of these heads may vouch for this one's conflicts while they're written: merge.txt
         // goes first and comes back last, after conflicts.txt (finding 1f85d3eb08d1).
         self.clear_merge()?;
+        self.clear_marks()?;
         // The merged files over the tree's own commit, unstaged: edits not yet proposed.
         let applied = self.git(&["read-tree", "--reset", "-u", &tree]).and_then(|_| self.git(&["reset", "-q"]));
         if let Err(e) = applied {
@@ -1714,7 +1727,7 @@ impl WeaveStore {
         argv.extend(["--".into(), path.into()]);
         let out = self.bracken(&argv)?;
         let mut v: Value = serde_json::from_slice(&out).map_err(|e| format!("bracken printed bad JSON: {e}"))?;
-        if self.unmark(path)? {
+        if self.unmark(path, take == "tree")? {
             v["note"] = json!(format!(
                 "Your working tree's {} is back as it was before markers: the resolution holds what you settled.",
                 short(path)
@@ -1723,12 +1736,24 @@ impl WeaveStore {
         Ok(v)
     }
 
-    /// The paths `resolve` wrote markers into ([`WeaveStore::mark`]), not yet resolved: a JSON array.
-    fn marked(&self) -> Vec<String> {
+    /// The paths `resolve` wrote markers into ([`WeaveStore::mark`]), not yet resolved, each with the blake3 of
+    /// what it wrote: a JSON array of pairs.
+    fn marked(&self) -> Vec<(String, String)> {
         std::fs::read_to_string(self.config.dir.join("marked.json"))
             .ok()
             .and_then(|t| serde_json::from_str(&t).ok())
             .unwrap_or_default()
+    }
+
+    fn save_marked(&self, all: &[(String, String)]) -> Result<(), String> {
+        self.save("marked.json", &json!(all).to_string())
+    }
+
+    /// Whether the working tree's `path` is still exactly what markers wrote there.
+    fn still_marked(&self, path: &str) -> Result<bool, String> {
+        let Some((_, hash)) = self.marked().into_iter().find(|(p, _)| p == path) else { return Ok(false) };
+        let file = self.file(path)?;
+        Ok(std::fs::read(&file).is_ok_and(|b| blake3::hash(&b).to_hex().as_str() == hash))
     }
 
     /// The three-way marked merge of the conflict at `path` that integrating `proposals` stops at, as bracken
@@ -1785,7 +1810,8 @@ impl WeaveStore {
     fn mark(&mut self, proposals: &[String], path: &str) -> Result<Value, String> {
         let file = self.file(path)?;
         let status = self.git(&["status", "--porcelain", "--untracked-files=all", "--", path])?;
-        if !status.is_empty() && !self.marked().iter().any(|m| m == path) {
+        // Edits there are the agent's, unless the file is exactly what markers last wrote (finding 1d415d498eb4).
+        if !status.is_empty() && !self.still_marked(path)? {
             return Err(format!(
                 "you have edits to {} not yet proposed: propose them first, or resolve with take tree to give them",
                 short(path)
@@ -1799,11 +1825,9 @@ impl WeaveStore {
             std::fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
         }
         std::fs::write(&file, &marked).map_err(|e| format!("writing {}: {e}", short(path)))?;
-        let mut all = self.marked();
-        if !all.iter().any(|m| m == path) {
-            all.push(path.to_string());
-        }
-        self.save("marked.json", &Value::from(all).to_string())?;
+        let mut all: Vec<(String, String)> = self.marked().into_iter().filter(|(p, _)| p != path).collect();
+        all.push((path.to_string(), blake3::hash(marked.as_bytes()).to_hex().to_string()));
+        self.save_marked(&all)?;
         Ok(json!({
             "path": path,
             "regions": regions,
@@ -1817,11 +1841,18 @@ impl WeaveStore {
         }))
     }
 
-    /// If `resolve` wrote markers into `path`, puts the working tree's file back as its last commit has it, and
-    /// forgets it: whether it did.
-    fn unmark(&mut self, path: &str) -> Result<bool, String> {
+    /// If `resolve` wrote markers into `path` since the tree was last replaced or committed, puts the working tree's
+    /// file back as its last commit has it, and forgets it: whether it did. Only `tree`'s resolution, which takes the
+    /// file as edited, or a file still exactly as markers wrote it, is put back; any other edit there is the agent's
+    /// and stays (finding 1d415d498eb4).
+    fn unmark(&mut self, path: &str, took_tree: bool) -> Result<bool, String> {
         let mut all = self.marked();
-        let Some(k) = all.iter().position(|m| m == path) else { return Ok(false) };
+        let Some(k) = all.iter().position(|(p, _)| p == path) else { return Ok(false) };
+        if !took_tree && !self.still_marked(path)? {
+            all.remove(k);
+            self.save_marked(&all)?;
+            return Ok(false);
+        }
         let tracked = self.git_output(&["cat-file", "-e", &format!("HEAD:{path}")])?.status.success();
         if tracked {
             self.git(&["checkout", "-q", "HEAD", "--", path])?;
@@ -1832,7 +1863,7 @@ impl WeaveStore {
             }
         }
         all.remove(k);
-        self.save("marked.json", &Value::from(all).to_string())?;
+        self.save_marked(&all)?;
         Ok(true)
     }
 

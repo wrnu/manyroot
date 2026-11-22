@@ -369,6 +369,62 @@ fn a_conflict_shows_three_sides_and_a_mixed_resolution_goes_through_the_tree() {
     assert!(err.expect_err("edits there").contains("not yet proposed"));
 }
 
+/// Markers never cost the agent an edit it hasn't proposed (finding 1d415d498eb4): once it edits a marked file
+/// itself, resolving another way leaves the edit, and markers are refused over it; and once the tree is committed
+/// or replaced, the old mark is gone.
+#[test]
+fn markers_never_put_back_an_edit_the_agent_made() {
+    let mut s = Stores::new(&["agent-0", "agent-1"]);
+    let path = "tiny/stats.py";
+    let line = std::fs::read_to_string(s.trees[0].join(path))
+        .expect("stats")
+        .lines()
+        .find(|l| l.contains("return"))
+        .expect("return")
+        .to_string();
+    let mut proposals = Vec::new();
+    for i in 0..2 {
+        s.ok(i, "edit_file", json!({"path": path, "old": line, "new": format!("{line}  # agent {i}")}));
+        let p = s.ok(i, "propose", json!({"summary": format!("agent {i}'s edit")}));
+        proposals.push(p["proposal"].as_str().expect("a proposal").to_string());
+        s.sync(i);
+    }
+    s.sync(0);
+    s.ok(0, "integrate", json!({"proposals": [proposals[0]], "note": "the first"}));
+    let resolve = |take: &str| json!({"proposals": [proposals[1]], "path": path, "take": take});
+    s.ok(0, "resolve", resolve("markers"));
+    let mine = "def mean(numbers):\n    return 0  # the agent's own\n";
+    s.ok(0, "write_file", json!({"path": path, "text": mine}));
+    let err = s.tool(0, "resolve", resolve("markers")).expect_err("the agent's edit is there now");
+    assert!(err.contains("not yet proposed"), "{err}");
+    let into = s.ok(0, "resolve", resolve("into"));
+    assert!(into["note"].is_null(), "nothing put back: {into}");
+    assert_eq!(std::fs::read_to_string(s.trees[0].join(path)).expect("kept"), mine, "the agent's edit stays");
+
+    // Marked, then committed by a proposal: the mark is gone, so a later edit there is the agent's own.
+    let s2 = &mut Stores::new(&["agent-0", "agent-1"]);
+    let mut ps = Vec::new();
+    for i in 0..2 {
+        s2.ok(i, "edit_file", json!({"path": path, "old": line, "new": format!("{line}  # agent {i}")}));
+        let p = s2.ok(i, "propose", json!({"summary": format!("agent {i}'s edit")}));
+        ps.push(p["proposal"].as_str().expect("a proposal").to_string());
+        s2.sync(i);
+    }
+    s2.sync(0);
+    s2.ok(0, "integrate", json!({"proposals": [ps[0]], "note": "the first"}));
+    let resolve = |take: &str| json!({"proposals": [ps[1]], "path": path, "take": take});
+    s2.ok(0, "resolve", resolve("markers"));
+    s2.ok(0, "write_file", json!({"path": path, "text": "def mean(numbers):\n    return 1\n"}));
+    s2.ok(0, "propose", json!({"summary": "the agent's own"}));
+    let later = "def mean(numbers):\n    return 2  # not yet proposed\n";
+    s2.ok(0, "write_file", json!({"path": path, "text": later}));
+    let err = s2.tool(0, "resolve", resolve("markers")).expect_err("the later edit is the agent's");
+    assert!(err.contains("not yet proposed"), "{err}");
+    let into = s2.ok(0, "resolve", resolve("into"));
+    assert!(into["note"].is_null(), "{into}");
+    assert_eq!(std::fs::read_to_string(s2.trees[0].join(path)).expect("kept"), later);
+}
+
 /// Two integrations that meet fork the line. Recording a tree is refused on a forked line until it is the
 /// merge of every head, and for a tree that didn't start from the line's head: either would drop work
 /// (finding 9f4e48c4c547). The merge keeps both heads' files, leaves the file both changed marked until it is

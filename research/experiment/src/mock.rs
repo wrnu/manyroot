@@ -82,10 +82,15 @@ pub struct MockBackend {
     /// A project run's `(agent, turn)` that also breaks the package's import ([`BREAK_LINE`]), so main breaks once
     /// it is integrated.
     pub breaks: Option<(usize, u32)>,
+    /// What it appends to break it: [`BREAK_LINE`] unless given, such as [`EXIT_LINE`].
+    pub break_line: &'static str,
 }
 
 /// The line an agent that breaks main appends to its package's `__init__.py`, and its integrator takes out.
 pub const BREAK_LINE: &str = "raise ImportError(\"broken on purpose\")\n";
+
+/// A break the public tests can't report on: the import ends the test runner's process before it says anything.
+pub const EXIT_LINE: &str = "import os; os._exit(3)  # broken on purpose\n";
 
 /// The name the mock's agents call that the shim doesn't offer: the one e3wb's agent made up.
 pub const UNKNOWN_TOOL: &str = "mcp__experiment__give_up_item";
@@ -106,6 +111,7 @@ impl Default for MockBackend {
             unknown: crate::backend::UnknownCalls::default(),
             hinted: std::sync::Mutex::new(Vec::new()),
             breaks: None,
+            break_line: BREAK_LINE,
         }
     }
 }
@@ -393,12 +399,13 @@ impl MockBackend {
         let has = |tool: &str| tools["tools"].as_array().is_some_and(|t| t.iter().any(|t| t["name"] == tool));
         let notes = c.tool("notes_read", json!({}))?;
         let noted = notes["notes"].as_str().unwrap_or_default().to_string();
-        let breaks = self.breaks == Some((agent, turn));
+        let breaks = (self.breaks == Some((agent, turn))).then_some(self.break_line);
+        let mended = self.break_line;
         if has("request_integration") {
-            return git_project_turn(c, agent, turn, self.integrator, &noted, breaks);
+            return git_project_turn(c, agent, turn, self.integrator, &noted, (breaks, mended));
         }
         if has("propose") {
-            return weave_turn(c, agent, turn, self.integrator, &noted, breaks);
+            return weave_turn(c, agent, turn, self.integrator, &noted, (breaks, mended));
         }
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
         if has("replace") && !has("pr_open") {
@@ -533,7 +540,7 @@ fn weave_turn(
     turn: u32,
     integrator: Option<usize>,
     notes: &str,
-    breaks: bool,
+    (breaks, mended): (Option<&str>, &str),
 ) -> Result<(), String> {
     let task = read_task(c, agent, turn)?;
     let took = take_an_item(c, agent, &task, integrator, notes)?;
@@ -579,11 +586,13 @@ fn weave_turn(
     match c.tool("integrate", integrate.clone()) {
         Ok(done) if done["main_tests"]["broken"] == true => {
             // Main broke: integrating more is refused until it is repaired, through the agent's own tree.
-            refused_while_broken(c.tool("integrate", integrate))?;
+            let refused = refused_while_broken(&done["main_tests"], c.tool("integrate", integrate))?;
             c.tool("update", json!({}))?;
-            unbreak(c)?;
-            let repaired = c.tool("integrate", json!({"note": format!("agent {agent} repairs main")}))?;
-            sound_again(&repaired)?;
+            if refused && holds_break(c, mended)? {
+                unbreak(c, mended)?;
+                let repaired = c.tool("integrate", json!({"note": format!("agent {agent} repairs main")}))?;
+                sound_again(&repaired)?;
+            }
         }
         Ok(_) => {
             c.tool("update", json!({}))?;
@@ -603,7 +612,7 @@ fn git_project_turn(
     turn: u32,
     integrator: Option<usize>,
     notes: &str,
-    breaks: bool,
+    (breaks, mended): (Option<&str>, &str),
 ) -> Result<(), String> {
     let task = read_task(c, agent, turn)?;
     let took = take_an_item(c, agent, &task, integrator, notes)?;
@@ -619,7 +628,21 @@ fn git_project_turn(
         c.tool("switch", json!({"branch": branch, "create": true}))?;
     }
     let module = write_own_module(c, agent, turn, breaks)?;
-    c.tool("commit", json!({"message": format!("agent {agent}'s module of turn {turn}")}))?;
+    let committed = c.tool("commit", json!({"message": format!("agent {agent}'s module of turn {turn}")}))?;
+    if committed["main_tests"]["broken"] == true {
+        // Its own commit broke its main: every commit on main is tested, as every Weave integration is. Merging an
+        // open request is then refused until it is repaired.
+        let open = c.tool("requests", json!({}))?;
+        let mut refused = true;
+        if let Some(r) = open["requests"].as_array().and_then(|r| r.first()) {
+            refused = refused_while_broken(&committed["main_tests"], c.tool("merge", json!({"ref": r["branch"]})))?;
+        }
+        if refused && holds_break(c, mended)? {
+            unbreak(c, mended)?;
+            let repaired = c.tool("commit", json!({"message": format!("agent {agent} repairs main")}))?;
+            sound_again(&repaired)?;
+        }
+    }
     let diff = c.tool("diff", json!({"against": "origin/main"}))?;
     if !diff["files"].as_array().is_some_and(|f| f.iter().any(|f| f["path"] == module.as_str())) {
         return Err(format!("the diff against origin/main leaves out {module}: {diff}"));
@@ -646,10 +669,13 @@ fn git_project_turn(
             }
             if merged["main_tests"]["broken"] == true {
                 // Main broke: merging more is refused until it is repaired, on main itself.
-                refused_while_broken(c.tool("merge", json!({"ref": r["branch"]})))?;
-                unbreak(c)?;
-                let repaired = c.tool("commit", json!({"message": format!("agent {agent} repairs main")}))?;
-                sound_again(&repaired)?;
+                let refused =
+                    refused_while_broken(&merged["main_tests"], c.tool("merge", json!({"ref": r["branch"]})))?;
+                if refused && holds_break(c, mended)? {
+                    unbreak(c, mended)?;
+                    let repaired = c.tool("commit", json!({"message": format!("agent {agent} repairs main")}))?;
+                    sound_again(&repaired)?;
+                }
             }
         }
     }
@@ -668,28 +694,45 @@ fn git_project_turn(
     Ok(())
 }
 
-/// An integration tried while main is broken must be refused as such.
-fn refused_while_broken(tried: Result<Value, String>) -> Result<(), String> {
+/// An integration tried while main is broken, as `report` said, must be refused as such: whether it was. Only where
+/// `report` said main was untested may it go through instead, once the driver's retest shows main sound (the run
+/// that didn't report may have been slow, not broken): then there's nothing to repair.
+fn refused_while_broken(report: &Value, tried: Result<Value, String>) -> Result<bool, String> {
     match tried {
-        Err(e) if e.contains("main is broken") && e.contains("Repair it before you integrate anything else") => Ok(()),
+        Err(e) if e.contains("main is broken") && e.contains("Repair it before you integrate anything else") => {
+            Ok(true)
+        }
+        Ok(v) if report["untested"].is_string() && v["main_tests"]["broken"] == false => Ok(false),
         other => Err(format!("an integration onto a broken main wasn't refused as such: {other:?}")),
     }
 }
 
-/// Takes [`BREAK_LINE`] out of the working tree's package, and runs the public tests.
-fn unbreak(c: &mut Client) -> Result<(), String> {
+/// Whether the working tree's package holds the break `line`: a main reported broken without it was only reported
+/// untested by a slow run, with nothing to repair.
+fn holds_break(c: &mut Client, line: &str) -> Result<bool, String> {
     let init = package_init(c)?;
-    c.tool("edit_file", json!({"path": init, "old": BREAK_LINE, "new": ""}))?;
+    let read = c.tool("read_file", json!({"path": init}))?;
+    let text: String =
+        read["text"].as_str().unwrap_or_default().lines().map(|l| format!("{}\n", l.get(7..).unwrap_or(""))).collect();
+    Ok(text.contains(line))
+}
+
+/// Takes the break `line` out of the working tree's package, and runs the public tests.
+fn unbreak(c: &mut Client, line: &str) -> Result<(), String> {
+    let init = package_init(c)?;
+    c.tool("edit_file", json!({"path": init, "old": line, "new": ""}))?;
     let tests = c.tool("run_tests", json!({}))?;
-    if tests["errors"] != 0 || tests["failed"] != 0 {
+    if tests["reported"] == true && (tests["errors"] != 0 || tests["failed"] != 0) {
         return Err(format!("the repaired tree still fails its public tests: {tests}"));
     }
     Ok(())
 }
 
-/// A repair's integration must report main sound again.
+/// A repair's integration must not report main broken by its tests; a run too slow to report leaves it untested,
+/// which the next integration's retest settles.
 fn sound_again(repaired: &Value) -> Result<(), String> {
-    if repaired["main_tests"]["broken"] != false {
+    let t = &repaired["main_tests"];
+    if t["broken"] != false && !t["untested"].is_string() {
         return Err(format!("the repair didn't report main sound: {repaired}"));
     }
     Ok(())
@@ -709,8 +752,8 @@ fn package_init(c: &mut Client) -> Result<String, String> {
 }
 
 /// Writes the agent's own module of this turn into the package, after looking at its tree, and runs the public
-/// tests: its path. If it `breaks`, it also appends [`BREAK_LINE`] to the package's `__init__.py`.
-fn write_own_module(c: &mut Client, agent: usize, turn: u32, breaks: bool) -> Result<String, String> {
+/// tests: its path. If it `breaks`, it also appends that line to the package's `__init__.py`.
+fn write_own_module(c: &mut Client, agent: usize, turn: u32, breaks: Option<&str>) -> Result<String, String> {
     let files = c.tool("list_files", json!({}))?;
     let init = files["files"]
         .as_array()
@@ -724,7 +767,7 @@ fn write_own_module(c: &mut Client, agent: usize, turn: u32, breaks: bool) -> Re
     let package = init.trim_end_matches("/__init__.py");
     let module = format!("{package}/by_agent_{agent}_turn_{turn}.py");
     c.tool("write_file", json!({"path": module, "text": format!("VALUE = {}\n", turn * 10 + agent as u32)}))?;
-    if breaks {
+    if let Some(line) = breaks {
         let read = c.tool("read_file", json!({"path": init}))?;
         // Each line as read_file numbers it: five places for its number, then two spaces.
         let text: String = read["text"]
@@ -733,7 +776,7 @@ fn write_own_module(c: &mut Client, agent: usize, turn: u32, breaks: bool) -> Re
             .lines()
             .map(|l| format!("{}\n", l.get(7..).unwrap_or("")))
             .collect();
-        c.tool("write_file", json!({"path": init, "text": format!("{text}{BREAK_LINE}")}))?;
+        c.tool("write_file", json!({"path": init, "text": format!("{text}{line}")}))?;
     }
     c.tool("run_tests", json!({}))?;
     Ok(module)
