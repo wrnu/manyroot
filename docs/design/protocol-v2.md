@@ -195,9 +195,10 @@ bytes, 32 bytes, the id algorithm: the agility invariant covers it).
 - **Validity never needs the bytes.** A payload artifact is valid when its
   record is; whether a replica holds the blob is storage, not validity.
   That is what lets validity converge while blobs come and go.
-- **A blob is checked on arrival.** A replica stores or serves a blob only
-  if its BLAKE3 equals `hash` and its length equals `size`; anything else
-  is refused as a blob, which never affects any contribution.
+- **A blob is checked on arrival.** A replica accepts a blob for an
+  artifact only if its BLAKE3 equals the artifact's `hash` and its length
+  equals `size`; anything else is refused as a blob, which never affects
+  any contribution. Blobs are received and served per artifact (4.2).
 - **Size.** The record keeps v1's 16 MiB limit. A payload's `size` is at
   most 16 MiB too, and that is a validity rule (5.1, rule 9), so no valid
   record can make a replica expect a larger blob. Payloads over 16 MiB are
@@ -226,23 +227,31 @@ stay valid and replicate as before.
 - **Who counts.** Only the artifact's own author: a request by anyone else
   counts for nothing, under every policy. Erasure by a steward is an open
   question (section 9), not part of this design.
-- **It acts on one artifact, not on a hash.** Blobs are stored by hash, and
-  two artifacts may commit to the same hash (the same public file, or a
-  copy). An erase request erases *that artifact's* payload: the artifact
-  reads "payload erased" with its hash and size, and the replica no longer
-  serves the bytes for it. The replica deletes the blob and refuses to
-  store it again only once **every** non-retracted artifact it holds that
-  commits to that hash has an erase request by its own author. While any
-  other artifact commits to the hash without one, the bytes stay stored
-  and served through that artifact. So nobody can erase bytes another
-  author still publishes.
-- **The cost of that rule.** Anyone who knows a hash can write an artifact
-  committing to it, and so keep the bytes served after their author erased
-  them. That matters only if they can get the bytes: with a random nonce in
-  the bytes (4.3) the hash can't be guessed back, so only someone who
-  already held the bytes can serve them, and a copy they hold can't be
-  recalled anyway. Erasable data without a nonce has no such protection,
-  which is why 4.3 asks for one.
+- **Bytes are held per artifact, not per hash.** Two artifacts may commit
+  to the same hash (the same public file, or a copy). A replica holds a
+  payload's bytes *for an artifact* only if it received them as that
+  artifact's payload: written with it locally, or fetched for it from a peer
+  that held them for it. A replica may store one copy per hash, but it
+  keeps, for each copy, the set of artifacts it holds the bytes for, and it
+  serves the bytes only as the payload of an artifact in that set. **A
+  commitment without possession holds nothing:** an artifact that merely
+  names a hash, written by someone who never had the bytes, gets no bytes
+  from any conforming replica, because none received the bytes for it.
+- **An erase request erases that artifact's payload.** The artifact reads
+  "payload erased" with its hash and size, and leaves the set; the replica
+  no longer serves the bytes for it. When the set is empty the replica
+  deletes the bytes, and it refuses them again for that artifact while the
+  request stands. While another artifact is still in the set, the bytes
+  stay for that artifact only, because the replica received them for it
+  too. So nobody can erase bytes another author holds and publishes, and
+  nobody can block an author's erasure with a bare hash.
+- **The inherent limit.** Anyone who already holds the bytes can publish
+  them again under an artifact of their own, before or after the erasure,
+  and replicas that fetch them for that artifact hold them for it.
+  Erasure removes an author's copy from conforming replicas; it can't
+  remove every copy. A random nonce in the bytes (4.3) makes sure that only
+  someone who really held the bytes can do this, never someone who only
+  guessed them from the hash.
 - **Retraction.** If the request is retracted, the artifact's payload is no
   longer erased: replicas may accept the bytes again from anyone who still
   holds them, and nothing obliges anyone to supply them.
@@ -389,8 +398,8 @@ something refuses it rather than misreading it.
   by its first bytes: a v1 contribution is a map whose first key is the
   text `content`, a v2 one a map whose first key is 0.
 - **Payloads** travel separately from records, between v2 replicas only,
-  with two messages under the `v2` feature: a request for a blob by hash,
-  and replies carrying it in chunks of at most 1 MiB (4.1), whatever the
+  with two messages under the `v2` feature: a request for an artifact's
+  payload, naming the artifact, and replies carrying it in chunks of at most 1 MiB (4.1), whatever the
   peers' `batch_bytes`. Their exact shape is for the freeze. Records sync
   without their blobs, and a replica may fetch blobs lazily.
 
@@ -481,10 +490,13 @@ Pinned in `protocol_guard.rs` next to v1's, which never change; a
   16 MiB blob reaching a peer with the smallest `batch_bytes` (44) in
   chunks; an author's erase request removing the blob and refusing it
   again; another author's request on that artifact counting for nothing;
-  two artifacts by different authors committing to one hash, where one
-  author's request erases only their artifact's payload and the bytes stay
-  served for the other, until both have erased; a retracted request
-  letting the blob back.
+  two artifacts by different authors committing to one hash, both
+  supplied with the bytes, where one author's request erases only their
+  artifact's payload and the bytes stay served for the other, until both
+  have erased; an artifact naming an erased artifact's hash, written
+  without the bytes, getting no bytes and not keeping the erased bytes; a
+  request for an artifact's payload answered only by a peer that holds the
+  bytes for that artifact; a retracted request letting the blob back.
 - **Opt-in.** A v2 contribution with no opt-in in its ancestry refused by a
   v2 replica and listed in `rejected`, and its child refused for a missing
   parent; an opt-in signed by a key other than the configured root not
