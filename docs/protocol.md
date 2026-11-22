@@ -24,6 +24,13 @@ names or validation policy, is a local choice.
 
 Identifiers are byte strings in CBOR and lowercase hex in JSON.
 
+**Algorithm agility.** Two invariants hold across protocol versions. A
+future id algorithm comes with a new `protocol` version *and* a different
+`ContributionId` length, so an id can never be read under the wrong
+algorithm. Every signing context names the protocol version (version 1's is
+`manyroot/v1/contribution:`, below), so a signature made under one version
+can never verify as another's. Version 1 keeps BLAKE3 and Ed25519 as listed.
+
 ## Contributions
 
 A contribution is a CBOR map `{content, signature}`. `content` is:
@@ -91,6 +98,15 @@ A replica adds a contribution only if all of these hold:
 Every rule depends only on the contribution and its parents. Any two replicas
 that hold the parents therefore reach the same verdict, so validity converges
 along with the graph.
+
+**Project rules never affect validity.** The rules above are the only ones
+that decide whether a replica adds a contribution. A project's own rules
+(what types its claims have, who must review what, which checks count, how
+its rules change) decide only how readers interpret the graph: they are
+policies, evaluated by each reader over valid contributions, as in
+Acceptance below. So projects can hold different rules, and change them,
+in one Ground without forking it. Which contributions a replica chooses to
+store is local admission policy (Sync, below), not validity either.
 
 ## Replication
 
@@ -219,6 +235,12 @@ rule required the relation's author to have written `S` instead; see
 [releases.md](releases.md).)
 
 ## Acceptance
+
+This section specifies the **reference policy**: one acceptance policy among
+the policies projects define, and the one `manyroot` implements and the
+protocol guard pins. Replicas need not agree on a policy to interoperate;
+two readers under the same policy and the same graph reach the same
+statuses. Its behaviour is as follows.
 
 A policy has `min_passes` (default 1) and an optional set of `validators`.
 For a subject `X`, evidence *counts* when it targets `X`, is not retracted,
