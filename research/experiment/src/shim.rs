@@ -19,7 +19,10 @@ pub fn run(socket: &Path) -> Result<(), String> {
     });
     let mut from_driver = stream;
     relay(&mut from_driver, &mut std::io::stdout().lock())?;
-    let _ = up.join();
+    // The driver has closed its side: the turn is over, for the harness too. The shim ends now, not once the
+    // harness closes its standard input, so a harness waiting on a reply reads the end of the shim's output
+    // instead of waiting for ever (the driver stops serving a turn at its deadline without a last reply).
+    drop(up);
     Ok(())
 }
 

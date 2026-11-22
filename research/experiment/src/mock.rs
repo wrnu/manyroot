@@ -138,9 +138,14 @@ impl Moves {
     }
 }
 
+/// The longest the mock waits for one reply: past any turn's limit, so a turn the driver stopped serving without a
+/// reply fails instead of waiting for ever.
+const REPLY_LIMIT: std::time::Duration = std::time::Duration::from_secs(3600);
+
 /// A minimal MCP client over newline-delimited JSON-RPC.
 pub struct Client {
-    reader: BufReader<Box<dyn Read + Send>>,
+    /// The driver's lines, read on their own thread so a reply is waited for at most [`REPLY_LIMIT`].
+    lines: std::sync::mpsc::Receiver<std::io::Result<String>>,
     writer: Box<dyn Write + Send>,
     next: u64,
     /// Tool calls made so far.
@@ -150,13 +155,26 @@ pub struct Client {
     /// Text a result carried beyond its first block: a hint naming the tools.
     pub hints: Vec<String>,
     _child: Option<std::process::Child>,
+    /// The driver's socket, where the client is connected to it directly: shut down when the client is dropped,
+    /// since the reading thread holds it open too.
+    socket: Option<UnixStream>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        if let Some(s) = &self.socket {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
 }
 
 impl Client {
     pub fn connect(socket: &Path, shim: Option<&Path>) -> Result<Client, String> {
+        let mut direct = None;
         let (reader, writer, child): (Box<dyn Read + Send>, Box<dyn Write + Send>, _) = match shim {
             None => {
                 let s = UnixStream::connect(socket).map_err(|e| socket_error("connecting to", socket, &e))?;
+                direct = Some(s.try_clone().map_err(|e| e.to_string())?);
                 (Box::new(s.try_clone().map_err(|e| e.to_string())?), Box::new(s), None)
             }
             Some(bin) => {
@@ -175,14 +193,27 @@ impl Client {
                 (Box::new(r), Box::new(w), Some(child))
             }
         };
+        let (send, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(reader);
+            loop {
+                let mut line = String::new();
+                let read = reader.read_line(&mut line).map(|_| line);
+                let ended = !matches!(&read, Ok(l) if !l.is_empty());
+                if send.send(read).is_err() || ended {
+                    return;
+                }
+            }
+        });
         let mut c = Client {
-            reader: BufReader::new(reader),
+            lines,
             writer,
             next: 1,
             calls: 0,
             asked: Vec::new(),
             hints: Vec::new(),
             _child: child,
+            socket: direct,
         };
         c.request(
             "initialize",
@@ -200,8 +231,16 @@ impl Client {
         let id = self.next;
         self.next += 1;
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))?;
-        let mut line = String::new();
-        self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let line = match self.lines.recv_timeout(REPLY_LIMIT) {
+            Ok(Ok(line)) if !line.is_empty() => line,
+            Ok(Ok(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(format!("the driver ended the connection before replying to {method}"));
+            }
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(format!("no reply to {method} within {} s", REPLY_LIMIT.as_secs()));
+            }
+        };
         let reply: Value = serde_json::from_str(&line).map_err(|e| format!("bad reply: {e}"))?;
         if reply["id"] != id {
             return Err("reply out of order".into());

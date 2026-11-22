@@ -178,7 +178,9 @@ mod macos_only {
             git: git_binary().expect("git"),
             trace: false,
             calls_per_turn: CALLS_PER_TURN,
-            turn_limit: TURN_LIMIT,
+            // Every change to an integrator's main runs the public tests in a container, which on a loaded
+            // machine can take minutes each: a turn's limit here is for a stuck turn, not a slow Docker.
+            turn_limit: 3 * TURN_LIMIT,
             plan: PlanInputs {
                 project: Some(ProjectPlan::of(&Project::load(project).expect("the project")).expect("its plan")),
                 python: Some(python),
