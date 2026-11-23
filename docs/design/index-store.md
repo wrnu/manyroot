@@ -165,10 +165,10 @@ CREATE TABLE obj    (seq INTEGER PRIMARY KEY,        -- stable row key; insertio
                      author INTEGER NOT NULL,        -- -> agent.n
                      ts_key INTEGER NOT NULL,        -- timestamp_ms XOR 2^63, as i64 (see below)
                      ck BLOB NOT NULL);              -- row checksum (section 6)
-CREATE TABLE agent  (n INTEGER PRIMARY KEY, key BLOB NOT NULL UNIQUE);
-CREATE TABLE parent (child INTEGER, parent INTEGER, PRIMARY KEY (child, parent)) WITHOUT ROWID;
-CREATE TABLE child  (parent INTEGER, child INTEGER, PRIMARY KEY (parent, child)) WITHOUT ROWID;
-CREATE TABLE head   (seq INTEGER PRIMARY KEY);
+CREATE TABLE agent  (n INTEGER PRIMARY KEY, key BLOB NOT NULL UNIQUE, ck BLOB NOT NULL);
+CREATE TABLE parent (child INTEGER, parent INTEGER, ck BLOB NOT NULL, PRIMARY KEY (child, parent)) WITHOUT ROWID;
+CREATE TABLE child  (parent INTEGER, child INTEGER, ck BLOB NOT NULL, PRIMARY KEY (parent, child)) WITHOUT ROWID;
+CREATE TABLE head   (seq INTEGER PRIMARY KEY, ck BLOB NOT NULL);
 CREATE TABLE tag    (tag TEXT, seq INTEGER, ck BLOB NOT NULL, PRIMARY KEY (tag, seq)) WITHOUT ROWID;
 CREATE INDEX obj_kind   ON obj(kind, pos);
 CREATE INDEX obj_author ON obj(author, pos);
@@ -181,8 +181,9 @@ CREATE TABLE hidden (seq INTEGER PRIMARY KEY, ck BLOB NOT NULL);           -- wh
 CREATE TABLE shard  (n INTEGER PRIMARY KEY,          -- 0..255; no row means dirty
                      present INTEGER NOT NULL,       -- 0: reconciled as absent
                      mtime_s INTEGER, mtime_ns INTEGER, ctime_s INTEGER, ctime_ns INTEGER,
-                     ino BLOB, dev BLOB);            -- u64s as 8 big-endian bytes
-CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL);
+                     ino BLOB, dev BLOB,             -- u64s as 8 big-endian bytes
+                     ck BLOB NOT NULL);
+CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL, ck BLOB NOT NULL);
                      -- schema_version, ground id, the file's own device and inode, hidden_stale, fs_clock
 ```
 
@@ -438,10 +439,16 @@ is SQLite's documented corruption case.
   that SQLite sees surfaces as SQLITE_CORRUPT and moves to a new generation, as
   above.
 - **Row checksums** (decision `c489f7f9dea9`). SQLite keeps no page checksums,
-  so every `obj`, `tag`, `ref`, `fwd` and `hidden` row carries `ck`: the first
-  8 bytes of a blake3 hash over its other fields, encoded in a fixed order.
+  so every row of every table carries `ck`: the first 8 bytes of a blake3 hash
+  over its other fields, encoded in a fixed order. The tables are `obj`,
+  `agent`, `parent`, `child`, `head`, `tag`, `ref`, `fwd`, `hidden`, `shard` and
+  `meta` (each key and its value).
   - A rewrite of `pos` rewrites that row's `ck`.
-  - Every row a read returns is checked against its `ck`.
+  - Every row a read or a refresh uses is checked against its `ck`: rows it
+    returns, rows it joins through (an `agent` key, a `parent` or `child` edge),
+    the `head` rows, the `shard` stamps freshness compares, and each `meta`
+    value it reads (`schema_version`, ground, device and inode, `hidden_stale`,
+    `fs_clock`).
   - A mismatch rebuilds the index in place, since the file itself is sound
     (SQLITE_CORRUPT moves to a new generation instead, as above), and that read
     falls back to the full path.
@@ -546,7 +553,7 @@ Each property maps to a test, in PR 2 unless marked PR 3:
 | Concurrency | several processes refreshing a stale, missing or damaged index at once agree, and each object is added once |
 | Rebuild under an open connection | a rebuild, or a move to a new generation, while another connection reads: both answer what the full computation gives |
 | Damage | a file that isn't a database moves to a new generation; a schema version or ground mismatch rebuilds; SQLITE_BUSY falls back without a rebuild |
-| Value corruption | a byte changed in an `obj`, `tag`, `ref`, `fwd` or `hidden` row fails that row's checksum on read, rebuilds the index, and the read's answer equals the full computation's (as `tests/snapshot.rs` does for the snapshot); a row deleted with a clean stamp fails the full check |
+| Value corruption | a byte changed in a row of each table fails that row's checksum on read, rebuilds the index, and the read's answer equals the full computation's (as `tests/snapshot.rs` does for the snapshot). The cases include an `agent` key, a `head` row, a `parent` and a `child` edge, a `shard` stamp, and `meta`'s `hidden_stale` and `fs_clock`. A row deleted with a clean stamp fails the full check |
 | Schema versions | two schema versions alternating on one Ground don't rebuild each other's file |
 | Widths | `timestamp_ms` = u64::MAX indexes, and orders after every smaller value |
 | Read-only | `bracken view` and a replica with a read-only `cache/` leave every file under `cache/` unchanged, index files included, and answer as the full path does |
