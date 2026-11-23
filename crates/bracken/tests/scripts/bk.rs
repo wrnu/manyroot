@@ -787,7 +787,8 @@ fn team_server_ready_says_whether_an_identity_can_write() {
         // a '*' inside a name, a duplicate table.
         let scopes = team.join("scopes.toml");
         let first = std::fs::read_to_string(&scopes).unwrap();
-        let full = "kinds = [\"claim\", \"relation\", \"evidence\"]";
+        let full = "kinds = [\"claim\", \"relation\", \"evidence\"]\n\
+                    relations = [\"implements\", \"supersedes\", \"refines\", \"contradicts\"]";
         let scoped = |text: &str| -> (String, bool) {
             std::fs::write(&scopes, text).unwrap();
             ready("builder-held")
@@ -802,9 +803,26 @@ fn team_server_ready_says_whether_an_identity_can_write() {
         }
         // A scope that allows nothing, or not every kind a builder writes.
         let (text, said) = scoped("[scope.\"builder-held\"]\n");
-        assert!(!said && text.contains("it lacks: claim relation evidence"), "{scripts}: {text}");
+        assert!(!said && text.contains("it refuses: kind claim, kind relation, kind evidence, "), "{scripts}: {text}");
         let (text, said) = scoped("[scope.\"builder-*\"]\nkinds = [\"claim\", \"relation\"]\n");
-        assert!(!said && text.contains("it lacks: evidence"), "{scripts}: {text}");
+        assert!(!said && text.contains("it refuses: kind evidence, relation implements, "), "{scripts}: {text}");
+        // Findings ae6b7aad42f9's counterexamples (task 50c98a2de33e): every kind, but a relation, a tag or a
+        // typed pr claim's tags refused, each judged by the server's own check through bracken id scope.
+        let kinds = "kinds = [\"claim\", \"relation\", \"evidence\"]";
+        for (scope, refused) in [
+            (format!("[scope.\"builder-*\"]\n{kinds}\n"), "relation implements, relation supersedes, relation refines"),
+            (format!("[scope.\"builder-*\"]\n{full}\ntags = [\"note\"]\n"), "tag question, tag report"),
+            (format!("[scope.\"builder-*\"]\n{full}\nforbidden_tags = [\"pr\"]\n"), "it refuses: tag pr, tag type:pr"),
+            (format!("[scope.\"builder-*\"]\n{full}\nforbidden_tags = [\"report\"]\n"), "it refuses: tag report"),
+            (
+                format!("[scope.\"builder-*\"]\n{kinds}\nrelations = [\"implements\"]\n"),
+                "it refuses: relation supersedes, relation refines, relation contradicts",
+            ),
+        ] {
+            let (text, said) = scoped(&scope);
+            assert!(!said && text.contains(refused), "{scripts}: {scope}: {text}");
+            assert!(text.contains("of what a builder writes, the server would refuse: "), "{scripts}: {text}");
+        }
         // No entry covers it: an exact entry for another name, and a pattern that doesn't match.
         let (text, said) = scoped(&format!("[scope.\"builder-x\"]\n{full}\n[scope.\"rev*\"]\n{full}\n"));
         assert!(!said && text.contains("add a scope for it"), "{scripts}: {text}");
@@ -817,7 +835,9 @@ fn team_server_ready_says_whether_an_identity_can_write() {
         for good in [
             format!("[scope.builder-held]\n{full}\n"),
             format!("[scope.'builder-*']\n{full}\n"),
-            "[scope]\nbuilder-held = { kinds = [\"claim\", \"relation\", \"evidence\"] }\n".to_owned(),
+            "[scope]\nbuilder-held = { kinds = [\"claim\", \"relation\", \"evidence\"], relations = [\"implements\", \
+             \"supersedes\", \"refines\", \"contradicts\"] }\n"
+                .to_owned(),
         ] {
             let (text, said) = scoped(&good);
             assert!(said, "{scripts}: {good}: {text}");
@@ -843,6 +863,50 @@ fn team_server_ready_says_whether_an_identity_can_write() {
         assert!(!out.status.success() && text.contains("upgrade the pinned binary"), "{scripts}: {text}");
         let (text, said) = ready("alice");
         assert!(said, "{scripts}: a key-file identity needs no scope: {text}");
+        // A pinned binary whose id scope predates --kind, --relation and --tag: not ready, naming the flag.
+        let older = tmp.path().join("bracken-older");
+        write_executable(
+            &older,
+            "#!/usr/bin/env bash
+if [ \"$1 $2 $3\" = 'id scope --help' ]; then \"$REAL_BRACKEN\" \"$@\" | grep -v -e '--tag'; exit 0; fi\n\
+             exec \"$REAL_BRACKEN\" \"$@\"\n",
+        );
+        let out =
+            command(&a, "scripts/team-server", &["ready", "builder-held"]).env("BRACKEN_BIN", &older).output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success() && text.contains("has no --tag"), "{scripts}: {text}");
+        assert!(text.contains("upgrade the pinned binary"), "{scripts}: {text}");
+        // Retired by public key, as the server decides it (finding e11bfc04af16): retired.jsonl's line with
+        // other spacing, or under another name, and a copy of the key in keys/retired/ under another name.
+        let agent = {
+            let key: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(team.join("keys/builder-held.json")).unwrap()).unwrap();
+            key["public_key"].as_str().unwrap().to_owned()
+        };
+        let list = team.join("keys/retired.jsonl");
+        let kept_list = std::fs::read(&list).unwrap();
+        for line in [
+            format!("{{\"name\": \"builder-held\", \"agent\": \"{agent}\"}}\n"),
+            format!("{{\"name\":\"other\",\"agent\":\"{agent}\"}}\n"),
+        ] {
+            let mut text = kept_list.clone();
+            text.extend_from_slice(line.as_bytes());
+            std::fs::write(&list, text).unwrap();
+            let (text, said) = ready("builder-held");
+            assert!(!said && text.contains("retired: the server no longer signs for it"), "{scripts}: {line}: {text}");
+        }
+        std::fs::write(&list, &kept_list).unwrap();
+        let copy = team.join("keys/retired/other.json");
+        std::fs::copy(team.join("keys/builder-held.json"), &copy).unwrap();
+        let (text, said) = ready("builder-held");
+        assert!(!said && text.contains("retired: the server no longer signs for it"), "{scripts}: {text}");
+        std::fs::remove_file(&copy).unwrap();
+        // A retired list the server can't read: it can't tell, so not ready.
+        std::fs::write(&list, "not json\n").unwrap();
+        let (text, said) = ready("builder-held");
+        assert!(!said && text.contains("retired.jsonl doesn't parse"), "{scripts}: {text}");
+        std::fs::write(&list, &kept_list).unwrap();
+        assert!(ready("builder-held").1, "{scripts}: the retired list restored");
 
         // A token file that doesn't match its hash in tokens.b3, as an interrupted token leaves it.
         let token = team.join("tokens/builder-held");
