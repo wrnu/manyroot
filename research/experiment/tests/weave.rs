@@ -333,14 +333,6 @@ fn a_conflict_shows_three_sides_and_a_mixed_resolution_goes_through_the_tree() {
     three_sides_and_a_mixed_resolution(Stores::new(&["agent-0", "agent-1"]));
 }
 
-/// The same with every worker sandboxed as in a real run, where the view once failed on every call (defect
-/// `cc1a19b1508e`): its mock tests ran unsandboxed.
-#[cfg(target_os = "macos")]
-#[test]
-fn a_sandboxed_conflict_shows_three_sides_and_a_mixed_resolution_goes_through_the_tree() {
-    three_sides_and_a_mixed_resolution(Stores::sandboxed(&["agent-0", "agent-1"]));
-}
-
 fn three_sides_and_a_mixed_resolution(mut s: Stores) {
     let path = "tiny/stats.py";
     let before = std::fs::read_to_string(s.trees[0].join(path)).expect("the seed's stats");
@@ -417,17 +409,12 @@ fn three_sides_and_a_mixed_resolution(mut s: Stores) {
 /// or replaced, the old mark is gone.
 #[test]
 fn markers_never_put_back_an_edit_the_agent_made() {
-    markers_keep_the_agents_edits(Stores::new(&["agent-0", "agent-1"]));
+    markers_keep_the_agents_edits(Stores::new);
 }
 
-/// The same with every worker sandboxed as in a real run (defect `cc1a19b1508e`).
-#[cfg(target_os = "macos")]
-#[test]
-fn sandboxed_markers_never_put_back_an_edit_the_agent_made() {
-    markers_keep_the_agents_edits(Stores::sandboxed(&["agent-0", "agent-1"]));
-}
-
-fn markers_keep_the_agents_edits(mut s: Stores) {
+/// Its stores, each time, made by `stores`: sandboxed or not, the same for both.
+fn markers_keep_the_agents_edits(stores: fn(&[&str]) -> Stores) {
+    let mut s = stores(&["agent-0", "agent-1"]);
     let path = "tiny/stats.py";
     let line = std::fs::read_to_string(s.trees[0].join(path))
         .expect("stats")
@@ -455,7 +442,7 @@ fn markers_keep_the_agents_edits(mut s: Stores) {
     assert_eq!(std::fs::read_to_string(s.trees[0].join(path)).expect("kept"), mine, "the agent's edit stays");
 
     // Marked, then committed by a proposal: the mark is gone, so a later edit there is the agent's own.
-    let s2 = &mut Stores::new(&["agent-0", "agent-1"]);
+    let s2 = &mut stores(&["agent-0", "agent-1"]);
     let mut ps = Vec::new();
     for i in 0..2 {
         s2.ok(i, "edit_file", json!({"path": path, "old": line, "new": format!("{line}  # agent {i}")}));
@@ -877,6 +864,19 @@ fn a_project_run_needs_weave_mode_and_the_python_pin() {
 #[cfg(target_os = "macos")]
 mod macos_only {
     use super::*;
+
+    /// The conflict view with every worker sandboxed as in a real run, where it once failed on every call (defect
+    /// `cc1a19b1508e`): its mock tests ran unsandboxed.
+    #[test]
+    fn a_sandboxed_conflict_shows_three_sides_and_a_mixed_resolution_goes_through_the_tree() {
+        three_sides_and_a_mixed_resolution(Stores::sandboxed(&["agent-0", "agent-1"]));
+    }
+
+    /// The same for markers and the agent's own edits, every store sandboxed.
+    #[test]
+    fn sandboxed_markers_never_put_back_an_edit_the_agent_made() {
+        markers_keep_the_agents_edits(Stores::sandboxed);
+    }
 
     /// A checkout sets the old tree aside whole and removes it after, so one that can't be cleared, as when
     /// something writes into it while it is (task 61c34b3c2704), neither fails it nor costs the tree its repository

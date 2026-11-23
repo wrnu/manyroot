@@ -840,8 +840,9 @@ impl WeaveStore {
         self.config.dir.join("tree")
     }
 
-    /// `bracken --dir <own replica> <argv>` in the store's directory, with only `PATH` set, to the real git's
-    /// directory: Weave reads a tree through git.
+    /// `bracken --dir <own replica> <argv>` in the store's directory, with `PATH` set to the real git's directory
+    /// (Weave reads a tree through git) and git's two config entries ([`WeaveStore::bracken_output`]), and nothing
+    /// else.
     fn bracken(&mut self, argv: &[String]) -> Result<Vec<u8>, String> {
         let out = self.bracken_output(argv)?;
         if out.status.success() {
