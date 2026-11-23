@@ -513,11 +513,24 @@ enum IdCommand {
     /// What a team server would sign for `name` under a scopes file, parsed and matched exactly as the
     /// server does (`team-server ready`). Fails, naming why, when the file doesn't parse: the server then
     /// signs nothing. Reads only the file.
+    ///
+    /// With `--kind`, `--relation` or `--tag`, it also judges each through the server's own check: a
+    /// contribution of that kind, a relation of that kind, a claim carrying that tag. It prints a line for
+    /// each one refused, and exits 1 if any is (all are, with no scope).
     Scope {
         name: String,
         /// The team server's scopes.toml.
         #[arg(long, value_name = "FILE")]
         scopes: PathBuf,
+        /// A kind of contribution to judge (claim, relation, evidence, ...). Repeatable.
+        #[arg(long = "kind", value_name = "KIND")]
+        kinds: Vec<BodyKind>,
+        /// A kind of relation to judge (implements, supersedes, ...). Repeatable.
+        #[arg(long = "relation", value_name = "KIND")]
+        relations: Vec<RelationKind>,
+        /// A tag to judge, as a claim would carry it (note, type:pr, pr:3, ...). Repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
         #[command(flatten)]
         out: Output,
     },
@@ -555,16 +568,51 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Weave(weave::WeaveCommand::Init { purpose, out }) => {
             return weave::init(cli.dir.as_deref(), cli.agent.as_deref(), purpose, out);
         }
-        Command::Id(IdCommand::Scope { name, scopes, out }) => {
+        Command::Id(IdCommand::Scope { name, scopes, kinds, relations, tags, out }) => {
             let text = std::fs::read_to_string(&scopes).with_context(|| format!("reading {}", scopes.display()))?;
             let scope = signing::scope_of(&text, &name).with_context(|| format!("{}", scopes.display()))?;
+            // Each thing asked about that the server would refuse: (what, which, why).
+            let none = || "it has no scope".to_owned();
+            let mut refused: Vec<(&str, String, String)> = Vec::new();
+            for kind in kinds {
+                if let Some(why) = scope.as_ref().map_or_else(|| Some(none()), |s| s.refuses_kind(kind)) {
+                    refused.push(("kind", kind.to_string(), why));
+                }
+            }
+            for kind in relations {
+                let why = scope.as_ref().map_or_else(
+                    || Some(none()),
+                    |s| s.refuses_kind(BodyKind::Relation).or_else(|| s.refuses_relation(kind)),
+                );
+                if let Some(why) = why {
+                    refused.push(("relation", kind.to_string(), why));
+                }
+            }
+            for tag in tags {
+                let why = scope
+                    .as_ref()
+                    .map_or_else(|| Some(none()), |s| s.refuses_kind(BodyKind::Claim).or_else(|| s.refuses_tag(&tag)));
+                if let Some(why) = why {
+                    refused.push(("tag", tag, why));
+                }
+            }
             if out.json {
-                print_json(&json!({"name": name, "scope": scope}));
+                let refused: Vec<Value> = refused
+                    .iter()
+                    .map(|(what, which, why)| json!({"what": what, "which": which, "why": why}))
+                    .collect();
+                print_json(&json!({"name": name, "scope": scope, "refused": refused}));
             } else {
-                match scope {
+                match &scope {
                     Some(scope) => println!("{}: {}", terminal::printable(&name), scope.describe()),
                     None => println!("{}: no scope, so a server signs nothing for it", terminal::printable(&name)),
                 }
+                for (what, which, why) in &refused {
+                    println!("refused {what} {}: {}", terminal::printable(which), terminal::printable(why));
+                }
+            }
+            if !refused.is_empty() {
+                return Ok(ExitCode::FAILURE);
             }
         }
         Command::Verify { out } => {

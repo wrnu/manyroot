@@ -36,8 +36,10 @@
 # ready reads only: whether an identity can write through scripts/bk, before its builder is launched (task
 # 9c46177b622d). It says whether the main checkout's Ground knows it; whether it signs with a key file in
 # .bracken/identities/ or the server holds its key, and then what the server's scopes.toml lets it sign, read
-# by the pinned bracken exactly as the server reads it, which must include claims, relations and evidence;
-# whether its token file matches its hash in tokens.b3; and whether it was retired. Anything it can't
+# by the pinned bracken exactly as the server reads it, which must allow what a builder writes: claims,
+# relations and evidence, the relations and the tags of AGENTS.md's table, judged by the server's own check
+# (bracken id scope --kind/--relation/--tag); whether its token file matches its hash in tokens.b3; and
+# whether it was retired, by name or, as the server decides it, by public key. Anything it can't
 # check counts as not ready. It prints no token, key or environment, changes nothing and
 # never restarts the server, so it is safe during a counted run or a merge. It exits 0 only when the
 # identity is ready.
@@ -133,12 +135,59 @@ retired() {
   [ -e "$dir/keys/retired/$1.json" ] || grep -q "\"name\":\"$1\"" "$dir/keys/retired.jsonl" 2>/dev/null
 }
 
+# Whether a key of $1's is retired as the server decides it, by public key (crates/bracken/src/signing.rs,
+# Keys::read; finding e11bfc04af16): $1's agent, as the main checkout's Ground and its held key file give it,
+# is the public_key of a key in keys/retired/ or the agent of a line in keys/retired.jsonl, whatever that
+# file's or line's name and spacing. Returns 0 if so, 1 if not, and 2, with $retired_err, when it can't
+# tell: no jq, or a retired.jsonl or retired key the server couldn't read either (it then starts nothing).
+retired_by_key() {
+  local ours theirs f
+  retired_err=''
+  command -v jq >/dev/null || { retired_err="needs jq to compare its public key with the retired ones"; return 2; }
+  # A key field as the server's parser takes it: 64 hex digits in either case (findings 22a5baa0d27d and
+  # 1d2100ed4f0b), lowercased; anything else, a missing field included, is an error, as it is for the server.
+  # The length check too, since jq's '$' also matches before a trailing newline (finding 6beb2a35cca2).
+  local key='def key(f): (f | strings | select(test("^[0-9a-fA-F]{64}$") and length == 64) | ascii_downcase) // error("no key");'
+  # A key file as the server reads one, slurped: exactly one object (not empty, blank or two), its name the
+  # file's, and both keys well formed.
+  local key_file="$key"' def key_file($stem): if length != 1 or (.[0] | type) != "object" then error("not one object") elif .[0].name != $stem then error("not its name") else .[0] | key(.secret_key) as $_ | key(.public_key) end;'
+  ours=$(identities | jq -r --arg n "$1" "$key"' .[] | select(.name == $n) | key(.agent)') ||
+    { retired_err="can't read the main checkout's identities to find its public key"; return 2; }
+  if [ -f "$dir/keys/$1.json" ]; then
+    ours+=$'\n'$(jq -s -r --arg s "$1" "$key_file"' key_file($s)' "$dir/keys/$1.json" 2>/dev/null) ||
+      { retired_err="$dir/keys/$1.json doesn't read as its key file, so the server wouldn't start"; return 2; }
+  fi
+  theirs=''
+  if [ -e "$dir/keys/retired.jsonl" ]; then
+    # One entry a line, blank lines skipped, each needing its agent, as Keys::read_retired_list reads it.
+    theirs=$(jq -R -r "$key"' select(test("\\S")) | fromjson | key(.agent)' "$dir/keys/retired.jsonl" 2>/dev/null) ||
+      { retired_err="$dir/keys/retired.jsonl has a line that isn't a retired key's entry, so the server wouldn't start"; return 2; }
+  fi
+  for f in "$dir"/keys/retired/*.json; do
+    [ -e "$f" ] || continue
+    theirs+=$'\n'$(jq -s -r --arg s "$(basename "$f" .json)" "$key_file"' key_file($s)' "$f" 2>/dev/null) ||
+      { retired_err="$f doesn't read as its key file, so the server wouldn't start"; return 2; }
+  done
+  [ -n "$(comm -12 <(grep -v '^$' <<<"$ours" | sort -u) <(grep -v '^$' <<<"$theirs" | sort -u))" ]
+}
+
+# What a builder writes (AGENTS.md, section 3), each of which the server must sign for an identity whose key
+# it holds: the kinds, the relations, and the tags, a typed pr claim's included (task 50c98a2de33e, finding
+# ae6b7aad42f9). Judged by the pinned bracken's id scope --kind/--relation/--tag, the server's own check.
+builder_writes=(
+  --kind claim --kind relation --kind evidence
+  --relation implements --relation supersedes --relation refines --relation contradicts
+  --tag note --tag question --tag report --tag gotcha --tag process --tag misfire --tag finding
+  --tag pr --tag type:pr --tag pr:1 --tag branch:a --tag class:low --tag sha:0000000000000000000000000000000000000000
+  --tag weave:0000000000000000000000000000000000000000000000000000000000000000
+)
+
 # What the server would sign for $1, from bracken id scope: the pinned binary's own parse and match of
 # scopes.toml, the server's code (findings 5bee4ea274aa, 945af04e6c99). Sets $scope_line (its one-line
 # answer) or $scope_err (why there's none to trust), and returns 1 for the latter.
 scope_for() {
   local out
-  scope_line='' scope_err=''
+  scope_line='' scope_err='' scope_refused=''
   if ! "$bin" id scope --help >/dev/null 2>&1; then
     scope_err="the pinned bracken can't read scopes.toml as the server does (it has no id scope): upgrade the pinned binary (docs/releases.md)"
     return 1
@@ -149,6 +198,23 @@ scope_for() {
     return 1
   }
   scope_line=${out#"$1: "}
+  # What it refuses of a builder's writes, one 'refused <what> <which>: <why>' line each; blank if nothing.
+  local help flag
+  help=$("$bin" id scope --help 2>&1)
+  for flag in --kind --relation --tag; do
+    [[ $help == *"$flag <"* ]] || {
+      scope_err="the pinned bracken's id scope has no $flag, so ready can't judge what the server signs of a builder's writes: upgrade the pinned binary (docs/releases.md)"
+      return 1
+    }
+  done
+  local rc=0
+  out=$("$bin" id scope "$1" --scopes "$dir/scopes.toml" "${builder_writes[@]}" 2>&1) || rc=$?
+  scope_refused=$(grep '^refused ' <<<"$out") || true
+  # Exit 1 with a refused line is an answer; any other failure is not one.
+  if [ $rc -ne 0 ] && { [ $rc -ne 1 ] || [ -z "$scope_refused" ]; }; then
+    scope_err="bracken id scope failed judging a builder's writes (exit $rc): ${out##*$'\n'}"
+    return 1
+  fi
 }
 
 # Refuses, before anything changes, when a running server would have to restart under a binary that can't
@@ -399,7 +465,22 @@ case "${1:-}" in
       say "not known to the main checkout's Ground"
       missing+=("make it with team-server key $name (with the owner's approval of the identity)")
     fi
+    gone=false
     if retired "$name"; then
+      gone=true
+    else
+      rc=0
+      retired_by_key "$name" || rc=$?
+      case $rc in
+        0) gone=true ;;
+        1) ;;
+        *)
+          say "can't tell whether it was retired: $retired_err"
+          missing+=("fix that, then run ready again")
+          ;;
+      esac
+    fi
+    if $gone; then
       say "retired: the server no longer signs for it"
       missing+=("it is retired: choose another identity")
     else
@@ -414,21 +495,16 @@ case "${1:-}" in
         say "its key is held by the server, whose scopes.toml gives it: $scope_line"
         if [ "$scope_line" = "no scope, so a server signs nothing for it" ]; then
           missing+=("add a scope for it to $dir/scopes.toml: with none, the server signs nothing for it")
-        else
-          kinds=${scope_line#kinds }
-          kinds=" ${kinds%%;*}, "
-          lacking=()
-          for kind in claim relation evidence; do
-            [[ $kinds == *" $kind,"* ]] || lacking+=("$kind")
-          done
-          [ ${#lacking[@]} -eq 0 ] ||
-            missing+=("its scope in $dir/scopes.toml must allow the kinds a builder writes; it lacks: ${lacking[*]}")
+        elif [ -n "$scope_refused" ]; then
+          say "of what a builder writes, the server would refuse: $(sed 's/^refused //' <<<"$scope_refused" | paste -sd ';' - | sed 's/;/; /g')"
+          lacking=$(sed -n 's/^refused \([a-z]*\) \([^ ]*\): .*/\1 \2/p' <<<"$scope_refused" | paste -sd ',' - | sed 's/,/, /g')
+          missing+=("its scope in $dir/scopes.toml must allow what a builder writes; it refuses: $lacking")
         fi
       else
         say "its key is held by the server, but $scope_err"
         missing+=("fix that, then run ready again")
       fi
-    elif ! retired "$name"; then
+    elif ! $gone; then
       say "has no key file and no key held by the server, so it can't sign"
       missing+=("make it with team-server key $name, or choose an identity that has a key")
     fi
@@ -437,7 +513,7 @@ case "${1:-}" in
     recorded=$(awk -v n="$name" '$1 == n { print $2 }' "$dir/tokens.b3" 2>/dev/null | tail -1)
     if [ ! -s "$dir/tokens/$name" ] || [ -z "$recorded" ]; then
       say "has no team token"
-      retired "$name" || missing+=("issue its token with team-server token $name (restarts the server: not during a counted run or a merge)")
+      $gone || missing+=("issue its token with team-server token $name (restarts the server: not during a counted run or a merge)")
     elif ! command -v b3sum >/dev/null; then
       say "has a token file, but b3sum isn't here to check it against tokens.b3"
       missing+=("install b3sum (cargo install --locked b3sum), then run ready again")
