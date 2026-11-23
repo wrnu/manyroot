@@ -1320,7 +1320,7 @@ fn contribute_with_parents(
     // directory, or an entry that isn't a regular file (a FIFO would block a plain read), is refused rather
     // than followed (security note 5 on PR #44, report acaa5cd6f738).
     let identities = s.identities()?;
-    refuse_unreadable_identity_names(&s.identities_dir())?;
+    refuse_unreadable_identity_names(s.dir())?;
     for id in identities {
         if fields.iter().any(|f| id.key_is_in(f)) {
             bail!(
@@ -1396,12 +1396,48 @@ fn claim_tags(
     Ok((tags, parents))
 }
 
-/// Refuses a write while `identities` holds a `*.json` entry whose name isn't UTF-8 (finding e2000e28c6f6).
-/// [`Store::identities`] skips such a name, as no identity Bracken makes has one, but Linux allows it, so a
-/// key file could sit there that the private-key scan can't read: fail closed rather than miss it. It lists
-/// names only, opening no file, after `Store::identities` has refused a symlinked directory.
-fn refuse_unreadable_identity_names(identities: &Path) -> Result<()> {
-    let entries = match std::fs::read_dir(identities) {
+/// Refuses a write while `<ground>/identities` holds a `*.json` entry whose name isn't UTF-8 (finding
+/// e2000e28c6f6). [`Store::identities`] skips such a name, as no identity Bracken makes has one, but Linux
+/// allows it, so a key file could sit there that the private-key scan can't read: fail closed rather than
+/// miss it. It lists names only, opening no file. On Unix, identities/ is opened from the Ground's root with
+/// `O_DIRECTORY | O_NOFOLLOW`, as the store opens it, and listed through that descriptor, so a symlink
+/// swapped in after `Store::identities` is refused, not followed (finding aba16386e811).
+#[cfg(unix)]
+fn refuse_unreadable_identity_names(ground: &Path) -> Result<()> {
+    use rustix::fs::{self as fs, CWD, Mode, OFlags};
+    use rustix::io::Errno;
+    let identities = ground.join("identities");
+    let listing = || format!("listing {}", identities.display());
+    let root = fs::openat(CWD, ground, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(io::Error::from)
+        .with_context(|| format!("opening {}", ground.display()))?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let dir = match fs::openat(&root, "identities", flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::LOOP | Errno::NOTDIR) => bail!("{} isn't a directory (or is a symlink)", identities.display()),
+        Err(e) => return Err(io::Error::from(e)).with_context(listing),
+    };
+    for entry in fs::Dir::read_from(&dir).map_err(io::Error::from).with_context(listing)? {
+        let entry = entry.map_err(io::Error::from).with_context(listing)?;
+        let name = entry.file_name().to_bytes();
+        if std::str::from_utf8(name).is_err() && name.ends_with(b".json") {
+            bail!(
+                "{} holds {:?}, whose name isn't UTF-8, so the private-key scan can't read it as an identity; \
+                 rename or remove it before writing",
+                identities.display(),
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+    Ok(())
+}
+
+/// As the Unix one, by path: no `openat` here.
+#[cfg(not(unix))]
+fn refuse_unreadable_identity_names(ground: &Path) -> Result<()> {
+    let identities = ground.join("identities");
+    let entries = match std::fs::read_dir(&identities) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(e).with_context(|| format!("listing {}", identities.display())),
@@ -1410,8 +1446,7 @@ fn refuse_unreadable_identity_names(identities: &Path) -> Result<()> {
         let name = entry.with_context(|| format!("listing {}", identities.display()))?.file_name();
         if name.to_str().is_none() && name.as_encoded_bytes().ends_with(b".json") {
             bail!(
-                "{} holds {name:?}, whose name isn't UTF-8, so the private-key scan can't read it as an identity; \
-                 rename or remove it before writing",
+                "{} holds {name:?}, whose name isn't UTF-8, so the private-key scan can't read it",
                 identities.display()
             );
         }
@@ -2665,6 +2700,52 @@ fn print_json(v: &impl serde::Serialize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding aba16386e811: the non-UTF-8 name check opens identities/ from the Ground's root with
+    /// O_NOFOLLOW, never by path. Absent: nothing to refuse. A symlink, even to a plain directory: refused,
+    /// not followed. A directory: listed.
+    #[cfg(unix)]
+    #[test]
+    fn the_identity_name_check_never_follows_a_symlinked_identities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ground = tmp.path().join("g");
+        std::fs::create_dir(&ground).unwrap();
+        refuse_unreadable_identity_names(&ground).expect("no identities/ is nothing to refuse");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("val.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, ground.join("identities")).unwrap();
+        let err = refuse_unreadable_identity_names(&ground).unwrap_err().to_string();
+        assert!(err.contains("isn't a directory (or is a symlink)"), "{err}");
+        std::fs::remove_file(ground.join("identities")).unwrap();
+        std::fs::create_dir(ground.join("identities")).unwrap();
+        std::fs::write(ground.join("identities/val.json"), "{}").unwrap();
+        refuse_unreadable_identity_names(&ground).expect("a UTF-8 name is the store's to read");
+    }
+
+    /// As above, on Linux, where a name needn't be UTF-8: a symlinked identities/ whose target holds a
+    /// non-UTF-8 key file name is refused as a symlink, without listing the target; the same name in the
+    /// real directory is refused as unreadable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_identity_name_check_refuses_a_non_utf8_name_but_not_through_a_symlink() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let ground = tmp.path().join("g");
+        std::fs::create_dir(&ground).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let odd = std::ffi::OsStr::from_bytes(b"\xffzed.json");
+        std::fs::write(elsewhere.join(odd), "{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, ground.join("identities")).unwrap();
+        let err = refuse_unreadable_identity_names(&ground).unwrap_err().to_string();
+        assert!(err.contains("isn't a directory (or is a symlink)") && !err.contains("UTF-8"), "{err}");
+        std::fs::remove_file(ground.join("identities")).unwrap();
+        std::fs::create_dir(ground.join("identities")).unwrap();
+        std::fs::write(ground.join("identities").join(odd), "{}").unwrap();
+        let err = refuse_unreadable_identity_names(&ground).unwrap_err().to_string();
+        assert!(err.contains("isn't UTF-8"), "{err}");
+    }
 
     /// `show`'s one-contribution answer against the whole view, the oracle (task `7a3d17f979c3`): on
     /// random graphs with retractions, supersessions by the author and by others, and relations and
