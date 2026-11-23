@@ -1319,7 +1319,9 @@ fn contribute_with_parents(
     // Each local identity, read through the store like every other read of identities/: a symlinked
     // directory, or an entry that isn't a regular file (a FIFO would block a plain read), is refused rather
     // than followed (security note 5 on PR #44, report acaa5cd6f738).
-    for id in s.identities()? {
+    let identities = s.identities()?;
+    refuse_unreadable_identity_names(&s.identities_dir())?;
+    for id in identities {
         if fields.iter().any(|f| id.key_is_in(f)) {
             bail!(
                 "this contribution contains the private key of identity {:?}; it can't go into the Ground",
@@ -1392,6 +1394,29 @@ fn claim_tags(
         add(legacy.to_owned(), &mut tags);
     }
     Ok((tags, parents))
+}
+
+/// Refuses a write while `identities` holds a `*.json` entry whose name isn't UTF-8 (finding e2000e28c6f6).
+/// [`Store::identities`] skips such a name, as no identity Bracken makes has one, but Linux allows it, so a
+/// key file could sit there that the private-key scan can't read: fail closed rather than miss it. It lists
+/// names only, opening no file, after `Store::identities` has refused a symlinked directory.
+fn refuse_unreadable_identity_names(identities: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(identities) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", identities.display())),
+    };
+    for entry in entries {
+        let name = entry.with_context(|| format!("listing {}", identities.display()))?.file_name();
+        if name.to_str().is_none() && name.as_encoded_bytes().ends_with(b".json") {
+            bail!(
+                "{} holds {name:?}, whose name isn't UTF-8, so the private-key scan can't read it as an identity; \
+                 rename or remove it before writing",
+                identities.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve(s: &Store, prefix: &str) -> Result<ContributionId> {

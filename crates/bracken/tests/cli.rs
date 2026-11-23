@@ -739,11 +739,12 @@ fn a_local_private_key_never_reaches_the_ground() {
     bracken(dir, &["claim", "Never commit a file with a secret_key field", "--as", "val"]);
 }
 
-/// Security note 5 on PR #44 (report acaa5cd6f738): the private-key scan reads identities/ through the
-/// store, as every other read of it does, never by path. An entry there that isn't a regular file, a FIFO
-/// named like a key file, or a symlink to a key file, makes a write fail at once, naming it, with nothing
-/// recorded. Before, the scan's plain read of a FIFO blocked every write until a writer came, and a symlink
-/// was followed.
+/// Security note 5 on PR #44 (report acaa5cd6f738) and finding b67e0c29874d: the private-key scan reads
+/// identities/ through the store, as every other read of it does, never by path. An entry there that isn't a
+/// regular file, a FIFO named like a key file or a symlink to another key file, makes a write fail at once,
+/// naming it, with nothing recorded. artifact, evidence, relate, retract and intend reach the scan with no
+/// earlier read of identities/ (claim reads it first, through the names), so on main the scan's plain read
+/// blocked on the FIFO until a writer came, and followed the symlink and recorded the write.
 #[test]
 fn a_write_refuses_an_identities_entry_that_isnt_a_regular_file() {
     use std::os::unix::process::CommandExt;
@@ -751,6 +752,9 @@ fn a_write_refuses_an_identities_entry_that_isnt_a_regular_file() {
     let dir = tmp.path();
     bracken(dir, &["init"]);
     bracken(dir, &["id", "new", "val"]);
+    let a = bracken(dir, &["claim", "A", "--as", "val"]);
+    let b = bracken(dir, &["claim", "B", "--as", "val"]);
+    std::fs::write(dir.join("notes.txt"), "notes\n").unwrap();
     let before = ids(dir, &["log", "--json"]).len();
     let elsewhere = tmp.path().join("elsewhere");
     std::fs::create_dir(&elsewhere).unwrap();
@@ -767,36 +771,75 @@ fn a_write_refuses_an_identities_entry_that_isnt_a_regular_file() {
         ("a FIFO", &|| fifo(&entry)),
         ("a symlink to a key file", &|| std::os::unix::fs::symlink(elsewhere.join("zed.json"), &entry).unwrap()),
     ];
+    let writes: [&[&str]; 5] = [
+        &["artifact", "notes.txt", "--as", "val"],
+        &["evidence", &a, "pass", "--method", "t", "--as", "val"],
+        &["relate", &a, "refines", &b, "--as", "val"],
+        &["retract", &a, "--as", "val"],
+        &["intend", &a, "--as", "val"],
+    ];
     for (what, make) in cases {
-        make();
-        // Within a deadline, its own process group killed whole at it, so a blocked read fails the test.
-        let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
-            .args(["claim", "Works", "--as", "val"])
-            .current_dir(dir)
-            .env_remove("BRACKEN_DIR")
-            .env_remove("BRACKEN_AGENT")
-            .process_group(0)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while child.try_wait().unwrap().is_none() {
-            if std::time::Instant::now() > deadline {
-                let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
-                let _ = child.wait();
-                panic!("{what}: a write blocked on identities/zed.json");
+        for args in writes {
+            make();
+            // Within a deadline, its own process group killed whole at it, so a blocked read fails the test.
+            let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
+                .args(args)
+                .current_dir(dir)
+                .env_remove("BRACKEN_DIR")
+                .env_remove("BRACKEN_AGENT")
+                .process_group(0)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while child.try_wait().unwrap().is_none() {
+                if std::time::Instant::now() > deadline {
+                    let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+                    let _ = child.wait();
+                    std::fs::remove_file(&entry).unwrap();
+                    panic!("{what}: {args:?} blocked on identities/zed.json");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            let out = child.wait_with_output().unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success(), "{what}: {args:?} was recorded: {err}");
+            assert!(err.contains("zed.json") && err.contains("not a regular file"), "{what}: {args:?}: {err}");
+            // log reads identities/ through the store too, so it counts once the entry is gone.
+            std::fs::remove_file(&entry).unwrap();
+            assert_eq!(ids(dir, &["log", "--json"]).len(), before, "{what}: {args:?}: nothing was recorded");
         }
-        let out = child.wait_with_output().unwrap();
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success(), "{what}: {err}");
-        assert!(err.contains("zed.json") && err.contains("not a regular file"), "{what}: {err}");
-        // log reads identities/ through the store too, so it counts once the entry is gone.
-        std::fs::remove_file(&entry).unwrap();
-        assert_eq!(ids(dir, &["log", "--json"]).len(), before, "{what}: nothing was recorded");
     }
+    for args in writes {
+        bracken(dir, args);
+    }
+}
+
+/// Finding e2000e28c6f6: Store::identities skips a name that isn't UTF-8, so a key file under one (Linux
+/// allows it; APFS doesn't) would escape the private-key scan. A write refuses while identities/ holds such
+/// a `*.json`, whatever it holds, naming the directory, and a key pasted from it is refused as before.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_write_refuses_an_identity_file_whose_name_isnt_utf8() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "val"]);
+    let before = ids(dir, &["log", "--json"]).len();
+    let identities = dir.join(".bracken/identities");
+    let key: Value = serde_json::from_str(&std::fs::read_to_string(identities.join("val.json")).unwrap()).unwrap();
+    let secret = key["secret_key"].as_str().unwrap().to_owned();
+    let odd = identities.join(std::ffi::OsStr::from_bytes(b"\xffzed.json"));
+    std::fs::copy(identities.join("val.json"), &odd).unwrap();
+    for text in [format!("the key is {secret}"), "Works".to_owned()] {
+        let err = bracken_fails(dir, &["claim", &text, "--as", "val"]);
+        assert!(err.contains("isn't UTF-8") && err.contains(".bracken/identities"), "{text}: {err}");
+    }
+    assert_eq!(ids(dir, &["log", "--json"]).len(), before, "nothing was recorded");
+    // A non-UTF-8 name that isn't a key file's is no identity, and doesn't stop a write.
+    std::fs::rename(&odd, identities.join(std::ffi::OsStr::from_bytes(b"\xffzed.txt"))).unwrap();
     bracken(dir, &["claim", "Works", "--as", "val"]);
 }
 
