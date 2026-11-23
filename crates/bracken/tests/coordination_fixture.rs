@@ -87,11 +87,13 @@ fn the_binary_reads_the_coordination_fixture_unchanged() {
         assert_eq!(accepted["conflicts"], expected["evaluation"]["conflicts"], "{name}");
     }
     assert_eq!(bracken(&["weave", "check"]).trim().lines().last(), Some("no problems"));
-    // Reads write nothing to the Ground. They may write their own local cache beside it, the verified
-    // snapshot in cache/ (task ac538d60e8f9, docs/cli.md), which git ignores and nothing replicates.
+    // Reads write nothing to the Ground. They may write their own local cache beside it, which git
+    // ignores and nothing replicates: the verified snapshot (task ac538d60e8f9, docs/cli.md), and the
+    // index with the clock its freshness reads (task 7d140f132b1a, docs/design/index-store.md).
     let mut after = files(&ground);
     let cache: Vec<PathBuf> = after.keys().filter(|p| p.starts_with("cache")).cloned().collect();
-    assert_eq!(cache, [PathBuf::from("cache/.gitignore"), PathBuf::from("cache/snapshot")], "only the snapshot");
+    let want = ["cache/.gitignore", "cache/clock", "cache/index-v1-1.sqlite", "cache/snapshot"].map(PathBuf::from);
+    assert_eq!(cache, want, "only the snapshot, the index and its clock");
     assert!(String::from_utf8_lossy(&after[&PathBuf::from("cache/.gitignore")]).lines().any(|l| l == "*"));
     after.retain(|p, _| !p.starts_with("cache"));
     assert_eq!(after, before, "reading wrote to the Ground");

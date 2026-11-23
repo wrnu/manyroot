@@ -1570,7 +1570,19 @@ pub fn compare(dir: &Path, store: &Store, before: &Before) -> Result<()> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stats = Before { clock: None, shards: before.shards.clone() };
     match reconcile(&tx, dir, &path, store, &stats, Record::No, Options::default()) {
-        Ok(_) => differs("this replica's index", &want, &actual(&tx)?).context("BRACKEN_FULL_CHECK")?,
+        Ok(_) => {
+            let got = actual(&tx)?;
+            let (held, indexed): (BTreeSet<&Id>, BTreeSet<&Id>) =
+                (want.order.iter().collect(), got.order.iter().collect());
+            let extra: Vec<&&Id> = indexed.difference(&held).collect();
+            if extra.is_empty() || !held.is_subset(&indexed) {
+                differs("this replica's index", &want, &got).context("BRACKEN_FULL_CHECK")?;
+            } else if let Some(id) = extra.iter().map(|id| ContributionId(***id)).find(|id| !object_exists(dir, id)) {
+                bail!("BRACKEN_FULL_CHECK: this replica's index holds {}, which has no object", id.to_hex());
+            }
+            // Otherwise another process indexed what this store, opened earlier, never listed: no
+            // disagreement, and nothing to compare this store with.
+        }
         Err(Needs::Rebuild) => {}
         Err(Needs::Damaged(e)) => return Err(e.context("BRACKEN_FULL_CHECK: this replica's index is damaged")),
         Err(Needs::Error(e)) if is_damage(&e) => {}

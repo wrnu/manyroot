@@ -1210,12 +1210,22 @@ mod tests {
             fs::rename(dir.join("cache"), &victim).expect("moved");
             fs::remove_file(victim.join(".gitignore")).expect("removed");
             let kept = fs::read(victim.join(SNAPSHOT)).expect("there");
+            // Every file there, with its bytes: the snapshot, and the index and its clock, which the open
+            // made before the swap (docs/design/index-store.md).
+            let contents = |d: &Path| -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+                fs::read_dir(d)
+                    .expect("listed")
+                    .map(|e| e.expect("entry"))
+                    .map(|e| (e.file_name(), fs::read(e.path()).expect("read")))
+                    .collect()
+            };
+            let was = contents(&victim);
+            assert!(was.contains_key(std::ffi::OsStr::new(SNAPSHOT)), "{:?}", was.keys());
             symlink(&victim, dir.join("cache")).expect("linked");
             drop(s);
             assert_eq!(fs::read(victim.join(SNAPSHOT)).expect("there"), kept, "never appended to");
             assert!(!victim.join(".gitignore").exists(), "no .gitignore written through the link");
-            let names: Vec<_> = fs::read_dir(&victim).expect("listed").map(|e| e.expect("entry").file_name()).collect();
-            assert_eq!(names, vec![std::ffi::OsString::from(SNAPSHOT)], "no temporary file left there");
+            assert_eq!(contents(&victim), was, "nothing written there, and no temporary file left");
 
             // Reads through a linked cache/ are full ones and write nothing there.
             let full = Store::open(&dir).expect("valid");
@@ -1224,6 +1234,7 @@ mod tests {
             assert_eq!(fs::read(victim.join(SNAPSHOT)).expect("there"), kept);
             assert!(verify(&dir).is_err(), "verify refuses to write the snapshot through a link");
             assert_eq!(fs::read(victim.join(SNAPSHOT)).expect("there"), kept);
+            assert_eq!(contents(&victim), was, "neither the reads nor verify wrote anything there");
         }
     }
 }
