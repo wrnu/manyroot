@@ -524,6 +524,7 @@ fn a_changed_value_in_any_table_fails_its_checksum() {
         ("meta derived_stale", "UPDATE meta SET v = x'01' WHERE k = 'derived_stale'"),
         ("meta fs_clock", "UPDATE meta SET v = zeroblob(16) WHERE k = 'fs_clock'"),
         ("meta ids", "UPDATE meta SET v = zeroblob(32) WHERE k = 'ids'"),
+        ("meta key", "UPDATE meta SET v = zeroblob(32) WHERE k = 'key'"),
     ];
     for (what, sql) in cases {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -1021,4 +1022,54 @@ fn an_existing_index_is_left_unchanged_by_the_view_and_a_read_only_cache() {
     std::fs::set_permissions(dir.join("cache"), std::fs::Permissions::from_mode(0o755)).expect("restored");
     opened.expect("opens through the full path");
     assert!(after == was, "a read-only cache/ left the index unchanged");
+}
+
+/// Finding a713038d77ae: a schema SQLite can't drop (a virtual table of a module this build lacks, written
+/// in by another SQLite client with defensive mode off) is damage, so verify and a rebuild use the next
+/// generation instead of failing every time.
+#[test]
+fn a_schema_that_cant_be_dropped_moves_to_the_next_generation() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 60, 20);
+    read(&dir, 0);
+    let first = path(&dir).expect("path");
+    {
+        let c = rusqlite::Connection::open(&first).expect("another client");
+        c.execute_batch(
+            "PRAGMA writable_schema = ON; \
+             INSERT INTO sqlite_master VALUES ('table', 'vt', 'vt', 0, 'CREATE VIRTUAL TABLE vt USING nosuchmod()'); \
+             PRAGMA writable_schema = OFF;",
+        )
+        .expect("a virtual table of an unknown module");
+    }
+    let store = Store::open(&dir).expect("valid");
+    rebuild(&dir, &store, &take(&dir)).expect("verify's rebuild moves on to the next generation");
+    assert_ne!(path(&dir).expect("path"), first, "the next generation");
+    agrees(&dir, &store);
+    // Later opens use it (verify's own racy margin left its recent shards dirty, so they're diffed again).
+    let next = read(&dir, 0);
+    assert!(!next.rebuilt && !next.new_generation && next.added == 0, "{next:?}");
+}
+
+/// The ids digest is keyed per index (security review round 2, note 1): two indexes, and two builds of one,
+/// never share a key, so chosen ids can't be solved for a collision without reading this file.
+#[test]
+fn each_index_has_its_own_digest_key() {
+    let key = |dir: &Path| -> Vec<u8> {
+        conn(dir).query_row("SELECT v FROM meta WHERE k = 'key'", [], |r| r.get(0)).expect("a key")
+    };
+    let tmp = tempfile::tempdir().expect("tmp");
+    let (a, b) = (ground(&tmp.path().join("a")), ground(&tmp.path().join("b")));
+    for dir in [&a, &b] {
+        grow(dir, 61, 10);
+        read(dir, 0);
+    }
+    let (ka, kb) = (key(&a), key(&b));
+    assert_eq!(ka.len(), 32);
+    assert_ne!(ka, kb, "two indexes");
+    let store = Store::open(&a).expect("valid");
+    rebuild(&a, &store, &take(&a)).expect("rebuilt");
+    assert_ne!(key(&a), ka, "a rebuild makes a new one");
+    agrees(&a, &store);
 }

@@ -378,8 +378,21 @@ fn is_damage(e: &anyhow::Error) -> bool {
             matches!(e.sqlite_error_code(), Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase))
         }) || c.downcast_ref::<WrongVersion>().is_some()
             || c.downcast_ref::<NotAFile>().is_some()
+            || c.downcast_ref::<SchemaDamage>().is_some()
     })
 }
+
+/// A schema that couldn't be cleared or recreated: damage, so a new generation.
+#[derive(Debug)]
+struct SchemaDamage(String);
+
+impl std::fmt::Display for SchemaDamage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the index file's schema can't be replaced: {}", self.0)
+    }
+}
+
+impl std::error::Error for SchemaDamage {}
 
 /// Something at the index's path that isn't a regular file: damage, so a new generation.
 #[derive(Debug)]
@@ -749,7 +762,7 @@ fn reconcile(
         return Err(Needs::Rebuild);
     }
     let recorded_clock = meta.get("fs_clock").and_then(|v| clock_of(v));
-    let Some(mut indexed) = meta.get("ids").and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()) else {
+    let (Some(key), Some(mut indexed)) = (meta32(&meta, "key"), meta32(&meta, "ids")) else {
         return Err(Needs::Rebuild);
     };
     let mut rows = read_shards(tx)?;
@@ -836,7 +849,7 @@ fn reconcile(
     if !added.is_empty() {
         let wanted: HashSet<ContributionId> = added.iter().copied().collect();
         let order = g.topo_order();
-        let mut ins = Inserter::new(tx)?;
+        let mut ins = Inserter::new(tx, key)?;
         for id in order.iter().filter(|id| wanted.contains(id)) {
             if !ins.insert(g.get(id).expect("ordered ids exist"))? {
                 return Err(Needs::Rebuild);
@@ -851,7 +864,7 @@ fn reconcile(
     // the store holds: another process may have indexed what this store never listed, while this one
     // holds what that one didn't (finding cf0181613a78).
     let was_stale = meta.get("derived_stale").is_some_and(|v| v != &[0]);
-    if (was_stale || !added.is_empty()) && count(tx)? == g.len() as i64 && indexed == store_digest(store) {
+    if (was_stale || !added.is_empty()) && count(tx)? == g.len() as i64 && indexed == store_digest(&key, store) {
         let order = g.topo_order();
         let after = if was_stale { -1 } else { suffix_start(tx, store, &added)? };
         write_order(tx, &order, after)?;
@@ -932,26 +945,35 @@ fn durable(paths: &[PathBuf]) -> Result<usize> {
     Ok(unique.len())
 }
 
-/// The set of `ids` as one value: every id XORed together. Ids are unique, so two sets of one size agree
-/// here only by chance (ids are hashes), which a count alone doesn't give (finding cf0181613a78).
-fn digest<'a>(ids: impl IntoIterator<Item = &'a [u8; 32]>) -> [u8; 32] {
+/// The set of `ids` as one value, which a count alone doesn't give (finding cf0181613a78): the XOR of each
+/// id's BLAKE3 hash keyed with this index's own random `key` (`meta`'s `key`, made by each rebuild). Ids
+/// are unique, and ids arrive from others, who could choose some whose plain XOR collides (about 256 solve
+/// it over GF(2)); keyed with a key they never see, two sets of one size agree only by chance.
+fn digest<'a>(key: &[u8; 32], ids: impl IntoIterator<Item = &'a [u8; 32]>) -> [u8; 32] {
     let mut d = [0u8; 32];
     for id in ids {
-        for (x, y) in d.iter_mut().zip(id) {
-            *x ^= y;
-        }
+        d = xor(d, *blake3::keyed_hash(key, id).as_bytes());
     }
     d
 }
 
 fn xor(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
-    digest([&a, &b])
+    let mut d = a;
+    for (x, y) in d.iter_mut().zip(b) {
+        *x ^= y;
+    }
+    d
 }
 
-/// The digest of what `store` holds.
-fn store_digest(store: &Store) -> [u8; 32] {
+/// The digest of what `store` holds, with `key`.
+fn store_digest(key: &[u8; 32], store: &Store) -> [u8; 32] {
     let ids: Vec<[u8; 32]> = store.graph().iter().map(|c| *c.id().as_bytes()).collect();
-    digest(&ids)
+    digest(key, &ids)
+}
+
+/// `meta`'s 32-byte value `k`, if it has one.
+fn meta32(meta: &HashMap<String, Vec<u8>>, k: &str) -> Option<[u8; 32]> {
+    meta.get(k).and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
 }
 
 fn count(conn: &Connection) -> rusqlite::Result<i64> {
@@ -970,11 +992,15 @@ fn rebuild_in(
     record: Record,
     opts: Options,
 ) -> Result<Outcome> {
-    clear_schema(tx)?;
-    tx.execute_batch(SCHEMA)?;
+    // A schema that can't be cleared or made (a virtual table of a module this build lacks, say) is damage:
+    // the next generation is used (finding a713038d77ae).
+    clear_schema(tx).and_then(|()| Ok(tx.execute_batch(SCHEMA)?)).map_err(|e| SchemaDamage(format!("{e:#}")))?;
     let g = store.graph();
+    let mut key = [0u8; 32];
+    getrandom::fill(&mut key).map_err(|e| anyhow::anyhow!("no random key for the index: {e}"))?;
+    put_meta(tx, "key", &key)?;
     {
-        let mut ins = Inserter::new(tx)?;
+        let mut ins = Inserter::new(tx, key)?;
         for id in g.topo_order() {
             let inserted = ins.insert(g.get(&id).expect("ordered ids exist"))?;
             assert!(inserted, "topological order puts parents first");
@@ -1040,7 +1066,7 @@ fn suffix_start(tx: &Connection, store: &Store, added: &[ContributionId]) -> Res
 fn clear_schema(tx: &Connection) -> Result<()> {
     let objects: Vec<(String, String)> = {
         let mut st = tx.prepare(
-            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' \
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' ESCAPE '\\' \
              ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 WHEN 'index' THEN 2 ELSE 3 END",
         )?;
         st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
@@ -1172,14 +1198,15 @@ struct Inserter<'t> {
     tx: &'t Connection,
     next_seq: i64,
     next_pos: i64,
-    /// The [`digest`] of what this inserter added.
+    /// The index's digest key, and the [`digest`] of what this inserter added.
+    key: [u8; 32],
     digest: [u8; 32],
 }
 
 impl<'t> Inserter<'t> {
-    fn new(tx: &'t Connection) -> rusqlite::Result<Inserter<'t>> {
+    fn new(tx: &'t Connection, key: [u8; 32]) -> rusqlite::Result<Inserter<'t>> {
         let next_pos = tx.query_row("SELECT coalesce(max(pos) + 1, 0) FROM obj", [], |r| r.get(0))?;
-        Ok(Inserter { tx, next_seq: count(tx)?, next_pos, digest: [0; 32] })
+        Ok(Inserter { tx, next_seq: count(tx)?, next_pos, key, digest: [0; 32] })
     }
 
     fn seq_of(&self, id: &ContributionId) -> Result<Option<i64>> {
@@ -1246,7 +1273,7 @@ impl<'t> Inserter<'t> {
             ts_key: ts_key(c.content().timestamp_ms),
         };
         let seq = row.seq;
-        self.digest = xor(self.digest, row.id);
+        self.digest = xor(self.digest, digest(&self.key, [&row.id]));
         tx.prepare_cached("INSERT INTO obj VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?.execute(params![
             row.seq,
             row.pos,
@@ -1399,7 +1426,9 @@ fn actual(conn: &Connection) -> Result<Answers> {
     if seqs.iter().enumerate().any(|(i, s)| *s != i as i64) {
         bail!("the index's seqs aren't dense");
     }
-    if read_meta(conn)?.get("ids").map(Vec::as_slice) != Some(&digest(by_seq.values())[..]) {
+    let meta = read_meta(conn)?;
+    let key = meta32(&meta, "key").context("the index has no digest key")?;
+    if meta32(&meta, "ids") != Some(digest(&key, by_seq.values())) {
         bail!("the index's ids digest doesn't match its obj rows");
     }
     let id = |s: i64| -> Result<[u8; 32]> { by_seq.get(&s).copied().context("a row names a seq that isn't there") };

@@ -184,7 +184,7 @@ CREATE TABLE shard  (n INTEGER PRIMARY KEY,          -- 0..255; no row means dir
                      ino BLOB, dev BLOB,             -- u64s as 8 big-endian bytes
                      ck BLOB NOT NULL);
 CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL, ck BLOB NOT NULL);
-                     -- schema_version, ground id, file (its own device and inode), ids, derived_stale, fs_clock
+                     -- schema_version, ground id, file (its own device and inode), key, ids, derived_stale, fs_clock
 ```
 
 **Order.** Every answer that the full computation orders by `Graph::topo_order()`
@@ -247,8 +247,12 @@ incrementally is Phase 4 (research B R2).
 - In PR 2, the derived tables are brought up to date only when the index holds
   exactly what the store holds. Otherwise `derived_stale` is set until a later
   refresh, which then recomputes both whole.
-  - "Exactly" is the same count and the same `ids` digest: every indexed id
-    XORed together, kept in `meta` by each insert and compared with the store's.
+  - "Exactly" is the same count and the same `ids` digest: the XOR of every
+    indexed id's BLAKE3 hash keyed with `key`, a random 32 bytes each rebuild
+    makes, kept in `meta` by each insert and compared with the store's. Ids
+    arrive from others, who could choose some whose plain XOR collides (about
+    256 solve it over GF(2)); keyed with a key they never see, two sets agree
+    only by chance.
     A count alone isn't enough: another process can index what this store never
     listed while this store holds, in a shard its stamps call clean, as many that
     the index lacks (finding `cf0181613a78`).
@@ -453,9 +457,10 @@ is SQLite's documented corruption case.
   - the file's own device or inode differs from the one in `meta` (section 7);
   - a parent or referenced contribution is missing;
   - an indexed object is gone.
-- **SQLITE_CORRUPT or SQLITE_NOTADB**, from any statement, or anything at the
-  file's path that isn't a regular file (a directory, a link, a FIFO), means the
-  file isn't touched again. The next generation's file (`-<g+1>`) is created beside it and
+- **SQLITE_CORRUPT or SQLITE_NOTADB**, from any statement, anything at the
+  file's path that isn't a regular file (a directory, a link, a FIFO), or a
+  schema a rebuild can't drop or recreate (a virtual table of a module this
+  build lacks, finding `a713038d77ae`), means the file isn't touched again. The next generation's file (`-<g+1>`) is created beside it and
   used from then on.
   - Processes still holding the old file keep their handles, and nothing is
     unlinked under them.
