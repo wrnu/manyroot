@@ -163,20 +163,21 @@ CREATE TABLE obj    (seq INTEGER PRIMARY KEY,        -- stable row key; insertio
                      id BLOB NOT NULL UNIQUE,        -- 32 bytes; prefix lookups are range scans
                      kind INTEGER NOT NULL,          -- claim, artifact, relation, evidence, retract
                      author INTEGER NOT NULL,        -- -> agent.n
-                     ts_key INTEGER NOT NULL);       -- timestamp_ms XOR 2^63, as i64 (see below)
+                     ts_key INTEGER NOT NULL,        -- timestamp_ms XOR 2^63, as i64 (see below)
+                     ck BLOB NOT NULL);              -- row checksum (section 6)
 CREATE TABLE agent  (n INTEGER PRIMARY KEY, key BLOB NOT NULL UNIQUE);
 CREATE TABLE parent (child INTEGER, parent INTEGER, PRIMARY KEY (child, parent)) WITHOUT ROWID;
 CREATE TABLE child  (parent INTEGER, child INTEGER, PRIMARY KEY (parent, child)) WITHOUT ROWID;
 CREATE TABLE head   (seq INTEGER PRIMARY KEY);
-CREATE TABLE tag    (tag TEXT, seq INTEGER, PRIMARY KEY (tag, seq)) WITHOUT ROWID;
+CREATE TABLE tag    (tag TEXT, seq INTEGER, ck BLOB NOT NULL, PRIMARY KEY (tag, seq)) WITHOUT ROWID;
 CREATE INDEX obj_kind   ON obj(kind, pos);
 CREATE INDEX obj_author ON obj(author, pos);
 -- rkind: a relation kind, evidence pass, evidence fail, or retract
-CREATE TABLE ref    (target INTEGER, rkind INTEGER, src INTEGER,
+CREATE TABLE ref    (target INTEGER, rkind INTEGER, src INTEGER, ck BLOB NOT NULL,
                      PRIMARY KEY (target, rkind, src)) WITHOUT ROWID;
-CREATE TABLE fwd    (src_end INTEGER, rkind INTEGER, rel INTEGER, to_end INTEGER,
+CREATE TABLE fwd    (src_end INTEGER, rkind INTEGER, rel INTEGER, to_end INTEGER, ck BLOB NOT NULL,
                      PRIMARY KEY (src_end, rkind, rel)) WITHOUT ROWID;     -- relations by `from`
-CREATE TABLE hidden (seq INTEGER PRIMARY KEY);       -- what --current hides
+CREATE TABLE hidden (seq INTEGER PRIMARY KEY, ck BLOB NOT NULL);           -- what --current hides
 CREATE TABLE shard  (n INTEGER PRIMARY KEY,          -- 0..255; no row means dirty
                      present INTEGER NOT NULL,       -- 0: reconciled as absent
                      mtime_s INTEGER, mtime_ns INTEGER, ctime_s INTEGER, ctime_ns INTEGER,
@@ -388,20 +389,26 @@ is SQLite's documented corruption case.
 - `PRAGMA cell_size_check=ON` is set on every connection, which is cheap. Damage
   that SQLite sees surfaces as SQLITE_CORRUPT and moves to a new generation, as
   above.
-- SQLite keeps no page checksums. A bit flip inside a row value, or a secondary
-  index that no longer matches its table, can give a wrong answer without an
-  error. What catches it:
-  - `BRACKEN_FULL_CHECK`, which compares every table with the recompute (every
-    value, set and order the index answers, so any such flip that changes an
-    answer);
+- **Row checksums** (decision `c489f7f9dea9`). SQLite keeps no page checksums,
+  so every `obj`, `tag`, `ref`, `fwd` and `hidden` row carries `ck`: the first
+  8 bytes of a blake3 hash over its other fields, encoded in a fixed order.
+  - A rewrite of `pos` rewrites that row's `ck`.
+  - Every row a read returns is checked against its `ck`.
+  - A mismatch rebuilds the index in place, since the file itself is sound
+    (SQLITE_CORRUPT moves to a new generation instead, as above), and that read
+    falls back to the full path.
+
+  This keeps the snapshot's guarantee that a damaged byte is detected and
+  rebuilt (`crates/bracken/tests/snapshot.rs`), at a cost of one hash per returned
+  row. It isn't meant to resist forgery: anyone who can write `cache/` can
+  recompute it (section 7).
+- **Residual, accepted.** Structural damage that drops rows from a table or a
+  secondary index, so a read never returns them, isn't caught by a row check.
+  What catches it:
+  - `BRACKEN_FULL_CHECK`, which compares every table and the order with the
+    recompute;
   - the gate's check on the main Ground (PR 3);
   - `bracken verify`'s rebuild.
-
-  An ordinary read does not catch it. That's weaker than the snapshot, whose
-  segments carry checksums. Per-row checksums would narrow it, but the bundled
-  SQLite has no checksum VFS, and they wouldn't cover the secondary indexes. This
-  is stated as an accepted risk for a cache under the replica's own trust model,
-  for the manager to accept or not.
 
 **Concurrency.** WAL readers each read a consistent snapshot while one writer
 commits, and `busy_timeout` serialises writers. A reader that finds dirty shards
@@ -493,7 +500,7 @@ Each property maps to a test, in PR 2 unless marked PR 3:
 | Concurrency | several processes refreshing a stale, missing or damaged index at once agree, and each object is added once |
 | Rebuild under an open connection | a rebuild, or a move to a new generation, while another connection reads: both answer what the full computation gives |
 | Damage | a file that isn't a database moves to a new generation; a schema version or ground mismatch rebuilds; SQLITE_BUSY falls back without a rebuild |
-| Value corruption | a changed row (a tag, a hidden row, a `pos`) with a clean stamp fails the full check |
+| Value corruption | a byte changed in an `obj`, `tag`, `ref`, `fwd` or `hidden` row fails that row's checksum on read, rebuilds the index, and the read's answer equals the full computation's (as `tests/snapshot.rs` does for the snapshot); a row deleted with a clean stamp fails the full check |
 | Schema versions | two schema versions alternating on one Ground don't rebuild each other's file |
 | Widths | `timestamp_ms` = u64::MAX indexes, and orders after every smaller value |
 | Read-only | `bracken view` and a read-only replica never write, and fall back when the index is dirty or the `-shm` is missing |
@@ -520,7 +527,7 @@ Each PR reports those numbers.
 | `155f7566cac1`, `2538f1286416` rebuild protocol, newer schema | section 6, Rebuilds and Schema versions: in place in one transaction, never unlinking an open file; per-version files; BUSY isn't damage |
 | `1128ae98db65`, `23579eecd2a7` power loss | section 6, Order: shard directory fsync before the index commit, and the shard's row deleted in that transaction |
 | `21fedaad26ab` integer widths | section 4, Integer widths: `ts_key` order-preserving, stat fields whole |
-| `3f3b3d278d99` quick_check, value corruption | section 6, Integrity checks: when quick_check runs; SQLITE_CORRUPT means a new generation; value flips caught by the full check, the gate and verify, stated as an accepted risk |
+| `3f3b3d278d99` quick_check, value corruption | section 6, Integrity checks: when quick_check runs; SQLITE_CORRUPT means a new generation; per-row checksums checked on every returned row (decision `c489f7f9dea9`); dropped rows caught by the full check, the gate and verify |
 | `5947f43b4b64` read-only opens, serve | section 6, Read-only opens and `bracken serve` |
 | `6e6530271736` tests | section 8's table |
 
