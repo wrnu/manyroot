@@ -191,16 +191,21 @@ lines.
 | `checks` | `Mutex<Checks>`, from `Checks::build(g, &index, &lines)` | `Checks` holds a `Cell` (its epoch-miss count), so it is `Send` but not `Sync`. A mutex shares it, so green and counted results are computed one request at a time. PR (b) measures how long it is held, now and at 10x |
 | `reviews` | `Reviews::build(&index, &lines)` | |
 | `records` | one pass over `g` | The ids of every proposal, resolution and `text/plain` artifact, and every `supersedes` relation between line versions (a version's chain, which `Lines` keeps private), by media type and kind. `Lines` lists only valid proposals per line, and `Resolutions` has no iterator |
-| `answers` | one pass over every decision | Every decision answer, indexed by what it names: an objection id, a target id (a decision, a proposal, or a manifest artifact, which is also indexed by its hash), or its own line. Each entry holds the decision, disposition and reason. Section 4's objections page reads it |
-| `derived` | `Mutex<Cache>`, empty at build, filled on request | The answers of one line's or one record's reads that sort the graph (below), and conflict previews. At most 64 entries, dropped with the snapshot |
+| `answers` | one pass over every decision | Every decision answer, indexed by what it names, keyed as `crates/tree` resolves an answer (`Obligations`' keys): an objection id; a decision; a manifest artifact, by its manifest's hash; a proposal, by its line and change, so an answer to a rebased proposal with the same change is found too; or its own line. Each entry holds the decision and the disposition. Section 4's objections page reads it |
+| `derived` | `Mutex<Cache>`, empty at build, filled on request | The answers of one line's or one record's reads that sort the graph (below), and conflict previews, dropped with the snapshot. Bounded by bytes, not entries: an entry is kept as its serialized JSON, and its size is that length. The cache holds at most 32 MiB in all, evicting the oldest first. An entry over 4 MiB isn't kept at all: that read is recomputed for every page, within its slot |
 
 **Reads that sort the whole graph.** `Lines::open_objections`,
 `proposal_objections` and `manifest_objections` each build an `Ancestry`,
 which sorts the whole graph, on every call. `Checks::green` and
 `Lines::heads` walk a line's decision history. So the view calls them only
-for the one line or record a request names, never for every line. Each
-answer is kept in `derived`, so a reload costs nothing. At most 2 such reads
-run at once. A request past that gets a 503 at once (section 4, Caps).
+for the one line or record a request names, never for every line.
+- **What is kept.** `derived` keeps what the pages need of each read, never
+  the read's whole result. For an objection read, that is the objections'
+  ids in order and their total; the rows of a page are built from the
+  index for that page alone. For heads and green, it is the line's answer.
+  So a reload costs nothing, within the byte budget above.
+- **Slots.** At most 2 such reads run at once. A request past that gets a
+  503 at once (section 4, Caps).
 
 **Reading `weave-root`.** `weave::root` reads the file with an unbounded
 `read_to_string`. `scripts/weave` refuses a `weave-root` that isn't a
@@ -252,14 +257,28 @@ conflicts, problems, missing paths and change entries.
   path-ordered lists. In a tree it's a child's name, not its full path, so
   a request stays far under the 16 KiB head limit (`serve.rs`, `MAX_HEAD`).
   So a page stays the same as new records arrive.
-- **Each item's text** is capped as well (section 4, Caps), so the answer
-  is bounded by its limit times that cap.
+- **A list inside a list item** carries at most 5 entries and its own
+  `total`, with each entry's text cut to 200 characters (the view's
+  `SHORT_CHARS`). Its full list is on the item's own page or endpoint. This
+  covers:
+  - a decision row's `parents`, `proposals`, `resolutions`, `goals`,
+    `answers` and `breakage` in a log;
+  - an `Incomplete` problem's missing paths;
+  - an objection's answers.
+
+  An endpoint whose items hold such lists (`/api/weave/log`, `list=problems`
+  and `/api/weave/objections`) takes `limit` up to 200, not 2,000.
+- **So every answer is bounded by its limit times one row's cap.** A row's
+  own strings are cut to 4 KiB, and its nested lists as above, so a row is
+  at most about 16 KiB of JSON, and `json_bytes` can write that as up to 6
+  times as many bytes. A page of 200 nested rows is at most about 3 MiB
+  before escaping, and a page of 2,000 flat rows about 8 MiB.
 
 | Endpoint | Gives | Read with |
 |---|---|---|
-| `/api/weave?list&after&limit` | `weave`, marker, root; `lines` (as `weave line list --json`, each with its number of decisions from `logs`); the default line's `heads`, `forked` and green `state`; `problems` (each `Incomplete`'s `missing` cut to 20); `unreadable`; `ignored_versions`. No other line's heads, green or objections: those sort or walk per line (section 3) | `Index::counted_marker`, `root`, `problems`; `Lines::lines`, `default_line`, `unreadable`, `ignored_versions`; `logs`; for the default line, `derived` |
-| `/api/weave/line/<line>?list&after&limit` | current policy versions (several if diverged) with every policy field, every version of the chain (`records`' supersedes relations between `Lines::version`s, by the line's author), `heads`, `green` (as `weave green --json`), `goals` with `binds`, and the number of open objections (as `weave review --json`'s `open`, whose list is on the objections page) | `Lines::line`, `current_versions`, `version`; `derived` for `heads`, `Checks::green` and `counted`, and `open_objections`; `reviews::goals`, `Goal::binds` |
-| `/api/weave/objections/<line>?state&after&limit` | every objection whose target is a decision on the line, a proposal on the line, or a manifest a decision or proposal on the line has, ascending by id; `state` filters (`open`, `other`, `all`). An open one has its basis and allowed dispositions. Every other one has its author, note and whether it's retracted now (joined from `Index::reviews` by id), `open: false`, and `answers`: the decisions whose answers name it or its target (first 20, `total`), and `line_answers`, the count of the line's decisions with a line-wide answer | `Lines::objections().list()` with each `Objection`'s target; `Index::reviews`; `answers`; `derived` for `open_objections` |
+| `/api/weave?list&after&limit` | `weave`, marker, root; `lines` (as `weave line list --json`, each with its number of decisions from `logs`); the default line's `heads`, `forked` and green `state`; `problems` (each `Incomplete`'s `missing` as a nested list: 5 paths and its total); `unreadable`; `ignored_versions`. No other line's heads, green or objections: those sort or walk per line (section 3) | `Index::counted_marker`, `root`, `problems`; `Lines::lines`, `default_line`, `unreadable`, `ignored_versions`; `logs`; for the default line, `derived` |
+| `/api/weave/line/<line>?list&after&limit` | current policy versions (several if diverged) with every policy field, every version of the chain (`records`' supersedes relations between `Lines::version`s, by the line's author), `heads`, `green` (as `weave green --json`), `goals` with `binds`, and the number of open objections: exactly the objections `/api/weave/objections/<line>?state=open` lists, which `Lines::open_objections` gives (*Which objections a line has*, below) | `Lines::line`, `current_versions`, `version`; `derived` for `heads`, `Checks::green` and `counted`, and `open_objections`; `reviews::goals`, `Goal::binds` |
+| `/api/weave/objections/<line>?state&after&limit` | the line's objections (*Which objections a line has*, below), ascending by id, `limit` at most 200; `state` filters (`open`, `other`, `all`). Each has its author, its note (4 KiB) and whether it's retracted now (joined from `Index::reviews` by id). An open one also has its basis and allowed dispositions. Each has `answers`, a nested list of the decisions whose answers name the objection itself: 5 entries of decision and disposition, and the total. Answers that name its target or the line are the same for every objection to that target. So they come once per page, in `target_answers`, keyed by target (5 each, and the total), and `line_answers` is the line's count of line-wide answers. A decision's own page has each answer's full reason | `Lines::objections().list()` with each `Objection`'s target; `Lines::decision_ancestry`; `Index::reviews`; `answers`; `derived` for the line's objection ids and `open_objections` |
 | `/api/weave/log/<line>?after&limit` | decisions newest first, as `weave log --json` rows | `logs`; `Lines::decision` |
 | `/api/weave/decision/<id>?list&after&limit` | the `weave log` row, plus `verdict` (`qualifies`, or the rule's message), `policy` in force, `counted` per check, reviews | `Lines::decision`, `verdict`, `policy_in_force_for`; `Checks::counted`; `Reviews::of_decision` |
 | `/api/weave/tree/<record>?dir&after&limit` | the record's manifest hash, and the direct children of `dir` (default the root): directories with the number of files below them, then files with mode, size, hash and `held` | `Index::manifest`, `file_size` (held means held at the entry's size); the manifest's sorted entries, by a range search on the prefix |
@@ -283,16 +302,26 @@ conflicts, problems, missing paths and change entries.
   reads it: from the details' run lines only, before the first blank line,
   the line `log <id> <hash>`. It is linked only if that artifact's content
   hashes as named.
-- **Which objections a line has.** An objection belongs to a line when its
-  target is one of these:
-  - a decision whose payload's `line` is that line;
-  - a proposal whose payload's `line` is that line;
-  - a manifest that a decision or proposal on that line has.
+- **Which objections a line has.** One scope, used by the line page's count
+  and by the objections endpoint alike. It is the past rule 5 reads for the
+  line's next move (weave.md section 2), widened to what a move could use.
+  An objection belongs to a line when its target is one of these:
+  - a decision in the decision ancestry of the line's heads, on any line
+    (`Lines::decision_ancestry`, the heads included). A line that branched
+    from or merged another line's decision therefore lists objections to
+    that decision, as `Lines::open_objections` counts them (finding
+    `a57dc4619c24`);
+  - a proposal on that line, by its payload's `line`;
+  - a manifest that one of those decisions, or a proposal on that line, has.
 
-  So an objection to a manifest two lines share is listed on both. Its
-  target resolves whether or not the target is retracted, as weave.md
-  section 1 says. `Obligations::list` includes retracted objections, so the
-  view joins each one to `Index::reviews` by id and marks it.
+  `state=open` is exactly `Lines::open_objections` for the line, every one
+  of which is in that scope. `state=other` is the rest of the scope. So the
+  count on the line page and the open list always agree. An objection to a
+  manifest two lines share is listed on both. Its target resolves whether
+  or not the target is retracted, as weave.md section 1 says.
+  `Obligations::list` includes retracted objections, so the view joins
+  each one to `Index::reviews` by id and marks it. The scope's objection
+  ids and their total are what `derived` keeps for a line (section 3).
 
 ### Conflict preview
 
@@ -345,11 +374,13 @@ computes only this:
 | Each side of a unified diff | 1 MiB, and `diff::MAX_DIFF_CELLS` | `diff::unified` builds a table of up to 16 million `u32`s (64 MB). The page renders its output 5,000 lines at a time, as for files |
 | Work building at once | 2 unified diffs, 2 conflict previews, 2 graph-sorting reads (section 3) | Taken with a new non-blocking `Slots::try_take`. Today's `Slots::take` waits, which would hold a connection. A request past the slots gets a 503 at once, to retry |
 | A conflict preview | 20 conflicts a page, 10 resolutions each, sides at most 1 MiB each and 16 MiB in all | *Conflict preview* above |
-| Lists | 50 inside an answer; pages of 200 by default, 2,000 at most | *Every list is paged* above |
+| Lists | 50 inside an answer; pages of 200 by default, 2,000 at most, or 200 at most for an endpoint whose rows hold nested lists | *Every list is paged* above |
+| A list inside a list item | 5 entries and its total, each entry's text 200 characters | The row's own page has the rest |
 | A check result's details | 4 KiB in a list, 64 KiB on `/api/weave/result/<id>` | 64 KiB is the view's existing `TEXT_BYTES`. A list of 2,000 results is at most 8 MiB of details |
 | A box log | 64 KiB | |
 | Notes, summaries, reasons, goals and other short text in a list | 4 KiB each | A record's own page has its text up to 64 KiB |
-| Answers per objection | 20 decisions, with `total` | |
+| Answers per objection | 5 that name it, with the total; target-level answers once per page, 5 per target | Deduplicated, so one target's answers aren't repeated on every objection to it |
+| `derived` | 32 MiB in all, 4 MiB an entry, by serialized size | Section 3 |
 
 The text cap is 1 MiB, for files and each side of a diff. The 64 KiB and
 4 KiB caps apply to the other text, as listed above. Text is cut on a
@@ -593,7 +624,7 @@ read-only.
 | (c) | `tree` and `file`; the tree browser and file page, with line numbers rendered 5,000 at a time and invisible characters marked; tests for binary, oversized, symlink (text and not), missing and short-held files, and a megabyte of newlines in the Node check | cli |
 | (d) | `history` and `diff`; the history and diff pages; tests at the caps, for a line's root and a first decision made by a line merge, and for the diff slots refusing at once | cli |
 | (e) | `proposals` and `proposal`, with status and the conflict preview; the proposal pages. Its tests cover: <br>• each status; <br>• a forked line and a diverged policy getting no preview; <br>• a conflict with an offered resolution and one by an integrator, and 11 resolutions on one key paging; <br>• a mode-only conflict; <br>• the preview budget, with 1,000 paths naming one blob: at most 20 a page, the rest paged; <br>• a side over the view's cap; <br>• the cache | cli |
-| (f) | `objections`, `manifest`, `result` and `log-artifact`; check results by anyone, with details and box logs, goals and objections; tests for: <br>• counted, replaced, retracted and non-validator results; <br>• each objection basis; <br>• a retracted objection; <br>• an objection answered by name, by target and line-wide; <br>• a diverged policy; <br>• 2,001 results on one manifest paging; <br>• a non-UTF-8 log | cli |
+| (f) | `objections`, `manifest`, `result` and `log-artifact`; check results by anyone, with details and box logs, goals and objections; tests for: <br>• counted, replaced, retracted and non-validator results; <br>• each objection basis; <br>• a retracted objection; <br>• an objection answered by name, by target and line-wide; <br>• a diverged policy; <br>• 2,001 results on one manifest paging; <br>• objections to a decision another line branched from, counted and listed alike; <br>• many lines sharing one manifest with many objections to it, holding `derived` within its byte budget; <br>• a non-UTF-8 log | cli |
 
 Done when (a) to (f) are merged.
 
@@ -648,6 +679,16 @@ section:
 | `817bba809548`: `as_of` copies left out of memory; the Loom's `as_of` open to blind cross-site requests | Section 5 counts them: 9 copies at worst, measured in PR (b) and reported beside the 4 GB stop. The `Sec-Fetch-Site` refusal covers every `/api/` path, the Loom's included, and is listed as a shared change with its own test (sections 2 and 7) |
 | `7b26f824e133`: non-open objections promised but not served; `Obligations::list` includes retracted ones | A paged `/api/weave/objections/<line>` serves them. Section 4 says which objections a line has, joins each to `Index::reviews` for its note and whether it's retracted, and caps the answering decisions it lists from the `answers` index. Section 1 promises only that, and still nothing that needs `crates/tree` |
 | `5151a25507b9`: `Lines::log` and the objection reads sort the whole graph per call | Logs come from one `newest_first` per rebuild, bucketed by verdict line. Heads, green and objections are computed only for the line or record a request names, slotted and cached, and never for every line; the home page shows them for the default line only (sections 3, 4 and 5) |
+
+### Round 3
+
+Decision `057c4e8dace6`: these three only, then a delta check.
+
+| Finding | Handling |
+|---|---|
+| `a57dc4619c24`: the line page's count and the objections endpoint scope a line differently; proposal answers not keyed by line and change | One scope for both: objections to the decision ancestry of the line's heads on any line, the line's proposals, and their manifests. `state=open` is exactly `Lines::open_objections`. The `answers` index keys a proposal answer by line and change, as `crates/tree` does (sections 3 and 4) |
+| `a011a2d353e1`: the objections endpoint's limit times nested answers breaks the bound | Nested lists carry 5 entries of 200 characters and a total. Endpoints with nested rows take `limit` up to 200. Target-level answers come once per page. A page is bounded by its limit times one row's cap, stated in numbers (section 4) |
+| `63bb4c9c3cdd`: `derived` bounded by entries | 32 MiB in all and 4 MiB an entry, by serialized size, oldest evicted. Objection reads keep ids and a total, never the whole `Vec<Open>`; a larger read is recomputed per page within its slot (section 3) |
 
 Round 2's notes are taken too:
 - the scripts count rises to 13;
