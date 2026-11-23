@@ -464,6 +464,59 @@ fn tree_scope_frozen_names_every_cargo_configuration_crates_tree_builds_with() {
     }
 }
 
+/// Finding 61094746cfa7 (task 1fb015806aa5): what changes how crates/tree compiles with no change to its
+/// source, manifest or the lock is frozen too: the rustc wrapper every compile runs through, crates/tree's
+/// build script, and a toolchain pin rustup reads for a build there, in any letter case. Another crate's
+/// build script or toolchain file, or a file beside the wrapper, isn't.
+#[test]
+fn tree_scope_frozen_names_the_wrapper_build_script_and_toolchain_pins() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("tree-scope");
+        let files = [("scripts/tree-scope", scope.as_path())];
+        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/format.rs", "format\n");
+            put(dir, "scripts/rustc-wrapper", "#!/bin/sh\nexec \"$@\"\n");
+        });
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let frozen = |files: &[(&str, &str)]| {
+            let head = plumb(&dir, &main, &[&main], files);
+            let out = command(&dir, "scripts/tree-scope", &["frozen", &main, &head]).output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let wrapper = "the rustc wrapper .cargo/config.toml runs for every compile, crates/tree's included";
+        let build = "crates/tree's build script, which cargo builds and runs with no manifest change";
+        let toolchain = "a toolchain pin rustup reads for a build of crates/tree";
+        for (path, text, why) in [
+            ("scripts/rustc-wrapper", "#!/bin/sh\nexec \"$@\" --cfg x\n", wrapper),
+            ("crates/tree/build.rs", "fn main() { println!(\"cargo:rustc-cfg=x\"); }\n", build),
+            ("crates/tree/Build.rs", "fn main() {}\n", build),
+            ("rust-toolchain.toml", "[toolchain]\nchannel = \"nightly\"\n", toolchain),
+            ("rust-toolchain", "nightly\n", toolchain),
+            ("crates/rust-toolchain.toml", "[toolchain]\nchannel = \"nightly\"\n", toolchain),
+            ("crates/rust-toolchain", "nightly\n", toolchain),
+            ("crates/tree/rust-toolchain.toml", "[toolchain]\nchannel = \"nightly\"\n", toolchain),
+            ("crates/tree/Rust-Toolchain", "nightly\n", toolchain),
+        ] {
+            let (code, out) = frozen(&[(path, text)]);
+            assert_eq!(code, Some(0), "{scripts}: {path}: {out}");
+            assert!(out.contains(&format!("tree-scope: frozen: {path} ({why})\n")), "{scripts}: {path}: {out}");
+        }
+        // Removing the wrapper is a change to it too.
+        let (code, out) = frozen(&[("scripts/rustc-wrapper", "")]);
+        assert!(code == Some(0) && out.contains(&format!("scripts/rustc-wrapper ({wrapper})")), "{scripts}: {out}");
+        for path in [
+            "crates/bracken/build.rs",
+            "crates/tree/tests/build.rs",
+            "crates/bracken/rust-toolchain.toml",
+            "scripts/rustc-wrapper.md",
+            "docs/rust-toolchain.toml",
+        ] {
+            let (code, out) = frozen(&[(path, "x\n")]);
+            assert_eq!(code, Some(3), "{scripts}: {path}: {out}");
+        }
+    }
+}
+
 /// Findings 5b38ef3c9557 and e1a2fe970409. APFS folds some non-ASCII letters onto ASCII ones (the long s
 /// onto s, the Kelvin sign onto k), so a path holding any byte outside printable ASCII is refused by frozen,
 /// exit 2 naming it escaped, frozen or not. And it reads every path
