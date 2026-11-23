@@ -89,15 +89,17 @@ never writes to any Ground, and it never writes a tree to disk.
   to integrating it unchanged (`Lines::manifest_objections`).
 - **Goals and objections.** Goals show with whether they bind under the
   line's current policy. A line's objections page (`/api/weave/objections`,
-  section 4) lists every objection whose target is on that line, a page at a
-  time. *Open* objections (`Lines::open_objections`) show with their basis
+  section 4) lists the line's objections, a page at a time. That includes
+  objections to any decision in its heads' decision ancestry, whatever line
+  that decision is on, as well as to its proposals and their manifests
+  (section 4, *Which objections a line has*). *Open* objections (`Lines::open_objections`) show with their basis
   (evidence-backed, goal-backed or discussion, and `replaced`) and the
   dispositions they allow. Every other objection shows:
   - only what the Ground says: its author, note and target;
   - whether it is retracted now;
   - that it isn't open;
   - the decisions whose `answers` name it, or name its target, each with its
-    disposition and reason;
+    disposition (each answer's reason is on that decision's page);
   - how many decisions on the line answer the whole line.
 
   The view doesn't say which decision *settled* an objection, or how an
@@ -200,10 +202,19 @@ which sorts the whole graph, on every call. `Checks::green` and
 `Lines::heads` walk a line's decision history. So the view calls them only
 for the one line or record a request names, never for every line.
 - **What is kept.** `derived` keeps what the pages need of each read, never
-  the read's whole result. For an objection read, that is the objections'
-  ids in order and their total; the rows of a page are built from the
-  index for that page alone. For heads and green, it is the line's answer.
-  So a reload costs nothing, within the byte budget above.
+  the read's whole result.
+  - **For an objection read,** each objection in order with what its row
+    needs that only that read gives: its id, and for an open one its basis
+    (kind, failing result, check name cut to 800 bytes, `replaced`) and the
+    dispositions it allows. That's at most about 1 KiB an objection; the
+    row's other fields (author, note, retracted, answers) come from `Index`
+    and the `answers` index for that page alone.
+  - **For heads and green,** it is the line's answer.
+
+  So a reload costs nothing, within the byte budget above. An objection
+  read whose entry would pass 4 MiB isn't kept: each page of it is computed
+  again from the `Lines` call, within its slot, and only that page's rows
+  are built.
 - **Slots.** At most 2 such reads run at once. A request past that gets a
   503 at once (section 4, Caps).
 
@@ -259,20 +270,28 @@ conflicts, problems, missing paths and change entries.
   So a page stays the same as new records arrive.
 - **A list inside a list item** carries at most 5 entries and its own
   `total`, with each entry's text cut to 200 characters (the view's
-  `SHORT_CHARS`). Its full list is on the item's own page or endpoint. This
+  `SHORT_CHARS`) and to 800 bytes in all, since 200 characters can take 800
+  bytes of UTF-8. Its full list is on the item's own page or endpoint. This
   covers:
   - a decision row's `parents`, `proposals`, `resolutions`, `goals`,
-    `answers` and `breakage` in a log;
+    `answers` and `breakage` in a log, and within each breakage entry its
+    `paths`: 5 of them and their total, counted in that entry's 800 bytes;
   - an `Incomplete` problem's missing paths;
   - an objection's answers.
 
   An endpoint whose items hold such lists (`/api/weave/log`, `list=problems`
   and `/api/weave/objections`) takes `limit` up to 200, not 2,000.
-- **So every answer is bounded by its limit times one row's cap.** A row's
-  own strings are cut to 4 KiB, and its nested lists as above, so a row is
-  at most about 16 KiB of JSON, and `json_bytes` can write that as up to 6
-  times as many bytes. A page of 200 nested rows is at most about 3 MiB
-  before escaping, and a page of 2,000 flat rows about 8 MiB.
+- **So every answer is bounded by its limit times one row's cap, in
+  bytes.** The view measures each row as serialized JSON. If it is over its
+  cap, the view cuts the row's longest strings further until it fits.
+  - A row holding nested lists is at most 24 KiB, so a page of 200 is at
+    most about 4.7 MiB.
+  - Any other row is at most 4 KiB, so a page of 2,000 is at most about
+    8 MiB.
+
+  These are bytes before `json_bytes`, which can write each one as up to 6
+  bytes. So a page is at most about 28 MiB (200 nested rows) or 48 MiB
+  (2,000 other rows) on the wire.
 
 | Endpoint | Gives | Read with |
 |---|---|---|
@@ -375,7 +394,8 @@ computes only this:
 | Work building at once | 2 unified diffs, 2 conflict previews, 2 graph-sorting reads (section 3) | Taken with a new non-blocking `Slots::try_take`. Today's `Slots::take` waits, which would hold a connection. A request past the slots gets a 503 at once, to retry |
 | A conflict preview | 20 conflicts a page, 10 resolutions each, sides at most 1 MiB each and 16 MiB in all | *Conflict preview* above |
 | Lists | 50 inside an answer; pages of 200 by default, 2,000 at most, or 200 at most for an endpoint whose rows hold nested lists | *Every list is paged* above |
-| A list inside a list item | 5 entries and its total, each entry's text 200 characters | The row's own page has the rest |
+| A list inside a list item | 5 entries and its total, each entry's text 200 characters and 800 bytes | The row's own page has the rest |
+| A list row | 24 KiB with nested lists, 4 KiB otherwise, as serialized JSON | *Every list is paged* above |
 | A check result's details | 4 KiB in a list, 64 KiB on `/api/weave/result/<id>` | 64 KiB is the view's existing `TEXT_BYTES`. A list of 2,000 results is at most 8 MiB of details |
 | A box log | 64 KiB | |
 | Notes, summaries, reasons, goals and other short text in a list | 4 KiB each | A record's own page has its text up to 64 KiB |
@@ -689,6 +709,19 @@ Decision `057c4e8dace6`: these three only, then a delta check.
 | `a57dc4619c24`: the line page's count and the objections endpoint scope a line differently; proposal answers not keyed by line and change | One scope for both: objections to the decision ancestry of the line's heads on any line, the line's proposals, and their manifests. `state=open` is exactly `Lines::open_objections`. The `answers` index keys a proposal answer by line and change, as `crates/tree` does (sections 3 and 4) |
 | `a011a2d353e1`: the objections endpoint's limit times nested answers breaks the bound | Nested lists carry 5 entries of 200 characters and a total. Endpoints with nested rows take `limit` up to 200. Target-level answers come once per page. A page is bounded by its limit times one row's cap, stated in numbers (section 4) |
 | `63bb4c9c3cdd`: `derived` bounded by entries | 32 MiB in all and 4 MiB an entry, by serialized size, oldest evicted. Objection reads keep ids and a total, never the whole `Vec<Open>`; a larger read is recomputed per page within its slot (section 3) |
+
+### Delta check after round 3
+
+| Finding | Handling |
+|---|---|
+| `c7df2ff6b188`: an open objection's basis and allowed dispositions aren't in `Index`, so ids alone can't build its row | `derived` keeps each listed objection's basis and allowed dispositions with its id (about 1 KiB each). An entry over 4 MiB isn't kept, and each page is computed again from the `Lines` call within its slot (section 3) |
+
+Notes taken:
+- section 1 states the widened scope, and that reasons are on each
+  decision's page;
+- breakage `paths` follow the nested cap;
+- row and page bounds are stated in bytes: 24 KiB and 4 KiB rows, 800
+  bytes a nested entry.
 
 Round 2's notes are taken too:
 - the scripts count rises to 13;
