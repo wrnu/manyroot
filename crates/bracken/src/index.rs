@@ -1579,7 +1579,7 @@ pub fn compare(dir: &Path, store: &Store, before: &Before) -> Result<()> {
         // this transaction holds the lock, so a store listed now holds all the index does: the index is
         // brought up to date with that one instead, and compared with it whole.
         Replica::Ahead => {
-            tx.execute_batch("ROLLBACK TO full_check")?;
+            tx.execute_batch("ROLLBACK TO full_check; RELEASE full_check")?;
             let stats = Before::stats(dir);
             let now = Store::open(dir).context("BRACKEN_FULL_CHECK: reopening the store")?;
             let want = expected(&now);

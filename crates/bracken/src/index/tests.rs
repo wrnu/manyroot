@@ -1113,15 +1113,16 @@ fn the_full_check_allows_what_another_process_indexed_after_this_store_listed() 
 #[test]
 fn an_index_ahead_with_damaged_derived_rows_still_fails_the_full_check() {
     let run = |damage: bool| -> Result<()> {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 64, 60);
-        read(&dir, 0);
-        assert!(rows(&dir, "SELECT count(*) FROM hidden") > 0, "the scenario needs something hidden");
-        if damage {
-            conn(&dir).execute_batch("DELETE FROM hidden").expect("damaged");
-        }
+        // A fresh Ground for each attempt: one whose X and C shared a shard leaves both unindexed.
         for attempt in 0..20 {
+            let tmp = tempfile::tempdir().expect("tmp");
+            let dir = ground(tmp.path());
+            grow(&dir, 64, 60);
+            read(&dir, 0);
+            assert!(rows(&dir, "SELECT count(*) FROM hidden") > 0, "the scenario needs something hidden");
+            if damage {
+                conn(&dir).execute_batch("DELETE FROM hidden").expect("damaged");
+            }
             let mut theirs = Store::open(&dir).expect("valid"); // never lists X
             let x = contribute(&dir, "reviewer", claim(&format!("x {attempt}")));
             let before = Before::stats(&dir);
