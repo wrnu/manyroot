@@ -492,16 +492,25 @@ fn a_symlink_swapped_in_after_the_listing_is_never_followed() {
     std::fs::create_dir_all(s.agents_dir()).unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let swapper = swap_until(s.agents_dir().join("bob.json"), entry(real), outside, stop.clone());
-    let mut followed = 0;
+    let (mut followed, mut read_real, mut refused) = (0, 0, 0);
     let started = std::time::Instant::now();
     while started.elapsed() < std::time::Duration::from_secs(3) {
-        if let Ok(entries) = s.directory() {
-            followed += entries.iter().filter(|e| e.agent == forged).count();
+        match s.directory() {
+            Ok(entries) => {
+                followed += entries.iter().filter(|e| e.agent == forged).count();
+                read_real += entries.iter().filter(|e| e.agent == real).count();
+            }
+            Err(_) => refused += 1,
         }
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     swapper.join().unwrap();
     assert_eq!(followed, 0, "a read followed the link swapped in after the listing");
+    // Not vacuous (security c7d8520ac3ac and review 169f27b89f91, note 2 each): the race ran both ways, so
+    // reads saw the regular file and read it, and saw the link and refused it. A directory() that always
+    // failed, or a swap that never happened, fails here.
+    assert!(read_real > 0, "no read saw the regular file ({refused} refused): the test proves nothing");
+    assert!(refused > 0, "no read met the link ({read_real} read the file): the swap never raced a read");
 }
 
 #[test]
