@@ -48,7 +48,10 @@
 # binary sees, and a malformed file, which the binary reads as no root, is repaired by the same command
 # without --replace, with no hand edit. It runs that, reads the replica's weave-root back, and fails unless
 # it now holds exactly the pinned root. So the one way to set or move a replica's root through the scripts
-# is to the committed value; weave root set is refused once the replica matches. Changing which root is
+# is to the committed value; weave root set is refused once the replica matches. A weave-root that is a
+# symlink, or there but not a regular file (a FIFO, socket, device or directory), refuses everything, the
+# exception included, before anything reads it, since a read could block; moving it aside is the manager's
+# hand repair, then the exception sets the pin. Changing which root is
 # right is a change to .config/weave-root, which scripts/tree-scope frozen lists.
 # Creating the Weave Ground (weave init) waits for the owner's go.
 set -euo pipefail
@@ -191,6 +194,13 @@ if [ "$sub" != init ]; then
     fail "can't read the Ground id in $ground/ground.json"
   [ "$ours" = "$pin_ground" ] ||
     fail "refused: the Ground at $ground is $ours, not the committed pin's $pin_ground (.config/weave-root on main)"
+  # A weave-root that is there but isn't a regular file, or is a symlink, is refused before anything reads
+  # it (finding 9cd17a713d4e): reading a FIFO, which cmp below and the binary's read would both do, blocks
+  # until a writer comes, a device may never end, and a symlink can be swapped for one. weave root set
+  # renames a regular file into place, so none of these is its doing, and none has a scripted repair.
+  if [ -L "$ground/weave-root" ] || { [ -e "$ground/weave-root" ] && [ ! -f "$ground/weave-root" ]; }; then
+    fail "refused: this replica's weave-root ($ground/weave-root) isn't a regular file (a symlink, FIFO, socket, device or directory), so nothing reads it; the manager moves it aside by hand, then the only command run is scripts/weave weave root set $pin_root"
+  fi
   # The replica's root as the binary reads it: the file as weave root set writes it, or else what the
   # binary's weave check reports, so that the exception's --replace is never one the binary refuses.
   replica='' shown=''
