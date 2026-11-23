@@ -22,25 +22,27 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
         write_executable(
             &stubs.join("cargo"),
             "#!/bin/sh\necho \"cargo $*\" >>\"$LOG\"\n[ -z \"${BRACKEN_FULL_CHECK+x}\" ] || echo 'BRACKEN_FULL_CHECK reached cargo' >>\"$LOG\"\n\
-             case \"$*\" in *\"$FAIL_ON\"*) [ -n \"$FAIL_ON\" ] && exit 3 ;; esac\nexit 0\n",
+             case \"$*\" in *\"$FAIL_ON\"*) [ -n \"$FAIL_ON\" ] && { [ -z \"$CBUILD\" ] || \
+             echo 'error: failed to run custom build command for `libsqlite3-sys v0.40.0`' >&2; exit 3; } ;; esac\nexit 0\n",
         );
         let log = tmp.path().join("log");
         // A caller's BRACKEN_FULL_CHECK never reaches the tests (finding 607273d1d193): the calls below
         // would hold a line saying so.
-        let table_run = |fail_on: &str| {
+        let table_run = |fail_on: &str, cbuild: &str| {
             let _ = std::fs::remove_file(&log);
             let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
             let out = command(&dir.join("sub"), "../scripts/test-table", &[])
                 .env("PATH", path)
                 .env("LOG", &log)
                 .env("FAIL_ON", fail_on)
+                .env("CBUILD", cbuild)
                 .env("BRACKEN_FULL_CHECK", "1")
                 .output()
                 .unwrap();
             (out, std::fs::read_to_string(&log).unwrap_or_default())
         };
 
-        let (out, calls) = table_run("");
+        let (out, calls) = table_run("", "");
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
         assert_eq!(
             calls,
@@ -54,13 +56,30 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
             "{scripts}"
         );
 
-        let (out, calls) = table_run("--target x86_64");
-        assert!(!out.status.success(), "{scripts}: a failing step passed");
-        assert_eq!(calls.lines().count(), 4, "{scripts}: went on after a failure: {calls}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("failed: cargo clippy"), "{scripts}");
+        // The pass line follows the line saying where the Linux-target lint ran (answer 3fc621626cc6), so
+        // a run's evidence, which keeps the output's last lines, records it.
+        let host = String::from_utf8(run(&dir, "uname", &["-sm"]).stdout).unwrap().trim().to_owned();
+        let said = String::from_utf8_lossy(&out.stdout);
+        let lint = format!("test-table: Linux-target lint passed on {host}\ntest-table: all passed at ");
+        assert!(said.contains(&lint), "{scripts}: {said}");
+
+        // A failing Linux-target lint fails the table, never skipped. Off Linux, a failed build script
+        // (cargo's own words, on its standard error, which still reaches the caller's) says the box runs
+        // it; an ordinary lint error doesn't.
+        for cbuild in ["", "1"] {
+            let (out, calls) = table_run("--target x86_64", cbuild);
+            assert!(!out.status.success(), "{scripts}: a failing step passed");
+            assert_eq!(calls.lines().count(), 4, "{scripts}: went on after a failure: {calls}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(stderr.contains("failed: cargo clippy"), "{scripts}: {stderr}");
+            assert_eq!(stderr.contains("failed to run custom build command"), cbuild == "1", "{scripts}: {stderr}");
+            let hint = stderr.contains("--remote or --split runs this lint");
+            assert_eq!(hint, cbuild == "1" && host != "Linux x86_64", "{scripts}: {stderr}");
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("Linux-target lint passed"), "{scripts}");
+        }
 
         // Without cargo-nextest the table stops before its first step, saying what it needs.
-        let (out, calls) = table_run("nextest --version");
+        let (out, calls) = table_run("nextest --version", "");
         assert!(!out.status.success(), "{scripts}: ran without nextest");
         assert_eq!(calls, "cargo nextest --version\n", "{scripts}: went on without nextest");
         assert!(String::from_utf8_lossy(&out.stderr).contains("needs cargo-nextest"), "{scripts}");
@@ -68,14 +87,14 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
         // HEAD at origin/main (verify-seq's main alone): the whole table, but the Ground guards, which
         // would have nothing to compare, are skipped, saying so (task 1e89b53c6a4a). A head past it runs them.
         assert!(run(&dir, "git", &["update-ref", "refs/remotes/origin/main", "HEAD"]).status.success());
-        let (out, calls) = table_run("");
+        let (out, calls) = table_run("", "");
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
         assert!(!calls.contains("ground-guards") && calls.contains("cargo test --locked --doc"), "{scripts}: {calls}");
         let said = String::from_utf8_lossy(&out.stdout);
         assert!(said.contains("HEAD is origin/main: skipped the Ground guards"), "{scripts}: {said}");
         put(&dir, "code.txt", "a change\n");
         commit_all(&dir, "code");
-        let (out, calls) = table_run("");
+        let (out, calls) = table_run("", "");
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
         assert!(calls.ends_with("ground-guards origin/main HEAD\n"), "{scripts}: {calls}");
     }
@@ -211,6 +230,7 @@ fn test_table_remote_runs_one_box_and_leaves_none_behind() {
                ls -A \"$push\" >\"$T/pushed\"; cp \"$push/tree.bundle\" \"$T/\"\n\
                echo 'bx_stub01 ready in 1.0s'; echo 'test-table: deleting box bx_other99'; touch \"$T/ready\"\n\
                sleep \"${SLEEP:-0}\"\n\
+               [ -z \"$LINT\" ] || printf 'test-table: Linux-target lint passed on %s\\n%s\\n' \"$LINT\" \"$THEN\"\n\
                echo \"exit $EXIT · 1m 00s · default · \\$0.0010 · bx_stub01 deleted\"; exit \"$EXIT\" ;;\n\
              list) echo \"$*\" >>\"$T/listed\"\n\
                if [ -e \"$T/left\" ] && { [ \"$(cat \"$T/left\")\" = running ] || [[ \" $* \" == *' --all '* ]]; }; then\n\
@@ -221,15 +241,39 @@ fn test_table_remote_runs_one_box_and_leaves_none_behind() {
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
         let remote = |exit: &str, sleep: &str| {
             let mut c = command(&dir, "scripts/test-table", &["--remote"]);
-            c.env("PATH", &path).env("T", tmp.path()).env("EXIT", exit).env("SLEEP", sleep);
+            c.env("PATH", &path).env("T", tmp.path()).env("EXIT", exit).env("SLEEP", sleep).env("LINT", "");
+            c.env("THEN", "test-table: all passed at 0123456789abcdef0123456789abcdef01234567");
             c
         };
         let read = |name: &str| std::fs::read_to_string(tmp.path().join(name)).unwrap_or_default();
 
-        let out = remote("0", "0").output().unwrap();
+        // After the cost line it repeats where the box's Linux-target lint ran (answer 3fc621626cc6), or
+        // says the box didn't say, so a box run's evidence records it.
+        let out = remote("0", "0").env("LINT", "Linux x86_64").output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
-        assert!(stdout.contains("test-table: box: exit 0 · 1m 00s · default · $0.0010"), "{scripts}: {stdout}");
+        assert!(
+            stdout.contains(
+                "test-table: box: exit 0 · 1m 00s · default · $0.0010 · bx_stub01 deleted\n\
+                 test-table: box: Linux-target lint passed on Linux x86_64\n\
+                 test-table: all passed at "
+            ),
+            "{scripts}: {stdout}"
+        );
+        let out = remote("0", "0").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("test-table: box: no Linux-target lint line"), "{scripts}: {stdout}");
+        // Only from a box that exited 0, and only the line just before the box table's pass line
+        // (finding 72832438d764): a failing box's, or one printed elsewhere, is never repeated.
+        let out = remote("3", "0").env("LINT", "FakeOS").output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{scripts}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("test-table: box: Linux-target lint"), "{scripts}: {stdout}");
+        for then in ["a test's output", "test-table: all passed at 0123", "test-table: all passed at x, in a box"] {
+            let out = remote("0", "0").env("LINT", "FakeOS").env("THEN", then).output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("test-table: box: no Linux-target lint line"), "{scripts}: {then}: {stdout}");
+        }
         let args: Vec<String> = read("args").lines().map(String::from).collect();
         for want in ["--no-env", "--type", "default", "--timeout", "2400", "--push"] {
             assert!(args.iter().any(|a| a == want), "{scripts}: no {want} in {args:?}");
@@ -1211,6 +1255,38 @@ fn test_table_weave_box_pushes_the_bundle_and_this_script_and_records_the_boxs_p
         let args = std::fs::read_to_string(w.path("args")).unwrap();
         assert!(args.contains("bash ../runner/test-table --in-tree --light -p demo\n"), "{scripts}: {args}");
         assert!(args.contains("bash ../runner/test-table --in-tree --lists -p demo"), "{scripts}: {args}");
+
+        // The box's Linux-target lint line is repeated only from a box that exited 0, and only the one
+        // just before the table's pass line after 'WEAVE start' (finding 72832438d764).
+        let sha40 = "0123456789abcdef0123456789abcdef01234567";
+        let lint =
+            |os: &str| format!("test-table: Linux-target lint passed on {os}\ntest-table: all passed at {sha40}\n");
+        for (what, body, exit, want) in [
+            ("after the start", format!("WEAVE start\n{}WEAVE end\n", lint("Linux x86_64")), "0", true),
+            (
+                "before the start",
+                format!("{}WEAVE start\ntest-table: all passed\nWEAVE end\n", lint("FakeOS")),
+                "0",
+                false,
+            ),
+            ("a failed box", format!("WEAVE start\n{}WEAVE end\n", lint("FakeOS")), "4", false),
+            (
+                "not before the pass line",
+                "WEAVE start\ntest-table: Linux-target lint passed on FakeOS\nx\ntest-table: all passed\nWEAVE end\n"
+                    .into(),
+                "0",
+                false,
+            ),
+        ] {
+            std::fs::write(w.path("facts"), "").unwrap();
+            std::fs::write(w.path("box"), body).unwrap();
+            let out = w.table(&["--weave-box"]).env("PATH", &path).env("EXIT", exit).output().unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(out.status.success(), exit == "0", "{scripts}: {what}: {stdout}");
+            let repeated = stdout.lines().any(|l| l.starts_with("test-table: box: Linux-target lint passed on "));
+            assert_eq!(repeated, want, "{scripts}: {what}: {stdout}");
+            assert!(!stdout.contains("test-table: box: Linux-target lint passed on FakeOS"), "{scripts}: {what}");
+        }
 
         // The box failed: so does the check, with the proofs still written.
         std::fs::write(w.path("facts"), "").unwrap();

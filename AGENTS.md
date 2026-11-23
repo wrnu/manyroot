@@ -59,11 +59,10 @@ Don't repeat code, git log or docs. To change your entry, `claim … --supersede
 5. Answer each confirmed finding: a fix in a new head, a deferral proposed as a `question`, or a `contradicts` claim.
 6. Final report (claim `--tag report`, `implements` the task, id sent to the manager): PR URL, head and current `pr` claim; what changed and why; evidence ids per done-when check; what wasn't tested; tests you think wrong (with your claim's id); what you need; process ideas as separate `process` claims.
 
-**Builder checks**, each recorded (experiment `08fc19239548`: no local nextest pass; the box runs the whole table, slow tests included):
+**Builder checks**, each recorded (experiment `08fc19239548`: no local nextest pass; the box runs the whole table, slow tests and the Linux-target clippy included, answer `3fc621626cc6`):
 ```sh
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
-cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 scripts/test-table --remote
 ```
 A head changing `research/` (a sibling workspace `cargo test --workspace` never builds) also records `bash -c 'cd research && cargo test --locked'`, after `cargo build -p bracken` at the root.
