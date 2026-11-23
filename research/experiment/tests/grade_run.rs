@@ -686,15 +686,31 @@ mod macos_only {
     /// builder is told so on its next turn's first tool result, with the paths that conflicted, and brings its work
     /// up to date with main: in Weave it redoes it on the line's head and proposes again; in git project mode it
     /// merges origin/main into its branch, settles, commits and asks again. Main then holds both builders' lines and
-    /// turn-1 modules. Without the notice the builder never learns of it, and its line and module never land.
-    fn a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date(mode: &'static str, sandbox: bool) {
+    /// turn-1 modules. Without the notice the builder never learns of it, and its line and module never land. With
+    /// `silent`, both builders make no tool call in turn 2: the notice waits, and comes in turn 3 (finding
+    /// `0220fc3d2c7e`).
+    fn a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date(
+        mode: &'static str,
+        sandbox: bool,
+        silent: bool,
+    ) {
         let Some(python) = pin() else { return };
         let tmp = tempfile::tempdir().expect("a temp dir");
         let root = std::fs::canonicalize(tmp.path()).expect("resolved");
         let (project, _) = project_and_store(&root);
         let cfg = RunConfig {
             trace: true,
-            ..config_of(mode, "agent-2", python, root.join("run"), 3, 3, &project, false, sandbox)
+            ..config_of(
+                mode,
+                "agent-2",
+                python,
+                root.join("run"),
+                3,
+                if silent { 4 } else { 3 },
+                &project,
+                false,
+                sandbox,
+            )
         };
         let mock = MockBackend {
             seed: 1,
@@ -703,6 +719,7 @@ mod macos_only {
             integrator: Some(2),
             conflicts: Some(1),
             leaves_conflicts: true,
+            silent: if silent { vec![(0, 2), (1, 2)] } else { Vec::new() },
             ..MockBackend::default()
         };
         let outcome = run(&cfg, &mock).expect("the run");
@@ -717,6 +734,14 @@ mod macos_only {
         assert!(!told.is_empty(), "{mode}: a builder was told its work conflicts");
         assert!(told.iter().all(|e| e["agent"] != "agent-2"), "{mode}: only builders are told: {told:?}");
         assert!(told.iter().all(|e| e["data"]["turn"].as_u64() > Some(1)), "{mode}: told on a later turn: {told:?}");
+        notices_follow_the_integrators_turn(mode, &log);
+        if silent {
+            assert!(
+                told.iter().all(|e| e["data"]["turn"] != 2),
+                "{mode}: nothing told in a turn with no call: {told:?}"
+            );
+            assert!(told.iter().any(|e| e["data"]["turn"] == 3), "{mode}: told on the next turn with a call: {told:?}");
+        }
         let hinted = mock.hinted.lock().expect("the hints").clone();
         let (what, verb) = if mode == "weave" {
             ("Your proposal ", "propose it again")
@@ -732,7 +757,7 @@ mod macos_only {
         }
         if mode == "weave" {
             assert!(
-                notices.iter().all(|(_, _, n)| n.contains("The integrator's note: `agent 2's turn 1`.")),
+                notices.iter().all(|(_, _, n)| n.contains("The integrator's note: `agent 2's turn ")),
                 "{notices:?}"
             );
         }
@@ -747,24 +772,124 @@ mod macos_only {
         assert!(!init.1.contains("<<<<<<<") && !init.1.contains(">>>>>>>"), "{mode}: no marker left: {}", init.1);
     }
 
+    /// Finding `61993dafb91e`: the integrator's conflicts are noted only once its turn is over (after its last tool
+    /// call of that turn), and a builder is told only of work noted so.
+    fn notices_follow_the_integrators_turn(mode: &str, log: &[Value]) {
+        let seq = |e: &Value| e["seq"].as_u64().expect("a seq");
+        let noted: Vec<&Value> = log.iter().filter(|e| e["event"] == "conflict_noted").collect();
+        for n in &noted {
+            let last_call = log
+                .iter()
+                .filter(|e| {
+                    e["event"] == "tool_call" && e["agent"] == "agent-2" && e["data"]["turn"] == n["data"]["turn"]
+                })
+                .map(seq)
+                .max()
+                .expect("the integrator's calls");
+            assert!(seq(n) > last_call, "{mode}: noted only at the integrator's turn's end: {n}");
+        }
+        for t in log.iter().filter(|e| e["event"] == "conflict_notice") {
+            assert!(
+                noted.iter().any(|n| n["data"]["for"] == t["agent"] && seq(n) < seq(t)),
+                "{mode}: told only of work noted at an integrator's turn's end: {t}"
+            );
+        }
+    }
+
+    /// Finding `61993dafb91e`, in a concurrent run (no lockstep), where builders play their next turns while the
+    /// integrator plays: with `leaves`, the integrator leaves a builder's conflicting work open, and any notice
+    /// comes only after its turn ends; without, it settles every conflict in the turn it meets it, so no builder is
+    /// ever told, though the integrator's first try at the work stopped at conflicts.
+    /// Git project mode only: the mock's Weave integrator is written for lockstep (it settles the first proposal an
+    /// integrate stops at, and repairs a main reported broken by integrating again), so concurrent Weave runs fail
+    /// in the mock, not the driver. The notices' publishing is the same code in both modes.
+    fn a_concurrent_git_runs_notices_wait_for_the_integrators_turn(leaves: bool) {
+        let mode = bracken_experiment::git_project::NAME;
+        let Some(python) = pin() else { return };
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+        let (project, _) = project_and_store(&root);
+        let cfg = RunConfig {
+            trace: true,
+            ..config_of(mode, "agent-2", python, root.join("run"), 3, 3, &project, false, false)
+        };
+        let mock = MockBackend {
+            seed: 1,
+            shim: Some(bin()),
+            lockstep: false,
+            integrator: Some(2),
+            conflicts: Some(1),
+            leaves_conflicts: leaves,
+            ..MockBackend::default()
+        };
+        let outcome = run(&cfg, &mock).expect("the run");
+        let text = std::fs::read_to_string(cfg.root.join("events.jsonl")).expect("the events");
+        let log: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).expect("an event")).collect();
+        let kept = std::fs::read_to_string(cfg.root.join("turn-errors.txt")).unwrap_or_default();
+        let errors: Vec<&Value> = log.iter().filter(|e| e["event"] == "turn_error").collect();
+        assert!(errors.is_empty(), "{mode}: no turn erred: {errors:?}\n{kept}");
+        notices_follow_the_integrators_turn(mode, &log);
+        if !leaves {
+            let told: Vec<&Value> =
+                log.iter().filter(|e| e["event"] == "conflict_noted" || e["event"] == "conflict_notice").collect();
+            assert!(told.is_empty(), "{mode}: nothing told of conflicts the integrator settled: {told:?}");
+            let init = outcome.modules.iter().find(|(p, _)| p.ends_with("/__init__.py")).expect("the package");
+            for agent in [0, 1] {
+                assert!(init.1.contains(&shared_line(agent)), "{mode}: main keeps agent {agent}'s line: {}", init.1);
+            }
+        }
+    }
+
+    #[test]
+    fn a_concurrent_git_project_run_tells_nothing_of_conflicts_the_integrator_settles() {
+        a_concurrent_git_runs_notices_wait_for_the_integrators_turn(false);
+    }
+
+    #[test]
+    fn a_concurrent_git_project_runs_notices_wait_for_the_integrators_turn() {
+        a_concurrent_git_runs_notices_wait_for_the_integrators_turn(true);
+    }
+
     #[test]
     fn a_weave_builder_whose_proposal_conflicts_is_told_and_proposes_again() {
-        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date("weave", false);
+        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date("weave", false, false);
     }
 
     #[test]
     fn a_git_project_builder_whose_request_conflicts_is_told_and_asks_again() {
-        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date(bracken_experiment::git_project::NAME, false);
+        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date(
+            bracken_experiment::git_project::NAME,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn a_weave_notice_waits_out_a_turn_with_no_tool_call() {
+        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date("weave", false, true);
+    }
+
+    #[test]
+    fn a_git_project_notice_waits_out_a_turn_with_no_tool_call() {
+        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date(
+            bracken_experiment::git_project::NAME,
+            false,
+            true,
+        );
     }
 
     #[test]
     fn a_sandboxed_weave_builder_whose_proposal_conflicts_is_told_and_proposes_again() {
-        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date("weave", true);
+        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date("weave", true, false);
     }
 
     #[test]
     fn a_sandboxed_git_project_builder_whose_request_conflicts_is_told_and_asks_again() {
-        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date(bracken_experiment::git_project::NAME, true);
+        a_builder_whose_work_conflicts_is_told_and_brings_it_up_to_date(
+            bracken_experiment::git_project::NAME,
+            true,
+            false,
+        );
     }
 
     #[test]

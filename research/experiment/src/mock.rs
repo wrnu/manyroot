@@ -92,6 +92,9 @@ pub struct MockBackend {
     /// open, and the builder brings it up to date with main once its turn opens with the driver's notice of it (task
     /// `33ac510f7d4c`).
     pub leaves_conflicts: bool,
+    /// `(agent, turn)`s that list the tools and make no call, as a turn that ends at once or whose every model call
+    /// fails would: a notice due then waits for a turn that makes one (finding `0220fc3d2c7e`).
+    pub silent: Vec<(usize, u32)>,
 }
 
 /// What a project turn does of [`MockBackend::conflicts`]: whether this agent appends its [`shared_line`] this
@@ -140,6 +143,7 @@ impl Default for MockBackend {
             break_line: BREAK_LINE,
             conflicts: None,
             leaves_conflicts: false,
+            silent: Vec::new(),
         }
     }
 }
@@ -415,7 +419,11 @@ impl Backend for MockBackend {
             (0..self.unknown_each).for_each(|_| self.unknown.note(name, UNKNOWN_TOOL));
         }
         let mut c = Client::connect(socket, self.shim.as_deref())?;
-        let played = self.play(&mut c, agent, name, turn);
+        let played = if self.silent.contains(&(agent, turn)) {
+            c.request("tools/list", json!({})).map(|_| ())
+        } else {
+            self.play(&mut c, agent, name, turn)
+        };
         for hint in &c.hints {
             hinted(hint);
         }
