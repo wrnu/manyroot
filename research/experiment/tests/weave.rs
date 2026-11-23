@@ -56,6 +56,7 @@ impl Stores {
 
     /// The same as [`Stores::new`], every worker under its sandbox profile, as a real run's are (gotcha
     /// `73ebbb818ea1`): a path the sandbox denies fails here as it does in a run. macOS only.
+    #[cfg(target_os = "macos")]
     fn sandboxed(names: &[&str]) -> Stores {
         Stores::build(names, ANY_AGENT, true)
     }
