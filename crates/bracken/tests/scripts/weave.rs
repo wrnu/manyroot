@@ -1962,3 +1962,67 @@ fn weave_shadow_overrides_discussion_objections_only_from_outside_main_policy() 
     let reason = answer["reason"].as_str().unwrap();
     assert!(reason.contains("evidence-backed") && reason.contains(&fail[..12]) && reason.contains("B4"), "{reason}");
 }
+
+/// The Weave view (docs/design/weave-view.md section 6, answer e490eaaaebb3): scripts/weave lets `view`
+/// through with --port, the policy options, --as and help only, so it stays on loopback with no runs.
+/// --bind, --host and --runs are refused in both forms, as is any other option or word, a '--', and an
+/// option value that looks like an option; nothing reaches bracken when it refuses.
+#[test]
+fn weave_view_is_loopback_only_and_takes_only_what_keeps_it_so() {
+    let (tmp, dir, home, stub) = weave_repo();
+    let script = "scripts/weave";
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    let out = weave(&dir, script, &home, None, &["weave", "init", "--as", "weave-integrator"]);
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    pin(&dir, &home);
+    let ground = home.join("bracken-weave/manyroot").canonicalize().unwrap();
+    let ran = tmp.path().join("ran");
+    let logging = tmp.path().join("logging-stub");
+    write_executable(
+        &logging,
+        &format!("#!/bin/sh\necho \"$*\" >> '{}'\nexec '{}' \"$@\"\n", ran.display(), stub.display()),
+    );
+
+    for (args, expected) in [
+        (&["view", "--bind", "100.74.240.73"][..], "--bind is refused"),
+        (&["view", "--bind=0.0.0.0"], "--bind is refused"),
+        (&["view", "--port", "7392", "--bind", "127.0.0.1"], "--bind is refused"),
+        (&["view", "--host", "warren-mbp.jx.rs"], "--host is refused"),
+        (&["view", "--host=example"], "--host is refused"),
+        (&["view", "--runs", "/tmp/runs"], "--runs is refused"),
+        (&["--as", "alice", "view", "--runs=/tmp/runs"], "--runs is refused"),
+        (&["view", "--", "--bind", "1.2.3.4"], "view: -- is refused"),
+        (&["view", "--port", "--bind"], "can't start with '-'"),
+        (&["view", "--validator", "-x"], "can't start with '-'"),
+        (&["view", "--port"], "--port needs a value"),
+        (&["view", "--policy-file", "x"], "--policy-file is refused"),
+        (&["view", "-b"], "-b is refused"),
+        (&["view", "extra"], "extra is refused"),
+        (&["view", "view"], "view takes no word view"),
+    ] {
+        let out = weave(&dir, script, &home, Some(&logging), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}{}", String::from_utf8_lossy(&out.stdout));
+        assert!(stderr.contains(expected), "{args:?}: expected {expected:?} in {stderr}");
+    }
+    assert!(!ran.exists(), "a refused view reached bracken: {}", std::fs::read_to_string(&ran).unwrap_or_default());
+
+    for args in [
+        &["view"][..],
+        &["view", "--port", "0"],
+        &["view", "--port=7392", "--validator", "weave-runner", "--min-passes", "2", "--follow-changes"],
+        &["view", "--validator=weave-runner", "--min-passes=1"],
+        &["--as", "alice", "view", "--port", "0"],
+        &["--as=alice", "view"],
+        &["view", "--help"],
+        &["view", "-h"],
+    ] {
+        let out = weave(&dir, script, &home, Some(&stub), args);
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            format!("BRACKEN_DIR={} {}", ground.display(), args.join(" ")),
+            "{args:?}"
+        );
+    }
+}
