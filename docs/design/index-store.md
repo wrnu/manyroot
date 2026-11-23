@@ -6,6 +6,9 @@
 > `7d140f132b1a`, which builds Phase 3 of [layers.md](layers.md) (owner decision
 > `817afe6653a8`, item 2). The measurements are in note `799ce5d903e9`. PR 2 adds the
 > index as a cache behind the existing read API. PR 3 serves reads from it.
+> Sections 4–8 were revised for the security review's findings `23579eecd2a7`
+> (power loss), `de4b1cb363b6` (the clock) and `2538f1286416` (rebuilds and schema
+> versions).
 
 ## 1. What it is
 
@@ -148,8 +151,10 @@ else:
 
 ## 4. Schema
 
-The index lives in `cache/index.sqlite`, with its `-wal` and `-shm` files. `cache/`
-already holds a `.gitignore` of `*`.
+**Files.** The index is `cache/index-v<schema_version>-<generation>.sqlite`, with its
+`-wal` and `-shm` files. `cache/` already holds a `.gitignore` of `*`. The
+generation starts at 1, and a binary uses the highest generation of its own
+schema version (section 6, Rebuilds).
 
 ```sql
 CREATE TABLE obj    (seq INTEGER PRIMARY KEY,        -- local insertion order, parents first
@@ -169,73 +174,148 @@ CREATE TABLE ref    (target INTEGER, rkind INTEGER, src INTEGER,
                      PRIMARY KEY (target, rkind, src)) WITHOUT ROWID;
 CREATE TABLE fwd    (src_end INTEGER, rkind INTEGER, rel INTEGER, to_end INTEGER,
                      PRIMARY KEY (src_end, rkind, rel)) WITHOUT ROWID;     -- relations by `from`
-CREATE TABLE hidden (seq INTEGER PRIMARY KEY, reasons INTEGER NOT NULL);   -- what --current hides
-CREATE TABLE shard  (n INTEGER PRIMARY KEY,          -- 0..255
-                     mtime_ns INTEGER, ctime_ns INTEGER, ino INTEGER);
-CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB);    -- schema_version, ground id, objects/ stat
+CREATE TABLE hidden (seq INTEGER PRIMARY KEY);       -- what --current hides
+CREATE TABLE shard  (n INTEGER PRIMARY KEY,          -- 0..255; no row means dirty
+                     mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL, ino INTEGER NOT NULL);
+CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL);
+                     -- schema_version, ground id, the file's own inode, hidden_stale
 ```
 
-The index is rebuilt from `objects/` in any of these cases:
+**What each insert maintains.** A contribution is inserted in one statement group
+whether it comes from a write, from freshness or from a rebuild:
 
-- `schema_version` or the ground id differs from what this binary expects;
-- the open fails;
-- `PRAGMA quick_check` fails.
+- `obj`, `agent`;
+- `parent` and `child`;
+- `head`: its parents leave and it joins;
+- `tag` for a claim;
+- `ref` for a relation (both ends), evidence or a retraction, and `fwd` for a
+  relation.
 
-`hidden` must equal `CurrentView`'s hidden set. PR 2's equality tests compare the
-two. This note's benchmark used a simpler approximation.
+A parent or referenced contribution missing from the index means rebuild.
+
+`hidden` is the one table not maintained row by row. A supersession or retraction
+can hide or unhide contributions anywhere above it, and maintaining that
+incrementally is Phase 4 (research B R2). In PR 2, any change recomputes `hidden`
+whole from `CurrentView`, and only when the index holds exactly what the store
+holds; otherwise `hidden_stale` is set until a later refresh. PR 3 decides
+hidden-ness per answered row instead, by `HiddenOne`'s rule over `ref`.
 
 ## 5. Freshness after a git pull (G5)
 
 Objects can arrive outside Bracken: a git pull, a checkpoint, another tool, or an
 older `bracken` binary. Each open finds them as follows.
 
-1. Stat `objects/` and its 256 shard directories (0.45 ms), and compare each
-   shard's (mtime, ctime, inode) with the `shard` table.
+1. Stat `objects/`'s shard directories (0.45 ms), and compare each shard's
+   (mtime, ctime, inode) with the `shard` table.
    - Adding, renaming or removing a file changes its directory's times on every
      POSIX filesystem.
-   - A new shard changes `objects/`.
+   - A shard without a row, or a row without a shard, is dirty.
    - ctime can't be set from user space, so a `touch -m` that resets mtime is
      still caught.
-2. List only the changed shards, and diff each one against the index's id range
-   for that prefix.
-3. A file the index lacks is read and fully checked, then indexed in one
+2. List only the dirty shards, and diff each one against the index's id range for
+   that prefix. (In PR 2 the store has already listed and checked every object, so
+   the diff runs against the store's ids.)
+3. Read and fully check each file the index lacks, then index it in the same
    transaction. The check covers its signature and every protocol rule, as
    `Store::open_trusting_with` checks objects missing from the snapshot today.
-   An indexed id whose file is gone (a checkout that went backwards) means
-   rebuild, as a missing object sets the snapshot aside today.
-4. Record a shard's stat only when both of these hold:
+   - A file that fails its check refuses the open, as today, and no stamp is
+     recorded. git checkout writes files in place, so a concurrent open can see a
+     truncated one.
+   - An indexed id whose file is gone (a checkout that went backwards) means
+     rebuild, as a missing object sets the snapshot aside today. An indexed id
+     this store didn't list, whose file exists, was indexed by another process
+     after this one listed. That's not an error.
+4. Record a shard's stamp only when both of these hold:
    - the stat was taken before the listing the index was reconciled with;
-   - its times are more than 2 s older than the clock. This is git's racy-index
-     rule, and it covers coarse timestamps: Linux's coarse clock, and 1–2 s
-     filesystems.
+   - its mtime and ctime are more than 2 s older than **the filesystem's own
+     clock**: the mtime of `cache/clock`, a small file the refresh rewrites
+     after its listing.
 
-   Otherwise the shard stays dirty, and the next open lists it again (5 ms at 1M).
+   This is git's racy-index rule, which compares an entry's mtime with the index
+   file's own mtime. Both times come from the same filesystem clock, so skew
+   between this machine and a network filesystem's server can't break it. The 2 s
+   margin covers coarse timestamps: Linux's coarse clock, and 1–2 s filesystems.
+
+   If `cache/clock` can't be written, or `cache/` and `objects/` are on different
+   devices, no stamp is recorded. Every shard then stays dirty, which is slower
+   but never wrong.
 
 There is no git hook. Clones, checkpoints, other tools and older binaries are all
 caught the same way.
 
-## 6. Writes, crashes and concurrency
+## 6. Writes, crashes, rebuilds and concurrency
 
-**Order.** A write fsyncs and renames its object first, as today. Then it commits
-the index transaction (with `synchronous=NORMAL`).
+**Order.** A write follows three steps:
 
-**Crash.** If the process dies between those two steps, an object exists that the
-index lacks. Its shard's stat has changed, so the next open finds the object,
-checks it and indexes it. The index never names an object that wasn't written.
+1. Write the object to a temporary file, fsync it and rename it into its shard,
+   as today.
+2. Fsync the shard directory, and `objects/` when the shard was new. Today's
+   `write_object` doesn't; PR 2 adds it (`crates/manyroot/src/fsx.rs`).
+3. Commit the index transaction (`synchronous=NORMAL`).
+
+That transaction also deletes the shard's `shard` row, so the next open lists
+that shard again. The rows a write adds therefore never rest on a stamp that a
+power loss could put back.
+
+**Process crash.** A crash between steps 1–2 and step 3 leaves an object the
+index lacks, in a shard whose stat has changed. The next open finds it, checks it
+and indexes it.
+
+**Power loss.** After step 2, the object is durable before its row can be. The
+`shard` row deletion holds even if step 2 were lost: if the index transaction
+survived and the rename didn't, the shard has no row, so it is listed, the id is
+found missing, and the index is rebuilt.
+
+**The index never names an object that isn't on disk without that shard being
+dirty.**
 
 A crash inside the index transaction is SQLite's to recover: the WAL rolls back
 an uncommitted transaction. With `NORMAL`, a power loss can drop the last
-committed transactions. Those objects are then found by freshness in the same
-way.
+committed transactions, and freshness finds those objects again.
+
+**Rebuilds.** A rebuild never unlinks or renames a database that may be open. That
+is SQLite's documented corruption case.
+
+- A rebuild runs in place, in one `BEGIN IMMEDIATE` transaction: drop the tables,
+  recreate them, refill them from the store. Concurrent readers see the old index
+  or the new one, never a half-built one.
+- It happens when:
+  - the ground id differs;
+  - the file's own inode differs from the one in `meta` (see section 7);
+  - a parent is missing;
+  - an indexed object is gone.
+- A file SQLite reports as not a database, or corrupt, isn't touched. The next
+  generation's file (`-<g+1>`) is created beside it and used from then on.
+  Processes that still hold the old one keep their handles, and nothing is
+  unlinked under them. `bracken verify` may delete older generations only when it
+  can take an exclusive lock on each; otherwise it leaves them.
+- If opening or rebuilding fails, the command reads through the full path, as
+  today. It never loops.
+
+**Schema versions.** Each binary opens only its own schema version's files.
+
+- An older binary never sees a newer schema's file. It never rebuilds over it and
+  never writes to it.
+- Two versions on one Ground keep two indexes, each current by freshness, without
+  rebuilding each other's.
+- A `schema_version` inside a file that disagrees with its name is damage, and
+  gets a new generation.
+
+**Integrity checks.** `PRAGMA quick_check` costs time in proportion to the file,
+about 194 MiB at 1M, so it runs only in `bracken verify` and after a rebuild,
+never on an ordinary open. Damage found on an ordinary open shows up as
+SQLite's corruption error, which moves to a new generation as above.
 
 **Concurrency.** WAL readers each read a consistent snapshot while one writer
 commits, and `busy_timeout` serialises writers.
 
 A reader that finds dirty shards takes the write lock (`BEGIN IMMEDIATE`) and
 repeats the check inside it, so two readers don't index the same objects twice.
+A lock not granted within the timeout skips the index for that command; it is
+never taken as damage.
 
-**Long-lived processes.** `bracken view`, `watch` and `serve` keep one connection
-and re-run the freshness check on each refresh.
+**Long-lived processes.** `bracken view`, `watch` and `serve` re-run the freshness
+check each time they reopen the store.
 
 ## 7. Trust and the oracle
 
@@ -246,14 +326,33 @@ The index has the snapshot's trust model (decision `96e282819607`,
 - anyone who can write `cache/` can already write the replica;
 - an object's bytes overwritten in place go unnoticed, as with the snapshot.
 
-**Opening the file.** `cache/` is checked to be a real directory, not followed
-through a link, as today. The database is opened with `SQLITE_OPEN_NOFOLLOW`.
+**Bound to its own file.** `meta` records the inode of the file the index was
+built in. A file that arrives another way gets a new inode: a tracked
+`cache/index-*.sqlite` force-added to git and checked out, or a copied Ground.
+Its recorded inode doesn't match, so it's rebuilt from the store before any
+answer is used. The snapshot has the same gap today; it is blocked in this
+repository by ground-guards guard 1, but not in other repositories.
+
+**Opening the file.**
+
+- `cache/` is checked to be a real directory, not followed through a link, as
+  today.
+- The database is opened with `SQLITE_OPEN_NOFOLLOW`. SQLite then refuses a link
+  in any component of the path, and macOS's `/var` and `/tmp` are links, so the
+  replica's path is canonicalised before opening.
 
 **Oracle.**
 
 - `bracken verify` rebuilds the index.
 - With `BRACKEN_FULL_CHECK`, every read does a full `Store::open`, which stays
-  the oracle, and compares the index's answers with it.
+  the oracle. Then:
+  - an index is built fresh in memory and compared with it, which checks the
+    derivation;
+  - the replica's own index is brought up to date inside a transaction that is
+    rolled back, and compared too, which checks what freshness and the writes
+    kept.
+
+  A disagreement fails the command, and nothing is written.
 - PR 3 adds a gate check that makes the same comparison on the main Ground.
 - The snapshot is retired only if that equality holds on every test.
 
@@ -261,16 +360,22 @@ through a link, as today. The database is opened with `SQLITE_OPEN_NOFOLLOW`.
 
 There is no migration step.
 
-- An older binary, the pinned one or the team server's, ignores
-  `cache/index.sqlite`, and freshness (section 5) catches the objects it writes.
+- An older binary, the pinned one or the team server's, ignores the index files,
+  and freshness (section 5) catches the objects it writes.
 - The first open of an existing Ground with the new binary builds the index. At
   14k that takes about 0.1 s on top of today's full open.
 
-PR 2 tests both cases:
+PR 2 tests these cases:
 
 - an object added with no index update is found by freshness;
 - a crash between the object write and the index commit is repaired on the next
-  open.
+  open;
+- a write's transaction leaves its shard without a row;
+- stamps are judged against the filesystem's clock, not this process's;
+- two schema versions on one Ground don't rebuild each other's index;
+- a rebuild, or a move to a new generation, while another connection is open
+  leaves both connections answering what the full computation gives;
+- a linked or foreign index file is never written through or trusted.
 
 ## 9. Exit metric
 
