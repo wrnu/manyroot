@@ -36,6 +36,27 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+/// The bundled skills and plugins Claude Code 2.1.311 shows when started as the driver starts it (note `24aa40160488`).
+const SKILLS_2_1_311: [&str; 16] = [
+    "deep-research",
+    "dataviz",
+    "update-config",
+    "verify",
+    "debug",
+    "code-review",
+    "simplify",
+    "batch",
+    "fewer-permission-prompts",
+    "doctor",
+    "loop",
+    "claude-api",
+    "workflow-authoring",
+    "run",
+    "run-skill-generator",
+    "plugin-authoring",
+];
+const PLUGINS_2_1_311: [&str; 2] = ["cc-plugin-agents-md", "cc-plugin-plugin-authoring"];
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("spawn") {
@@ -174,7 +195,6 @@ impl Fake {
 
     fn init(&mut self, tools: Vec<String>, args: &[String], overrides: Map<String, Value>) {
         let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-        let expect = bracken_experiment::claude::Expect::pinned_2_1_311("");
         let config = std::env::var("CLAUDE_CONFIG_DIR").unwrap_or_default();
         let servers =
             if self.mcp.is_some() { json!([{"name": "experiment", "status": "connected"}]) } else { json!([]) };
@@ -187,8 +207,8 @@ impl Fake {
             "permissionMode": opt("--permission-mode"),
             "apiKeySource": "none",
             "claude_code_version": "2.1.311",
-            "skills": expect.skills,
-            "plugins": expect.plugins.iter().map(|p| json!({"name": p, "path": "builtin"})).collect::<Vec<_>>(),
+            "skills": SKILLS_2_1_311,
+            "plugins": PLUGINS_2_1_311.iter().map(|p| json!({"name": p, "path": "builtin"})).collect::<Vec<_>>(),
             "memory_paths": {"auto": format!("{config}/projects/fake/memory/")},
         });
         for (k, v) in overrides {

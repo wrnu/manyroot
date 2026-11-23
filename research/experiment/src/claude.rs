@@ -239,7 +239,8 @@ pub(crate) fn https_host(url: &str, what: &str) -> Result<(String, u16), String>
     Ok((host.to_ascii_lowercase(), port))
 }
 
-/// What the `init` event must show, from the plan.
+/// What the `init` event must show, from the plan: whatever the version, the start event must show the plan's model,
+/// permission mode and credential source (decision `2e583e378924`).
 #[derive(Debug, Clone)]
 pub struct Expect {
     pub model: String,
@@ -247,72 +248,63 @@ pub struct Expect {
     pub permission_mode: String,
     /// Where Claude Code says its credential came from: `none` when the auth token is in the environment.
     pub api_key_source: String,
-    /// The bundled skills and plugins of the pinned version.
-    pub skills: Vec<String>,
-    pub plugins: Vec<String>,
 }
 
 impl Expect {
-    /// What Claude Code 2.1.311 shows with the turn configuration (note 24aa40160488).
-    pub fn pinned_2_1_311(model: &str) -> Expect {
-        let skills = [
-            "deep-research",
-            "dataviz",
-            "update-config",
-            "verify",
-            "debug",
-            "code-review",
-            "simplify",
-            "batch",
-            "fewer-permission-prompts",
-            "doctor",
-            "loop",
-            "claude-api",
-            "workflow-authoring",
-            "run",
-            "run-skill-generator",
-            "plugin-authoring",
-        ];
+    /// The plan's start event for `model`, at medium effort, in the driver's turn configuration.
+    pub fn new(model: &str) -> Expect {
         Expect {
             model: model.into(),
             effort: "medium".into(),
             permission_mode: "dontAsk".into(),
             api_key_source: "none".into(),
-            skills: skills.iter().map(|s| s.to_string()).collect(),
-            plugins: vec!["cc-plugin-agents-md".into(), "cc-plugin-plugin-authoring".into()],
         }
     }
+}
 
-    /// What Claude Code 2.1.329 shows with the turn configuration, as a gateway or a subscription token signs it in
-    /// alike: 2.1.311's, with one more bundled plugin (task `b0a9769a48da`, seen with no model call).
-    pub fn pinned_2_1_329(model: &str) -> Expect {
-        let mut e = Expect::pinned_2_1_311(model);
-        e.plugins = ["cc-plugin-agents-md", "cc-plugin-privacy", "cc-plugin-plugin-authoring"].map(String::from).into();
-        e
+/// The gate (decision `2e583e378924`): what the runner relies on in Claude Code's `init` event, checked field by
+/// field whatever the version, each refusal naming its field. It must be the init event of the pinned `version`,
+/// with the plan's model, permission mode and credential source; offer exactly the mode's `tools` through exactly
+/// the shim; list its skills, and its plugins all builtin, so nothing of the owner's own config reached the agent;
+/// and keep its memory inside the agent's own directory `own`.
+pub fn check_start_event(init: &Value, e: &Expect, version: &str, tools: &[String], own: &Path) -> Result<(), String> {
+    let has = |k: &str| init.get(k).filter(|v| !v.is_null()).ok_or_else(|| format!("the init event has no {k}"));
+    let eq = |k: &str, want: &str| {
+        if has(k)?.as_str() == Some(want) { Ok(()) } else { Err(format!("the init event's {k} isn't {want}")) }
+    };
+    if init.get("type").and_then(Value::as_str) != Some("system")
+        || init.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return Err("the first event isn't init (its type and subtype)".into());
     }
-
-    /// What Claude Code 2.1.330 shows with the turn configuration: 2.1.329's, the same bundled skills and plugins
-    /// (decision `2e583e378924`; its init event, seen with no model call, is `tests/fixtures/claude-2.1.330-init.json`).
-    pub fn pinned_2_1_330(model: &str) -> Expect {
-        Expect::pinned_2_1_329(model)
+    eq("claude_code_version", version)?;
+    eq("model", &e.model)?;
+    eq("permissionMode", &e.permission_mode)?;
+    eq("apiKeySource", &e.api_key_source)?;
+    let list = |k: &str| has(k)?.as_array().ok_or_else(|| format!("the init event's {k} isn't a list"));
+    let set = |k: &str, pick: fn(&Value) -> Option<String>| -> Result<BTreeSet<String>, String> {
+        list(k)?.iter().map(|v| pick(v).ok_or_else(|| format!("a bad entry in the init event's {k}"))).collect()
+    };
+    let want: BTreeSet<String> = tools.iter().map(|t| format!("mcp__{SERVER}__{t}")).collect();
+    if set("tools", |v| v.as_str().map(String::from))? != want {
+        return Err("the init event's tools aren't exactly the mode's".into());
     }
-
-    /// What the pinned `version` shows, for `model` at `effort`: only a version whose start event is known.
-    pub fn for_version(version: &str, model: &str, effort: &str) -> Result<Expect, String> {
-        let mut e = match version {
-            "2.1.311" => Expect::pinned_2_1_311(model),
-            "2.1.329" => Expect::pinned_2_1_329(model),
-            "2.1.330" => Expect::pinned_2_1_330(model),
-            other => {
-                return Err(format!(
-                    "Claude Code {} isn't a version whose start event the gate knows (2.1.311, 2.1.329, 2.1.330)",
-                    crate::args::short(other)
-                ));
-            }
-        };
-        e.effort = effort.into();
-        Ok(e)
+    let servers = set("mcp_servers", |v| Some(format!("{}:{}", v["name"].as_str()?, v["status"].as_str()?)))?;
+    if servers != BTreeSet::from([format!("{SERVER}:connected")]) {
+        return Err("the init event's mcp_servers aren't exactly the shim".into());
     }
+    set("skills", |v| v.as_str().map(String::from))?;
+    let plugins = set("plugins", |v| Some(format!("{}:{}", v["name"].as_str()?, v["path"].as_str()?)))?;
+    if let Some(p) = plugins.iter().find(|p| !p.ends_with(":builtin")) {
+        let name = p.rsplit_once(':').map_or(p.as_str(), |(n, _)| n);
+        return Err(format!("the init event's plugins hold {}, which isn't builtin", crate::args::short(name)));
+    }
+    let memory = has("memory_paths")?.get("auto").and_then(Value::as_str);
+    let memory = memory.ok_or("the init event's memory_paths has no auto")?;
+    if !Path::new(memory).starts_with(resolved(own)?) || memory.contains("..") {
+        return Err("the init event's memory_paths.auto is outside the agent's directory".into());
+    }
+    Ok(())
 }
 
 /// The efforts `--effort` takes for Claude Code.
@@ -382,50 +374,16 @@ impl ClaudeCode {
         ])
     }
 
-    /// The gate: the `init` event must show exactly the plan.
+    /// The gate: the `init` event must show the plan ([`check_start_event`]).
     fn gate(&self, init: &Value, turn: &Turn) -> Result<(), String> {
-        let e = &self.expect;
-        let field = |k: &str| init.get(k).cloned().unwrap_or(Value::Null);
-        let eq = |k: &str, want: &str| {
-            if field(k).as_str() == Some(want) { Ok(()) } else { Err(format!("the init event's {k} isn't {want}")) }
-        };
-        if field("type") != "system" || field("subtype") != "init" {
-            return Err("the first event isn't init".into());
-        }
-        eq("claude_code_version", turn.version)?;
-        eq("model", &e.model)?;
-        eq("permissionMode", &e.permission_mode)?;
-        eq("apiKeySource", &e.api_key_source)?;
-        let set = |k: &str, pick: fn(&Value) -> Option<String>| -> Result<BTreeSet<String>, String> {
-            let items = init.get(k).and_then(Value::as_array).ok_or_else(|| format!("the init event has no {k}"))?;
-            items.iter().map(|v| pick(v).ok_or_else(|| format!("a bad entry in {k}"))).collect()
-        };
-        let want: BTreeSet<String> = self.tools.iter().map(|t| format!("mcp__{SERVER}__{t}")).collect();
-        if set("tools", |v| v.as_str().map(String::from))? != want {
-            return Err("the init event's tools aren't exactly the mode's".into());
-        }
-        let servers = set("mcp_servers", |v| Some(format!("{}:{}", v["name"].as_str()?, v["status"].as_str()?)))?;
-        if servers != BTreeSet::from([format!("{SERVER}:connected")]) {
-            return Err("the init event's MCP servers aren't exactly the shim".into());
-        }
-        if set("skills", |v| v.as_str().map(String::from))? != e.skills.iter().cloned().collect() {
-            return Err("the init event's skills aren't the bundled ones".into());
-        }
-        if set("plugins", |v| v["name"].as_str().map(String::from))? != e.plugins.iter().cloned().collect() {
-            return Err("the init event's plugins aren't the bundled ones".into());
-        }
-        let memory = init["memory_paths"]["auto"].as_str().ok_or("the init event has no memory path")?;
-        if !Path::new(memory).starts_with(resolved(turn.own)?) || memory.contains("..") {
-            return Err("the init event's memory path is outside the agent's directory".into());
-        }
-        Ok(())
+        check_start_event(init, &self.expect, turn.version, &self.tools, turn.own)
     }
 
     /// An assistant message: its id, model, usage and tool calls.
     fn message(m: &Value) -> Result<Event, String> {
-        let (Some(id), Ok(usage)) = (m["id"].as_str(), tokens(&m["usage"], true)) else {
-            return Err("an assistant message without readable usage".into());
-        };
+        // Each refusal names the field it found missing or changed (decision `2e583e378924`).
+        let id = m["id"].as_str().ok_or("an assistant message without an id")?;
+        let usage = tokens(&m["usage"], true).map_err(|e| format!("an assistant message's {e}"))?;
         let blocks = m["content"].as_array().into_iter().flatten().filter(|c| c["type"] == "tool_use");
         let tools: Option<Vec<(String, String)>> = blocks
             .map(|c| {
