@@ -171,6 +171,112 @@ lock_versions() {
   echo "${v:-none}"
 }
 
+# The root Cargo.toml (task 42e17ebb190f, finding 2f66d8148a00): what in it can change how crates/tree
+# compiles, which neither crates/tree's manifest nor Cargo.lock shows: the [workspace.dependencies] entries
+# of the crates crates/tree takes with `workspace = true` (their features, say), every [profile] section,
+# [workspace.package], which crates/tree inherits, and the rest of [workspace] (the resolver, say). It fails
+# closed: a changed line is left out only when it is provably a comment or blank, a [workspace] members or
+# exclude line, part of a [workspace.dependencies] entry of a crate crates/tree doesn't take, or
+# [workspace.metadata]; anything else, a line it can't place included, is reported. A multi-line string,
+# which this line-by-line reading can't follow, reports every change.
+#
+# tree_takes <tree-ish>: the crates crates/tree's manifest there takes from the workspace, one a line, or '*'
+# (all) when it holds what this can't read line by line (a multi-line string or inline table).
+tree_takes() {
+  local text
+  text=$({ git show "$1:crates/tree/Cargo.toml" 2>/dev/null || true; })
+  if grep -qE "'''|\"\"\"|\{[^}]*$" <<<"$text"; then
+    echo '*'
+    return
+  fi
+  LC_ALL=C awk '
+    { line = $0; sub(/#.*/, "", line) }
+    line ~ /^[ \t]*\[/ {
+      sect = line; gsub(/[ \t"\047]/, "", sect); dep = ""
+      if (match(sect, /dependencies\.[^]]+\]$/)) dep = substr(sect, RSTART + 13, RLENGTH - 14)
+      next
+    }
+    dep != "" && line ~ /^[ \t]*workspace[ \t]*=[ \t]*true/ { print tolower(dep); next }
+    { k = line; gsub(/[ \t"\047]/, "", k) }
+    k ~ /^[A-Za-z0-9_-]+\.workspace=true/ { sub(/\..*/, "", k); print tolower(k); next }
+    k ~ /^[A-Za-z0-9_-]+=\{.*workspace=true/ { sub(/=.*/, "", k); print tolower(k) }
+  ' <<<"$text" | sort -u
+}
+# changed_line_numbers <old|new> <old text> <new text>: the numbers of the lines a no-context diff changes, on
+# that side, space-separated.
+changed_line_numbers() {
+  local side=$1
+  diff -U0 <(printf '%s\n' "$2") <(printf '%s\n' "$3") | LC_ALL=C awk -v side="$side" '
+    /^@@ / {
+      split($0, f, " "); r = (side == "old") ? f[2] : f[3]; sub(/^[-+]/, "", r)
+      n = split(r, p, ","); start = p[1]; count = (n > 1) ? p[2] : 1
+      for (i = 0; i < count; i++) printf "%d ", start + i
+    }'
+}
+# cargo_toml_changes <old> <new> <crates>: why each line the root Cargo.toml changed between two tree-ishes
+# matters to crates/tree, one reason a line, each once; nothing if none does. <crates> are tree_takes's,
+# space-separated.
+cargo_toml_changes() {
+  local old_text new_text
+  old_text=$({ git show "$1:Cargo.toml" 2>/dev/null || true; })
+  new_text=$({ git show "$2:Cargo.toml" 2>/dev/null || true; })
+  [ "$old_text" != "$new_text" ] || return 0
+  if grep -qE "'''|\"\"\"" <<<"$old_text$new_text"; then
+    echo "a multi-line string, which this check can't read line by line"
+    return 0
+  fi
+  {
+    classify_toml "$(changed_line_numbers old "$old_text" "$new_text")" "$3" <<<"$old_text"
+    classify_toml "$(changed_line_numbers new "$old_text" "$new_text")" "$3" <<<"$new_text"
+  } | awk '!seen[$0]++'
+}
+# classify_toml <line numbers> <crates>: reads a Cargo.toml on standard input and prints, for each listed
+# line that matters to crates/tree, why (see above).
+classify_toml() {
+  LC_ALL=C awk -v want="$1" -v rel=" $2 " '
+    BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) W[w[i]] = 1; all = (rel ~ / \* /) }
+    function relevant(name) { return all || index(rel, " " tolower(name) " ") > 0 }
+    {
+      raw = $0; s = $0
+      gsub(/"([^"\\]|\\.)*"/, "\"\"", s); gsub(/\047[^\047]*\047/, "\047\047", s); sub(/#.*/, "", s)
+      t = s; gsub(/^[ \t]+|[ \t]+$/, "", t)
+      if (depth == 0) {
+        if (t ~ /^\[/) {
+          header = raw; sub(/[ \t]*#.*/, "", header); gsub(/^[ \t]+|[ \t]+$/, "", header)
+          sect = tolower(t); gsub(/[ \t"\047]/, "", sect); key = ""; kind = "header"
+        } else if (t == "") kind = "blank"
+        else { key = t; sub(/=.*/, "", key); gsub(/[ \t"\047]/, "", key); key = tolower(key); kind = "key" }
+      } else kind = "cont"
+      if (kind == "key" || kind == "cont") {
+        o = gsub(/[\[{]/, "&", s); c = gsub(/[\]}]/, "&", s); depth += o - c
+        if (depth < 0) depth = 0
+      }
+      if (!(NR in W)) next
+      if (raw ~ /^[ \t]*(#.*)?$/) next
+      if (sect == "") { print "a top-level key, which this check cannot rule out"; next }
+      if (sect == "[workspace]") {
+        if (kind != "header" && (key == "members" || key == "exclude")) next
+        print header " " (kind == "header" ? "itself" : key) ": how the workspace resolves crates/tree"
+        next
+      }
+      if (sect == "[workspace.dependencies]") {
+        if (kind == "header") { print "[workspace.dependencies] itself, which crates/tree takes from"; next }
+        name = key; sub(/\..*/, "", name)
+        if (relevant(name)) print "[workspace.dependencies] " name ", which crates/tree takes from the workspace"
+        next
+      }
+      if (index(sect, "[workspace.dependencies.") == 1) {
+        name = substr(sect, 25); sub(/[].].*/, "", name)
+        if (relevant(name)) print "[workspace.dependencies." name "], which crates/tree takes from the workspace"
+        next
+      }
+      if (index(sect, "[workspace.metadata") == 1) next
+      if (sect ~ /^\[\[?profile[].]/) { print header ": how crates/tree compiles"; next }
+      if (sect == "[workspace.package]") { print "[workspace.package], which crates/tree inherits"; next }
+      print header ", which this check cannot rule out"
+    }'
+}
+
 case "${1:-}" in
   frozen)
     [ $# -eq 3 ] || usage
@@ -233,6 +339,19 @@ case "${1:-}" in
       if why=$(frozen_mode "$path"); then found=true; echo "tree-scope: frozen: $path ($why)"; fi
       if why=$(owner_mode "$path"); then found=true; echo "tree-scope: owner: $path ($why)"; fi
       if why=$(security_mode "$path"); then found=true; echo "tree-scope: security: $path ($why)"; fi
+      if [ "$(lower "$path")" = cargo.toml ]; then
+        takes=$( { tree_takes "$base"; tree_takes "$head"; } | sort -u | tr '\n' ' ')
+        why=$(cargo_toml_changes "$base" "$head" "$takes")
+        if [ -z "$why" ]; then
+          takes=$( { tree_takes "$2"; tree_takes "$merged"; } | sort -u | tr '\n' ' ')
+          why=$(cargo_toml_changes "$2" "$merged" "$takes")
+        fi
+        while IFS= read -r reason; do
+          [ -n "$reason" ] || continue
+          found=true
+          echo "tree-scope: frozen: $path ($reason)"
+        done <<<"$why"
+      fi
       if [ "$path" = Cargo.lock ]; then
         for crate in $FROZEN_CRATES; do
           before=$(lock_entry "$base" "$crate")

@@ -365,6 +365,121 @@ fn tree_scope_folds_case_and_fails_closed_on_a_collision_or_a_criss_cross() {
     }
 }
 
+/// Finding 2f66d8148a00 (task 42e17ebb190f): a root Cargo.toml change that can alter how crates/tree compiles
+/// is frozen, named by what it touches: an entry in [workspace.dependencies] for a crate crates/tree takes from
+/// the workspace, in any of TOML's forms; any [profile] section; [workspace.package]; the rest of [workspace].
+/// Another crate's dependency, a new one, workspace members and comments aren't, and something the line-by-line
+/// reading can't place, a multi-line string, is.
+#[test]
+fn tree_scope_frozen_names_the_root_manifests_parts_crates_tree_builds_with() {
+    let root = "[workspace]\nresolver = \"3\"\nmembers = [\"crates/tree\", \"crates/other\"]\n\n\
+                [workspace.package]\nedition = \"2024\"\n\n\
+                [workspace.dependencies]\n# Pinned exactly.\nblake3 = \"=1.8.7\"\n\
+                imara-diff = { version = \"=0.2.0\", default-features = false }\nserde_json = \"1\"\n\
+                clap = { version = \"4\", features = [\"derive\"] }\nlong = [\n  \"a\",\n]\n\n\
+                [profile.dev]\ndebug = \"line-tables-only\"\n\n[profile.dev.package.\"*\"]\nopt-level = 2\n";
+    let tree = "[package]\nname = \"bracken-tree\"\nedition.workspace = true\n\n[dependencies]\nblake3.workspace = true\n\
+                imara-diff = { workspace = true }\n\n[dev-dependencies]\nserde_json.workspace = true\n";
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("tree-scope");
+        let files = [("scripts/tree-scope", scope.as_path())];
+        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "Cargo.toml", root);
+            put(dir, "crates/tree/Cargo.toml", tree);
+            put(dir, "crates/tree/src/format.rs", "format\n");
+        });
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let frozen = |text: &str| {
+            let head = plumb(&dir, &main, &[&main], &[("Cargo.toml", text)]);
+            let out = command(&dir, "scripts/tree-scope", &["frozen", &main, &head]).output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let takes = "which crates/tree takes from the workspace";
+        for (what, text, why) in [
+            (
+                "a feature on a crate it takes",
+                root.replace("default-features = false", "default-features = true"),
+                format!("[workspace.dependencies] imara-diff, {takes}"),
+            ),
+            (
+                "a version it takes",
+                root.replace("=1.8.7", "=1.8.8"),
+                format!("[workspace.dependencies] blake3, {takes}"),
+            ),
+            (
+                "a dotted key",
+                root.replace("serde_json = \"1\"\n", "serde_json = \"1\"\nblake3.features = [\"neon\"]\n"),
+                format!("[workspace.dependencies] blake3, {takes}"),
+            ),
+            (
+                "a dev-dependency it takes",
+                root.replace("serde_json = \"1\"", "serde_json = { version = \"1\", features = [\"preserve_order\"] }"),
+                format!("[workspace.dependencies] serde_json, {takes}"),
+            ),
+            (
+                "an entry as its own table",
+                format!("{root}\n[workspace.dependencies.blake3]\nfeatures = [\"neon\"]\n"),
+                format!("[workspace.dependencies.blake3], {takes}"),
+            ),
+            (
+                "a multi-line entry it takes",
+                root.replace("blake3 = \"=1.8.7\"", "blake3 = { version = \"=1.8.7\", features = [\n  \"neon\",\n] }"),
+                format!("[workspace.dependencies] blake3, {takes}"),
+            ),
+            (
+                "a profile",
+                root.replace("line-tables-only", "full"),
+                "[profile.dev]: how crates/tree compiles".to_owned(),
+            ),
+            (
+                "a package's profile",
+                root.replace("opt-level = 2", "opt-level = 0"),
+                "[profile.dev.package.\"*\"]: how crates/tree compiles".to_owned(),
+            ),
+            (
+                "a new profile",
+                format!("{root}\n[profile.release]\noverflow-checks = false\n"),
+                "[profile.release]: how crates/tree compiles".to_owned(),
+            ),
+            (
+                "the inherited edition",
+                root.replace("edition = \"2024\"", "edition = \"2021\""),
+                "[workspace.package], which crates/tree inherits".to_owned(),
+            ),
+            (
+                "the resolver",
+                root.replace("resolver = \"3\"", "resolver = \"2\""),
+                "[workspace] resolver: how the workspace resolves crates/tree".to_owned(),
+            ),
+            (
+                "a section it can't place",
+                format!("{root}\n[patch.crates-io]\nblake3 = {{ path = \"../blake3\" }}\n"),
+                "[patch.crates-io], which this check cannot rule out".to_owned(),
+            ),
+            (
+                "a multi-line string",
+                root.replace("long = [", "note = '''\nx'''\nlong = ["),
+                "a multi-line string, which this check can't read line by line".to_owned(),
+            ),
+        ] {
+            let (code, out) = frozen(&text);
+            assert_eq!(code, Some(0), "{scripts}: {what}: {out}");
+            assert!(out.contains(&format!("tree-scope: frozen: Cargo.toml ({why})\n")), "{scripts}: {what}: {out}");
+        }
+        for (what, text) in [
+            ("another crate's dependency", root.replace("features = [\"derive\"]", "features = [\"derive\", \"env\"]")),
+            ("a new dependency", root.replace("serde_json = \"1\"\n", "serde_json = \"1\"\nrusqlite = \"0.32\"\n")),
+            ("a multi-line entry it doesn't take", root.replace("  \"a\",\n", "  \"a\",\n  \"b\",\n")),
+            ("the members", root.replace("\"crates/other\"]", "\"crates/other\", \"crates/index\"]")),
+            ("a comment", root.replace("# Pinned exactly.", "# Pinned exactly, as the freeze asks.")),
+            ("metadata", format!("{root}\n[workspace.metadata.docs]\nall = true\n")),
+        ] {
+            let (code, out) = frozen(&text);
+            assert_eq!(code, Some(3), "{scripts}: {what}: {out}");
+        }
+    }
+}
+
 /// Findings 5b38ef3c9557 and e1a2fe970409. APFS folds some non-ASCII letters onto ASCII ones (the long s
 /// onto s, the Kelvin sign onto k), so a path holding any byte outside printable ASCII is refused by frozen,
 /// exit 2 naming it escaped, frozen or not. And it reads every path
