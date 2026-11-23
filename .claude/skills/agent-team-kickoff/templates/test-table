@@ -40,6 +40,16 @@
 # (gtimeout on macOS, from coreutils), and cargo-nextest (reference 4f8a96525a1e) where the tests run
 # here. A box gets its own (below).
 #
+# The Linux-target lint runs where it can build the tree's C code for Linux (answer 3fc621626cc6): a
+# Linux x86_64 host, as the box is, where that target is native. Off Linux, a tree with C code for
+# Linux (rusqlite's bundled SQLite) needs a Linux C cross-compiler, which a Mac doesn't have: there
+# the lint fails as any step does, and when a build script failed it says the box runs it, so --remote
+# or --split is the run to use. It is never skipped. A table that passes says, just before its pass
+# line, 'test-table: Linux-target lint passed on <uname -sm>'. --remote and --weave-box repeat that
+# line from a box that exited 0, and only the one just before the box table's pass line (after 'WEAVE
+# start' for --weave-box), so a box run's evidence, which keeps the output's last lines, records where
+# the lint ran, and no other output can stand in for it (finding 72832438d764).
+#
 # --remote runs the same table, unchanged, in one boat.dev box instead of on this machine (owner
 # decision 25c1e3543e76): HEAD and origin/main go in as a git bundle, the box checks HEAD out with
 # origin/main beside it and runs this script there, so the Ground guards check the same commits. The
@@ -209,14 +219,19 @@ scope_args() {
 }
 
 # The box's setup, before anything of the tree: the tools it lacks.
-# It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
-# programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both and
-# need 2.46 (MIN_GIT in research/experiment/src/git_mode.rs). The git-core PPA has the current git.
+# It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which ignores
+# GIT_NO_LAZY_FETCH: --weave-mac's clean check needs 2.45 or later (weave_mac), and its tests run that
+# check in the box with the box's git. The 2.46 that the
+# experiment's git-mode tests need (MIN_GIT in research/experiment/src/git_mode.rs) is research/'s own,
+# a workspace this table doesn't build. The git-core PPA has the current git.
 # Launchpad times out or drops the connection now and then (task 95302a01f49a), so adding the PPA is
 # tried four times, each for at most 2 minutes, 10, 30 and 90 s apart. If it still fails, the image's
-# own git does only if it's 2.46 or later; otherwise setup fails, saying so. Whichever git it ends
-# with is checked against 2.46. need_git holds that number, which a test keeps equal to MIN_GIT.
-# Their output shows only if they fail. Then cargo-nextest, as pinned. After its checkout, --remote
+# own git does only if it's 2.45 or later; otherwise setup fails, saying so. Whichever git it ends
+# with is checked against 2.45. need_git holds that number, which a test keeps equal to the clean
+# check's. add-apt-repository can succeed while apt can't fetch the PPA's index (Launchpad's content
+# server answering 503, note 0e3164150e9a), and then apt installs Ubuntu's git; so when the git is too
+# old after the PPA was added, setup reads apt-cache policy git and says whether the PPA's index is there.
+# The setup steps' output shows only if they fail. Then cargo-nextest, as pinned. After its checkout, --remote
 # also fetches every crate the host's whole package graph needs, dev-dependencies of packages a -p
 # list leaves out included, since a build fetches only what it builds (task 53efd11c6e4a:
 # unicode-properties, manyroot's dev-dependency, without -p manyroot).
@@ -227,7 +242,7 @@ setup() {
   log=$(mktemp)
   "$@" >"$log" 2>&1 || { rc=$?; echo "test-table: box setup failed (exit $rc): $*" >&2; cat "$log" >&2; exit "$rc"; }
 }
-need_git=2.46
+need_git=2.45
 git_ok() {
   read -r major minor < <(git --version 2>/dev/null | sed -n "s/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p") ||
     return 1
@@ -255,11 +270,16 @@ elif git_ok; then
   setup $sudo apt-get update -qq
   setup $sudo apt-get install -y -qq -o Acquire::Retries=3 b3sum curl jq lsof
 else
-  echo "test-table: box setup failed: couldn'"'"'t add ppa:git-core/ppa after $tries tries (Launchpad unreachable?), and the image'"'"'s $(git_said) is older than the $need_git the experiment'"'"'s git-mode tests need" >&2
+  echo "test-table: box setup failed: couldn'"'"'t add ppa:git-core/ppa after $tries tries (Launchpad unreachable?), and the image'"'"'s $(git_said) is older than the $need_git the clean check needs" >&2
   exit 1
 fi
 git_ok || {
-  echo "test-table: box setup failed: $(git_said) is older than the $need_git the experiment'"'"'s git-mode tests need" >&2
+  if [ $ppa = yes ] && ! apt-cache policy git 2>/dev/null | grep -q "ppa\.launchpadcontent\.net/git-core/ppa"; then
+    echo "test-table: box setup failed: ppa:git-core/ppa was added, but apt has no index from it (apt-cache policy git lists no ppa.launchpadcontent.net/git-core/ppa source: Launchpad'"'"'s content server down?), so apt installed $(git_said), older than the $need_git the clean check needs; retry when Launchpad answers" >&2
+    apt-cache policy git 2>&1 | head -n 12 >&2 || true
+  else
+    echo "test-table: box setup failed: $(git_said) is older than the $need_git the clean check needs" >&2
+  fi
   exit 1
 }
 nextest_tar=cargo-nextest-$nextest_version-x86_64-unknown-linux-gnu.tar.gz
@@ -272,7 +292,7 @@ export PATH="$nextest_dir:$PATH"'
 
 # The table in one boat box, for HEAD; $1, if given, runs in the box after it.
 remote() {
-  local rc line
+  local rc line lint
   command -v boat >/dev/null || fail "--remote needs boat (reference ea41264b3c38)"
   [ -z "$(git status --porcelain)" ] || fail "--remote tests HEAD: commit or set aside the changes first"
   git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
@@ -317,7 +337,21 @@ $1}"
     echo "test-table: the box's table exited $rc" >&2
     exit "$rc"
   fi
+  lint=$(box_lint "$out" '')
+  echo "test-table: box: ${lint:-no Linux-target lint line (docs-only)}"
   echo "test-table: all passed at $(git rev-parse HEAD), in a box"
+}
+
+# The Linux-target lint line (header) of a box that exited 0, from its output in $1, without its
+# 'test-table: ': only the one the table printed just before its pass line, which names a full sha, and
+# with $2 set only after a line that is exactly $2, so no other line the box printed stands in for it.
+box_lint() {
+  awk -v after="$2" '
+    BEGIN { r = "^test-table: (all|light run) passed at "; for (i = 0; i < 40; i++) r = r "[0-9a-f]"; r = r "([:,;]|$)" }
+    after != "" && !s { if ($0 == after) s = 1; next }
+    $0 ~ r && prev ~ /^test-table: Linux-target lint passed on / { l = prev }
+    { prev = $0 }
+    END { if (l != "") print substr(l, 13) }' "$1"
 }
 
 # The tests a 'cargo test -- --list' printed, as sorted '<test binary>|<test>' lines: the binary is the
@@ -609,7 +643,7 @@ git init -q tree
 cd tree
 git fetch -q ../tree.bundle +weave:refs/heads/tested
 # The commit as committed: attributes come from the empty tree, so the .gitattributes of the commit
-# itself can not filter the checkout (finding 42ac5a6e8aee; git 2.40 or later, box_setup gives 2.46).
+# itself can not filter the checkout (finding 42ac5a6e8aee; git 2.40 or later, box_setup gives 2.45 or later).
 git --attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904 checkout -q tested
 git update-ref refs/remotes/origin/main HEAD
 echo "WEAVE bundle $(sha256sum ../tree.bundle | cut -d" " -f1)"
@@ -673,6 +707,9 @@ echo 'WEAVE end'"
     echo "test-table: the box exited $rc" >&2
     exit "$rc"
   fi
+  local lint
+  lint=$(box_lint "$out" 'WEAVE start')
+  echo "test-table: box: ${lint:-no Linux-target lint line}"
   $ended || fail "the box exited 0, but its output has no 'WEAVE end' after the table's success line, so the table may not have run to its end"
   echo "test-table: weave box passed at $WEAVE_COMMIT${packages_args:+:$packages_args}, in box ${box:-unknown}"
 }
@@ -910,6 +947,32 @@ step() {
   echo "test-table: $*"
   "$@" || fail "failed: $*"
 }
+# The Linux-target lint (header): where it ran goes in $linted, printed before the pass line. Its standard
+# error is copied to a file as well, so a failure off Linux names the box only when a build script
+# failed (cargo's 'failed to run custom build command'), not for an ordinary lint error.
+linux_lint() {
+  local cmd=(cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings)
+  local host rc err
+  host=$(uname -sm)
+  echo "test-table: ${cmd[*]}"
+  err=$(mktemp)
+  exec 3>&1
+  set +e
+  "${cmd[@]}" 2>&1 >&3 3>&- | tee "$err" >&2
+  rc=${PIPESTATUS[0]}
+  set -e
+  exec 3>&-
+  if [ "$rc" -ne 0 ]; then
+    if [ "$host" != "Linux x86_64" ] && grep -q 'failed to run custom build command' "$err"; then
+      rm -f -- "$err"
+      fail "failed: ${cmd[*]} (on $host: a build script failed, and building the tree's C code for Linux needs a Linux C cross-compiler; scripts/test-table --remote or --split runs this lint in a Linux box)"
+    fi
+    rm -f -- "$err"
+    fail "failed: ${cmd[*]}"
+  fi
+  rm -f -- "$err"
+  linted="test-table: Linux-target lint passed on $host"
+}
 guards() {
   # In a Weave box: no .bracken/ to guard, and scripts/merge runs them; never the tree's own script.
   if $in_tree; then
@@ -930,7 +993,7 @@ if $light; then
   echo "test-table: light:$scope"
   step cargo fmt --check
   step cargo clippy --locked --all-targets -- -D warnings
-  step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+  linux_lint
   # shellcheck disable=SC2086 # $scope is the -p options, one word each
   step "$timeout" 1800 cargo nextest run --locked --no-fail-fast $scope
   if [ ${#libs[@]} -gt 0 ]; then
@@ -939,6 +1002,7 @@ if $light; then
     echo "test-table: no doctests:$scope has no library"
   fi
   guards
+  echo "$linted"
   echo "test-table: light run passed at $(git rev-parse HEAD):$scope; not the whole table"
   mode_line
   exit 0
@@ -955,9 +1019,10 @@ fi
 need_nextest
 step cargo fmt --check
 step cargo clippy --locked --all-targets -- -D warnings
-step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+linux_lint
 step "$timeout" 1800 cargo nextest run --locked --workspace --no-fail-fast
 step "$timeout" 1800 cargo test --locked --doc --workspace
 guards
+echo "$linted"
 echo "test-table: all passed at $(git rev-parse HEAD)"
 mode_line

@@ -39,7 +39,8 @@
 # error with nothing on standard output, since one couldn't be printed a line each (findings
 # db2dc1c6120e, e3f9ae2b1820). So is a changed path that differs only in ASCII case from another path in the
 # merged tree (<base> merged with <head>, as GitHub's squash merge makes it), naming both: a
-# case-insensitive checkout writes one over the other; a head that doesn't merge cleanly; and several
+# case-insensitive checkout writes one over the other (a path the head deleted isn't in it, so a rename by
+# letter case alone passes: finding e41d9b6f87db); a head that doesn't merge cleanly; and several
 # merge bases, a criss-cross history a diff from one can miss (findings 89119f47ba5c, bb7107f27076). Every
 # path is matched with its ASCII letters lowercased. A path holding any byte outside
 # printable ASCII is refused too, named escaped: APFS folds some non-ASCII letters onto ASCII ones (finding
@@ -51,7 +52,9 @@
 # counts too.
 #   'tree-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, the committed pin
-#     .config/weave-root (docs/design/weave-marker.md, option A); as
+#     .config/weave-root (docs/design/weave-marker.md, option A), a cargo configuration crates/tree
+#     builds with (the root's .cargo/, crates/.cargo/, and a .cargo/ at any depth under crates/tree:
+#     finding c2ee30084fa6, answer c733ce9e013f); as
 #     'tree-scope: frozen: Cargo.toml (<what>)', a change to the root Cargo.toml's frozen view (see
 #     cargo_toml_changes), or a failure to read it; and, as
 #     'tree-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
@@ -141,6 +144,9 @@ frozen_mode() {
     crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's test and its pinned values" ;;
     crates/tree/tests/fixtures/*) echo "a Weave fixture" ;;
     .config/weave-root) echo "the Weave Ground's committed pin: its id, and the root whose marker counts" ;;
+    .cargo/*) echo "cargo's configuration for the workspace, which crates/tree builds with" ;;
+    crates/.cargo/* | crates/tree/.cargo/* | crates/tree/*/.cargo/*)
+      echo "a cargo configuration that cargo run inside crates/tree reads" ;;
     *) return 1 ;;
   esac
 }
@@ -333,7 +339,9 @@ case "${1:-}" in
     # checkout (macOS's default) writes one over the other (finding 89119f47ba5c), so refuse, naming both.
     git ls-tree -r -z --name-only "$merged" | tr '\0' '\n' >"$tree_paths" || exit 2
     # Each path and each of its leading directories (finding 304dd65b233c: a case variant of a directory
-    # replaces it): any two spellings with one lowercase form, one of them from a changed path, collide.
+    # replaces it): any two spellings in the merged tree with one lowercase form, where a changed path has
+    # that form, collide. Only the merged tree's spellings count: a path the head deleted is in no checkout,
+    # so renaming a file by letter case alone is one spelling (finding e41d9b6f87db).
     collisions=$(LC_ALL=C awk '
       function add(p, touched,   n, i, part, pre, k) {
         n = split(p, part, "/")
@@ -341,7 +349,7 @@ case "${1:-}" in
         for (i = 1; i <= n; i++) {
           pre = (i == 1) ? part[1] : pre "/" part[i]
           k = tolower(pre)
-          if (touched) hit[k] = 1
+          if (touched) { hit[k] = 1; continue }
           if ((k, pre) in seen) continue
           seen[k, pre] = 1
           all[k] = (k in all) ? all[k] " and " pre : pre
