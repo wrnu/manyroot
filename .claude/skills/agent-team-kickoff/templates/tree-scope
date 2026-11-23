@@ -54,7 +54,9 @@
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, the committed pin
 #     .config/weave-root (docs/design/weave-marker.md, option A), a cargo configuration crates/tree
 #     builds with (the root's .cargo/, crates/.cargo/, and a .cargo/ at any depth under crates/tree:
-#     finding c2ee30084fa6, answer c733ce9e013f); as
+#     finding c2ee30084fa6, answer c733ce9e013f), what else changes how crates/tree compiles with no
+#     change to those (finding 61094746cfa7): scripts/rustc-wrapper, crates/tree/build.rs, and a
+#     rust-toolchain or rust-toolchain.toml at the root, in crates/ or in crates/tree; as
 #     'tree-scope: frozen: Cargo.toml (<what>)', a change to the root Cargo.toml's frozen view (see
 #     cargo_toml_changes), or a failure to read it; and, as
 #     'tree-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
@@ -147,6 +149,11 @@ frozen_mode() {
     .cargo/*) echo "cargo's configuration for the workspace, which crates/tree builds with" ;;
     crates/.cargo/* | crates/tree/.cargo/* | crates/tree/*/.cargo/*)
       echo "a cargo configuration that cargo run inside crates/tree reads" ;;
+    scripts/rustc-wrapper) echo "the rustc wrapper .cargo/config.toml runs for every compile, crates/tree's included" ;;
+    crates/tree/build.rs) echo "crates/tree's build script, which cargo builds and runs with no manifest change" ;;
+    rust-toolchain | rust-toolchain.toml | crates/rust-toolchain | crates/rust-toolchain.toml | \
+      crates/tree/rust-toolchain | crates/tree/rust-toolchain.toml)
+      echo "a toolchain pin rustup reads for a build of crates/tree" ;;
     *) return 1 ;;
   esac
 }
