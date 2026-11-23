@@ -1074,10 +1074,11 @@ fn each_index_has_its_own_digest_key() {
     agrees(&a, &store);
 }
 
-/// The full check while another process writes (the box's speculative queue, evidence 0d625fbdec0f's run):
+/// The full check while another process writes (the box's speculative queue, evidence d625fbdec0f3's run):
 /// that process may index what this process's store, opened earlier, never listed. The index then holds
-/// more than this store, which isn't a disagreement, so the replica's comparison is skipped; anything this
-/// store holds that the index lacks still fails it.
+/// more than this store, which isn't a disagreement in itself: the check lists the store again under the
+/// index's lock and compares the index with that, whole. Anything a store holds that the index lacks
+/// still fails it.
 #[test]
 fn the_full_check_allows_what_another_process_indexed_after_this_store_listed() {
     let tmp = tempfile::tempdir().expect("tmp");
@@ -1096,8 +1097,47 @@ fn the_full_check_allows_what_another_process_indexed_after_this_store_listed() 
     assert!(compare(&dir, &this, &before).is_err(), "an index ahead of the store is still compared");
     rebuild(&dir, &Store::open(&dir).expect("valid"), &take(&dir)).expect("rebuilt");
 
-    // Behind it instead: a row this store holds, deleted under a clean stamp, still fails.
+    // Behind it instead: a row of a contribution already indexed, deleted, still fails (no refresh puts a
+    // row back for a contribution the index already holds, whether its shard's stamp is recorded or not).
     conn(&dir).execute_batch("DELETE FROM tag WHERE seq = (SELECT min(seq) FROM tag)").expect("deleted");
     let now = Store::open(&dir).expect("valid");
     assert!(compare(&dir, &now, &Before::stats(&dir)).is_err());
+}
+
+/// Finding 48732994a715: the full check's two passes over an index ahead of its store don't share
+/// writes. This store holds X, unindexed, in a dirty shard; another process, whose store never listed X,
+/// indexed C, so the index is ahead. Bringing the index up to date with this store adds X and marks the
+/// derived tables stale; if that stayed for the pass against the reopened store, that pass would recompute
+/// `hidden` whole and hide damage to it. With the first pass rolled back to a savepoint, a damaged `hidden`
+/// still fails the check, and the same scenario without the damage passes.
+#[test]
+fn an_index_ahead_with_damaged_derived_rows_still_fails_the_full_check() {
+    let run = |damage: bool| -> Result<()> {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = ground(tmp.path());
+        grow(&dir, 64, 60);
+        read(&dir, 0);
+        assert!(rows(&dir, "SELECT count(*) FROM hidden") > 0, "the scenario needs something hidden");
+        if damage {
+            conn(&dir).execute_batch("DELETE FROM hidden").expect("damaged");
+        }
+        for attempt in 0..20 {
+            let mut theirs = Store::open(&dir).expect("valid"); // never lists X
+            let x = contribute(&dir, "reviewer", claim(&format!("x {attempt}")));
+            let before = Before::stats(&dir);
+            let this = Store::open(&dir).expect("valid");
+            let me = theirs.identity("builder").expect("an identity");
+            let c = theirs.contribute(&me, claim(&format!("c {attempt}"))).expect("valid");
+            if shard_of(&x) == shard_of(&c) {
+                continue; // X's shard must stay dirty, apart from C's
+            }
+            let outcome = refresh_with(&dir, &theirs, &Before::stats(&dir), Record::No, opts(0)).expect("C indexed");
+            assert_eq!(outcome.added, 1, "{outcome:?}");
+            return compare(&dir, &this, &before);
+        }
+        panic!("no attempt put X and C in two shards");
+    };
+    run(false).expect("without the damage the index agrees");
+    let err = run(true).expect_err("a damaged hidden set fails the check, the index being ahead or not");
+    assert!(format!("{err:#}").contains("hidden"), "{err:#}");
 }

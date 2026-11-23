@@ -1569,12 +1569,17 @@ pub fn compare(dir: &Path, store: &Store, before: &Before) -> Result<()> {
     let mut conn = open_db(&path, BUSY).with_context(|| format!("opening {}", path.display()))?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stats = Before { clock: None, shards: before.shards.clone() };
+    // The first pass in a savepoint, so a second starts from the index as it is (finding 48732994a715):
+    // what the first wrote, its insertions and a stale mark, would make the second recompute the derived
+    // tables whole and hide damage to them. The transaction, and its lock, stay.
+    tx.execute_batch("SAVEPOINT full_check")?;
     match replica(&tx, dir, &path, store, &want, &stats)? {
         Replica::Agrees | Replica::Unused => {}
         // Another process indexed what `store`, opened earlier, never listed. Nothing can index more while
         // this transaction holds the lock, so a store listed now holds all the index does: the index is
         // brought up to date with that one instead, and compared with it whole.
         Replica::Ahead => {
+            tx.execute_batch("ROLLBACK TO full_check")?;
             let stats = Before::stats(dir);
             let now = Store::open(dir).context("BRACKEN_FULL_CHECK: reopening the store")?;
             let want = expected(&now);
