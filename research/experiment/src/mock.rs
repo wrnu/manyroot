@@ -95,7 +95,14 @@ pub struct MockBackend {
     /// `(agent, turn)`s that list the tools and make no call, as a turn that ends at once or whose every model call
     /// fails would: a notice due then waits for a turn that makes one (finding `0220fc3d2c7e`).
     pub silent: Vec<(usize, u32)>,
+    /// A run's events file: in a run without lockstep, each builder ends its turn `t` (from 2) only once it shows
+    /// the integrator ended turn `t - 1`, so the builder's next turn starts after the integrator's notices of that
+    /// turn are published (finding `2d5c6f3e6a67`). Builders still play while the integrator plays.
+    pub paced_by: Option<PathBuf>,
 }
+
+/// How long a paced builder waits for the integrator's turn to end ([`MockBackend::paced_by`]).
+const PACE_LIMIT: std::time::Duration = std::time::Duration::from_secs(1800);
 
 /// What a project turn does of [`MockBackend::conflicts`]: whether this agent appends its [`shared_line`] this
 /// turn, and whether the integrator leaves conflicting work open for its builder ([`MockBackend::leaves_conflicts`]).
@@ -144,6 +151,7 @@ impl Default for MockBackend {
             conflicts: None,
             leaves_conflicts: false,
             silent: Vec::new(),
+            paced_by: None,
         }
     }
 }
@@ -427,13 +435,40 @@ impl Backend for MockBackend {
         for hint in &c.hints {
             hinted(hint);
         }
+        let asked = std::mem::take(&mut c.asked);
+        drop(c);
+        if let (Some(events), Some(n)) = (&self.paced_by, self.integrator)
+            && n != agent
+            && turn >= 2
+        {
+            wait_for_turn_end(events, &format!("agent-{n}"), turn - 1)?;
+        }
         if self.unknown_at.contains(&(agent, turn, false)) {
             (0..self.unknown_each).for_each(|_| self.unknown.note(name, UNKNOWN_TOOL));
         }
         match &self.usage {
-            Some(path) => usage(path, name, turn, &c.asked).and(played),
+            Some(path) => usage(path, name, turn, &asked).and(played),
             None => played,
         }
+    }
+}
+
+/// Waits until `events` shows `agent` ended turn `turn`.
+fn wait_for_turn_end(events: &Path, agent: &str, turn: u32) -> Result<(), String> {
+    let start = std::time::Instant::now();
+    loop {
+        let text = std::fs::read_to_string(events).unwrap_or_default();
+        let ended = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .any(|e| e["event"] == "turn_end" && e["agent"] == agent && e["data"]["turn"] == turn);
+        if ended {
+            return Ok(());
+        }
+        if start.elapsed() > PACE_LIMIT {
+            return Err(format!("{agent} didn't end turn {turn}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 

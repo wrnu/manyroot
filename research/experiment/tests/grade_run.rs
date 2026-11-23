@@ -788,23 +788,30 @@ mod macos_only {
                 .expect("the integrator's calls");
             assert!(seq(n) > last_call, "{mode}: noted only at the integrator's turn's end: {n}");
         }
+        // Finding `a71c41f4c289`: a notice comes in a turn that started (and synced) after its work was noted.
         for t in log.iter().filter(|e| e["event"] == "conflict_notice") {
+            let started = log
+                .iter()
+                .find(|e| {
+                    e["event"] == "turn_start" && e["agent"] == t["agent"] && e["data"]["turn"] == t["data"]["turn"]
+                })
+                .expect("the turn's start");
             assert!(
-                noted.iter().any(|n| n["data"]["for"] == t["agent"] && seq(n) < seq(t)),
-                "{mode}: told only of work noted at an integrator's turn's end: {t}"
+                noted.iter().any(|n| n["data"]["for"] == t["agent"] && seq(n) < seq(started)),
+                "{mode}: told only of work noted before its turn started: {t}"
             );
         }
     }
 
-    /// Finding `61993dafb91e`, in a concurrent run (no lockstep), where builders play their next turns while the
-    /// integrator plays: with `leaves`, the integrator leaves a builder's conflicting work open, and any notice
-    /// comes only after its turn ends; without, it settles every conflict in the turn it meets it, so no builder is
-    /// ever told, though the integrator's first try at the work stopped at conflicts.
-    /// Git project mode only: the mock's Weave integrator is written for lockstep (it settles the first proposal an
-    /// integrate stops at, and repairs a main reported broken by integrating again), so concurrent Weave runs fail
-    /// in the mock, not the driver. The notices' publishing is the same code in both modes.
-    fn a_concurrent_git_runs_notices_wait_for_the_integrators_turn(leaves: bool) {
-        let mode = bracken_experiment::git_project::NAME;
+    /// Findings `61993dafb91e`, `a71c41f4c289` and `2d5c6f3e6a67`, in a concurrent run (no lockstep), where
+    /// builders play their next turns while the integrator plays. With `leaves`, the integrator leaves a builder's
+    /// conflicting work open: the builders are paced ([`MockBackend::paced_by`]) so a turn of theirs starts after
+    /// the integrator's turn 1 ends, and the builder whose work conflicted is told then, not before, and brings it up
+    /// to date. Without, the integrator settles every conflict in the turn it meets it, so no builder is ever told,
+    /// though its first try at the work stopped at conflicts. Git project mode only: publishing notices is the same
+    /// code in both modes, and only reading Weave's conflict error differs, which a unit test covers (security review
+    /// `0ccccb53a79d`).
+    fn a_concurrent_runs_notices_wait_for_the_integrators_turn(mode: &'static str, leaves: bool) {
         let Some(python) = pin() else { return };
         let tmp = tempfile::tempdir().expect("a temp dir");
         let root = std::fs::canonicalize(tmp.path()).expect("resolved");
@@ -820,6 +827,7 @@ mod macos_only {
             integrator: Some(2),
             conflicts: Some(1),
             leaves_conflicts: leaves,
+            paced_by: leaves.then(|| cfg.root.join("events.jsonl")),
             ..MockBackend::default()
         };
         let outcome = run(&cfg, &mock).expect("the run");
@@ -829,11 +837,27 @@ mod macos_only {
         let errors: Vec<&Value> = log.iter().filter(|e| e["event"] == "turn_error").collect();
         assert!(errors.is_empty(), "{mode}: no turn erred: {errors:?}\n{kept}");
         notices_follow_the_integrators_turn(mode, &log);
-        if !leaves {
-            let told: Vec<&Value> =
-                log.iter().filter(|e| e["event"] == "conflict_noted" || e["event"] == "conflict_notice").collect();
-            assert!(told.is_empty(), "{mode}: nothing told of conflicts the integrator settled: {told:?}");
-            let init = outcome.modules.iter().find(|(p, _)| p.ends_with("/__init__.py")).expect("the package");
+        let noted: Vec<&Value> = log.iter().filter(|e| e["event"] == "conflict_noted").collect();
+        let told: Vec<&Value> = log.iter().filter(|e| e["event"] == "conflict_notice").collect();
+        let init = outcome.modules.iter().find(|(p, _)| p.ends_with("/__init__.py")).expect("the package");
+        if leaves {
+            // The integrator's turn 1 holds for both builders' turn 1, so it meets the conflict and leaves it.
+            assert!(noted.iter().any(|e| e["data"]["turn"] == 1), "{mode}: the conflict was noted: {noted:?}");
+            assert!(!told.is_empty(), "{mode}: a builder was told");
+            let work = |agent: usize| format!("by_agent_{agent}_turn_1");
+            for agent in [0, 1] {
+                assert!(init.1.contains(&shared_line(agent)), "{mode}: main keeps agent {agent}'s line: {}", init.1);
+                assert!(
+                    outcome.modules.iter().any(|(p, _)| p.contains(&work(agent))),
+                    "{mode}: main holds {}",
+                    work(agent)
+                );
+            }
+        } else {
+            assert!(
+                noted.is_empty() && told.is_empty(),
+                "{mode}: nothing told of settled conflicts: {noted:?} {told:?}"
+            );
             for agent in [0, 1] {
                 assert!(init.1.contains(&shared_line(agent)), "{mode}: main keeps agent {agent}'s line: {}", init.1);
             }
@@ -842,12 +866,12 @@ mod macos_only {
 
     #[test]
     fn a_concurrent_git_project_run_tells_nothing_of_conflicts_the_integrator_settles() {
-        a_concurrent_git_runs_notices_wait_for_the_integrators_turn(false);
+        a_concurrent_runs_notices_wait_for_the_integrators_turn(bracken_experiment::git_project::NAME, false);
     }
 
     #[test]
     fn a_concurrent_git_project_runs_notices_wait_for_the_integrators_turn() {
-        a_concurrent_git_runs_notices_wait_for_the_integrators_turn(true);
+        a_concurrent_runs_notices_wait_for_the_integrators_turn(bracken_experiment::git_project::NAME, true);
     }
 
     #[test]
