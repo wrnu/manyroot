@@ -262,12 +262,46 @@ impl Expect {
     }
 }
 
+/// What a start event showed that varies with the version: the version, and its skills and plugins by name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StartEvent {
+    pub version: String,
+    pub skills: BTreeSet<String>,
+    pub plugins: BTreeSet<String>,
+}
+
+impl StartEvent {
+    /// As a turn's gate record keeps it.
+    pub fn record(&self) -> Value {
+        json!({"version": self.version, "skills": self.skills, "plugins": self.plugins})
+    }
+
+    /// A later turn's start event must show its run's first turn's skills and plugins (finding `aaa686b72100`): a
+    /// different version may show others, but not partway through a run.
+    pub fn same_as(&self, first: &StartEvent) -> Result<(), String> {
+        for (k, mine, theirs) in [("skills", &self.skills, &first.skills), ("plugins", &self.plugins, &first.plugins)] {
+            if mine != theirs {
+                return Err(format!("the init event's {k} aren't the run's first turn's"));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The gate (decision `2e583e378924`): what the runner relies on in Claude Code's `init` event, checked field by
 /// field whatever the version, each refusal naming its field. It must be the init event of the pinned `version`,
 /// with the plan's model, permission mode and credential source; offer exactly the mode's `tools` through exactly
 /// the shim; list its skills, and its plugins all builtin, so nothing of the owner's own config reached the agent;
-/// and keep its memory inside the agent's own directory `own`.
-pub fn check_start_event(init: &Value, e: &Expect, version: &str, tools: &[String], own: &Path) -> Result<(), String> {
+/// run in the agent's `home`; and keep its memory inside the agent's own directory `own`. What it showed that varies
+/// with the version, it returns.
+pub fn check_start_event(
+    init: &Value,
+    e: &Expect,
+    version: &str,
+    tools: &[String],
+    home: &Path,
+    own: &Path,
+) -> Result<StartEvent, String> {
     let has = |k: &str| init.get(k).filter(|v| !v.is_null()).ok_or_else(|| format!("the init event has no {k}"));
     let eq = |k: &str, want: &str| {
         if has(k)?.as_str() == Some(want) { Ok(()) } else { Err(format!("the init event's {k} isn't {want}")) }
@@ -293,18 +327,22 @@ pub fn check_start_event(init: &Value, e: &Expect, version: &str, tools: &[Strin
     if servers != BTreeSet::from([format!("{SERVER}:connected")]) {
         return Err("the init event's mcp_servers aren't exactly the shim".into());
     }
-    set("skills", |v| v.as_str().map(String::from))?;
-    let plugins = set("plugins", |v| Some(format!("{}:{}", v["name"].as_str()?, v["path"].as_str()?)))?;
-    if let Some(p) = plugins.iter().find(|p| !p.ends_with(":builtin")) {
-        let name = p.rsplit_once(':').map_or(p.as_str(), |(n, _)| n);
-        return Err(format!("the init event's plugins hold {}, which isn't builtin", crate::args::short(name)));
+    let skills = set("skills", |v| v.as_str().map(String::from))?;
+    let plugins = set("plugins", |v| v["name"].as_str().map(String::from))?;
+    // Each plugin's own path, exactly (finding `6f43bdd61405`).
+    if let Some(p) = list("plugins")?.iter().find(|p| p["path"].as_str() != Some("builtin")) {
+        let name = p["name"].as_str().unwrap_or_default();
+        return Err(format!("the init event's plugins hold {}, whose path isn't builtin", crate::args::short(name)));
+    }
+    if has("cwd")?.as_str().map(PathBuf::from) != Some(resolved(home)?) {
+        return Err("the init event's cwd isn't the agent's home".into());
     }
     let memory = has("memory_paths")?.get("auto").and_then(Value::as_str);
     let memory = memory.ok_or("the init event's memory_paths has no auto")?;
     if !Path::new(memory).starts_with(resolved(own)?) || memory.contains("..") {
         return Err("the init event's memory_paths.auto is outside the agent's directory".into());
     }
-    Ok(())
+    Ok(StartEvent { version: version.into(), skills, plugins })
 }
 
 /// The efforts `--effort` takes for Claude Code.
@@ -339,7 +377,8 @@ impl HarnessBackend<ClaudeCode> {
         let ClaudeConfig { pin, expect, caps, sign_in, dir, shim, prompt, turns, tools, upstream } = cfg;
         let backend = BackendConfig { caps: caps.clone(), dir, shim: shim.clone(), turns };
         let names = ENV_NAMES.iter().chain(sign_in.names()).copied().collect();
-        let harness = ClaudeCode { pin, expect, caps, sign_in, names, shim, prompt, tools, upstream };
+        let first = std::sync::Mutex::new(None);
+        let harness = ClaudeCode { pin, expect, caps, sign_in, names, shim, prompt, tools, upstream, first };
         HarnessBackend::start(harness, backend)
     }
 }
@@ -356,9 +395,17 @@ pub struct ClaudeCode {
     prompt: String,
     tools: Vec<String>,
     upstream: Option<std::net::SocketAddr>,
+    /// What the run's first gated turn's start event showed: every later turn's must show the same (finding
+    /// `aaa686b72100`).
+    first: std::sync::Mutex<Option<StartEvent>>,
 }
 
 impl ClaudeCode {
+    /// What the run's first gated turn's start event showed, if a turn has been gated.
+    pub fn start_event(&self) -> Option<StartEvent> {
+        self.first.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// The turn configuration for an agent whose socket is `socket`: (file name, bytes).
     fn turn_files(&self, socket: &Path) -> Result<Vec<(&'static str, Vec<u8>)>, String> {
         let mcp = json!({"mcpServers": {SERVER: {
@@ -374,32 +421,44 @@ impl ClaudeCode {
         ])
     }
 
-    /// The gate: the `init` event must show the plan ([`check_start_event`]).
-    fn gate(&self, init: &Value, turn: &Turn) -> Result<(), String> {
-        check_start_event(init, &self.expect, turn.version, &self.tools, turn.own)
+    /// The gate: the `init` event must show the plan ([`check_start_event`]), and what the run's first turn's showed;
+    /// the turn's gate record keeps what it showed.
+    fn gate(&self, init: &Value, turn: &Turn) -> Result<Value, String> {
+        let seen = check_start_event(init, &self.expect, turn.version, &self.tools, turn.home, turn.own)?;
+        let mut first = self.first.lock().unwrap_or_else(|e| e.into_inner());
+        match &*first {
+            Some(f) => seen.same_as(f)?,
+            None => *first = Some(seen.clone()),
+        }
+        Ok(seen.record())
     }
 
     /// An assistant message: its id, model, usage and tool calls.
     fn message(m: &Value) -> Result<Event, String> {
-        // Each refusal names the field it found missing or changed (decision `2e583e378924`).
-        let id = m["id"].as_str().ok_or("an assistant message without an id")?;
+        // Each refusal names the field it found missing or changed (decision `2e583e378924`, finding
+        // `0c108f394b12`): what the run records and counts must be there, as it reads it.
+        let id = m["id"].as_str().filter(|i| !i.is_empty()).ok_or("an assistant message without an id")?;
+        let model = m["model"].as_str().ok_or("an assistant message without a model")?;
         let usage = tokens(&m["usage"], true).map_err(|e| format!("an assistant message's {e}"))?;
-        let blocks = m["content"].as_array().into_iter().flatten().filter(|c| c["type"] == "tool_use");
-        let tools: Option<Vec<(String, String)>> = blocks
+        let content = m["content"].as_array().ok_or("an assistant message whose content isn't a list")?;
+        let blocks = content.iter().filter(|c| c["type"] == "tool_use");
+        let tools: Result<Vec<(String, String)>, String> = blocks
             .map(|c| {
-                let id = c["id"].as_str().filter(|i| !i.is_empty())?;
-                Some((id.to_string(), c["name"].as_str().unwrap_or_default().to_string()))
+                let id = c["id"].as_str().filter(|i| !i.is_empty()).ok_or("a tool call without an id")?;
+                let name = c["name"].as_str().ok_or("a tool call without a name")?;
+                Ok((id.to_string(), name.to_string()))
             })
             .collect();
-        let tools = tools.ok_or("a tool call without an id")?;
+        let tools = tools?;
         // Claude Code refuses a name it doesn't hold itself; nothing here halts on one, as before (answer
         // `98c18ce63bfc`).
-        Ok(Event::Message { id: id.to_string(), model: m["model"].clone(), usage, tools, unknown: Vec::new() })
+        Ok(Event::Message { id: id.to_string(), model: json!(model), usage, tools, unknown: Vec::new() })
     }
 
     /// The result event: the larger of its `usage` and its `modelUsage`, both required.
     fn result(event: &Value) -> Result<Event, String> {
         let usage = tokens(&event["usage"], true).map_err(|e| format!("the result event: {e}"))?;
+        let ended = event["subtype"].as_str().ok_or("the result event has no subtype")?;
         let models = event["modelUsage"].as_object().filter(|m| !m.is_empty());
         let models = models.ok_or("the result event has no modelUsage")?;
         let mut by_model = Tokens::default();
@@ -410,7 +469,7 @@ impl ClaudeCode {
         }
         Ok(Event::Result {
             usage: Some(usage.max(&by_model)),
-            ended: event["subtype"].clone(),
+            ended: json!(ended),
             cost_usd: event["total_cost_usd"].clone(),
             duration_ms: event["duration_ms"].clone(),
         })

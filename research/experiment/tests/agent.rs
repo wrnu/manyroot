@@ -637,14 +637,16 @@ fn a_subscription_token_is_read_from_a_private_file_and_never_shown() {
 }
 
 /// A version's start event, as recorded (`tests/fixtures/claude-<version>-init.json`: the fields the gate reads that
-/// the version decides), completed with what the run decides: the mode's tools through the shim, and memory inside
-/// the agent's directory `own`.
+/// the version decides), completed with what the run decides: the mode's tools through the shim, its working
+/// directory the agent's home (`own`/home, which it makes), and memory inside the agent's directory `own`.
 fn start_event(version: &str, own: &Path) -> Value {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/claude-{version}-init.json"));
     let mut init: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("the fixture")).expect("JSON");
     init["tools"] = json!(tools().iter().map(|t| format!("mcp__experiment__{t}")).collect::<Vec<_>>());
     init["mcp_servers"] = json!([{"name": "experiment", "status": "connected"}]);
     init["memory_paths"] = json!({"auto": own.join("config/projects/x/memory/")});
+    std::fs::create_dir_all(own.join("home")).expect("a home");
+    init["cwd"] = json!(std::fs::canonicalize(own.join("home")).expect("resolved"));
     init
 }
 
@@ -658,13 +660,19 @@ fn every_versions_start_event_of_the_same_shape_passes_the_gate() {
     let tools: Vec<String> = tools().iter().map(|t| t.to_string()).collect();
     for version in ["2.1.311", "2.1.329", "2.1.330"] {
         let init = start_event(version, &own);
-        check_start_event(&init, &e, version, &tools, &own).unwrap_or_else(|err| panic!("{version}: {err}"));
+        let seen = check_start_event(&init, &e, version, &tools, &own.join("home"), &own)
+            .unwrap_or_else(|err| panic!("{version}: {err}"));
+        // What it showed that varies with the version, for the turn's record.
+        assert_eq!(seen.version, version);
+        assert_eq!(seen.skills.len(), 16, "{version}");
+        assert!(seen.plugins.contains("cc-plugin-agents-md"), "{version}");
     }
     let mut unseen = start_event("2.1.330", &own);
     unseen["claude_code_version"] = json!("2.1.999");
-    check_start_event(&unseen, &e, "2.1.999", &tools, &own).expect("an unseen version of the same shape");
+    check_start_event(&unseen, &e, "2.1.999", &tools, &own.join("home"), &own)
+        .expect("an unseen version of the same shape");
     // The pinned version is still the one it must show.
-    let err = check_start_event(&unseen, &e, "2.1.330", &tools, &own).expect_err("another version");
+    let err = check_start_event(&unseen, &e, "2.1.330", &tools, &own.join("home"), &own).expect_err("another version");
     assert!(err.contains("claude_code_version"), "{err}");
 }
 
@@ -686,26 +694,66 @@ fn a_start_event_missing_what_the_gate_relies_on_is_refused_naming_it() {
         "skills",
         "plugins",
         "memory_paths",
+        "cwd",
     ];
     for field in fields {
         let mut init = start_event("2.1.330", &own);
         init.as_object_mut().expect("an object").remove(field);
-        let err = check_start_event(&init, &e, "2.1.330", &tools, &own).expect_err(field);
+        let err = check_start_event(&init, &e, "2.1.330", &tools, &own.join("home"), &own).expect_err(field);
         assert!(err.contains(&format!("has no {field}")), "{field}: {err}");
     }
     let changed = [
         ("skills", json!("deep-research"), "skills isn't a list"),
         ("skills", json!([1]), "a bad entry in the init event's skills"),
         ("plugins", json!([{"name": "owner-plugin", "path": "/Users/someone/plugin"}]), "owner-plugin"),
-        ("plugins", json!([{"name": "cc-plugin-agents-md"}]), "a bad entry in the init event's plugins"),
+        // Finding `6f43bdd61405`: the path itself must be builtin.
+        (
+            "plugins",
+            json!([{"name": "owner-plugin", "path": "/Users/someone/x:builtin"}]),
+            "`owner-plugin`, whose path",
+        ),
+        ("cwd", json!("/Users/someone"), "cwd isn't the agent's home"),
+        ("plugins", json!([{"name": "cc-plugin-agents-md"}]), "`cc-plugin-agents-md`, whose path isn't builtin"),
         ("memory_paths", json!({}), "memory_paths has no auto"),
         ("subtype", json!("status"), "type and subtype"),
     ];
     for (field, value, says) in changed {
         let mut init = start_event("2.1.330", &own);
         init[field] = value;
-        let err = check_start_event(&init, &e, "2.1.330", &tools, &own).expect_err(field);
+        let err = check_start_event(&init, &e, "2.1.330", &tools, &own.join("home"), &own).expect_err(field);
         assert!(err.contains(says), "{field}: {err}");
+    }
+}
+
+/// Finding `aaa686b72100`: within a run, a turn's start event must show its first turn's skills and plugins; the
+/// gate refuses it otherwise, naming which.
+#[test]
+fn a_turns_start_event_must_show_its_runs_first_skills_and_plugins() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let own = std::fs::canonicalize(tmp.path()).expect("resolved");
+    let e = Expect::new("claude-sonnet-5-5");
+    let tools: Vec<String> = tools().iter().map(|t| t.to_string()).collect();
+    let seen = |init: &Value| check_start_event(init, &e, "2.1.330", &tools, &own.join("home"), &own).expect("passes");
+    let first = seen(&start_event("2.1.330", &own));
+    first.same_as(&first).expect("the same");
+    let mut more = start_event("2.1.330", &own);
+    more["plugins"].as_array_mut().expect("a list").push(json!({"name": "cc-plugin-new", "path": "builtin"}));
+    assert!(seen(&more).same_as(&first).expect_err("a new plugin").contains("plugins"));
+    let mut fewer = start_event("2.1.330", &own);
+    fewer["skills"].as_array_mut().expect("a list").pop();
+    assert!(seen(&fewer).same_as(&first).expect_err("a skill fewer").contains("skills"));
+    // As a turn's record keeps it.
+    let record = first.record();
+    assert_eq!(record["version"], "2.1.330");
+    assert_eq!(record["plugins"].as_array().map(Vec::len), Some(3));
+}
+
+/// Reviewer note on PR #77: a pin without a version is refused at once, not at the first turn's gate.
+#[test]
+fn a_pin_without_a_version_is_refused() {
+    for version in ["", "  "] {
+        let err = Pin::of(&fake(), version).expect_err("no version");
+        assert!(err.contains("version is empty"), "{err}");
     }
 }
 
@@ -1081,25 +1129,42 @@ mod macos_only {
             let s = Setup::new();
             let backend = s.backend_with(&script, caps(), Pin::of(&fake(), version).expect("pin"));
             s.run(&backend, 1, 1).unwrap_or_else(|e| panic!("{version}: {e}"));
-            assert!(s.usage().iter().any(|r| r["gate"] == true), "{version}: the gate passed");
+            let gated = s.usage().into_iter().find(|r| r["gate"] == true).expect("the gate passed");
+            // The turn's record keeps what its start event showed (finding `aaa686b72100`).
+            let names = |k: &str, pick: fn(&Value) -> Option<&str>| -> std::collections::BTreeSet<String> {
+                recorded[k].as_array().expect("a list").iter().filter_map(pick).map(String::from).collect()
+            };
+            let (skills, plugins) = (names("skills", |v| v.as_str()), names("plugins", |v| v["name"].as_str()));
+            assert_eq!(gated["version"], version);
+            assert_eq!(gated["skills"], json!(skills));
+            assert_eq!(gated["plugins"], json!(plugins));
         }
     }
 
-    /// Decision `2e583e378924`: an assistant message missing what the runner reads stops the run, naming it.
+    /// Decision `2e583e378924`, finding `0c108f394b12`: an assistant message or result missing what the runner reads
+    /// stops the run, naming it.
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "needs macOS sandbox-exec")]
     fn a_stream_event_missing_what_the_runner_reads_stops_the_run_naming_it() {
         let usage = r#"{"input_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}"#;
+        let full = r#"{"input_tokens": 1, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 1}"#;
+        let by_model =
+            r#"{"m": {"inputTokens": 1, "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0, "outputTokens": 1}}"#;
+        let message = |m: String| format!(r#"{{"type": "assistant", "message": {m}}}"#);
+        let call = r#"[{"type": "tool_use", "id": "t1", "tool_name": "x"}]"#;
         let cases = [
+            (message(format!(r#"{{"model": "m", "usage": {full}, "content": []}}"#)), "without an id"),
+            (message(format!(r#"{{"id": "", "model": "m", "usage": {full}, "content": []}}"#)), "without an id"),
+            (message(format!(r#"{{"id": "m1", "model": "m", "usage": {usage}, "content": []}}"#)), "output_tokens"),
+            (message(format!(r#"{{"id": "m1", "usage": {full}, "content": []}}"#)), "without a model"),
+            (message(format!(r#"{{"id": "m1", "model": "m", "usage": {full}}}"#)), "content isn't a list"),
             (
-                format!(r#"{{"type": "assistant", "message": {{"model": "m", "usage": {usage}, "content": []}}}}"#),
-                "without an id",
+                message(format!(r#"{{"id": "m1", "model": "m", "usage": {full}, "content": {call}}}"#)),
+                "a tool call without a name",
             ),
             (
-                format!(
-                    r#"{{"type": "assistant", "message": {{"id": "m1", "model": "m", "usage": {usage}, "content": []}}}}"#
-                ),
-                "output_tokens",
+                format!(r#"{{"type": "result", "usage": {full}, "modelUsage": {by_model}}}"#),
+                "the result event has no subtype",
             ),
         ];
         for (line, says) in cases {
@@ -1123,6 +1188,7 @@ mod macos_only {
             ("skills", "\"deep-research\""),
             ("plugins", "[{\"name\": \"owner-plugin\"}]"),
             ("plugins", "[{\"name\": \"owner-plugin\", \"path\": \"/Users/someone/plugin\"}]"),
+            ("cwd", "\"/Users/someone\""),
             (
                 "mcp_servers",
                 "[{\"name\": \"experiment\", \"status\": \"connected\"}, {\"name\": \"owner\", \"status\": \"connected\"}]",
@@ -1132,7 +1198,8 @@ mod macos_only {
         ];
         for (key, value) in cases {
             let err = refused_by_gate(&format!("init {key} {value}\nresult 10"));
-            assert!(!err.is_empty(), "{key}");
+            // Refused by name (reviewer note on PR #77).
+            assert!(err.contains(key), "{key}: {err}");
         }
         // An added tool, beside the mode's, is refused too.
         let mut with_extra: Vec<String> = tools().iter().map(|t| format!("\"mcp__experiment__{t}\"")).collect();

@@ -708,7 +708,19 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
             if let Some(setting) = &setting {
                 backend.set_integrator(mode.name(), setting, a.agents)?;
             }
-            run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
+            let outcome = run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?;
+            // What the start event showed, every turn alike: a change across runs shows before grading (finding
+            // `aaa686b72100`).
+            if let Some(seen) = backend.harness().start_event() {
+                let names = |s: &std::collections::BTreeSet<String>| s.iter().cloned().collect::<Vec<_>>().join(", ");
+                println!(
+                    "Claude Code {}'s start event, every turn: skills [{}]; plugins [{}]",
+                    seen.version,
+                    names(&seen.skills),
+                    names(&seen.plugins)
+                );
+            }
+            outcome
         }
         HarnessArgs::Pi { prefix, version, provider, .. } => {
             let credential = match provider {

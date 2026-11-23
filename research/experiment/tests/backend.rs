@@ -126,7 +126,7 @@ impl Harness for Mock {
         if first {
             let why: Vec<&str> = words.collect();
             return Ok(match (kind, why.as_slice()) {
-                ("init", ["ok"]) => Event::Init(Ok(())),
+                ("init", ["ok"]) => Event::Init(Ok(Value::Null)),
                 ("init", why) => Event::Init(Err(why.join(" "))),
                 _ => Event::Other,
             });
