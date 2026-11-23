@@ -6,7 +6,7 @@
 > `7d140f132b1a`, which builds Phase 3 of [layers.md](layers.md) (owner decision
 > `817afe6653a8`, item 2). The measurements are in note `799ce5d903e9`. PR 2 adds the
 > index as a cache behind the existing read API. PR 3 serves reads from it.
-> Round 2 revised sections 3–8 for the twelve review findings (section 10).
+> Rounds 2 and 3 revised sections 3–8 for the review findings (section 10).
 
 ## 1. What it is
 
@@ -183,7 +183,7 @@ CREATE TABLE shard  (n INTEGER PRIMARY KEY,          -- 0..255; no row means dir
                      mtime_s INTEGER, mtime_ns INTEGER, ctime_s INTEGER, ctime_ns INTEGER,
                      ino BLOB, dev BLOB);            -- u64s as 8 big-endian bytes
 CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL);
-                     -- schema_version, ground id, the file's own inode, hidden_stale, fs_clock
+                     -- schema_version, ground id, the file's own device and inode, hidden_stale, fs_clock
 ```
 
 **Order.** Every answer that the full computation orders by `Graph::topo_order()`
@@ -197,7 +197,11 @@ exact like this:
   parents. For several new contributions, *m* is the smallest such value over
   those whose parents are all already indexed. Positions after *m* are recomputed by running Kahn over the
   contributions after *m* plus the new ones, smallest id first, and only rows
-  whose `pos` changed are rewritten.
+  whose `pos` changed are rewritten. `pos` is `UNIQUE`, which SQLite checks row
+  by row, so the rewrite takes two steps: the affected rows move to `-pos - 1`,
+  then to their new values.
+  - A contribution with no parents gives *m* = -1, so every position is
+    recomputed. A new root is rare.
   - A local write's parents are every head of the store it was made in. When
     the index holds what that store holds, *m* is the last position, and X
     appends with no rewrite.
@@ -215,7 +219,9 @@ u64.
   inode and device as 8-byte big-endian blobs, compared only for equality.
 
 **What each insert maintains.** A contribution is inserted the same way whether it
-comes from a write, from freshness or from a rebuild:
+comes from a write, from freshness or from a rebuild. Inserting an id that is
+already indexed is a no-op, so a write racing a freshness reconcile in another
+process adds each row once.
 
 - `obj` and `agent`;
 - `parent` and `child`;
@@ -244,34 +250,64 @@ incrementally is Phase 4 (research B R2).
 Objects can arrive outside Bracken: a git pull, a checkpoint, another tool, or an
 older `bracken` binary. Each open finds them as follows.
 
-1. **Read the filesystem's clock first.** On an open that may record stamps (not
-   a read-only one), rewrite `cache/clock`, a small file, without fsync, and take
-   its mtime as *T*. This is git's racy-index rule, which compares an entry's
-   mtime with a time from the same filesystem. *T* is taken before any stat, and
-   from the filesystem rather than this process's wall clock, so neither a slow
-   reconcile nor skew against a network filesystem's server can break it.
-2. **List `objects/` and stat its shards** (0.45 ms). `objects/` is listed with the
-   store's own checks: the same code as `Store::open`, through `fsx`, opened
-   without following links. An entry that isn't a 2-hex shard directory refuses
-   the open exactly as `Store::open` does, so stray files, symlinked shards and
-   non-hex directories are caught on every open, not only when a shard changes.
-3. **Find the dirty shards.** Every one of the 256 is decided:
-   - a shard is clean only if its row matches its current stamp (mtime, ctime,
-     inode, device), or its row says absent and it is absent;
-   - anything else is dirty: no row, a different stamp, a row for a shard that's
-     gone, or a new shard;
+**The rule for every open, freshness and rebuild alike:** *T* is read, and every
+shard statted, before any listing of `objects/` or of a shard. That includes
+`Store::open`'s own listing in PR 2. A stamp is only ever compared with, or
+recorded from, a stat taken after *T* and before the listing it is reconciled
+with.
+
+1. **Read the filesystem's clock first.** Rewrite `cache/clock`, a small file,
+   without fsync, and take its mtime as *T*.
+   - This is git's racy-index rule, which compares an entry's mtime with a time
+     from the same filesystem.
+   - Taking *T* first, and from the filesystem rather than this process's wall
+     clock, means neither a slow reconcile nor skew against a network
+     filesystem's server can break it.
+   - If `cache/clock` can't be written or read, this open records no stamps and
+     treats every shard as dirty.
+2. **Stat `objects/`'s directories** (0.45 ms). In PR 2 this happens before
+   `Store::open` lists anything.
+3. **Find the dirty shards.**
+   - **Clock step back first.** If *T* is earlier than the `fs_clock` recorded in
+     `meta`, the filesystem clock stepped back: every shard is dirty on this open,
+     and every shard row is cleared, before any stamp is compared.
+   - Otherwise, each of the 256 shards `00`–`ff` is decided. It is clean only if
+     its row matches its current stamp (mtime, ctime, inode, device), or its row
+     says absent and it is absent. Anything else is dirty: no row, a different
+     stamp, a row for a shard that's gone, or a new shard.
    - ctime can't be set from user space, so a `touch -m` that resets mtime is
      still caught.
-4. **List each dirty shard with the store's own checks**, the same per-shard
-   listing `Store::open` uses, which `crates/manyroot` exposes for this. A
-   non-regular entry (link, directory, FIFO) or a misnamed or uppercase file
-   refuses the open, as `Store::open` does. Then diff the listing against the
-   index's id range for that prefix. (In PR 2 the store has already listed and
-   checked every object, so the diff runs against the store's ids.)
-5. **Index what the index lacks.** Each such file is read and fully checked, then
-   indexed in the same transaction. The check covers its signature and every
-   protocol rule, as `Store::open_trusting_with` checks objects missing from the
-   snapshot today, in causal order across shards.
+4. **List with `Store::open`'s own checks**, the code `crates/manyroot` exposes for
+   this (unchanged; this work doesn't tighten `Store::open`). Those checks are:
+   - **`objects/`**: opened without following a link. Its entries named with a dot
+     are skipped. An entry that isn't UTF-8, isn't a directory, or is a link is
+     `StoreError::Corrupt`.
+   - **Any directory is accepted as a shard**, whatever its name. Its entries
+     named with a dot (a write in flight) or not UTF-8 are skipped.
+   - **Every other entry is read as an object.** A non-regular one (link,
+     directory, FIFO) is refused, and so is a file whose path isn't its content's
+     id.
+
+   So freshness lists `objects/` itself on every open (257 entries, about 0.1 ms):
+   - a stray file or symlinked shard refuses the open as `Store::open` does;
+   - every dirty shard is listed;
+   - every directory that isn't one of the 256 lowercase hex names is listed on
+     every open. An empty one is accepted and any file in one refuses, exactly as
+     `Store::open` does, because no such path can be an object's.
+
+   Then each dirty shard's listing is diffed against the index's id range for that
+   prefix. In PR 2 the store has already listed and checked every object, after
+   step 2, so the diff runs against the store's ids.
+5. **Index what the index lacks.** Each such file is read and fully checked, in
+   causal order across shards, as `Store::open_trusting_with` checks objects
+   missing from the snapshot today. The check covers its signature and every
+   protocol rule.
+   - **Make them durable first.** Before the transaction that adds them commits,
+     fsync each added object file, each shard directory it was found in, and
+     `objects/` if that shard is new. Another writer (git, an older binary,
+     `serve`) may have renamed it in without a directory fsync, and the index must
+     not commit a row, or a stamp, for a directory entry a power loss could take
+     back.
    - A file that fails its check refuses the open, as today, and no stamp is
      recorded. git checkout writes files in place, so a concurrent open can see a
      truncated one.
@@ -279,18 +315,19 @@ older `bracken` binary. Each open finds them as follows.
      removed whole) means rebuild, as a missing object sets the snapshot aside
      today.
    - An indexed id this store didn't list, whose file exists, was indexed by
-     another process after this one listed. That's not an error.
-6. **Record stamps.** A dirty shard's stamp is recorded only if it was taken in
-   step 2, before the listing it was reconciled with, and its mtime and ctime are
-   both more than 2 s older than *T*.
+     another process after this one listed. That's not an error, and inserting an
+     id that's already indexed is a no-op, on every path.
+6. **Record stamps and the clock.** In the same transaction, record `fs_clock` =
+   *T*. A dirty shard's stamp, from step 2, is recorded only if its mtime and
+   ctime are both more than 2 s older than *T*.
    - The margin covers coarse timestamps: Linux's coarse clock, and 1–2 s
-     filesystems. Any write to that shard after the listing lands at *T* or later,
-     so it changes the stamp.
+     filesystems. Any write to that shard after step 2 lands at *T* or later, so it
+     changes the stamp.
    - Otherwise the shard stays dirty, and the next open lists it again (5 ms at
      1M).
    - An absent shard is recorded as absent.
-   - If *T* is earlier than the *T* recorded last time (the filesystem clock
-     stepped back), every shard row is cleared.
+   - A rebuild follows the same steps. Its stamps come from step 2, taken before
+     its own listing.
 
 **Where stamps are recorded at all.** Only where the stamp is trustworthy:
 
@@ -303,12 +340,23 @@ Network filesystems, FAT and exFAT, Windows and anything unknown record no stamp
 so every shard is always dirty. That's slower (a full listing, 18 ms at 14k) but
 never wrong.
 
+**Opens that can't write** never use the index at all. They read through the full
+path, as today:
+
+- `bracken view`, whose `Refresh::No` means it never writes;
+- a replica whose `cache/` this process can't write.
+
+Even `SQLITE_OPEN_READ_ONLY` writes on a writable `cache/`: SQLite recreates the
+`-wal` and `-shm` files and writes read-marks to `-shm`. `immutable=1` would be
+wrong for a file other processes change. So such an open never touches the index
+files, and the clock-step check never needs a read-only form.
+
 **What stays undetected:**
 
 - an object's bytes overwritten in place (section 7);
 - a write that the filesystem stamps with exactly a recorded (mtime, ctime) pair,
   after its clock went back and then forward again between two of this replica's
-  opens.
+  opens. A step back that is still in effect is caught in step 3.
 
 There is no git hook. Clones, checkpoints, other tools and older binaries are all
 caught the same way.
@@ -357,7 +405,7 @@ is SQLite's documented corruption case.
 - It happens when:
   - the file has no schema yet;
   - the ground id differs;
-  - the file's own inode differs from the one in `meta` (section 7);
+  - the file's own device or inode differs from the one in `meta` (section 7);
   - a parent or referenced contribution is missing;
   - an indexed object is gone.
 - **SQLITE_CORRUPT or SQLITE_NOTADB**, from any statement, means the file isn't
@@ -415,13 +463,9 @@ commits, and `busy_timeout` serialises writers. A reader that finds dirty shards
 takes the write lock (`BEGIN IMMEDIATE`) and repeats the check inside it, so two
 readers don't index the same objects twice.
 
-**Read-only opens.** `bracken view` (`Refresh::No`) and replicas the process can't
-write never write the index.
-
-- They open it with `SQLITE_OPEN_READ_ONLY`.
-- They use it only if it opens, has no dirty shard and isn't marked stale.
-  Otherwise, including SQLITE_READONLY because the `-shm` file is missing, they
-  read through the full path.
+**Read-only opens.** `bracken view` and replicas whose `cache/` this process can't
+write never touch the index files. They read through the full path (section 5,
+Opens that can't write).
 
 **`bracken serve`** adds contributions through `Store::import`, outside
 `Refreshing`. Those objects are found by freshness on the next open, by serve or
@@ -437,10 +481,10 @@ The index has the snapshot's trust model (decision `96e282819607`,
 - anyone who can write `cache/` can already write the replica;
 - an object's bytes overwritten in place go unnoticed, as with the snapshot.
 
-**Bound to its own file.** `meta` records the inode of the file the index was
-built in. A file that arrives another way gets a new inode: a tracked
+**Bound to its own file.** `meta` records the device and inode of the file the
+index was built in. A file that arrives another way gets a new inode: a tracked
 `cache/index-*.sqlite` force-added to git and checked out, or a copied Ground.
-Its recorded inode doesn't match, so it's rebuilt from the store before any
+Its recorded device and inode don't match, so it's rebuilt from the store before any
 answer is used. The snapshot has the same gap today; it is blocked in this
 repository by ground-guards guard 1, but not in other repositories.
 
@@ -486,12 +530,14 @@ Each property maps to a test, in PR 2 unless marked PR 3:
 | Property | Test |
 |---|---|
 | Answers equal the full computation | the full-check comparison on generated Grounds after each operation below, every table and `pos` |
-| Order across replicas | two replicas with concurrent work, pulled both ways: `pos` equals `topo_order()` on both; a pull that interleaves rewrites only the suffix |
+| Order across replicas | two replicas with concurrent work, pulled both ways: `pos` equals `topo_order()` on both; a pull that interleaves rewrites only the suffix; a new root recomputes all; an id already indexed is inserted once |
 | Freshness: an object with no index update | an object written through `Store` alone (an older binary) is found |
 | Freshness: removal | a head object deleted; a shard removed whole while unrecorded: both rebuild |
-| Freshness: open's checks | a stray file, a symlinked shard, a non-hex directory in `objects/`; a link, directory, FIFO or misnamed file in a shard: each refuses as `Store::open` does (PR 3, when freshness lists) |
+| Freshness: open's checks | matched to `Store::open` case by case: a stray file or symlinked shard in `objects/` refuses; an empty non-hex or uppercase directory is accepted and a file in one refuses; a link, directory, FIFO or misnamed file in a shard refuses (PR 3, when freshness lists) |
+| T before any listing | an object written between the store's listing and the stamps would be recorded clean if stats came after the listing; with *T* and the stats first, the next open finds it |
+| Freshness durability | objects found by freshness have their files and shard directories fsynced before the commit (counted through a test hook) |
 | Racy window | a shard written within 2 s of *T* isn't recorded; a write after the listing in the same tick is found |
-| Clock | stamps are judged against `cache/clock`'s mtime: a local clock offset changes nothing; a clock step back clears the rows |
+| Clock | stamps are judged against `cache/clock`'s mtime: a local clock offset changes nothing; with `fs_clock` ahead of *T*, every shard is dirty on that same open, before any stamp is compared; a `cache/clock` that can't be written records no stamps |
 | Filesystems | an unlisted filesystem type records no stamps |
 | mtime reset | a shard whose mtime is put back is still dirty (ctime) |
 | Write order | a write's transaction leaves its shard without a row; the shard directory is fsynced |
@@ -503,7 +549,7 @@ Each property maps to a test, in PR 2 unless marked PR 3:
 | Value corruption | a byte changed in an `obj`, `tag`, `ref`, `fwd` or `hidden` row fails that row's checksum on read, rebuilds the index, and the read's answer equals the full computation's (as `tests/snapshot.rs` does for the snapshot); a row deleted with a clean stamp fails the full check |
 | Schema versions | two schema versions alternating on one Ground don't rebuild each other's file |
 | Widths | `timestamp_ms` = u64::MAX indexes, and orders after every smaller value |
-| Read-only | `bracken view` and a read-only replica never write, and fall back when the index is dirty or the `-shm` is missing |
+| Read-only | `bracken view` and a replica with a read-only `cache/` leave every file under `cache/` unchanged, index files included, and answer as the full path does |
 | Foreign file | a linked index file is never written through; a copied or checked-out index (another inode) is rebuilt |
 | Found objects are checked | a forged or orphan object arriving by freshness refuses the open as `Store::open_trusting_with` does (PR 3) |
 | serve | objects serve imports are found by the next open (PR 2); serve's write-path commit (PR 3) |
@@ -517,7 +563,7 @@ From [layers.md](layers.md) Phase 3:
 
 Each PR reports those numbers.
 
-## 10. Review findings, round 1
+## 10. Review findings
 
 | Finding | Handled in |
 |---|---|
@@ -538,3 +584,22 @@ says the write path records no stamp. Section 8 covers object reads for printed
 rows. Section 7 canonicalises the path and binds the file's inode. Section 5
 covers found objects that fail their check. Section 6 says when quick_check
 runs. PR 2's body lists the Cargo.lock diff (answer `d3363867edca`).
+
+Round 2, handled in round 3:
+
+| Finding | Handled in |
+|---|---|
+| `1007a1bf46b4` freshness indexes an object whose directory entry isn't durable | section 5 step 5: added files, their shard directories and a new shard's `objects/` are fsynced before the commit |
+| `1701912e08db` in PR 2 the store lists before *T* and the stamps | section 5, the rule for every open: *T* and the stats come before any listing, `Store::open`'s included; rebuilds too (step 6) |
+| `64a69d0334dc` the clock step-back check runs too late | section 5 step 3: checked before any stamp is compared, so every shard is dirty on that same open |
+| `3674e5ee100b` read-only opens still write | section 5, Opens that can't write: view and read-only replicas never touch the index files |
+| `5e280b92e7c0` `Store::open` doesn't check shard names | section 5 step 4 states `Store::open`'s real checks; non-hex directories are listed on every open, so empty ones pass and files in them refuse, as `Store::open` does |
+
+Round 2's notes are taken as well:
+
+- section 6's accepted-risk line is replaced by the row checksums (decision `c489f7f9dea9`);
+- the two-step `pos` rewrite and a new root's full recompute (section 4);
+- inserting an indexed id is a no-op (sections 4 and 5);
+- `meta` binds the device as well as the inode (section 7);
+- a rebuild's stamps come before its own listing (section 5 step 6);
+- no stamps if `cache/clock` fails (section 5 step 1).
