@@ -1090,6 +1090,12 @@ fn the_full_check_allows_what_another_process_indexed_after_this_store_listed() 
     read(&dir, 0); // another process indexes the three
     compare(&dir, &this, &before).expect("an index ahead of this store is no disagreement");
 
+    // Ahead, and wrong about what it's ahead with: a tag row of one of the three deleted. The full check
+    // compares a store listed under its lock, so it still sees it.
+    conn(&dir).execute_batch("DELETE FROM tag WHERE seq = (SELECT max(seq) FROM tag)").expect("deleted");
+    assert!(compare(&dir, &this, &before).is_err(), "an index ahead of the store is still compared");
+    rebuild(&dir, &Store::open(&dir).expect("valid"), &take(&dir)).expect("rebuilt");
+
     // Behind it instead: a row this store holds, deleted under a clean stamp, still fails.
     conn(&dir).execute_batch("DELETE FROM tag WHERE seq = (SELECT min(seq) FROM tag)").expect("deleted");
     let now = Store::open(&dir).expect("valid");

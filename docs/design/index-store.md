@@ -583,6 +583,13 @@ repository by ground-guards guard 1, but not in other repositories.
   - A replica with no index yet, or one whose `cache/` this process can't
     write, has only the in-memory comparison: there is no index of its own to
     check, and the full check never creates one.
+  - The replica's index may hold more than this process's store: another
+    process can index what this store, opened earlier, never listed. Then,
+    still holding the index's write lock, so nothing can index more, the full
+    check lists the store again, brings the index up to date with that store
+    in the same rolled-back transaction, and compares the two whole. Anything
+    a store holds that the index lacks is always a disagreement, and so is an
+    indexed contribution with no object.
 - PR 3 adds a gate check that makes the same comparison on the main Ground.
 - The snapshot is retired only if that equality holds on every test.
 

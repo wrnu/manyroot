@@ -1569,27 +1569,57 @@ pub fn compare(dir: &Path, store: &Store, before: &Before) -> Result<()> {
     let mut conn = open_db(&path, BUSY).with_context(|| format!("opening {}", path.display()))?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let stats = Before { clock: None, shards: before.shards.clone() };
-    match reconcile(&tx, dir, &path, store, &stats, Record::No, Options::default()) {
-        Ok(_) => {
-            let got = actual(&tx)?;
-            let (held, indexed): (BTreeSet<&Id>, BTreeSet<&Id>) =
-                (want.order.iter().collect(), got.order.iter().collect());
-            let extra: Vec<&&Id> = indexed.difference(&held).collect();
-            if extra.is_empty() || !held.is_subset(&indexed) {
-                differs("this replica's index", &want, &got).context("BRACKEN_FULL_CHECK")?;
-            } else if let Some(id) = extra.iter().map(|id| ContributionId(***id)).find(|id| !object_exists(dir, id)) {
-                bail!("BRACKEN_FULL_CHECK: this replica's index holds {}, which has no object", id.to_hex());
+    match replica(&tx, dir, &path, store, &want, &stats)? {
+        Replica::Agrees | Replica::Unused => {}
+        // Another process indexed what `store`, opened earlier, never listed. Nothing can index more while
+        // this transaction holds the lock, so a store listed now holds all the index does: the index is
+        // brought up to date with that one instead, and compared with it whole.
+        Replica::Ahead => {
+            let stats = Before::stats(dir);
+            let now = Store::open(dir).context("BRACKEN_FULL_CHECK: reopening the store")?;
+            let want = expected(&now);
+            if let Replica::Ahead = replica(&tx, dir, &path, &now, &want, &stats)? {
+                bail!("BRACKEN_FULL_CHECK: this replica's index holds more than a store listed under its lock");
             }
-            // Otherwise another process indexed what this store, opened earlier, never listed: no
-            // disagreement, and nothing to compare this store with.
         }
-        Err(Needs::Rebuild) => {}
-        Err(Needs::Damaged(e)) => return Err(e.context("BRACKEN_FULL_CHECK: this replica's index is damaged")),
-        Err(Needs::Error(e)) if is_damage(&e) => {}
-        Err(Needs::Error(e)) => return Err(e),
     }
     tx.rollback()?;
     Ok(())
+}
+
+/// What the full check found in the replica's own index.
+enum Replica {
+    /// Brought up to date with the store, it gives the same answers.
+    Agrees,
+    /// It needs a rebuild or a new generation, so there's nothing of it to compare.
+    Unused,
+    /// It holds every contribution the store does and more, each with its object.
+    Ahead,
+}
+
+/// The replica's index brought up to date with `store` inside `tx` (which the caller rolls back) and
+/// compared with `want`, the full recompute from `store`. Anything the store holds that the index lacks
+/// is a disagreement, and so is an indexed contribution with no object.
+fn replica(tx: &Connection, dir: &Path, path: &Path, store: &Store, want: &Answers, stats: &Before) -> Result<Replica> {
+    match reconcile(tx, dir, path, store, stats, Record::No, Options::default()) {
+        Ok(_) => {}
+        Err(Needs::Rebuild) => return Ok(Replica::Unused),
+        Err(Needs::Damaged(e)) => return Err(e.context("BRACKEN_FULL_CHECK: this replica's index is damaged")),
+        Err(Needs::Error(e)) if is_damage(&e) => return Ok(Replica::Unused),
+        Err(Needs::Error(e)) => return Err(e),
+    }
+    let got = actual(tx)?;
+    let held: BTreeSet<&Id> = want.order.iter().collect();
+    let indexed: BTreeSet<&Id> = got.order.iter().collect();
+    let extra: Vec<ContributionId> = indexed.difference(&held).map(|id| ContributionId(**id)).collect();
+    if extra.is_empty() || !held.is_subset(&indexed) {
+        differs("this replica's index", want, &got).context("BRACKEN_FULL_CHECK")?;
+        return Ok(Replica::Agrees);
+    }
+    if let Some(id) = extra.iter().find(|id| !object_exists(dir, id)) {
+        bail!("BRACKEN_FULL_CHECK: this replica's index holds {}, which has no object", id.to_hex());
+    }
+    Ok(Replica::Ahead)
 }
 
 #[cfg(test)]
