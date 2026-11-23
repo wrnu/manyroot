@@ -379,3 +379,125 @@ fn a_server_signature_is_the_signature_the_key_file_makes() {
     let local = Contribution::create(ground, &identity, [], 1, claim("same bytes", &["note"]));
     assert_eq!(signature, local.signature().0);
 }
+
+/// Task 50c98a2de33e: `bracken id scope`, which `team-server ready` reads, directly. It prints the scope the
+/// server would use (an exact name over a longer pattern over a shorter one), or none; with --kind,
+/// --relation and --tag it judges each through the server's own check, printing what's refused and exiting
+/// 1 if anything is. A typed tag is judged by its type's names, an attr tag by itself; a file the server
+/// can't parse is an error, as the server then signs nothing.
+#[test]
+fn id_scope_judges_kinds_relations_and_tags_as_the_server_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let scopes = dir.path().join("scopes.toml");
+    std::fs::write(
+        &scopes,
+        r#"
+[scope."builder-*"]
+kinds = ["claim", "relation", "evidence"]
+relations = ["implements", "supersedes"]
+forbidden_tags = ["decision", "pr"]
+[scope."builder-n*"]
+kinds = ["claim"]
+tags = ["note"]
+[scope.builder-none]
+"#,
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let mut all = vec!["id", "scope"];
+        all.extend_from_slice(args);
+        all.extend(["--scopes", scopes.to_str().unwrap()]);
+        let out = cmd(dir.path()).args(&all).output().unwrap();
+        (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned(), stderr(&out))
+    };
+
+    // The scope each name gets, with no checks asked: exit 0 whatever it allows.
+    let (code, out, _) = run(&["builder-x"]);
+    assert_eq!(code, Some(0));
+    assert_eq!(
+        out,
+        "builder-x: kinds claim, relation, evidence; relations implements, supersedes; tags any; forbidden tags decision, pr\n"
+    );
+    let (_, out, _) = run(&["builder-note"]);
+    assert_eq!(out, "builder-note: kinds claim; relations none; tags note; forbidden tags none\n");
+    let (_, out, _) = run(&["builder-none"]);
+    assert_eq!(out, "builder-none: kinds none; relations none; tags any; forbidden tags none\n");
+    let (code, out, _) = run(&["manager"]);
+    assert_eq!((code, out.as_str()), (Some(0), "manager: no scope, so a server signs nothing for it\n"));
+
+    // Everything allowed: exit 0, no refused line.
+    let allowed =
+        ["--kind", "claim", "--kind", "evidence", "--relation", "implements", "--tag", "note", "--tag", "pr:3"];
+    let (code, out, err) = run(&[&["builder-x"][..], &allowed].concat());
+    assert_eq!(code, Some(0), "{out}{err}");
+    assert!(!out.contains("refused"), "{out}");
+
+    // Refused, each named: a kind, a relation, a forbidden tag, a type whose plain tag is forbidden.
+    let asked = [
+        "--kind",
+        "retract",
+        "--relation",
+        "refines",
+        "--relation",
+        "implements",
+        "--tag",
+        "pr",
+        "--tag",
+        "type:decision",
+        "--tag",
+        "type:note",
+    ];
+    let (code, out, _) = run(&[&["builder-x"][..], &asked].concat());
+    assert_eq!(code, Some(1), "{out}");
+    let refused: Vec<&str> = out.lines().filter(|l| l.starts_with("refused ")).collect();
+    assert_eq!(
+        refused,
+        [
+            "refused kind retract: its scope doesn't include retracts",
+            "refused relation refines: its scope doesn't include refines relations",
+            "refused tag pr: its scope doesn't allow the tag \"pr\"",
+            "refused tag type:decision: its scope doesn't allow the tag \"type:decision\"",
+        ],
+        "{out}"
+    );
+    // An allow-list: a relation fails on the kind, and only the listed tag (and its type) passes.
+    let (code, out, _) = run(&["builder-note", "--relation", "implements", "--tag", "type:note", "--tag", "pr:3"]);
+    assert_eq!(code, Some(1), "{out}");
+    let refused: Vec<&str> = out.lines().filter(|l| l.starts_with("refused ")).collect();
+    assert_eq!(
+        refused,
+        [
+            "refused relation implements: its scope doesn't include relations",
+            "refused tag pr:3: its scope doesn't allow the tag \"pr:3\"",
+        ],
+        "{out}"
+    );
+    // No scope: everything asked is refused.
+    let (code, out, _) = run(&["manager", "--kind", "claim", "--tag", "note"]);
+    assert_eq!(code, Some(1), "{out}");
+    assert!(out.contains("refused kind claim: it has no scope\nrefused tag note: it has no scope\n"), "{out}");
+
+    // --json gives the scope and what's refused.
+    let (code, out, _) = run(&["builder-x", "--relation", "refines", "--tag", "note", "--json"]);
+    assert_eq!(code, Some(1));
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["name"], "builder-x");
+    assert_eq!(v["scope"]["relations"], serde_json::json!(["implements", "supersedes"]));
+    assert_eq!(
+        v["refused"],
+        serde_json::json!([{"what": "relation", "which": "refines", "why": "its scope doesn't include refines relations"}])
+    );
+    let (_, out, _) = run(&["manager", "--json"]);
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert!(v["scope"].is_null() && v["refused"] == serde_json::json!([]), "{out}");
+
+    // An unknown kind is a usage error; a file the server can't parse is an error, checks or not.
+    assert_eq!(run(&["builder-x", "--kind", "claims"]).0, Some(2));
+    std::fs::write(&scopes, "[scope.\"a*b\"]\n").unwrap();
+    for args in [&["builder-x"][..], &["builder-x", "--tag", "note"]] {
+        // It fails as any error does, with no refused line, which is how team-server ready tells it apart.
+        let (code, out, err) = run(args);
+        assert!(code != Some(0) && out.is_empty(), "{args:?}: {out}{err}");
+        assert!(err.contains("scopes.toml") && err.contains("give a name"), "{args:?}: {err}");
+    }
+}
