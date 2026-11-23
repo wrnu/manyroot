@@ -693,3 +693,41 @@ fn a_new_root_is_ordered_too() {
     store.add(root).expect("valid");
     assert_eq!(read(&dir, 0).added, 1);
 }
+
+/// A refresh recomputes only what its additions can change (section 4): positions after the smallest
+/// largest-parent position among them, and the hidden status of the additions alone unless one is a
+/// retraction or a supersession. Refreshed after every contribution, and after small batches of each
+/// kind, the index equals the full recompute every time, order and hidden set included.
+#[test]
+fn refreshes_after_each_addition_recompute_only_what_it_changes_and_agree() {
+    for seed in [41u64, 42, 43] {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = ground(tmp.path());
+        grow(&dir, seed, 4);
+        read(&dir, 0);
+        for i in 0..40 {
+            grow(&dir, seed * 1000 + i, 1 + (i as usize % 3));
+            let outcome = read(&dir, 0);
+            assert!(!outcome.rebuilt, "seed {seed}, step {i}: an addition never rebuilds: {outcome:?}");
+        }
+    }
+}
+
+#[test]
+fn can_hide_is_only_retractions_and_supersessions() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 7, 200);
+    let store = Store::open(&dir).expect("valid");
+    let mut seen = HashSet::new();
+    for c in store.graph().iter() {
+        let want = match c.body() {
+            Body::Retract { .. } => true,
+            Body::Relation { kind, .. } => *kind == RelationKind::Supersedes,
+            _ => false,
+        };
+        assert_eq!(can_hide(c), want, "{:?}", c.body().kind());
+        seen.insert((c.body().kind(), want));
+    }
+    assert!(seen.len() >= 5, "every kind, and both sorts of relation: {seen:?}");
+}

@@ -244,12 +244,21 @@ contribution missing from the index means rebuild.
 can hide or unhide contributions anywhere above it, and maintaining that
 incrementally is Phase 4 (research B R2).
 
-- In PR 2, any change recomputes `hidden` whole from `CurrentView`, and only when
-  the index holds exactly what the store holds. Otherwise `derived_stale` is set
-  until a later refresh. The same flag covers `pos`: PR 2 recomputes the order
-  from `Graph::topo_order()`, which the full open has already built, and writes
-  only the rows whose `pos` changed (two steps, since `pos` is unique). The
-  suffix recompute above is what PR 3, which no longer builds the graph, needs.
+- In PR 2, the derived tables are brought up to date only when the index holds
+  exactly what the store holds. Otherwise `derived_stale` is set until a later
+  refresh, which then recomputes both whole.
+  - `pos`: the positions after *m* (above) are compared with
+    `Graph::topo_order()`, which the full open has the graph for, and only rows
+    whose `pos` changed are written (in two steps, since `pos` is unique). A
+    local write reads no old row.
+  - `hidden`: only a retraction or a supersession can change whether anything
+    else is hidden. If none of the additions is one, each addition is hidden
+    exactly when something it refers to is, and only those rows are decided.
+    Otherwise `hidden` is recomputed whole from `CurrentView`.
+  - Measured on a copy of this repository's Ground (14.9k contributions, 6.6k
+    hidden), CPU time p50 of 20 interleaved runs against the pinned binary: a
+    read costs 2–6 ms more (about 250 ms either way, the full open), and a
+    `claim` 26 ms more (258 against 232 ms). Recomputing both whole cost 69 ms.
 - PR 3 decides hidden-ness per answered row, by `HiddenOne`'s rule over `ref`.
 
 ## 5. Freshness after a git pull (G5)

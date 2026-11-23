@@ -804,10 +804,18 @@ fn reconcile(
         }
         put_meta(tx, "derived_stale", &[1])?;
     }
-    let stale = meta.get("derived_stale").is_some_and(|v| v != &[0]) || !added.is_empty();
-    if stale && count(tx)? == g.len() as i64 {
-        write_order(tx, store)?;
-        write_hidden(tx, store)?;
+    // The derived tables (section 4): only what `added` can change, unless an earlier refresh left them
+    // stale, which may cover contributions this one didn't add.
+    let was_stale = meta.get("derived_stale").is_some_and(|v| v != &[0]);
+    if (was_stale || !added.is_empty()) && count(tx)? == g.len() as i64 {
+        let order = g.topo_order();
+        let after = if was_stale { -1 } else { suffix_start(tx, store, &added)? };
+        write_order(tx, &order, after)?;
+        if was_stale || added.iter().any(|id| can_hide(g.get(id).expect("added ids are in the graph"))) {
+            write_hidden(tx, store, &order)?;
+        } else {
+            hide_added(tx, &order, store, &added)?;
+        }
         put_meta(tx, "derived_stale", &[0])?;
     }
 
@@ -901,7 +909,7 @@ fn rebuild_in(
             assert!(inserted, "topological order puts parents first");
         }
     }
-    write_hidden(tx, store)?;
+    write_hidden(tx, store, &g.topo_order())?;
     put_meta(tx, "schema_version", &SCHEMA_VERSION.to_le_bytes())?;
     put_meta(tx, "ground", store.info().ground.as_bytes())?;
     put_meta(tx, "file", &file_identity(path))?;
@@ -931,14 +939,39 @@ fn rebuild_in(
     Ok(outcome)
 }
 
-/// Sets every row's `pos` to its place in `topo_order()` (section 4, Order). Only rows whose place
+/// The last position that inserting `added` can't move (section 4, Order, Insert): Kahn's state after
+/// emitting position *m* depends only on what was emitted, and none of `added` is ready before all its
+/// parents are, so *m* is the smallest, over those of `added` whose parents are all already indexed, of
+/// their parents' largest position (-1 for a root, which moves everything).
+fn suffix_start(tx: &Connection, store: &Store, added: &[ContributionId]) -> Result<i64> {
+    let g = store.graph();
+    let new: HashSet<&ContributionId> = added.iter().collect();
+    let mut st = tx.prepare_cached(&format!("SELECT {OBJ_COLUMNS} FROM obj WHERE id = ?1"))?;
+    let mut m = i64::MAX;
+    for id in added {
+        let parents = g.get(id).expect("added ids are in the graph").parents();
+        if parents.iter().any(|p| new.contains(p)) {
+            continue;
+        }
+        let mut top = -1;
+        for p in parents {
+            top = top.max(checked(st.query_row([&p.as_bytes()[..]], obj_row)?)?.pos);
+        }
+        m = m.min(top);
+    }
+    Ok(if m == i64::MAX { -1 } else { m })
+}
+
+/// Sets the `pos` of every row after position `after` to its place in `order`, the graph's
+/// `topo_order()` (section 4, Order); rows at or before it are already there. Only rows whose place
 /// changed are written, in two steps, since `pos` is unique and SQLite checks it row by row.
-fn write_order(tx: &Connection, store: &Store) -> Result<()> {
-    let order = store.graph().topo_order();
-    let want: HashMap<[u8; 32], i64> = order.iter().enumerate().map(|(i, id)| (*id.as_bytes(), i as i64)).collect();
+fn write_order(tx: &Connection, order: &[ContributionId], after: i64) -> Result<()> {
+    let first = usize::try_from(after + 1).expect("after is -1 or a position");
+    let want: HashMap<[u8; 32], i64> =
+        order.iter().enumerate().skip(first).map(|(i, id)| (*id.as_bytes(), i as i64)).collect();
     let rows: Vec<ObjRow> = {
-        let mut st = tx.prepare(&format!("SELECT {OBJ_COLUMNS} FROM obj"))?;
-        let raw: Vec<(ObjRow, Vec<u8>)> = st.query_map([], obj_row)?.collect::<rusqlite::Result<_>>()?;
+        let mut st = tx.prepare(&format!("SELECT {OBJ_COLUMNS} FROM obj WHERE pos > ?1"))?;
+        let raw: Vec<(ObjRow, Vec<u8>)> = st.query_map([after], obj_row)?.collect::<rusqlite::Result<_>>()?;
         raw.into_iter().map(checked).collect::<Result<_>>()?
     };
     let moved: Vec<(ObjRow, i64)> = rows
@@ -958,10 +991,59 @@ fn write_order(tx: &Connection, store: &Store) -> Result<()> {
     Ok(())
 }
 
-/// Replaces the hidden set with [`crate::CurrentView`]'s over `store`.
-fn write_hidden(tx: &Connection, store: &Store) -> Result<()> {
+/// Whether adding `c` can change whether any other contribution is hidden (section 4): only a retraction
+/// or a supersession can, since [`crate::CurrentView`] hides what is retracted, a subject with a
+/// supersession that counts, and what refers to anything hidden.
+fn can_hide(c: &Contribution) -> bool {
+    matches!(c.body(), Body::Retract { .. } | Body::Relation { kind: RelationKind::Supersedes, .. })
+}
+
+/// Adds to the hidden set those of `added` that are hidden, when none of them [`can_hide`] anything
+/// else: then nothing already indexed changes, and none of `added` is retracted or superseded (what
+/// would do it is a retraction or a supersession, which would be new too), so each is hidden exactly
+/// when something it refers to is. `order` is causal, so references are decided first.
+fn hide_added(tx: &Connection, order: &[ContributionId], store: &Store, added: &[ContributionId]) -> Result<()> {
     let g = store.graph();
-    let view = crate::CurrentView::new(g, &g.topo_order());
+    let new: HashSet<&ContributionId> = added.iter().collect();
+    let mut decided: HashMap<ContributionId, bool> = HashMap::new();
+    let mut by_id = tx.prepare_cached(&format!("SELECT {OBJ_COLUMNS} FROM obj WHERE id = ?1"))?;
+    let mut hidden = tx.prepare_cached("SELECT seq, ck FROM hidden WHERE seq = ?1")?;
+    for id in order.iter().filter(|id| new.contains(id)) {
+        let mut is_hidden = false;
+        for r in g.get(id).expect("ordered ids exist").body().references() {
+            is_hidden = match decided.get(&r) {
+                Some(h) => *h,
+                None => {
+                    let seq = checked(by_id.query_row([&r.as_bytes()[..]], obj_row)?)?.seq;
+                    match hidden
+                        .query_row([seq], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)))
+                        .optional()?
+                    {
+                        Some((s, c)) => {
+                            check("hidden", &[F::I(s)], &c)?;
+                            true
+                        }
+                        None => false,
+                    }
+                }
+            };
+            if is_hidden {
+                break;
+            }
+        }
+        if is_hidden {
+            let seq = checked(by_id.query_row([&id.as_bytes()[..]], obj_row)?)?.seq;
+            tx.execute("INSERT INTO hidden VALUES (?1, ?2)", params![seq, &ck("hidden", &[F::I(seq)])[..]])?;
+        }
+        decided.insert(*id, is_hidden);
+    }
+    Ok(())
+}
+
+/// Replaces the hidden set with [`crate::CurrentView`]'s over `store`, `order` being its `topo_order()`.
+fn write_hidden(tx: &Connection, store: &Store, order: &[ContributionId]) -> Result<()> {
+    let g = store.graph();
+    let view = crate::CurrentView::new(g, order);
     let mut want: BTreeSet<i64> = BTreeSet::new();
     let mut seq = tx.prepare_cached(&format!("SELECT {OBJ_COLUMNS} FROM obj WHERE id = ?1"))?;
     for id in &view.hidden {
