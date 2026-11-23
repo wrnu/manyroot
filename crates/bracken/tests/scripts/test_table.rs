@@ -54,10 +54,25 @@ fn test_table_runs_the_whole_table_in_order_and_stops_at_a_failure() {
             "{scripts}"
         );
 
+        // The pass line follows the line saying where the Linux-target lint ran (answer 3fc621626cc6), so
+        // a run's evidence, which keeps the output's last lines, records it.
+        let host = String::from_utf8(run(&dir, "uname", &["-sm"]).stdout).unwrap().trim().to_owned();
+        let said = String::from_utf8_lossy(&out.stdout);
+        let lint = format!("test-table: Linux-target lint passed on {host}\ntest-table: all passed at ");
+        assert!(said.contains(&lint), "{scripts}: {said}");
+
+        // A failing Linux-target lint fails the table, never skipped; off Linux it says the box runs it.
         let (out, calls) = table_run("--target x86_64");
         assert!(!out.status.success(), "{scripts}: a failing step passed");
         assert_eq!(calls.lines().count(), 4, "{scripts}: went on after a failure: {calls}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("failed: cargo clippy"), "{scripts}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("failed: cargo clippy"), "{scripts}: {stderr}");
+        assert_eq!(
+            host != "Linux x86_64",
+            stderr.contains("--remote or --split runs this lint"),
+            "{scripts}: {stderr}"
+        );
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("Linux-target lint passed"), "{scripts}");
 
         // Without cargo-nextest the table stops before its first step, saying what it needs.
         let (out, calls) = table_run("nextest --version");
@@ -211,6 +226,7 @@ fn test_table_remote_runs_one_box_and_leaves_none_behind() {
                ls -A \"$push\" >\"$T/pushed\"; cp \"$push/tree.bundle\" \"$T/\"\n\
                echo 'bx_stub01 ready in 1.0s'; echo 'test-table: deleting box bx_other99'; touch \"$T/ready\"\n\
                sleep \"${SLEEP:-0}\"\n\
+               [ -z \"$LINT\" ] || echo \"test-table: Linux-target lint passed on $LINT\"\n\
                echo \"exit $EXIT · 1m 00s · default · \\$0.0010 · bx_stub01 deleted\"; exit \"$EXIT\" ;;\n\
              list) echo \"$*\" >>\"$T/listed\"\n\
                if [ -e \"$T/left\" ] && { [ \"$(cat \"$T/left\")\" = running ] || [[ \" $* \" == *' --all '* ]]; }; then\n\
@@ -221,15 +237,27 @@ fn test_table_remote_runs_one_box_and_leaves_none_behind() {
         let path = format!("{}:{}", stubs.display(), std::env::var("PATH").unwrap());
         let remote = |exit: &str, sleep: &str| {
             let mut c = command(&dir, "scripts/test-table", &["--remote"]);
-            c.env("PATH", &path).env("T", tmp.path()).env("EXIT", exit).env("SLEEP", sleep);
+            c.env("PATH", &path).env("T", tmp.path()).env("EXIT", exit).env("SLEEP", sleep).env("LINT", "");
             c
         };
         let read = |name: &str| std::fs::read_to_string(tmp.path().join(name)).unwrap_or_default();
 
-        let out = remote("0", "0").output().unwrap();
+        // After the cost line it repeats where the box's Linux-target lint ran (answer 3fc621626cc6), or
+        // says the box didn't say, so a box run's evidence records it.
+        let out = remote("0", "0").env("LINT", "Linux x86_64").output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success(), "{scripts}: {}", String::from_utf8_lossy(&out.stderr));
-        assert!(stdout.contains("test-table: box: exit 0 · 1m 00s · default · $0.0010"), "{scripts}: {stdout}");
+        assert!(
+            stdout.contains(
+                "test-table: box: exit 0 · 1m 00s · default · $0.0010 · bx_stub01 deleted\n\
+                 test-table: box: Linux-target lint passed on Linux x86_64\n\
+                 test-table: all passed at "
+            ),
+            "{scripts}: {stdout}"
+        );
+        let out = remote("0", "0").output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("test-table: box: no Linux-target lint line"), "{scripts}: {stdout}");
         let args: Vec<String> = read("args").lines().map(String::from).collect();
         for want in ["--no-env", "--type", "default", "--timeout", "2400", "--push"] {
             assert!(args.iter().any(|a| a == want), "{scripts}: no {want} in {args:?}");

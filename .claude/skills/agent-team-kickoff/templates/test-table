@@ -40,6 +40,14 @@
 # (gtimeout on macOS, from coreutils), and cargo-nextest (reference 4f8a96525a1e) where the tests run
 # here. A box gets its own (below).
 #
+# The Linux-target lint runs where it can build the tree's C code for Linux (answer 3fc621626cc6): a
+# Linux x86_64 host, as the box is, where that target is native. Off Linux, a tree with C code for
+# Linux (rusqlite's bundled SQLite) needs a Linux C cross-compiler, which a Mac doesn't have: there
+# the lint fails as any step does, saying the box runs it, so --remote or --split is the run to use.
+# It is never skipped. A table that passes says, just before its pass line, 'test-table:
+# Linux-target lint passed on <uname -sm>', and --remote repeats the box's line after its cost line,
+# so a box run's evidence, which keeps the output's last lines, records where the lint ran.
+#
 # --remote runs the same table, unchanged, in one boat.dev box instead of on this machine (owner
 # decision 25c1e3543e76): HEAD and origin/main go in as a git bundle, the box checks HEAD out with
 # origin/main beside it and runs this script there, so the Ground guards check the same commits. The
@@ -272,7 +280,7 @@ export PATH="$nextest_dir:$PATH"'
 
 # The table in one boat box, for HEAD; $1, if given, runs in the box after it.
 remote() {
-  local rc line
+  local rc line lint
   command -v boat >/dev/null || fail "--remote needs boat (reference ea41264b3c38)"
   [ -z "$(git status --porcelain)" ] || fail "--remote tests HEAD: commit or set aside the changes first"
   git rev-parse -q --verify refs/remotes/origin/main >/dev/null || fail "no origin/main to bundle"
@@ -313,6 +321,9 @@ $1}"
   set -e
   line=$(grep -E '^exit [0-9]+ · ' "$out" | tail -1 || true)
   echo "test-table: box: ${line:-no cost line from boat}"
+  lint=$(grep -E '^test-table: Linux-target lint passed on ' "$out" | tail -1 || true)
+  lint=${lint#test-table: }
+  echo "test-table: box: ${lint:-no Linux-target lint line (docs-only, or the table stopped)}"
   if [ "$rc" -ne 0 ]; then
     echo "test-table: the box's table exited $rc" >&2
     exit "$rc"
@@ -669,6 +680,9 @@ echo 'WEAVE end'"
     echo "end seen" >>"$WEAVE_FACTS"
   fi
   echo "test-table: box: ${line:-no cost line from boat}"
+  lint=$(grep -E '^test-table: Linux-target lint passed on ' "$out" | tail -1 || true)
+  lint=${lint#test-table: }
+  echo "test-table: box: ${lint:-no Linux-target lint line (docs-only, or the table stopped)}"
   if [ "$rc" -ne 0 ]; then
     echo "test-table: the box exited $rc" >&2
     exit "$rc"
@@ -910,6 +924,19 @@ step() {
   echo "test-table: $*"
   "$@" || fail "failed: $*"
 }
+# The Linux-target lint (header): where it ran goes in $linted, printed before the pass line.
+linux_lint() {
+  local cmd=(cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings)
+  local host
+  host=$(uname -sm)
+  echo "test-table: ${cmd[*]}"
+  if ! "${cmd[@]}"; then
+    [ "$host" = "Linux x86_64" ] ||
+      fail "failed: ${cmd[*]} (on $host: building the tree's C code for Linux needs a Linux C cross-compiler; scripts/test-table --remote or --split runs this lint in a Linux box)"
+    fail "failed: ${cmd[*]}"
+  fi
+  linted="test-table: Linux-target lint passed on $host"
+}
 guards() {
   # In a Weave box: no .bracken/ to guard, and scripts/merge runs them; never the tree's own script.
   if $in_tree; then
@@ -930,7 +957,7 @@ if $light; then
   echo "test-table: light:$scope"
   step cargo fmt --check
   step cargo clippy --locked --all-targets -- -D warnings
-  step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+  linux_lint
   # shellcheck disable=SC2086 # $scope is the -p options, one word each
   step "$timeout" 1800 cargo nextest run --locked --no-fail-fast $scope
   if [ ${#libs[@]} -gt 0 ]; then
@@ -939,6 +966,7 @@ if $light; then
     echo "test-table: no doctests:$scope has no library"
   fi
   guards
+  echo "$linted"
   echo "test-table: light run passed at $(git rev-parse HEAD):$scope; not the whole table"
   mode_line
   exit 0
@@ -955,9 +983,10 @@ fi
 need_nextest
 step cargo fmt --check
 step cargo clippy --locked --all-targets -- -D warnings
-step cargo clippy --locked --workspace --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
+linux_lint
 step "$timeout" 1800 cargo nextest run --locked --workspace --no-fail-fast
 step "$timeout" 1800 cargo test --locked --doc --workspace
 guards
+echo "$linted"
 echo "test-table: all passed at $(git rev-parse HEAD)"
 mode_line
