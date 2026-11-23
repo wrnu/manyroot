@@ -365,37 +365,46 @@ fn tree_scope_folds_case_and_fails_closed_on_a_collision_or_a_criss_cross() {
     }
 }
 
-/// Finding 2f66d8148a00 (task 42e17ebb190f): a root Cargo.toml change that can alter how crates/tree compiles
-/// is frozen, named by what it touches: an entry in [workspace.dependencies] for a crate crates/tree takes from
-/// the workspace, in any of TOML's forms; any [profile] section; [workspace.package]; the rest of [workspace].
-/// Another crate's dependency, a new one, workspace members and comments aren't, and something the line-by-line
-/// reading can't place, a multi-line string, is.
+/// Finding 2f66d8148a00 (task 42e17ebb190f) and decision 4fcfa49dfc1c: tree-scope frozen compares the root
+/// Cargo.toml's frozen view, parsed with tomllib, at the base and the head: [workspace] without members,
+/// exclude, default-members and metadata; the [workspace.dependencies] entries crates/tree takes; [profile],
+/// [patch] and [replace]. Every counterexample of round 1's findings is reported, in whatever form TOML
+/// allows and through whatever letter case the tree tracks; a new member, another crate's dependency,
+/// metadata and comments aren't; a manifest that doesn't parse, or a python3 that fails, is.
 #[test]
-fn tree_scope_frozen_names_the_root_manifests_parts_crates_tree_builds_with() {
-    let root = "[workspace]\nresolver = \"3\"\nmembers = [\"crates/tree\", \"crates/other\"]\n\n\
+fn tree_scope_frozen_compares_the_root_manifests_parsed_frozen_view() {
+    let root = "[workspace]\nresolver = \"3\"\nmembers = [\"crates/tree\", \"crates/other\"]\nexclude = [\"research\"]\n\n\
                 [workspace.package]\nedition = \"2024\"\n\n\
                 [workspace.dependencies]\n# Pinned exactly.\nblake3 = \"=1.8.7\"\n\
                 imara-diff = { version = \"=0.2.0\", default-features = false }\nserde_json = \"1\"\n\
-                clap = { version = \"4\", features = [\"derive\"] }\nlong = [\n  \"a\",\n]\n\n\
+                clap = { version = \"4\", features = [\"derive\"] }\n\n\
                 [profile.dev]\ndebug = \"line-tables-only\"\n\n[profile.dev.package.\"*\"]\nopt-level = 2\n";
     let tree = "[package]\nname = \"bracken-tree\"\nedition.workspace = true\n\n[dependencies]\nblake3.workspace = true\n\
                 imara-diff = { workspace = true }\n\n[dev-dependencies]\nserde_json.workspace = true\n";
     for scripts in SCRIPTS {
         let scope = repo_root().join(scripts).join("tree-scope");
         let files = [("scripts/tree-scope", scope.as_path())];
-        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
-            put(dir, "Cargo.toml", root);
-            put(dir, "crates/tree/Cargo.toml", tree);
-            put(dir, "crates/tree/src/format.rs", "format\n");
-        });
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| put(dir, "crates/tree/src/format.rs", "format\n"));
         let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
-        let frozen = |text: &str| {
-            let head = plumb(&dir, &main, &[&main], &[("Cargo.toml", text)]);
-            let out = command(&dir, "scripts/tree-scope", &["frozen", &main, &head]).output().unwrap();
+        // A base holding `base` as the root manifest at `path` and `tree` as crates/tree's, and a head on it
+        // changing the root manifest to `head`: tree-scope frozen's exit code and output.
+        let path_env = std::env::var("PATH").unwrap();
+        let frozen_in = |path: &str, base: &str, tree: &str, head: &str, env_path: &str| {
+            let b = plumb(&dir, &main, &[&main], &[(path, base), ("crates/tree/Cargo.toml", tree)]);
+            let h = plumb(&dir, &b, &[&b], &[(path, head)]);
+            let out = command(&dir, "scripts/tree-scope", &["frozen", &b, &h]).env("PATH", env_path).output().unwrap();
             (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
         };
+        let frozen = |base: &str, tree: &str, head: &str| frozen_in("Cargo.toml", base, tree, head, &path_env);
+        let says = |(code, out): (Option<i32>, String), what: &str, why: &str| {
+            assert_eq!(code, Some(0), "{scripts}: {what}: {out}");
+            assert!(out.contains(&format!("tree-scope: frozen: Cargo.toml ({why})\n")), "{scripts}: {what}: {out}");
+        };
         let takes = "which crates/tree takes from the workspace";
-        for (what, text, why) in [
+        let profile = "[profile]: how crates/tree compiles";
+
+        // The plain changes.
+        for (what, head, why) in [
             (
                 "a feature on a crate it takes",
                 root.replace("default-features = false", "default-features = true"),
@@ -407,76 +416,185 @@ fn tree_scope_frozen_names_the_root_manifests_parts_crates_tree_builds_with() {
                 format!("[workspace.dependencies] blake3, {takes}"),
             ),
             (
-                "a dotted key",
-                root.replace("serde_json = \"1\"\n", "serde_json = \"1\"\nblake3.features = [\"neon\"]\n"),
-                format!("[workspace.dependencies] blake3, {takes}"),
-            ),
-            (
                 "a dev-dependency it takes",
                 root.replace("serde_json = \"1\"", "serde_json = { version = \"1\", features = [\"preserve_order\"] }"),
                 format!("[workspace.dependencies] serde_json, {takes}"),
             ),
             (
                 "an entry as its own table",
-                format!("{root}\n[workspace.dependencies.blake3]\nfeatures = [\"neon\"]\n"),
-                format!("[workspace.dependencies.blake3], {takes}"),
-            ),
-            (
-                "a multi-line entry it takes",
-                root.replace("blake3 = \"=1.8.7\"", "blake3 = { version = \"=1.8.7\", features = [\n  \"neon\",\n] }"),
+                root.replace("blake3 = \"=1.8.7\"\n", "")
+                    + "\n[workspace.dependencies.blake3]\nversion = \"=1.8.7\"\nfeatures = [\"neon\"]\n",
                 format!("[workspace.dependencies] blake3, {takes}"),
             ),
-            (
-                "a profile",
-                root.replace("line-tables-only", "full"),
-                "[profile.dev]: how crates/tree compiles".to_owned(),
-            ),
-            (
-                "a package's profile",
-                root.replace("opt-level = 2", "opt-level = 0"),
-                "[profile.dev.package.\"*\"]: how crates/tree compiles".to_owned(),
-            ),
-            (
-                "a new profile",
-                format!("{root}\n[profile.release]\noverflow-checks = false\n"),
-                "[profile.release]: how crates/tree compiles".to_owned(),
-            ),
+            ("a profile", root.replace("line-tables-only", "full"), profile.to_owned()),
+            ("a package's profile", root.replace("opt-level = 2", "opt-level = 0"), profile.to_owned()),
+            ("a new profile", format!("{root}\n[profile.release]\noverflow-checks = false\n"), profile.to_owned()),
             (
                 "the inherited edition",
                 root.replace("edition = \"2024\"", "edition = \"2021\""),
-                "[workspace.package], which crates/tree inherits".to_owned(),
+                "[workspace] package: how the workspace builds crates/tree".to_owned(),
             ),
             (
                 "the resolver",
                 root.replace("resolver = \"3\"", "resolver = \"2\""),
-                "[workspace] resolver: how the workspace resolves crates/tree".to_owned(),
+                "[workspace] resolver: how the workspace builds crates/tree".to_owned(),
             ),
             (
-                "a section it can't place",
+                "a patch",
                 format!("{root}\n[patch.crates-io]\nblake3 = {{ path = \"../blake3\" }}\n"),
-                "[patch.crates-io], which this check cannot rule out".to_owned(),
+                "[patch]: how crates/tree compiles".to_owned(),
             ),
             (
-                "a multi-line string",
-                root.replace("long = [", "note = '''\nx'''\nlong = ["),
-                "a multi-line string, which this check can't read line by line".to_owned(),
+                "a replace",
+                format!("{root}\n[replace]\n\"blake3:1.8.7\" = {{ path = \"../blake3\" }}\n"),
+                "[replace]: how crates/tree compiles".to_owned(),
             ),
         ] {
-            let (code, out) = frozen(&text);
-            assert_eq!(code, Some(0), "{scripts}: {what}: {out}");
-            assert!(out.contains(&format!("tree-scope: frozen: Cargo.toml ({why})\n")), "{scripts}: {what}: {out}");
+            says(frozen(root, tree, &head), what, &why);
         }
-        for (what, text) in [
+
+        // Finding 21c742cb5437: quotes inside a literal string and a comment.
+        let quoted = format!(
+            "{root}\n[workspace.metadata.notes]\ntags = [ '\"' ] # \"\n[profile.dev.package.bracken-tree]\noverflow-checks = false\nopt-level = 3\n"
+        );
+        says(frozen(root, tree, &quoted), "21c742cb5437 (1)", profile);
+        let excluded = root.replace("exclude = [\"research\"]", "exclude = [\"research\", '\"'] # \"");
+        let (code, out) = frozen(root, tree, &excluded);
+        assert_eq!(code, Some(3), "{scripts}: an exclude alone isn't frozen: {out}");
+        let both = excluded
+            .replace("opt-level = 2", "opt-level = 0")
+            .replace("debug = \"line-tables-only\"", "debug = false")
+            .replace("default-features = false", "default-features = true");
+        let (code, out) = frozen(&excluded, tree, &both);
+        assert_eq!(code, Some(0), "{scripts}: 21c742cb5437 (2): {out}");
+        assert!(out.contains(profile) && out.contains("imara-diff"), "{scripts}: 21c742cb5437 (2): {out}");
+
+        // Finding 23dc00447dd5: a header inserted or deleted moves unchanged lines between tables.
+        let moved =
+            root.replace("[profile.dev.package.\"*\"]\n", "[profile.dev.package.\"*\"]\n[workspace.metadata]\n");
+        says(frozen(root, tree, &moved), "23dc00447dd5 (a): opt-level", profile);
+        let moved = root.replace("[profile.dev]\n", "[profile.dev]\n[workspace.metadata]\n");
+        says(frozen(root, tree, &moved), "23dc00447dd5 (a): debug", profile);
+        let base_b = root.replace(
+            "debug = \"line-tables-only\"\n",
+            "debug = \"line-tables-only\"\n[workspace.metadata]\noverflow-checks = false\n",
+        );
+        let deleted = base_b.replace("[workspace.metadata]\n", "");
+        let (code, out) = frozen(&base_b, tree, &deleted);
+        assert_eq!(code, Some(0), "{scripts}: 23dc00447dd5 (b): {out}");
+        assert!(out.contains(profile), "{scripts}: 23dc00447dd5 (b): {out}");
+        let table = root.replace("imara-diff = { version = \"=0.2.0\", default-features = false }\n", "")
+            + "\n[workspace.dependencies.imara-diff]\nversion = \"=0.2.0\"\ndefault-features = false\n";
+        let split = table.replace(
+            "version = \"=0.2.0\"\ndefault-features = false\n",
+            "version = \"=0.2.0\"\n[workspace.dependencies.clap2]\nversion = \"4\"\ndefault-features = false\n",
+        );
+        says(
+            frozen(&table, tree, &split),
+            "23dc00447dd5 (c)",
+            &format!("[workspace.dependencies] imara-diff, {takes}"),
+        );
+
+        // Finding 445cc0fe0da7: a literal string holding a quote, then brackets in strings and comments.
+        let bridged = root.replace("exclude = [\"research\"]", "exclude = [\"research\", 'a\"', \"[\"]").replace(
+            "debug = \"line-tables-only\"",
+            "debug = \"line-tables-only\"\noverflow-checks = false\nopt-level = 3",
+        ) + "\n[profile.release]\nlto = true\n[profile.dev.package.bracken-tree]\nopt-level = 0\n\
+              [patch.crates-io]\nblake3 = { path = \"../evil\" }\n";
+        let (code, out) = frozen(root, tree, &bridged);
+        assert_eq!(code, Some(0), "{scripts}: 445cc0fe0da7 (a): {out}");
+        assert!(out.contains(profile) && out.contains("[patch]"), "{scripts}: 445cc0fe0da7 (a): {out}");
+        let noted = root.replace(
+            "[profile.dev]\ndebug = \"line-tables-only\"\n",
+            "[workspace.metadata]\nnote = 'a\"b' # \" [\n[profile.dev]\ndebug = \"line-tables-only\"\noverflow-checks = false\n",
+        ) + "\n[profile.dev.package.bracken-tree]\nopt-level = 0\n";
+        says(frozen(root, tree, &noted), "445cc0fe0da7 (b)", profile);
+
+        // Finding 2c56e188f7ab: crates/tree taking blake3 in other valid forms.
+        let blake3 = root.replace("blake3 = \"=1.8.7\"", "blake3 = { version = \"=1.8.7\", default-features = false }");
+        let blake3_on = blake3.replace("default-features = false }\nimara", "default-features = true }\nimara");
+        let plain = tree.replace("blake3.workspace = true\n", "");
+        for (what, tree) in [
+            (
+                "a target table's dotted key",
+                format!("{plain}\n[target.'cfg(unix)']\ndependencies.blake3.workspace = true\n"),
+            ),
+            (
+                "a top-level dotted key",
+                "dependencies.blake3.workspace = true\ndependencies.imara-diff.workspace = true\n\
+                 [package]\nname = \"bracken-tree\"\n"
+                    .to_owned(),
+            ),
+            ("a quoted workspace key", format!("{plain}\n[dependencies.blake3]\n\"workspace\" = true\n")),
+            ("CRLF lines", format!("{plain}\n[dependencies.blake3]\nworkspace = true\n").replace('\n', "\r\n")),
+            (
+                "a # in a string",
+                plain.replace(
+                    "[dependencies]\n",
+                    "[dependencies]\nblake3 = { features = [\"a#b\"], workspace = true }\n",
+                ),
+            ),
+            (
+                "a target's dependencies",
+                format!("{plain}\n[target.'cfg(unix)'.dependencies]\nblake3 = {{ workspace = true }}\n"),
+            ),
+        ] {
+            says(
+                frozen(&blake3, &tree, &blake3_on),
+                &format!("2c56e188f7ab: {what}"),
+                &format!("[workspace.dependencies] blake3, {takes}"),
+            );
+        }
+
+        // Finding 9077ff0d3be9: a tree that tracks the root manifest as CARGO.toml.
+        let (code, out) =
+            frozen_in("CARGO.toml", root, tree, &root.replace("opt-level = 2", "opt-level = 0"), &path_env);
+        assert_eq!(code, Some(0), "{scripts}: 9077ff0d3be9: {out}");
+        assert!(
+            out.contains(&format!("tree-scope: frozen: CARGO.toml ({profile})\n")),
+            "{scripts}: 9077ff0d3be9: {out}"
+        );
+
+        // Not frozen.
+        for (what, head) in [
+            ("a new member", root.replace("\"crates/other\"]", "\"crates/other\", \"crates/index\"]")),
+            ("an exclude", root.replace("[\"research\"]", "[\"research\", \"scratch\"]")),
             ("another crate's dependency", root.replace("features = [\"derive\"]", "features = [\"derive\", \"env\"]")),
             ("a new dependency", root.replace("serde_json = \"1\"\n", "serde_json = \"1\"\nrusqlite = \"0.32\"\n")),
-            ("a multi-line entry it doesn't take", root.replace("  \"a\",\n", "  \"a\",\n  \"b\",\n")),
-            ("the members", root.replace("\"crates/other\"]", "\"crates/other\", \"crates/index\"]")),
-            ("a comment", root.replace("# Pinned exactly.", "# Pinned exactly, as the freeze asks.")),
             ("metadata", format!("{root}\n[workspace.metadata.docs]\nall = true\n")),
+            ("a comment", root.replace("# Pinned exactly.", "# Pinned exactly, as the freeze asks.")),
+            (
+                "a reordering",
+                root.replace("serde_json = \"1\"\nclap", "clap")
+                    .replace("[\"derive\"] }\n", "[\"derive\"] }\nserde_json = \"1\"\n"),
+            ),
         ] {
-            let (code, out) = frozen(&text);
+            let (code, out) = frozen(root, tree, &head);
             assert_eq!(code, Some(3), "{scripts}: {what}: {out}");
         }
+
+        // Failures are frozen: a manifest that doesn't parse, and a python3 that fails saying nothing.
+        let (code, out) = frozen(root, tree, &format!("{root}\n[profile.dev\n"));
+        assert_eq!(code, Some(0), "{scripts}: a parse error: {out}");
+        assert!(
+            out.contains("tree-scope: frozen: Cargo.toml (the root Cargo.toml after doesn't parse as TOML ("),
+            "{scripts}: {out}"
+        );
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(&stubs.join("python3"), "#!/bin/sh\nexit 3\n");
+        let (code, out) = frozen_in(
+            "Cargo.toml",
+            root,
+            tree,
+            &root.replace("# Pinned exactly.", "# A comment."),
+            &format!("{}:{path_env}", stubs.display()),
+        );
+        assert_eq!(code, Some(0), "{scripts}: a failing python3: {out}");
+        assert!(
+            out.contains("tree-scope: frozen: Cargo.toml (python3 failed reading the root Cargo.toml (exit 3))"),
+            "{out}"
+        );
     }
 }
 

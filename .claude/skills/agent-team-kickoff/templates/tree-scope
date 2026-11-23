@@ -51,7 +51,9 @@
 # counts too.
 #   'tree-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, the committed pin
-#     .config/weave-root (docs/design/weave-marker.md, option A), and, as
+#     .config/weave-root (docs/design/weave-marker.md, option A); as
+#     'tree-scope: frozen: Cargo.toml (<what>)', a change to the root Cargo.toml's frozen view (see
+#     cargo_toml_changes), or a failure to read it; and, as
 #     'tree-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
 #     crate the frozen formats rest on: unicode-normalization, icu_casemap, ciborium, blake3, imara-diff.
 #     merge asks for a current owner-review claim by manager naming the pr claim and the head.
@@ -171,110 +173,129 @@ lock_versions() {
   echo "${v:-none}"
 }
 
-# The root Cargo.toml (task 42e17ebb190f, finding 2f66d8148a00): what in it can change how crates/tree
-# compiles, which neither crates/tree's manifest nor Cargo.lock shows: the [workspace.dependencies] entries
-# of the crates crates/tree takes with `workspace = true` (their features, say), every [profile] section,
-# [workspace.package], which crates/tree inherits, and the rest of [workspace] (the resolver, say). It fails
-# closed: a changed line is left out only when it is provably a comment or blank, a [workspace] members or
-# exclude line, part of a [workspace.dependencies] entry of a crate crates/tree doesn't take, or
-# [workspace.metadata]; anything else, a line it can't place included, is reported. A multi-line string,
-# which this line-by-line reading can't follow, reports every change.
-#
-# tree_takes <tree-ish>: the crates crates/tree's manifest there takes from the workspace, one a line, or '*'
-# (all) when it holds what this can't read line by line (a multi-line string or inline table).
-tree_takes() {
-  local text
-  text=$({ git show "$1:crates/tree/Cargo.toml" 2>/dev/null || true; })
-  if grep -qE "'''|\"\"\"|\{[^}]*$" <<<"$text"; then
-    echo '*'
-    return
-  fi
-  LC_ALL=C awk '
-    { line = $0; sub(/#.*/, "", line) }
-    line ~ /^[ \t]*\[/ {
-      sect = line; gsub(/[ \t"\047]/, "", sect); dep = ""
-      if (match(sect, /dependencies\.[^]]+\]$/)) dep = substr(sect, RSTART + 13, RLENGTH - 14)
-      next
+# The root Cargo.toml (task 42e17ebb190f, finding 2f66d8148a00; decision 4fcfa49dfc1c): what in it can change
+# how crates/tree compiles, which neither crates/tree's manifest nor Cargo.lock shows. Both manifests are
+# parsed with the standard library's tomllib (python3 -I, Python 3.11 or later; no third-party package),
+# never read line by line: strings, comments and moved headers defeated that (findings 21c742cb5437,
+# 23dc00447dd5, 445cc0fe0da7, 2c56e188f7ab). The frozen view is [workspace] without members, exclude,
+# default-members and metadata ([workspace.package], the resolver and the rest stay in), the
+# [workspace.dependencies] entries of every crate crates/tree takes with `workspace = true` in any dependency
+# table (target.* included) at either end, [profile], [patch] and [replace]. It's frozen where the two views
+# differ as canonical JSON; a missing python3 or tomllib, a manifest that doesn't parse, or anything
+# unexpected is frozen too, with the reason. Each manifest is read through the path the tree tracks for it,
+# in whatever letter case (finding 9077ff0d3be9), and handed to python as a file, never as code.
+TOML_VIEW=$(cat <<'PY'
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    print("python3 has no tomllib (it needs 3.11 or later), so the root Cargo.toml can't be read")
+    sys.exit(1)
+
+def load(path, what):
+    with open(path, "rb") as f:
+        data = f.read()
+    if not data:
+        return {}
+    try:
+        return tomllib.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        print(f"{what} doesn't parse as TOML ({e})")
+        sys.exit(1)
+
+def taken(manifest):
+    names = set()
+    def scan(table):
+        for key in ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies"):
+            deps = table.get(key)
+            if isinstance(deps, dict):
+                for name, dep in deps.items():
+                    if isinstance(dep, dict) and dep.get("workspace") is True:
+                        names.add(name)
+    scan(manifest)
+    targets = manifest.get("target")
+    if isinstance(targets, dict):
+        for table in targets.values():
+            if isinstance(table, dict):
+                scan(table)
+    return names
+
+def view(root, names):
+    ws = root.get("workspace")
+    ws = ws if isinstance(ws, dict) else {"": ws}
+    rest = {k: v for k, v in ws.items() if k not in ("members", "exclude", "default-members", "metadata", "dependencies")}
+    deps = ws.get("dependencies")
+    deps = deps if isinstance(deps, dict) else {}
+    return {
+        "workspace": rest,
+        "dependencies": {name: deps.get(name) for name in sorted(names)},
+        "profile": root.get("profile"),
+        "patch": root.get("patch"),
+        "replace": root.get("replace"),
     }
-    dep != "" && line ~ /^[ \t]*workspace[ \t]*=[ \t]*true/ { print tolower(dep); next }
-    { k = line; gsub(/[ \t"\047]/, "", k) }
-    k ~ /^[A-Za-z0-9_-]+\.workspace=true/ { sub(/\..*/, "", k); print tolower(k); next }
-    k ~ /^[A-Za-z0-9_-]+=\{.*workspace=true/ { sub(/=.*/, "", k); print tolower(k) }
-  ' <<<"$text" | sort -u
+
+def canon(value):
+    return json.dumps(value, sort_keys=True, default=str)
+
+def main():
+    old_root, new_root, old_tree, new_tree = sys.argv[1:5]
+    a = load(old_root, "the root Cargo.toml before")
+    b = load(new_root, "the root Cargo.toml after")
+    names = taken(load(old_tree, "crates/tree/Cargo.toml before")) | taken(load(new_tree, "crates/tree/Cargo.toml after"))
+    va, vb = view(a, names), view(b, names)
+    for key in sorted(set(va["workspace"]) | set(vb["workspace"])):
+        if canon(va["workspace"].get(key)) != canon(vb["workspace"].get(key)):
+            print(f"[workspace] {key}: how the workspace builds crates/tree")
+    for name in sorted(names):
+        if canon(va["dependencies"][name]) != canon(vb["dependencies"][name]):
+            print(f"[workspace.dependencies] {name}, which crates/tree takes from the workspace")
+    for part in ("profile", "patch", "replace"):
+        if canon(va[part]) != canon(vb[part]):
+            print(f"[{part}]: how crates/tree compiles")
+
+try:
+    main()
+except SystemExit:
+    raise
+except Exception as e:
+    print(f"reading the root Cargo.toml failed ({type(e).__name__}: {e})")
+    sys.exit(1)
+PY
+)
+# tracked <tree-ish> <path>: the one path <tree-ish> tracks that is <path> in some letter case, or nothing;
+# fails if it tracks more than one.
+tracked() {
+  local found
+  found=$(git ls-tree -r --name-only "$1" | LC_ALL=C awk -v want="$(lower "$2")" 'tolower($0) == want')
+  [ "$(grep -c . <<<"$found")" -le 1 ] || return 1
+  echo "$found"
 }
-# changed_line_numbers <old|new> <old text> <new text>: the numbers of the lines a no-context diff changes, on
-# that side, space-separated.
-changed_line_numbers() {
-  local side=$1
-  diff -U0 <(printf '%s\n' "$2") <(printf '%s\n' "$3") | LC_ALL=C awk -v side="$side" '
-    /^@@ / {
-      split($0, f, " "); r = (side == "old") ? f[2] : f[3]; sub(/^[-+]/, "", r)
-      n = split(r, p, ","); start = p[1]; count = (n > 1) ? p[2] : 1
-      for (i = 0; i < count; i++) printf "%d ", start + i
-    }'
-}
-# cargo_toml_changes <old> <new> <crates>: why each line the root Cargo.toml changed between two tree-ishes
-# matters to crates/tree, one reason a line, each once; nothing if none does. <crates> are tree_takes's,
-# space-separated.
+# cargo_toml_changes <old> <new>: why the root Cargo.toml's frozen view differs between two tree-ishes, one
+# reason a line, each once; nothing if it doesn't. Any failure is a reason too.
 cargo_toml_changes() {
-  local old_text new_text
-  old_text=$({ git show "$1:Cargo.toml" 2>/dev/null || true; })
-  new_text=$({ git show "$2:Cargo.toml" 2>/dev/null || true; })
-  [ "$old_text" != "$new_text" ] || return 0
-  if grep -qE "'''|\"\"\"" <<<"$old_text$new_text"; then
-    echo "a multi-line string, which this check can't read line by line"
-    return 0
-  fi
-  {
-    classify_toml "$(changed_line_numbers old "$old_text" "$new_text")" "$3" <<<"$old_text"
-    classify_toml "$(changed_line_numbers new "$old_text" "$new_text")" "$3" <<<"$new_text"
-  } | awk '!seen[$0]++'
-}
-# classify_toml <line numbers> <crates>: reads a Cargo.toml on standard input and prints, for each listed
-# line that matters to crates/tree, why (see above).
-classify_toml() {
-  LC_ALL=C awk -v want="$1" -v rel=" $2 " '
-    BEGIN { n = split(want, w, " "); for (i = 1; i <= n; i++) W[w[i]] = 1; all = (rel ~ / \* /) }
-    function relevant(name) { return all || index(rel, " " tolower(name) " ") > 0 }
-    {
-      raw = $0; s = $0
-      gsub(/"([^"\\]|\\.)*"/, "\"\"", s); gsub(/\047[^\047]*\047/, "\047\047", s); sub(/#.*/, "", s)
-      t = s; gsub(/^[ \t]+|[ \t]+$/, "", t)
-      if (depth == 0) {
-        if (t ~ /^\[/) {
-          header = raw; sub(/[ \t]*#.*/, "", header); gsub(/^[ \t]+|[ \t]+$/, "", header)
-          sect = tolower(t); gsub(/[ \t"\047]/, "", sect); key = ""; kind = "header"
-        } else if (t == "") kind = "blank"
-        else { key = t; sub(/=.*/, "", key); gsub(/[ \t"\047]/, "", key); key = tolower(key); kind = "key" }
-      } else kind = "cont"
-      if (kind == "key" || kind == "cont") {
-        o = gsub(/[\[{]/, "&", s); c = gsub(/[\]}]/, "&", s); depth += o - c
-        if (depth < 0) depth = 0
-      }
-      if (!(NR in W)) next
-      if (raw ~ /^[ \t]*(#.*)?$/) next
-      if (sect == "") { print "a top-level key, which this check cannot rule out"; next }
-      if (sect == "[workspace]") {
-        if (kind != "header" && (key == "members" || key == "exclude")) next
-        print header " " (kind == "header" ? "itself" : key) ": how the workspace resolves crates/tree"
-        next
-      }
-      if (sect == "[workspace.dependencies]") {
-        if (kind == "header") { print "[workspace.dependencies] itself, which crates/tree takes from"; next }
-        name = key; sub(/\..*/, "", name)
-        if (relevant(name)) print "[workspace.dependencies] " name ", which crates/tree takes from the workspace"
-        next
-      }
-      if (index(sect, "[workspace.dependencies.") == 1) {
-        name = substr(sect, 25); sub(/[].].*/, "", name)
-        if (relevant(name)) print "[workspace.dependencies." name "], which crates/tree takes from the workspace"
-        next
-      }
-      if (index(sect, "[workspace.metadata") == 1) next
-      if (sect ~ /^\[\[?profile[].]/) { print header ": how crates/tree compiles"; next }
-      if (sect == "[workspace.package]") { print "[workspace.package], which crates/tree inherits"; next }
-      print header ", which this check cannot rule out"
-    }'
+  local dir f side path
+  command -v python3 >/dev/null || { echo "no python3 here to read the root Cargo.toml"; return 0; }
+  dir=$(mktemp -d) || { echo "no temporary directory to read the root Cargo.toml in"; return 0; }
+  for side in old new; do
+    local commit=$1
+    [ $side = old ] || commit=$2
+    for f in Cargo.toml crates/tree/Cargo.toml; do
+      path=$(tracked "$commit" "$f") || { echo "$commit tracks $f in more than one letter case"; rm -rf "$dir"; return 0; }
+      if [ -n "$path" ]; then
+        git show "$commit:$path" >"$dir/$side-${f//\//-}" 2>/dev/null ||
+          { echo "can't read $path at $commit"; rm -rf "$dir"; return 0; }
+      else
+        : >"$dir/$side-${f//\//-}"
+      fi
+    done
+  done
+  local out rc=0
+  out=$(python3 -I -c "$TOML_VIEW" "$dir/old-Cargo.toml" "$dir/new-Cargo.toml" "$dir/old-crates-tree-Cargo.toml" \
+    "$dir/new-crates-tree-Cargo.toml" 2>&1) || rc=$?
+  rm -rf "$dir"
+  # A failure is a reason, its own words or, with none, its exit status; one line each, as python wrote them.
+  [ $rc -eq 0 ] || [ -n "$out" ] || out="python3 failed reading the root Cargo.toml (exit $rc)"
+  [ -z "$out" ] || awk '!seen[$0]++' <<<"$out"
 }
 
 case "${1:-}" in
@@ -340,12 +361,8 @@ case "${1:-}" in
       if why=$(owner_mode "$path"); then found=true; echo "tree-scope: owner: $path ($why)"; fi
       if why=$(security_mode "$path"); then found=true; echo "tree-scope: security: $path ($why)"; fi
       if [ "$(lower "$path")" = cargo.toml ]; then
-        takes=$( { tree_takes "$base"; tree_takes "$head"; } | sort -u | tr '\n' ' ')
-        why=$(cargo_toml_changes "$base" "$head" "$takes")
-        if [ -z "$why" ]; then
-          takes=$( { tree_takes "$2"; tree_takes "$merged"; } | sort -u | tr '\n' ' ')
-          why=$(cargo_toml_changes "$2" "$merged" "$takes")
-        fi
+        why=$(cargo_toml_changes "$base" "$head")
+        [ -n "$why" ] || why=$(cargo_toml_changes "$2" "$merged")
         while IFS= read -r reason; do
           [ -n "$reason" ] || continue
           found=true
