@@ -25,6 +25,9 @@ getrandom = "0.3"
 hex = "0.4"
 httparse = "1"
 humantime = "2"
+# The index store (decision f294933b4244, docs/design/index-store.md): SQLite's amalgamation compiled in, so
+# every platform runs the same SQLite; fallible_uint for u64 columns.
+rusqlite = { version = "0.43", features = ["bundled", "fallible_uint"] }
 # Pinned exactly with blake3 above.
 icu_casemap = "=2.4.0"
 # Pinned exactly: the line merge's results are part of what the format guard pins (task 7cbd0a0ce7d0).
