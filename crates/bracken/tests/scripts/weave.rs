@@ -1717,17 +1717,21 @@ fn weave_runs_only_on_the_pinned_ground_and_root_set_moves_only_to_the_pin() {
 fn a_weave_root_that_isnt_a_regular_file_is_refused_before_it_is_read() {
     let (tmp, dir, home, _) = weave_repo();
     std::fs::create_dir(home.join("bracken-weave")).unwrap();
-    // Each run within a deadline, so a read blocked on a FIFO fails the test instead of hanging it.
+    // Each run within a deadline, so a read blocked on a FIFO fails the test instead of hanging it. A run is
+    // its own process group, killed whole at the deadline: a cmp or bracken blocked on the FIFO would keep
+    // the pipes open, and outlive the script.
     let timed = |script: &str, args: &[&str]| {
+        use std::os::unix::process::CommandExt;
         let mut c = command(&dir, script, args);
-        c.env("HOME", &home).env("BRACKEN_DIR", "/inherited/and/ignored");
+        c.env("HOME", &home).env("BRACKEN_DIR", "/inherited/and/ignored").process_group(0);
         let mut child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while child.try_wait().unwrap().is_none() {
             if std::time::Instant::now() > deadline {
-                child.kill().unwrap();
-                let out = child.wait_with_output().unwrap();
-                panic!("{script} {args:?} didn't finish in 60 s: {}", String::from_utf8_lossy(&out.stderr));
+                let group = format!("-{}", child.id());
+                let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+                let _ = child.wait();
+                panic!("{script} {args:?} didn't finish in 60 s: it blocked");
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
