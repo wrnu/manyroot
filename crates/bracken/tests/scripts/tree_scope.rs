@@ -365,6 +365,105 @@ fn tree_scope_folds_case_and_fails_closed_on_a_collision_or_a_criss_cross() {
     }
 }
 
+/// Finding e41d9b6f87db (task 72e821f475dd): the case check counts only the merged tree's spellings, so a
+/// head that renames a file or a whole directory by letter case alone passes it (a frozen path is still
+/// named, both spellings), while a rename that leaves the old spelling beside the new, a new case variant of
+/// a path or of a directory that stays, is still refused.
+#[test]
+fn tree_scope_lets_a_case_only_rename_through_and_still_refuses_two_spellings() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("tree-scope");
+        let files = [("scripts/tree-scope", scope.as_path())];
+        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/format.rs", "format\n");
+            put(dir, "notes.txt", "notes\n");
+            put(dir, "tools/a.txt", "a\n");
+            put(dir, "tools/b.txt", "b\n");
+        });
+        let scope = |args: &[&str]| {
+            let out = command(&dir, "scripts/tree-scope", args).output().unwrap();
+            let said =
+                (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+            (out.status.code(), said.0, said.1)
+        };
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let head = |files: &[(&str, &str)]| plumb(&dir, &main, &[&main], files);
+
+        // A file renamed by case alone: one spelling in the merged tree, so nothing to refuse.
+        let (code, out, err) = scope(&["frozen", &main, &head(&[("notes.txt", ""), ("NOTES.txt", "notes\n")])]);
+        assert_eq!(code, Some(3), "{scripts}: {out}{err}");
+        // A whole directory renamed by case alone.
+        let renamed = head(&[("tools/a.txt", ""), ("tools/b.txt", ""), ("Tools/a.txt", "a\n"), ("Tools/b.txt", "b\n")]);
+        let (code, out, err) = scope(&["frozen", &main, &renamed]);
+        assert_eq!(code, Some(3), "{scripts}: {out}{err}");
+        // A frozen file renamed by case: both spellings named as frozen, not refused.
+        let frozen = head(&[("crates/tree/src/format.rs", ""), ("crates/tree/src/Format.rs", "format\n")]);
+        let (code, out, err) = scope(&["frozen", &main, &frozen]);
+        assert_eq!(code, Some(0), "{scripts}: {out}{err}");
+        for path in ["crates/tree/src/Format.rs", "crates/tree/src/format.rs"] {
+            assert!(out.contains(&format!("tree-scope: frozen: {path} (")), "{scripts}: {path}: {out}");
+        }
+
+        // Still refused: a case variant beside the path it varies, and part of a directory moved to a new
+        // spelling while the rest stays.
+        for (files, both) in [
+            (&[("NOTES.txt", "notes\n")][..], "NOTES.txt and notes.txt"),
+            (&[("tools/a.txt", ""), ("Tools/a.txt", "a\n")][..], "Tools and tools"),
+        ] {
+            let (code, out, err) = scope(&["frozen", &main, &head(files)]);
+            assert_eq!(code, Some(2), "{scripts}: {both}: {out}{err}");
+            assert!(out.is_empty(), "{scripts}: {both}: {out}");
+            assert!(err.contains("differing only in case") && err.contains(both), "{scripts}: {both}: {err}");
+        }
+    }
+}
+
+/// Finding c2ee30084fa6 (task 920a8585d468) and answer c733ce9e013f: a cargo configuration crates/tree
+/// builds with is frozen: the root's .cargo/, crates/.cargo/ and a .cargo/ at any depth under crates/tree,
+/// in any letter case. Another crate's .cargo/ isn't.
+#[test]
+fn tree_scope_frozen_names_every_cargo_configuration_crates_tree_builds_with() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("tree-scope");
+        let files = [("scripts/tree-scope", scope.as_path())];
+        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/format.rs", "format\n");
+            put(dir, ".cargo/config.toml", "[build]\n");
+        });
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let frozen = |files: &[(&str, &str)]| {
+            let head = plumb(&dir, &main, &[&main], files);
+            let out = command(&dir, "scripts/tree-scope", &["frozen", &main, &head]).output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let root = "cargo's configuration for the workspace, which crates/tree builds with";
+        let inside = "a cargo configuration that cargo run inside crates/tree reads";
+        for (path, why) in [
+            (".cargo/config.toml", root),
+            (".cargo/config", root),
+            (".CARGO/config.toml", root),
+            ("crates/.cargo/config.toml", inside),
+            ("crates/tree/.cargo/config.toml", inside),
+            ("crates/tree/tests/.cargo/config.toml", inside),
+            ("crates/tree/benches/deep/.Cargo/config.toml", inside),
+        ] {
+            // .CARGO beside the root's .cargo would be refused as a case collision: change it alone.
+            let files: Vec<(&str, &str)> = if path.starts_with(".CARGO") {
+                vec![(".cargo/config.toml", ""), (path, "[build]\nrustflags = [\"--cfg\", \"x\"]\n")]
+            } else {
+                vec![(path, "[build]\nrustflags = [\"--cfg\", \"x\"]\n")]
+            };
+            let (code, out) = frozen(&files);
+            assert_eq!(code, Some(0), "{scripts}: {path}: {out}");
+            assert!(out.contains(&format!("tree-scope: frozen: {path} ({why})\n")), "{scripts}: {path}: {out}");
+        }
+        for path in ["crates/bracken/.cargo/config.toml", "crates/tree/cargo/config.toml", "docs/.cargo/config.toml"] {
+            let (code, out) = frozen(&[(path, "[build]\n")]);
+            assert_eq!(code, Some(3), "{scripts}: {path}: {out}");
+        }
+    }
+}
+
 /// Finding 61094746cfa7 (task 1fb015806aa5): what changes how crates/tree compiles with no change to its
 /// source, manifest or the lock is frozen too: the rustc wrapper every compile runs through, crates/tree's
 /// build script, and a toolchain pin rustup reads for a build there, in any letter case. Another crate's
