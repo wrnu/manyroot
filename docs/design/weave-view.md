@@ -7,8 +7,8 @@ and all of that." The Weave view is a set of pages in `bracken view` for a
 Ground that holds Weave records ([weave.md](weave.md)). It is separate from
 the Loom and the other Ground pages ([visualizer.md](visualizer.md)). Its
 open questions went to the manager as question `90dc7287b194`, and answer
-`e490eaaaebb3` accepts every recommendation (section 9). Round 1's findings
-and how this revision handles them are in section 10.
+`e490eaaaebb3` accepts every recommendation (section 9). Section 10 lists the
+review findings and how this revision handles them.
 
 It changes nothing in `crates/tree`, in manyroot's protocol files or in any
 frozen format ([weave-freeze.md](weave-freeze.md)). It adds no dependency. It
@@ -16,18 +16,22 @@ never writes to any Ground, and it never writes a tree to disk.
 
 ## 1. What a reader can do
 
-- **See the Weave Ground at a glance.** The counted marker and the root,
-  every current line with its name, author and reach (`weave line list`),
-  its head or the heads of a fork, its green state, and how many decisions,
-  open proposals and open objections it has. Also what `weave check` would
-  list: invalid payloads, incomplete manifests, extra markers and ignored
-  policy versions, plus records this build can't read (`Lines::unreadable`).
+- **See the Weave Ground at a glance.** The counted marker and the root.
+  Every current line, a page at a time, with its name, author, reach (`weave
+  line list`) and number of decisions. The default line also shows its head
+  or the heads of a fork, and its green state. Every other line shows those
+  on its own page (section 4 says why). Also what `weave check` would list:
+  - invalid payloads;
+  - incomplete manifests;
+  - extra markers;
+  - ignored policy versions;
+  - records this build can't read (`Lines::unreadable`).
 - **Browse a line.** Its current policy: integrators, validators, goal
   setters, each check with its argv and definition hash, executors,
   guardrails, and the owner decision the version cites. Also the policy's
-  versions, its heads, its green decision, its goals, its open objections
-  and its open proposals. Its decisions are listed newest first in causal
-  order, a page at a time.
+  versions, its heads, its green decision, its goals, its objections and its
+  open proposals. Its decisions are listed newest first in causal order, a
+  page at a time.
 - **Open a decision.** Every field of its payload: parents, proposals,
   resolutions, answers with their dispositions and reasons, breakage, goals,
   the git commit it mirrors, and the integrator's note. Also its verdict
@@ -71,30 +75,37 @@ never writes to any Ground, and it never writes a tree to disk.
   - the resolutions offered for that key, with their authors and results,
     marking those an integrator of the line wrote.
 - **See checks and their evidence.** For any manifest, every check result on
-  it, by anyone (`Index::check_results`), with:
+  it, by anyone (`Index::check_results`), a page at a time, with:
   - its author, marked if it is a validator under the line's current policy;
   - its check, pass or fail, and attempt;
-  - whether it is retracted or replaced;
-  - its details as recorded: argv, exit and output tail;
+  - whether it is retracted, and for a validator's result, whether a later
+    attempt replaced it;
+  - the first 4 KiB of its details (argv, exit and output tail). A result's
+    own page has its details up to 64 KiB;
   - a box check's log, linked and readable as text.
 
   The page also shows the counted results under a line's current policy (as
   `weave green --manifest`), the reviews of the manifest, and the objections
   to integrating it unchanged (`Lines::manifest_objections`).
 - **Goals and objections.** Goals show with whether they bind under the
-  line's current policy. **Open** objections (`Lines::open_objections`,
-  `proposal_objections`, `manifest_objections`) show with their basis
+  line's current policy. A line's objections page (`/api/weave/objections`,
+  section 4) lists every objection whose target is on that line, a page at a
+  time. *Open* objections (`Lines::open_objections`) show with their basis
   (evidence-backed, goal-backed or discussion, and `replaced`) and the
-  dispositions they allow. For every other objection, the view shows only
-  what the payloads say: the objection itself (`Obligations::list`), that
-  it is not open on that line, and the decisions whose `answers` name it,
-  its target or their own line, each with its disposition and reason. It
-  doesn't say which decision *settled* an objection, or how an answered
-  objection's basis was classified, because `crates/tree` keeps those
-  private (`Obligations`' settled map and its basis classification). Showing
-  them needs a public read in `crates/tree`. That is a later item, outside
-  this task, and as a change to `crates/tree` it needs the review and
-  approvals AGENTS.md section 1 sets.
+  dispositions they allow. Every other objection shows:
+  - only what the Ground says: its author, note and target;
+  - whether it is retracted now;
+  - that it isn't open;
+  - the decisions whose `answers` name it, or name its target, each with its
+    disposition and reason;
+  - how many decisions on the line answer the whole line.
+
+  The view doesn't say which decision *settled* an objection, or how an
+  answered objection's basis was classified. `crates/tree` keeps both
+  private (`Obligations`' settled map and its basis classification).
+  Showing them needs a public read in `crates/tree`. That is a later item,
+  outside this task, and as a change to `crates/tree` it needs the review
+  and approvals AGENTS.md section 1 sets.
 - **Jump to any record by id.** A prefix of 8 or more hex digits, or
   `blake3:<64 hex>` for a content hash, opens the right page for that
   record, or says what kind of record it is (`ground::kind_of`).
@@ -125,9 +136,10 @@ Every page has a URL fragment (`/weave.html#decision/<id>`,
   whose click handler sets `location.hash` to a fragment. `weave.js`
   builds the fragment from a route name it holds and a record id it has
   checked as hex (or `blake3:` and 64 hex digits). A path goes in only
-  after `encodeURIComponent`. The page reads the route back on
-  `hashchange` and checks it the same way before using it, as
-  `root.js` does. `common.js` doesn't change.
+  after `encodeURIComponent`, in a fragment and in every API query, so a
+  `&`, `=`, `+` or `%` in a path can't add a parameter or change its
+  value. The page reads the route back on `hashchange` and checks it the
+  same way before using it, as `root.js` does. `common.js` doesn't change.
 - **Code layout.** A new module, `crates/bracken/src/view_weave.rs`, holds
   the Weave state and every `/api/weave` handler. The JSON reuses the CLI's
   `--json` shapes and field names (`weave log`, `head`, `green`, `review`,
@@ -135,21 +147,30 @@ Every page has a URL fragment (`/weave.html#decision/<id>`,
   `weave/review.rs` become `pub(crate)`. They aren't copied.
 - **Shared files.** These are the files the plan touches that other pages
   or other builders use too:
-  - `crates/bracken/src/view.rs`: the Weave state in `Snapshot`, one
-    routing arm, three `ASSETS` rows, the new endpoints' parameters in the
-    `takes` table, a non-blocking `Slots::try_take` (section 4, Caps),
-    `weave-root` added to `signature()` (section 3), and the
-    scripts-checking test's count, `assert_eq!(scripts, 11, ...)`, raised
-    to 12;
-  - `crates/bracken/src/main.rs`: `Command::View` hands its `Store` to
-    `view::serve`, instead of keeping it open beside the view's own
-    (section 5);
+  - `crates/bracken/src/view.rs`:
+    - the Weave state in `Snapshot`;
+    - one routing arm, and the new endpoints' parameters in the `takes`
+      table;
+    - `ASSETS` rows for `weave.html`, `weave.js` and `weave.css`;
+    - `Sec-Fetch-Site` read in `read_request`, and its refusal on every
+      `/api/` path, the Loom's included (section 7);
+    - a non-blocking `Slots::try_take` (section 4, Caps);
+    - `weave-root` added to `signature()` (section 3);
+    - in the scripts-checking test, `assert_eq!(scripts, 11, ...)` raised
+      to 13: that test counts pages and scripts, and `weave.html` and
+      `weave.js` are one of each;
+  - `crates/bracken/src/main.rs`: `Command::View` takes the replica's
+    signature before it opens the `Store`, as the view's re-read does
+    (view.rs, finding `31f5a44fc779`). It then hands both to `view::serve`,
+    instead of keeping its `Store` open beside the view's own (section 5);
   - `crates/bracken/assets/view/index.html`: one nav line,
     `<a href="/weave.html">Weave</a>`, static markup beside the Loom,
     Trust, Tension and Runs links. That is the Loom's builder's file
     (task `b140c091be3d`); the manager passes the change to them;
-  - `crates/bracken/tests/view.rs`: `/weave.html` added to the list of
-    pages whose `src` and `href` must be served.
+  - `crates/bracken/tests/view.rs`: `/weave.html` added to the pages whose
+    `src` and `href` must be served, and `/weave.css` to the stylesheets
+    it reads; and a test for the `Sec-Fetch-Site` refusal on the Loom's
+    endpoints.
 
   `common.js`, `visualizer.css` and the fonts are read, not changed.
 
@@ -157,18 +178,29 @@ Every page has a URL fragment (`/weave.html#decision/<id>`,
 
 When the watcher re-reads the replica (`Viewer::watch`), it builds the Weave
 state with the snapshot, once per change, off the request path. Every request
-reads from that state:
+reads from that state. Nothing in it is built per line, so a Ground with
+thousands of lines costs a rebuild what its records cost, not that times the
+lines.
 
 | Field | Built with | Notes |
 |---|---|---|
 | `root` | the replica's `weave-root`, read as below | No root, no Weave state: nothing else is built |
 | `index` | `Index::build(g, root)` | |
-| `lines` | `Lines::build(g, &index)` | Every line is judged: the home page lists them all |
-| `logs` | `Lines::log(g, line, None)` once per current line, kept as id lists | `Lines::log` runs `newest_first`, a sort of the whole graph, on every call. So no request calls it |
+| `lines` | `Lines::build(g, &index)` | Every line is judged, as `weave line list` does |
+| `logs` | `lines::newest_first(g)` called **once**, then each qualifying decision put in its line's list by `Lines::verdict`'s `line` | The same order `Lines::log(g, line, None)` gives, without its whole-graph sort per line. No request calls `Lines::log` |
 | `checks` | `Mutex<Checks>`, from `Checks::build(g, &index, &lines)` | `Checks` holds a `Cell` (its epoch-miss count), so it is `Send` but not `Sync`. A mutex shares it, so green and counted results are computed one request at a time. PR (b) measures how long it is held, now and at 10x |
 | `reviews` | `Reviews::build(&index, &lines)` | |
 | `records` | one pass over `g` | The ids of every proposal, resolution and `text/plain` artifact, and every `supersedes` relation between line versions (a version's chain, which `Lines` keeps private), by media type and kind. `Lines` lists only valid proposals per line, and `Resolutions` has no iterator |
-| `previews` | an empty map, filled on request | Conflict previews, by proposal and head (section 4) |
+| `answers` | one pass over every decision | Every decision answer, indexed by what it names: an objection id, a target id (a decision, a proposal, or a manifest artifact, which is also indexed by its hash), or its own line. Each entry holds the decision, disposition and reason. Section 4's objections page reads it |
+| `derived` | `Mutex<Cache>`, empty at build, filled on request | The answers of one line's or one record's reads that sort the graph (below), and conflict previews. At most 64 entries, dropped with the snapshot |
+
+**Reads that sort the whole graph.** `Lines::open_objections`,
+`proposal_objections` and `manifest_objections` each build an `Ancestry`,
+which sorts the whole graph, on every call. `Checks::green` and
+`Lines::heads` walk a line's decision history. So the view calls them only
+for the one line or record a request names, never for every line. Each
+answer is kept in `derived`, so a reload costs nothing. At most 2 such reads
+run at once. A request past that gets a 503 at once (section 4, Caps).
 
 **Reading `weave-root`.** `weave::root` reads the file with an unbounded
 `read_to_string`. `scripts/weave` refuses a `weave-root` that isn't a
@@ -180,10 +212,12 @@ regular file only once, when it starts. So the view doesn't call
 - parse it as `weave::root` does.
 
 A link, a FIFO or anything else gives no root. The view logs why and serves
-no Weave pages until the file is fixed. `signature()` counts `weave-root`'s
-size and modification time, so a `weave root set` is seen at the next poll.
-This read is the only file access in `view_weave.rs`, in one named function.
-The test in section 8 allows that function and refuses any other.
+no Weave pages until the file is fixed. `signature()` reads `weave-root`
+with `symlink_metadata`, never following it. It counts its inode, size, and
+modification and change times, so a `weave root set`, which renames a new
+file into place, is seen at the next poll. This read is the only file access
+in `view_weave.rs`, in one named function. The test in section 8 allows that
+function and refuses any other.
 
 If the state fails to build, the snapshot keeps the Loom's part and the Weave
 endpoints answer 503 with the reason. The view's other pages are never lost
@@ -204,39 +238,61 @@ a 400, and so is a bad value.
   never by the server from text.
 - **Paths.** A file path is the `path` query parameter, percent-decoded by
   the existing `percent_decode`.
-- **Lists.** They take `limit` (default 200, at most 2,000) and `after`,
-  the last key of the previous page. That is an id, or a path for
+
+**Every list is paged.** This covers every list in every answer, whatever
+its source: decisions, proposals, tree children, history, diff entries,
+check results, reviews, goals, objections, answers, resolutions,
+conflicts, problems, missing paths and change entries.
+- **Inside an answer,** each list carries at most its first 50 items, with
+  `total` and `more`.
+- **Its next items** come from the same endpoint with `list=<name>`,
+  `after` and `limit`. That answer holds only that list's page. `limit`
+  defaults to 200 and is at most 2,000.
+- **`after`** is the last key of the previous page: an id, or a path for
   path-ordered lists. In a tree it's a child's name, not its full path, so
   a request stays far under the 16 KiB head limit (`serve.rs`, `MAX_HEAD`).
-  Each list answers `more: bool`, so a page stays the same as new records
-  arrive.
+  So a page stays the same as new records arrive.
+- **Each item's text** is capped as well (section 4, Caps), so the answer
+  is bounded by its limit times that cap.
 
 | Endpoint | Gives | Read with |
 |---|---|---|
-| `/api/weave` | `weave`, marker, root, the lines (as `weave line list --json`, each with `heads`, `forked`, green `state`, and counts of decisions, open proposals and open objections), `problems` (first 200, each `Incomplete`'s `missing` cut to 20, and `total`), `unreadable`, `ignored_versions` | `Index::counted_marker`, `root`, `problems`; `Lines::lines`, `heads`, `unreadable`, `ignored_versions`; `Checks::green` |
-| `/api/weave/line/<line>` | current policy versions (several if diverged) with every policy field, every version of the chain (`records`' supersedes relations between `Lines::version`s, by the line's author), heads, `green` (as `weave green --json`), goals with `binds`, open objections (as `weave review --json`'s `open`) | `Lines::line`, `current_versions`, `version`, `heads`, `open_objections`; `Checks::green`, `counted`; `reviews::goals`, `Goal::binds` |
+| `/api/weave?list&after&limit` | `weave`, marker, root; `lines` (as `weave line list --json`, each with its number of decisions from `logs`); the default line's `heads`, `forked` and green `state`; `problems` (each `Incomplete`'s `missing` cut to 20); `unreadable`; `ignored_versions`. No other line's heads, green or objections: those sort or walk per line (section 3) | `Index::counted_marker`, `root`, `problems`; `Lines::lines`, `default_line`, `unreadable`, `ignored_versions`; `logs`; for the default line, `derived` |
+| `/api/weave/line/<line>?list&after&limit` | current policy versions (several if diverged) with every policy field, every version of the chain (`records`' supersedes relations between `Lines::version`s, by the line's author), `heads`, `green` (as `weave green --json`), `goals` with `binds`, and the number of open objections (as `weave review --json`'s `open`, whose list is on the objections page) | `Lines::line`, `current_versions`, `version`; `derived` for `heads`, `Checks::green` and `counted`, and `open_objections`; `reviews::goals`, `Goal::binds` |
+| `/api/weave/objections/<line>?state&after&limit` | every objection whose target is a decision on the line, a proposal on the line, or a manifest a decision or proposal on the line has, ascending by id; `state` filters (`open`, `other`, `all`). An open one has its basis and allowed dispositions. Every other one has its author, note and whether it's retracted now (joined from `Index::reviews` by id), `open: false`, and `answers`: the decisions whose answers name it or its target (first 20, `total`), and `line_answers`, the count of the line's decisions with a line-wide answer | `Lines::objections().list()` with each `Objection`'s target; `Index::reviews`; `answers`; `derived` for `open_objections` |
 | `/api/weave/log/<line>?after&limit` | decisions newest first, as `weave log --json` rows | `logs`; `Lines::decision` |
-| `/api/weave/decision/<id>` | the `weave log` row, plus `verdict` (`qualifies`, or the rule's message), `policy` in force, `counted` per check, reviews | `Lines::decision`, `verdict`, `policy_in_force_for`; `Checks::counted`; `Reviews::of_decision` |
+| `/api/weave/decision/<id>?list&after&limit` | the `weave log` row, plus `verdict` (`qualifies`, or the rule's message), `policy` in force, `counted` per check, reviews | `Lines::decision`, `verdict`, `policy_in_force_for`; `Checks::counted`; `Reviews::of_decision` |
 | `/api/weave/tree/<record>?dir&after&limit` | the record's manifest hash, and the direct children of `dir` (default the root): directories with the number of files below them, then files with mode, size, hash and `held` | `Index::manifest`, `file_size` (held means held at the entry's size); the manifest's sorted entries, by a range search on the prefix |
 | `/api/weave/file/<record>?path` | `path`, `mode`, `size`, `hash`, `shown`: `text`, `symlink`, `binary`, `oversized` or `missing`; `text` only when shown, with `lines` | `Manifest::get`, `Index::file`, `file_size`, `diff::is_text` |
 | `/api/weave/history/<line>?path&after&limit` | the line's decisions, newest first, where the path's file value differs from the decision's first parent on the line, each with `kind`, `before` and `after`. A decision with no parent on the line (the line's root, or a first decision a line merge started from another line's head) compares with its first parent on any line, or, with no parent, with an absent file | `logs`; `Lines::decision`; `Index::manifest`; `Manifest::get` |
 | `/api/weave/diff?a&b&after&limit` | the per-file list from `a`'s tree to `b`'s: `path`, `kind`, `before`, `after` | `diff::manifests` |
 | `/api/weave/diff?a&b&path` | that one file: `unified` text, or `shown` saying why not (`binary`, `oversized`, `too_large_to_diff`, `missing`) | `diff::unified`, `diff::is_text` |
 | `/api/weave/proposals/<line>?status&after&limit` | proposals on the line, ascending by id, each with `status`, author, base, summary. `status` filters (`open`, `integrated`, `invalid`, `retracted`, `all`). No change is computed for a list: the change's size is on the proposal's page | `records`; `Lines::proposal`, `proposal_named`; `logs` and `Lines::decision` for what each decision lists, compared by the payloads' `change` hashes |
-| `/api/weave/proposal/<id>?after&limit` | the proposal, its status and integrating decision with its note, its change entries (`Change::between`, one per request, first 2,000 and `total`), reviews, objections to answer, and for an open proposal the conflict preview, a page at a time | `Lines::proposal`, `proposal_objections`; `Reviews::of_proposal`; `format::Change::between`; *Conflict preview* below |
-| `/api/weave/manifest/<hash>?line` | every check result on it (`Index::check_results` filtered by manifest), each with details (cut to 64 KiB), a box log link and validator mark; the counted results under `line`'s current policy (default the default line; none when the policy has diverged); its reviews and the objections to it; the decisions and proposals with this manifest | `Index::check_results`; `Checks::counted_on_manifest`; `Reviews::of_manifest`; `Lines::manifest_objections`; each evidence's `details` from `g` |
+| `/api/weave/proposal/<id>?list&after&limit` | the proposal, its status and integrating decision with its note, its change entries (`Change::between`, one per request), reviews, objections to answer, and for an open proposal the conflict preview | `Lines::proposal`; `derived` for `proposal_objections` and the preview; `Reviews::of_proposal`; `format::Change::between`; *Conflict preview* below |
+| `/api/weave/manifest/<hash>?line&list&after&limit` | its check results by anyone (`Index::check_results` for that manifest, ascending by id), each with its first 4 KiB of details, a box log link and validator mark; the counted results under `line`'s current policy (default the default line; none when the policy has diverged); its reviews and the objections to it; the decisions and proposals with this manifest | `Index::check_results`; `Checks::counted_on_manifest`, and `Checks::latest` for `replaced` on a validator's result; `Reviews::of_manifest`; `derived` for `manifest_objections`; each evidence's `details` from `g` |
+| `/api/weave/result/<id>` | one check result, with its details up to 64 KiB | `Index::check_results`; `g` |
 | `/api/weave/log-artifact/<id>` | a `text/plain` box log's text, cut to 64 KiB, shown only if it is UTF-8 without NUL; otherwise named with its size | `records`; `g`; `diff::is_text` |
 | `/api/weave/record/<id or hash>` | `kind` and the page that shows it | `ground::kind_of`, `Index::hash_kind` |
 
 - **What a tree shows.** A tree's record can be a decision (its manifest), a
   proposal (its manifest), a manifest artifact, or a content hash. A tree is
   shown only for a valid manifest. Its completeness is reported
-  (`Index::missing`, as a count and the first 200 paths). A file this
+  (`Index::missing`, as a count and the first paths, paged). A file this
   replica doesn't hold at its entry's size shows as `missing`.
 - **Box logs.** A result's box log link is read as `checks.rs`'s `box_logs`
   reads it: from the details' run lines only, before the first blank line,
   the line `log <id> <hash>`. It is linked only if that artifact's content
   hashes as named.
+- **Which objections a line has.** An objection belongs to a line when its
+  target is one of these:
+  - a decision whose payload's `line` is that line;
+  - a proposal whose payload's `line` is that line;
+  - a manifest that a decision or proposal on that line has.
+
+  So an objection to a manifest two lines share is listed on both. Its
+  target resolves whether or not the target is retracted, as weave.md
+  section 1 says. `Obligations::list` includes retracted objections, so the
+  view joins each one to `Index::reviews` by id and marks it.
 
 ### Conflict preview
 
@@ -253,27 +309,32 @@ computes only this:
    proposal against its own base. `head` is the line head's manifest, and
    `proposal` is the proposal's. So no merge base is searched for. This is
    linear in the three manifests' entries, at most about 200,000 each. Its
-   conflicts are paged by path, by `after` and `limit`, and the answer
-   gives their `total`.
-3. **Each conflict on the page.** The resolutions offered for its key
-   (`Resolutions::for_key` on `Index::resolutions`), each with its author,
-   result and whether that author integrates the line under its current
-   policy. Then, within the budget, `merge::text_conflicts`: an empty list
-   means its lines would merge cleanly, a non-empty one gives the base line
-   ranges where they conflict, and `None` means it can't merge line by line
-   (not text, absent on a side, a symlink, not held, or over
-   `text_merge::MAX_DIFF_LINES`).
-4. **The budget, per request.** At most 20 conflicts get `text_conflicts`.
-   Their three sides add up to at most 16 MiB, and each side is at most the
-   view's 1 MiB text cap, not `text_merge`'s 8 MiB. A conflict past the
-   budget is listed with `lines: "not computed"`, and the next page computes
-   the next 20. Nothing merged is kept: `text_conflicts` returns ranges, not
-   bytes. So duplicate content hashes across many paths (one 8 MiB blob
-   named at 1,000 paths) cost at most 20 diffs of 1 MiB sides a request,
-   never 1,000 merges.
-5. **Cached.** The answer for each (proposal, head, page) is kept in the
-   state's `previews`, at most 64 entries, dropped with the snapshot, so a
-   reload costs nothing.
+   conflicts are paged by path, at most **20 a page**, with their `total`.
+3. **Each conflict on the page.**
+   - **Resolutions offered** for its key (`Resolutions::for_key` on
+     `Index::resolutions`): the first 10, with `total`. Each has its
+     author, its result, and whether that author integrates the line under
+     its current policy. The rest page with `list=resolutions&path=<path>`.
+   - **Then its lines**, with `merge::merge_mode` and
+     `merge::text_conflicts`:
+     - `clean` when the modes merge and `text_conflicts` is empty;
+     - `conflicts` with the base line ranges when `text_conflicts` gives
+       some;
+     - `mode` when only the modes don't merge;
+     - `not_text` when `text_conflicts` is `None`: not text, absent on a
+       side, a symlink, not held, or over `text_merge::MAX_DIFF_LINES`;
+     - `over_view_cap` when a side is over the view's 1 MiB cap. Integrate
+       itself line-merges sides up to 8 MiB, so this one says only that
+       the view didn't compute it, never that it can't merge.
+4. **The budget, per page.** The three sides of the page's conflicts add up
+   to at most 16 MiB. A conflict past that is listed as `not_computed`, and
+   the next page starts from it. Nothing merged is kept: `text_conflicts`
+   returns ranges, not bytes. So duplicate content hashes across many paths
+   (one 8 MiB blob named at 1,000 paths) cost at most 20 diffs of 1 MiB
+   sides a request, never 1,000 merges.
+5. **Cached.** Each page's answer is kept in `derived`, keyed by proposal,
+   head and page, holding only what it returned: at most 20 conflicts, each
+   with at most 10 resolutions.
 6. **Slotted.** At most 2 previews build at once (section 4, Caps).
 
 ### Caps
@@ -282,14 +343,17 @@ computes only this:
 |---|---|---|
 | A file's text shown | 1 MiB, and rendered 5,000 lines at a time | About 20,000 lines of code fit in 1 MiB, but a megabyte of newlines is a million lines. So the page builds the rows for 5,000 lines and adds the next 5,000 when asked, from the text it already holds. The answer gives `lines`, the count |
 | Each side of a unified diff | 1 MiB, and `diff::MAX_DIFF_CELLS` | `diff::unified` builds a table of up to 16 million `u32`s (64 MB). The page renders its output 5,000 lines at a time, as for files |
-| Unified diffs and conflict previews building at once | 2 each | Taken with a new non-blocking `Slots::try_take`. Today's `Slots::take` waits, which would hold a connection. A request past the slots gets a 503 at once, to retry |
-| A conflict preview | 20 `text_conflicts` a request, sides at most 1 MiB each and 16 MiB in all | *Conflict preview* above |
-| List pages | 200 by default, 2,000 at most | |
-| Check details, box logs | 64 KiB, cut on a character boundary (`cut_bytes`) | The view's existing `TEXT_BYTES` |
-| Problems, missing paths, change entries | 200 (each `Incomplete` with 20 paths), 200, 2,000, each with a `total` | |
+| Work building at once | 2 unified diffs, 2 conflict previews, 2 graph-sorting reads (section 3) | Taken with a new non-blocking `Slots::try_take`. Today's `Slots::take` waits, which would hold a connection. A request past the slots gets a 503 at once, to retry |
+| A conflict preview | 20 conflicts a page, 10 resolutions each, sides at most 1 MiB each and 16 MiB in all | *Conflict preview* above |
+| Lists | 50 inside an answer; pages of 200 by default, 2,000 at most | *Every list is paged* above |
+| A check result's details | 4 KiB in a list, 64 KiB on `/api/weave/result/<id>` | 64 KiB is the view's existing `TEXT_BYTES`. A list of 2,000 results is at most 8 MiB of details |
+| A box log | 64 KiB | |
+| Notes, summaries, reasons, goals and other short text in a list | 4 KiB each | A record's own page has its text up to 64 KiB |
+| Answers per objection | 20 decisions, with `total` | |
 
-The text cap is 1 MiB, for files and each side of a diff. The 64 KiB cap
-applies only to check details and box logs.
+The text cap is 1 MiB, for files and each side of a diff. The 64 KiB and
+4 KiB caps apply to the other text, as listed above. Text is cut on a
+character boundary (`cut_bytes`).
 
 ## 5. Performance
 
@@ -306,15 +370,22 @@ A whole `scripts/weave weave head|log|green|review|check --json` run takes
 snapshot, `Index`, `Lines` and the command. So a re-read with the Weave state
 should cost well under a second, once per change.
 
-Requests then cost:
+**Rebuild.** It is one pass each for `Index`, `Lines`, `Checks`, `Reviews`,
+`records` and `answers`, plus one `newest_first` sort for every line's log
+together. It is never per line: a hostile Ground with 5,000 lines costs a
+rebuild one sort, not 5,000.
+
+**Requests** then cost:
 - a tree directory: a range search over at most about 830 entries;
 - a file: one map lookup and the JSON escape of at most 1 MiB;
 - a history: one manifest lookup for each of the line's 157 decisions, from
-  the cached log;
-- a diff list: one pass over two manifests.
+  `logs`;
+- a diff list: one pass over two manifests;
+- a line's heads, green or objections: one walk or one graph sort for that
+  line, slotted, then cached in `derived`.
 
-Only unified diffs and conflict previews do real work, within the caps
-above.
+Only unified diffs, conflict previews and those per-line reads do real work,
+and they are capped, slotted and cached.
 
 **Memory.** Today `bracken view` holds two copies of the replica, and three
 during a re-read:
@@ -327,20 +398,39 @@ uses it as the first snapshot. That makes one copy, and two during a
 re-read. The Weave state adds the decoded manifests, about 70 bytes a path
 per distinct manifest, and indexes much smaller than the payload.
 
+**The Loom's `as_of` graphs.** The Loom's `?as_of=` reads
+(`/api/tension`, `/api/root/<id>`) keep up to 4 past graphs and build up to
+3 at once (`PAST_GRAPHS`, `PAST_BUILDS`). Each holds a copy of the replica
+as of a cursor. So the view's worst case is 1 copy, plus 1 during a
+re-read, plus 4 kept and 3 building as-of copies: 9 copies. The Weave pages
+use no `as_of` read. Only a reader who opens those Loom views on the Weave
+Ground pays for them. A blind cross-site request can't, since section 7
+refuses those on every `/api/` path.
+
 **At 10x** (about 33,000 contributions and 1.3 GB of payload; 1,570
 decisions; an 8,300-file tree):
-- **Memory:** about 1.3 GB, briefly about 2.6 GB during a re-read.
-- **Rebuild:** `Index`, `Lines`, `Checks` and the per-line logs are
-  near-linear in the records they index. The estimate is about 5 to 10 s,
-  off the request path.
+- **Memory, steady:** about 1.3 GB, and about 2.6 GB during a re-read. If a
+  reader uses the Loom's `as_of` views too, each past graph adds up to
+  1.3 GB.
+- **Rebuild:** near-linear in the records indexed, one sort for all logs.
+  The estimate is about 5 to 10 s, off the request path.
 - **Requests:** a history is 1,570 lookups; a tree directory is a range
-  search over 8,300 entries.
+  search over 8,300 entries; a per-line read is one sort of 33,000
+  contributions.
 
-PR (b) measures the rebuild, the memory, and how long requests hold
-`Mutex<Checks>`, on a generated 10x Weave Ground, and records the numbers.
-If a rebuild passes 10 s or memory passes 4 GB, the builder stops and
-reports rather than tune `crates/tree`. Past that size the answer is the
-index store ([index-store.md](index-store.md)), not this view.
+PR (b) measures these on a generated 10x Weave Ground and records the
+numbers:
+- the rebuild;
+- memory steady and during a re-read;
+- memory with the 4 `as_of` graphs kept;
+- how long requests hold `Mutex<Checks>`;
+- each per-line read.
+
+The 4 GB stop applies to the steady state with a re-read. If that passes
+4 GB, or a rebuild passes 10 s, the builder stops and reports rather than
+tune `crates/tree`. The `as_of` figure is reported beside it for the
+manager. Past that size the answer is the index store
+([index-store.md](index-store.md)), not this view.
 
 The page fetches only what it shows. A tree is fetched one directory at a
 time, a file only when it is opened, and a diff one file at a time.
@@ -411,8 +501,8 @@ name, argv, output tail and log on a Weave Ground is author-controlled.
   never as strings.
 - **Author text reaches no attribute.** Navigation is by buttons that set
   `location.hash` (section 2). The only author-controlled text in a
-  fragment is a path, encoded by `encodeURIComponent`, and it is decoded
-  and looked up in a manifest, never inserted into anything but text. A
+  fragment or a query is a path, encoded by `encodeURIComponent`. It is
+  decoded and looked up in a manifest, and only ever inserted as text. A
   `title` attribute set through `h()` (for a long path's full text) goes
   through `common.js`'s `plain()`.
 - **Invisible characters are marked.** This covers every author-controlled
@@ -444,19 +534,30 @@ name, argv, output tail and log on a Weave Ground is author-controlled.
   - `Cross-Origin-Resource-Policy: same-origin`;
   - `X-Frame-Options: DENY`.
 - **Bounded work.** Every list pages, every text is capped, and the
-  expensive computations (unified diffs, conflict previews) have their
-  inputs capped and their slots refused at once when full (section 4). The
-  listener's connection budget, Host checking and timeouts are the view's
-  own and unchanged. A hostile Weave Ground costs the view the same as its
-  size, as it costs every reader.
-- **Cross-site requests are refused on `/api/weave`.** CORS and the Host
-  check already keep another site from *reading* a response. But a page in
-  the reader's browser could still send blind `no-cors` GETs to the
-  loopback port, with a valid Host, and hold the diff and preview slots.
-  So a `/api/weave` request whose `Sec-Fetch-Site` is `cross-site` or
-  `same-site` gets a 403. Browsers send that header on every request.
-  Tools without a browser (curl, tests) send none, and are served. The
-  Loom's endpoints keep today's behaviour.
+  expensive computations (unified diffs, conflict previews, per-line graph
+  reads) have their inputs capped, are cached, and have their slots refused
+  at once when full (sections 3 and 4). Nothing is computed per line for
+  all lines. The listener's connection budget, Host checking and timeouts
+  are the view's own and unchanged. A hostile Weave Ground costs the view
+  the same as its size, as it costs every reader.
+- **Cross-site requests are refused on every `/api/` path.** CORS and the
+  Host check already keep another site from *reading* a response. But a
+  page in the reader's browser could still send blind `no-cors` GETs to the
+  loopback port, with a valid Host:
+  - to hold the Weave slots;
+  - to make the Loom's `as_of` reads build past graphs, each a copy of the
+    replica (section 5).
+
+  So any `/api/` request whose `Sec-Fetch-Site` is `cross-site` or
+  `same-site` gets a 403, the Loom's endpoints and the event stream
+  included. The view's own pages send `same-origin`, or `none` when a URL
+  is typed. Browsers send the header on every request. A tool without a
+  browser (curl, the tests) sends none, and is served, as is an old browser
+  that doesn't send it, which is today's behaviour for every reader. The
+  embedded pages and assets themselves aren't refused, since they carry no
+  Ground data and do no work. This touches the Loom's endpoints in
+  `view.rs`, so it is listed among the shared changes (section 2), with
+  its own test in `tests/view.rs`.
 - **Not secrets, but not published either.** Import refuses secrets
   (weave.md section 3), but a check's output tail or a box log could still
   hold something private about this machine. The view never serves the
@@ -488,11 +589,11 @@ read-only.
 | PR | Gives | Class |
 |---|---|---|
 | (a), #76 | `scripts/weave view`: `--port`, the policy options, `--as` and help only; `--bind`, `--host`, `--runs` and anything else refused; tests that fail on `main`; header and docs/cli.md | merge-gate tooling (risky) |
-| (b) | The Weave state in the snapshot, with the guarded `weave-root` read and `signature()` watching it; `main.rs` handing its `Store` to the view; `/api/weave`, `line`, `log`, `decision`, `record`; the `Sec-Fetch-Site` refusal; the home, line and decision pages, with button navigation; the `index.html` nav line and the shared files in section 2. Its tests: <br>• the 10x measurement; <br>• a hostile Weave Ground's strings come back escaped; <br>• `view_weave.rs` names no file-system call but the `weave-root` read; <br>• a `weave-root` symlink or FIFO gives no root and doesn't block; <br>• a session of requests leaves the Ground byte for byte the same | cli |
+| (b) | Gives: <br>• the Weave state in the snapshot, with the guarded `weave-root` read and `signature()` watching it; <br>• `main.rs` taking the signature first and handing its `Store` to the view; <br>• `/api/weave`, `line`, `log`, `decision`, `record`, with list paging; <br>• `Slots::try_take` and `derived`; <br>• the `Sec-Fetch-Site` refusal on every `/api/` path; <br>• the home, line and decision pages, with button navigation; <br>• the `index.html` nav line and the shared files in section 2. <br>Its tests: <br>• the 10x measurement in section 5; <br>• a hostile Weave Ground's strings come back escaped; <br>• `view_weave.rs` names no file-system call but the `weave-root` read; <br>• a `weave-root` symlink or FIFO gives no root and doesn't block; <br>• a session of requests leaves the Ground byte for byte the same; <br>• a Ground of many lines costs one log sort; <br>• cross-site requests refused on the Weave and the Loom endpoints, and served without the header | cli |
 | (c) | `tree` and `file`; the tree browser and file page, with line numbers rendered 5,000 at a time and invisible characters marked; tests for binary, oversized, symlink (text and not), missing and short-held files, and a megabyte of newlines in the Node check | cli |
 | (d) | `history` and `diff`; the history and diff pages; tests at the caps, for a line's root and a first decision made by a line merge, and for the diff slots refusing at once | cli |
-| (e) | `proposals` and `proposal`, with status and the conflict preview; the proposal pages. Its tests cover: <br>• each status; <br>• a forked line and a diverged policy getting no preview; <br>• a conflict with an offered resolution and one by an integrator; <br>• the preview budget, with 1,000 paths naming one blob: at most 20 computed, the rest `not computed`, paged; <br>• the cache | cli |
-| (f) | `manifest` and `log-artifact`; check results by anyone, with details and box logs, goals and objections (open ones with their basis, others with the answers naming them); tests for counted, replaced, retracted and non-validator results, each objection basis, a diverged policy, and a non-UTF-8 log | cli |
+| (e) | `proposals` and `proposal`, with status and the conflict preview; the proposal pages. Its tests cover: <br>• each status; <br>• a forked line and a diverged policy getting no preview; <br>• a conflict with an offered resolution and one by an integrator, and 11 resolutions on one key paging; <br>• a mode-only conflict; <br>• the preview budget, with 1,000 paths naming one blob: at most 20 a page, the rest paged; <br>• a side over the view's cap; <br>• the cache | cli |
+| (f) | `objections`, `manifest`, `result` and `log-artifact`; check results by anyone, with details and box logs, goals and objections; tests for: <br>• counted, replaced, retracted and non-validator results; <br>• each objection basis; <br>• a retracted objection; <br>• an objection answered by name, by target and line-wide; <br>• a diverged policy; <br>• 2,001 results on one manifest paging; <br>• a non-UTF-8 log | cli |
 
 Done when (a) to (f) are merged.
 
@@ -516,37 +617,47 @@ exposure needs the owner's own approval.
 9. The 10x measurement and its stop thresholds.
 10. The build plan above.
 
-## 10. Round 1, and how it is handled
+## 10. Review findings, and how they are handled
+
+### Round 1
 
 | Finding | Handling |
 |---|---|
-| `4d2c3775c999`, `cc5d437b1852`: `resolve_lines` uncapped; conflicts unpaged; `Change::between` per listed proposal | The preview never calls `resolve_lines`. It runs `three_way` once, then pages the conflicts, and runs `text_conflicts` (ranges, not merged bytes) on at most 20 a request, with sides at most 1 MiB and 16 MiB in all. It caches by proposal, head and page, and its slots refuse at once (section 4). The proposals list computes no change; a proposal's page computes one. PR (e) tests the 1,000-paths-one-blob case |
+| `4d2c3775c999`, `cc5d437b1852`: `resolve_lines` uncapped; conflicts unpaged; `Change::between` per listed proposal | The preview never calls `resolve_lines`. It runs `three_way` once, then pages the conflicts, and runs `text_conflicts` (ranges, not merged bytes) on at most 20 a page, with sides at most 1 MiB and 16 MiB in all. It caches by proposal, head and page, and its slots refuse at once (section 4). The proposals list computes no change; a proposal's page computes one. PR (e) tests the 1,000-paths-one-blob case |
 | `53fca000203f`: `weave-root` read unbounded on every rebuild | Read with `O_NOFOLLOW`, a regular-file check and 256 bytes, in the one file access the module has; `signature()` watches it; tested in PR (b) (section 3) |
 | `f3ec9bbabd28`: a byte cap allows a million lines | Files and diffs render 5,000 lines at a time; PR (c)'s Node check uses a megabyte of newlines (section 4, Caps) |
 | `eed6a83b1862`: answered objections' settling decision and basis aren't public; `Checks::on_manifest` holds validators' results only | Narrowed. The view shows open objections with their basis, and for the rest only what the payloads say, and names the missing `crates/tree` read as a later item outside this task. Check results come from `Index::check_results`, marked validator or not (section 1) |
-| `d7bc1fd686e8`: `common.js` refuses `a` and `href`; shared files not named | Buttons that set `location.hash`, as `root.js` reads it; `common.js` unchanged; every shared file named, the `scripts == 11` assertion and `tests/view.rs` included (section 2) |
-| `e7710acc020d`: three `Store`s during a re-read; `Lines::log` sorts the graph per request | `main.rs` hands its `Store` to the view, so one copy and two during a re-read; per-line logs cached in the state; figures corrected (sections 3 and 5) |
+| `d7bc1fd686e8`: `common.js` refuses `a` and `href`; shared files not named | Buttons that set `location.hash`, as `root.js` reads it; `common.js` unchanged; every shared file named, the scripts count and `tests/view.rs` included (section 2) |
+| `e7710acc020d`: three `Store`s during a re-read; `Lines::log` sorts the graph per request | `main.rs` hands its `Store` to the view, so one copy and two during a re-read; logs built once (sections 3 and 5) |
 
-Notes taken: the `Sec-Fetch-Site` refusal, and what the join must approve
-(security notes 1 and 2), are in section 7. Also from security:
-- note 3: attribute wording;
-- note 4: the preview merges against the proposal's own base, as integrate
-  does;
-- note 5: measuring `Mutex<Checks>`;
-- note 6: invisible characters marked in all author text;
-- note 8: non-UTF-8 logs.
+Round 1's notes were taken as listed in the previous revision of this
+section:
+- security's `Sec-Fetch-Site` refusal, now on every `/api/` path, and what
+  the join must approve;
+- the merge base;
+- measuring the checks mutex;
+- marking invisible characters in all author text;
+- non-UTF-8 logs;
+- the reviewer's notes 1 to 8.
 
-From the reviewer:
-- note 1: the "done when" line;
-- note 2: the `retracted` filter, and no `Change::hash` in the list;
-- note 3: version chains, and lines by id;
-- note 4: held at the entry's size;
-- note 5: non-UTF-8 targets and logs, and which text cap is meant;
-- note 6: missing paths cut, no counted results on a diverged policy, log
-  links from the run lines, and `manifest_objections`;
-- note 7: forked and diverged lines, and history's first decisions;
-- note 8: `try_take`, `signature()`, no index without a root, marking
-  before `plain()`, and child names as `after`.
+### Round 2
 
-Security's note 7 (diff compare cost is cells times line length) is bounded
-by the same cap and slots, and needs no change.
+| Finding | Handling |
+|---|---|
+| `529a929f53e2`: results, reviews, goals, objections and preview resolutions unpaged | Every list in every answer is paged: 50 inside an answer, the rest by `list`, `after` and `limit`. Each item's text is capped (4 KiB in lists, 64 KiB on a record's own page, `/api/weave/result/<id>` for a result's details). A preview caches only its page: 20 conflicts, 10 resolutions each (section 4) |
+| `817bba809548`: `as_of` copies left out of memory; the Loom's `as_of` open to blind cross-site requests | Section 5 counts them: 9 copies at worst, measured in PR (b) and reported beside the 4 GB stop. The `Sec-Fetch-Site` refusal covers every `/api/` path, the Loom's included, and is listed as a shared change with its own test (sections 2 and 7) |
+| `7b26f824e133`: non-open objections promised but not served; `Obligations::list` includes retracted ones | A paged `/api/weave/objections/<line>` serves them. Section 4 says which objections a line has, joins each to `Index::reviews` for its note and whether it's retracted, and caps the answering decisions it lists from the `answers` index. Section 1 promises only that, and still nothing that needs `crates/tree` |
+| `5151a25507b9`: `Lines::log` and the objection reads sort the whole graph per call | Logs come from one `newest_first` per rebuild, bucketed by verdict line. Heads, green and objections are computed only for the line or record a request names, slotted and cached, and never for every line; the home page shows them for the default line only (sections 3, 4 and 5) |
+
+Round 2's notes are taken too:
+- the scripts count rises to 13;
+- `encodeURIComponent` in queries as well as fragments;
+- a side over the view's cap is `over_view_cap`, never "can't merge";
+- browsers without `Sec-Fetch-Site` are served;
+- `/weave.css` joins `tests/view.rs`' stylesheet list;
+- the signature is taken before the `Store` opens;
+- `derived` is behind a mutex, and preview pages are at most 20 conflicts,
+  so none is skipped;
+- `signature()` uses `symlink_metadata`, with the inode and change time;
+- `replaced` applies to validators' results, and results are paged;
+- `merge_mode` is checked beside `text_conflicts`.
