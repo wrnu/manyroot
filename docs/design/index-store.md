@@ -184,7 +184,7 @@ CREATE TABLE shard  (n INTEGER PRIMARY KEY,          -- 0..255; no row means dir
                      ino BLOB, dev BLOB,             -- u64s as 8 big-endian bytes
                      ck BLOB NOT NULL);
 CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL, ck BLOB NOT NULL);
-                     -- schema_version, ground id, file (its own device and inode), derived_stale, fs_clock
+                     -- schema_version, ground id, file (its own device and inode), ids, derived_stale, fs_clock
 ```
 
 **Order.** Every answer that the full computation orders by `Graph::topo_order()`
@@ -247,6 +247,13 @@ incrementally is Phase 4 (research B R2).
 - In PR 2, the derived tables are brought up to date only when the index holds
   exactly what the store holds. Otherwise `derived_stale` is set until a later
   refresh, which then recomputes both whole.
+  - "Exactly" is the same count and the same `ids` digest: every indexed id
+    XORed together, kept in `meta` by each insert and compared with the store's.
+    A count alone isn't enough: another process can index what this store never
+    listed while this store holds, in a shard its stamps call clean, as many that
+    the index lacks (finding `cf0181613a78`).
+  - A row after *m* that the order doesn't hold refuses the refresh instead of
+    being skipped.
   - `pos`: the positions after *m* (above) are compared with
     `Graph::topo_order()`, which the full open has the graph for, and only rows
     whose `pos` changed are written (in two steps, since `pos` is unique). A
@@ -282,8 +289,9 @@ with.
    - `cache/clock` is opened relative to `cache/`'s own descriptor with
      `O_NOFOLLOW` (and nonblocking, so a FIFO planted there can't hang the open),
      and must be a regular file.
-   - If `cache/clock` can't be written or read, this open records no stamps and
-     treats every shard as dirty, but still uses the index: every dirty shard is
+   - If `cache/clock` can't be written or read, this open records no stamps,
+     drops every stamp already recorded, and treats every shard as dirty
+     (finding `e138686585be`), but still uses the index: every dirty shard is
      diffed, so the answers are right, only slower. That differs from a `cache/`
      this process can't write, which never touches the index at all (Opens that
      can't write, below).
@@ -331,7 +339,8 @@ with.
    protocol rule.
    - **Make them durable first.** Before the transaction that adds them commits,
      fsync each added object file, each shard directory it was found in, and
-     `objects/` if that shard is new. Each is a plain `fsync`; on macOS one
+     `objects/` if that shard is new. A write's own refresh does the same for
+     what it adds beyond its own objects. Each is a plain `fsync`; on macOS one
      `F_FULLFSYNC` follows, on the last of them, which flushes the drive's cache
      for everything written before it, so it stands for a full sync of each
      (Rust's `File::sync_all` is the same `F_FULLFSYNC` per file). Another writer (git, an older binary,
@@ -431,8 +440,9 @@ committed transactions, and freshness finds those objects again.
 is SQLite's documented corruption case.
 
 - A rebuild, the first build included, runs in place in one `BEGIN IMMEDIATE`
-  transaction: drop the tables, recreate them, refill them from the store, and
-  write `meta` last but inside the same transaction.
+  transaction: drop every trigger, view, index and table the file holds, ours
+  or not, recreate the schema, refill it from the store, and write `meta` last
+  but inside the same transaction.
   - Concurrent readers see the old index or the new one, never a half-built one.
   - A second process waiting on the lock rechecks `meta` once it holds the lock,
     and finds the index built.
@@ -443,8 +453,9 @@ is SQLite's documented corruption case.
   - the file's own device or inode differs from the one in `meta` (section 7);
   - a parent or referenced contribution is missing;
   - an indexed object is gone.
-- **SQLITE_CORRUPT or SQLITE_NOTADB**, from any statement, means the file isn't
-  touched again. The next generation's file (`-<g+1>`) is created beside it and
+- **SQLITE_CORRUPT or SQLITE_NOTADB**, from any statement, or anything at the
+  file's path that isn't a regular file (a directory, a link, a FIFO), means the
+  file isn't touched again. The next generation's file (`-<g+1>`) is created beside it and
   used from then on.
   - Processes still holding the old file keep their handles, and nothing is
     unlinked under them.
@@ -537,10 +548,18 @@ repository by ground-guards guard 1, but not in other repositories.
 **Opening the file.**
 
 - `cache/` is checked to be a real directory, not followed through a link, as
-  today.
+  today, by every open that may use the index, the full check's included
+  (finding `32fc7df1acf4`). A linked `cache/` means no index.
 - The database is opened with `SQLITE_OPEN_NOFOLLOW`. SQLite then refuses a link
   in any component of the path, and macOS's `/var` and `/tmp` are links, so the
   replica's path is canonicalised before opening.
+- Every connection sets `trusted_schema=OFF` and `SQLITE_DBCONFIG_DEFENSIVE`, so
+  nothing in the file's schema runs SQL functions and no write can corrupt the
+  file through SQLite's own interfaces. Extension loading stays off.
+- What syncing opens (object files and shard directories) is opened
+  nonblocking and must be a file or a directory, so a FIFO can't hang a command.
+- Generation numbers are checked: there is no generation after the last, and
+  then the index isn't used.
 
 **Oracle.**
 

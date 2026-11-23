@@ -310,17 +310,28 @@ fn a_shard_whose_mtime_was_put_back_is_still_dirty() {
     let dir = ground(tmp.path());
     grow(&dir, 16, 40);
     read(&dir, 0);
-    let before = take(&dir);
-    grow(&dir, 17, 1);
-    let head = Store::open(&dir).expect("valid").graph().heads().next().expect("a head");
-    let n = shard_of(&head);
-    if let Seen::Present(Some(old)) = before.shards[usize::from(n)] {
+    // Until a new contribution lands in a shard that was already there (finding 3da85ae371bf: most land
+    // in a new one, where putting the mtime back tests nothing).
+    for k in 0..200u64 {
+        let before = take(&dir);
+        grow(&dir, 17 + k, 1);
+        let head = Store::open(&dir).expect("valid").graph().heads().next().expect("a head");
+        let n = shard_of(&head);
+        let Seen::Present(Some(old)) = before.shards[usize::from(n)] else {
+            read(&dir, 0);
+            continue;
+        };
         let shard = dir.join("objects").join(format!("{n:02x}"));
         let t = rustix::fs::Timespec { tv_sec: old.mtime_s, tv_nsec: old.mtime_ns as _ };
         let times = rustix::fs::Timestamps { last_access: t, last_modification: t };
         rustix::fs::utimensat(rustix::fs::CWD, &shard, &times, rustix::fs::AtFlags::empty()).expect("mtime put back");
+        let now = Before::stats(&dir).shards[usize::from(n)];
+        let Seen::Present(Some(now)) = now else { panic!("the shard is there") };
+        assert_eq!((now.mtime_s, now.mtime_ns), (old.mtime_s, old.mtime_ns), "the mtime is the recorded one");
+        assert_eq!(read(&dir, 0).added, 1, "the ctime still differs, so the shard is diffed");
+        return;
     }
-    assert_eq!(read(&dir, 0).added, 1, "the ctime still differs, so the shard is diffed");
+    panic!("no new contribution landed in an existing shard");
 }
 
 #[test]
@@ -381,26 +392,42 @@ fn a_rebuild_that_never_commits_leaves_the_old_index() {
 
 #[test]
 fn concurrent_refreshes_agree_and_add_each_object_once() {
-    let tmp = tempfile::tempdir().expect("tmp");
-    let dir = ground(tmp.path());
-    grow(&dir, 22, 60);
-    read(&dir, 0);
-    grow(&dir, 23, 60);
-    let handles: Vec<_> = (0..4)
-        .map(|_| {
-            let dir = dir.clone();
-            std::thread::spawn(move || {
-                let before = take(&dir);
-                let store = Store::open(&dir).expect("valid");
-                refresh_with(&dir, &store, &before, Record::Yes, opts(0)).expect("refreshed")
+    // A stale index, none, and a damaged one (finding 3da85ae371bf): four processes at once add each
+    // object exactly once between them, whichever gets there first.
+    for (what, seed) in [("stale", 22u64), ("missing", 24), ("damaged", 26)] {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = ground(tmp.path());
+        grow(&dir, seed, 60);
+        if what != "missing" {
+            read(&dir, 0);
+        }
+        grow(&dir, seed + 1, 60);
+        let total = Store::open(&dir).expect("valid").graph().len();
+        let expected = match what {
+            "stale" => total - rows(&dir, "SELECT count(*) FROM obj") as usize,
+            _ => total,
+        };
+        if what == "damaged" {
+            let file = path(&dir).expect("path");
+            std::fs::write(&file, vec![7u8; 8192]).expect("not a database");
+        }
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || {
+                    let before = take(&dir);
+                    let store = Store::open(&dir).expect("valid");
+                    refresh_with(&dir, &store, &before, Record::Yes, opts(0)).expect("refreshed")
+                })
             })
-        })
-        .collect();
-    let added: usize = handles.into_iter().map(|h| h.join().expect("joined").added).sum();
-    let expected_new = Store::open(&dir).expect("valid").graph().len() as i64 - rows(&dir, "SELECT count(*) FROM obj");
-    assert_eq!(expected_new, 0);
-    assert!(added >= 40, "each object added once, by whichever got there first: {added}");
-    assert_eq!(read(&dir, 0), Outcome::default());
+            .collect();
+        let outcomes: Vec<Outcome> = handles.into_iter().map(|h| h.join().expect("joined")).collect();
+        let added: usize = outcomes.iter().map(|o| o.added).sum();
+        assert_eq!(added, expected, "{what}: each object added once: {outcomes:?}");
+        assert_eq!(outcomes.iter().filter(|o| o.rebuilt).count(), usize::from(what != "stale"), "{what}: {outcomes:?}");
+        assert_eq!(rows(&dir, "SELECT count(*) FROM obj"), total as i64, "{what}");
+        assert_eq!(read(&dir, 0), Outcome::default(), "{what}");
+    }
 }
 
 #[test]
@@ -496,6 +523,7 @@ fn a_changed_value_in_any_table_fails_its_checksum() {
         ("meta file (device and inode)", "UPDATE meta SET v = zeroblob(16) WHERE k = 'file'"),
         ("meta derived_stale", "UPDATE meta SET v = x'01' WHERE k = 'derived_stale'"),
         ("meta fs_clock", "UPDATE meta SET v = zeroblob(16) WHERE k = 'fs_clock'"),
+        ("meta ids", "UPDATE meta SET v = zeroblob(32) WHERE k = 'ids'"),
     ];
     for (what, sql) in cases {
         let tmp = tempfile::tempdir().expect("tmp");
@@ -730,4 +758,267 @@ fn can_hide_is_only_retractions_and_supersessions() {
         seen.insert((c.body().kind(), want));
     }
     assert!(seen.len() >= 5, "every kind, and both sorts of relation: {seen:?}");
+}
+
+/// Writes `body` as `who` through `Store` alone (no index update), as another process would.
+fn contribute(dir: &Path, who: &str, body: Body) -> ContributionId {
+    let mut store = Store::open(dir).expect("valid");
+    let me = store.identity(who).expect("an identity");
+    store.contribute(&me, body).expect("valid")
+}
+
+fn claim(statement: &str) -> Body {
+    Body::Claim { statement: statement.into(), tags: vec!["note".into()] }
+}
+
+/// Finding cf0181613a78: the index and the store can hold sets of one size that differ. Another process
+/// indexes Z, which this store never listed, while this store holds X, in a shard its stamps say is
+/// clean, which the index lacks. A count says they agree; recomputing `hidden` from this store then drops
+/// Z, which is hidden (it is evidence about a retracted claim), and nothing later puts it back. With the
+/// ids' digest the derived tables wait until the sets agree.
+#[test]
+fn equal_counts_of_different_sets_never_bring_the_derived_tables_up_to_date() {
+    for attempt in 0..20u32 {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = ground(tmp.path());
+        let c0 = contribute(&dir, "manager", claim(&format!("c0 {attempt}")));
+        contribute(&dir, "manager", Body::Retract { target: c0, reason: "withdrawn".into() });
+        let c1 = contribute(&dir, "builder", claim(&format!("c1 {attempt}")));
+        read(&dir, 0);
+        let pre = take(&dir);
+        // X, Y and Z are siblings, each written by its own process from the same heads.
+        let mut stores: Vec<Store> = (0..3).map(|_| Store::open(&dir).expect("valid")).collect();
+        let mut write = |k: usize, who: &str, body: Body| -> ContributionId {
+            let me = stores[k].identity(who).expect("an identity");
+            stores[k].contribute(&me, body).expect("valid")
+        };
+        // Y, a retraction (so this refresh recomputes `hidden` whole), in a shard left dirty.
+        let y = write(0, "builder", Body::Retract { target: c1, reason: "withdrawn".into() });
+        let stale = take(&dir);
+        // X, which the index never gets from this refresh: its shard is clean in `stale`.
+        let x = write(1, "reviewer", claim(&format!("x {attempt}")));
+        let this = Store::open(&dir).expect("valid");
+        // Z, hidden, written and indexed by another process that never saw X's or Y's shard change.
+        let z = write(
+            2,
+            "manager",
+            Body::Evidence { target: c0, verdict: Verdict::Pass, method: "check".into(), details: String::new() },
+        );
+        let shards = [shard_of(&y), shard_of(&x), shard_of(&z)];
+        if shards[0] == shards[1] || shards[1] == shards[2] || shards[0] == shards[2] {
+            continue; // the scenario needs three shards; ids are random
+        }
+        let mut other = Before::stats(&dir);
+        for n in [shards[0], shards[1]] {
+            other.shards[usize::from(n)] = pre.shards[usize::from(n)];
+        }
+        let theirs = Store::open(&dir).expect("valid");
+        let theirs_outcome = refresh_with(&dir, &theirs, &other, Record::No, opts(0)).expect("they index Z");
+        assert_eq!(theirs_outcome.added, 1, "only Z: {theirs_outcome:?}");
+        assert_eq!(rows(&dir, "SELECT count(*) FROM obj"), this.graph().len() as i64 - 1);
+        // This refresh: Y added, so the index has as many contributions as this store, but not the same.
+        refresh_with(&dir, &this, &stale, Record::Yes, opts(0)).expect("refreshed");
+        assert_eq!(rows(&dir, "SELECT count(*) FROM obj"), this.graph().len() as i64);
+        // Every later open, with nothing left dirty, must still agree with the full computation.
+        read(&dir, 0);
+        read(&dir, 0);
+        return;
+    }
+    panic!("no attempt put Y, X and Z in three shards");
+}
+
+/// Finding e138686585be: an open with no trusted clock treats every shard as dirty and drops every old
+/// stamp, even where an index already holds them (section 5 step 1).
+#[test]
+fn an_open_without_a_clock_finds_every_shard_dirty_and_drops_the_old_stamps() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 50, 40);
+    read(&dir, 0);
+    assert_eq!(rows(&dir, "SELECT count(*) FROM shard"), 256);
+    let clock = dir.join("cache").join("clock");
+    std::fs::remove_file(&clock).expect("clock removed");
+    std::fs::create_dir(&clock).expect("a directory where cache/clock goes");
+    let before = Before::take(&dir);
+    assert!(before.clock.is_none());
+    let store = Store::open(&dir).expect("valid");
+    let outcome = refresh_with(&dir, &store, &before, Record::Yes, opts(0)).expect("refreshed");
+    assert_eq!(outcome.dirty_shards, 256, "{outcome:?}");
+    assert_eq!(rows(&dir, "SELECT count(*) FROM shard"), 0, "every old stamp goes");
+    agrees(&dir, &store);
+}
+
+/// Finding 32fc7df1acf4: a `cache/` that is a link is never used, by an ordinary open or the full check,
+/// and nothing behind the link changes.
+#[cfg(unix)]
+#[test]
+fn a_linked_cache_is_never_used_even_by_the_full_check() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 51, 30);
+    read(&dir, 0);
+    let victim = tmp.path().join("victim");
+    std::fs::rename(dir.join("cache"), &victim).expect("moved");
+    std::os::unix::fs::symlink(&victim, dir.join("cache")).expect("linked");
+    let state = |p: &Path| -> Vec<(String, u64, std::time::SystemTime)> {
+        let mut v: Vec<_> = std::fs::read_dir(p)
+            .expect("listed")
+            .flatten()
+            .map(|e| {
+                let m = e.metadata().expect("m");
+                (e.file_name().to_string_lossy().into_owned(), m.len(), m.modified().expect("mtime"))
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let was = state(&victim);
+    assert!(!usable(&dir), "a linked cache/ isn't usable");
+    let store = Store::open(&dir).expect("valid");
+    compare(&dir, &store, &Before::stats(&dir)).expect("compares the in-memory index only");
+    assert_eq!(state(&victim), was, "nothing behind the link changed");
+}
+
+/// Security review note 3: a file named with the last generation doesn't overflow.
+#[test]
+fn the_last_generation_damaged_doesnt_overflow() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 52, 10);
+    std::fs::create_dir_all(dir.join("cache")).expect("cache/");
+    std::fs::write(dir.join("cache").join(file_name(u64::MAX)), vec![7u8; 8192]).expect("not a database");
+    let before = take(&dir);
+    let store = Store::open(&dir).expect("valid");
+    let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| refresh(&dir, &store, &before, Record::Yes)));
+    let got = got.expect("no overflow panic");
+    assert!(got.is_err(), "no generation after the last, so the index isn't used: {got:?}");
+}
+
+/// Security review note 4: syncing never waits on a FIFO put where an object or a shard was.
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_the_sync_list_is_refused_without_waiting() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let fifo = tmp.path().join("fifo");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status().expect("mkfifo runs");
+    assert!(made.success(), "a FIFO");
+    let (send, got) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = send.send(durable(&[fifo]).is_err());
+    });
+    let refused = got.recv_timeout(Duration::from_secs(20)).expect("durable returned instead of waiting on the FIFO");
+    assert!(refused, "a FIFO is neither a file nor a directory");
+}
+
+/// Security review note 5: the index's connections distrust the file's schema and run in defensive mode.
+#[test]
+fn connections_distrust_the_files_schema() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 53, 5);
+    read(&dir, 0);
+    let c = conn(&dir);
+    let trusted: i64 = c.query_row("PRAGMA trusted_schema", [], |r| r.get(0)).expect("pragma");
+    assert_eq!(trusted, 0);
+    assert!(c.db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE).expect("db_config"));
+}
+
+/// Security review note 2: a directory at the index's path is damage (the next generation is used), and a
+/// view or a trigger put in the file doesn't stop a rebuild.
+#[test]
+fn a_directory_at_the_index_path_or_a_view_in_the_file_doesnt_stop_the_index() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 54, 20);
+    std::fs::create_dir_all(dir.join("cache").join(file_name(1))).expect("a directory where the index goes");
+    let outcome = read(&dir, 0);
+    assert!(outcome.new_generation, "{outcome:?}");
+
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 55, 20);
+    read(&dir, 0);
+    let c = conn(&dir);
+    c.execute_batch(
+        "DROP TABLE tag; CREATE VIEW tag AS SELECT 1 AS tag, 2 AS seq, x'00' AS ck; \
+         CREATE TRIGGER noisy AFTER INSERT ON obj BEGIN SELECT 1; END;",
+    )
+    .expect("a view and a trigger");
+    drop(c);
+    let store = Store::open(&dir).expect("valid");
+    rebuild(&dir, &store, &take(&dir)).expect("a rebuild clears whatever the file held");
+    agrees(&dir, &store);
+    let left: i64 = conn(&dir)
+        .query_row("SELECT count(*) FROM sqlite_master WHERE type IN ('view', 'trigger')", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(left, 0);
+}
+
+/// Security review note 1: a write's own refresh syncs each object it adds that another writer put there.
+#[test]
+fn a_writes_refresh_syncs_the_objects_it_adds() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 56, 20);
+    read(&dir, 0);
+    let theirs = contribute(&dir, "reviewer", claim("renamed in by another writer"));
+    let store = Store::open(&dir).expect("valid");
+    SYNCED.with(|s| s.borrow_mut().clear());
+    refresh_with(&dir, &store, &Before::stats(&dir), Record::No, opts(0)).expect("refreshed");
+    let synced = SYNCED.with(|s| s.borrow().clone());
+    assert!(synced.contains(&object_path(&dir, &theirs)), "{synced:?}");
+}
+
+/// Section 8, Value corruption: a row deleted from a shard whose stamp is clean, which no refresh will
+/// look at again, fails the full check, in every table that holds rows per contribution.
+#[test]
+fn a_row_deleted_under_a_clean_stamp_fails_the_full_check() {
+    for sql in [
+        "DELETE FROM obj WHERE seq = (SELECT max(seq) FROM obj)",
+        "DELETE FROM tag WHERE seq = (SELECT min(seq) FROM tag)",
+        "DELETE FROM ref WHERE src = (SELECT max(src) FROM ref)",
+        "DELETE FROM parent WHERE child = (SELECT max(child) FROM parent)",
+        "DELETE FROM head",
+    ] {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let dir = ground(tmp.path());
+        grow(&dir, 57, 60);
+        read(&dir, 0);
+        assert_eq!(read(&dir, 0), Outcome::default(), "every stamp clean");
+        conn(&dir).execute_batch(sql).expect("deleted");
+        let store = Store::open(&dir).expect("valid");
+        assert!(compare(&dir, &store, &Before::stats(&dir)).is_err(), "{sql}");
+    }
+}
+
+/// Section 8, Read-only: with an index already there, the view and a replica whose cache/ can't be
+/// written leave it as it was, and make no `-wal` or `-shm`.
+#[cfg(unix)]
+#[test]
+fn an_existing_index_is_left_unchanged_by_the_view_and_a_read_only_cache() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 58, 30);
+    read(&dir, 0);
+    grow(&dir, 59, 5); // something for an open that wrote to find
+    let file = path(&dir).expect("path");
+    let state = || -> (Vec<u8>, std::time::SystemTime, bool, bool) {
+        let m = std::fs::metadata(&file).expect("m");
+        let side = |s: &str| std::path::PathBuf::from(format!("{}{s}", file.display())).exists();
+        (std::fs::read(&file).expect("r"), m.modified().expect("mtime"), side("-wal"), side("-shm"))
+    };
+    let was = state();
+    assert!(!was.2 && !was.3, "no -wal or -shm once the last connection closed");
+    crate::snapshot::open(&dir, crate::snapshot::Refresh::No).expect("the view opens");
+    assert!(state() == was, "the view left the index unchanged");
+    if rustix::process::geteuid().is_root() {
+        return; // permissions don't bind root
+    }
+    std::fs::set_permissions(dir.join("cache"), std::fs::Permissions::from_mode(0o555)).expect("read-only");
+    let opened = crate::snapshot::open(&dir, crate::snapshot::Refresh::Yes);
+    let after = state();
+    std::fs::set_permissions(dir.join("cache"), std::fs::Permissions::from_mode(0o755)).expect("restored");
+    opened.expect("opens through the full path");
+    assert!(after == was, "a read-only cache/ left the index unchanged");
 }

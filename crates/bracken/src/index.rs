@@ -61,7 +61,6 @@ CREATE TABLE shard  (n INTEGER PRIMARY KEY, present INTEGER NOT NULL, mtime_s IN
                      ctime_s INTEGER, ctime_ns INTEGER, ino BLOB, dev BLOB, ck BLOB NOT NULL);
 CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL, ck BLOB NOT NULL);
 ";
-const TABLES: [&str; 11] = ["obj", "agent", "parent", "child", "head", "tag", "ref", "fwd", "hidden", "shard", "meta"];
 
 // ---------------------------------------------------------------------------------------------------
 // Codes and checksums
@@ -293,11 +292,14 @@ fn filesystem_name(_: &Path) -> Option<String> {
 // Files and connections
 
 /// Whether this process may use the index here (section 5, Opens that can't write): only where it can
-/// write `cache/` (or create it).
+/// write `cache/` (or create it), and only if `cache/` is a real directory, not a link to one (section 7,
+/// Opening the file; finding 32fc7df1acf4).
 pub fn usable(dir: &Path) -> bool {
     let cache = dir.join("cache");
-    let target = if std::fs::symlink_metadata(&cache).is_ok() { cache } else { dir.to_owned() };
-    writable(&target)
+    match std::fs::symlink_metadata(&cache) {
+        Ok(m) => m.file_type().is_dir() && writable(&cache),
+        Err(_) => writable(dir),
+    }
 }
 
 #[cfg(unix)]
@@ -346,12 +348,22 @@ pub fn path(dir: &Path) -> Result<PathBuf> {
     Ok(cache.join(file_name(current_generation(&cache).unwrap_or(1))))
 }
 
-fn open_db(path: &Path, busy: Duration) -> rusqlite::Result<Connection> {
+/// Opens the index file. Anything there that isn't a regular file (a directory, a link, a FIFO) is damage,
+/// so the next generation is used (security review note 2). The connection distrusts the file's schema:
+/// no SQL functions run from it, and defensive mode refuses writes that could corrupt it (note 5).
+fn open_db(path: &Path, busy: Duration) -> Result<Connection> {
+    if let Ok(m) = std::fs::symlink_metadata(path)
+        && !m.file_type().is_file()
+    {
+        return Err(NotAFile.into());
+    }
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
         | OpenFlags::SQLITE_OPEN_CREATE
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
     let conn = Connection::open_with_flags(path, flags)?;
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+    conn.pragma_update(None, "trusted_schema", "OFF")?;
     conn.busy_timeout(busy)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -365,8 +377,21 @@ fn is_damage(e: &anyhow::Error) -> bool {
         c.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
             matches!(e.sqlite_error_code(), Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase))
         }) || c.downcast_ref::<WrongVersion>().is_some()
+            || c.downcast_ref::<NotAFile>().is_some()
     })
 }
+
+/// Something at the index's path that isn't a regular file: damage, so a new generation.
+#[derive(Debug)]
+struct NotAFile;
+
+impl std::fmt::Display for NotAFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the index's path holds something that isn't a regular file")
+    }
+}
+
+impl std::error::Error for NotAFile {}
 
 /// A file whose `schema_version` disagrees with its name: damage, so a new generation.
 #[derive(Debug)]
@@ -434,13 +459,18 @@ pub(crate) fn refresh_with(
     let generation = current_generation(&cache).unwrap_or(1);
     match refresh_file(dir, &cache.join(file_name(generation)), store, before, record, opts) {
         Err(e) if is_damage(&e) => {
-            let next = cache.join(file_name(generation + 1));
+            let next = cache.join(file_name(next_generation(generation)?));
             let mut outcome = refresh_file(dir, &next, store, before, record, opts)?;
             outcome.new_generation = true;
             Ok(outcome)
         }
         other => other,
     }
+}
+
+/// The generation after `g`; none after the last (security review note 3), and then the index isn't used.
+fn next_generation(g: u64) -> Result<u64> {
+    g.checked_add(1).context("no index generation is left after the last one")
 }
 
 fn refresh_file(
@@ -479,7 +509,7 @@ pub fn rebuild(dir: &Path, store: &Store, before: &Before) -> Result<()> {
         Ok(())
     };
     match attempt(&cache.join(file_name(generation))) {
-        Err(e) if is_damage(&e) => attempt(&cache.join(file_name(generation + 1))),
+        Err(e) if is_damage(&e) => attempt(&cache.join(file_name(next_generation(generation)?))),
         other => other,
     }
 }
@@ -719,6 +749,9 @@ fn reconcile(
         return Err(Needs::Rebuild);
     }
     let recorded_clock = meta.get("fs_clock").and_then(|v| clock_of(v));
+    let Some(mut indexed) = meta.get("ids").and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok()) else {
+        return Err(Needs::Rebuild);
+    };
     let mut rows = read_shards(tx)?;
 
     // Step 3: a clock that stepped back makes every shard dirty, before any stamp is compared. A later
@@ -733,6 +766,14 @@ fn reconcile(
             tx.execute("DELETE FROM shard", [])?;
             rows.clear();
         }
+    }
+    // No trusted clock (section 5 step 1): no stamp can be judged, so every shard is dirty and every old
+    // stamp goes, as after a step back (finding e138686585be). A write's own refresh records nothing and
+    // never has a clock, so it keeps them.
+    if record == Record::Yes && before.clock.is_none() {
+        stepped_back = true;
+        tx.execute("DELETE FROM shard", [])?;
+        rows.clear();
     }
     let dirty: Vec<u8> = (0..=255u8)
         .filter(|n| {
@@ -782,14 +823,13 @@ fn reconcile(
 
     // Step 5: what freshness found is made durable before it's committed (a write's own objects were
     // synced by the store).
-    let mut to_sync: Vec<PathBuf> = Vec::new();
-    if record == Record::Yes {
-        to_sync.extend(added.iter().map(|id| object_path(dir, id)));
-        for n in &added_shards {
-            to_sync.push(dir.join("objects").join(format!("{n:02x}")));
-            if !matches!(rows.get(n), Some(Row::Present(_))) {
-                to_sync.push(dir.join("objects"));
-            }
+    // On every path, a write's own refresh included: what it adds may be another writer's, renamed in
+    // without a sync (security review note 1).
+    let mut to_sync: Vec<PathBuf> = added.iter().map(|id| object_path(dir, id)).collect();
+    for n in &added_shards {
+        to_sync.push(dir.join("objects").join(format!("{n:02x}")));
+        if !matches!(rows.get(n), Some(Row::Present(_))) {
+            to_sync.push(dir.join("objects"));
         }
     }
 
@@ -802,12 +842,16 @@ fn reconcile(
                 return Err(Needs::Rebuild);
             }
         }
+        indexed = xor(indexed, ins.digest);
+        put_meta(tx, "ids", &indexed)?;
         put_meta(tx, "derived_stale", &[1])?;
     }
     // The derived tables (section 4): only what `added` can change, unless an earlier refresh left them
-    // stale, which may cover contributions this one didn't add.
+    // stale, which may cover contributions this one didn't add. Only when the index holds exactly what
+    // the store holds: another process may have indexed what this store never listed, while this one
+    // holds what that one didn't (finding cf0181613a78).
     let was_stale = meta.get("derived_stale").is_some_and(|v| v != &[0]);
-    if (was_stale || !added.is_empty()) && count(tx)? == g.len() as i64 {
+    if (was_stale || !added.is_empty()) && count(tx)? == g.len() as i64 && indexed == store_digest(store) {
         let order = g.topo_order();
         let after = if was_stale { -1 } else { suffix_start(tx, store, &added)? };
         write_order(tx, &order, after)?;
@@ -867,8 +911,15 @@ fn durable(paths: &[PathBuf]) -> Result<usize> {
         use rustix::fs::{Mode, OFlags};
         let mut last = None;
         for p in &unique {
-            let fd = rustix::fs::open(*p, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+            // Nonblocking, so a FIFO put there can't hang the command, and then only a file or a directory
+            // (security review note 4).
+            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let fd = rustix::fs::open(*p, flags, Mode::empty())
                 .with_context(|| format!("opening {} to sync it", p.display()))?;
+            let kind = rustix::fs::FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode);
+            if !matches!(kind, rustix::fs::FileType::RegularFile | rustix::fs::FileType::Directory) {
+                bail!("{} is neither a file nor a directory, so it isn't synced or indexed", p.display());
+            }
             rustix::fs::fsync(&fd).with_context(|| format!("syncing {}", p.display()))?;
             last = Some(fd);
         }
@@ -879,6 +930,28 @@ fn durable(paths: &[PathBuf]) -> Result<usize> {
         let _ = last;
     }
     Ok(unique.len())
+}
+
+/// The set of `ids` as one value: every id XORed together. Ids are unique, so two sets of one size agree
+/// here only by chance (ids are hashes), which a count alone doesn't give (finding cf0181613a78).
+fn digest<'a>(ids: impl IntoIterator<Item = &'a [u8; 32]>) -> [u8; 32] {
+    let mut d = [0u8; 32];
+    for id in ids {
+        for (x, y) in d.iter_mut().zip(id) {
+            *x ^= y;
+        }
+    }
+    d
+}
+
+fn xor(a: [u8; 32], b: [u8; 32]) -> [u8; 32] {
+    digest([&a, &b])
+}
+
+/// The digest of what `store` holds.
+fn store_digest(store: &Store) -> [u8; 32] {
+    let ids: Vec<[u8; 32]> = store.graph().iter().map(|c| *c.id().as_bytes()).collect();
+    digest(&ids)
 }
 
 fn count(conn: &Connection) -> rusqlite::Result<i64> {
@@ -897,9 +970,7 @@ fn rebuild_in(
     record: Record,
     opts: Options,
 ) -> Result<Outcome> {
-    for table in TABLES {
-        tx.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
-    }
+    clear_schema(tx)?;
     tx.execute_batch(SCHEMA)?;
     let g = store.graph();
     {
@@ -908,6 +979,7 @@ fn rebuild_in(
             let inserted = ins.insert(g.get(&id).expect("ordered ids exist"))?;
             assert!(inserted, "topological order puts parents first");
         }
+        put_meta(tx, "ids", &ins.digest)?;
     }
     write_hidden(tx, store, &g.topo_order())?;
     put_meta(tx, "schema_version", &SCHEMA_VERSION.to_le_bytes())?;
@@ -962,6 +1034,31 @@ fn suffix_start(tx: &Connection, store: &Store, added: &[ContributionId]) -> Res
     Ok(if m == i64::MAX { -1 } else { m })
 }
 
+/// Drops every trigger, view, index and table the file holds, ours or not, so a rebuild starts from an
+/// empty schema whatever was put there (security review note 2): `DROP TABLE` refuses a view, and a
+/// trigger left behind would run on our writes.
+fn clear_schema(tx: &Connection) -> Result<()> {
+    let objects: Vec<(String, String)> = {
+        let mut st = tx.prepare(
+            "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' \
+             ORDER BY CASE type WHEN 'trigger' THEN 0 WHEN 'view' THEN 1 WHEN 'index' THEN 2 ELSE 3 END",
+        )?;
+        st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+    };
+    for (kind, name) in objects {
+        let kind = match kind.as_str() {
+            "trigger" => "TRIGGER",
+            "view" => "VIEW",
+            "index" => "INDEX",
+            "table" => "TABLE",
+            other => bail!("the index file holds a schema object of an unknown type: {other}"),
+        };
+        let quoted = name.replace('"', "\"\"");
+        tx.execute_batch(&format!("DROP {kind} IF EXISTS \"{quoted}\""))?;
+    }
+    Ok(())
+}
+
 /// Sets the `pos` of every row after position `after` to its place in `order`, the graph's
 /// `topo_order()` (section 4, Order); rows at or before it are already there. Only rows whose place
 /// changed are written, in two steps, since `pos` is unique and SQLite checks it row by row.
@@ -976,11 +1073,12 @@ fn write_order(tx: &Connection, order: &[ContributionId], after: i64) -> Result<
     };
     let moved: Vec<(ObjRow, i64)> = rows
         .into_iter()
-        .filter_map(|r| {
-            let to = *want.get(&r.id)?;
-            (r.pos != to).then_some((r, to))
+        .map(|r| {
+            let to = *want.get(&r.id).context("the index holds a contribution the store doesn't")?;
+            Ok((r.pos != to).then_some((r, to)))
         })
-        .collect();
+        .filter_map(Result::transpose)
+        .collect::<Result<_>>()?;
     for (r, _) in &moved {
         tx.execute("UPDATE obj SET pos = ?1 WHERE seq = ?2", [-1 - r.seq, r.seq])?;
     }
@@ -1074,12 +1172,14 @@ struct Inserter<'t> {
     tx: &'t Connection,
     next_seq: i64,
     next_pos: i64,
+    /// The [`digest`] of what this inserter added.
+    digest: [u8; 32],
 }
 
 impl<'t> Inserter<'t> {
     fn new(tx: &'t Connection) -> rusqlite::Result<Inserter<'t>> {
         let next_pos = tx.query_row("SELECT coalesce(max(pos) + 1, 0) FROM obj", [], |r| r.get(0))?;
-        Ok(Inserter { tx, next_seq: count(tx)?, next_pos })
+        Ok(Inserter { tx, next_seq: count(tx)?, next_pos, digest: [0; 32] })
     }
 
     fn seq_of(&self, id: &ContributionId) -> Result<Option<i64>> {
@@ -1146,6 +1246,7 @@ impl<'t> Inserter<'t> {
             ts_key: ts_key(c.content().timestamp_ms),
         };
         let seq = row.seq;
+        self.digest = xor(self.digest, row.id);
         tx.prepare_cached("INSERT INTO obj VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?.execute(params![
             row.seq,
             row.pos,
@@ -1298,6 +1399,9 @@ fn actual(conn: &Connection) -> Result<Answers> {
     if seqs.iter().enumerate().any(|(i, s)| *s != i as i64) {
         bail!("the index's seqs aren't dense");
     }
+    if read_meta(conn)?.get("ids").map(Vec::as_slice) != Some(&digest(by_seq.values())[..]) {
+        bail!("the index's ids digest doesn't match its obj rows");
+    }
     let id = |s: i64| -> Result<[u8; 32]> { by_seq.get(&s).copied().context("a row names a seq that isn't there") };
     let pairs = |table: &'static str| -> Result<Vec<(i64, i64)>> {
         let mut st = conn.prepare(&format!("SELECT * FROM {table}"))?;
@@ -1425,11 +1529,13 @@ pub fn compare(dir: &Path, store: &Store, before: &Before) -> Result<()> {
     }
     differs("a freshly built index", &want, &actual(&fresh)?)?;
 
-    let Ok(cache) = std::fs::canonicalize(dir.join("cache")) else { return Ok(()) };
-    let Some(generation) = current_generation(&cache) else { return Ok(()) };
-    if !usable(dir) {
+    // cache/ only as a real directory, opened without following a link before it's resolved, as every
+    // other open does (finding 32fc7df1acf4); none, or none this process can write, means no index here.
+    if !usable(dir) || !matches!(crate::snapshot::cache::Cache::open(dir, false), Ok(Some(_))) {
         return Ok(());
     }
+    let Ok(cache) = std::fs::canonicalize(dir.join("cache")) else { return Ok(()) };
+    let Some(generation) = current_generation(&cache) else { return Ok(()) };
     let path = cache.join(file_name(generation));
     let mut conn = open_db(&path, BUSY).with_context(|| format!("opening {}", path.display()))?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
