@@ -739,6 +739,67 @@ fn a_local_private_key_never_reaches_the_ground() {
     bracken(dir, &["claim", "Never commit a file with a secret_key field", "--as", "val"]);
 }
 
+/// Security note 5 on PR #44 (report acaa5cd6f738): the private-key scan reads identities/ through the
+/// store, as every other read of it does, never by path. An entry there that isn't a regular file, a FIFO
+/// named like a key file, or a symlink to a key file, makes a write fail at once, naming it, with nothing
+/// recorded. Before, the scan's plain read of a FIFO blocked every write until a writer came, and a symlink
+/// was followed.
+#[test]
+fn a_write_refuses_an_identities_entry_that_isnt_a_regular_file() {
+    use std::os::unix::process::CommandExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    bracken(dir, &["init"]);
+    bracken(dir, &["id", "new", "val"]);
+    let before = ids(dir, &["log", "--json"]).len();
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let other = tempfile::tempdir().unwrap();
+    bracken(other.path(), &["init"]);
+    bracken(other.path(), &["id", "new", "zed"]);
+    std::fs::copy(other.path().join(".bracken/identities/zed.json"), elsewhere.join("zed.json")).unwrap();
+    let entry = dir.join(".bracken/identities/zed.json");
+    let fifo = |path: &Path| {
+        let out = Command::new("mkfifo").arg(path).output().unwrap();
+        assert!(out.status.success(), "mkfifo: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let cases: [(&str, &dyn Fn()); 2] = [
+        ("a FIFO", &|| fifo(&entry)),
+        ("a symlink to a key file", &|| std::os::unix::fs::symlink(elsewhere.join("zed.json"), &entry).unwrap()),
+    ];
+    for (what, make) in cases {
+        make();
+        // Within a deadline, its own process group killed whole at it, so a blocked read fails the test.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_bracken"))
+            .args(["claim", "Works", "--as", "val"])
+            .current_dir(dir)
+            .env_remove("BRACKEN_DIR")
+            .env_remove("BRACKEN_AGENT")
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                let _ = Command::new("kill").args(["-KILL", "--", &format!("-{}", child.id())]).status();
+                let _ = child.wait();
+                panic!("{what}: a write blocked on identities/zed.json");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let out = child.wait_with_output().unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{what}: {err}");
+        assert!(err.contains("zed.json") && err.contains("not a regular file"), "{what}: {err}");
+        // log reads identities/ through the store too, so it counts once the entry is gone.
+        std::fs::remove_file(&entry).unwrap();
+        assert_eq!(ids(dir, &["log", "--json"]).len(), before, "{what}: nothing was recorded");
+    }
+    bracken(dir, &["claim", "Works", "--as", "val"]);
+}
+
 /// `status` lists each current claim that something implements, with each implementer's assessment:
 /// waiting ones first, within a claim and across claims; implementers of any kind; only current
 /// relations and claims. `--all` adds the claims nothing implements; `--json` has the same content.

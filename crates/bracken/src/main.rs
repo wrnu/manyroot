@@ -1316,10 +1316,15 @@ fn contribute_with_parents(
         Body::Evidence { method, details, .. } => vec![method.as_bytes(), details.as_bytes()],
         Body::Retract { reason, .. } => vec![reason.as_bytes()],
     };
-    for (name, hex, raw) in local_secret_keys(s)? {
-        let found = fields.iter().any(|f| contains(&f.to_ascii_lowercase(), hex.as_bytes()) || contains(f, &raw));
-        if found {
-            bail!("this contribution contains the private key of identity {name:?}; it can't go into the Ground");
+    // Each local identity, read through the store like every other read of identities/: a symlinked
+    // directory, or an entry that isn't a regular file (a FIFO would block a plain read), is refused rather
+    // than followed (security note 5 on PR #44, report acaa5cd6f738).
+    for id in s.identities()? {
+        if fields.iter().any(|f| id.key_is_in(f)) {
+            bail!(
+                "this contribution contains the private key of identity {:?}; it can't go into the Ground",
+                id.name()
+            );
         }
     }
     if parents.is_empty() {
@@ -1387,36 +1392,6 @@ fn claim_tags(
         add(legacy.to_owned(), &mut tags);
     }
     Ok((tags, parents))
-}
-
-/// Each local identity's name and secret key, as lowercase hex and as bytes. Read from the
-/// identity files themselves, like scripts/ground-checkpoint does.
-fn local_secret_keys(s: &Store) -> Result<Vec<(String, String, Vec<u8>)>> {
-    let dir = s.identities_dir();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
-    };
-    let mut keys = Vec::new();
-    for entry in entries {
-        let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let file: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        let Some(hex) = file["secret_key"].as_str() else { continue };
-        let hex = hex.to_ascii_lowercase();
-        let raw = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()).collect();
-        let name = path.file_stem().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        keys.push((name, hex, raw));
-    }
-    Ok(keys)
-}
-
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn resolve(s: &Store, prefix: &str) -> Result<ContributionId> {
