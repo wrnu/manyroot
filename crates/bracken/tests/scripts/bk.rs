@@ -899,18 +899,55 @@ if [ \"$1 $2 $3\" = 'id scope --help' ]; then \"$REAL_BRACKEN\" \"$@\" | grep -v
         }
         std::fs::write(&list, &kept_list).unwrap();
         let copy = team.join("keys/retired/other.json");
-        let held = std::fs::read_to_string(team.join("keys/builder-held.json")).unwrap();
-        // The key file as it is, and with its public_key in uppercase hex.
-        for text in [held.clone(), held.replace(&agent, &agent.to_uppercase())] {
+        let held_path = team.join("keys/builder-held.json");
+        let held = std::fs::read_to_string(&held_path).unwrap();
+        // The key file renamed "other", as the server reads it, and with its public_key in uppercase hex.
+        let mut renamed: serde_json::Value = serde_json::from_str(&held).unwrap();
+        renamed["name"] = "other".into();
+        let mut upper = renamed.clone();
+        upper["public_key"] = agent.to_uppercase().into();
+        for value in [renamed, upper] {
+            let text = value.to_string();
             std::fs::write(&copy, &text).unwrap();
             let (out, said) = ready("builder-held");
             assert!(!said && out.contains("retired: the server no longer signs for it"), "{scripts}: {text}: {out}");
         }
         std::fs::remove_file(&copy).unwrap();
+        // Finding 1d2100ed4f0b: a retired entry or key file the server can't read stops it from starting, so
+        // ready can't tell and isn't ready: a line without an agent, or with one that isn't a key, a key file
+        // that's empty or not under its own name, and the identity's own key file emptied.
+        let unreadable = "so the server wouldn't start";
+        for line in ["{\"name\":\"other\"}\n", "{\"name\":\"other\",\"agent\":\"not-a-key\"}\n", "[1]\n"] {
+            let mut text = kept_list.clone();
+            text.extend_from_slice(line.as_bytes());
+            std::fs::write(&list, text).unwrap();
+            let (out, said) = ready("builder-held");
+            assert!(!said && out.contains(unreadable), "{scripts}: {line}: {out}");
+        }
+        std::fs::write(&list, &kept_list).unwrap();
+        for text in ["{}".to_owned(), held.clone()] {
+            std::fs::write(&copy, &text).unwrap();
+            let (out, said) = ready("builder-held");
+            assert!(!said && out.contains(unreadable), "{scripts}: {text}: {out}");
+        }
+        std::fs::remove_file(&copy).unwrap();
+        std::fs::write(&held_path, "{}").unwrap();
+        let (out, said) = ready("builder-held");
+        assert!(!said && out.contains(unreadable), "{scripts}: {out}");
+        std::fs::write(&held_path, &held).unwrap();
+        // Blank lines in the retired list are skipped, as the server skips them.
+        let mut text = kept_list.clone();
+        text.extend_from_slice(b"\n  \n");
+        std::fs::write(&list, text).unwrap();
+        assert!(ready("builder-held").1, "{scripts}: blank lines in the retired list");
+        std::fs::write(&list, &kept_list).unwrap();
         // A retired list the server can't read: it can't tell, so not ready.
         std::fs::write(&list, "not json\n").unwrap();
         let (text, said) = ready("builder-held");
-        assert!(!said && text.contains("retired.jsonl doesn't parse"), "{scripts}: {text}");
+        assert!(
+            !said && text.contains("retired.jsonl has a line that isn't a retired key's entry"),
+            "{scripts}: {text}"
+        );
         std::fs::write(&list, &kept_list).unwrap();
         assert!(ready("builder-held").1, "{scripts}: the retired list restored");
 

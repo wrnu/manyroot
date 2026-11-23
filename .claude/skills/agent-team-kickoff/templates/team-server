@@ -144,25 +144,29 @@ retired_by_key() {
   local ours theirs f
   retired_err=''
   command -v jq >/dev/null || { retired_err="needs jq to compare its public key with the retired ones"; return 2; }
-  ours=$(identities | jq -r --arg n "$1" '.[] | select(.name == $n) | .agent') ||
+  # A key field as the server's parser takes it: 64 hex digits in either case (findings 22a5baa0d27d and
+  # 1d2100ed4f0b), lowercased; anything else, a missing field included, is an error, as it is for the server.
+  local key='def key(f): (f | strings | select(test("^[0-9a-fA-F]{64}$")) | ascii_downcase) // error("no key");'
+  # A key file as the server reads one: its name the file's, and both keys well formed.
+  local key_file="$key"' def key_file($stem): if .name != $stem then error("not its name") else key(.secret_key) as $_ | key(.public_key) end;'
+  ours=$(identities | jq -r --arg n "$1" "$key"' .[] | select(.name == $n) | key(.agent)') ||
     { retired_err="can't read the main checkout's identities to find its public key"; return 2; }
   if [ -f "$dir/keys/$1.json" ]; then
-    ours+=$'\n'$(jq -r '.public_key' "$dir/keys/$1.json" 2>/dev/null) ||
-      { retired_err="$dir/keys/$1.json doesn't read as a key file"; return 2; }
+    ours+=$'\n'$(jq -r --arg s "$1" "$key_file"' key_file($s)' "$dir/keys/$1.json" 2>/dev/null) ||
+      { retired_err="$dir/keys/$1.json doesn't read as its key file, so the server wouldn't start"; return 2; }
   fi
   theirs=''
   if [ -e "$dir/keys/retired.jsonl" ]; then
-    theirs=$(jq -r '.agent' "$dir/keys/retired.jsonl" 2>/dev/null) ||
-      { retired_err="$dir/keys/retired.jsonl doesn't parse, so the server wouldn't start"; return 2; }
+    # One entry a line, blank lines skipped, each needing its agent, as Keys::read_retired_list reads it.
+    theirs=$(jq -R -r "$key"' select(test("\\S")) | fromjson | key(.agent)' "$dir/keys/retired.jsonl" 2>/dev/null) ||
+      { retired_err="$dir/keys/retired.jsonl has a line that isn't a retired key's entry, so the server wouldn't start"; return 2; }
   fi
   for f in "$dir"/keys/retired/*.json; do
     [ -e "$f" ] || continue
-    theirs+=$'\n'$(jq -r '.public_key' "$f" 2>/dev/null) ||
-      { retired_err="$f doesn't read as a key file, so the server wouldn't start"; return 2; }
+    theirs+=$'\n'$(jq -r --arg s "$(basename "$f" .json)" "$key_file"' key_file($s)' "$f" 2>/dev/null) ||
+      { retired_err="$f doesn't read as its key file, so the server wouldn't start"; return 2; }
   done
-  # Hex in either case, as the server's parser takes it (finding 22a5baa0d27d), compared lowercased.
-  hex_keys() { tr 'A-F' 'a-f' | grep -E '^[0-9a-f]{64}$' | sort -u; }
-  [ -n "$(comm -12 <(hex_keys <<<"$ours") <(hex_keys <<<"$theirs"))" ]
+  [ -n "$(comm -12 <(grep -v '^$' <<<"$ours" | sort -u) <(grep -v '^$' <<<"$theirs" | sort -u))" ]
 }
 
 # What a builder writes (AGENTS.md, section 3), each of which the server must sign for an identity whose key
