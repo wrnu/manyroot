@@ -88,6 +88,23 @@ pub struct MockBackend {
     /// `__init__.py`, so their work conflicts there and the integrator settles it keeping both: through the
     /// three-way view in Weave (markers, then take tree), through git's conflict markers in git project mode.
     pub conflicts: Option<u32>,
+    /// With [`MockBackend::conflicts`]: the integrator doesn't settle a builder's work that conflicts but leaves it
+    /// open, and the builder brings it up to date with main once its turn opens with the driver's notice of it (task
+    /// `33ac510f7d4c`).
+    pub leaves_conflicts: bool,
+}
+
+/// What a project turn does of [`MockBackend::conflicts`]: whether this agent appends its [`shared_line`] this
+/// turn, and whether the integrator leaves conflicting work open for its builder ([`MockBackend::leaves_conflicts`]).
+#[derive(Clone, Copy)]
+struct Sharing {
+    shares: bool,
+    leaves: bool,
+}
+
+/// The driver's notice that work of the agent's own conflicts with main, if its turn opened with one.
+fn conflict_notice(c: &Client) -> Option<&str> {
+    c.hints.iter().map(String::as_str).find(|h| h.starts_with("Your proposal ") || h.starts_with("Your request "))
 }
 
 /// The line agent `agent` appends to its package's `__init__.py` in [`MockBackend::conflicts`]'s turn.
@@ -122,6 +139,7 @@ impl Default for MockBackend {
             breaks: None,
             break_line: BREAK_LINE,
             conflicts: None,
+            leaves_conflicts: false,
         }
     }
 }
@@ -451,6 +469,7 @@ impl MockBackend {
         let breaks = (self.breaks == Some((agent, turn))).then_some(self.break_line);
         let mended = self.break_line;
         let shares = self.conflicts == Some(turn) && self.integrator.is_some_and(|n| n != agent);
+        let shares = Sharing { shares, leaves: self.leaves_conflicts };
         if has("request_integration") {
             return git_project_turn(c, agent, turn, self.integrator, &noted, (breaks, mended), shares);
         }
@@ -591,7 +610,7 @@ fn weave_turn(
     integrator: Option<usize>,
     notes: &str,
     (breaks, mended): (Option<&str>, &str),
-    shares: bool,
+    sharing: Sharing,
 ) -> Result<(), String> {
     let task = read_task(c, agent, turn)?;
     let took = take_an_item(c, agent, &task, integrator, notes)?;
@@ -613,8 +632,22 @@ fn weave_turn(
         c.tool("update", json!({}))?;
     }
     let module = write_own_module(c, agent, turn, breaks)?;
-    if shares {
+    if sharing.shares {
         append_shared(c, agent)?;
+    }
+    if conflict_notice(c).is_some() {
+        // Its last proposal conflicts with main: redone onto the line's head, which the tree now is, its module
+        // and shared line with this turn's work, then proposed again.
+        let last = notes.split_once(" proposed ").map(|(_, m)| m.split(TOOK).next().unwrap_or(m).trim());
+        if let Some(path) = last.filter(|m| m.ends_with(".py")) {
+            let value = path.rsplit_once("_turn_").and_then(|(_, t)| t.trim_end_matches(".py").parse::<u32>().ok());
+            let value = value.ok_or_else(|| format!("no turn in {path}"))? * 10 + agent as u32;
+            c.tool("write_file", json!({"path": path, "text": format!("VALUE = {value}\n")}))?;
+        }
+        let init = package_init(c)?;
+        if !tree_text(c, &init)?.contains(&shared_line(agent)) {
+            append_shared(c, agent)?;
+        }
     }
     let proposed = c.tool("propose", json!({"summary": format!("agent {agent}'s module of turn {turn}")}))?;
     let proposal = proposed["proposal"].as_str().ok_or("propose gave no proposal")?.to_string();
@@ -638,6 +671,10 @@ fn weave_turn(
     // so it names its real step (task 61c34b3c2704).
     let integrate = json!({"proposals": proposals, "note": format!("agent {agent}'s turn {turn}")});
     let tried = match c.tool("integrate", integrate.clone()) {
+        // Builders' work that conflicts, left open for them: the rest integrated without it.
+        Err(e) if e.contains("conflicts with no resolution") && sharing.leaves => {
+            integrate_leaving_conflicts(c, agent, turn, proposals, e)
+        }
         // Builders' work that conflicts: settled keeping both sides, through the three-way view, then integrated.
         Err(e) if e.contains("conflicts with no resolution") => {
             settle_through_markers(c, &proposals, &e)?;
@@ -675,10 +712,13 @@ fn git_project_turn(
     integrator: Option<usize>,
     notes: &str,
     (breaks, mended): (Option<&str>, &str),
-    shares: bool,
+    sharing: Sharing,
 ) -> Result<(), String> {
     let task = read_task(c, agent, turn)?;
     let took = take_an_item(c, agent, &task, integrator, notes)?;
+    if let Some(notice) = conflict_notice(c).map(str::to_string) {
+        bring_up_to_date(c, agent, turn, &notice)?;
+    }
     let updates_main = integrator.is_none_or(|n| n == agent);
     let branch = if updates_main { "main".to_string() } else { format!("agent-{agent}-turn-{turn}") };
     let status = c.tool("status", json!({}))?;
@@ -691,7 +731,7 @@ fn git_project_turn(
         c.tool("switch", json!({"branch": branch, "create": true}))?;
     }
     let module = write_own_module(c, agent, turn, breaks)?;
-    if shares {
+    if sharing.shares {
         append_shared(c, agent)?;
     }
     let committed = c.tool("commit", json!({"message": format!("agent {agent}'s module of turn {turn}")}))?;
@@ -731,6 +771,11 @@ fn git_project_turn(
             // Each agent writes its own files; a conflict comes only from MockBackend::conflicts' shared line, and
             // is settled keeping both sides, as git leaves it, then committed.
             let mut merged = c.tool("merge", json!({"ref": r["branch"]}))?;
+            if merged["merged"] == false && sharing.leaves {
+                // Left open for its builder, who is told of it.
+                c.tool("merge", json!({"abort": true}))?;
+                continue;
+            }
             if merged["merged"] == false {
                 settle_git_conflicts(c, &merged)?;
                 merged = c.tool("commit", json!({"message": format!("agent {agent} merges {}", r["branch"])}))?;
@@ -761,6 +806,51 @@ fn git_project_turn(
     }
     c.tool("notes_write", json!({"text": format!("turn {turn}: wrote {module}{took}")}))?;
     c.tool("sync", json!({}))?;
+    Ok(())
+}
+
+/// Integrates `proposals` but those that conflict, which stay open for their builders: integrating stopped at
+/// `error`'s, so it is left out and the rest tried again.
+fn integrate_leaving_conflicts(
+    c: &mut Client,
+    agent: usize,
+    turn: u32,
+    mut proposals: Vec<String>,
+    mut error: String,
+) -> Result<Value, String> {
+    loop {
+        let prefix = error
+            .strip_prefix("merging proposal ")
+            .and_then(|r| r.split_once(' '))
+            .map(|(p, _)| p.to_string())
+            .ok_or_else(|| format!("no proposal named in {error}"))?;
+        proposals.retain(|p| !p.starts_with(&prefix));
+        if proposals.is_empty() {
+            return Ok(json!({}));
+        }
+        match c.tool("integrate", json!({"proposals": proposals, "note": format!("agent {agent}'s turn {turn}")})) {
+            Err(e) if e.contains("conflicts with no resolution") => error = e,
+            other => return other,
+        }
+    }
+}
+
+/// A git builder told its request conflicts with main (`notice`) brings that branch up to date: merges origin/main
+/// into it, settles each conflict keeping both sides, commits and asks for its integration again.
+fn bring_up_to_date(c: &mut Client, agent: usize, turn: u32, notice: &str) -> Result<(), String> {
+    let prefix = format!("Your request origin/agent-{agent}/");
+    let branch = notice
+        .strip_prefix(&prefix)
+        .and_then(|r| r.split_once(' '))
+        .map(|(b, _)| b.to_string())
+        .ok_or_else(|| format!("the notice names no branch of agent {agent}'s: {notice}"))?;
+    c.tool("switch", json!({"branch": branch}))?;
+    let merged = c.tool("merge", json!({"ref": "origin/main"}))?;
+    if merged["merged"] == false {
+        settle_git_conflicts(c, &merged)?;
+        c.tool("commit", json!({"message": format!("agent {agent} brings {branch} up to date in turn {turn}")}))?;
+    }
+    c.tool("request_integration", json!({"branch": branch, "summary": format!("agent {agent}'s {branch}, again")}))?;
     Ok(())
 }
 

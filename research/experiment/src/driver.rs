@@ -379,6 +379,24 @@ struct Run<'a> {
     mains: Mutex<Vec<MainCheck>>,
     /// The public tests the project's seed passes: every main's first baseline, run once, when first needed.
     seed_passing: Mutex<Option<std::collections::BTreeSet<String>>>,
+    /// Per agent, the work of theirs the integrator couldn't integrate for conflicts, told at the start of their
+    /// next turn while it is still open ([`ConflictNotice`], task `33ac510f7d4c`).
+    notices: Mutex<Vec<Vec<ConflictNotice>>>,
+    /// Weave mode: each proposal a builder made, by id, and whose it is.
+    proposed: Mutex<std::collections::BTreeMap<String, usize>>,
+    /// The work each notice told of, as it stood: a Weave proposal's id, a git request's branch and commit. Work is
+    /// told of once; a git branch brought up to date and conflicting again is new work.
+    told: Mutex<std::collections::BTreeSet<String>>,
+}
+
+/// A builder's work the integrator tried and couldn't integrate because it conflicts with main (task
+/// `33ac510f7d4c`): a Weave proposal by id, or a git project request by its branch as the integrator merges it
+/// (`origin/<agent>/<branch>`), with the paths that conflicted and, in Weave, the integrator's note if it gave one.
+#[derive(Clone, Debug, PartialEq)]
+struct ConflictNotice {
+    work: String,
+    paths: Vec<String>,
+    note: Option<String>,
 }
 
 /// What the public tests showed of one agent's own main, the one it integrates onto (task `b0a9769a48da`): the
@@ -549,6 +567,9 @@ pub fn run(cfg: &RunConfig, backend: &dyn Backend) -> Result<Outcome, String> {
         turns_ended: (Mutex::new(vec![0; cfg.agents]), Condvar::new()),
         mains: Mutex::new((0..cfg.agents).map(|_| MainCheck::default()).collect()),
         seed_passing: Mutex::new(None),
+        notices: Mutex::new(vec![Vec::new(); cfg.agents]),
+        proposed: Mutex::new(std::collections::BTreeMap::new()),
+        told: Mutex::new(std::collections::BTreeSet::new()),
     };
     run.snapshot(&mut run.hub(), None, "setup");
     // A wave due after turn 0 goes out before anyone plays.
@@ -897,6 +918,85 @@ impl Run<'_> {
         }))
     }
 
+    /// Keeps what a call tells of builders' work the integrator couldn't integrate (task `33ac510f7d4c`): in Weave, a
+    /// builder's proposal, and the integrator's integrate that stopped at conflicts merging one; in git project mode,
+    /// the integrator's merge of a builder's branch that stopped at conflicts. Each is told to that builder at the
+    /// start of its next turn ([`Run::conflict_notice`]).
+    fn note_conflicts(&self, i: usize, turn: u32, tool: &str, args: &str, result: &Result<Value, String>) {
+        let Some(integrator) = self.integrator.filter(|_| self.project.is_some()) else { return };
+        let args: Value = serde_json::from_str(args).unwrap_or_default();
+        let found = match (self.mode.name(), tool, result) {
+            ("weave", "propose", Ok(v)) if i != integrator => {
+                if let Some(id) = v["proposal"].as_str() {
+                    self.proposed.lock().unwrap_or_else(|e| e.into_inner()).insert(id.to_string(), i);
+                }
+                None
+            }
+            ("weave", "integrate", Err(e)) if i == integrator => weave_conflict(e).and_then(|(prefix, paths)| {
+                let proposed = self.proposed.lock().unwrap_or_else(|e| e.into_inner());
+                let (id, owner) = proposed.iter().find(|(id, _)| id.starts_with(&prefix))?;
+                let note = args["note"].as_str().map(str::trim).filter(|n| !n.is_empty()).map(str::to_string);
+                Some((*owner, ConflictNotice { work: id.clone(), paths, note }))
+            }),
+            (crate::git_project::NAME, "merge", Ok(v)) if i == integrator && v["merged"] == false => {
+                let work = args["ref"].as_str().unwrap_or_default();
+                let owner = work.strip_prefix("origin/").and_then(|r| {
+                    self.names.iter().position(|n| r.strip_prefix(n.as_str()).is_some_and(|b| b.starts_with('/')))
+                });
+                let paths = v["conflicts"].as_array().into_iter().flatten();
+                let paths = paths.filter_map(|p| p.as_str().or_else(|| p["path"].as_str())).map(str::to_string);
+                owner
+                    .filter(|&o| o != integrator)
+                    .map(|o| (o, ConflictNotice { work: work.to_string(), paths: paths.collect(), note: None }))
+            }
+            _ => None,
+        };
+        let Some((owner, notice)) = found else { return };
+        self.events.log(
+            Some(&self.names[i]),
+            "conflict_noted",
+            json!({"turn": turn, "for": self.names[owner], "paths": notice.paths.len()}),
+        );
+        let mut notices = self.notices.lock().unwrap_or_else(|e| e.into_inner());
+        notices[owner].retain(|n| n.work != notice.work);
+        notices[owner].push(notice);
+    }
+
+    /// What agent `i` is told at the start of turn `turn` of its work the integrator couldn't integrate for
+    /// conflicts, each still open as its turn starts: the same words in both modes, in each mode's own
+    /// terms, asking it to bring that work up to date with main. Each piece of work is told of once (`told`).
+    fn conflict_notice(&self, i: usize, turn: u32) -> Option<String> {
+        let held = std::mem::take(&mut self.notices.lock().unwrap_or_else(|e| e.into_inner())[i]);
+        if held.is_empty() {
+            return None;
+        }
+        let weave = self.mode.name() == "weave";
+        let list = if weave { "proposals" } else { "requests" };
+        let req = Request { op: "tool".into(), tool: Some(list.into()), args: json!({}), ..Request::default() };
+        let open = self.copy(i).ok(&req).map(|r| r.result).unwrap_or_default();
+        // Each open item, by its work and as it stands now.
+        let open: Vec<(&str, String)> = open[list]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                let work = if weave { r["proposal"].as_str() } else { r["branch"].as_str() }?;
+                Some((work, format!("{work}@{}", r["commit"].as_str().unwrap_or_default())))
+            })
+            .collect();
+        let mut told = self.told.lock().unwrap_or_else(|e| e.into_inner());
+        let still: Vec<&ConflictNotice> = held
+            .iter()
+            .filter(|n| open.iter().any(|(work, key)| *work == n.work && told.insert(key.clone())))
+            .collect();
+        drop(told);
+        if still.is_empty() {
+            return None;
+        }
+        self.events.log(Some(&self.names[i]), "conflict_notice", json!({"turn": turn, "works": still.len()}));
+        Some(still.iter().map(|n| notice_text(weave, n)).collect::<Vec<_>>().join("\n"))
+    }
+
     /// How the call `tool` with `args` steps on agent `i`'s own main (task `b0a9769a48da`), the same rule in both
     /// project modes: an integration onto it is tested after, and one that brings others' work in is refused
     /// while it is broken. In Weave mode, `integrate`: with proposals it brings others' work in; with none it
@@ -1239,6 +1339,8 @@ impl Run<'_> {
         let mut calls = 0;
         // Past the cap, one notes_write still runs, so a turn at the cap can keep its notes (decision `74d00180c642`).
         let mut noted_past_cap = false;
+        // The turn's first tool result carries what of the agent's work couldn't be integrated (task `33ac510f7d4c`).
+        let mut notice = self.conflict_notice(i, turn);
         while lines.next_line(&mut line)? {
             let Ok(msg) = serde_json::from_str::<Value>(&line) else {
                 self.events.log(Some(name), "bad_message", json!({"turn": turn, "bytes": line.len()}));
@@ -1285,6 +1387,12 @@ impl Run<'_> {
                 // tools it has (process `dc2dd9647315` (1)).
                 content.push(json!({"type": "text", "text": hint}));
                 self.events.log(Some(name), "unknown_hint", json!({"turn": turn, "via": "result"}));
+            }
+            if msg["method"] == "tools/call"
+                && let Some(text) = notice.take()
+                && let Some(content) = reply["result"]["content"].as_array_mut()
+            {
+                content.push(json!({"type": "text", "text": text}));
             }
             reply["jsonrpc"] = json!("2.0");
             reply["id"] = id;
@@ -1374,6 +1482,7 @@ impl Run<'_> {
             }
         };
         let mut result = result;
+        self.note_conflicts(i, turn, tool_name(params), &args_text, &result);
         if let (Some(taken), "task", Ok(v)) = (&self.taken, tool_name(params), &mut result) {
             // Each item's taker, as of now, on the index and an item's view.
             let names = taken.lock().unwrap_or_else(|e| e.into_inner()).names();
@@ -1396,6 +1505,43 @@ impl Run<'_> {
             json!({"turn": turn, "tool": shown, "ok": !is_error, "bytes": text.len(), "digest": digest(text.as_bytes()), "cut_from": cut_from, "record": record}),
         );
         json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+    }
+}
+
+/// The proposal a Weave integrate stopped at for conflicts, by the id prefix its error names, and the paths that
+/// conflicted: from the error's text, `merging proposal <id> stopped at <n> conflicts ...: [<rows>]. Settle ...`.
+fn weave_conflict(error: &str) -> Option<(String, Vec<String>)> {
+    let rest = error.strip_prefix("merging proposal ")?;
+    let (prefix, rest) = rest.split_once(' ')?;
+    if !rest.starts_with("stopped at") || prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let rows = rest.split_once(": [").and_then(|(_, r)| r.rsplit_once("]. Settle")).map(|(r, _)| format!("[{r}]"));
+    let rows: Value = rows.and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
+    let paths = rows.as_array().into_iter().flatten().filter_map(|r| r["path"].as_str()).map(str::to_string);
+    Some((prefix.to_string(), paths.collect()))
+}
+
+/// The notice an agent is given of work of its own the integrator couldn't integrate: the same sentences in both
+/// modes, each in its own terms (task `33ac510f7d4c`).
+fn notice_text(weave: bool, n: &ConflictNotice) -> String {
+    let paths = if n.paths.is_empty() { "some files".to_string() } else { n.paths.join(", ") };
+    let note =
+        n.note.as_ref().map(|t| format!(" The integrator's note: {}.", crate::args::short(t))).unwrap_or_default();
+    if weave {
+        format!(
+            "Your proposal {} isn't integrated: integrating it onto main stopped at conflicts in {paths}.{note} It \
+             stays open but won't integrate as it is. Bring it up to date with main: update to the line's head, redo \
+             its work there, settling what conflicts, and propose it again.",
+            n.work
+        )
+    } else {
+        format!(
+            "Your request {} isn't merged: merging it into main stopped at conflicts in {paths}.{note} It stays open \
+             but won't merge as it is. Bring it up to date with main: merge origin/main into your branch, settle \
+             what conflicts, commit, and ask for its integration again.",
+            n.work
+        )
     }
 }
 
@@ -1600,6 +1746,37 @@ impl Write for Hashing<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Task `33ac510f7d4c`: the proposal and paths of a Weave integrate that stopped at conflicts, read from the
+    /// error the integrator is given, and the notice its builder gets, in the same words in both modes.
+    #[test]
+    fn a_conflicting_integrate_names_its_proposal_and_paths_for_the_notice() {
+        let c = |path: &str| {
+            json!({"path": path, "base": {"hash": "h"}, "into": {"hash": "i"}, "from": {"hash": "f"},
+                                    "offered": [], "text_conflicts": [[1, 2]]})
+        };
+        let v = json!({"step": "proposal 1a2b3c", "conflicts": [c("pkg/__init__.py"), c("pkg/amount.py")]});
+        let error = crate::weave_mode::conflicts_error(&v).expect("an error");
+        assert_eq!(
+            weave_conflict(&error),
+            Some(("1a2b3c".to_string(), vec!["pkg/__init__.py".to_string(), "pkg/amount.py".to_string()]))
+        );
+        assert_eq!(weave_conflict("the line is forked: merge its heads first"), None);
+        assert_eq!(weave_conflict("merging the proposals stopped at 1 conflicts"), None);
+
+        let paths = vec!["pkg/__init__.py".to_string(), "pkg/amount.py".to_string()];
+        let weave =
+            notice_text(true, &ConflictNotice { work: "1a2b".into(), paths: paths.clone(), note: Some("x".into()) });
+        let git = notice_text(false, &ConflictNotice { work: "origin/agent-0/b".into(), paths, note: None });
+        assert!(weave.starts_with("Your proposal 1a2b isn't integrated: integrating it onto main stopped at conflicts in pkg/__init__.py, pkg/amount.py. The integrator's note: `x`."), "{weave}");
+        assert!(git.starts_with("Your request origin/agent-0/b isn't merged: merging it into main stopped at conflicts in pkg/__init__.py, pkg/amount.py. It stays open"), "{git}");
+        for text in [&weave, &git] {
+            assert!(
+                text.contains("It stays open but won't ") && text.contains("Bring it up to date with main: "),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn the_one_integrator_plays_each_turn_after_every_other_agents_same_turn() {
