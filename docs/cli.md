@@ -161,6 +161,11 @@ plan. It shows only that report and the plan's waves, and never serves a file. I
 the directory's children, refuses every symlink and any home directory, and is refused unless the view
 listens on loopback only.
 
+On the Weave Ground the view is `scripts/weave view [--port N]`: the pinned binary, in the foreground, on
+127.0.0.1 only. `scripts/weave` lets `view` through only with `--port`, the policy options
+(`--min-passes`, `--validator`, `--follow-changes`), `--as` and help. It refuses `--bind`, `--host`,
+`--runs` and anything else ([design/weave-view.md](design/weave-view.md) section 6).
+
 ## Moving contributions between replicas
 
 ```sh
