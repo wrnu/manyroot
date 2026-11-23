@@ -195,8 +195,14 @@ forged marker becomes noise in `weave check`, not a takeover or a stop.
   is the manager's own step. An agent that bypasses `scripts/weave`, runs
   the binary on the Ground directly and sets another root gets a stop, not
   a takeover: every script refuses on the mismatch until the exception
-  moves the pin back. A `weave-root` the binary can't replace, such as a
-  directory, still fails closed and takes a hand repair by the manager.
+  moves the pin back. A `weave-root` that is a symlink, or there but not
+  a regular file (a FIFO, socket, device or directory), makes
+  `scripts/weave`, and so `scripts/weave-pin check`, refuse at once,
+  before anything reads it, since a read of a FIFO or device could block
+  (finding `9cd17a713d4e`). It fails closed and takes a hand repair by the
+  manager: moving it aside, then the exception. The check and the read
+  aren't one step, so a file swapped for a FIFO between them can still
+  block a read, which takes a writer who can already edit the Ground.
   An agent that edits `scripts/weave` itself, or
   commits a different pin on `main` locally, is the forging agent of
   agent-keys.md section 2, which nothing here stops.

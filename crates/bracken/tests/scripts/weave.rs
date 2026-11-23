@@ -1709,6 +1709,101 @@ fn weave_runs_only_on_the_pinned_ground_and_root_set_moves_only_to_the_pin() {
     assert_eq!(std::fs::read_to_string(ground.join("weave-root")).unwrap(), format!("{root}\n"));
 }
 
+/// Finding 9cd17a713d4e (task a2701d390d8f): a replica weave-root that is a symlink, or there but not a regular
+/// file, is refused at once by scripts/weave and scripts/weave-pin check, before anything reads it. Before,
+/// a FIFO blocked the script's cmp (or the binary's read) until a writer came, a directory read as no root
+/// and was offered a repair that couldn't replace it, and a symlink was followed.
+#[test]
+fn a_weave_root_that_isnt_a_regular_file_is_refused_before_it_is_read() {
+    let (tmp, dir, home, _) = weave_repo();
+    std::fs::create_dir(home.join("bracken-weave")).unwrap();
+    // Each run within a deadline, so a read blocked on a FIFO fails the test instead of hanging it.
+    let timed = |script: &str, args: &[&str]| {
+        let mut c = command(&dir, script, args);
+        c.env("HOME", &home).env("BRACKEN_DIR", "/inherited/and/ignored");
+        let mut child = c.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                let out = child.wait_with_output().unwrap();
+                panic!("{script} {args:?} didn't finish in 60 s: {}", String::from_utf8_lossy(&out.stderr));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        child.wait_with_output().unwrap()
+    };
+    let out = timed("scripts/weave", &["weave", "init", "--as", "weave-integrator"]);
+    assert!(out.status.success(), "init: {}", String::from_utf8_lossy(&out.stderr));
+    pin(&dir, &home);
+    let ground = home.join("bracken-weave/manyroot");
+    let file = ground.join("weave-root");
+    let (_, root) = pin_of(&home);
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let fifo = |path: &Path| {
+        let out = Command::new("mkfifo").arg(path).output().unwrap();
+        assert!(out.status.success(), "mkfifo: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    let check_ok = || {
+        let out = timed("scripts/weave-pin", &["check"]);
+        assert!(out.status.success(), "weave-pin check: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    check_ok();
+
+    let cases: [(&str, &dyn Fn()); 6] = [
+        ("a FIFO", &|| fifo(&file)),
+        ("a directory", &|| std::fs::create_dir(&file).unwrap()),
+        // Bound under /tmp, whose path is short enough for a socket's, then renamed into place.
+        ("a socket", &|| {
+            let short = tempfile::Builder::new().prefix("wr").tempdir_in("/tmp").unwrap();
+            std::mem::forget(std::os::unix::net::UnixListener::bind(short.path().join("s")).unwrap());
+            std::fs::rename(short.path().join("s"), &file).unwrap();
+        }),
+        ("a symlink to the pin", &|| {
+            std::fs::write(elsewhere.join("root"), format!("{root}\n")).unwrap();
+            std::os::unix::fs::symlink(elsewhere.join("root"), &file).unwrap();
+        }),
+        ("a symlink to a FIFO", &|| {
+            fifo(&elsewhere.join("fifo"));
+            std::os::unix::fs::symlink(elsewhere.join("fifo"), &file).unwrap();
+        }),
+        ("a dangling symlink", &|| std::os::unix::fs::symlink(elsewhere.join("nothing"), &file).unwrap()),
+    ];
+    let refusal = "isn't a regular file (a symlink, FIFO, socket, device or directory), so nothing reads it";
+    for (what, make) in cases {
+        std::fs::remove_file(&file).unwrap();
+        make();
+        // weave-pin check reads scripts/weave's weave check --json, with its stderr dropped, so it gives its own
+        // refusal, as promptly.
+        let pinless = "weave check --json didn't give the Weave Ground's id and root";
+        for (script, args, expected) in [
+            ("scripts/weave", &["weave", "check"][..], refusal),
+            ("scripts/weave", &["weave", "head"], refusal),
+            ("scripts/weave", &["weave", "root", "set", &root], refusal),
+            ("scripts/weave-pin", &["check"], pinless),
+        ] {
+            let out = timed(script, args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{what}: {script} {args:?}: {stderr}");
+            assert!(stderr.contains(expected), "{what}: {script} {args:?}: {stderr}");
+        }
+        // The hand repair: move it aside, then the exception sets the pin.
+        if file.is_dir() && !file.is_symlink() {
+            std::fs::remove_dir(&file).unwrap();
+        } else {
+            std::fs::remove_file(&file).unwrap();
+        }
+        let out = timed("scripts/weave", &["weave", "root", "set", &root]);
+        assert!(out.status.success(), "{what}: root set: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{root}\n"), "{what}");
+        check_ok();
+        for leftover in ["root", "fifo"] {
+            let _ = std::fs::remove_file(elsewhere.join(leftover));
+        }
+    }
+}
+
 /// Finding 598258717737 (decision a2e0b9c241c7): any writer can object to line main's head, and rule 5 makes
 /// the next move answer it, which stopped weave-shadow. Now an objection by an identity outside line main's
 /// policy is answered overridden, by id, with a reason naming it and its author, and the merge is recorded;
