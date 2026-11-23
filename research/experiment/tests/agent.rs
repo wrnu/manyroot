@@ -149,9 +149,22 @@ impl Setup {
     }
 
     fn backend_signed_in(&self, mode: &str, script: &str, caps: Caps, pin: Pin, sign_in: SignIn) -> ClaudeBackend {
+        self.backend_expecting(mode, script, caps, pin, sign_in, Expect::pinned_2_1_311("claude-opus-5-5"))
+    }
+
+    /// A backend whose gate expects `expect`: the start event of the pinned version.
+    fn backend_expecting(
+        &self,
+        mode: &str,
+        script: &str,
+        caps: Caps,
+        pin: Pin,
+        sign_in: SignIn,
+        expect: Expect,
+    ) -> ClaudeBackend {
         ClaudeBackend::new(ClaudeConfig {
             pin,
-            expect: Expect::pinned_2_1_311("claude-opus-5-5"),
+            expect,
             caps,
             sign_in,
             dir: self.dir.join("claude"),
@@ -648,7 +661,33 @@ fn the_expected_start_event_follows_the_pinned_version() {
         new.plugins.contains(&"cc-plugin-privacy".to_string()) && !old.plugins.contains(&"cc-plugin-privacy".into())
     );
     assert_eq!(new.api_key_source, "none", "a subscription token, like a gateway's, shows none");
-    assert!(Expect::for_version("2.1.330", "claude-sonnet-5-5", "medium").is_err());
+    // Decision `2e583e378924`: 2.1.330 shows 2.1.329's start event.
+    let newer = Expect::for_version("2.1.330", "claude-sonnet-5-5", "medium").expect("known");
+    assert_eq!((&newer.skills, &newer.plugins), (&new.skills, &new.plugins));
+    let unknown = Expect::for_version("2.1.331", "claude-sonnet-5-5", "medium").expect_err("not known");
+    assert!(unknown.contains("2.1.331") && unknown.contains("2.1.330"), "{unknown}");
+}
+
+/// Decision `2e583e378924`: the gate's 2.1.330 is what that version's own init event shows, as recorded with no
+/// model call (throwaway home and config, a fake auth value, no reachable model): its version, credential source,
+/// bundled skills and plugins.
+#[test]
+fn the_gates_2_1_330_is_its_recorded_start_event() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-2.1.330-init.json");
+    let init: Value = serde_json::from_str(&std::fs::read_to_string(path).expect("the fixture")).expect("JSON");
+    let e = Expect::for_version("2.1.330", "claude-sonnet-5-5", "medium").expect("known");
+    assert_eq!((&init["type"], &init["subtype"]), (&json!("system"), &json!("init")));
+    assert_eq!(init["claude_code_version"], "2.1.330");
+    assert_eq!(
+        (init["model"].as_str(), init["permissionMode"].as_str()),
+        (Some(e.model.as_str()), Some(e.permission_mode.as_str()))
+    );
+    assert_eq!(init["apiKeySource"].as_str(), Some(e.api_key_source.as_str()));
+    let names = |k: &str, pick: fn(&Value) -> Option<&str>| -> std::collections::BTreeSet<String> {
+        init[k].as_array().expect("a list").iter().map(|v| pick(v).expect("a name").to_string()).collect()
+    };
+    assert_eq!(names("skills", |v| v.as_str()), e.skills.iter().cloned().collect());
+    assert_eq!(names("plugins", |v| v["name"].as_str()), e.plugins.iter().cloned().collect());
 }
 
 // ---- The real binary ----
@@ -664,10 +703,14 @@ fn real_claude_code_reaches_init_and_first_request() {
     let claude = PathBuf::from(std::env::var("EXPERIMENT_CLAUDE").expect("EXPERIMENT_CLAUDE"));
     let version = claude.parent().and_then(|d| d.file_name()).and_then(|v| v.to_str()).expect("a versioned path");
     let s = Setup::new();
-    let backend = s.backend_with(
+    // The gate expects the pinned version's own start event (decision `2e583e378924`).
+    let backend = s.backend_expecting(
+        "bracken",
         "You are a test. Reply with one word.",
         Caps { turn_time: Duration::from_secs(25), turn_budget_usd: Some(0.5), ..caps() },
         Pin::of(&claude, version).expect("pin"),
+        SignIn::Gateway(routing()),
+        Expect::for_version(version, "claude-opus-5-5", "medium").expect("a version the gate knows"),
     );
     let _ = s.run(&backend, 1, 1).expect("the run");
     let t = s.transcript("agent-0", 1).expect("a transcript");

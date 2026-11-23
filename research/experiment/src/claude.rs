@@ -291,14 +291,21 @@ impl Expect {
         e
     }
 
+    /// What Claude Code 2.1.330 shows with the turn configuration: 2.1.329's, the same bundled skills and plugins
+    /// (decision `2e583e378924`; its init event, seen with no model call, is `tests/fixtures/claude-2.1.330-init.json`).
+    pub fn pinned_2_1_330(model: &str) -> Expect {
+        Expect::pinned_2_1_329(model)
+    }
+
     /// What the pinned `version` shows, for `model` at `effort`: only a version whose start event is known.
     pub fn for_version(version: &str, model: &str, effort: &str) -> Result<Expect, String> {
         let mut e = match version {
             "2.1.311" => Expect::pinned_2_1_311(model),
             "2.1.329" => Expect::pinned_2_1_329(model),
+            "2.1.330" => Expect::pinned_2_1_330(model),
             other => {
                 return Err(format!(
-                    "Claude Code {} isn't a version whose start event the gate knows (2.1.311, 2.1.329)",
+                    "Claude Code {} isn't a version whose start event the gate knows (2.1.311, 2.1.329, 2.1.330)",
                     crate::args::short(other)
                 ));
             }
