@@ -75,7 +75,7 @@ mod macos_only {
 
     use super::*;
     use bracken_experiment::driver::{CALLS_PER_TURN, RunConfig, TURN_LIMIT, git_binary, run};
-    use bracken_experiment::mock::{BREAK_LINE, EXIT_LINE, MockBackend};
+    use bracken_experiment::mock::{BREAK_LINE, EXIT_LINE, MockBackend, shared_line};
     use bracken_experiment::plan::{PlanInputs, ProjectPlan};
     use bracken_experiment::project::{Project, digest};
     use bracken_experiment::python::PythonPin;
@@ -632,6 +632,53 @@ mod macos_only {
         assert!(outcome.modules.iter().all(|(_, t)| !t.contains("broken on purpose")), "{mode}: main ends sound");
         let work = format!("by_agent_{breaker}_turn_1");
         assert!(outcome.modules.iter().any(|(p, _)| p.contains(&work)), "{mode}: the breaker's work stays");
+    }
+
+    /// A run as a real one runs, every worker sandboxed (gotcha `73ebbb818ea1`): in turn 1 both builders also
+    /// append their own line to the package's `__init__.py`, so their work conflicts there, and the integrator
+    /// settles it keeping both. In Weave through the three-way view: each conflict shows its three sides, take
+    /// markers writes them, and take tree settles it (defect `cc1a19b1508e`: in stage 5 every markers call failed
+    /// under the sandbox, which unsandboxed tests never saw); in git project mode through git's own markers. The
+    /// mock errs, and the run logs a turn error, if a conflict shows no three sides or a resolve fails.
+    fn a_sandboxed_conflict_is_settled_keeping_both_sides(mode: &'static str) {
+        let Some(python) = pin() else { return };
+        let tmp = tempfile::tempdir().expect("a temp dir");
+        let root = std::fs::canonicalize(tmp.path()).expect("resolved");
+        let (project, _) = project_and_store(&root);
+        let cfg = RunConfig {
+            trace: true,
+            ..config_of(mode, "agent-2", python, root.join("run"), 3, 2, &project, false, true)
+        };
+        let mock = MockBackend {
+            seed: 1,
+            shim: Some(bin()),
+            lockstep: true,
+            integrator: Some(2),
+            conflicts: Some(1),
+            ..MockBackend::default()
+        };
+        let outcome = run(&cfg, &mock).expect("the run");
+        let text = std::fs::read_to_string(cfg.root.join("events.jsonl")).expect("the events");
+        let log: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).expect("an event")).collect();
+        let kept = std::fs::read_to_string(cfg.root.join("turn-errors.txt")).unwrap_or_default();
+        let errors: Vec<&Value> = log.iter().filter(|e| e["event"] == "turn_error").collect();
+        assert!(errors.is_empty(), "{mode}: no turn erred: {errors:?}\n{kept}");
+        assert!(!kept.contains("needs a git checkout"), "{mode}: {kept}");
+        let init = outcome.modules.iter().find(|(p, _)| p.ends_with("/__init__.py")).expect("the package");
+        for agent in [0, 1] {
+            assert!(init.1.contains(&shared_line(agent)), "{mode}: main keeps agent {agent}'s line: {}", init.1);
+        }
+        assert!(!init.1.contains("<<<<<<<") && !init.1.contains(">>>>>>>"), "{mode}: no marker left: {}", init.1);
+    }
+
+    #[test]
+    fn a_sandboxed_weave_conflict_is_settled_through_the_three_way_view() {
+        a_sandboxed_conflict_is_settled_keeping_both_sides("weave");
+    }
+
+    #[test]
+    fn a_sandboxed_git_project_conflict_is_settled_through_gits_markers() {
+        a_sandboxed_conflict_is_settled_keeping_both_sides(bracken_experiment::git_project::NAME);
     }
 
     #[test]

@@ -861,6 +861,11 @@ impl WeaveStore {
             .args(argv)
             .env_clear()
             .env("PATH", path)
+            // The git bracken starts (resolve --markers checks the tree is a checkout) reads no config, as the
+            // worker's own git doesn't: the sandbox denies git's system config, so without these every such
+            // call failed in a real run (defect cc1a19b1508e, note 804ab326ef7d).
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .current_dir(&self.config.dir)
             .stdin(Stdio::null())
             .output()

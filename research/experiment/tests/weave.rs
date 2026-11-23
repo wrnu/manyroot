@@ -416,7 +416,17 @@ fn three_sides_and_a_mixed_resolution(mut s: Stores) {
 /// or replaced, the old mark is gone.
 #[test]
 fn markers_never_put_back_an_edit_the_agent_made() {
-    let mut s = Stores::new(&["agent-0", "agent-1"]);
+    markers_keep_the_agents_edits(Stores::new(&["agent-0", "agent-1"]));
+}
+
+/// The same with every worker sandboxed as in a real run (defect `cc1a19b1508e`).
+#[cfg(target_os = "macos")]
+#[test]
+fn sandboxed_markers_never_put_back_an_edit_the_agent_made() {
+    markers_keep_the_agents_edits(Stores::sandboxed(&["agent-0", "agent-1"]));
+}
+
+fn markers_keep_the_agents_edits(mut s: Stores) {
     let path = "tiny/stats.py";
     let line = std::fs::read_to_string(s.trees[0].join(path))
         .expect("stats")
