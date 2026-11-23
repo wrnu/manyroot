@@ -427,6 +427,17 @@ impl ConflictNotice {
     }
 }
 
+/// Puts a newly published `notice` among an agent's `held` ones (findings `cb7135b7c5a4`, `2c7bd06b2045`): the same
+/// work tried again as it was keeps the notice already held, with its publication, so an agent whose copy has seen
+/// that one is told now; the work at a new commit replaces it, with the new publication.
+fn publish_into(held: &mut Vec<ConflictNotice>, notice: ConflictNotice) {
+    if held.iter().any(|n| n.key() == notice.key()) {
+        return;
+    }
+    held.retain(|n| n.work != notice.work);
+    held.push(notice);
+}
+
 /// Takes the notices given (`keys`, as each work was tried) out of `held`: one published since for the same work
 /// at a new commit stays, to be given in its turn (security review `0ccccb53a79d`, note 2).
 fn given(held: &mut Vec<ConflictNotice>, keys: &[String]) {
@@ -1077,8 +1088,7 @@ impl Run<'_> {
                 "conflict_noted",
                 json!({"turn": turn, "for": self.names[owner], "paths": notice.paths.len()}),
             );
-            notices[owner].retain(|n| n.work != notice.work);
-            notices[owner].push(notice);
+            publish_into(&mut notices[owner], notice);
         }
     }
 
@@ -1992,6 +2002,19 @@ mod tests {
         let first = held[0].key();
         given(&mut held, &[first]);
         assert_eq!(held, [notice("origin/agent-0/feat", Some("c2bbbbb"))]);
+        // Findings `cb7135b7c5a4` and `2c7bd06b2045`: tried again as it was, a notice keeps its publication, so an
+        // agent whose copy saw that one is still told; at a new commit it takes the new publication.
+        let published = |n: ConflictNotice, at: u64| ConflictNotice { published: at, ..n };
+        let mut held = Vec::new();
+        publish_into(&mut held, published(notice("origin/agent-0/feat", Some("c1aaaaa")), 1));
+        publish_into(&mut held, published(notice("origin/agent-0/feat", Some("c1aaaaa")), 2));
+        assert_eq!(held, [published(notice("origin/agent-0/feat", Some("c1aaaaa")), 1)]);
+        let empty = std::collections::BTreeSet::new();
+        assert_eq!(due(&held, &tried, &empty, 1).len(), 1);
+        publish_into(&mut held, published(notice("origin/agent-0/feat", Some("c2bbbbb")), 3));
+        assert_eq!(held, [published(notice("origin/agent-0/feat", Some("c2bbbbb")), 3)]);
+        assert!(due(&held, &moved, &empty, 1).is_empty());
+        assert_eq!(due(&held, &moved, &empty, 3).len(), 1);
         // Finding `a71c41f4c289`: published after the agent's copy last synced, it waits.
         assert!(due(&again, &moved, &told, 0).is_empty());
         // A commit can't be matched by nothing.
