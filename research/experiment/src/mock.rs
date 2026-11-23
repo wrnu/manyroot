@@ -84,6 +84,15 @@ pub struct MockBackend {
     pub breaks: Option<(usize, u32)>,
     /// What it appends to break it: [`BREAK_LINE`] unless given, such as [`EXIT_LINE`].
     pub break_line: &'static str,
+    /// A project run's turn in which every builder also appends its own line ([`shared_line`]) to the package's
+    /// `__init__.py`, so their work conflicts there and the integrator settles it keeping both: through the
+    /// three-way view in Weave (markers, then take tree), through git's conflict markers in git project mode.
+    pub conflicts: Option<u32>,
+}
+
+/// The line agent `agent` appends to its package's `__init__.py` in [`MockBackend::conflicts`]'s turn.
+pub fn shared_line(agent: usize) -> String {
+    format!("# agent {agent} was here\n")
 }
 
 /// The line an agent that breaks main appends to its package's `__init__.py`, and its integrator takes out.
@@ -112,6 +121,7 @@ impl Default for MockBackend {
             hinted: std::sync::Mutex::new(Vec::new()),
             breaks: None,
             break_line: BREAK_LINE,
+            conflicts: None,
         }
     }
 }
@@ -440,11 +450,12 @@ impl MockBackend {
         let noted = notes["notes"].as_str().unwrap_or_default().to_string();
         let breaks = (self.breaks == Some((agent, turn))).then_some(self.break_line);
         let mended = self.break_line;
+        let shares = self.conflicts == Some(turn) && self.integrator.is_some_and(|n| n != agent);
         if has("request_integration") {
-            return git_project_turn(c, agent, turn, self.integrator, &noted, (breaks, mended));
+            return git_project_turn(c, agent, turn, self.integrator, &noted, (breaks, mended), shares);
         }
         if has("propose") {
-            return weave_turn(c, agent, turn, self.integrator, &noted, (breaks, mended));
+            return weave_turn(c, agent, turn, self.integrator, &noted, (breaks, mended), shares);
         }
         let mut memory: Memory = serde_json::from_str(notes["notes"].as_str().unwrap_or_default()).unwrap_or_default();
         if has("replace") && !has("pr_open") {
@@ -580,6 +591,7 @@ fn weave_turn(
     integrator: Option<usize>,
     notes: &str,
     (breaks, mended): (Option<&str>, &str),
+    shares: bool,
 ) -> Result<(), String> {
     let task = read_task(c, agent, turn)?;
     let took = take_an_item(c, agent, &task, integrator, notes)?;
@@ -601,6 +613,9 @@ fn weave_turn(
         c.tool("update", json!({}))?;
     }
     let module = write_own_module(c, agent, turn, breaks)?;
+    if shares {
+        append_shared(c, agent)?;
+    }
     let proposed = c.tool("propose", json!({"summary": format!("agent {agent}'s module of turn {turn}")}))?;
     let proposal = proposed["proposal"].as_str().ok_or("propose gave no proposal")?.to_string();
     if integrator.is_some_and(|n| n != agent) {
@@ -622,7 +637,15 @@ fn weave_turn(
     // Refused if the line forked under it: the proposal stays open, for later. Any other failure is the turn's,
     // so it names its real step (task 61c34b3c2704).
     let integrate = json!({"proposals": proposals, "note": format!("agent {agent}'s turn {turn}")});
-    match c.tool("integrate", integrate.clone()) {
+    let tried = match c.tool("integrate", integrate.clone()) {
+        // Builders' work that conflicts: settled keeping both sides, through the three-way view, then integrated.
+        Err(e) if e.contains("conflicts with no resolution") => {
+            settle_through_markers(c, &proposals, &e)?;
+            c.tool("integrate", integrate.clone())
+        }
+        other => other,
+    };
+    match tried {
         Ok(done) if done["main_tests"]["broken"] == true => {
             // Main broke: integrating more is refused until it is repaired, through the agent's own tree.
             let refused = refused_while_broken(&done["main_tests"], c.tool("integrate", integrate))?;
@@ -652,6 +675,7 @@ fn git_project_turn(
     integrator: Option<usize>,
     notes: &str,
     (breaks, mended): (Option<&str>, &str),
+    shares: bool,
 ) -> Result<(), String> {
     let task = read_task(c, agent, turn)?;
     let took = take_an_item(c, agent, &task, integrator, notes)?;
@@ -667,6 +691,9 @@ fn git_project_turn(
         c.tool("switch", json!({"branch": branch, "create": true}))?;
     }
     let module = write_own_module(c, agent, turn, breaks)?;
+    if shares {
+        append_shared(c, agent)?;
+    }
     let committed = c.tool("commit", json!({"message": format!("agent {agent}'s module of turn {turn}")}))?;
     if committed["main_tests"]["broken"] == true {
         // Its own commit broke its main: every commit on main is tested, as every Weave integration is. Merging an
@@ -701,10 +728,14 @@ fn git_project_turn(
             if files == 0 || review["diff"].as_str().is_some_and(|d| d.contains("\n-VALUE")) {
                 return Err(format!("the review of {} shows no change, or it inverted: {review}", r["branch"]));
             }
-            // Each agent writes its own files, so no merge conflicts.
-            let merged = c.tool("merge", json!({"ref": r["branch"]}))?;
-            if merged["merged"] != true {
-                return Err(format!("merging {} conflicts: {merged}", r["branch"]));
+            // Each agent writes its own files; a conflict comes only from MockBackend::conflicts' shared line, and
+            // is settled keeping both sides, as git leaves it, then committed.
+            let mut merged = c.tool("merge", json!({"ref": r["branch"]}))?;
+            if merged["merged"] == false {
+                settle_git_conflicts(c, &merged)?;
+                merged = c.tool("commit", json!({"message": format!("agent {agent} merges {}", r["branch"])}))?;
+            } else if merged["merged"] != true {
+                return Err(format!("merging {} failed: {merged}", r["branch"]));
             }
             if merged["main_tests"]["broken"] == true {
                 // Main broke: merging more is refused until it is repaired, on main itself.
@@ -744,6 +775,75 @@ fn refused_while_broken(report: &Value, tried: Result<Value, String>) -> Result<
         Ok(v) if report["untested"].is_string() && v["main_tests"]["broken"] == false => Ok(false),
         other => Err(format!("an integration onto a broken main wasn't refused as such: {other:?}")),
     }
+}
+
+/// `path`'s text in the working tree, as read_file shows it less its line numbers.
+fn tree_text(c: &mut Client, path: &str) -> Result<String, String> {
+    let read = c.tool("read_file", json!({"path": path}))?;
+    // Each line as read_file numbers it: five places for its number, then two spaces.
+    Ok(read["text"].as_str().unwrap_or_default().lines().map(|l| format!("{}\n", l.get(7..).unwrap_or(""))).collect())
+}
+
+/// Appends agent `agent`'s [`shared_line`] to its package's `__init__.py`.
+fn append_shared(c: &mut Client, agent: usize) -> Result<(), String> {
+    let init = package_init(c)?;
+    let text = tree_text(c, &init)?;
+    c.tool("write_file", json!({"path": init, "text": format!("{text}{}", shared_line(agent))}))?;
+    Ok(())
+}
+
+/// `text` with its conflict markers taken out, keeping both sides and dropping the base: diff3 style
+/// (`<<<<<<<`, `|||||||` then the base, `=======`, `>>>>>>>`) or git's plain style.
+fn both_sides(text: &str) -> String {
+    let mut out = String::new();
+    let mut in_base = false;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("|||||||") {
+            in_base = true;
+        } else if line.starts_with("=======") {
+            in_base = false;
+        } else if !(line.starts_with("<<<<<<<") || line.starts_with(">>>>>>>") || in_base) {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+/// Settles each conflict integrating `proposals` stopped at (`error`, its rows) keeping both sides: each row must
+/// show its regions' three sides, then take markers writes the file with them, the agent takes the markers out,
+/// and take tree settles it from the working tree.
+fn settle_through_markers(c: &mut Client, proposals: &[String], error: &str) -> Result<(), String> {
+    let rows: Value = error
+        .split_once(": [")
+        .and_then(|(_, r)| r.split_once("]. Settle"))
+        .and_then(|(r, _)| serde_json::from_str(&format!("[{r}]")).ok())
+        .ok_or_else(|| format!("the conflicts' rows didn't parse: {error}"))?;
+    for row in rows.as_array().into_iter().flatten() {
+        let path = row["path"].as_str().ok_or("a conflict row names no path")?;
+        let region = &row["regions"][0];
+        if !(region["base"].is_string() && region["into"].is_string() && region["from"].is_string()) {
+            return Err(format!("the conflict in {path} doesn't show its three sides: {row}"));
+        }
+        let resolve = |take: &str| json!({"proposals": proposals, "path": path, "take": take});
+        c.tool("resolve", resolve("markers"))?;
+        let marked = tree_text(c, path)?;
+        c.tool("write_file", json!({"path": path, "text": both_sides(&marked)}))?;
+        c.tool("resolve", resolve("tree"))?;
+    }
+    Ok(())
+}
+
+/// Settles each file a git merge left conflicted (`merged`, its result) keeping both sides.
+fn settle_git_conflicts(c: &mut Client, merged: &Value) -> Result<(), String> {
+    for path in merged["conflicts"].as_array().into_iter().flatten() {
+        let path = path.as_str().or_else(|| path["path"].as_str()).ok_or_else(|| format!("a conflict: {merged}"))?;
+        let marked = tree_text(c, path)?;
+        if !marked.contains("<<<<<<<") {
+            return Err(format!("git left {path} conflicted without markers: {merged}"));
+        }
+        c.tool("write_file", json!({"path": path, "text": both_sides(&marked)}))?;
+    }
+    Ok(())
 }
 
 /// Whether the working tree's package holds the break `line`: a main reported broken without it was only reported

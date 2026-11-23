@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use bracken_experiment::driver::git_binary;
 use bracken_experiment::mode::{Session, StoreConfig};
 use bracken_experiment::project::Project;
+use bracken_experiment::sandbox::{Git, Sandbox, WorkerPaths};
 use bracken_experiment::task::Task;
 use bracken_experiment::weave_mode::{ANY_AGENT, hub_data};
 use bracken_experiment::worker::{Request, Worker};
@@ -50,6 +51,17 @@ impl Stores {
 
     /// The same, under the integrator setting `setting`.
     fn with(names: &[&str], setting: &str) -> Stores {
+        Stores::build(names, setting, false)
+    }
+
+    /// The same as [`Stores::new`], every worker under its sandbox profile, as a real run's are (gotcha
+    /// `73ebbb818ea1`): a path the sandbox denies fails here as it does in a run. macOS only.
+    #[cfg(target_os = "macos")]
+    fn sandboxed(names: &[&str]) -> Stores {
+        Stores::build(names, ANY_AGENT, true)
+    }
+
+    fn build(names: &[&str], setting: &str, sandboxed: bool) -> Stores {
         let dir = tempfile::tempdir().expect("a temp dir");
         let config = |sub: &str, identity: &str| StoreConfig {
             dir: dir.path().join(sub),
@@ -64,14 +76,34 @@ impl Stores {
         let sockets = dir.path().join("s");
         std::fs::create_dir(&sockets).expect("sockets");
         let project = Project::load(&tiny()).expect("the fixture");
-        let mut hub = Worker::spawn(&bin(), "weave", &config("hub", "setter")).expect("hub");
+        let git = sandboxed.then(|| Git::of(&git_binary().expect("git")).expect("git's exec path"));
+        // As the driver builds them: a store's directory made first, the copy's own sync socket, every hub end.
+        let profile = |sub: &str, sockets: Vec<PathBuf>, hub: bool| {
+            sandboxed.then(|| {
+                let store = dir.path().join(sub);
+                std::fs::create_dir_all(&store).expect("the store's directory");
+                let bracken = bracken();
+                let paths = WorkerPaths {
+                    store: &store,
+                    worker: &bin(),
+                    bracken: &bracken,
+                    git: git.as_ref(),
+                    sockets: &sockets,
+                };
+                if hub { Sandbox::hub(&paths) } else { Sandbox::tools(&paths) }.expect("the profile")
+            })
+        };
+        let hub_ends: Vec<PathBuf> = (0..names.len()).map(|i| sockets.join(format!("h{i}.sock"))).collect();
+        let hub_profile = profile("hub", hub_ends, true);
+        let mut hub = Worker::spawn_in(&bin(), "weave", &config("hub", "setter"), hub_profile.as_ref()).expect("hub");
         hub.ok(&request("project", hub_data(&project, setting, false).expect("the data"))).expect("the project");
         let setup = hub.ok(&request("setup", Value::Null)).expect("hub setup");
         assert_eq!(setup.result["released"], json!(["sum", "mean-empty"]), "the items released at the start");
         let seed = Worker::bytes(&hub.ok(&request("export", Value::Null)).expect("export")).expect("bytes");
         let (mut copies, mut peers, mut trees) = (Vec::new(), Vec::new(), Vec::new());
-        for name in names {
-            let mut w = Worker::spawn(&bin(), "weave", &config(name, name)).expect("copy");
+        for (i, name) in names.iter().enumerate() {
+            let own = profile(name, vec![sockets.join(format!("c{i}.sock"))], false);
+            let mut w = Worker::spawn_in(&bin(), "weave", &config(name, name), own.as_ref()).expect("copy");
             let reply = w
                 .ok(&Request { op: "setup".into(), bytes: Some(hex::encode(&seed)), ..Request::default() })
                 .expect("copy setup");
@@ -298,7 +330,10 @@ fn a_conflicting_proposal_waits_for_a_resolution() {
 /// unproposed. The integration holds both sides' edits.
 #[test]
 fn a_conflict_shows_three_sides_and_a_mixed_resolution_goes_through_the_tree() {
-    let mut s = Stores::new(&["agent-0", "agent-1"]);
+    three_sides_and_a_mixed_resolution(Stores::new(&["agent-0", "agent-1"]));
+}
+
+fn three_sides_and_a_mixed_resolution(mut s: Stores) {
     let path = "tiny/stats.py";
     let before = std::fs::read_to_string(s.trees[0].join(path)).expect("the seed's stats");
     let line = before.lines().find(|l| l.contains("return")).expect("a return line").to_string();
@@ -374,7 +409,12 @@ fn a_conflict_shows_three_sides_and_a_mixed_resolution_goes_through_the_tree() {
 /// or replaced, the old mark is gone.
 #[test]
 fn markers_never_put_back_an_edit_the_agent_made() {
-    let mut s = Stores::new(&["agent-0", "agent-1"]);
+    markers_keep_the_agents_edits(Stores::new);
+}
+
+/// Its stores, each time, made by `stores`: sandboxed or not, the same for both.
+fn markers_keep_the_agents_edits(stores: fn(&[&str]) -> Stores) {
+    let mut s = stores(&["agent-0", "agent-1"]);
     let path = "tiny/stats.py";
     let line = std::fs::read_to_string(s.trees[0].join(path))
         .expect("stats")
@@ -402,7 +442,7 @@ fn markers_never_put_back_an_edit_the_agent_made() {
     assert_eq!(std::fs::read_to_string(s.trees[0].join(path)).expect("kept"), mine, "the agent's edit stays");
 
     // Marked, then committed by a proposal: the mark is gone, so a later edit there is the agent's own.
-    let s2 = &mut Stores::new(&["agent-0", "agent-1"]);
+    let s2 = &mut stores(&["agent-0", "agent-1"]);
     let mut ps = Vec::new();
     for i in 0..2 {
         s2.ok(i, "edit_file", json!({"path": path, "old": line, "new": format!("{line}  # agent {i}")}));
@@ -824,6 +864,19 @@ fn a_project_run_needs_weave_mode_and_the_python_pin() {
 #[cfg(target_os = "macos")]
 mod macos_only {
     use super::*;
+
+    /// The conflict view with every worker sandboxed as in a real run, where it once failed on every call (defect
+    /// `cc1a19b1508e`): its mock tests ran unsandboxed.
+    #[test]
+    fn a_sandboxed_conflict_shows_three_sides_and_a_mixed_resolution_goes_through_the_tree() {
+        three_sides_and_a_mixed_resolution(Stores::sandboxed(&["agent-0", "agent-1"]));
+    }
+
+    /// The same for markers and the agent's own edits, every store sandboxed.
+    #[test]
+    fn sandboxed_markers_never_put_back_an_edit_the_agent_made() {
+        markers_keep_the_agents_edits(Stores::sandboxed);
+    }
 
     /// A checkout sets the old tree aside whole and removes it after, so one that can't be cleared, as when
     /// something writes into it while it is (task 61c34b3c2704), neither fails it nor costs the tree its repository
