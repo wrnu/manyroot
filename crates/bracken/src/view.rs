@@ -61,6 +61,9 @@ const ASSETS: &[(&str, &str, &[u8])] = &[
     ("/runs.html", "text/html; charset=utf-8", include_bytes!("../assets/view/runs.html")),
     ("/runs.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/runs.js")),
     ("/runs.css", "text/css; charset=utf-8", include_bytes!("../assets/view/runs.css")),
+    ("/weave.html", "text/html; charset=utf-8", include_bytes!("../assets/view/weave.html")),
+    ("/weave.js", "text/javascript; charset=utf-8", include_bytes!("../assets/view/weave.js")),
+    ("/weave.css", "text/css; charset=utf-8", include_bytes!("../assets/view/weave.css")),
     ("/fonts/alegreya.woff2", "font/woff2", include_bytes!("../assets/view/fonts/alegreya.woff2")),
     ("/fonts/alegreya-italic.woff2", "font/woff2", include_bytes!("../assets/view/fonts/alegreya-italic.woff2")),
     (
@@ -117,14 +120,16 @@ struct Snapshot {
     conflicts: Vec<Conflict>,
     /// The current view (what's hidden), which every `/api/contribution` and `/api/intents` needs.
     current: CurrentView,
-    /// What changes when the replica does: its object and agent entry counts.
-    signature: (usize, usize),
+    /// What changes when the replica does: its object and agent entry counts, and its weave-root.
+    signature: Signature,
+    /// The Weave pages' state, once the watcher thread has read it (docs/design/weave-view.md section 3).
+    weave: crate::view_weave::Cell,
 }
 
 impl Snapshot {
     /// `signature` must be taken before `store` was opened: something written while it was being
     /// read then changes the signature again, and the next poll reads the replica again.
-    fn new(store: Store, policy: &Policy, previous: Option<&Snapshot>, signature: (usize, usize)) -> Result<Snapshot> {
+    fn new(store: Store, policy: &Policy, previous: Option<&Snapshot>, signature: Signature) -> Result<Snapshot> {
         let names = public_names(&store)?;
         let g = store.graph();
         let order = g.topo_order();
@@ -151,7 +156,8 @@ impl Snapshot {
             .collect();
         let conflicts = policy.evaluate(g).conflicts;
         let current = CurrentView::new(g, &order);
-        Ok(Snapshot { store, names, order, depth, agents, agent_index, statuses, conflicts, current, signature })
+        let weave = crate::view_weave::Cell::default();
+        Ok(Snapshot { store, names, order, depth, agents, agent_index, statuses, conflicts, current, signature, weave })
     }
 
     fn graph(&self) -> &Graph {
@@ -169,9 +175,18 @@ pub fn public_names(store: &Store) -> Result<Names> {
     Ok(Names(store.directory()?.into_iter().map(|e| (e.agent, e.name)).collect()))
 }
 
+/// What [`signature`] counts: the replica's object files and agent entries, and its weave-root's metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Signature {
+    objects: usize,
+    agents: usize,
+    root: Option<(u64, u64, u64, i64, i64, i64, i64)>,
+}
+
 /// The replica's object files and agent entries, counted. The Ground is append-only, so a change
-/// in either means something arrived.
-fn signature(dir: &Path) -> Result<(usize, usize)> {
+/// in either means something arrived. And its weave-root, read without following a link: `weave root set`
+/// renames a new file into place, which changes the Weave pages without any object arriving.
+pub fn signature(dir: &Path) -> Result<Signature> {
     let count = |d: PathBuf| -> Result<usize> {
         match std::fs::read_dir(&d) {
             Ok(entries) => {
@@ -187,7 +202,7 @@ fn signature(dir: &Path) -> Result<(usize, usize)> {
             objects += count(shard.path())?;
         }
     }
-    Ok((objects, count(dir.join("agents"))?))
+    Ok(Signature { objects, agents: count(dir.join("agents"))?, root: crate::view_weave::root_signature(dir) })
 }
 
 /// The replica as a cursor saw it, and its causal order.
@@ -203,6 +218,8 @@ struct Viewer {
     past: Mutex<Vec<(blake3::Hash, Arc<Past>)>>,
     /// Slots for building `?as_of=` graphs, [`PAST_BUILDS`] of them.
     building: Slots,
+    /// Slots for the Weave reads that sort the graph or walk a line, taken without waiting.
+    weave_slots: Slots,
     /// For tests only (`BRACKEN_VIEW_REREAD_DELAY_MS`): how long a re-read waits after reading the
     /// replica before it's used, so a test can write while one is under way. At most
     /// [`MAX_REREAD_DELAY`].
@@ -334,7 +351,10 @@ impl Listener {
 /// 6e1807aa762f). For each listener off loopback it warns on stderr that anyone on that network can read
 /// the whole Ground: there's no login. With `runs`, the run is read first, and refused unless every
 /// listener is on loopback (section 1.10).
-pub fn serve(dir: &Path, policy: Policy, bind: &Bind, runs: Option<&Path>) -> Result<()> {
+/// Serves `store`, the replica as it was read after `first`, its signature, was taken (the order
+/// [`Snapshot::new`] needs). The caller hands its open replica over, so the view holds one copy of it, and
+/// two only while it re-reads (docs/design/weave-view.md section 5).
+pub fn serve(store: Store, first: Signature, policy: Policy, bind: &Bind, runs: Option<&Path>) -> Result<()> {
     let ips = bind.check()?;
     // Before anything listens, so a run that can't be shown, or one that would reach a network, stops
     // the view at once.
@@ -356,7 +376,7 @@ pub fn serve(dir: &Path, policy: Policy, bind: &Bind, runs: Option<&Path>) -> Re
         .into_iter()
         .map(|(ip, socket)| (ip, socket, Arc::new(Listener::new(hosts(ip, port, bind.names_on(ip, &ips))))))
         .collect();
-    let viewer = Arc::new(Viewer::new(dir, policy, runs)?);
+    let viewer = Arc::new(Viewer::new(store, first, policy, runs)?);
     let mut stdout = io::stdout().lock();
     for (ip, ..) in &listeners {
         writeln!(stdout, "view at http://{}/", host_port(*ip, port))?;
@@ -424,7 +444,11 @@ fn security_headers() -> String {
 
 fn respond(stream: &TcpStream, r: &Response) -> io::Result<()> {
     let mut out = Timed::new(stream, Instant::now() + IO_TIMEOUT, None);
-    let allow = if r.status == 405 { "Allow: GET\r\n" } else { "" };
+    let allow = match r.status {
+        405 => "Allow: GET\r\n",
+        503 => "Retry-After: 2\r\n",
+        _ => "",
+    };
     let head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{allow}{}Connection: close\r\n\r\n",
         r.status,
@@ -438,12 +462,13 @@ fn respond(stream: &TcpStream, r: &Response) -> io::Result<()> {
     out.flush()
 }
 
-/// A request's method, path and query, and its Host header.
+/// A request's method, path and query, its Host header, and the Sec-Fetch-Site a browser sends.
 struct Request {
     method: String,
     path: String,
     query: HashMap<String, String>,
     host: Option<String>,
+    fetch_site: Option<String>,
 }
 
 fn read_request(stream: &TcpStream, head_timeout: Duration) -> Result<Request, Refused> {
@@ -462,6 +487,12 @@ fn read_request(stream: &TcpStream, head_timeout: Duration) -> Result<Request, R
             return Err(Refused::new(400, "more than one Host"));
         }
     }
+    let mut fetch_site = None;
+    for h in req.headers.iter().filter(|h| h.name.eq_ignore_ascii_case("sec-fetch-site")) {
+        if fetch_site.replace(String::from_utf8_lossy(h.value).to_ascii_lowercase()).is_some() {
+            return Err(Refused::new(400, "more than one Sec-Fetch-Site"));
+        }
+    }
     let target = req.path.unwrap_or_default();
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let mut parameters = HashMap::new();
@@ -473,7 +504,7 @@ fn read_request(stream: &TcpStream, head_timeout: Duration) -> Result<Request, R
         }
     }
     let query = parameters;
-    Ok(Request { method: req.method.unwrap_or_default().to_owned(), path: path.to_owned(), query, host })
+    Ok(Request { method: req.method.unwrap_or_default().to_owned(), path: path.to_owned(), query, host, fetch_site })
 }
 
 fn percent_decode(s: &str) -> Result<String, Refused> {
@@ -504,6 +535,13 @@ impl Viewer {
     /// that fails to read (a write half done elsewhere, say) is tried again at the next poll.
     fn watch(&self) {
         loop {
+            // The current snapshot's Weave state, read here and never on a request's thread, so neither
+            // listening nor the other pages wait for it: at start, and after each re-read.
+            let (_, current) = self.snapshot();
+            if current.weave.get().is_none() {
+                current.weave.set(crate::view_weave::Weave::build(current.graph(), &self.dir));
+            }
+            drop(current);
             std::thread::sleep(POLL);
             let (_, last) = self.snapshot();
             // Counted before the replica is read (finding 31f5a44fc779): a write during the read
@@ -512,6 +550,9 @@ impl Viewer {
             if now == last.signature {
                 continue;
             }
+            // Dropped before the next is read, so the two are never held at once; the Weave pages answer
+            // 503 meanwhile, and the others keep serving `last`.
+            last.weave.clear();
             let next = crate::snapshot::open(&self.dir, crate::snapshot::Refresh::No).and_then(|store| {
                 std::thread::sleep(self.reread_delay);
                 Snapshot::new(store, &self.policy, Some(&last), now)
@@ -527,11 +568,10 @@ impl Viewer {
         }
     }
 
-    /// The replica in `dir` read once, for listeners to serve.
-    fn new(dir: &Path, policy: Policy, runs: Option<Value>) -> Result<Viewer> {
-        let dir = dir.to_owned();
-        let first = signature(&dir)?;
-        let snapshot = Snapshot::new(crate::snapshot::open(&dir, crate::snapshot::Refresh::No)?, &policy, None, first)?;
+    /// The replica `store`, read after its signature `first` was taken, for listeners to serve.
+    fn new(store: Store, first: Signature, policy: Policy, runs: Option<Value>) -> Result<Viewer> {
+        let dir = store.dir().to_owned();
+        let snapshot = Snapshot::new(store, &policy, None, first)?;
         let reread_delay = std::env::var("BRACKEN_VIEW_REREAD_DELAY_MS")
             .ok()
             .and_then(|ms| ms.parse().ok())
@@ -544,6 +584,7 @@ impl Viewer {
             changed: Condvar::new(),
             past: Mutex::new(Vec::new()),
             building: Slots::new(PAST_BUILDS),
+            weave_slots: Slots::new(crate::view_weave::DERIVED_AT_ONCE),
             reread_delay,
             runs,
         })
@@ -604,12 +645,22 @@ impl Viewer {
             let _ = respond(stream, &error(405, "this view is read-only: only GET is served"));
             return;
         }
+        // A page on another site can't read an answer (no CORS), but it could still send blind requests
+        // that make the view work: build as-of graphs, hold the Weave slots. Browsers say where a request
+        // comes from; a tool without one sends nothing, and is served (docs/design/weave-view.md section 7).
+        if request.path.starts_with("/api/")
+            && matches!(request.fetch_site.as_deref(), Some("cross-site") | Some("same-site"))
+        {
+            let _ = respond(stream, &error(403, "this view answers its API only to its own pages"));
+            return;
+        }
         // A parameter is never ignored: one a page doesn't take is refused, as is a bad value.
         let takes: &[&str] = match request.path.as_str() {
             "/api/graph" | "/api/contributions" => &["since", "limit"],
             "/api/events" => &["since"],
             "/api/tension" => &["as_of"],
             path if path.starts_with("/api/root/") => &["as_of"],
+            path if crate::view_weave::is_weave(path) => crate::view_weave::takes(path),
             _ => &[],
         };
         if let Some(k) = request.query.keys().find(|k| !takes.contains(&k.as_str())) {
@@ -648,6 +699,13 @@ impl Viewer {
             "/api/trust" => Ok(self.trust_json(&snap)),
             "/api/runs" => self.runs.clone().ok_or_else(|| error(404, "this view was started without --runs")),
             "/api/tension" => self.tension_json(&snap, request.query.get("as_of").map(String::as_str)),
+            path if crate::view_weave::is_weave(path) => match snap.weave.get() {
+                Some(weave) => {
+                    crate::view_weave::route(&weave, snap.graph(), &snap.names, path, &request.query, &self.weave_slots)
+                        .map_err(|(status, why)| error(status, why))
+                }
+                None => Err(error(503, "reading the Weave records: try again in a moment")),
+            },
             path => match (path.strip_prefix("/api/contribution/"), path.strip_prefix("/api/root/")) {
                 (Some(id), _) => self.contribution_json(&snap, id),
                 (_, Some(id)) => self.root_json(&snap, id, request.query.get("as_of").map(String::as_str)),
@@ -1120,7 +1178,7 @@ impl Viewer {
 }
 
 /// A fixed number of slots: `take` waits until one is free.
-struct Slots {
+pub(crate) struct Slots {
     max: usize,
     taken: Mutex<usize>,
     freed: Condvar,
@@ -1129,6 +1187,17 @@ struct Slots {
 impl Slots {
     fn new(max: usize) -> Slots {
         Slots { max, taken: Mutex::new(0), freed: Condvar::new() }
+    }
+
+    /// A slot if one is free now, without waiting: a request past the slots is refused at once rather
+    /// than holding its connection (docs/design/weave-view.md section 4).
+    pub(crate) fn try_take(&self) -> Option<Slot<'_>> {
+        let mut taken = self.taken.lock().unwrap_or_else(|p| p.into_inner());
+        if *taken >= self.max {
+            return None;
+        }
+        *taken += 1;
+        Some(Slot(self))
     }
 
     /// Waits for a slot, given back when the guard drops.
@@ -1143,7 +1212,7 @@ impl Slots {
 }
 
 /// Gives back a slot when dropped, and wakes one waiting for it.
-struct Slot<'a>(&'a Slots);
+pub(crate) struct Slot<'a>(&'a Slots);
 
 impl Drop for Slot<'_> {
     fn drop(&mut self) {
@@ -1487,7 +1556,9 @@ mod tests {
         let tmp = tempfile::tempdir().expect("a temp dir");
         let dir = tmp.path().join("g");
         Store::init(&dir, "budget").expect("a Ground");
-        let viewer = Arc::new(Viewer::new(&dir, Policy::default(), None).expect("a viewer"));
+        let first = signature(&dir).expect("a signature");
+        let store = crate::snapshot::open(&dir, crate::snapshot::Refresh::No).expect("the replica");
+        let viewer = Arc::new(Viewer::new(store, first, Policy::default(), None).expect("a viewer"));
         // Longer than any test runs.
         const FOREVER: Duration = Duration::from_secs(3_600);
         let (mut ports, mut listeners) = (Vec::new(), Vec::new());
@@ -1706,7 +1777,7 @@ mod tests {
                 );
             }
         }
-        assert_eq!(scripts, 11, "the five pages and their six scripts");
+        assert_eq!(scripts, 13, "the six pages and their seven scripts");
     }
 
     /// Computed property accesses that could build a sink's name or reach one on a DOM object: a string in

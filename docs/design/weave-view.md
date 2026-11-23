@@ -178,11 +178,24 @@ Every page has a URL fragment (`/weave.html#decision/<id>`,
 
 ## 3. The Weave state
 
-When the watcher re-reads the replica (`Viewer::watch`), it builds the Weave
-state with the snapshot, once per change, off the request path. Every request
-reads from that state. Nothing in it is built per line, so a Ground with
-thousands of lines costs a rebuild what its records cost, not that times the
-lines.
+The watcher thread (`Viewer::watch`) builds the Weave state, once per change,
+never on the listener or on a request's thread (answer `a300d75086d5`):
+- **At start,** the view listens and serves its other pages from the first
+  snapshot at once. The watcher builds that snapshot's Weave state in the
+  background, so the first visit usually finds it ready.
+- **On a change,** the watcher drops the old snapshot's Weave state first,
+  then reads the new snapshot, swaps it in, and builds its Weave state. So
+  at most one Weave state is held at a time. A request that is still
+  reading the old state holds a counted reference, and the state is freed
+  when that request ends.
+- **Until it is built,** every Weave endpoint answers 503 with
+  `Retry-After: 2` and "reading the Weave records". `weave.js` waits that
+  long and asks again, for up to ten minutes, while the reader stays on
+  that page. The view's other pages keep answering throughout.
+
+Every request reads from that state. Nothing in it is built per line, so a
+Ground with thousands of lines costs a rebuild what its records cost, not
+that times the lines.
 
 | Field | Built with | Notes |
 |---|---|---|
@@ -205,7 +218,8 @@ for the one line or record a request names, never for every line.
   the read's whole result.
   - **For an objection read,** each objection in order with what its row
     needs that only that read gives: its id, and for an open one its basis
-    (kind, failing result, check name cut to 800 bytes, `replaced`) and the
+    (its kind; for `Basis::Evidence` the failing result, the check name cut
+    to 800 bytes and `replaced`; for `Basis::Goal` the goal's id) and the
     dispositions it allows. That's at most about 1 KiB an objection; the
     row's other fields (author, note, retracted, answers) come from `Index`
     and the `answers` index for that page alone.
@@ -339,8 +353,10 @@ conflicts, problems, missing paths and change entries.
   manifest two lines share is listed on both. Its target resolves whether
   or not the target is retracted, as weave.md section 1 says.
   `Obligations::list` includes retracted objections, so the view joins
-  each one to `Index::reviews` by id and marks it. The scope's objection
-  ids and their total are what `derived` keeps for a line (section 3).
+  each one to `Index::reviews` by id and marks it. For a line, `derived`
+  keeps each objection in the scope with what only the objection read
+  gives: its id, and for an open one its basis and allowed dispositions
+  (section 3, *What is kept*).
 
 ### Conflict preview
 
@@ -395,7 +411,7 @@ computes only this:
 | A conflict preview | 20 conflicts a page, 10 resolutions each, sides at most 1 MiB each and 16 MiB in all | *Conflict preview* above |
 | Lists | 50 inside an answer; pages of 200 by default, 2,000 at most, or 200 at most for an endpoint whose rows hold nested lists | *Every list is paged* above |
 | A list inside a list item | 5 entries and its total, each entry's text 200 characters and 800 bytes | The row's own page has the rest |
-| A list row | 24 KiB with nested lists, 4 KiB otherwise, as serialized JSON | *Every list is paged* above |
+| A list row | 24 KiB with nested lists, 4 KiB otherwise, as serialized JSON | *Every list is paged* above. A flat row's own text can be up to 4 KiB a string, so a row with a long note or a check result's full 4 KiB of details is trimmed a little further, its longest strings first, to fit. Its own page has the text in full, up to 64 KiB |
 | A check result's details | 4 KiB in a list, 64 KiB on `/api/weave/result/<id>` | 64 KiB is the view's existing `TEXT_BYTES`. A list of 2,000 results is at most 8 MiB of details |
 | A box log | 64 KiB | |
 | Notes, summaries, reasons, goals and other short text in a list | 4 KiB each | A record's own page has its text up to 64 KiB |
@@ -479,7 +495,38 @@ numbers:
 
 The 4 GB stop applies to the steady state with a re-read. If that passes
 4 GB, or a rebuild passes 10 s, the builder stops and reports rather than
-tune `crates/tree`. The `as_of` figure is reported beside it for the
+tune `crates/tree`.
+
+**Measured** (notes `8d2fa97daa7c` and `b81cf1bbcb74`). The generated
+Ground reached 420 decisions on an 8,300-file tree (371 MB) before the
+2-hour limit on the generator. Every figure was taken at a load average of
+250 to 830 on a 10-core machine, so each overstates an idle one.
+- **When the Weave state was built with the snapshot:** 6.4 s to listen,
+  544 MiB steady and 1,042 MiB at the peak of a re-read. Linear from 20 to
+  420 decisions, that is about 22 s and 3.9 GB at 1,570. That's past the
+  10 s stop, which is why the state is now built lazily (above).
+- **Built lazily** (the same copy, measured once at the end): 0.8 s to
+  listen, with `/api/ground` answering at once; 4.1 s until the first Weave
+  page answers; 543 MiB steady. On a change, the Weave pages answer again
+  4.3 s later, and the peak is 588 MiB, since the old Weave state is
+  dropped first. At 1,570 decisions that is about 3 s to listen, about
+  15 s until the first Weave page, and about 2.2 GB at the peak.
+- **What remains is `Index::build`** in the frozen `crates/tree`, which
+  decodes and checks every decision's full manifest. On the same copy,
+  `weave log --json` took 4.4 s and 548 MiB, and `weave green --json`
+  8.8 s. Every weave CLI read pays the same, so the view's Weave state costs
+  about one CLI read per change. Decoding manifests once, or lazily, is the
+  held "Weave single-decode" item (owner decision `817afe6653a8`), with this
+  measurement as its evidence (note `357e72db08ca`).
+- **Requests,** once the state is built, answer in 1 to 5 ms: the summary,
+  a line, a decision with `Mutex<Checks>` held, and a 200-row log page of
+  129 KB. A per-line read (heads, green and the open count, computed once
+  and kept) took about 4 ms. `Mutex<Checks>` was held under 1 ms for a
+  decision's counted results.
+- **The Loom's `as_of` graphs,** reported beside the stop: 4 kept took the
+  view from 522 to 1,033 MiB, about 128 MiB each, and each took 0.1 to 0.2 s
+  to build. At 1,570 decisions that is about 480 MiB each, so a reader who
+  opens 4 of them adds about 1.9 GB. The `as_of` figure is reported beside it for the
 manager. Past that size the answer is the index store
 ([index-store.md](index-store.md)), not this view.
 
@@ -722,6 +769,13 @@ Notes taken:
 - breakage `paths` follow the nested cap;
 - row and page bounds are stated in bytes: 24 KiB and 4 KiB rows, 800
   bytes a nested entry.
+
+### PR (b)
+
+| What | Handling |
+|---|---|
+| Manager notes after the delta check: section 4 still said ids and a total; `Basis::Goal`'s goal id; the 4 KiB flat row trims | Section 4 points to section 3's *What is kept*; the goal id is named; the caps table says how a flat row is trimmed |
+| The 10x rebuild passed 10 s (question `91abf8289969`) | Answer `a300d75086d5`, option 1: the state is built lazily on the watcher thread, the old one dropped first, the Weave pages answer 503 with `Retry-After` until it's ready, and it's built at start in the background. The numbers are in section 5 |
 
 Round 2's notes are taken too:
 - the scripts count rises to 13;
