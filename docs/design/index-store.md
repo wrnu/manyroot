@@ -184,7 +184,7 @@ CREATE TABLE shard  (n INTEGER PRIMARY KEY,          -- 0..255; no row means dir
                      ino BLOB, dev BLOB,             -- u64s as 8 big-endian bytes
                      ck BLOB NOT NULL);
 CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL, ck BLOB NOT NULL);
-                     -- schema_version, ground id, the file's own device and inode, hidden_stale, fs_clock
+                     -- schema_version, ground id, file (its own device and inode), derived_stale, fs_clock
 ```
 
 **Order.** Every answer that the full computation orders by `Graph::topo_order()`
@@ -230,7 +230,10 @@ process adds each row once.
 - `tag` for a claim: `INSERT OR IGNORE`, since a claim may repeat a tag;
 - `ref` for a relation (both ends), evidence or a retraction, and `fwd` for a
   relation. A referrer's author comes from joining `obj` on `src`, and a
-  relation's other end from `fwd`, which is what `CurrentView`'s `others` needs;
+  relation's other end from `fwd`, which is what `CurrentView`'s `others` needs.
+  `fwd` is keyed by `src_end`, but `others` asks by `to_end` as well, so PR 3,
+  which answers it from the index, adds an index on `fwd(to_end)` (a schema
+  version bump);
 - `pos`, as above.
 
 Contributions found together by freshness are inserted in causal order across
@@ -242,8 +245,11 @@ can hide or unhide contributions anywhere above it, and maintaining that
 incrementally is Phase 4 (research B R2).
 
 - In PR 2, any change recomputes `hidden` whole from `CurrentView`, and only when
-  the index holds exactly what the store holds. Otherwise `hidden_stale` is set
-  until a later refresh.
+  the index holds exactly what the store holds. Otherwise `derived_stale` is set
+  until a later refresh. The same flag covers `pos`: PR 2 recomputes the order
+  from `Graph::topo_order()`, which the full open has already built, and writes
+  only the rows whose `pos` changed (two steps, since `pos` is unique). The
+  suffix recompute above is what PR 3, which no longer builds the graph, needs.
 - PR 3 decides hidden-ness per answered row, by `HiddenOne`'s rule over `ref`.
 
 ## 5. Freshness after a git pull (G5)
@@ -264,14 +270,25 @@ with.
    - Taking *T* first, and from the filesystem rather than this process's wall
      clock, means neither a slow reconcile nor skew against a network
      filesystem's server can break it.
+   - `cache/clock` is opened relative to `cache/`'s own descriptor with
+     `O_NOFOLLOW` (and nonblocking, so a FIFO planted there can't hang the open),
+     and must be a regular file.
    - If `cache/clock` can't be written or read, this open records no stamps and
-     treats every shard as dirty.
+     treats every shard as dirty, but still uses the index: every dirty shard is
+     diffed, so the answers are right, only slower. That differs from a `cache/`
+     this process can't write, which never touches the index at all (Opens that
+     can't write, below).
 2. **Stat `objects/`'s directories** (0.45 ms). In PR 2 this happens before
    `Store::open` lists anything.
 3. **Find the dirty shards.**
    - **Clock step back first.** If *T* is earlier than the `fs_clock` recorded in
      `meta`, the filesystem clock stepped back: every shard is dirty on this open,
      and every shard row is cleared, before any stamp is compared.
+   - That comparison is made under the write lock, against the `fs_clock` read
+     there. A concurrent refresh may have recorded a later *T* of its own after
+     this one took *T*, which is no step back, so the clock is read once more
+     under the lock and only a value still earlier than `fs_clock` counts. The
+     `fs_clock` recorded is never moved backwards except after a step back.
    - Otherwise, each of the 256 shards `00`–`ff` is decided. It is clean only if
      its row matches its current stamp (mtime, ctime, inode, device), or its row
      says absent and it is absent. Anything else is dirty: no row, a different
@@ -305,7 +322,10 @@ with.
    protocol rule.
    - **Make them durable first.** Before the transaction that adds them commits,
      fsync each added object file, each shard directory it was found in, and
-     `objects/` if that shard is new. Another writer (git, an older binary,
+     `objects/` if that shard is new. Each is a plain `fsync`; on macOS one
+     `F_FULLFSYNC` follows, on the last of them, which flushes the drive's cache
+     for everything written before it, so it stands for a full sync of each
+     (Rust's `File::sync_all` is the same `F_FULLFSYNC` per file). Another writer (git, an older binary,
      `serve`) may have renamed it in without a directory fsync, and the index must
      not commit a row, or a stamp, for a directory entry a power loss could take
      back.
@@ -328,7 +348,12 @@ with.
      1M).
    - An absent shard is recorded as absent.
    - A rebuild follows the same steps. Its stamps come from step 2, taken before
-     its own listing.
+     its own listing. What it fsyncs is the shard directories whose stamps it
+     records, not every object file: a rebuild indexes what the store listed, and
+     a shard recorded clean must not be one a power loss could change back.
+   - Stamps come only from step 2's stats. A refresh that waits for the lock
+     rechecks `meta` and the shard rows it reads there, but never takes new stats
+     after the listing and records them.
 
 **Where stamps are recorded at all.** Only where the stamp is trustworthy:
 
@@ -447,15 +472,20 @@ is SQLite's documented corruption case.
   - Every row a read or a refresh uses is checked against its `ck`: rows it
     returns, rows it joins through (an `agent` key, a `parent` or `child` edge),
     the `head` rows, the `shard` stamps freshness compares, and each `meta`
-    value it reads (`schema_version`, ground, device and inode, `hidden_stale`,
+    value it reads (`schema_version`, ground, device and inode, `derived_stale`,
     `fs_clock`).
+  - `meta`'s checksums are checked before any of its values is compared, so a
+    damaged `schema_version` is damage, not another version's file.
+  - A returned row is also checked against the query that asked for it: the ids
+    read for a shard must have that shard's prefix, so a row with a sound `ck`
+    in the wrong place isn't taken as an answer.
   - A mismatch rebuilds the index in place, since the file itself is sound
     (SQLITE_CORRUPT moves to a new generation instead, as above), and that read
     falls back to the full path.
 
   This keeps the snapshot's guarantee that a damaged byte is detected and
-  rebuilt (`crates/bracken/tests/snapshot.rs`), at a cost of one hash per returned
-  row. It isn't meant to resist forgery: anyone who can write `cache/` can
+  rebuilt (`crates/bracken/tests/snapshot.rs`), at a cost of one hash per row
+  used. It isn't meant to resist forgery: anyone who can write `cache/` can
   recompute it (section 7).
 - **Residual, accepted.** Structural damage that drops rows from a table or a
   secondary index, so a read never returns them, isn't caught by a row check.
@@ -517,6 +547,9 @@ repository by ground-guards guard 1, but not in other repositories.
   The comparison covers every table (objects, parents, children, heads, tags,
   references, relations by `from`, hidden) and the order (`pos` against
   `topo_order()`). A disagreement fails the command, and nothing is written.
+  - A replica with no index yet, or one whose `cache/` this process can't
+    write, has only the in-memory comparison: there is no index of its own to
+    check, and the full check never creates one.
 - PR 3 adds a gate check that makes the same comparison on the main Ground.
 - The snapshot is retired only if that equality holds on every test.
 
@@ -553,7 +586,7 @@ Each property maps to a test, in PR 2 unless marked PR 3:
 | Concurrency | several processes refreshing a stale, missing or damaged index at once agree, and each object is added once |
 | Rebuild under an open connection | a rebuild, or a move to a new generation, while another connection reads: both answer what the full computation gives |
 | Damage | a file that isn't a database moves to a new generation; a schema version or ground mismatch rebuilds; SQLITE_BUSY falls back without a rebuild |
-| Value corruption | a byte changed in a row of each table fails that row's checksum on read, rebuilds the index, and the read's answer equals the full computation's (as `tests/snapshot.rs` does for the snapshot). The cases include an `agent` key, a `head` row, a `parent` and a `child` edge, a `shard` stamp, and `meta`'s `hidden_stale` and `fs_clock`. A row deleted with a clean stamp fails the full check |
+| Value corruption | a byte changed in a row of each table fails that row's checksum on read, rebuilds the index, and the read's answer equals the full computation's (as `tests/snapshot.rs` does for the snapshot). The cases include an `agent` key, a `head` row, a `parent` and a `child` edge, a `shard` stamp, and each `meta` value: `schema_version`, ground, `file` (device and inode), `derived_stale` and `fs_clock`. A row deleted with a clean stamp fails the full check |
 | Schema versions | two schema versions alternating on one Ground don't rebuild each other's file |
 | Widths | `timestamp_ms` = u64::MAX indexes, and orders after every smaller value |
 | Read-only | `bracken view` and a replica with a read-only `cache/` leave every file under `cache/` unchanged, index files included, and answer as the full path does |
@@ -580,7 +613,7 @@ Each PR reports those numbers.
 | `155f7566cac1`, `2538f1286416` rebuild protocol, newer schema | section 6, Rebuilds and Schema versions: in place in one transaction, never unlinking an open file; per-version files; BUSY isn't damage |
 | `1128ae98db65`, `23579eecd2a7` power loss | section 6, Order: shard directory fsync before the index commit, and the shard's row deleted in that transaction |
 | `21fedaad26ab` integer widths | section 4, Integer widths: `ts_key` order-preserving, stat fields whole |
-| `3f3b3d278d99` quick_check, value corruption | section 6, Integrity checks: when quick_check runs; SQLITE_CORRUPT means a new generation; per-row checksums checked on every returned row (decision `c489f7f9dea9`); dropped rows caught by the full check, the gate and verify |
+| `3f3b3d278d99` quick_check, value corruption | section 6, Integrity checks: when quick_check runs; SQLITE_CORRUPT means a new generation; per-row checksums checked on every row used (decision `c489f7f9dea9`); dropped rows caught by the full check, the gate and verify |
 | `5947f43b4b64` read-only opens, serve | section 6, Read-only opens and `bracken serve` |
 | `6e6530271736` tests | section 8's table |
 
@@ -610,3 +643,22 @@ Round 2's notes are taken as well:
 - `meta` binds the device as well as the inode (section 7);
 - a rebuild's stamps come before its own listing (section 5 step 6);
 - no stamps if `cache/clock` fails (section 5 step 1).
+
+Round 3's finding (`14f9e4b1a786`) is handled by giving every table, `meta`
+included, its own checksum (section 6). Round 3's notes are taken in PR 2:
+
+- one hash per row used, not only per row returned (section 6);
+- an unwritable `cache/clock` turns stamps off but keeps the index, while an
+  unwritable `cache/` means no index at all (section 5 step 1);
+- `cache/clock` is opened relative to `cache/` with `O_NOFOLLOW` (section 5 step 1);
+- the clock step-back comparison is rechecked under the lock (section 5 step 3);
+- `fsync` with one `F_FULLFSYNC` stands for `sync_all` (section 5 step 5);
+- a rebuild fsyncs the shard directories whose stamps it records, and no stats
+  taken after the listing are ever recorded (section 5 step 6);
+- `meta`'s checksums come before its schema version, and returned rows are
+  checked against their query (section 6);
+- the full check skips the replica's own comparison when there is no index
+  (section 7);
+- each `meta` value is named in the corruption test (section 8);
+- `fwd` is keyed by `src_end` while `others` also asks by `to_end`, so PR 3 adds
+  an index for it (section 4).

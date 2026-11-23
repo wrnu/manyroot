@@ -489,9 +489,13 @@ fn a_changed_value_in_any_table_fails_its_checksum() {
         ("fwd", "UPDATE fwd SET to_end = 0 WHERE rel = (SELECT max(rel) FROM fwd)"),
         ("hidden", "UPDATE hidden SET ck = zeroblob(8)"),
         ("shard", "UPDATE shard SET mtime_ns = 1 WHERE present = 1"),
-        ("meta hidden_stale", "UPDATE meta SET v = x'01' WHERE k = 'derived_stale'"),
+        // meta's ck is checked before its values are: a changed schema_version is a checksum failure,
+        // not another version's file.
+        ("meta schema_version", "UPDATE meta SET v = zeroblob(8) WHERE k = 'schema_version'"),
+        ("meta ground", "UPDATE meta SET v = zeroblob(32) WHERE k = 'ground'"),
+        ("meta file (device and inode)", "UPDATE meta SET v = zeroblob(16) WHERE k = 'file'"),
+        ("meta derived_stale", "UPDATE meta SET v = x'01' WHERE k = 'derived_stale'"),
         ("meta fs_clock", "UPDATE meta SET v = zeroblob(16) WHERE k = 'fs_clock'"),
-        ("meta file", "UPDATE meta SET v = zeroblob(16) WHERE k = 'file'"),
     ];
     for (what, sql) in cases {
         let tmp = tempfile::tempdir().expect("tmp");
