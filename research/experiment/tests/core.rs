@@ -417,6 +417,32 @@ fn a_run_directory_too_long_for_its_sockets_is_refused_before_anything_is_made()
     assert!(!tmp.path().join("x").exists(), "nothing was made");
 }
 
+/// Decision `2e583e378924`: `run` takes any Claude Code version it is given, with no list of versions to refuse it
+/// by; the version is checked against the binary's own start event, turn by turn. Here an unseen one gets as far
+/// as reading the sign-in, which is missing, and nothing is made.
+#[test]
+fn run_takes_any_claude_code_version() {
+    let tmp = tempfile::tempdir().expect("a temp dir");
+    let out = Command::new(bin())
+        .arg("run")
+        .arg("--dir")
+        .arg(tmp.path().join("r"))
+        .args(["--mode", "bracken", "--agents", "1", "--turns", "1", "--claude-version", "2.1.999"])
+        .arg("--claude")
+        .arg(env!("CARGO_BIN_EXE_experiment-fake-claude"))
+        .arg("--settings")
+        .arg(tmp.path().join("missing-settings.json"))
+        .arg("--bracken")
+        .arg(bracken())
+        .output()
+        .expect("run runs");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(!stderr.contains("isn't a version"), "no version is refused as such: {stderr}");
+    assert!(stderr.contains("missing-settings.json"), "it stopped at the sign-in: {stderr}");
+    assert!(!tmp.path().join("r").exists(), "nothing was made");
+}
+
 /// The same gotcha: a bind or connect that the system refuses for the path's length says which path, how
 /// long it is and the most it may be; other errors name the path alone.
 #[test]

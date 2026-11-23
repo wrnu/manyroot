@@ -269,6 +269,9 @@ pub struct Pin {
 impl Pin {
     /// Pins the binary at `path` as it is now.
     pub fn of(path: &Path, version: &str) -> Result<Pin, String> {
+        if version.trim().is_empty() {
+            return Err("the pinned version is empty: give the binary's own version".into());
+        }
         let path = std::fs::canonicalize(path).map_err(|e| format!("resolving {}: {e}", path.display()))?;
         let install = path.parent().ok_or("the pinned binary has no directory")?.to_path_buf();
         Ok(Pin { blake3: file_hash(&path)?, path, install, version: version.into(), tree: false })
@@ -434,8 +437,9 @@ impl Launch {
 /// What the backend reads from a harness's event stream.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Event {
-    /// The first event, checked against the plan: why it doesn't match, if it doesn't.
-    Init(Result<(), String>),
+    /// The first event, checked against the plan: what of it the turn's gate record keeps (an object's fields, or
+    /// nothing), or why it doesn't match.
+    Init(Result<Value, String>),
     /// A model call as far as it has gone. Every event about one call repeats its usage so far.
     Message {
         id: String,
@@ -927,7 +931,11 @@ impl<H: Harness> HarnessBackend<H> {
                     Event::Init(v) => v,
                     _ => Err("the first event isn't init".into()),
                 };
-                self.record(json!({"agent": name, "turn": turn, "gate": verdict.is_ok()}));
+                let mut row = json!({"agent": name, "turn": turn, "gate": verdict.is_ok()});
+                if let (Ok(Value::Object(kept)), Some(row)) = (&verdict, row.as_object_mut()) {
+                    row.extend(kept.iter().map(|(k, v)| (k.clone(), v.clone())));
+                }
+                self.record(row);
                 if let Err(e) = verdict {
                     break End::Halt(format!("the gate refused {name}'s turn {turn}: {e}"));
                 }

@@ -483,7 +483,7 @@ impl Harness for Pi {
             return Err("an event that isn't JSON".into());
         };
         if first {
-            return Ok(Event::Init(Pi::gate(&event, turn)));
+            return Ok(Event::Init(Pi::gate(&event, turn).map(|()| Value::Null)));
         }
         match event["type"].as_str() {
             Some("message_end") if event["message"]["role"] == "assistant" => self.message(&event["message"]),
@@ -590,7 +590,7 @@ mod tests {
                 Ok(Event::Init(v)) => v,
                 other => panic!("not an init: {other:?}"),
             };
-            assert_eq!(gate(header("session", 3, t.home)), Ok(()));
+            assert_eq!(gate(header("session", 3, t.home)), Ok(Value::Null));
             assert_eq!(gate(header("agent_start", 3, t.home)), Err("the first event isn't the session header".into()));
             assert_eq!(gate(header("session", 4, t.home)), Err("the session header's version isn't 3".into()));
             assert_eq!(

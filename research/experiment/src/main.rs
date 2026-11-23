@@ -617,7 +617,7 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
     if a.prompt_file.is_some() {
         println!("the system prompt is from --prompt-file, not the reviewed prompts; the plan hashes it");
     }
-    let (mut expect, mut caps) = (Expect::pinned_2_1_311(&a.model), a.caps);
+    let (mut expect, mut caps) = (Expect::new(&a.model), a.caps);
     if let HarnessArgs::Claude { sign_in, budget, effort, .. } = &a.harness {
         expect.effort = effort.clone();
         // The $ stop was for API spend: a subscription's runs stop at the token, time and call caps unless one is
@@ -688,10 +688,10 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
         })
     };
     let outcome = match &a.harness {
-        HarnessArgs::Claude { binary, version, sign_in, effort, .. } => {
+        HarnessArgs::Claude { binary, version, sign_in, .. } => {
             let pin = Pin::of(binary, version)?;
-            // The start event its pinned version shows, and its sign-in, read now, into memory.
-            let expect = Expect::for_version(version, &expect.model, effort)?;
+            // Any version whose start event shows what the gate relies on (decision `2e583e378924`); its sign-in,
+            // read now, into memory.
             let sign_in = sign_in.read()?;
             let mut backend = ClaudeBackend::new(ClaudeConfig {
                 pin,
@@ -708,7 +708,19 @@ fn agent_run(a: AgentRun) -> Result<(), String> {
             if let Some(setting) = &setting {
                 backend.set_integrator(mode.name(), setting, a.agents)?;
             }
-            run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?
+            let outcome = run(&cfg(PlanInputs { harness: backend.harness_record().clone(), ..plan })?, &backend)?;
+            // What the start event showed, every turn alike: a change across runs shows before grading (finding
+            // `aaa686b72100`).
+            if let Some(seen) = backend.harness().start_event() {
+                let names = |s: &std::collections::BTreeSet<String>| s.iter().cloned().collect::<Vec<_>>().join(", ");
+                println!(
+                    "Claude Code {}'s start event, every turn: skills [{}]; plugins [{}]",
+                    seen.version,
+                    names(&seen.skills),
+                    names(&seen.plugins)
+                );
+            }
+            outcome
         }
         HarnessArgs::Pi { prefix, version, provider, .. } => {
             let credential = match provider {
