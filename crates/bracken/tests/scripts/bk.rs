@@ -888,6 +888,8 @@ if [ \"$1 $2 $3\" = 'id scope --help' ]; then \"$REAL_BRACKEN\" \"$@\" | grep -v
         for line in [
             format!("{{\"name\": \"builder-held\", \"agent\": \"{agent}\"}}\n"),
             format!("{{\"name\":\"other\",\"agent\":\"{agent}\"}}\n"),
+            // Uppercase hex, which the server's parser accepts too (finding 22a5baa0d27d).
+            format!("{{\"name\":\"other\",\"agent\":\"{}\"}}\n", agent.to_uppercase()),
         ] {
             let mut text = kept_list.clone();
             text.extend_from_slice(line.as_bytes());
@@ -897,9 +899,13 @@ if [ \"$1 $2 $3\" = 'id scope --help' ]; then \"$REAL_BRACKEN\" \"$@\" | grep -v
         }
         std::fs::write(&list, &kept_list).unwrap();
         let copy = team.join("keys/retired/other.json");
-        std::fs::copy(team.join("keys/builder-held.json"), &copy).unwrap();
-        let (text, said) = ready("builder-held");
-        assert!(!said && text.contains("retired: the server no longer signs for it"), "{scripts}: {text}");
+        let held = std::fs::read_to_string(team.join("keys/builder-held.json")).unwrap();
+        // The key file as it is, and with its public_key in uppercase hex.
+        for text in [held.clone(), held.replace(&agent, &agent.to_uppercase())] {
+            std::fs::write(&copy, &text).unwrap();
+            let (out, said) = ready("builder-held");
+            assert!(!said && out.contains("retired: the server no longer signs for it"), "{scripts}: {text}: {out}");
+        }
         std::fs::remove_file(&copy).unwrap();
         // A retired list the server can't read: it can't tell, so not ready.
         std::fs::write(&list, "not json\n").unwrap();

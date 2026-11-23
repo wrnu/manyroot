@@ -160,7 +160,9 @@ retired_by_key() {
     theirs+=$'\n'$(jq -r '.public_key' "$f" 2>/dev/null) ||
       { retired_err="$f doesn't read as a key file, so the server wouldn't start"; return 2; }
   done
-  [ -n "$(comm -12 <(grep -E '^[0-9a-f]{64}$' <<<"$ours" | sort -u) <(grep -E '^[0-9a-f]{64}$' <<<"$theirs" | sort -u))" ]
+  # Hex in either case, as the server's parser takes it (finding 22a5baa0d27d), compared lowercased.
+  hex_keys() { tr 'A-F' 'a-f' | grep -E '^[0-9a-f]{64}$' | sort -u; }
+  [ -n "$(comm -12 <(hex_keys <<<"$ours") <(hex_keys <<<"$theirs"))" ]
 }
 
 # What a builder writes (AGENTS.md, section 3), each of which the server must sign for an identity whose key
@@ -170,7 +172,7 @@ builder_writes=(
   --kind claim --kind relation --kind evidence
   --relation implements --relation supersedes --relation refines --relation contradicts
   --tag note --tag question --tag report --tag gotcha --tag process --tag misfire --tag finding
-  --tag pr --tag type:pr --tag pr:1 --tag branch:a --tag sha:0000000000000000000000000000000000000000
+  --tag pr --tag type:pr --tag pr:1 --tag branch:a --tag class:low --tag sha:0000000000000000000000000000000000000000
   --tag weave:0000000000000000000000000000000000000000000000000000000000000000
 )
 
