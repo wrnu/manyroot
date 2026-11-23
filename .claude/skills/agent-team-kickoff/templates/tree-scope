@@ -51,7 +51,9 @@
 # counts too.
 #   'tree-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, the committed pin
-#     .config/weave-root (docs/design/weave-marker.md, option A), and, as
+#     .config/weave-root (docs/design/weave-marker.md, option A), what else changes how crates/tree
+#     compiles with no change to those (finding 61094746cfa7): scripts/rustc-wrapper, crates/tree/build.rs,
+#     and a rust-toolchain or rust-toolchain.toml at the root, in crates/ or in crates/tree, and, as
 #     'tree-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
 #     crate the frozen formats rest on: unicode-normalization, icu_casemap, ciborium, blake3, imara-diff.
 #     merge asks for a current owner-review claim by manager naming the pr claim and the head.
@@ -139,6 +141,11 @@ frozen_mode() {
     crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's test and its pinned values" ;;
     crates/tree/tests/fixtures/*) echo "a Weave fixture" ;;
     .config/weave-root) echo "the Weave Ground's committed pin: its id, and the root whose marker counts" ;;
+    scripts/rustc-wrapper) echo "the rustc wrapper .cargo/config.toml runs for every compile, crates/tree's included" ;;
+    crates/tree/build.rs) echo "crates/tree's build script, which cargo builds and runs with no manifest change" ;;
+    rust-toolchain | rust-toolchain.toml | crates/rust-toolchain | crates/rust-toolchain.toml | \
+      crates/tree/rust-toolchain | crates/tree/rust-toolchain.toml)
+      echo "a toolchain pin rustup reads for a build of crates/tree" ;;
     *) return 1 ;;
   esac
 }
