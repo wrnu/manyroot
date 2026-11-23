@@ -1,71 +1,70 @@
-//! The index store (task `7d140f132b1a`, decision `f294933b4244`, [docs/design/index-store.md]): a local,
-//! derived, rebuildable SQLite database, `cache/index.sqlite` in WAL mode, holding what reads need:
-//! ids, kinds, authors, parents, heads, tags, references and the `--current` hidden set.
+//! The index store (task `7d140f132b1a`, decision `f294933b4244`): a local, derived, rebuildable
+//! SQLite database under `cache/`, in WAL mode, holding what reads need: ids, kinds, authors, the
+//! causal order, parents, children, heads, tags, references and the `--current` hidden set. The design,
+//! and the review findings it answers, is [docs/design/index-store.md]; section numbers below are its.
 //!
-//! **A cache, never the truth.** Everything in it is derived from `objects/`, and deleting it loses
-//! nothing: the next open rebuilds it. It has the snapshot's trust model (decision `96e282819607`, the
-//! header of [`crate::snapshot`]): it's this replica's own record of contributions its readers already
-//! verified, kept under `cache/`, which git ignores. Here every read still opens the store through the
-//! snapshot; the index is kept current beside it, and `BRACKEN_FULL_CHECK` compares its answers with
-//! the full recompute (see [`compare`]), the oracle, until reads are served from it.
+//! **A cache, never the truth.** Everything here is derived from `objects/`, and deleting it loses
+//! nothing. It has the snapshot's trust model (decision `96e282819607`, [`crate::snapshot`]'s header).
+//! In this step every read still opens the store through the snapshot; the index is kept current beside
+//! it, and `BRACKEN_FULL_CHECK` compares its answers with the full recompute ([`compare`]).
 //!
-//! **Freshness** (design section 5). Objects can arrive outside `bracken`: a git pull, a checkpoint,
-//! another tool, an older binary. Before the store lists `objects/`, [`Shards::take`] stats each shard
-//! directory (mtime, ctime, inode). A shard whose stamp differs from the one the index recorded is
-//! dirty: only dirty shards are diffed, the index's ids with that first byte against the store's.
-//! What the store holds and the index lacks is added; an indexed id whose object is gone means a
-//! rebuild. A stamp is recorded only from a stat taken before the listing it was reconciled with, and
-//! only once it is more than [`RACY_NS`] older than the clock (git's racy-index rule), so a file added
-//! in the same timestamp tick as the stat is never missed: the shard stays dirty and is diffed again.
+//! **Freshness** (section 5). [`Before::take`] reads the filesystem's clock (`cache/clock`'s mtime, *T*)
+//! and stats all 256 shards before anything lists `objects/`, the store's own open included. A shard is
+//! clean only if its recorded stamp still matches; dirty shards are diffed against the store's ids. A
+//! stamp is recorded only if it's more than [`RACY_NS`] older than *T*, only on allow-listed local
+//! filesystems, and only after its directory (and any objects found in it) were synced.
 //!
-//! **Writes.** An object is written (fsync and rename) before the index transaction commits. A crash in
-//! between leaves an object the index lacks in a shard whose stamp changed, so the next open adds it.
-//! The index never names an object that wasn't written.
+//! **Writes** (section 6). The store syncs an object and its shard directory before the index commits
+//! it, and the write's transaction deletes that shard's row, so the next open lists it again.
 //!
-//! **Rebuilds** happen in place, in one transaction, so concurrent readers never see a half-built
-//! index: on a schema version or ground mismatch, a missing parent, or an indexed object that's gone.
-//! Only a file SQLite can't open as a database is deleted and recreated. The database is opened with
-//! `SQLITE_OPEN_NOFOLLOW`, inside a `cache/` that [`crate::snapshot`]'s cache module refuses if it's a
-//! link.
+//! **Rebuilds** happen in place, in one transaction. A file SQLite calls corrupt, or one whose schema
+//! version doesn't match its name, is never touched again: the next generation's file is made beside it.
+//! Each schema version has its own files, so binaries of different versions never rebuild each other's.
+//!
+//! **Row checksums** (decision `c489f7f9dea9`): every row of every table carries `ck`, 8 bytes of blake3
+//! over its other fields. Every row this module reads is checked; a mismatch rebuilds the index.
 //!
 //! [docs/design/index-store.md]: ../../../docs/design/index-store.md
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use manyroot::{Body, BodyKind, Contribution, ContributionId, RelationKind, Store, Verdict};
-use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
-/// Bumped whenever the schema or what a row means changes; a mismatch means rebuild.
+/// Bumped whenever the schema or what a row means changes. Each version has its own files.
 pub const SCHEMA_VERSION: i64 = 1;
-const FILE: &str = "index.sqlite";
-/// How much older than the clock a shard's stamp must be before it's recorded (git's racy-index rule):
-/// covers coarse filesystem timestamps (1-2 s on some, a kernel tick on Linux).
+/// How much older than *T* a shard's stamp must be before it's recorded (git's racy-index rule).
 pub const RACY_NS: i128 = 2_000_000_000;
+const BUSY: Duration = Duration::from_secs(10);
 
 const SCHEMA: &str = "
-CREATE TABLE obj    (seq INTEGER PRIMARY KEY, id BLOB NOT NULL UNIQUE, kind INTEGER NOT NULL,
-                     author INTEGER NOT NULL, ts_ms INTEGER NOT NULL);
-CREATE TABLE agent  (n INTEGER PRIMARY KEY, key BLOB NOT NULL UNIQUE);
-CREATE TABLE parent (child INTEGER NOT NULL, parent INTEGER NOT NULL, PRIMARY KEY (child, parent)) WITHOUT ROWID;
-CREATE TABLE child  (parent INTEGER NOT NULL, child INTEGER NOT NULL, PRIMARY KEY (parent, child)) WITHOUT ROWID;
-CREATE TABLE head   (seq INTEGER PRIMARY KEY);
-CREATE TABLE tag    (tag TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (tag, seq)) WITHOUT ROWID;
-CREATE INDEX obj_kind   ON obj(kind, seq);
-CREATE INDEX obj_author ON obj(author, seq);
-CREATE TABLE ref    (target INTEGER NOT NULL, rkind INTEGER NOT NULL, src INTEGER NOT NULL,
+CREATE TABLE obj    (seq INTEGER PRIMARY KEY, pos INTEGER NOT NULL UNIQUE, id BLOB NOT NULL UNIQUE,
+                     kind INTEGER NOT NULL, author INTEGER NOT NULL, ts_key INTEGER NOT NULL, ck BLOB NOT NULL);
+CREATE TABLE agent  (n INTEGER PRIMARY KEY, key BLOB NOT NULL UNIQUE, ck BLOB NOT NULL);
+CREATE TABLE parent (child INTEGER NOT NULL, parent INTEGER NOT NULL, ck BLOB NOT NULL,
+                     PRIMARY KEY (child, parent)) WITHOUT ROWID;
+CREATE TABLE child  (parent INTEGER NOT NULL, child INTEGER NOT NULL, ck BLOB NOT NULL,
+                     PRIMARY KEY (parent, child)) WITHOUT ROWID;
+CREATE TABLE head   (seq INTEGER PRIMARY KEY, ck BLOB NOT NULL);
+CREATE TABLE tag    (tag TEXT NOT NULL, seq INTEGER NOT NULL, ck BLOB NOT NULL, PRIMARY KEY (tag, seq)) WITHOUT ROWID;
+CREATE INDEX obj_kind   ON obj(kind, pos);
+CREATE INDEX obj_author ON obj(author, pos);
+CREATE TABLE ref    (target INTEGER NOT NULL, rkind INTEGER NOT NULL, src INTEGER NOT NULL, ck BLOB NOT NULL,
                      PRIMARY KEY (target, rkind, src)) WITHOUT ROWID;
 CREATE TABLE fwd    (src_end INTEGER NOT NULL, rkind INTEGER NOT NULL, rel INTEGER NOT NULL,
-                     to_end INTEGER NOT NULL, PRIMARY KEY (src_end, rkind, rel)) WITHOUT ROWID;
-CREATE TABLE hidden (seq INTEGER PRIMARY KEY);
-CREATE TABLE shard  (n INTEGER PRIMARY KEY, mtime_ns INTEGER NOT NULL, ctime_ns INTEGER NOT NULL,
-                     ino INTEGER NOT NULL);
-CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL);
+                     to_end INTEGER NOT NULL, ck BLOB NOT NULL, PRIMARY KEY (src_end, rkind, rel)) WITHOUT ROWID;
+CREATE TABLE hidden (seq INTEGER PRIMARY KEY, ck BLOB NOT NULL);
+CREATE TABLE shard  (n INTEGER PRIMARY KEY, present INTEGER NOT NULL, mtime_s INTEGER, mtime_ns INTEGER,
+                     ctime_s INTEGER, ctime_ns INTEGER, ino BLOB, dev BLOB, ck BLOB NOT NULL);
+CREATE TABLE meta   (k TEXT PRIMARY KEY, v BLOB NOT NULL, ck BLOB NOT NULL);
 ";
-const TABLES: [&str; 12] =
-    ["obj", "agent", "parent", "child", "head", "tag", "ref", "fwd", "hidden", "shard", "meta", "sqlite_stat1"];
+const TABLES: [&str; 11] = ["obj", "agent", "parent", "child", "head", "tag", "ref", "fwd", "hidden", "shard", "meta"];
+
+// ---------------------------------------------------------------------------------------------------
+// Codes and checksums
 
 /// `obj.kind`.
 fn kind_code(k: BodyKind) -> i64 {
@@ -110,31 +109,120 @@ fn refs_of(c: &Contribution) -> Vec<(ContributionId, i64)> {
     }
 }
 
+/// `timestamp_ms` as an i64 that orders as the u64 does (section 4, Integer widths).
+pub fn ts_key(ms: u64) -> i64 {
+    (ms ^ (1 << 63)) as i64
+}
+
+/// A field of a row, for its checksum.
+#[derive(Clone, Copy)]
+enum F<'a> {
+    I(i64),
+    B(&'a [u8]),
+    N,
+}
+
+/// A row's checksum: the first 8 bytes of blake3 over its table's name and its fields, each tagged and
+/// length-framed, so no two rows of different content share an encoding.
+fn ck(table: &str, fields: &[F]) -> [u8; 8] {
+    let mut h = blake3::Hasher::new();
+    h.update(&(table.len() as u64).to_le_bytes());
+    h.update(table.as_bytes());
+    for f in fields {
+        match f {
+            F::I(i) => h.update(&[1]).update(&i.to_le_bytes()),
+            F::B(b) => h.update(&[2]).update(&(b.len() as u64).to_le_bytes()).update(b),
+            F::N => h.update(&[3]),
+        };
+    }
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    out
+}
+
+/// A row whose checksum doesn't match: the index is damaged and is rebuilt.
+#[derive(Debug)]
+pub struct Damaged(&'static str);
+
+impl std::fmt::Display for Damaged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "row checksum mismatch in the index's {} table", self.0)
+    }
+}
+
+impl std::error::Error for Damaged {}
+
+fn check(table: &'static str, fields: &[F], got: &[u8]) -> Result<()> {
+    if ck(table, fields)[..] != *got {
+        return Err(Damaged(table).into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Before: the clock and the shards' stamps, taken before any listing
+
 /// A shard directory's stamp: what changes when a file in it is added, renamed or removed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Stamp {
+    mtime_s: i64,
     mtime_ns: i64,
+    ctime_s: i64,
     ctime_ns: i64,
-    ino: i64,
+    ino: u64,
+    dev: u64,
 }
 
-/// `objects/`'s shard directories and their stamps, taken before the store lists them. A shard with no
-/// stamp (a non-Unix platform, or a stat that failed) is always dirty.
-#[derive(Clone, Debug, Default)]
-pub struct Shards(BTreeMap<u8, Option<Stamp>>);
+impl Stamp {
+    fn mtime(&self) -> i128 {
+        i128::from(self.mtime_s) * 1_000_000_000 + i128::from(self.mtime_ns)
+    }
+    fn ctime(&self) -> i128 {
+        i128::from(self.ctime_s) * 1_000_000_000 + i128::from(self.ctime_ns)
+    }
+}
 
-impl Shards {
-    pub fn take(dir: &Path) -> Shards {
-        let mut out = BTreeMap::new();
-        let Ok(entries) = std::fs::read_dir(dir.join("objects")) else { return Shards(out) };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(n) = name.to_str().filter(|s| s.len() == 2).and_then(|s| u8::from_str_radix(s, 16).ok()) else {
-                continue;
-            };
-            out.insert(n, stamp(&entry.path()));
-        }
-        Shards(out)
+/// One shard as step 2 saw it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seen {
+    Absent,
+    /// A directory, with its stamp if it could be taken.
+    Present(Option<Stamp>),
+}
+
+/// Steps 1 and 2 (section 5): *T*, if this filesystem's stamps can be trusted, then every shard's state,
+/// taken before anything lists `objects/`.
+#[derive(Clone, Debug)]
+pub struct Before {
+    clock: Option<i128>,
+    shards: Vec<Seen>,
+}
+
+impl Before {
+    pub fn take(dir: &Path) -> Before {
+        let clock = trusted_clock(dir);
+        let shards = (0..=255u8).map(|n| seen(&dir.join("objects").join(format!("{n:02x}")))).collect();
+        Before { clock, shards }
+    }
+
+    /// Stats only, no clock: for a refresh that records no stamps.
+    pub fn stats(dir: &Path) -> Before {
+        let shards = (0..=255u8).map(|n| seen(&dir.join("objects").join(format!("{n:02x}")))).collect();
+        Before { clock: None, shards }
+    }
+}
+
+/// *T*, the filesystem's clock, if stamps can be trusted here: Unix, `cache/clock` written, `cache/` and
+/// `objects/` on one device, of an allow-listed local filesystem type.
+fn trusted_clock(dir: &Path) -> Option<i128> {
+    let cache = crate::snapshot::cache::Cache::open(dir, true).ok()??;
+    let (t, dev) = cache.clock().ok()?;
+    let objects = dir.join("objects");
+    match stamp(&objects) {
+        Some(s) if s.dev == dev && local_filesystem(&objects) => Some(t),
+        // No objects/ yet: nothing to stamp but absences, which need no clock comparison.
+        None if std::fs::symlink_metadata(&objects).is_err() && local_filesystem(dir) => Some(t),
+        _ => None,
     }
 }
 
@@ -142,8 +230,14 @@ impl Shards {
 fn stamp(path: &Path) -> Option<Stamp> {
     use std::os::unix::fs::MetadataExt;
     let m = std::fs::symlink_metadata(path).ok().filter(|m| m.is_dir())?;
-    let ns = |s: i64, n: i64| s.checked_mul(1_000_000_000)?.checked_add(n);
-    Some(Stamp { mtime_ns: ns(m.mtime(), m.mtime_nsec())?, ctime_ns: ns(m.ctime(), m.ctime_nsec())?, ino: m.ino() as i64 })
+    Some(Stamp {
+        mtime_s: m.mtime(),
+        mtime_ns: m.mtime_nsec(),
+        ctime_s: m.ctime(),
+        ctime_ns: m.ctime_nsec(),
+        ino: m.ino(),
+        dev: m.dev(),
+    })
 }
 
 #[cfg(not(unix))]
@@ -151,8 +245,146 @@ fn stamp(_: &Path) -> Option<Stamp> {
     None
 }
 
-/// Whether to record the stamps taken before the store's listing. A refresh after a write doesn't:
-/// stamps taken then may cover objects other processes wrote that this store never listed.
+fn seen(path: &Path) -> Seen {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Seen::Absent,
+        _ => Seen::Present(stamp(path)),
+    }
+}
+
+/// Whether `path` is on a filesystem type whose directory times this design trusts (section 5): APFS,
+/// HFS+, ext4, xfs, btrfs, zfs, tmpfs.
+pub fn local_filesystem(path: &Path) -> bool {
+    filesystem_name(path).is_some_and(|name| allowed_filesystem(&name))
+}
+
+fn allowed_filesystem(name: &str) -> bool {
+    matches!(name, "apfs" | "hfs" | "ext4" | "xfs" | "btrfs" | "zfs" | "tmpfs")
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn filesystem_name(path: &Path) -> Option<String> {
+    let st = rustix::fs::statfs(path).ok()?;
+    let bytes: Vec<u8> = st.f_fstypename.iter().take_while(|c| **c != 0).map(|c| *c as u8).collect();
+    String::from_utf8(bytes).ok()
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_name(path: &Path) -> Option<String> {
+    let st = rustix::fs::statfs(path).ok()?;
+    #[allow(clippy::unnecessary_cast)]
+    let name = match st.f_type as i64 {
+        0xEF53 => "ext4",
+        0x5846_5342 => "xfs",
+        0x9123_683E => "btrfs",
+        0x2FC1_2FC1 => "zfs",
+        0x0102_1994 => "tmpfs",
+        _ => return None,
+    };
+    Some(name.to_owned())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
+fn filesystem_name(_: &Path) -> Option<String> {
+    None
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Files and connections
+
+/// Whether this process may use the index here (section 5, Opens that can't write): only where it can
+/// write `cache/` (or create it).
+pub fn usable(dir: &Path) -> bool {
+    let cache = dir.join("cache");
+    let target = if std::fs::symlink_metadata(&cache).is_ok() { cache } else { dir.to_owned() };
+    writable(&target)
+}
+
+#[cfg(unix)]
+fn writable(path: &Path) -> bool {
+    rustix::fs::access(path, rustix::fs::Access::WRITE_OK).is_ok()
+}
+
+#[cfg(not(unix))]
+fn writable(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| !m.permissions().readonly())
+}
+
+fn file_name(generation: u64) -> String {
+    format!("index-v{SCHEMA_VERSION}-{generation}.sqlite")
+}
+
+/// The highest generation of this schema version's files in `cache/`, if any.
+fn current_generation(cache: &Path) -> Option<u64> {
+    let prefix = format!("index-v{SCHEMA_VERSION}-");
+    std::fs::read_dir(cache)
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let g = name.strip_prefix(&prefix)?.strip_suffix(".sqlite")?;
+            if g.is_empty() || !g.bytes().all(|b| b.is_ascii_digit()) || g.starts_with('0') {
+                return None;
+            }
+            g.parse::<u64>().ok()
+        })
+        .max()
+}
+
+/// The canonical `cache/` (macOS's `/var` and `/tmp` are links, and `SQLITE_OPEN_NOFOLLOW` refuses a link
+/// anywhere in the path), made first if missing, with its `.gitignore`, and refused if it's a link.
+fn cache_dir(dir: &Path) -> Result<PathBuf> {
+    crate::snapshot::cache::Cache::open(dir, true).context("opening cache/")?.context("no cache/ was made")?;
+    let cache = std::fs::canonicalize(dir.join("cache")).context("resolving cache/")?;
+    Ok(cache)
+}
+
+/// The index's current file, for tests.
+#[cfg(test)]
+pub fn path(dir: &Path) -> Result<PathBuf> {
+    let cache = cache_dir(dir)?;
+    Ok(cache.join(file_name(current_generation(&cache).unwrap_or(1))))
+}
+
+fn open_db(path: &Path, busy: Duration) -> rusqlite::Result<Connection> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
+        | OpenFlags::SQLITE_OPEN_CREATE
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let conn = Connection::open_with_flags(path, flags)?;
+    conn.busy_timeout(busy)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "cell_size_check", "ON")?;
+    Ok(conn)
+}
+
+/// SQLite saying the file isn't a sound database: a new generation (section 6, Rebuilds).
+fn is_damage(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<rusqlite::Error>().is_some_and(|e| {
+            matches!(e.sqlite_error_code(), Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase))
+        }) || c.downcast_ref::<WrongVersion>().is_some()
+    })
+}
+
+/// A file whose `schema_version` disagrees with its name: damage, so a new generation.
+#[derive(Debug)]
+struct WrongVersion;
+
+impl std::fmt::Display for WrongVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the index file's schema version doesn't match its name")
+    }
+}
+
+impl std::error::Error for WrongVersion {}
+
+// ---------------------------------------------------------------------------------------------------
+// Refresh
+
+/// Whether to record the stamps of `Before`. A write's own refresh doesn't: it runs after the write's
+/// rename, and stamps taken then could cover other processes' objects that this store never listed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Record {
     Yes,
@@ -163,247 +395,503 @@ pub enum Record {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
     pub rebuilt: bool,
+    pub new_generation: bool,
     pub dirty_shards: usize,
     pub added: usize,
+    pub recorded: usize,
+    pub synced: usize,
 }
 
-fn index_path(dir: &Path) -> PathBuf {
-    dir.join("cache").join(FILE)
+/// Knobs the tests turn.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Options {
+    pub racy_ns: i128,
+    pub busy: Duration,
 }
 
-fn open_db(path: &Path) -> rusqlite::Result<Connection> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
-        | OpenFlags::SQLITE_OPEN_CREATE
-        | OpenFlags::SQLITE_OPEN_NO_MUTEX
-        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let conn = Connection::open_with_flags(path, flags)?;
-    conn.busy_timeout(std::time::Duration::from_secs(10))?;
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "synchronous", "NORMAL")?;
-    Ok(conn)
-}
-
-/// Whether an error says the file isn't a usable database, so it should be replaced.
-fn is_damage(e: &rusqlite::Error) -> bool {
-    matches!(e.sqlite_error_code(), Some(ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase | ErrorCode::CannotOpen))
-}
-
-/// Opens the index under `dir/cache`, making `cache/` (refused if it's a link) and the file if missing.
-/// A file SQLite can't use as a database is deleted with its WAL and shared-memory files and made anew.
-fn connect(dir: &Path) -> Result<Connection> {
-    crate::snapshot::cache::Cache::open(dir, true).context("opening cache/")?.context("no cache/ was made")?;
-    let path = index_path(dir);
-    let probe = |path: &Path| -> rusqlite::Result<Connection> {
-        let conn = open_db(path)?;
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))?;
-        Ok(conn)
-    };
-    match probe(&path) {
-        Ok(conn) => Ok(conn),
-        Err(e) if is_damage(&e) => {
-            for suffix in ["", "-wal", "-shm"] {
-                let p = PathBuf::from(format!("{}{suffix}", path.display()));
-                match std::fs::remove_file(&p) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e).with_context(|| format!("removing {}", p.display())),
-                }
-            }
-            probe(&path).with_context(|| format!("recreating {}", path.display()))
-        }
-        Err(e) => Err(e).with_context(|| format!("opening {}", path.display())),
+impl Default for Options {
+    fn default() -> Options {
+        Options { racy_ns: RACY_NS, busy: BUSY }
     }
 }
 
 /// Keeps the index current with `store`, which was opened after `before` was taken: built on first use,
-/// rebuilt on a mismatch or damage, otherwise only dirty shards reconciled. Callers treat a failure as a
-/// cache that's only slower next time.
-pub fn refresh(dir: &Path, store: &Store, before: &Shards, record: Record) -> Result<Outcome> {
-    refresh_with(dir, store, before, record, RACY_NS)
+/// rebuilt in place on a mismatch, moved to a new generation on damage, otherwise only dirty shards
+/// reconciled. A failure (a lock not granted in time, say) leaves the index for a later command: the
+/// caller reads through the full path either way.
+pub fn refresh(dir: &Path, store: &Store, before: &Before, record: Record) -> Result<Outcome> {
+    refresh_with(dir, store, before, record, Options::default())
 }
 
-pub(crate) fn refresh_with(dir: &Path, store: &Store, before: &Shards, record: Record, racy_ns: i128) -> Result<Outcome> {
-    let mut conn = connect(dir)?;
+pub(crate) fn refresh_with(
+    dir: &Path,
+    store: &Store,
+    before: &Before,
+    record: Record,
+    opts: Options,
+) -> Result<Outcome> {
+    let cache = cache_dir(dir)?;
+    let generation = current_generation(&cache).unwrap_or(1);
+    match refresh_file(dir, &cache.join(file_name(generation)), store, before, record, opts) {
+        Err(e) if is_damage(&e) => {
+            let next = cache.join(file_name(generation + 1));
+            let mut outcome = refresh_file(dir, &next, store, before, record, opts)?;
+            outcome.new_generation = true;
+            Ok(outcome)
+        }
+        other => other,
+    }
+}
+
+fn refresh_file(
+    dir: &Path,
+    path: &Path,
+    store: &Store,
+    before: &Before,
+    record: Record,
+    opts: Options,
+) -> Result<Outcome> {
+    let mut conn = open_db(path, opts.busy)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let outcome = match reconcile(&tx, store, before, record, racy_ns) {
+    let outcome = match reconcile(&tx, dir, path, store, before, record, opts) {
         Ok(outcome) => outcome,
-        Err(Needs::Rebuild) => {
-            rebuild_in(&tx, store, before, racy_ns)?;
-            Outcome { rebuilt: true, dirty_shards: before.0.len(), added: store.graph().len() }
-        }
-        Err(Needs::Error(e)) if e.downcast_ref::<rusqlite::Error>().is_some_and(is_damage) => {
-            drop(tx);
-            drop(conn);
-            return rebuild(dir, store, before).map(|()| Outcome {
-                rebuilt: true,
-                dirty_shards: before.0.len(),
-                added: store.graph().len(),
-            });
-        }
+        Err(Needs::Rebuild | Needs::Damaged(_)) => rebuild_in(&tx, dir, path, store, before, record, opts)?,
         Err(Needs::Error(e)) => return Err(e),
     };
     tx.commit()?;
     Ok(outcome)
 }
 
-/// `bracken verify`: the index rebuilt whole from `store`, a full open made after `before` was taken.
-pub fn rebuild(dir: &Path, store: &Store, before: &Shards) -> Result<()> {
-    let mut conn = connect(dir)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    rebuild_in(&tx, store, before, RACY_NS)?;
-    tx.commit()?;
-    let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
-    if integrity != "ok" {
-        bail!("the index failed SQLite's quick_check after a rebuild: {integrity}");
+/// `bracken verify`: the index rebuilt whole from `store`, a full open made after `before` was taken,
+/// then SQLite's `quick_check` (section 6, Integrity checks).
+pub fn rebuild(dir: &Path, store: &Store, before: &Before) -> Result<()> {
+    let cache = cache_dir(dir)?;
+    let generation = current_generation(&cache).unwrap_or(1);
+    let attempt = |path: &Path| -> Result<()> {
+        let mut conn = open_db(path, BUSY)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        rebuild_in(&tx, dir, path, store, before, Record::Yes, Options::default())?;
+        tx.commit()?;
+        let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+        if integrity != "ok" {
+            bail!("the index failed SQLite's quick_check after a rebuild: {integrity}");
+        }
+        Ok(())
+    };
+    match attempt(&cache.join(file_name(generation))) {
+        Err(e) if is_damage(&e) => attempt(&cache.join(file_name(generation + 1))),
+        other => other,
     }
-    Ok(())
 }
 
 enum Needs {
+    /// A mismatch or a missing contribution: rebuild in place.
     Rebuild,
+    /// A row whose checksum doesn't match: rebuild in place too, but the full check reports it.
+    Damaged(anyhow::Error),
     Error(anyhow::Error),
 }
 
 impl<E: Into<anyhow::Error>> From<E> for Needs {
     fn from(e: E) -> Needs {
-        Needs::Error(e.into())
+        let e = e.into();
+        if e.downcast_ref::<Damaged>().is_some() { Needs::Damaged(e) } else { Needs::Error(e) }
     }
 }
 
-fn meta(tx: &Connection, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
-    tx.query_row("SELECT v FROM meta WHERE k = ?1", [key], |r| r.get(0)).optional()
+/// `meta` as read, every row's checksum checked.
+fn read_meta(conn: &Connection) -> Result<HashMap<String, Vec<u8>>> {
+    let mut st = conn.prepare("SELECT k, v, ck FROM meta")?;
+    let mut out = HashMap::new();
+    for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)))? {
+        let (k, v, c) = row?;
+        check("meta", &[F::B(k.as_bytes()), F::B(&v)], &c)?;
+        out.insert(k, v);
+    }
+    Ok(out)
 }
 
-fn has_schema(tx: &Connection) -> rusqlite::Result<bool> {
-    tx.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'", [], |r| r.get::<_, i64>(0))
-        .map(|n| n > 0)
+fn put_meta(conn: &Connection, k: &str, v: &[u8]) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta VALUES (?1, ?2, ?3)",
+        params![k, v, &ck("meta", &[F::B(k.as_bytes()), F::B(v)])[..]],
+    )?;
+    Ok(())
 }
 
-/// Brings an index of the right version and ground up to date, or says it needs a rebuild.
-fn reconcile(tx: &Transaction, store: &Store, before: &Shards, record: Record, racy_ns: i128) -> Result<Outcome, Needs> {
+fn has_schema(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n > 0)
+}
+
+/// The device and inode of the index file itself (section 7, Bound to its own file).
+fn file_identity(path: &Path) -> Vec<u8> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(m) = std::fs::symlink_metadata(path) {
+            return [m.dev().to_be_bytes(), m.ino().to_be_bytes()].concat();
+        }
+    }
+    let _ = path;
+    Vec::new()
+}
+
+fn clock_bytes(t: i128) -> Vec<u8> {
+    t.to_be_bytes().to_vec()
+}
+
+fn clock_of(v: &[u8]) -> Option<i128> {
+    Some(i128::from_be_bytes(v.try_into().ok()?))
+}
+
+/// A shard row as recorded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Row {
+    Absent,
+    Present(Stamp),
+}
+
+fn read_shards(conn: &Connection) -> Result<BTreeMap<u8, Row>> {
+    let mut st = conn.prepare("SELECT n, present, mtime_s, mtime_ns, ctime_s, ctime_ns, ino, dev, ck FROM shard")?;
+    let mut out = BTreeMap::new();
+    let rows = st.query_map([], |r| {
+        Ok((
+            r.get::<_, i64>(0)?,
+            r.get::<_, i64>(1)?,
+            r.get::<_, Option<i64>>(2)?,
+            r.get::<_, Option<i64>>(3)?,
+            r.get::<_, Option<i64>>(4)?,
+            r.get::<_, Option<i64>>(5)?,
+            r.get::<_, Option<Vec<u8>>>(6)?,
+            r.get::<_, Option<Vec<u8>>>(7)?,
+            r.get::<_, Vec<u8>>(8)?,
+        ))
+    })?;
+    for row in rows {
+        let (n, present, ms, mn, cs, cn, ino, dev, c) = row?;
+        fn opt(x: Option<i64>) -> F<'static> {
+            x.map_or(F::N, F::I)
+        }
+        fn optb(x: &Option<Vec<u8>>) -> F<'_> {
+            x.as_deref().map_or(F::N, F::B)
+        }
+        check("shard", &[F::I(n), F::I(present), opt(ms), opt(mn), opt(cs), opt(cn), optb(&ino), optb(&dev)], &c)?;
+        let n = u8::try_from(n).map_err(|_| Damaged("shard"))?;
+        let row = match (present, ms, mn, cs, cn, ino, dev) {
+            (0, ..) => Row::Absent,
+            (1, Some(mtime_s), Some(mtime_ns), Some(ctime_s), Some(ctime_ns), Some(ino), Some(dev)) => {
+                let u =
+                    |b: Vec<u8>| -> Result<u64> { Ok(u64::from_be_bytes(b.try_into().map_err(|_| Damaged("shard"))?)) };
+                Row::Present(Stamp { mtime_s, mtime_ns, ctime_s, ctime_ns, ino: u(ino)?, dev: u(dev)? })
+            }
+            _ => return Err(Damaged("shard").into()),
+        };
+        out.insert(n, row);
+    }
+    Ok(out)
+}
+
+fn put_shard(conn: &Connection, n: u8, row: Row) -> rusqlite::Result<()> {
+    let n = i64::from(n);
+    match row {
+        Row::Absent => conn.execute(
+            "INSERT OR REPLACE INTO shard VALUES (?1, 0, NULL, NULL, NULL, NULL, NULL, NULL, ?2)",
+            params![n, &ck("shard", &[F::I(n), F::I(0), F::N, F::N, F::N, F::N, F::N, F::N])[..]],
+        )?,
+        Row::Present(s) => {
+            let (ino, dev) = (s.ino.to_be_bytes(), s.dev.to_be_bytes());
+            let c = ck(
+                "shard",
+                &[
+                    F::I(n),
+                    F::I(1),
+                    F::I(s.mtime_s),
+                    F::I(s.mtime_ns),
+                    F::I(s.ctime_s),
+                    F::I(s.ctime_ns),
+                    F::B(&ino),
+                    F::B(&dev),
+                ],
+            );
+            conn.execute(
+                "INSERT OR REPLACE INTO shard VALUES (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![n, s.mtime_s, s.mtime_ns, s.ctime_s, s.ctime_ns, &ino[..], &dev[..], &c[..]],
+            )?
+        }
+    };
+    Ok(())
+}
+
+/// An `obj` row, checked.
+#[derive(Clone, Debug)]
+struct ObjRow {
+    seq: i64,
+    pos: i64,
+    id: [u8; 32],
+    kind: i64,
+    author: i64,
+    ts_key: i64,
+}
+
+impl ObjRow {
+    fn ck(&self) -> [u8; 8] {
+        ck(
+            "obj",
+            &[F::I(self.seq), F::I(self.pos), F::B(&self.id), F::I(self.kind), F::I(self.author), F::I(self.ts_key)],
+        )
+    }
+}
+
+const OBJ_COLUMNS: &str = "seq, pos, id, kind, author, ts_key, ck";
+
+fn obj_row(r: &rusqlite::Row) -> rusqlite::Result<(ObjRow, Vec<u8>)> {
+    let id: Vec<u8> = r.get(2)?;
+    let id = <[u8; 32]>::try_from(id)
+        .map_err(|_| rusqlite::Error::InvalidColumnType(2, "id".into(), rusqlite::types::Type::Blob))?;
+    Ok((
+        ObjRow { seq: r.get(0)?, pos: r.get(1)?, id, kind: r.get(3)?, author: r.get(4)?, ts_key: r.get(5)? },
+        r.get(6)?,
+    ))
+}
+
+fn checked(row: (ObjRow, Vec<u8>)) -> Result<ObjRow> {
+    if row.0.ck()[..] != *row.1 {
+        return Err(Damaged("obj").into());
+    }
+    Ok(row.0)
+}
+
+/// The indexed ids whose first byte is `n`, each row checked, its id checked against the range asked for.
+fn ids_in_shard(conn: &Connection, n: u8) -> Result<HashSet<ContributionId>> {
+    let lo = [n];
+    let rows: Vec<(ObjRow, Vec<u8>)> = if n == u8::MAX {
+        let mut st = conn.prepare_cached(&format!("SELECT {OBJ_COLUMNS} FROM obj WHERE id >= ?1"))?;
+        st.query_map([&lo[..]], obj_row)?.collect::<rusqlite::Result<_>>()?
+    } else {
+        let hi = [n + 1];
+        let mut st = conn.prepare_cached(&format!("SELECT {OBJ_COLUMNS} FROM obj WHERE id >= ?1 AND id < ?2"))?;
+        st.query_map([&lo[..], &hi[..]], obj_row)?.collect::<rusqlite::Result<_>>()?
+    };
+    let mut out = HashSet::new();
+    for row in rows {
+        let row = checked(row)?;
+        if row.id[0] != n {
+            return Err(Damaged("obj").into());
+        }
+        out.insert(ContributionId(row.id));
+    }
+    Ok(out)
+}
+
+fn object_path(dir: &Path, id: &ContributionId) -> PathBuf {
+    let hex = id.to_hex();
+    dir.join("objects").join(&hex[..2]).join(&hex[2..])
+}
+
+fn object_exists(dir: &Path, id: &ContributionId) -> bool {
+    std::fs::symlink_metadata(object_path(dir, id)).is_ok_and(|m| m.is_file())
+}
+
+/// Brings an index of the right version, ground and file up to date (section 5 steps 3-6), or says it
+/// needs a rebuild.
+fn reconcile(
+    tx: &Connection,
+    dir: &Path,
+    path: &Path,
+    store: &Store,
+    before: &Before,
+    record: Record,
+    opts: Options,
+) -> Result<Outcome, Needs> {
     if !has_schema(tx)? {
         return Err(Needs::Rebuild);
     }
-    let version = meta(tx, "schema_version")?;
-    let ground = meta(tx, "ground")?;
-    if version.as_deref() != Some(&SCHEMA_VERSION.to_le_bytes()[..])
-        || ground.as_deref() != Some(&store.info().ground.as_bytes()[..])
+    let meta = read_meta(tx)?;
+    if meta.get("schema_version").map(Vec::as_slice) != Some(&SCHEMA_VERSION.to_le_bytes()[..]) {
+        return Err(Needs::Error(WrongVersion.into()));
+    }
+    if meta.get("ground").map(Vec::as_slice) != Some(&store.info().ground.as_bytes()[..])
+        || meta.get("file").map(Vec::as_slice) != Some(&file_identity(path)[..])
     {
         return Err(Needs::Rebuild);
     }
-    let recorded = recorded_stamps(tx)?;
-    let dirty: BTreeSet<u8> = before
-        .0
-        .iter()
-        .filter(|(n, s)| s.is_none() || recorded.get(n) != Some(*s))
-        .map(|(n, _)| *n)
-        .chain(recorded.keys().filter(|n| !before.0.contains_key(n)).copied())
+    let recorded_clock = meta.get("fs_clock").and_then(|v| clock_of(v));
+    let mut rows = read_shards(tx)?;
+
+    // Step 3: a clock that stepped back makes every shard dirty, before any stamp is compared. A later
+    // clock recorded by a concurrent refresh isn't a step back: the clock is read again, under the lock.
+    let mut stepped_back = false;
+    if let (Some(t), Some(f)) = (before.clock, recorded_clock)
+        && t < f
+    {
+        let now = trusted_clock(dir);
+        if now.is_none_or(|now| now < f) {
+            stepped_back = true;
+            tx.execute("DELETE FROM shard", [])?;
+            rows.clear();
+        }
+    }
+    let dirty: Vec<u8> = (0..=255u8)
+        .filter(|n| {
+            let clean = match (rows.get(n), before.shards[usize::from(*n)]) {
+                (Some(Row::Absent), Seen::Absent) => true,
+                (Some(Row::Present(r)), Seen::Present(Some(s))) => *r == s,
+                _ => false,
+            };
+            stepped_back || !clean
+        })
         .collect();
+
+    // Step 4: diff each dirty shard against the store's ids (the store listed and checked every object,
+    // after `before`).
     let g = store.graph();
     let mut added: Vec<ContributionId> = Vec::new();
+    let mut added_shards: BTreeSet<u8> = BTreeSet::new();
     if !dirty.is_empty() {
-        let mut in_graph: HashMap<u8, HashSet<ContributionId>> = dirty.iter().map(|n| (*n, HashSet::new())).collect();
+        let wanted: HashSet<u8> = dirty.iter().copied().collect();
+        let mut in_graph: HashMap<u8, HashSet<ContributionId>> = HashMap::new();
         for c in g.iter() {
-            if let Some(set) = in_graph.get_mut(&c.id().as_bytes()[0]) {
-                set.insert(c.id());
+            let n = c.id().as_bytes()[0];
+            if wanted.contains(&n) {
+                in_graph.entry(n).or_default().insert(c.id());
             }
         }
+        let empty = HashSet::new();
         for n in &dirty {
             let indexed = ids_in_shard(tx, *n)?;
+            let listed = in_graph.get(n).unwrap_or(&empty);
             for id in &indexed {
                 // Indexed but not in this store: newer than this store's listing if its object is there,
-                // gone (a checkout that went back) if not.
-                if !in_graph[n].contains(id) && !object_exists(store.dir(), id) {
+                // gone (a checkout that went back, a shard removed whole) if not.
+                if !listed.contains(id) && !object_exists(dir, id) {
                     return Err(Needs::Rebuild);
                 }
             }
-            added.extend(in_graph[n].iter().filter(|id| !indexed.contains(id)));
+            let new: Vec<ContributionId> = listed.iter().filter(|id| !indexed.contains(id)).copied().collect();
+            if !new.is_empty() {
+                added_shards.insert(*n);
+            }
+            added.extend(new);
         }
     }
-    let added_count = added.len();
+
+    let mut outcome = Outcome { dirty_shards: dirty.len(), added: added.len(), ..Outcome::default() };
+
+    // Step 5: what freshness found is made durable before it's committed (a write's own objects were
+    // synced by the store).
+    let mut to_sync: Vec<PathBuf> = Vec::new();
+    if record == Record::Yes {
+        to_sync.extend(added.iter().map(|id| object_path(dir, id)));
+        for n in &added_shards {
+            to_sync.push(dir.join("objects").join(format!("{n:02x}")));
+            if !matches!(rows.get(n), Some(Row::Present(_))) {
+                to_sync.push(dir.join("objects"));
+            }
+        }
+    }
+
     if !added.is_empty() {
-        let wanted: HashSet<ContributionId> = added.into_iter().collect();
-        let order: Vec<ContributionId> = g.topo_order().into_iter().filter(|id| wanted.contains(id)).collect();
+        let wanted: HashSet<ContributionId> = added.iter().copied().collect();
+        let order = g.topo_order();
         let mut ins = Inserter::new(tx)?;
-        for id in &order {
+        for id in order.iter().filter(|id| wanted.contains(id)) {
             if !ins.insert(g.get(id).expect("ordered ids exist"))? {
                 return Err(Needs::Rebuild);
             }
         }
-        tx.execute("INSERT OR REPLACE INTO meta VALUES ('hidden_stale', 1)", [])?;
+        put_meta(tx, "derived_stale", &[1])?;
     }
-    // The hidden set is recomputed whole from this store, and only when the index holds exactly what the
-    // store holds; otherwise it's left marked stale for a later refresh.
-    let stale = meta(tx, "hidden_stale")?.is_some_and(|v| v != [0]);
+    let stale = meta.get("derived_stale").is_some_and(|v| v != &[0]) || !added.is_empty();
     if stale && count(tx)? == g.len() as i64 {
+        write_order(tx, store)?;
         write_hidden(tx, store)?;
+        put_meta(tx, "derived_stale", &[0])?;
     }
-    if record == Record::Yes {
-        record_stamps(tx, before, &dirty, racy_ns)?;
-    }
-    Ok(Outcome { rebuilt: false, dirty_shards: dirty.len(), added: added_count })
-}
 
-fn count(tx: &Connection) -> rusqlite::Result<i64> {
-    tx.query_row("SELECT coalesce(max(seq) + 1, 0) FROM obj", [], |r| r.get(0))
-}
-
-fn object_exists(dir: &Path, id: &ContributionId) -> bool {
-    let hex = id.to_hex();
-    std::fs::symlink_metadata(dir.join("objects").join(&hex[..2]).join(&hex[2..])).is_ok_and(|m| m.is_file())
-}
-
-fn recorded_stamps(tx: &Connection) -> rusqlite::Result<BTreeMap<u8, Stamp>> {
-    let mut st = tx.prepare("SELECT n, mtime_ns, ctime_ns, ino FROM shard")?;
-    let rows = st.query_map([], |r| {
-        Ok((r.get::<_, u8>(0)?, Stamp { mtime_ns: r.get(1)?, ctime_ns: r.get(2)?, ino: r.get(3)? }))
-    })?;
-    rows.collect()
-}
-
-fn now_ns() -> i128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as i128).unwrap_or(0)
-}
-
-/// Records each reconciled shard's stamp from `before`, unless it's too recent to trust (it stays dirty).
-fn record_stamps(tx: &Connection, before: &Shards, reconciled: &BTreeSet<u8>, racy_ns: i128) -> rusqlite::Result<()> {
-    let cutoff = now_ns() - racy_ns;
-    for n in reconciled {
-        tx.execute("DELETE FROM shard WHERE n = ?1", [n])?;
-        if let Some(Some(s)) = before.0.get(n)
-            && (s.mtime_ns as i128) < cutoff
-            && (s.ctime_ns as i128) < cutoff
-        {
-            tx.execute("INSERT INTO shard VALUES (?1, ?2, ?3, ?4)", params![n, s.mtime_ns, s.ctime_ns, s.ino])?;
+    // Step 6: stamps, recorded only from `before`, only if older than T by the margin, only once their
+    // directories are synced. A write's refresh records nothing and leaves its shards without a row.
+    match record {
+        Record::Yes => {
+            for n in &dirty {
+                tx.execute("DELETE FROM shard WHERE n = ?1", [i64::from(*n)])?;
+            }
+            if let Some(t) = before.clock {
+                for n in &dirty {
+                    match before.shards[usize::from(*n)] {
+                        Seen::Absent => {
+                            put_shard(tx, *n, Row::Absent)?;
+                            outcome.recorded += 1;
+                        }
+                        Seen::Present(Some(s)) if s.mtime() < t - opts.racy_ns && s.ctime() < t - opts.racy_ns => {
+                            put_shard(tx, *n, Row::Present(s))?;
+                            to_sync.push(dir.join("objects").join(format!("{n:02x}")));
+                            outcome.recorded += 1;
+                        }
+                        Seen::Present(_) => {}
+                    }
+                }
+                let keep = recorded_clock.filter(|f| !stepped_back && *f > t).unwrap_or(t);
+                put_meta(tx, "fs_clock", &clock_bytes(keep))?;
+            }
+        }
+        Record::No => {
+            for n in &added_shards {
+                tx.execute("DELETE FROM shard WHERE n = ?1", [i64::from(*n)])?;
+            }
         }
     }
-    Ok(())
+    outcome.synced = durable(&to_sync).map_err(|e| Needs::Error(e.context("syncing objects/")))?;
+    Ok(outcome)
 }
 
-fn ids_in_shard(tx: &Connection, n: u8) -> rusqlite::Result<HashSet<ContributionId>> {
-    let lo = [n];
-    let mut st = if n == u8::MAX {
-        tx.prepare_cached("SELECT id FROM obj WHERE id >= ?1")?
-    } else {
-        tx.prepare_cached("SELECT id FROM obj WHERE id >= ?1 AND id < ?2")?
-    };
-    let hi = [n.wrapping_add(1)];
-    let map = |r: &rusqlite::Row| r.get::<_, Vec<u8>>(0);
-    let rows: Vec<Vec<u8>> = if n == u8::MAX {
-        st.query_map([&lo[..]], map)?.collect::<rusqlite::Result<_>>()?
-    } else {
-        st.query_map([&lo[..], &hi[..]], map)?.collect::<rusqlite::Result<_>>()?
-    };
-    Ok(rows.into_iter().filter_map(|b| <[u8; 32]>::try_from(b).ok().map(ContributionId)).collect())
+/// Makes `paths` (object files and directories under `objects/`) durable: `fsync` on each, then on
+/// macOS one `F_FULLFSYNC`, which flushes the drive's cache for everything before it. Returns how many
+/// were synced.
+fn durable(paths: &[PathBuf]) -> Result<usize> {
+    let unique: BTreeSet<&PathBuf> = paths.iter().collect();
+    #[cfg(test)]
+    tests::SYNCED.with(|s| s.borrow_mut().extend(unique.iter().map(|p| (*p).clone())));
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags};
+        let mut last = None;
+        for p in &unique {
+            let fd = rustix::fs::open(*p, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+                .with_context(|| format!("opening {} to sync it", p.display()))?;
+            rustix::fs::fsync(&fd).with_context(|| format!("syncing {}", p.display()))?;
+            last = Some(fd);
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(fd) = &last {
+            rustix::fs::fcntl_fullfsync(fd).context("F_FULLFSYNC")?;
+        }
+        let _ = last;
+    }
+    Ok(unique.len())
 }
 
-/// Empties the index and fills it from `store`, inside `tx`: concurrent readers see the old index or
-/// the new one, never a half-built one.
-fn rebuild_in(tx: &Transaction, store: &Store, before: &Shards, racy_ns: i128) -> Result<()> {
+fn count(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row("SELECT coalesce(max(seq) + 1, 0) FROM obj", [], |r| r.get(0))
+}
+
+/// Empties the index and fills it from `store` inside the caller's transaction (section 6, Rebuilds):
+/// concurrent readers see the old index or the new one. Stamps are recorded from `before`, as step 6 says;
+/// what a rebuild syncs is the shard directories whose stamps it records, not every object file.
+fn rebuild_in(
+    tx: &Connection,
+    dir: &Path,
+    path: &Path,
+    store: &Store,
+    before: &Before,
+    record: Record,
+    opts: Options,
+) -> Result<Outcome> {
     for table in TABLES {
         tx.execute_batch(&format!("DROP TABLE IF EXISTS {table}"))?;
     }
-    tx.execute_batch("DROP INDEX IF EXISTS obj_kind; DROP INDEX IF EXISTS obj_author;")?;
     tx.execute_batch(SCHEMA)?;
     let g = store.graph();
     {
@@ -413,53 +901,144 @@ fn rebuild_in(tx: &Transaction, store: &Store, before: &Shards, racy_ns: i128) -
             assert!(inserted, "topological order puts parents first");
         }
     }
-    tx.execute("INSERT INTO meta VALUES ('schema_version', ?1)", [&SCHEMA_VERSION.to_le_bytes()[..]])?;
-    tx.execute("INSERT INTO meta VALUES ('ground', ?1)", [&store.info().ground.as_bytes()[..]])?;
     write_hidden(tx, store)?;
-    let all: BTreeSet<u8> = before.0.keys().copied().collect();
-    record_stamps(tx, before, &all, racy_ns)?;
+    put_meta(tx, "schema_version", &SCHEMA_VERSION.to_le_bytes())?;
+    put_meta(tx, "ground", store.info().ground.as_bytes())?;
+    put_meta(tx, "file", &file_identity(path))?;
+    put_meta(tx, "derived_stale", &[0])?;
+    let mut outcome = Outcome { rebuilt: true, dirty_shards: 256, added: g.len(), ..Outcome::default() };
+    let mut to_sync = Vec::new();
+    if record == Record::Yes
+        && let Some(t) = before.clock
+    {
+        for n in 0..=255u8 {
+            match before.shards[usize::from(n)] {
+                Seen::Absent => {
+                    put_shard(tx, n, Row::Absent)?;
+                    outcome.recorded += 1;
+                }
+                Seen::Present(Some(s)) if s.mtime() < t - opts.racy_ns && s.ctime() < t - opts.racy_ns => {
+                    put_shard(tx, n, Row::Present(s))?;
+                    to_sync.push(dir.join("objects").join(format!("{n:02x}")));
+                    outcome.recorded += 1;
+                }
+                Seen::Present(_) => {}
+            }
+        }
+        put_meta(tx, "fs_clock", &clock_bytes(t))?;
+    }
+    outcome.synced = durable(&to_sync)?;
+    Ok(outcome)
+}
+
+/// Sets every row's `pos` to its place in `topo_order()` (section 4, Order). Only rows whose place
+/// changed are written, in two steps, since `pos` is unique and SQLite checks it row by row.
+fn write_order(tx: &Connection, store: &Store) -> Result<()> {
+    let order = store.graph().topo_order();
+    let want: HashMap<[u8; 32], i64> = order.iter().enumerate().map(|(i, id)| (*id.as_bytes(), i as i64)).collect();
+    let rows: Vec<ObjRow> = {
+        let mut st = tx.prepare(&format!("SELECT {OBJ_COLUMNS} FROM obj"))?;
+        let raw: Vec<(ObjRow, Vec<u8>)> = st.query_map([], obj_row)?.collect::<rusqlite::Result<_>>()?;
+        raw.into_iter().map(checked).collect::<Result<_>>()?
+    };
+    let moved: Vec<(ObjRow, i64)> = rows
+        .into_iter()
+        .filter_map(|r| {
+            let to = *want.get(&r.id)?;
+            (r.pos != to).then_some((r, to))
+        })
+        .collect();
+    for (r, _) in &moved {
+        tx.execute("UPDATE obj SET pos = ?1 WHERE seq = ?2", [-1 - r.seq, r.seq])?;
+    }
+    for (r, to) in &moved {
+        let row = ObjRow { pos: *to, ..r.clone() };
+        tx.execute("UPDATE obj SET pos = ?1, ck = ?2 WHERE seq = ?3", params![*to, &row.ck()[..], r.seq])?;
+    }
     Ok(())
 }
 
-/// Replaces the hidden set with [`crate::CurrentView`]'s over `store`, and clears the stale mark.
-fn write_hidden(tx: &Connection, store: &Store) -> rusqlite::Result<()> {
+/// Replaces the hidden set with [`crate::CurrentView`]'s over `store`.
+fn write_hidden(tx: &Connection, store: &Store) -> Result<()> {
     let g = store.graph();
     let view = crate::CurrentView::new(g, &g.topo_order());
     let mut want: BTreeSet<i64> = BTreeSet::new();
-    let mut seq = tx.prepare_cached("SELECT seq FROM obj WHERE id = ?1")?;
+    let mut seq = tx.prepare_cached(&format!("SELECT {OBJ_COLUMNS} FROM obj WHERE id = ?1"))?;
     for id in &view.hidden {
-        want.insert(seq.query_row([&id.as_bytes()[..]], |r| r.get(0))?);
+        let row = checked(seq.query_row([&id.as_bytes()[..]], obj_row)?)?;
+        want.insert(row.seq);
     }
-    let have: BTreeSet<i64> =
-        tx.prepare("SELECT seq FROM hidden")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let mut have: BTreeSet<i64> = BTreeSet::new();
+    {
+        let mut st = tx.prepare("SELECT seq, ck FROM hidden")?;
+        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))? {
+            let (s, c) = row?;
+            check("hidden", &[F::I(s)], &c)?;
+            have.insert(s);
+        }
+    }
     for s in have.difference(&want) {
         tx.execute("DELETE FROM hidden WHERE seq = ?1", [s])?;
     }
     for s in want.difference(&have) {
-        tx.execute("INSERT INTO hidden VALUES (?1)", [s])?;
+        tx.execute("INSERT INTO hidden VALUES (?1, ?2)", params![s, &ck("hidden", &[F::I(*s)])[..]])?;
     }
-    tx.execute("INSERT OR REPLACE INTO meta VALUES ('hidden_stale', ?1)", [&[0u8][..]])?;
     Ok(())
 }
 
-/// Inserts contributions, parents first, assigning each the next seq.
+/// Inserts contributions, parents first. A row's `pos` is the next free one; [`write_order`] then puts
+/// every row at its place in `topo_order()`.
 struct Inserter<'t> {
     tx: &'t Connection,
-    next: i64,
+    next_seq: i64,
+    next_pos: i64,
 }
 
 impl<'t> Inserter<'t> {
     fn new(tx: &'t Connection) -> rusqlite::Result<Inserter<'t>> {
-        Ok(Inserter { tx, next: count(tx)? })
+        let next_pos = tx.query_row("SELECT coalesce(max(pos) + 1, 0) FROM obj", [], |r| r.get(0))?;
+        Ok(Inserter { tx, next_seq: count(tx)?, next_pos })
     }
 
-    fn seq_of(&self, id: &ContributionId) -> rusqlite::Result<Option<i64>> {
-        self.tx.prepare_cached("SELECT seq FROM obj WHERE id = ?1")?.query_row([&id.as_bytes()[..]], |r| r.get(0)).optional()
+    fn seq_of(&self, id: &ContributionId) -> Result<Option<i64>> {
+        let mut st = self.tx.prepare_cached(&format!("SELECT {OBJ_COLUMNS} FROM obj WHERE id = ?1"))?;
+        match st.query_row([&id.as_bytes()[..]], obj_row).optional()? {
+            Some(row) => {
+                let row = checked(row)?;
+                if row.id != *id.as_bytes() {
+                    return Err(Damaged("obj").into());
+                }
+                Ok(Some(row.seq))
+            }
+            None => Ok(None),
+        }
     }
 
-    /// Adds `c`; `false` (and nothing written) if a parent or a referenced contribution isn't indexed.
-    fn insert(&mut self, c: &Contribution) -> rusqlite::Result<bool> {
+    fn agent(&self, key: &[u8]) -> Result<i64> {
         let tx = self.tx;
+        let found: Option<(i64, Vec<u8>, Vec<u8>)> = tx
+            .prepare_cached("SELECT n, key, ck FROM agent WHERE key = ?1")?
+            .query_row([key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        if let Some((n, k, c)) = found {
+            check("agent", &[F::I(n), F::B(&k)], &c)?;
+            return Ok(n);
+        }
+        let n: i64 = tx.query_row("SELECT coalesce(max(n) + 1, 0) FROM agent", [], |r| r.get(0))?;
+        tx.prepare_cached("INSERT INTO agent VALUES (?1, ?2, ?3)")?.execute(params![
+            n,
+            key,
+            &ck("agent", &[F::I(n), F::B(key)])[..]
+        ])?;
+        Ok(n)
+    }
+
+    /// Adds `c`, unless it's already indexed (then a no-op, `true`); `false`, with nothing written, if a
+    /// parent or a referenced contribution isn't indexed.
+    fn insert(&mut self, c: &Contribution) -> Result<bool> {
+        if self.seq_of(&c.id())?.is_some() {
+            return Ok(true);
+        }
         let mut parents = Vec::with_capacity(c.parents().len());
         for p in c.parents() {
             match self.seq_of(p)? {
@@ -474,66 +1053,104 @@ impl<'t> Inserter<'t> {
                 None => return Ok(false),
             }
         }
-        let key = &c.author().as_bytes()[..];
-        tx.prepare_cached("INSERT OR IGNORE INTO agent (key) VALUES (?1)")?.execute([key])?;
-        let author: i64 = tx.prepare_cached("SELECT n FROM agent WHERE key = ?1")?.query_row([key], |r| r.get(0))?;
-        let seq = self.next;
-        tx.prepare_cached("INSERT INTO obj VALUES (?1, ?2, ?3, ?4, ?5)")?.execute(params![
-            seq,
-            &c.id().as_bytes()[..],
-            kind_code(c.body().kind()),
+        let author = self.agent(c.author().as_bytes())?;
+        let tx = self.tx;
+        let row = ObjRow {
+            seq: self.next_seq,
+            pos: self.next_pos,
+            id: *c.id().as_bytes(),
+            kind: kind_code(c.body().kind()),
             author,
-            c.content().timestamp_ms as i64
+            ts_key: ts_key(c.content().timestamp_ms),
+        };
+        let seq = row.seq;
+        tx.prepare_cached("INSERT INTO obj VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)")?.execute(params![
+            row.seq,
+            row.pos,
+            &row.id[..],
+            row.kind,
+            row.author,
+            row.ts_key,
+            &row.ck()[..]
         ])?;
         for p in parents {
-            tx.prepare_cached("INSERT OR IGNORE INTO parent VALUES (?1, ?2)")?.execute([seq, p])?;
-            tx.prepare_cached("INSERT OR IGNORE INTO child VALUES (?1, ?2)")?.execute([p, seq])?;
+            tx.prepare_cached("INSERT OR IGNORE INTO parent VALUES (?1, ?2, ?3)")?.execute(params![
+                seq,
+                p,
+                &ck("parent", &[F::I(seq), F::I(p)])[..]
+            ])?;
+            tx.prepare_cached("INSERT OR IGNORE INTO child VALUES (?1, ?2, ?3)")?.execute(params![
+                p,
+                seq,
+                &ck("child", &[F::I(p), F::I(seq)])[..]
+            ])?;
             tx.prepare_cached("DELETE FROM head WHERE seq = ?1")?.execute([p])?;
         }
-        tx.prepare_cached("INSERT INTO head VALUES (?1)")?.execute([seq])?;
+        tx.prepare_cached("INSERT INTO head VALUES (?1, ?2)")?.execute(params![seq, &ck("head", &[F::I(seq)])[..]])?;
         if let Body::Claim { tags, .. } = c.body() {
             for t in tags {
-                tx.prepare_cached("INSERT OR IGNORE INTO tag VALUES (?1, ?2)")?.execute(params![t, seq])?;
+                tx.prepare_cached("INSERT OR IGNORE INTO tag VALUES (?1, ?2, ?3)")?.execute(params![
+                    t,
+                    seq,
+                    &ck("tag", &[F::B(t.as_bytes()), F::I(seq)])[..]
+                ])?;
             }
         }
         for (target, rkind) in &refs {
-            tx.prepare_cached("INSERT OR IGNORE INTO ref VALUES (?1, ?2, ?3)")?.execute([*target, *rkind, seq])?;
+            tx.prepare_cached("INSERT OR IGNORE INTO ref VALUES (?1, ?2, ?3, ?4)")?.execute(params![
+                *target,
+                *rkind,
+                seq,
+                &ck("ref", &[F::I(*target), F::I(*rkind), F::I(seq)])[..]
+            ])?;
         }
         if let Body::Relation { kind, .. } = c.body() {
             let (to, from) = (refs[0].0, refs[1].0);
-            tx.prepare_cached("INSERT OR IGNORE INTO fwd VALUES (?1, ?2, ?3, ?4)")?.execute([
+            let k = relation_code(*kind);
+            tx.prepare_cached("INSERT OR IGNORE INTO fwd VALUES (?1, ?2, ?3, ?4, ?5)")?.execute(params![
                 from,
-                relation_code(*kind),
+                k,
                 seq,
                 to,
+                &ck("fwd", &[F::I(from), F::I(k), F::I(seq), F::I(to)])[..]
             ])?;
         }
-        self.next += 1;
+        self.next_seq += 1;
+        self.next_pos += 1;
         Ok(true)
     }
 }
 
+// ---------------------------------------------------------------------------------------------------
+// The oracle
+
+type Id = [u8; 32];
+
 /// Everything the index answers, as id-keyed rows, so two derivations can be compared.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Answers {
+    order: Vec<[u8; 32]>,
     objects: BTreeSet<([u8; 32], i64, [u8; 32], i64)>,
     parents: BTreeSet<([u8; 32], [u8; 32])>,
     children: BTreeSet<([u8; 32], [u8; 32])>,
     heads: BTreeSet<[u8; 32]>,
     tags: BTreeSet<(String, [u8; 32])>,
     refs: BTreeSet<([u8; 32], i64, [u8; 32])>,
-    forward: BTreeSet<([u8; 32], i64, [u8; 32], [u8; 32])>,
+    forward: BTreeSet<(Id, i64, Id, Id)>,
     hidden: BTreeSet<[u8; 32]>,
 }
 
-/// The oracle: the answers recomputed from the store, through the graph's own maps (referrers, heads,
-/// parents) rather than the bodies the index was filled from, and the hidden set from `CurrentView`.
+/// The answers recomputed from the store, through the graph's own maps (referrers, children, heads)
+/// rather than the bodies the index was filled from; the order from `topo_order()`, the hidden set from
+/// `CurrentView`.
 fn expected(store: &Store) -> Answers {
     let g = store.graph();
     let mut a = Answers::default();
+    let order = g.topo_order();
+    a.order = order.iter().map(|id| *id.as_bytes()).collect();
     for c in g.iter() {
         let id = *c.id().as_bytes();
-        a.objects.insert((id, kind_code(c.body().kind()), *c.author().as_bytes(), c.content().timestamp_ms as i64));
+        a.objects.insert((id, kind_code(c.body().kind()), *c.author().as_bytes(), ts_key(c.content().timestamp_ms)));
         for p in c.parents() {
             a.parents.insert((id, *p.as_bytes()));
         }
@@ -561,72 +1178,144 @@ fn expected(store: &Store) -> Answers {
         }
     }
     a.heads = g.heads().map(|h| *h.as_bytes()).collect();
-    a.hidden = crate::CurrentView::new(g, &g.topo_order()).hidden.iter().map(|h| *h.as_bytes()).collect();
+    a.hidden = crate::CurrentView::new(g, &order).hidden.iter().map(|h| *h.as_bytes()).collect();
     a
 }
 
-fn id32(b: Vec<u8>) -> rusqlite::Result<[u8; 32]> {
-    <[u8; 32]>::try_from(b).map_err(|_| rusqlite::Error::InvalidColumnType(0, "id".into(), rusqlite::types::Type::Blob))
-}
-
-/// What an index says, read back as id-keyed rows; also checks that every edge runs from a lower seq
-/// (parents first) and that seqs are dense.
+/// What an index says, every row of every table read and its checksum checked; also checks that seqs
+/// are dense and that every parent edge runs from a lower seq.
 fn actual(conn: &Connection) -> Result<Answers> {
     let mut a = Answers::default();
-    let mut st = conn.prepare("SELECT o.id, o.kind, a.key, o.ts_ms FROM obj o JOIN agent a ON a.n = o.author")?;
-    for row in st.query_map([], |r| Ok((id32(r.get(0)?)?, r.get(1)?, id32(r.get(2)?)?, r.get(3)?)))? {
-        a.objects.insert(row?);
+    let mut by_seq: HashMap<i64, [u8; 32]> = HashMap::new();
+    let mut agents: HashMap<i64, [u8; 32]> = HashMap::new();
+    {
+        let mut st = conn.prepare("SELECT n, key, ck FROM agent")?;
+        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?, r.get::<_, Vec<u8>>(2)?)))? {
+            let (n, k, c) = row?;
+            check("agent", &[F::I(n), F::B(&k)], &c)?;
+            agents.insert(n, k.try_into().map_err(|_| Damaged("agent"))?);
+        }
     }
-    let pairs = |sql: &str| -> Result<BTreeSet<([u8; 32], [u8; 32])>> {
-        let mut st = conn.prepare(sql)?;
-        let rows = st.query_map([], |r| Ok((id32(r.get(0)?)?, id32(r.get(1)?)?)))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let mut objs: Vec<ObjRow> = {
+        let mut st = conn.prepare(&format!("SELECT {OBJ_COLUMNS} FROM obj"))?;
+        let raw: Vec<(ObjRow, Vec<u8>)> = st.query_map([], obj_row)?.collect::<rusqlite::Result<_>>()?;
+        raw.into_iter().map(checked).collect::<Result<_>>()?
     };
-    a.parents = pairs("SELECT c.id, p.id FROM parent x JOIN obj c ON c.seq = x.child JOIN obj p ON p.seq = x.parent")?;
-    a.children = pairs("SELECT p.id, c.id FROM child x JOIN obj p ON p.seq = x.parent JOIN obj c ON c.seq = x.child")?;
-    let singles = |sql: &str| -> Result<BTreeSet<[u8; 32]>> {
-        let mut st = conn.prepare(sql)?;
-        let rows = st.query_map([], |r| id32(r.get(0)?))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    objs.sort_by_key(|r| r.pos);
+    for (i, r) in objs.iter().enumerate() {
+        if r.pos != i as i64 {
+            bail!("the index's positions aren't 0..{}: {} at {i}", objs.len(), r.pos);
+        }
+        let author = agents.get(&r.author).context("an obj row names an agent that isn't there")?;
+        a.objects.insert((r.id, r.kind, *author, r.ts_key));
+        a.order.push(r.id);
+        by_seq.insert(r.seq, r.id);
+    }
+    let mut seqs: Vec<i64> = by_seq.keys().copied().collect();
+    seqs.sort_unstable();
+    if seqs.iter().enumerate().any(|(i, s)| *s != i as i64) {
+        bail!("the index's seqs aren't dense");
+    }
+    let id = |s: i64| -> Result<[u8; 32]> { by_seq.get(&s).copied().context("a row names a seq that isn't there") };
+    let pairs = |table: &'static str| -> Result<Vec<(i64, i64)>> {
+        let mut st = conn.prepare(&format!("SELECT * FROM {table}"))?;
+        let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Vec<u8>>(2)?)))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (x, y, c) = row?;
+            check(table, &[F::I(x), F::I(y)], &c)?;
+            out.push((x, y));
+        }
+        Ok(out)
     };
-    a.heads = singles("SELECT o.id FROM head h JOIN obj o ON o.seq = h.seq")?;
-    a.hidden = singles("SELECT o.id FROM hidden h JOIN obj o ON o.seq = h.seq")?;
-    let mut st = conn.prepare("SELECT t.tag, o.id FROM tag t JOIN obj o ON o.seq = t.seq")?;
-    for row in st.query_map([], |r| Ok((r.get(0)?, id32(r.get(1)?)?)))? {
-        a.tags.insert(row?);
+    for (child, parent) in pairs("parent")? {
+        if parent >= child {
+            bail!("a parent edge runs forwards in the index");
+        }
+        a.parents.insert((id(child)?, id(parent)?));
     }
-    let mut st = conn.prepare("SELECT t.id, r.rkind, s.id FROM ref r JOIN obj t ON t.seq = r.target JOIN obj s ON s.seq = r.src")?;
-    for row in st.query_map([], |r| Ok((id32(r.get(0)?)?, r.get(1)?, id32(r.get(2)?)?)))? {
-        a.refs.insert(row?);
+    for (parent, child) in pairs("child")? {
+        a.children.insert((id(parent)?, id(child)?));
     }
-    let mut st = conn.prepare(
-        "SELECT f.id, x.rkind, r.id, t.id FROM fwd x JOIN obj f ON f.seq = x.src_end JOIN obj r ON r.seq = x.rel
-         JOIN obj t ON t.seq = x.to_end",
-    )?;
-    for row in st.query_map([], |r| Ok((id32(r.get(0)?)?, r.get(1)?, id32(r.get(2)?)?, id32(r.get(3)?)?)))? {
-        a.forward.insert(row?);
+    let singles = |table: &'static str| -> Result<Vec<i64>> {
+        let mut st = conn.prepare(&format!("SELECT seq, ck FROM {table}"))?;
+        let mut out = Vec::new();
+        for row in st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?)))? {
+            let (s, c) = row?;
+            check(table, &[F::I(s)], &c)?;
+            out.push(s);
+        }
+        Ok(out)
+    };
+    for s in singles("head")? {
+        a.heads.insert(id(s)?);
     }
-    let backwards: i64 = conn.query_row("SELECT count(*) FROM parent WHERE parent >= child", [], |r| r.get(0))?;
-    let (n, max): (i64, i64) = conn.query_row("SELECT count(*), coalesce(max(seq), -1) FROM obj", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
-    if backwards != 0 || n != max + 1 {
-        bail!("the index's order is broken: {backwards} parent edges run forwards, {n} rows for seqs 0..={max}");
+    for s in singles("hidden")? {
+        a.hidden.insert(id(s)?);
     }
+    {
+        let mut st = conn.prepare("SELECT tag, seq, ck FROM tag")?;
+        for row in st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, Vec<u8>>(2)?)))? {
+            let (t, s, c) = row?;
+            check("tag", &[F::B(t.as_bytes()), F::I(s)], &c)?;
+            a.tags.insert((t, id(s)?));
+        }
+    }
+    {
+        let mut st = conn.prepare("SELECT target, rkind, src, ck FROM ref")?;
+        let rows = st.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, Vec<u8>>(3)?))
+        })?;
+        for row in rows {
+            let (t, k, s, c) = row?;
+            check("ref", &[F::I(t), F::I(k), F::I(s)], &c)?;
+            a.refs.insert((id(t)?, k, id(s)?));
+        }
+    }
+    {
+        let mut st = conn.prepare("SELECT src_end, rkind, rel, to_end, ck FROM fwd")?;
+        let rows = st.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, Vec<u8>>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (f, k, rel, t, c) = row?;
+            check("fwd", &[F::I(f), F::I(k), F::I(rel), F::I(t)], &c)?;
+            a.forward.insert((id(f)?, k, id(rel)?, id(t)?));
+        }
+    }
+    read_shards(conn)?;
+    read_meta(conn)?;
     Ok(a)
 }
 
-/// Fails naming the first part where `got` (what the index says) differs from `want` (the oracle).
+/// Fails naming the first part where `got` (what an index says) differs from `want` (the oracle).
 fn differs(what: &str, want: &Answers, got: &Answers) -> Result<()> {
     fn part<T: Ord + std::fmt::Debug>(what: &str, name: &str, want: &BTreeSet<T>, got: &BTreeSet<T>) -> Result<()> {
         if want != got {
-            let missing = want.difference(got).next();
-            let extra = got.difference(want).next();
             bail!(
-                "{what} disagrees with the full recompute on {name}: {} missing (first {missing:?}), {} extra (first {extra:?})",
+                "{what} disagrees with the full recompute on {name}: {} missing (first {:?}), {} extra (first {:?})",
                 want.difference(got).count(),
-                got.difference(want).count()
+                want.difference(got).next(),
+                got.difference(want).count(),
+                got.difference(want).next(),
             );
         }
         Ok(())
+    }
+    if want.order != got.order {
+        let at = want
+            .order
+            .iter()
+            .zip(&got.order)
+            .position(|(a, b)| a != b)
+            .unwrap_or(want.order.len().min(got.order.len()));
+        bail!("{what} disagrees with the full recompute on the causal order, first at position {at}");
     }
     part(what, "objects", &want.objects, &got.objects)?;
     part(what, "parents", &want.parents, &got.parents)?;
@@ -639,35 +1328,35 @@ fn differs(what: &str, want: &Answers, got: &Answers) -> Result<()> {
     Ok(())
 }
 
-/// `BRACKEN_FULL_CHECK`: compares the index's answers with the full recompute from `store` (a full
-/// open, made after `before` was taken), writing nothing. Two indexes are checked: one built fresh in
-/// memory, which checks the derivation, and the replica's own, brought up to date inside a transaction
-/// that is rolled back, which checks what freshness and the writes kept. A replica's index that would
-/// need a rebuild is reported as such, not compared. Any disagreement is an error.
-pub fn compare(dir: &Path, store: &Store, before: &Shards) -> Result<()> {
+/// `BRACKEN_FULL_CHECK` (section 7, Oracle): compares the index's answers with the full recompute from
+/// `store` (a full open, made after `before` was taken), committing nothing. An index built fresh in
+/// memory checks the derivation; the replica's own, if it has one, is brought up to date inside a
+/// transaction that's rolled back, which checks what freshness and the writes kept. Every row's checksum
+/// is checked. One that would need a rebuild or a new generation is reported as such, not compared.
+pub fn compare(dir: &Path, store: &Store, before: &Before) -> Result<()> {
     let want = expected(store);
     let mut fresh = Connection::open_in_memory()?;
     {
         let tx = fresh.transaction()?;
-        rebuild_in(&tx, store, before, RACY_NS)?;
+        rebuild_in(&tx, dir, Path::new(""), store, &Before::stats(dir), Record::No, Options::default())?;
         tx.commit()?;
     }
     differs("a freshly built index", &want, &actual(&fresh)?)?;
 
-    let path = index_path(dir);
-    if std::fs::symlink_metadata(&path).is_err() {
+    let Ok(cache) = std::fs::canonicalize(dir.join("cache")) else { return Ok(()) };
+    let Some(generation) = current_generation(&cache) else { return Ok(()) };
+    if !usable(dir) {
         return Ok(());
     }
-    let mut conn = match open_db(&path) {
-        Ok(conn) => conn,
-        Err(e) if is_damage(&e) => return Ok(()),
-        Err(e) => return Err(e).with_context(|| format!("opening {}", path.display())),
-    };
+    let path = cache.join(file_name(generation));
+    let mut conn = open_db(&path, BUSY).with_context(|| format!("opening {}", path.display()))?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    match reconcile(&tx, store, before, Record::No, RACY_NS) {
-        Ok(_) => differs("this replica's index", &want, &actual(&tx)?)?,
+    let stats = Before { clock: None, shards: before.shards.clone() };
+    match reconcile(&tx, dir, &path, store, &stats, Record::No, Options::default()) {
+        Ok(_) => differs("this replica's index", &want, &actual(&tx)?).context("BRACKEN_FULL_CHECK")?,
         Err(Needs::Rebuild) => {}
-        Err(Needs::Error(e)) if e.downcast_ref::<rusqlite::Error>().is_some_and(is_damage) => {}
+        Err(Needs::Damaged(e)) => return Err(e.context("BRACKEN_FULL_CHECK: this replica's index is damaged")),
+        Err(Needs::Error(e)) if is_damage(&e) => {}
         Err(Needs::Error(e)) => return Err(e),
     }
     tx.rollback()?;
@@ -675,297 +1364,4 @@ pub fn compare(dir: &Path, store: &Store, before: &Shards) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use manyroot::Identity;
-
-    const PEOPLE: [&str; 3] = ["manager", "builder", "reviewer"];
-
-    struct Rng(u64);
-
-    impl Rng {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 ^= self.0 >> 12;
-            self.0 ^= self.0 << 25;
-            self.0 ^= self.0 >> 27;
-            (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 33) as usize % n.max(1)
-        }
-    }
-
-    fn ground(tmp: &Path) -> PathBuf {
-        let dir = tmp.join("g");
-        let store = Store::init(&dir, "index").expect("a Ground");
-        for p in PEOPLE {
-            store.create_identity(p).expect("an identity");
-        }
-        dir
-    }
-
-    /// Adds about `n` contributions through `Store` alone, as an older binary or a git pull would: tagged
-    /// claims, evidence, relations (supersessions among them) and retractions of the author's own work.
-    fn grow(dir: &Path, seed: u64, n: usize) {
-        let mut store = Store::open(dir).expect("valid");
-        let ids: Vec<Identity> = PEOPLE.iter().map(|p| store.identity(p).expect("an identity")).collect();
-        let mut rng = Rng(seed);
-        for i in 0..n {
-            let who = rng.below(ids.len());
-            let all: Vec<ContributionId> = store.graph().topo_order();
-            let pick = |rng: &mut Rng| all[rng.below(all.len())];
-            let tags = ["pr", "finding", "task", "decision", "note"];
-            let body = match (all.len(), rng.below(12)) {
-                (0..=2, _) | (_, 0..=3) => Body::Claim {
-                    statement: format!("claim {seed}-{i}"),
-                    tags: vec![tags[rng.below(tags.len())].into(), tags[rng.below(tags.len())].into()],
-                },
-                (_, 4..=5) => Body::Evidence {
-                    target: pick(&mut rng),
-                    verdict: if rng.below(3) == 0 { Verdict::Fail } else { Verdict::Pass },
-                    method: "check".into(),
-                    details: String::new(),
-                },
-                (_, 6..=9) => {
-                    let (from, to) = (pick(&mut rng), pick(&mut rng));
-                    if from == to {
-                        continue;
-                    }
-                    let kinds = [RelationKind::Supersedes, RelationKind::Implements, RelationKind::Contradicts];
-                    Body::Relation { from, kind: kinds[rng.below(kinds.len())], to, note: String::new() }
-                }
-                _ => {
-                    let me = ids[who].agent_id();
-                    let own: Vec<_> =
-                        all.iter().filter(|id| store.graph().get(id).expect("present").author() == me).collect();
-                    if own.is_empty() {
-                        continue;
-                    }
-                    Body::Retract { target: *own[rng.below(own.len())], reason: "withdrawn".into() }
-                }
-            };
-            store.contribute(&ids[who], body).expect("valid");
-        }
-    }
-
-    /// Opens as a read does (shards stamped first), refreshes with racy window `racy`, and checks the
-    /// replica's index against the full recompute.
-    fn read(dir: &Path, racy: i128) -> Outcome {
-        let before = Shards::take(dir);
-        let store = Store::open(dir).expect("valid");
-        let outcome = refresh_with(dir, &store, &before, Record::Yes, racy).expect("refreshed");
-        let conn = open_db(&index_path(dir)).expect("opens");
-        differs("the index", &expected(&store), &actual(&conn).expect("reads")).expect("agrees");
-        outcome
-    }
-
-    fn rows(dir: &Path, sql: &str) -> i64 {
-        open_db(&index_path(dir)).expect("opens").query_row(sql, [], |r| r.get(0)).expect("a count")
-    }
-
-    #[test]
-    fn built_on_first_open_then_only_dirty_shards_are_diffed() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 1, 120);
-        let first = read(&dir, 0);
-        assert!(first.rebuilt, "no index yet, so it's built: {first:?}");
-        let again = read(&dir, 0);
-        assert_eq!(again, Outcome::default(), "nothing changed, so no shard is dirty");
-    }
-
-    #[test]
-    fn an_object_written_without_the_index_is_found_by_freshness() {
-        // What an older binary, another tool or a git pull does: objects appear with no index update.
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 2, 80);
-        read(&dir, 0);
-        grow(&dir, 3, 1);
-        let after = read(&dir, 0);
-        assert!(!after.rebuilt && after.added >= 1 && after.dirty_shards >= 1, "{after:?}");
-        grow(&dir, 4, 40);
-        let more = read(&dir, 0);
-        assert!(!more.rebuilt && more.added >= 30, "{more:?}");
-    }
-
-    #[test]
-    fn a_shard_whose_mtime_was_put_back_is_still_dirty() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 5, 40);
-        read(&dir, 0);
-        let before = Shards::take(&dir);
-        grow(&dir, 6, 1);
-        let after = Shards::take(&dir);
-        let (n, old) = before
-            .0
-            .iter()
-            .find(|(n, s)| after.0.get(n) != Some(s))
-            .map(|(n, s)| (*n, s.expect("stamped")))
-            .or_else(|| after.0.keys().find(|n| !before.0.contains_key(n)).map(|n| (*n, Stamp { mtime_ns: 0, ctime_ns: 0, ino: 0 })))
-            .expect("the write changed a shard");
-        if old.ino != 0 {
-            let shard = dir.join("objects").join(format!("{n:02x}"));
-            let t = rustix::fs::Timespec { tv_sec: old.mtime_ns / 1_000_000_000, tv_nsec: (old.mtime_ns % 1_000_000_000) as _ };
-            let times = rustix::fs::Timestamps { last_access: t, last_modification: t };
-            rustix::fs::utimensat(rustix::fs::CWD, &shard, &times, rustix::fs::AtFlags::empty()).expect("set mtime back");
-        }
-        let outcome = read(&dir, 0);
-        assert!(outcome.added >= 1, "the ctime still differs, so the shard is diffed: {outcome:?}");
-    }
-
-    #[test]
-    fn a_recent_stamp_is_not_recorded_so_its_shard_stays_dirty() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 7, 30);
-        read(&dir, RACY_NS);
-        assert_eq!(rows(&dir, "SELECT count(*) FROM shard"), 0, "every shard was written in the last 2 s");
-        let again = read(&dir, RACY_NS);
-        assert!(again.dirty_shards > 0 && again.added == 0 && !again.rebuilt, "{again:?}");
-        read(&dir, 0);
-        assert!(rows(&dir, "SELECT count(*) FROM shard") > 0);
-    }
-
-    #[test]
-    fn a_crash_between_the_object_write_and_the_index_commit_is_repaired_on_the_next_open() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 8, 40);
-        read(&dir, 0);
-        // A write command: the store opened, an object written, then the process dies before the
-        // index transaction (Refreshing's drop, which refreshes the index, never runs).
-        let written = {
-            let mut s = crate::snapshot::Refreshing::open(&dir, crate::snapshot::Refresh::Yes).expect("opens");
-            let who = s.identity("builder").expect("an identity");
-            let id = s.contribute(&who, Body::Claim { statement: "lost".into(), tags: vec!["note".into()] }).expect("ok");
-            std::mem::forget(s);
-            id
-        };
-        let after = read(&dir, 0);
-        assert!(after.added >= 1 && !after.rebuilt, "{after:?}");
-        let n = rows(&dir, &format!("SELECT count(*) FROM obj WHERE hex(id) = '{}'", written.to_hex().to_uppercase()));
-        assert_eq!(n, 1);
-    }
-
-    #[test]
-    fn a_write_through_refreshing_is_indexed_when_it_ends() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 9, 30);
-        read(&dir, 0);
-        let written = {
-            let mut s = crate::snapshot::Refreshing::open(&dir, crate::snapshot::Refresh::Yes).expect("opens");
-            let who = s.identity("builder").expect("an identity");
-            s.contribute(&who, Body::Claim { statement: "kept".into(), tags: vec!["decision".into()] }).expect("ok")
-        };
-        let n = rows(&dir, &format!("SELECT count(*) FROM tag t JOIN obj o ON o.seq = t.seq WHERE t.tag = 'decision' AND hex(o.id) = '{}'", written.to_hex().to_uppercase()));
-        assert_eq!(n, 1, "indexed by the write itself, before any read");
-        read(&dir, 0);
-    }
-
-    #[test]
-    fn a_version_or_ground_mismatch_and_damage_mean_rebuild() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 10, 40);
-        read(&dir, 0);
-        let conn = open_db(&index_path(&dir)).expect("opens");
-        conn.execute("UPDATE meta SET v = ?1 WHERE k = 'schema_version'", [&0i64.to_le_bytes()[..]]).expect("set");
-        drop(conn);
-        assert!(read(&dir, 0).rebuilt, "a schema version mismatch rebuilds");
-        let conn = open_db(&index_path(&dir)).expect("opens");
-        conn.execute("UPDATE meta SET v = ?1 WHERE k = 'ground'", [&[9u8; 32][..]]).expect("set");
-        drop(conn);
-        assert!(read(&dir, 0).rebuilt, "a ground mismatch rebuilds");
-        for suffix in ["-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", index_path(&dir).display()));
-        }
-        std::fs::write(index_path(&dir), b"not a database, just bytes long enough to look like a header..").expect("w");
-        assert!(read(&dir, 0).rebuilt, "a damaged file is replaced");
-    }
-
-    #[test]
-    fn an_indexed_object_that_is_gone_means_rebuild() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 11, 40);
-        read(&dir, 0);
-        let store = Store::open(&dir).expect("valid");
-        let head = store.graph().heads().next().expect("a head");
-        let hex = head.to_hex();
-        std::fs::remove_file(dir.join("objects").join(&hex[..2]).join(&hex[2..])).expect("removed");
-        assert!(read(&dir, 0).rebuilt, "a checkout that went back");
-    }
-
-    #[test]
-    fn a_missing_index_row_with_a_clean_stamp_fails_the_full_check() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 12, 60);
-        read(&dir, 0);
-        let before = Shards::take(&dir);
-        let store = Store::open(&dir).expect("valid");
-        compare(&dir, &store, &before).expect("an index kept current agrees");
-        let conn = open_db(&index_path(&dir)).expect("opens");
-        conn.execute("DELETE FROM tag WHERE rowid IN (SELECT rowid FROM tag LIMIT 1)", []).ok();
-        conn.execute("DELETE FROM tag WHERE seq = (SELECT min(seq) FROM tag)", []).expect("deleted");
-        drop(conn);
-        let err = compare(&dir, &store, &before).expect_err("a lost row is caught");
-        assert!(format!("{err:#}").contains("tags"), "{err:#}");
-        let conn = open_db(&index_path(&dir)).expect("opens");
-        conn.execute("DELETE FROM hidden WHERE seq = (SELECT min(seq) FROM hidden)", []).expect("deleted");
-        drop(conn);
-        assert!(compare(&dir, &store, &before).is_err());
-    }
-
-    #[test]
-    fn the_full_check_writes_nothing() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 13, 30);
-        read(&dir, 0);
-        grow(&dir, 14, 10);
-        let before = Shards::take(&dir);
-        let store = Store::open(&dir).expect("valid");
-        let count = rows(&dir, "SELECT count(*) FROM obj");
-        compare(&dir, &store, &before).expect("agrees after an in-transaction catch-up");
-        assert_eq!(rows(&dir, "SELECT count(*) FROM obj"), count, "rolled back");
-    }
-
-    #[test]
-    fn concurrent_refreshes_agree() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 15, 60);
-        read(&dir, 0);
-        grow(&dir, 16, 60);
-        let handles: Vec<_> = (0..4)
-            .map(|_| {
-                let dir = dir.clone();
-                std::thread::spawn(move || {
-                    let before = Shards::take(&dir);
-                    let store = Store::open(&dir).expect("valid");
-                    refresh_with(&dir, &store, &before, Record::Yes, 0).expect("refreshed")
-                })
-            })
-            .collect();
-        let added: usize = handles.into_iter().map(|h| h.join().expect("joined").added).sum();
-        assert!(added >= 50, "each object added once, by whichever got there first: {added}");
-        assert_eq!(read(&dir, 0), Outcome::default());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_linked_index_file_is_never_written_through() {
-        let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 17, 20);
-        std::fs::create_dir_all(dir.join("cache")).expect("cache/");
-        let outside = tmp.path().join("outside");
-        std::fs::write(&outside, b"keep me").expect("w");
-        std::os::unix::fs::symlink(&outside, index_path(&dir)).expect("link");
-        let before = Shards::take(&dir);
-        let store = Store::open(&dir).expect("valid");
-        let _ = refresh(&dir, &store, &before, Record::Yes);
-        assert_eq!(std::fs::read(&outside).expect("r"), b"keep me");
-    }
-}
+mod tests;

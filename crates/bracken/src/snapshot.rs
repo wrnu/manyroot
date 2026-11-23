@@ -103,9 +103,18 @@ pub fn open(dir: &Path, refresh: Refresh) -> Result<Store> {
 }
 
 fn open_held(dir: &Path, refresh: Refresh) -> Result<(Store, Option<Held>)> {
+    // The index's stamps are taken before anything lists objects/ (docs/design/index-store.md section 5),
+    // and only by an open that may write: the view never touches the index.
+    let index = refresh == Refresh::Yes && crate::index::usable(dir);
     if full_check() {
-        return Ok((Store::open(dir)?, None));
+        let before = crate::index::Before::stats(dir);
+        let store = Store::open(dir)?;
+        if index {
+            crate::index::compare(dir, &store, &before)?;
+        }
+        return Ok((store, None));
     }
+    let before = index.then(|| crate::index::Before::take(dir));
     let mut decoded: Option<Decoded> = None;
     let opened = Store::open_trusting_with(dir, |ground, on_disk| {
         decoded = read_snapshot(dir, ground, on_disk);
@@ -125,6 +134,10 @@ fn open_held(dir: &Path, refresh: Refresh) -> Result<(Store, Option<Held>)> {
         // Best effort: a cache that can't be written is only slower next time.
         let _ = save(dir, &store, &mut held);
     }
+    if let Some(before) = &before {
+        // Best effort too: a lock not granted in time, or a failure, leaves the index for a later command.
+        let _ = crate::index::refresh(dir, &store, before, crate::index::Record::Yes);
+    }
     Ok((store, Some(held)))
 }
 
@@ -135,12 +148,15 @@ pub struct Refreshing {
     store: Option<Store>,
     held: Option<Held>,
     refresh: Refresh,
+    /// How many contributions the store held when opened: more when dropped means this command wrote.
+    opened: usize,
 }
 
 impl Refreshing {
     pub fn open(dir: &Path, refresh: Refresh) -> Result<Refreshing> {
         let (store, held) = open_held(dir, refresh)?;
-        Ok(Refreshing { store: Some(store), held, refresh })
+        let opened = store.graph().len();
+        Ok(Refreshing { store: Some(store), held, refresh, opened })
     }
 
     /// The store, for a command that keeps it (`watch`, `serve`): it reads through the snapshot itself.
@@ -164,6 +180,22 @@ impl DerefMut for Refreshing {
 
 impl Drop for Refreshing {
     fn drop(&mut self) {
+        // A test hook, in debug builds only: the process dies after its objects were written and before
+        // the snapshot or the index records them (docs/design/index-store.md section 8, Process crash).
+        #[cfg(debug_assertions)]
+        if std::env::var_os("BRACKEN_TEST_ABORT_BEFORE_INDEX").is_some() {
+            std::process::abort();
+        }
+        // The index learns this command's writes (section 6): no stamps, the written shards left dirty.
+        if let Some(store) = &self.store
+            && self.refresh == Refresh::Yes
+            && store.graph().len() != self.opened
+            && !full_check()
+            && crate::index::usable(store.dir())
+        {
+            let before = crate::index::Before::stats(store.dir());
+            let _ = crate::index::refresh(store.dir(), store, &before, crate::index::Record::No);
+        }
         if let (Some(store), Some(held)) = (&self.store, &mut self.held)
             && self.refresh == Refresh::Yes
             && store.graph().len() != held.ids.len()
@@ -176,10 +208,15 @@ impl Drop for Refreshing {
 
 /// `bracken verify`: a full `Store::open`, then the snapshot rewritten whole from it.
 pub fn verify(dir: &Path) -> Result<Store> {
+    // Under BRACKEN_FULL_CHECK nothing is written, cache/clock included.
+    let before = if full_check() { crate::index::Before::stats(dir) } else { crate::index::Before::take(dir) };
     let store = Store::open(dir)?;
     if !full_check() {
         let cache = Cache::open(dir, true).context("opening cache/")?.context("no cache/ was made")?;
         rewrite(&cache, &store, &mut Held::default()).context("writing the snapshot")?;
+        if crate::index::usable(dir) {
+            crate::index::rebuild(dir, &store, &before).context("rebuilding the index")?;
+        }
     }
     Ok(store)
 }
@@ -503,7 +540,7 @@ fn rewrite(cache: &Cache, store: &Store, held: &mut Held) -> Result<()> {
 
 /// `cache/` and the files in it, never through a link.
 #[cfg(unix)]
-mod cache {
+pub(crate) mod cache {
     use std::fs::File;
     use std::io::{self, Write};
     use std::os::fd::OwnedFd;
@@ -599,6 +636,25 @@ mod cache {
             written
         }
 
+        /// The filesystem's own clock, as the index's freshness reads it (docs/design/index-store.md
+        /// section 5 step 1): `clock` here is rewritten (opened with `O_NOFOLLOW | O_NONBLOCK`, refused
+        /// unless it's a regular file) and its mtime in nanoseconds returned, with the device it's on.
+        pub fn clock(&self) -> io::Result<(i128, u64)> {
+            let flags =
+                OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let fd = fs::openat(&self.fd, "clock", flags, Mode::from_raw_mode(0o666)).map_err(|e| match e {
+                Errno::LOOP | Errno::NOTDIR => refused("clock"),
+                e => e.into(),
+            })?;
+            let st = fs::fstat(&fd)?;
+            if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
+                return Err(refused("clock"));
+            }
+            File::from(fd.try_clone()?).write_all(&std::process::id().to_le_bytes())?;
+            let st = fs::fstat(&fd)?;
+            Ok((i128::from(st.st_mtime) * 1_000_000_000 + i128::from(st.st_mtime_nsec), st.st_dev as u64))
+        }
+
         /// Creates `.gitignore` (`*`) if nothing is at its name; never writes through a link there.
         fn ignore(&self) -> io::Result<()> {
             match fs::statat(&self.fd, IGNORE, AtFlags::SYMLINK_NOFOLLOW) {
@@ -619,7 +675,7 @@ mod cache {
 
 /// Elsewhere, the same checks by path, each just before the step it guards.
 #[cfg(not(unix))]
-mod cache {
+pub(crate) mod cache {
     use std::fs::{self, File};
     use std::io::{self, Write};
     use std::path::{Path, PathBuf};
@@ -699,6 +755,11 @@ mod cache {
                 let _ = fs::remove_file(&tmp);
             }
             written
+        }
+
+        /// No filesystem clock the index trusts here: freshness records no stamps.
+        pub fn clock(&self) -> io::Result<(i128, u64)> {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "no filesystem clock on this platform"))
         }
     }
 }
