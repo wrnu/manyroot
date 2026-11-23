@@ -201,7 +201,11 @@ key is in `<dir>/retired.jsonl` (`{"name", "agent"}` lines) or `<dir>/retired/`,
 `bracken id scope <name> --scopes <file> [--json]` says what a server would sign for `<name>` under that
 scopes file, parsed and matched by the server's own code: its kinds, relations and tags, or that it has no
 scope. A file the server couldn't parse fails it, naming why; the server would then sign nothing. It reads
-only the file, and needs no replica. `scripts/team-server ready` uses it.
+only the file, and needs no replica. `scripts/team-server ready` uses it. With `--kind <kind>`,
+`--relation <kind>` or `--tag <tag>` (each repeatable), it also judges each by the server's own check: a
+contribution of that kind, a relation of that kind, a claim carrying that tag (a `type:<name>` tag by its
+type's names too). It prints `refused <kind|relation|tag> <which>: <why>` for each one refused, and exits 1
+if any is; with no scope, all are. `--json` adds them as `refused`, a list of `{what, which, why}`.
 
 A write command signs with the identity's file in `identities/` if there is one. Otherwise, with
 `BRACKEN_SIGN_URL` (a loopback server's URL) and `BRACKEN_SIGN_TOKEN_FILE` set, it sends the content to
