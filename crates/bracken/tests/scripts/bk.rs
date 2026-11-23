@@ -917,7 +917,11 @@ if [ \"$1 $2 $3\" = 'id scope --help' ]; then \"$REAL_BRACKEN\" \"$@\" | grep -v
         // ready can't tell and isn't ready: a line without an agent, or with one that isn't a key, a key file
         // that's empty or not under its own name, and the identity's own key file emptied.
         let unreadable = "so the server wouldn't start";
-        for line in ["{\"name\":\"other\"}\n", "{\"name\":\"other\",\"agent\":\"not-a-key\"}\n", "[1]\n"] {
+        // An agent with a trailing newline, which jq's '$' alone would let through (finding 6beb2a35cca2).
+        let newline = format!("{{\"name\":\"other\",\"agent\":\"{agent}\\n\"}}\n");
+        for line in
+            ["{\"name\":\"other\"}\n", "{\"name\":\"other\",\"agent\":\"not-a-key\"}\n", "[1]\n", newline.as_str()]
+        {
             let mut text = kept_list.clone();
             text.extend_from_slice(line.as_bytes());
             std::fs::write(&list, text).unwrap();
@@ -925,15 +929,19 @@ if [ \"$1 $2 $3\" = 'id scope --help' ]; then \"$REAL_BRACKEN\" \"$@\" | grep -v
             assert!(!said && out.contains(unreadable), "{scripts}: {line}: {out}");
         }
         std::fs::write(&list, &kept_list).unwrap();
-        for text in ["{}".to_owned(), held.clone()] {
+        // Empty, whitespace only, two objects (finding 6beb2a35cca2), an empty object, and one not under its
+        // own name.
+        for text in [String::new(), " \n\t\n".to_owned(), format!("{held}{held}"), "{}".to_owned(), held.clone()] {
             std::fs::write(&copy, &text).unwrap();
             let (out, said) = ready("builder-held");
             assert!(!said && out.contains(unreadable), "{scripts}: {text}: {out}");
         }
         std::fs::remove_file(&copy).unwrap();
-        std::fs::write(&held_path, "{}").unwrap();
-        let (out, said) = ready("builder-held");
-        assert!(!said && out.contains(unreadable), "{scripts}: {out}");
+        for text in ["{}", "", " \n"] {
+            std::fs::write(&held_path, text).unwrap();
+            let (out, said) = ready("builder-held");
+            assert!(!said && out.contains(unreadable), "{scripts}: {text:?}: {out}");
+        }
         std::fs::write(&held_path, &held).unwrap();
         // Blank lines in the retired list are skipped, as the server skips them.
         let mut text = kept_list.clone();
