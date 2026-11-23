@@ -191,7 +191,16 @@ never on the listener or on a request's thread (answer `a300d75086d5`):
 - **Until it is built,** every Weave endpoint answers 503 with
   `Retry-After: 2` and "reading the Weave records". `weave.js` waits that
   long and asks again, for up to ten minutes, while the reader stays on
-  that page. The view's other pages keep answering throughout.
+  that page. Any other 503 it shows at once. The view's other pages keep
+  answering throughout.
+- **If the re-read fails** (a write half done elsewhere, say), the old
+  snapshot keeps serving the other pages, and its Weave state stays
+  dropped. It is never rebuilt from the old graph against what is on disk
+  now. The Weave endpoints answer 503 with why. The same signature is
+  tried again after 2 s, doubling up to 60 s, and a new signature at once.
+- **If the build panics,** the watcher catches it. The Weave endpoints say
+  so until the replica changes, and the rest of the view keeps
+  refreshing.
 
 Every request reads from that state. Nothing in it is built per line, so a
 Ground with thousands of lines costs a rebuild what its records cost, not
@@ -249,9 +258,9 @@ file into place, is seen at the next poll. This read is the only file access
 in `view_weave.rs`, in one named function. The test in section 8 allows that
 function and refuses any other.
 
-If the state fails to build, the snapshot keeps the Loom's part and the Weave
-endpoints answer 503 with the reason. The view's other pages are never lost
-to a Weave problem.
+If the state can't be had, the snapshot keeps the Loom's part and the Weave
+endpoints answer 503 with the reason, as above. The view's other pages are
+never lost to a Weave problem.
 
 ## 4. The API
 
@@ -288,13 +297,24 @@ conflicts, problems, missing paths and change entries.
   bytes of UTF-8. Its full list is on the item's own page or endpoint. This
   covers:
   - a decision row's `parents`, `proposals`, `resolutions`, `goals`,
-    `answers` and `breakage` in a log, and within each breakage entry its
-    `paths`: 5 of them and their total, counted in that entry's 800 bytes;
+    `answers` and `breakage` in a log;
+  - a policy version's `integrators`, `validators`, `goal_setters`,
+    `checks` and `guardrails.protected`, in `current` and `versions`;
+  - a counted check's `passes`, `fails` and `replaced`;
   - an `Incomplete` problem's missing paths;
   - an objection's answers.
 
-  An endpoint whose items hold such lists (`/api/weave/log`, `list=problems`
-  and `/api/weave/objections`) takes `limit` up to 200, not 2,000.
+  An entry's own lists (a breakage entry's `paths`, a check's `argv`) are
+  bounded the same way, 5 and their total, within the entry's 800 bytes.
+  An endpoint whose items hold such lists (`/api/weave/log`, `list=problems`,
+  `list=current`, `list=versions`, `list=counted`, `list=checks` and
+  `/api/weave/objections`) takes `limit` up to 200, not 2,000.
+- **What is never cut** (finding `80050786bf97`): a record id, a content
+  hash, and a check's name where it is the key a list pages after
+  (`list=counted`, `list=checks`). They are links and cursors. Only free text
+  is cut, and arrays are bounded by count, never by cutting their strings.
+  A row or answer with any string cut carries `"cut": true`, and the page
+  says "(shortened)". The row's own page, or the CLI, has the rest.
 - **So every answer is bounded by its limit times one row's cap, in
   bytes.** The view measures each row as serialized JSON. If it is over its
   cap, the view cuts the row's longest strings further until it fits.
@@ -302,6 +322,8 @@ conflicts, problems, missing paths and change entries.
     most about 4.7 MiB.
   - Any other row is at most 4 KiB, so a page of 2,000 is at most about
     8 MiB.
+  - What is never cut isn't counted against these: an id is 64 bytes, and a
+    check's name is as long as its policy makes it.
 
   These are bytes before `json_bytes`, which can write each one as up to 6
   bytes. So a page is at most about 28 MiB (200 nested rows) or 48 MiB
@@ -310,7 +332,7 @@ conflicts, problems, missing paths and change entries.
 | Endpoint | Gives | Read with |
 |---|---|---|
 | `/api/weave?list&after&limit` | `weave`, marker, root; `lines` (as `weave line list --json`, each with its number of decisions from `logs`); the default line's `heads`, `forked` and green `state`; `problems` (each `Incomplete`'s `missing` as a nested list: 5 paths and its total); `unreadable`; `ignored_versions`. No other line's heads, green or objections: those sort or walk per line (section 3) | `Index::counted_marker`, `root`, `problems`; `Lines::lines`, `default_line`, `unreadable`, `ignored_versions`; `logs`; for the default line, `derived` |
-| `/api/weave/line/<line>?list&after&limit` | current policy versions (several if diverged) with every policy field, every version of the chain (`records`' supersedes relations between `Lines::version`s, by the line's author), `heads`, `green` (as `weave green --json`), `goals` with `binds`, and the number of open objections: exactly the objections `/api/weave/objections/<line>?state=open` lists, which `Lines::open_objections` gives (*Which objections a line has*, below) | `Lines::line`, `current_versions`, `version`; `derived` for `heads`, `Checks::green` and `counted`, and `open_objections`; `reviews::goals`, `Goal::binds` |
+| `/api/weave/line/<line>?list&after&limit` | the one current policy's `checks`, `integrators`, `validators`, `goal_setters` and `protected` in `policy`, each in full by `list=` (null when the policy has diverged: then each current version's lists are nested in `current`); current policy versions (several if diverged) with every policy field, every version of the chain (`records`' supersedes relations between `Lines::version`s, by the line's author), `heads`, `green` (as `weave green --json`), `goals` with `binds`, and the number of open objections: exactly the objections `/api/weave/objections/<line>?state=open` lists, which `Lines::open_objections` gives (*Which objections a line has*, below) | `Lines::line`, `current_versions`, `version`; `derived` for `heads`, `Checks::green` and `counted`, and `open_objections`; `reviews::goals`, `Goal::binds` |
 | `/api/weave/objections/<line>?state&after&limit` | the line's objections (*Which objections a line has*, below), ascending by id, `limit` at most 200; `state` filters (`open`, `other`, `all`). Each has its author, its note (4 KiB) and whether it's retracted now (joined from `Index::reviews` by id). An open one also has its basis and allowed dispositions. Each has `answers`, a nested list of the decisions whose answers name the objection itself: 5 entries of decision and disposition, and the total. Answers that name its target or the line are the same for every objection to that target. So they come once per page, in `target_answers`, keyed by target (5 each, and the total), and `line_answers` is the line's count of line-wide answers. A decision's own page has each answer's full reason | `Lines::objections().list()` with each `Objection`'s target; `Lines::decision_ancestry`; `Index::reviews`; `answers`; `derived` for the line's objection ids and `open_objections` |
 | `/api/weave/log/<line>?after&limit` | decisions newest first, as `weave log --json` rows | `logs`; `Lines::decision` |
 | `/api/weave/decision/<id>?list&after&limit` | the `weave log` row, plus `verdict` (`qualifies`, or the rule's message), `policy` in force, `counted` per check, reviews | `Lines::decision`, `verdict`, `policy_in_force_for`; `Checks::counted`; `Reviews::of_decision` |
@@ -776,6 +798,8 @@ Notes taken:
 |---|---|
 | Manager notes after the delta check: section 4 still said ids and a total; `Basis::Goal`'s goal id; the 4 KiB flat row trims | Section 4 points to section 3's *What is kept*; the goal id is named; the caps table says how a flat row is trimmed |
 | The 10x rebuild passed 10 s (question `91abf8289969`) | Answer `a300d75086d5`, option 1: the state is built lazily on the watcher thread, the old one dropped first, the Weave pages answer 503 with `Retry-After` until it's ready, and it's built at start in the background. The numbers are in section 5 |
+| PR #79 round 1, `9f37a1b9146c`: a failed re-read rebuilt the Weave state from the old graph every poll | It stays dropped and the Weave pages say why; retries back off; a panic in the build is caught (section 3) |
+| PR #79 round 1, `80050786bf97`: row caps cut ids and cursors | Ids, hashes and paged check names are never cut; arrays are bounded by count; cut rows are marked; the line pages its current policy's lists (section 4) |
 
 Round 2's notes are taken too:
 - the scripts count rises to 13;

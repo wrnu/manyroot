@@ -11,11 +11,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use bracken_tree::format::{Guardrails, LINE_MEDIA_TYPE, Line, Record, VERSION};
 use serde_json::Value;
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_bracken");
 const AS: &str = "weave-integrator";
+/// An owner decision's id, as a line's policy cites one.
+const OD: &str = "0123456789abcdef";
 const HOSTILE: &str = "</script><img src=x onerror=alert(1)> & \u{1b}[2K\u{202e}txt.exe \u{2028}\"quoted\"";
 
 /// A throwaway Weave Ground at `<tmp>/g`, fed from a git repository at `<tmp>/repo`.
@@ -89,6 +92,11 @@ impl Weave {
         let first = w.decide(&[("README.md", "hello\n"), ("src/lib.rs", "pub fn a() {}\n")], "first");
         let second = w.decide(&[("odd/x\u{202e}y.txt", "tricky\n")], HOSTILE);
         (w, first, second)
+    }
+
+    /// The id a `--json` command prints under `key`.
+    fn id_of(&self, args: &[&str], key: &str) -> String {
+        self.json(args)[key].as_str().unwrap_or_else(|| panic!("{args:?} prints {key}")).to_owned()
     }
 
     fn main_line(&self) -> String {
@@ -469,4 +477,146 @@ fn the_view_follows_weave_root() {
         assert!(Instant::now() < deadline, "the view didn't see weave-root come back");
         std::thread::sleep(Duration::from_millis(200));
     }
+}
+
+/// Finding 9f37a1b9146c: a re-read that fails leaves the Weave pages unavailable, saying why, and never
+/// rebuilds the Weave state from the old graph against what is on disk now; the other pages keep answering.
+#[test]
+fn a_failed_re_read_leaves_the_weave_pages_unavailable_and_says_why() {
+    let (w, ..) = Weave::with_two_decisions();
+    w.ok(&["id", "new", "val"]);
+    w.ok(&["claim", "a second author", "--as", "val"]);
+    let v = view(&w.ground);
+    assert_eq!(v.api("/api/weave")["weave"], true);
+    // A directory entry naming another's key (as tests/view.rs's a_name_two_keys_claim_is_refused): the
+    // replica no longer reads.
+    let val: Value =
+        serde_json::from_str(&std::fs::read_to_string(w.ground.join("agents/val.json")).expect("val's entry"))
+            .expect("JSON");
+    let forged = serde_json::json!({"name": AS, "agent": val["agent"]});
+    std::fs::write(w.ground.join("agents/mallory.json"), forged.to_string()).expect("writes the entry");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let failed = loop {
+        let r = v.request_once("/api/weave");
+        if r.status == 503 && !String::from_utf8_lossy(&r.body).contains(READING) {
+            break r;
+        }
+        assert!(Instant::now() < deadline, "the Weave pages never said the re-read failed: {}", r.status);
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        failed.json()["error"].as_str().unwrap_or_default().contains("couldn't be read again"),
+        "{}",
+        failed.json()
+    );
+    // Over several polls, the Weave pages stay unavailable: no stale state comes back as 200.
+    let until = Instant::now() + Duration::from_secs(4);
+    while Instant::now() < until {
+        assert_eq!(v.request_once("/api/weave").status, 503, "a stale Weave state was served");
+        assert_eq!(v.request_once("/api/ground").status, 200, "the other pages keep answering");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Finding 80050786bf97: a policy too big for a row keeps its ids whole. Its lists are bounded by count in
+/// a row (5 and the total), and the line pages the current policy's checks in full, by check name.
+#[test]
+fn a_wide_policy_keeps_its_ids_whole_and_pages_its_checks() {
+    let (w, ..) = Weave::with_two_decisions();
+    let long = "x".repeat(300);
+    let checks: Vec<String> = (0..30).map(|i| format!("check{i:02}=run --flag={long} --more={long}")).collect();
+    let mut args = vec!["weave", "line", "create", "wide", "--owner-decision", OD, "--as", AS, "--json"];
+    for c in &checks {
+        args.extend(["--check", c.as_str()]);
+    }
+    let wide = w.id_of(&args, "line");
+    let author = w.json(&["id", "list", "--json"])[0]["agent"].as_str().expect("an agent").to_owned();
+    let v = view(&w.ground);
+    let page = v.api(&format!("/api/weave/line/{wide}"));
+    for row in [&page["current"]["items"][0], &page["versions"]["items"][0]] {
+        assert_eq!(row["version"], wide.as_str(), "the version's id is whole");
+        assert_eq!(row["author"], author.as_str(), "the author's key is whole");
+        assert_eq!(row["checks_total"], 30);
+        assert_eq!(row["checks"].as_array().expect("checks").len(), 5);
+        assert!(serde_json::to_vec(row).expect("JSON").len() <= 24 * 1024, "a nested row is at most 24 KiB");
+    }
+    let listed = v.api(&format!("/api/weave/line/{wide}?list=versions"));
+    assert_eq!(listed["items"][0]["version"], wide.as_str());
+    // The checks, page by page, after each page's last check name.
+    assert_eq!(page["policy"]["checks"]["total"], 30);
+    let mut names = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let q = match &after {
+            Some(a) => format!("?list=checks&limit=7&after={a}"),
+            None => "?list=checks&limit=7".to_owned(),
+        };
+        let got = v.api(&format!("/api/weave/line/{wide}{q}"));
+        for c in got["items"].as_array().expect("items") {
+            assert_eq!(c["argv"][1].as_str().map(str::len), Some(7 + 300), "argv kept whole within its row");
+            names.push(c["check"].as_str().expect("a name").to_owned());
+        }
+        if got["more"] != true {
+            break;
+        }
+        after = names.last().cloned();
+    }
+    let want: Vec<String> = (0..30).map(|i| format!("check{i:02}")).collect();
+    assert_eq!(names, want);
+}
+
+/// Finding e7e9850e4d63: another author's version isn't a line's successor, though the line's author
+/// relates it, as `Lines` (crates/tree/src/lines.rs) chains only the line's author's versions.
+#[test]
+fn another_authors_version_is_not_a_lines_successor() {
+    let (w, ..) = Weave::with_two_decisions();
+    w.ok(&["id", "new", "bob"]);
+    let one = w.id_of(&["weave", "line", "create", "one", "--owner-decision", OD, "--as", AS, "--json"], "line");
+    let two = w.id_of(&["weave", "line", "create", "two", "--owner-decision", OD, "--as", "bob", "--json"], "line");
+    w.ok(&["relate", &two, "supersedes", &one, "--as", AS]);
+    let v = view(&w.ground);
+    let page = v.api(&format!("/api/weave/line/{one}"));
+    assert_eq!(page["versions"]["total"], 1, "{}", page["versions"]);
+    assert_eq!(page["versions"]["items"][0]["version"], one.as_str());
+}
+
+/// Finding 08c43e704dff: a line whose policy has diverged has no single current policy, so its open
+/// objections and a decision's counted checks are null, as the CLI gives, never 0 or [].
+#[test]
+fn a_diverged_policy_gives_null_not_none() {
+    let (w, ..) = Weave::with_two_decisions();
+    let dev = w.id_of(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS, "--json"], "line");
+    let decision =
+        w.id_of(&["weave", "integrate", "--line", "dev", "--as", AS, "--note", "on dev", "--json"], "decision");
+    w.ok(&["weave", "line", "policy", "dev", "--max-known", "1", "--owner-decision", OD, "--as", AS]);
+    // A second successor of the first version, written by hand, diverges the chain.
+    let me = w.json(&["id", "list", "--json"])[0]["agent"].as_str().expect("an agent").to_owned();
+    let other = Line {
+        v: VERSION,
+        name: "dev".into(),
+        integrators: vec![me.parse().expect("a key")],
+        validators: vec![me.parse().expect("a key")],
+        goal_setters: vec![me.parse().expect("a key")],
+        checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
+        guardrails: Guardrails { max_known: 2, max_age: 0, protected: vec![] },
+        owner_decision: Some(OD.into()),
+    };
+    let file = w.tmp.path().join("other.cbor");
+    std::fs::write(&file, other.encode()).expect("writes the policy");
+    let out = w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", LINE_MEDIA_TYPE, "--as", AS]);
+    let other = out.trim().strip_prefix("artifact ").expect("labelled").to_owned();
+    w.ok(&["relate", &other, "supersedes", &dev, "--as", AS]);
+    let cli = w.json(&["weave", "green", "--line", &dev, "--json"]);
+    assert!(cli["heads"][0]["checks"].is_null(), "the CLI's answer: {cli}");
+
+    let v = view(&w.ground);
+    let line = v.api(&format!("/api/weave/line/{dev}"));
+    assert_eq!(line["diverged"], true);
+    assert_eq!(line["current"]["total"], 2);
+    assert!(line["open_objections"].is_null(), "{}", line["open_objections"]);
+    assert!(line["policy"]["checks"].is_null(), "no single current policy to page");
+    let page = v.api(&format!("/api/weave/decision/{decision}"));
+    assert!(page["counted"].is_null(), "{}", page["counted"]);
+    v.refused(&format!("/api/weave/decision/{decision}?list=counted"), 404);
 }

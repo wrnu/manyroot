@@ -88,6 +88,10 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const IO_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often the replica is checked for change, and how often an idle event stream is pinged.
 const POLL: Duration = Duration::from_secs(1);
+/// After a re-read fails, the same signature is tried again after this, doubling up to the most below; a
+/// new signature is tried at once.
+const REREAD_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_REREAD_BACKOFF: Duration = Duration::from_secs(60);
 const PING: Duration = Duration::from_secs(15);
 /// An artifact's text in `/api/contribution`, a tag in `/api/graph`, and a statement in the short
 /// entries of `/api/root` are cut to these.
@@ -489,7 +493,7 @@ fn read_request(stream: &TcpStream, head_timeout: Duration) -> Result<Request, R
     }
     let mut fetch_site = None;
     for h in req.headers.iter().filter(|h| h.name.eq_ignore_ascii_case("sec-fetch-site")) {
-        if fetch_site.replace(String::from_utf8_lossy(h.value).to_ascii_lowercase()).is_some() {
+        if fetch_site.replace(String::from_utf8_lossy(h.value).trim().to_ascii_lowercase()).is_some() {
             return Err(Refused::new(400, "more than one Sec-Fetch-Site"));
         }
     }
@@ -532,14 +536,28 @@ impl Viewer {
     }
 
     /// Re-reads the replica whenever its signature changes, and wakes the event streams. A replica
-    /// that fails to read (a write half done elsewhere, say) is tried again at the next poll.
+    /// that fails to read (a write half done elsewhere, say) is tried again when its signature changes
+    /// again, or after a backoff that doubles from [`REREAD_BACKOFF`] up to [`MAX_REREAD_BACKOFF`].
     fn watch(&self) {
+        // The signature that last failed to read, when it may be tried again, and the backoff after that.
+        let mut failed: Option<(Signature, Instant, Duration)> = None;
         loop {
             // The current snapshot's Weave state, read here and never on a request's thread, so neither
-            // listening nor the other pages wait for it: at start, and after each re-read.
+            // listening nor the other pages wait for it: at start, and after each re-read. A panic in
+            // the build leaves the Weave pages saying so and the rest of the view refreshing.
             let (_, current) = self.snapshot();
-            if current.weave.get().is_none() {
-                current.weave.set(crate::view_weave::Weave::build(current.graph(), &self.dir));
+            if current.weave.reading() {
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::view_weave::Weave::build(current.graph(), &self.dir)
+                }));
+                match built {
+                    Ok(weave) => current.weave.set(weave),
+                    Err(_) => current.weave.fail(
+                        "building the Weave state failed (crates/tree panicked): the Weave pages are \
+                         unavailable until the replica changes"
+                            .to_owned(),
+                    ),
+                }
             }
             drop(current);
             std::thread::sleep(POLL);
@@ -548,6 +566,12 @@ impl Viewer {
             // changes the count again, so the next poll reads again rather than missing it.
             let Ok(now) = signature(&self.dir) else { continue };
             if now == last.signature {
+                continue;
+            }
+            if let Some((sig, retry, _)) = failed
+                && sig == now
+                && Instant::now() < retry
+            {
                 continue;
             }
             // Dropped before the next is read, so the two are never held at once; the Weave pages answer
@@ -559,11 +583,25 @@ impl Viewer {
             });
             match next {
                 Ok(next) => {
+                    failed = None;
                     let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
                     *current = (current.0 + 1, Arc::new(next));
                     self.changed.notify_all();
                 }
-                Err(e) => eprintln!("bracken view: re-reading the replica: {e:#}"),
+                Err(e) => {
+                    eprintln!("bracken view: re-reading the replica: {e:#}");
+                    // `last` keeps serving the other pages; its Weave state is never rebuilt from its graph
+                    // against what is on disk now (finding 9f37a1b9146c). The Weave pages say why.
+                    last.weave.fail(format!(
+                        "the replica changed and couldn't be read again, so the Weave pages are unavailable \
+                         until it can: {e:#}"
+                    ));
+                    let backoff = match failed {
+                        Some((sig, _, b)) if sig == now => (b * 2).min(MAX_REREAD_BACKOFF),
+                        _ => REREAD_BACKOFF,
+                    };
+                    failed = Some((now, Instant::now() + backoff, backoff));
+                }
             }
         }
     }
@@ -684,7 +722,9 @@ impl Viewer {
         }
         let (_, snap) = self.snapshot();
         let since = request.query.get("since").map(String::as_str);
+        // `/api/graph` and `/api/contributions`' limit; the Weave endpoints check their own.
         let limit = match request.query.get("limit").map(|l| l.parse::<usize>()) {
+            _ if crate::view_weave::is_weave(&request.path) => None,
             None => None,
             Some(Ok(n)) if n > 0 => Some(n),
             Some(_) => return error(400, "limit is a whole number, at least 1"),
@@ -700,11 +740,11 @@ impl Viewer {
             "/api/runs" => self.runs.clone().ok_or_else(|| error(404, "this view was started without --runs")),
             "/api/tension" => self.tension_json(&snap, request.query.get("as_of").map(String::as_str)),
             path if crate::view_weave::is_weave(path) => match snap.weave.get() {
-                Some(weave) => {
+                Ok(weave) => {
                     crate::view_weave::route(&weave, snap.graph(), &snap.names, path, &request.query, &self.weave_slots)
                         .map_err(|(status, why)| error(status, why))
                 }
-                None => Err(error(503, "reading the Weave records: try again in a moment")),
+                Err(why) => Err(error(503, why)),
             },
             path => match (path.strip_prefix("/api/contribution/"), path.strip_prefix("/api/root/")) {
                 (Some(id), _) => self.contribution_json(&snap, id),
@@ -1515,6 +1555,18 @@ fn cut_bytes(s: &str, max: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// Independent note 10: past its slots, `try_take` refuses at once, and a slot given back is free again.
+    #[test]
+    fn try_take_refuses_past_its_slots_without_waiting() {
+        let slots = Slots::new(2);
+        let a = slots.try_take().expect("a first slot");
+        let _b = slots.try_take().expect("a second slot");
+        assert!(slots.try_take().is_none(), "a third is refused at once");
+        drop(a);
+        assert!(slots.try_take().is_some(), "a slot given back is free again");
+    }
+
     use super::*;
 
     fn ip(s: &str) -> IpAddr {

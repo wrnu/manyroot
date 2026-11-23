@@ -125,28 +125,61 @@ impl Derived {
     }
 }
 
-/// A snapshot's Weave state: empty until the watcher thread has read it, and emptied again before the
-/// next snapshot's is read, so at most one is held at a time (answer a300d75086d5). A request takes a
-/// counted reference, so a state emptied here is dropped when the last request reading it ends.
+/// A snapshot's Weave state: being read until the watcher thread has built it, and emptied again before
+/// the next snapshot's is read, so at most one is held at a time (answer a300d75086d5). A request takes a
+/// counted reference, so a state emptied here is dropped when the last request reading it ends. If it
+/// can't be had (the replica's re-read failed, or the build panicked) it says why, and nothing rebuilds it
+/// from a graph it wasn't read with (finding 9f37a1b9146c).
 #[derive(Default)]
-pub(crate) struct Cell(Mutex<Option<Arc<Weave>>>);
+pub(crate) struct Cell(Mutex<Held>);
+
+#[derive(Default)]
+enum Held {
+    #[default]
+    Reading,
+    Ready(Arc<Weave>),
+    Failed(String),
+}
+
+/// What a Weave page answers while its state is being read; `weave.js` waits only for this.
+pub(crate) const READING: &str = "reading the Weave records: try again in a moment";
 
 impl Cell {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Arc<Weave>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
         self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// The state, if it has been read.
-    pub(crate) fn get(&self) -> Option<Arc<Weave>> {
-        self.lock().clone()
+    /// The state, or why there is none: [`READING`], or why it failed.
+    pub(crate) fn get(&self) -> Result<Arc<Weave>, String> {
+        match &*self.lock() {
+            Held::Ready(w) => Ok(Arc::clone(w)),
+            Held::Reading => Err(READING.to_owned()),
+            Held::Failed(why) => Err(why.clone()),
+        }
+    }
+
+    /// Whether the watcher has yet to build it.
+    pub(crate) fn reading(&self) -> bool {
+        matches!(*self.lock(), Held::Reading)
     }
 
     pub(crate) fn set(&self, weave: Weave) {
-        *self.lock() = Some(Arc::new(weave));
+        self.put(Held::Ready(Arc::new(weave)));
+    }
+
+    pub(crate) fn fail(&self, why: String) {
+        self.put(Held::Failed(why));
     }
 
     pub(crate) fn clear(&self) {
-        self.lock().take();
+        self.put(Held::Reading);
+    }
+
+    /// Replaces what is held; the old state is dropped after the lock is let go (a large state takes a
+    /// while to free, and no request should wait on that).
+    fn put(&self, next: Held) {
+        let old = std::mem::replace(&mut *self.lock(), next);
+        drop(old);
     }
 }
 
@@ -177,7 +210,10 @@ impl Weave {
         for c in g.iter() {
             if let Body::Relation { from, kind: RelationKind::Supersedes, to, .. } = c.body()
                 && let (Some(new), Some(old)) = (lines.version(from), lines.version(to))
+                // `Lines::build`'s rule (crates/tree/src/lines.rs), which keeps its chain private: the
+                // relation by the old version's author, and the new version by that author too.
                 && c.author() == old.author
+                && new.author == old.author
                 && !g.is_retracted(&c.id())
             {
                 successors.entry(old.id).or_default().push(new.id);
@@ -352,9 +388,75 @@ fn json_size(v: &Value) -> usize {
     serde_json::to_vec(v).map_or(usize::MAX, |b| b.len())
 }
 
-/// `v` within `max` bytes as JSON, if cutting strings can bring it there: its longest strings are cut to
-/// the most bytes each may keep for the whole to fit, so shorter strings are kept whole.
-fn fit(v: Value, max: usize) -> Value {
+/// A string the view never cuts (finding 80050786bf97): a record id or a content hash, which a page links
+/// to or pages after.
+fn kept_whole(s: &str) -> bool {
+    let hex64 = |h: &str| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
+    hex64(s) || s.strip_prefix("blake3:").is_some_and(hex64)
+}
+
+/// Keys whose string values are never cut: a check's name is the key `list=counted` and `list=checks` page
+/// after.
+const WHOLE_KEYS: &[&str] = &["check"];
+
+/// How a string is cut: to at most so many bytes, or so many characters.
+#[derive(Clone, Copy)]
+enum Cap {
+    Bytes(usize),
+    Chars(usize),
+}
+
+/// Cuts every string in `v` to `cap`, on a character boundary, except ids and hashes and the values of
+/// `whole_keys`; whether any was cut.
+fn cut_strings(v: &mut Value, cap: Cap, whole_keys: &[&str]) -> bool {
+    fn walk(v: &mut Value, cap: Cap, whole: bool, keys: &[&str]) -> bool {
+        match v {
+            Value::String(s) if !whole && !kept_whole(s) => {
+                let end = match cap {
+                    Cap::Bytes(max) if s.len() > max => {
+                        let mut end = max;
+                        while !s.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        end
+                    }
+                    Cap::Chars(max) => match s.char_indices().nth(max) {
+                        Some((at, _)) => at,
+                        None => return false,
+                    },
+                    Cap::Bytes(_) => return false,
+                };
+                s.truncate(end);
+                true
+            }
+            Value::Array(a) => a.iter_mut().fold(false, |any, x| walk(x, cap, whole, keys) | any),
+            Value::Object(o) => {
+                o.iter_mut().fold(false, |any, (k, x)| walk(x, cap, keys.contains(&k.as_str()), keys) | any)
+            }
+            _ => false,
+        }
+    }
+    walk(v, cap, false, whole_keys)
+}
+
+/// Marks `v`, an object, as cut, so the page can say so (security note 4 on PR #79).
+fn mark_cut(v: &mut Value, cut: bool) {
+    if cut && let Value::Object(o) = v {
+        o.insert("cut".into(), json!(true));
+    }
+}
+
+/// `v` with every string cut to at most `max` bytes, except those kept whole, and `cut` set if any was.
+fn capped(mut v: Value, max: usize) -> Value {
+    let cut = cut_strings(&mut v, Cap::Bytes(max), WHOLE_KEYS);
+    mark_cut(&mut v, cut);
+    v
+}
+
+/// `v` within `max` bytes as JSON, by cutting its longest strings (never those kept whole) to the most each
+/// may keep for the whole to fit, so shorter strings are kept whole; then whether any was cut. Arrays are
+/// bounded by count before this ([`nest`]), so what can't be cut is ids, hashes, check names and structure.
+fn fitted(v: Value, max: usize, whole_keys: &[&str]) -> (Value, bool) {
     fn longest(v: &Value) -> usize {
         match v {
             Value::String(s) => s.len(),
@@ -364,77 +466,74 @@ fn fit(v: Value, max: usize) -> Value {
         }
     }
     if json_size(&v) <= max {
-        return v;
+        return (v, false);
     }
+    let shrunk = |cap: usize| {
+        let mut w = v.clone();
+        cut_strings(&mut w, Cap::Bytes(cap), whole_keys);
+        w
+    };
     // The largest per-string cap that fits; a cap of 0 is tried last, and kept whether or not it fits.
     let (mut low, mut high) = (0, longest(&v));
     while low < high {
         let mid = (low + high).div_ceil(2);
-        if json_size(&capped(v.clone(), mid)) <= max {
+        if json_size(&shrunk(mid)) <= max {
             low = mid;
         } else {
             high = mid - 1;
         }
     }
-    capped(v, low)
+    let mut v = v;
+    let cut = cut_strings(&mut v, Cap::Bytes(low), whole_keys);
+    (v, cut)
 }
 
-/// `v` with every string cut to at most `max` bytes, on a character boundary.
-fn capped(mut v: Value, max: usize) -> Value {
-    fn cut(v: &mut Value, max: usize) {
-        match v {
-            Value::String(s) if s.len() > max => {
-                let mut end = max;
-                while !s.is_char_boundary(end) {
-                    end -= 1;
-                }
-                s.truncate(end);
-            }
-            Value::Array(a) => a.iter_mut().for_each(|x| cut(x, max)),
-            Value::Object(o) => o.values_mut().for_each(|x| cut(x, max)),
-            _ => {}
-        }
-    }
-    cut(&mut v, max);
+/// [`fitted`], marked `cut` if it was.
+fn fit(v: Value, max: usize) -> Value {
+    // Room for the mark, so a cut row is within `max` with it.
+    let room = if json_size(&v) > max { max.saturating_sub(r#","cut":true"#.len()) } else { max };
+    let (mut v, cut) = fitted(v, room, WHOLE_KEYS);
+    mark_cut(&mut v, cut);
     v
 }
 
-/// `row` with each of its lists named in `keys` cut to [`NESTED`] entries, with `<key>_total` beside it,
-/// and each of those entries cut to [`NESTED_CHARS`] characters a string and [`NESTED_BYTES`] in all. An
-/// entry's own `paths` (a breakage entry's) is cut the same way, with `paths_total` (section 4).
-fn nest(mut row: Value, keys: &[&str]) -> Value {
-    fn short(v: &mut Value) {
-        match v {
-            Value::String(s) => {
-                if let Some((at, _)) = s.char_indices().nth(NESTED_CHARS) {
-                    s.truncate(at);
-                }
-            }
-            Value::Array(a) => a.iter_mut().for_each(short),
-            Value::Object(o) => o.values_mut().for_each(short),
-            _ => {}
-        }
+/// `list` cut to its first `n` entries, with `<key>_total` set in `o`.
+fn bound(o: &mut Map<String, Value>, key: &str, n: usize) {
+    if let Some(Value::Array(list)) = o.get_mut(key) {
+        let total = list.len();
+        list.truncate(n);
+        o.insert(format!("{key}_total"), json!(total));
     }
+}
+
+/// `row` with each of its lists named in `keys` cut to [`NESTED`] entries, with `<key>_total` beside it
+/// (section 4). Each entry's own lists (a breakage entry's `paths`, a check's `argv`) are cut the same way,
+/// with their totals; then each entry is cut to [`NESTED_CHARS`] characters a string and [`NESTED_BYTES`]
+/// in all, never cutting ids, hashes or check names. The row is marked `cut` if any string was.
+fn nest(mut row: Value, keys: &[&str]) -> Value {
+    let mut cut = false;
     if let Value::Object(o) = &mut row {
         for key in keys {
+            bound(o, key, NESTED);
             if let Some(Value::Array(list)) = o.get_mut(*key) {
-                let total = list.len();
-                list.truncate(NESTED);
                 for entry in list.iter_mut() {
-                    if let Value::Object(e) = entry
-                        && let Some(Value::Array(paths)) = e.get_mut("paths")
-                    {
-                        let all = paths.len();
-                        paths.truncate(NESTED);
-                        e.insert("paths_total".into(), json!(all));
+                    if let Value::Object(e) = entry {
+                        let inner: Vec<String> =
+                            e.iter().filter(|(_, x)| x.is_array()).map(|(k, _)| k.clone()).collect();
+                        for k in inner {
+                            bound(e, &k, NESTED);
+                        }
                     }
-                    short(entry);
-                    *entry = fit(std::mem::take(entry), NESTED_BYTES);
+                    // A nested entry is never paged after, so its check names are cut like any text.
+                    cut |= cut_strings(entry, Cap::Chars(NESTED_CHARS), &[]);
+                    let (fitted, more) = fitted(std::mem::take(entry), NESTED_BYTES, &[]);
+                    *entry = fitted;
+                    cut |= more;
                 }
-                o.insert(format!("{key}_total"), json!(total));
             }
         }
     }
+    mark_cut(&mut row, cut);
     row
 }
 
@@ -538,7 +637,9 @@ impl Ctx<'_> {
             let per_head: Vec<_> = heads.iter().map(|h| (*h, checks.counted(self.g, lines, h))).collect();
             let green = green_json(line, &green, &per_head, lines, &checks, self.names);
             drop(checks);
-            let open = if lines.objections().list().is_empty() {
+            // With no objection anywhere, the count is 0, but only for a line with one current policy:
+            // `open_objections` has no answer (null) for a diverged one.
+            let open = if lines.objections().list().is_empty() && lines.current_versions(line).len() == 1 {
                 Some(0)
             } else {
                 lines.open_objections(self.g, &self.s.index, line).map(|o| o.len())
@@ -648,7 +749,11 @@ impl Ctx<'_> {
     }
 
     fn line(&self, given: &str, p: &Paging, query: &HashMap<String, String>) -> Result<Value, Fail> {
-        p.check(&["current", "versions", "goals"], query)?;
+        const POLICY_LISTS: [&str; 5] = ["checks", "integrators", "validators", "goal_setters", "protected"];
+        p.check(
+            &["current", "versions", "goals", "checks", "integrators", "validators", "goal_setters", "protected"],
+            query,
+        )?;
         let line = self.line_of(given)?;
         let lines = &self.s.lines;
         let current = lines.current_versions(&line);
@@ -668,12 +773,68 @@ impl Ctx<'_> {
                    "link": goal.link, "linker": goal.linker.to_string(), "linker_name": self.names.display(&goal.linker),
                    "binds": policy.map(|pol| goal.binds(pol))})
         };
-        let version_row = |v: &ContributionId| self.policy_json(v);
+        // A version as a list row: its own lists nested, 5 and their totals; the current policy's are paged
+        // in full below (finding 80050786bf97).
+        let version_row = |v: &ContributionId| {
+            let mut row = nest(self.policy_json(v), &["integrators", "validators", "goal_setters", "checks"]);
+            if let Some(g) = row.get_mut("guardrails") {
+                *g = nest(std::mem::take(g), &["protected"]);
+                if g.get("cut").is_some() {
+                    row["cut"] = json!(true);
+                }
+            }
+            row
+        };
+        // The one current policy's lists, each paged in full; none when the policy has diverged, where each
+        // current version's lists are nested in `current`.
+        let one = match current.as_slice() {
+            [one] => Some(self.policy_json(one)),
+            _ => None,
+        };
+        let policy_list = |name: &str| -> Vec<Value> {
+            let Some(v) = &one else { return Vec::new() };
+            let list = if name == "protected" { &v["guardrails"]["protected"] } else { &v[name] };
+            list.as_array().cloned().unwrap_or_default()
+        };
+        let policy_key = |name: &'static str| {
+            move |x: &Value| match name {
+                "checks" => x["check"].as_str().unwrap_or_default().to_owned(),
+                "protected" => x.as_str().unwrap_or_default().to_owned(),
+                _ => x["agent"].as_str().unwrap_or_default().to_owned(),
+            }
+        };
+        // A check's argv is bounded by count, as a nested list is, so the row's byte cap cuts only text.
+        let policy_row = |name: &'static str| {
+            move |x: &Value| {
+                let mut x = x.clone();
+                if name == "checks"
+                    && let Value::Object(o) = &mut x
+                {
+                    bound(o, "argv", IN_ANSWER);
+                }
+                x
+            }
+        };
+        let policy_bytes = |name: &str| if name == "checks" { NESTED_ROW_BYTES } else { ROW_BYTES };
         match p.list {
-            Some("current") => return listed("current", &current, |v| v.to_hex(), version_row, ROW_BYTES, p),
-            Some("versions") => return listed("versions", &versions, |v| v.to_hex(), version_row, ROW_BYTES, p),
+            Some(name @ ("current" | "versions")) => {
+                p.nested()?;
+                let list = if name == "current" { &current } else { &versions };
+                return listed(name, list, |v| v.to_hex(), version_row, NESTED_ROW_BYTES, p);
+            }
             Some("goals") => return listed("goals", &all_goals, |g| g.link.to_hex(), goal_row, ROW_BYTES, p),
-            _ => {}
+            Some(name) => {
+                let name = POLICY_LISTS.into_iter().find(|n| *n == name).expect("checked above");
+                if one.is_none() {
+                    return fail(404, "this line's policy has diverged: each current version's lists are in current");
+                }
+                if name == "checks" {
+                    p.nested()?;
+                }
+                let items = policy_list(name);
+                return listed(name, &items, policy_key(name), policy_row(name), policy_bytes(name), p);
+            }
+            None => {}
         }
         let first = lines.line(&line).expect("resolved to a line");
         let (author, author_name) = self.agent(&first.author);
@@ -683,13 +844,21 @@ impl Ctx<'_> {
             "default": lines.default_line() == Some(line),
             "decisions": self.s.logs.get(&line).map_or(0, Vec::len),
             "diverged": current.len() > 1,
-            "current": embedded(&current, ROW_BYTES, version_row),
-            "versions": embedded(&versions, ROW_BYTES, version_row),
+            "current": embedded(&current, NESTED_ROW_BYTES, version_row),
+            "versions": embedded(&versions, NESTED_ROW_BYTES, version_row),
             "goals": embedded(&all_goals, ROW_BYTES, goal_row),
         });
         if let (Value::Object(into), Value::Object(from)) = (&mut v, fields) {
             into.extend(from);
         }
+        let mut policy = Map::new();
+        for name in POLICY_LISTS {
+            let items = policy_list(name);
+            let shown =
+                if one.is_some() { embedded(&items, policy_bytes(name), policy_row(name)) } else { Value::Null };
+            policy.insert(name.into(), shown);
+        }
+        v["policy"] = Value::Object(policy);
         Ok(v)
     }
 
@@ -715,13 +884,28 @@ impl Ctx<'_> {
         };
         let reviews: Vec<(&bracken_tree::ground::Review, Target)> = self.s.reviews.of_decision(lines, &id);
         let review_row = |(r, t): &(&bracken_tree::ground::Review, Target)| review_json(r, t, self.names);
-        let checks = self.s.checks.lock().unwrap_or_else(|p| p.into_inner());
-        let counted = checks.counted(self.g, lines, &id).unwrap_or_default();
-        let counted_row = |c: &bracken_tree::results::Counted| counted_json(c, &checks, self.names);
-        match p.list {
-            Some("counted") => return listed("counted", &counted, |c| c.check.clone(), counted_row, ROW_BYTES, p),
-            Some("reviews") => return listed("reviews", &reviews, |(r, _)| r.id.to_hex(), review_row, ROW_BYTES, p),
-            _ => {}
+        if p.list == Some("reviews") {
+            return listed("reviews", &reviews, |(r, _)| r.id.to_hex(), review_row, ROW_BYTES, p);
+        }
+        // Counted under the line's current policy: none (null) when it has diverged, as `weave green --json`
+        // gives (finding 08c43e704dff). `Checks` is held only to build the rows; each row's results nested.
+        let counted: Option<Vec<(String, Value)>> = {
+            let checks = self.s.checks.lock().unwrap_or_else(|p| p.into_inner());
+            checks.counted(self.g, lines, &id).map(|list| {
+                list.iter()
+                    .map(|c| {
+                        (c.check.clone(), nest(counted_json(c, &checks, self.names), &["passes", "fails", "replaced"]))
+                    })
+                    .collect()
+            })
+        };
+        let counted_row = |(_, row): &(String, Value)| row.clone();
+        if p.list == Some("counted") {
+            p.nested()?;
+            let Some(counted) = &counted else {
+                return fail(404, "this decision's line has no single current policy, so nothing is counted");
+            };
+            return listed("counted", counted, |(check, _)| check.clone(), counted_row, NESTED_ROW_BYTES, p);
         }
         let mut v = decision_json(record, self.names);
         let verdict = match lines.verdict(&id) {
@@ -735,7 +919,10 @@ impl Ctx<'_> {
         more.insert("line".into(), json!(line));
         more.insert("line_name".into(), json!(lines.line(&line).map(|l| l.policy.name.clone())));
         more.insert("policy".into(), json!(lines.policy_in_force_for(&id).map(|v| v.id)));
-        more.insert("counted".into(), embedded(&counted, ROW_BYTES, counted_row));
+        more.insert(
+            "counted".into(),
+            counted.as_ref().map_or(Value::Null, |c| embedded(c, NESTED_ROW_BYTES, counted_row)),
+        );
         more.insert("reviews".into(), embedded(&reviews, ROW_BYTES, review_row));
         if let Value::Object(o) = &mut v {
             o.extend(more);
@@ -844,10 +1031,56 @@ mod tests {
         assert_eq!(fit(small.clone(), ROW_BYTES), small);
     }
 
+    /// Finding 80050786bf97: ids, content hashes and check names are never cut, whatever the cap; arrays in
+    /// a nested entry are bounded by count; and a cut row says so.
+    #[test]
+    fn ids_hashes_and_check_names_are_never_cut() {
+        let id = "ab".repeat(32);
+        let hash = format!("blake3:{}", "cd".repeat(32));
+        let check = "c".repeat(5_000);
+        let mut row = json!({"version": id, "manifest": hash, "check": check, "note": "n".repeat(10_000),
+                             "parents": vec![id.clone(); 9]});
+        row = capped(row, 16);
+        assert_eq!(row["version"], id.as_str());
+        assert_eq!(row["manifest"], hash.as_str());
+        assert_eq!(row["check"], check.as_str());
+        assert_eq!(row["note"].as_str().map(str::len), Some(16));
+        assert_eq!(row["cut"], true);
+        let fitted = fit(json!({"version": id, "note": "n".repeat(10_000)}), 200);
+        assert_eq!(fitted["version"], id.as_str());
+        assert_eq!(fitted["cut"], true);
+        let untouched = fit(json!({"version": id}), ROW_BYTES);
+        assert!(untouched.get("cut").is_none(), "a row within its cap isn't marked");
+        // A check in a nested list: its argv bounded by count, with its total.
+        let nested = nest(json!({"checks": [{"check": "t", "argv": vec!["a"; 40]}]}), &["checks"]);
+        assert_eq!(nested["checks"][0]["argv"].as_array().map(Vec::len), Some(NESTED));
+        assert_eq!(nested["checks"][0]["argv_total"], 40);
+    }
+
+    /// Independent note 10: the derived cache evicts its oldest entries to stay within its bytes, and
+    /// keeps nothing over an entry's cap.
+    #[test]
+    fn derived_evicts_the_oldest_to_stay_within_its_bytes() {
+        let mut d = Derived::default();
+        let entry = |n: usize| json!("x".repeat(n));
+        // Entries of 3 MiB: 10 fit in the 32 MiB.
+        let third = 3 << 20;
+        for k in 0..10 {
+            d.keep(format!("k{k}"), &entry(third));
+        }
+        assert!(d.get("k0").is_some() && d.get("k9").is_some());
+        d.keep("k10".into(), &entry(third));
+        assert!(d.get("k0").is_none(), "the oldest went first");
+        assert!(d.get("k1").is_some() && d.get("k10").is_some());
+        assert!(d.bytes <= DERIVED_BYTES);
+        d.keep("big".into(), &entry(DERIVED_ENTRY_BYTES + 1));
+        assert!(d.get("big").is_none(), "an entry over its cap isn't kept");
+    }
+
     #[test]
     fn strings_are_cut_on_a_character_boundary() {
         let v = capped(json!({"a": ["ééé", {"b": "abcdef"}], "n": 7}), 3);
-        assert_eq!(v, json!({"a": ["é", {"b": "abc"}], "n": 7}));
+        assert_eq!(v, json!({"a": ["é", {"b": "abc"}], "n": 7, "cut": true}));
     }
 
     #[test]

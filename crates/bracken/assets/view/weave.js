@@ -40,6 +40,22 @@
     return out;
   }
 
+  /**
+   * A text's first line, at most `max` characters: common.js's firstLine() without its plain(), which would
+   * strip the bidi controls before shown() could mark them (finding 2a8558fd62c8).
+   */
+  function firstLine(value, max) {
+    const line = String(value || "").split(/\r\n|[\n\r\u0085\u2028\u2029]/)[0];
+    const chars = Array.from(line);
+    return chars.length > max ? chars.slice(0, max - 1).join("") + "…" : line;
+  }
+
+  /** Says a record's text was shortened here; its own page, or the CLI, has the rest. */
+  const cutMark = (x) => (x && x.cut ? h("span", { class: "muted" }, "(shortened)") : null);
+
+  /** A list's full count: its `<key>_total` where the answer cut it to a few, else its length. */
+  const count = (list, all) => (typeof all === "number" ? all : list.length);
+
   const short = (id) => String(id).slice(0, 12);
   const who = (key, name) => name || `~${String(key).slice(0, 8)}`;
 
@@ -68,29 +84,28 @@
   let shownRoute = 0;
 
   // While the view reads the Weave records (at start, and after the replica changes) its Weave pages
-  // answer 503 with a Retry-After: wait that long and ask again, for up to ten minutes, unless the reader
-  // has moved to another page meanwhile.
+  // answer 503 with a Retry-After and this reason: wait that long and ask again, for up to ten minutes,
+  // unless the reader has moved to another page meanwhile. Any other 503 is shown as it is.
+  const READING = "reading the Weave records";
   const WAIT_AT_MOST_MS = 10 * 60 * 1000;
   const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
   async function api(path) {
     const mine = shownRoute;
     const until = Date.now() + WAIT_AT_MOST_MS;
-    let r = await fetch(path, { headers: { Accept: "application/json" } });
-    while (r.status === 503 && r.headers.get("Retry-After") && Date.now() < until && mine === shownRoute) {
-      const seconds = Math.min(Math.max(Number(r.headers.get("Retry-After")) || 2, 1), 30);
-      await sleep(seconds * 1000);
-      if (mine !== shownRoute) break;
-      r = await fetch(path, { headers: { Accept: "application/json" } });
-    }
-    if (!r.ok) {
+    for (;;) {
+      const r = await fetch(path, { headers: { Accept: "application/json" } });
+      if (r.ok) return r.json();
       let message = `${r.status}`;
       try {
         message = (await r.json()).error || message;
       } catch (_) {}
-      throw new Error(message);
+      const reading = r.status === 503 && message.startsWith(READING) && r.headers.get("Retry-After");
+      if (!reading || Date.now() >= until || mine !== shownRoute) throw new Error(message);
+      const seconds = Math.min(Math.max(Number(r.headers.get("Retry-After")) || 2, 1), 30);
+      await sleep(seconds * 1000);
+      if (mine !== shownRoute) throw new Error("left this page");
     }
-    return r.json();
   }
 
   function query(params) {
@@ -153,19 +168,23 @@
     return { one: "green", none: "no green decision yet", ambiguous: "green is ambiguous", undefined: "undefined: the policy has diverged" }[green.state] || green.state;
   }
 
+  /** One check's counted results, as a row: from `weave green --json`, or a decision's nested row. */
+  function checkRow(c) {
+    const [passes, fails, replaced] = [count(c.passes, c.passes_total), count(c.fails, c.fails_total), count(c.replaced, c.replaced_total)];
+    return h("li", { class: c.green ? "green" : fails ? "failing" : "" }, h("span", { class: "sc" }, shown(c.check)), c.green ? "green" : "not green",
+      passes ? h("span", { class: "pass" }, `${passes} pass`) : null,
+      fails ? h("span", { class: "fail" }, `${fails} fail`) : null,
+      replaced ? h("span", { class: "muted" }, `${replaced} replaced by a later attempt`) : null,
+      !passes && !fails ? h("span", { class: "muted" }, "no counted result") : null,
+      cutMark(c));
+  }
+
+  /** Counted checks: `checks` is null when there's no single current policy, so nothing is counted. */
   function checkRows(checks) {
     if (!checks) return h("p", { class: "muted" }, "No current policy, so nothing is counted.");
     if (!checks.length) return h("p", { class: "muted" }, "The policy names no checks.");
     const ul = h("ul", { class: "rows" });
-    for (const c of checks) {
-      const tally = [
-        c.passes.length ? h("span", { class: "pass" }, `${c.passes.length} pass`) : null,
-        c.fails.length ? h("span", { class: "fail" }, `${c.fails.length} fail`) : null,
-        c.replaced.length ? h("span", { class: "muted" }, `${c.replaced.length} replaced by a later attempt`) : null,
-        !c.passes.length && !c.fails.length ? h("span", { class: "muted" }, "no counted result") : null,
-      ];
-      ul.append(h("li", { class: c.green ? "green" : c.fails.length ? "failing" : "" }, h("span", { class: "sc" }, shown(c.check)), c.green ? "green" : "not green", ...tally));
-    }
+    for (const c of checks) ul.append(checkRow(c));
     return ul;
   }
 
@@ -173,8 +192,8 @@
 
   async function home() {
     const w = await api("/api/weave");
-    if (!w.weave) return [h("h2", {}, "No Weave records here"), h("p", { class: "lede" }, shown(w.why))];
     $("data-note").textContent = "";
+    if (!w.weave) return [h("h2", {}, "No Weave records here"), h("p", { class: "lede" }, shown(w.why))];
     const out = [h("h2", {}, "Lines")];
     out.push(facts([
       ["marker", h("span", { class: "id" }, shown(short(w.marker)))],
@@ -196,30 +215,61 @@
         h("span", { class: "num" }, `${l.decisions} decisions`),
         l.reach !== "name" ? h("span", { class: "muted" }, l.reach === "id_only" ? "reached by id only" : "its name is shared") : null);
     out.push(...section("Every line", pagedList(w.lines, (l) => l.line, lineRow, (after) => api(`/api/weave?${query({ list: "lines", after, limit: PAGE })}`))));
-    if (w.problems.total || w.unreadable.total) {
-      const problemRow = (p) => h("li", { class: "problem" }, shown(p.text));
-      out.push(...section("What weave check would list", pagedList(w.problems, (p) => String(p.at), problemRow, (after) => api(`/api/weave?${query({ list: "problems", after, limit: PAGE })}`))));
+    // What `weave check` lists: the index's problems, the records that couldn't be read, and the policy
+    // versions that count for nothing (finding 48a5414cb94e).
+    if (w.problems.total || w.unreadable.total || w.ignored_versions.total) {
+      out.push(h("h3", {}, "What weave check would list"));
+      const more = (list) => (after) => api(`/api/weave?${query({ list, after, limit: PAGE })}`);
+      if (w.problems.total) {
+        const problemRow = (p) => h("li", { class: "problem" }, shown(p.text), cutMark(p));
+        out.push(h("p", { class: "muted" }, "Problems in the records"), pagedList(w.problems, (p) => String(p.at), problemRow, more("problems")));
+      }
+      if (w.unreadable.total) {
+        const unreadableRow = (u) => h("li", { class: "problem" }, h("span", { class: "sc" }, shown(u.kind)), h("span", { class: "id" }, short(u.id)), h("span", {}, shown(u.why)), cutMark(u));
+        out.push(h("p", { class: "muted" }, "Records that can't be read"), pagedList(w.unreadable, (u) => u.id, unreadableRow, more("unreadable")));
+      }
+      if (w.ignored_versions.total) {
+        const ignoredRow = (id) => h("li", { class: "problem" }, h("span", { class: "id" }, short(id)), h("span", { class: "muted" }, "a policy version that counts for nothing"));
+        out.push(h("p", { class: "muted" }, "Ignored policy versions"), pagedList(w.ignored_versions, (id) => id, ignoredRow, more("ignored_versions")));
+      }
     }
     return out;
   }
 
-  function policyFacts(v) {
+  const checkDef = (c) => h("li", {}, h("span", { class: "sc" }, shown(c.check)), h("span", { class: "argv" }, shown(c.argv.join(" "))),
+    count(c.argv, c.argv_total) > c.argv.length ? h("span", { class: "muted" }, `(${count(c.argv, c.argv_total)} arguments in all)`) : null,
+    c.executor ? h("span", { class: "muted" }, shown(`runs as ${c.executor.kind}`)) : null, cutMark(c));
+  const agentRow = (a) => h("li", {}, shown(who(a.agent, a.name)));
+
+  /**
+   * A policy version. `lists`, for the line's one current policy, pages each of its lists in full;
+   * otherwise each shows the 5 the version's row carries, and how many there are.
+   */
+  function policyFacts(v, lists, lineId) {
     if (!v) return h("p", { class: "muted" }, "No policy version.");
-    const agents = (list) => (list.length ? h("span", {}, shown(list.map((a) => who(a.agent, a.name)).join(", "))) : null);
-    const checks = h("ul", { class: "rows" });
-    for (const c of v.checks) checks.append(h("li", {}, h("span", { class: "sc" }, shown(c.check)), h("span", { class: "argv" }, shown(c.argv.join(" "))), c.executor ? h("span", { class: "muted" }, shown(`runs as ${c.executor.kind}`)) : null));
-    if (!v.checks.length) checks.append(h("li", { class: "muted" }, "none"));
+    const listOf = (key, row, keyOf) => {
+      if (lists && lists[key]) return pagedList(lists[key], keyOf, row, (after) => api(`/api/weave/line/${lineId}?${query({ list: key, after, limit: PAGE })}`));
+      const totals = { integrators: v.integrators_total, validators: v.validators_total, goal_setters: v.goal_setters_total, checks: v.checks_total };
+      const items = key === "protected" ? v.guardrails.protected : v[key];
+      const all = key === "protected" ? count(v.guardrails.protected, v.guardrails.protected_total) : count(v[key], totals[key]);
+      const ul = h("ul", { class: "rows" });
+      for (const x of items) ul.append(row(x));
+      if (!items.length) ul.append(h("li", { class: "muted" }, "none"));
+      return h("div", {}, ul, all > items.length ? h("p", { class: "muted" }, `${items.length} of ${all} shown`) : null);
+    };
     return h("div", {},
       facts([
         ["version", h("span", { class: "id" }, short(v.version))],
         ["by", shown(who(v.author, v.author_name))],
-        ["integrators", agents(v.integrators)],
-        ["validators", agents(v.validators)],
-        ["goal setters", agents(v.goal_setters)],
-        ["guardrails", shown(`at most ${v.guardrails.max_known} known breakage, ${v.guardrails.max_age} moves old` + (v.guardrails.protected.length ? `; protected: ${v.guardrails.protected.join(", ")}` : ""))],
+        ["guardrails", shown(`at most ${v.guardrails.max_known} known breakage, ${v.guardrails.max_age} moves old`)],
         ["owner decision", v.owner_decision === null ? null : h("span", { class: "id" }, shown(v.owner_decision))],
       ]),
-      h("h3", {}, "Checks"), checks);
+      cutMark(v),
+      h("h3", {}, "Integrators"), listOf("integrators", agentRow, (a) => a.agent),
+      h("h3", {}, "Validators"), listOf("validators", agentRow, (a) => a.agent),
+      h("h3", {}, "Goal setters"), listOf("goal_setters", agentRow, (a) => a.agent),
+      h("h3", {}, "Protected paths"), listOf("protected", (p) => h("li", { class: "argv" }, shown(p)), (p) => p),
+      h("h3", {}, "Checks"), listOf("checks", checkDef, (c) => c.check));
   }
 
   function decisionRow(d) {
@@ -227,14 +277,14 @@
       go("decision", d.decision),
       h("span", { class: "muted" }, shown(`by ${who(d.author, d.author_name)}`)),
       d.source ? h("span", { class: "id" }, shown(`git ${String(d.source.git).slice(0, 12)}`)) : null,
-      d.parents.length > 1 ? h("span", { class: "muted" }, `merges ${d.parents.length}`) : null,
-      d.note ? h("span", { class: "note" }, shown(B.firstLine(d.note, 200))) : null);
+      count(d.parents, d.parents_total) > 1 ? h("span", { class: "muted" }, `merges ${count(d.parents, d.parents_total)}`) : null,
+      cutMark(d),
+      d.note ? h("span", { class: "note" }, shown(firstLine(d.note, 200))) : null);
   }
 
   async function line(id) {
     const l = await api(`/api/weave/line/${id}`);
     $("data-note").textContent = "";
-    const policy = l.current.items[0];
     const out = [h("h2", {}, shown(l.name)),
       h("p", { class: "lede" }, shown(`A line by ${who(l.author, l.author_name)}${l.default ? ", the default line" : ""}. ${l.decisions} decisions.`))];
     out.push(facts([
@@ -244,13 +294,23 @@
       ["green", stateWord(l.green)],
       ["open objections", l.open_objections === null ? null : String(l.open_objections)],
     ]));
-    if (l.green && l.green.heads.length) out.push(...section("Checks on the head", checkRows(l.green.heads[0].checks)));
-    out.push(...section(l.diverged ? "Current policy (diverged: its author settles it)" : "Current policy", policyFacts(policy)));
+    // Each head's counted checks: a forked line has several (independent note 1).
+    for (const head of l.green ? l.green.heads : []) {
+      const title = l.green.heads.length > 1 ? `Checks on head ${short(head.decision)}` : "Checks on the head";
+      out.push(...section(title, checkRows(head.checks)));
+    }
+    // Every current version: several when the policy has diverged (independent note 2).
+    if (l.diverged) {
+      out.push(...section("Current policy (diverged: its author settles it)", h("p", { class: "muted" }, `${l.current.total} current versions`)));
+      for (const v of l.current.items) out.push(policyFacts(v, null, id));
+    } else {
+      out.push(...section("Current policy", policyFacts(l.current.items[0], l.policy, id)));
+    }
     const log = await api(`/api/weave/log/${id}?${query({ limit: PAGE })}`);
     out.push(...section("Decisions, newest first", pagedList(log, (d) => d.decision, decisionRow, (after) => api(`/api/weave/log/${id}?${query({ after, limit: PAGE })}`))));
-    const goalRow = (g) => h("li", { class: g.binds ? "green" : "" }, h("span", { class: "statement" }, shown(g.statement)), h("span", { class: "muted" }, shown(`by ${who(g.author, g.author_name)}${g.binds ? ", binds" : ", doesn't bind"}`)));
+    const goalRow = (g) => h("li", { class: g.binds ? "green" : "" }, h("span", { class: "statement" }, shown(g.statement)), h("span", { class: "muted" }, shown(`by ${who(g.author, g.author_name)}${g.binds ? ", binds" : ", doesn't bind"}`)), cutMark(g));
     out.push(...section("Goals", pagedList(l.goals, (g) => g.link, goalRow, (after) => api(`/api/weave/line/${id}?${query({ list: "goals", after, limit: PAGE })}`))));
-    const versionRow = (v) => h("li", {}, h("span", { class: "id" }, short(v.version)), h("span", { class: "muted" }, shown(`${v.name}, by ${who(v.author, v.author_name)}`)));
+    const versionRow = (v) => h("li", {}, h("span", { class: "id" }, short(v.version)), h("span", { class: "muted" }, shown(`${v.name}, by ${who(v.author, v.author_name)}`)), cutMark(v));
     out.push(...section("Policy versions", pagedList(l.versions, (v) => v.version, versionRow, (after) => api(`/api/weave/line/${id}?${query({ list: "versions", after, limit: PAGE })}`))));
     return out;
   }
@@ -270,8 +330,12 @@
       ["proposals", d.proposals.length ? h("span", { class: "id" }, shown(d.proposals.map(short).join(" "))) : null],
       ["resolutions", d.resolutions.length ? h("span", { class: "id" }, shown(d.resolutions.map(short).join(" "))) : null],
     ]));
+    if (d.cut) out.push(h("p", { class: "muted" }, "Some text on this page is shortened to 64 KiB; the CLI has it in full."));
     if (d.note) out.push(...section("The integrator's note", h("p", { class: "text" }, shown(d.note))));
-    out.push(...section("Checks, counted under the line's current policy", checkRows(d.counted.items)));
+    const counted = d.counted === null ? checkRows(null)
+      : d.counted.total === 0 ? checkRows([])
+      : pagedList(d.counted, (c) => c.check, checkRow, (after) => api(`/api/weave/decision/${id}?${query({ list: "counted", after, limit: PAGE })}`));
+    out.push(...section("Checks, counted under the line's current policy", counted));
     if (d.breakage.length) {
       const ul = h("ul", { class: "rows" });
       for (const b of d.breakage) ul.append(h("li", { class: "failing" }, h("span", { class: "sc" }, shown(b.check)), h("span", {}, shown(b.detail)), b.paths.length ? h("span", { class: "argv" }, shown(b.paths.join(", "))) : null));
@@ -282,7 +346,7 @@
       for (const a of d.answers) ul.append(h("li", {}, h("span", { class: "id" }, short(a.objection)), h("span", { class: "sc" }, shown(a.disposition)), h("span", { class: "note" }, shown(a.reason))));
       out.push(...section("Objections it answers", ul));
     }
-    const reviewRow = (r) => h("li", { class: r.kind === "objection" ? "failing" : "green" }, h("span", { class: "sc" }, r.kind), h("span", { class: "muted" }, shown(`by ${who(r.author, r.author_name)}`)), h("span", { class: "note" }, shown(r.note)));
+    const reviewRow = (r) => h("li", { class: r.kind === "objection" ? "failing" : "green" }, h("span", { class: "sc" }, r.kind), h("span", { class: "muted" }, shown(`by ${who(r.author, r.author_name)}`)), cutMark(r), h("span", { class: "note" }, shown(r.note)));
     out.push(...section("Reviews", pagedList(d.reviews, (r) => r.review, reviewRow, (after) => api(`/api/weave/decision/${id}?${query({ list: "reviews", after, limit: PAGE })}`))));
     return out;
   }
@@ -301,6 +365,7 @@
       body = [h("h2", {}, "This page can't be shown"), h("p", { class: "problem" }, shown(e.message))];
     }
     if (mine !== shownRoute) return; // a later route won
+    $("data-note").textContent = "";
     if (r.name !== "home") body.unshift(h("p", {}, go("home", "0".repeat(64), "All lines")));
     page.replaceChildren(...body.flat());
     window.scrollTo(0, 0);
