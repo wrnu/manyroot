@@ -199,9 +199,15 @@ a:hover {
 }
 .masthead nav {
   display: flex;
-  gap: 1.1rem;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.45rem 1.1rem;
   margin-left: auto;
   font-size: 0.95rem;
+}
+.masthead nav a {
+  white-space: nowrap;
+  padding-bottom: 0.12rem;
 }
 .masthead nav a[aria-current="page"] {
   text-decoration: none;
@@ -211,6 +217,10 @@ a:hover {
 .masthead nav a:not([aria-current]) {
   color: var(--root-dim);
   text-decoration: none;
+}
+.masthead .theme-toggle {
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .synthetic {
@@ -280,11 +290,11 @@ button:disabled {
 @media (max-width: 760px) {
   .masthead {
     flex-wrap: wrap;
-    gap: 0.4rem 1rem;
-    padding: 0.8rem 1rem;
+    gap: 0.35rem 0.75rem;
+    padding: 0.55rem 0.85rem;
   }
   .masthead h1 {
-    font-size: 1.25rem;
+    font-size: 1.2rem;
   }
   .masthead .synthetic {
     display: none;
@@ -292,6 +302,13 @@ button:disabled {
   .masthead nav {
     margin-left: 0;
     width: 100%;
+    gap: 0.35rem 0.75rem;
+    font-size: 0.86rem;
+  }
+  .masthead .theme-toggle {
+    margin-left: auto;
+    font-size: 0.76rem;
+    padding: 0.16rem 0.55rem;
   }
 }
 

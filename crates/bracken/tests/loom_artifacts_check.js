@@ -166,13 +166,14 @@ async function runLoom(fixture, hash = "", canvasHeight = 760) {
   for (const id of [
     "ground-name", "data-note", "agents", "labels", "tether", "hover-label", "side",
     "window", "surface", "surface-time", "flag", "to-flag", "play", "speed",
-    "axis-time", "axis-causal", "key",
+    "axis-time", "axis-causal", "zoom-in", "zoom-out", "zoom-reset", "key",
   ]) reg(id);
   const nav = new MockNode("nav");
   const docListeners = {};
   const winListeners = {};
   const navigated = [];
 
+  let nowMs = 1000;
   const sandbox = {
     console,
     Math,
@@ -195,7 +196,7 @@ async function runLoom(fixture, hash = "", canvasHeight = 760) {
     Node: MockNode,
     Path2D: class Path2D { constructor(d) { this._d = d; } },
     CustomEvent: class CustomEvent { constructor(type, init) { this.type = type; this.detail = init?.detail; } },
-    performance: { now: () => 1000 },
+    performance: { now: () => nowMs },
     setTimeout: () => 0,
     requestAnimationFrame: (fn) => { fn(1016); return 1; },
     cancelAnimationFrame: () => {},
@@ -242,6 +243,7 @@ async function runLoom(fixture, hash = "", canvasHeight = 760) {
     navigated,
     location: sandbox.location,
     dispatchWin: (ev) => { for (const fn of winListeners[ev] || []) fn(); },
+    advanceTime: (ms) => { nowMs += ms; },
     Bracken: vm.runInContext("Bracken", ctx),
   };
 }
@@ -431,7 +433,7 @@ function makeSmallOverlapFixture() {
 async function main() {
   // 1. Dense mode: all 4 artifact statuses drawn with artifact nodule shape, readable size, AFTER blooms.
   const dense = makeDenseFixture();
-  const { byId, loomCanvas, navigated, location, dispatchWin, Bracken } = await runLoom(dense);
+  const { byId, loomCanvas, navigated, location, dispatchWin, advanceTime, Bracken } = await runLoom(dense);
   const ops = loomCanvas._ops;
   const artShape = Bracken.SHAPES.artifact;
   const bloomIndices = ops.map((o, idx) => (o.op === "fillRect" && o.w === 2 && o.h === 2 ? idx : -1)).filter((i) => i >= 0);
@@ -691,7 +693,52 @@ async function main() {
     `expected negative-Y edge to clamp into band 0 (1 bundle total), got ${tallBeziers.length}: ${JSON.stringify(tallBeziers)}`
   );
 
-  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, safe text preview, pinned ancestry, clickable lineage, hashchange, dense ancestry threshold, and negative-Y band clamp all pass.");
+  // 11. Zoom controls (+/-/Reset), touch double-tap + pinch zoom, and .side close button.
+  const zIn = byId.get("zoom-in"), zOut = byId.get("zoom-out"), zReset = byId.get("zoom-reset");
+  assert.strictEqual(zOut.disabled, true, "zoom-out should start disabled when unzoomed");
+  assert.strictEqual(zReset.disabled, true, "zoom-reset should start disabled when unzoomed");
+  assert.strictEqual(zIn.disabled, false, "zoom-in should be enabled once loaded");
+  zIn.dispatch("click", {});
+  assert.strictEqual(zOut.disabled, false, "clicking zoom-in should enable zoom-out");
+  assert.strictEqual(zReset.disabled, false, "clicking zoom-in should enable zoom-reset");
+  zReset.dispatch("click", {});
+  assert.strictEqual(zOut.disabled, true, "clicking zoom-reset should disable zoom-out");
+  assert.strictEqual(zReset.disabled, true, "clicking zoom-reset should disable zoom-reset");
+
+  // Touch double-tap zooms in, and a second double-tap resets zoom.
+  advanceTime(500);
+  win.dispatch("pointerdown", { pointerType: "touch", pointerId: 1, clientX: 200, clientY: 300 });
+  win.dispatch("pointerup", { pointerType: "touch", pointerId: 1, clientX: 200, clientY: 300 });
+  advanceTime(120);
+  win.dispatch("pointerdown", { pointerType: "touch", pointerId: 2, clientX: 204, clientY: 302 });
+  win.dispatch("pointerup", { pointerType: "touch", pointerId: 2, clientX: 204, clientY: 302 });
+  assert.strictEqual(zReset.disabled, false, "touch double-tap should zoom in");
+  advanceTime(500);
+  win.dispatch("pointerdown", { pointerType: "touch", pointerId: 3, clientX: 200, clientY: 300 });
+  win.dispatch("pointerup", { pointerType: "touch", pointerId: 3, clientX: 200, clientY: 300 });
+  advanceTime(120);
+  win.dispatch("pointerdown", { pointerType: "touch", pointerId: 4, clientX: 202, clientY: 301 });
+  win.dispatch("pointerup", { pointerType: "touch", pointerId: 4, clientX: 202, clientY: 301 });
+  assert.strictEqual(zReset.disabled, true, "second touch double-tap should reset zoom");
+
+  // Touch two-finger pinch out zooms in.
+  advanceTime(500);
+  win.dispatch("pointerdown", { pointerType: "touch", pointerId: 10, clientX: 200, clientY: 260 });
+  win.dispatch("pointerdown", { pointerType: "touch", pointerId: 11, clientX: 200, clientY: 340 });
+  win.dispatch("pointermove", { pointerType: "touch", pointerId: 11, clientX: 200, clientY: 460 });
+  win.dispatch("pointerup", { pointerType: "touch", pointerId: 10, clientX: 200, clientY: 260 });
+  win.dispatch("pointerup", { pointerType: "touch", pointerId: 11, clientX: 200, clientY: 460 });
+  assert.strictEqual(zReset.disabled, false, "touch pinch-out should zoom in");
+  zReset.dispatch("click", {});
+
+  // Selecting a knot renders .side-close and clicking it closes/deselects cleanly.
+  const closeBtn = side.querySelector(".side-close");
+  assert(closeBtn, "selected knot specimen card must render .side-close button");
+  closeBtn.dispatch("click", {});
+  assert(side.textContent.includes("Hover a knot"), "clicking .side-close must deselect and show hint");
+  assert(!hasAncestryVeil(), "clicking .side-close must clear pinned ancestry");
+
+  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, safe text preview, pinned ancestry, clickable lineage, hashchange, dense ancestry threshold, negative-Y band clamp, zoom controls, touch zoom, and side close all pass.");
 }
 
 main().catch((err) => {

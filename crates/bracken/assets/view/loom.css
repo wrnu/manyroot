@@ -2,6 +2,7 @@
 
 .loom-page {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto 1fr auto;
   height: 100vh;
   overflow: hidden;
@@ -279,9 +280,33 @@
   height: 1.3rem;
   background: var(--stratum-line);
 }
-.segmented {
+.segmented,
+.zoom-controls {
   display: inline-flex;
+  align-items: center;
   gap: 0.25rem;
+}
+.zoom-controls button {
+  min-width: 1.85rem;
+  padding: 0.22rem 0.55rem;
+}
+.side-close {
+  margin-left: auto;
+  min-width: 1.75rem;
+  min-height: 1.75rem;
+  padding: 0 0.4rem;
+  font-size: 1rem;
+  line-height: 1;
+  color: var(--root-dim);
+  background: transparent;
+  border-color: transparent;
+}
+.side-close:hover {
+  color: var(--root);
+  border-color: var(--stratum-line);
+}
+#loom-canvas {
+  touch-action: none;
 }
 .speed {
   display: inline-flex;
@@ -350,6 +375,45 @@
   }
   .side:has(.side-hint) {
     display: none;
+  }
+}
+@media (max-width: 760px) {
+  .controls {
+    min-width: 0;
+    max-width: 100%;
+    gap: 0.35rem 0.45rem;
+    padding: 0.42rem 0.65rem;
+    font-size: 0.8rem;
+  }
+  .controls .divider {
+    display: none;
+  }
+  .controls button,
+  .controls select {
+    padding: 0.18rem 0.55rem;
+    font-size: 0.78rem;
+  }
+  .controls .zoom-controls button {
+    min-width: 1.6rem;
+    padding: 0.16rem 0.45rem;
+  }
+  .controls .key {
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+    margin-left: 0;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    gap: 0.2rem;
+    padding-bottom: 0.08rem;
+  }
+  .controls .key-btn,
+  .controls .key-group {
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+  .side {
+    padding: 0.85rem 0.9rem;
   }
 }
 
