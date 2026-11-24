@@ -242,11 +242,12 @@ function makeDenseFixture() {
   const ids = [], kind = [], author = [], parents = [], time = [], depth = [], tags = [];
   const t0 = 1793000000000;
   // Four artifacts on author 0 at distinct vertical bands, each sharing its exact timestamp with claims.
+  const HOSTILE_TEXT = "<script>alert(1)</script><img src=x onerror=alert(1)>\nline 2";
   const artifacts = new Map([
-    [100, { name: "docs/pending.md", media_type: "text/markdown", size: 16055, status: "pending" }],
-    [1500, { name: "docs/accepted.md", media_type: "text/markdown", size: 2048, status: "accepted" }],
-    [3000, { name: "docs/rejected.md", media_type: "text/plain", size: 512, status: "rejected" }],
-    [4500, { name: "docs/retracted.md", media_type: "text/plain", size: 99, status: "retracted" }],
+    [100, { name: "docs/pending.md", media_type: "text/markdown", size: 16055, status: "pending", text: HOSTILE_TEXT, truncated: false }],
+    [1500, { name: "docs/accepted.md", media_type: "text/markdown", size: 80000, status: "accepted", text: "truncated body", truncated: true }],
+    [3000, { name: "docs/rejected.md", media_type: "application/octet-stream", size: 512, status: "rejected", text: null, truncated: false }],
+    [4500, { name: "docs/retracted.md", media_type: "text/plain", size: 0, status: "retracted", text: "", truncated: false }],
   ]);
   const statuses = {};
   const retracts = [];
@@ -315,7 +316,13 @@ function makeDenseFixture() {
             parents: [ids[idx - 1]],
             timestamp_ms: time[idx],
             retracted: art.status === "retracted",
-            body: { name: art.name, media_type: art.media_type, size: art.size, text: "sample" },
+            body: {
+              name: art.name,
+              media_type: art.media_type,
+              size: art.size,
+              text: art.text,
+              ...(art.truncated ? { text_truncated: true } : {}),
+            },
             assessment: {
               id,
               status: art.status,
@@ -507,7 +514,34 @@ async function main() {
   for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
   assert(byId.get("side").textContent.includes("docs/pending.md"), `expected Prev jump to return to docs/pending.md, got: ${byId.get("side").textContent}`);
 
-  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, and artifact jump all pass.");
+  // 8. Artifact text preview: collapsed by default, renders hostile text strictly as #text (never HTML),
+  // shows truncation note at 64 KiB, resets on selection change, and handles binary (text: null).
+  const toggle1 = side.querySelector(".preview-toggle");
+  assert(toggle1, "missing artifact content preview toggle button");
+  assert.strictEqual(toggle1.getAttribute("aria-pressed"), "false", "preview should start collapsed");
+  assert.strictEqual(side.querySelector(".artifact-preview"), null, "preview body should be hidden while collapsed");
+  toggle1.dispatch("click", {});
+  const previewBox = side.querySelector(".artifact-preview");
+  assert(previewBox, "clicking Show content should render .artifact-preview");
+  assert.strictEqual(previewBox.children.length, 1, "preview should contain a single #text node");
+  assert.strictEqual(previewBox.children[0].tag, "#text", "artifact content must be inserted as a text node, never HTML");
+  assert(
+    previewBox.textContent.includes("<script>alert(1)</script><img src=x onerror=alert(1)>"),
+    `expected verbatim literal markup text in preview, got: ${JSON.stringify(previewBox.textContent)}`
+  );
+  // Jumping to the next artifact (docs/accepted.md, truncated) resets previewOpen to collapsed, and expanding shows 64 KiB note.
+  nextBtn.dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert.strictEqual(side.querySelector(".artifact-preview"), null, "changing selection should collapse preview");
+  side.querySelector(".preview-toggle").dispatch("click", {});
+  assert(side.querySelector(".preview-note").textContent.includes("64 KiB"), "expected truncation note for text_truncated artifact");
+  // Jumping to the binary artifact (docs/rejected.md, text: null) shows binary notice and no toggle.
+  nextBtn.dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert.strictEqual(side.querySelector(".preview-toggle"), null, "binary artifact should not show text preview toggle");
+  assert(side.querySelector(".preview-note").textContent.includes("Binary content"), "expected binary content note");
+
+  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, and safe text preview all pass.");
 }
 
 main().catch((err) => {
