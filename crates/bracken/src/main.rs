@@ -17,6 +17,7 @@ use manyroot::validation::{Assessor, Trusted, open_conflicts, open_supersessors,
 use manyroot::*;
 use serde_json::{Value, json};
 
+mod index;
 mod listing;
 mod remote;
 mod runs;

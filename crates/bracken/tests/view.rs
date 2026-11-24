@@ -248,8 +248,10 @@ fn every_endpoint_is_read_only_and_carries_the_csp() {
     let art = art.lines().next().unwrap().to_owned();
     ok(&dir, &["evidence", &art, "pass", "--method", HOSTILE, "--details", HOSTILE, "--as", "val"]);
     ok(&dir, &["intend", &claim, "--as", "bob"]);
-    let before = files(&dir);
+    // After this read, which may write its own cache (the index's clock is rewritten on every read): what
+    // follows is the view's session alone.
     let log = ok(&dir, &["log", "--json"]);
+    let before = files(&dir);
 
     let v = view(&dir);
     let gets = [
