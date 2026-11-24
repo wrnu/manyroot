@@ -620,3 +620,84 @@ fn a_diverged_policy_gives_null_not_none() {
     assert!(page["counted"].is_null(), "{}", page["counted"]);
     v.refused(&format!("/api/weave/decision/{decision}?list=counted"), 404);
 }
+
+/// Finding c50605c13cd4: once the change that failed to read goes away, the replica is what the view last
+/// read, and the Weave pages come back.
+#[test]
+fn the_weave_pages_come_back_when_a_failed_change_is_undone() {
+    let (w, ..) = Weave::with_two_decisions();
+    w.ok(&["id", "new", "val"]);
+    w.ok(&["claim", "a second author", "--as", "val"]);
+    let v = view(&w.ground);
+    assert_eq!(v.api("/api/weave")["weave"], true);
+    let val: Value =
+        serde_json::from_str(&std::fs::read_to_string(w.ground.join("agents/val.json")).expect("val's entry"))
+            .expect("JSON");
+    let forged = w.ground.join("agents/mallory.json");
+    std::fs::write(&forged, serde_json::json!({"name": AS, "agent": val["agent"]}).to_string())
+        .expect("writes the entry");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = v.request_once("/api/weave");
+        if r.status == 503 && !String::from_utf8_lossy(&r.body).contains(READING) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the re-read never failed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::fs::remove_file(&forged).expect("undoes the change");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let r = v.request_once("/api/weave");
+        if r.status == 200 {
+            assert_eq!(r.json()["weave"], true);
+            break;
+        }
+        assert!(Instant::now() < deadline, "the Weave pages stayed unavailable: {}", String::from_utf8_lossy(&r.body));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Finding 886fba8945e1: a protected path is its own key for `after`, so it is never cut, even at the
+/// longest a path may be; paging past it reaches every path.
+#[test]
+fn protected_paths_page_whole_at_the_longest_a_path_may_be() {
+    let (w, ..) = Weave::with_two_decisions();
+    let longest = vec!["a".repeat(255); 16].join("/");
+    assert_eq!(longest.len(), 4095);
+    let paths: Vec<String> = (0..51).map(|i| if i == 49 { longest.clone() } else { format!("p{i:02}") }).collect();
+    let mut args = vec!["weave", "line", "create", "guarded", "--owner-decision", OD, "--as", AS, "--json"];
+    for p in &paths {
+        args.extend(["--protected", p.as_str()]);
+    }
+    let line = w.id_of(&args, "line");
+    let v = view(&w.ground);
+    let first = v.api(&format!("/api/weave/line/{line}"));
+    let protected = &first["policy"]["protected"];
+    assert_eq!(protected["total"], 51);
+    let shown: Vec<String> =
+        protected["items"].as_array().expect("items").iter().map(|p| p.as_str().expect("a path").to_owned()).collect();
+    assert!(shown.contains(&longest), "the longest path comes back whole");
+    let last = shown.last().expect("a page").clone();
+    let rest = v.api(&format!("/api/weave/line/{line}?list=protected&after={}&limit=50", encode(&last)));
+    let mut all = shown;
+    all.extend(rest["items"].as_array().expect("items").iter().map(|p| p.as_str().expect("a path").to_owned()));
+    let mut want = paths.clone();
+    want.sort();
+    let mut got = all.clone();
+    got.sort();
+    assert_eq!(got, want, "every protected path is reached");
+}
+
+/// `s` as a query value: everything but unreserved characters percent-encoded.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}

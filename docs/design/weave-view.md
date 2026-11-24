@@ -198,6 +198,8 @@ never on the listener or on a request's thread (answer `a300d75086d5`):
   dropped. It is never rebuilt from the old graph against what is on disk
   now. The Weave endpoints answer 503 with why. The same signature is
   tried again after 2 s, doubling up to 60 s, and a new signature at once.
+  If the change is undone, so the signature is the old snapshot's again,
+  its Weave state is built again from it.
 - **If the build panics,** the watcher catches it. The Weave endpoints say
   so until the replica changes, and the rest of the view keeps
   refreshing.
@@ -310,8 +312,9 @@ conflicts, problems, missing paths and change entries.
   `list=current`, `list=versions`, `list=counted`, `list=checks` and
   `/api/weave/objections`) takes `limit` up to 200, not 2,000.
 - **What is never cut** (finding `80050786bf97`): a record id, a content
-  hash, and a check's name where it is the key a list pages after
-  (`list=counted`, `list=checks`). They are links and cursors. Only free text
+  hash, a check's name where it is the key a list pages after
+  (`list=counted`, `list=checks`), and a row that is itself a key, such as
+  a protected path in `list=protected` (at most 4 KiB, as a path is). They are links and cursors. Only free text
   is cut, and arrays are bounded by count, never by cutting their strings.
   A row or answer with any string cut carries `"cut": true`, and the page
   says "(shortened)". The row's own page, or the CLI, has the rest.
@@ -800,6 +803,8 @@ Notes taken:
 | The 10x rebuild passed 10 s (question `91abf8289969`) | Answer `a300d75086d5`, option 1: the state is built lazily on the watcher thread, the old one dropped first, the Weave pages answer 503 with `Retry-After` until it's ready, and it's built at start in the background. The numbers are in section 5 |
 | PR #79 round 1, `9f37a1b9146c`: a failed re-read rebuilt the Weave state from the old graph every poll | It stays dropped and the Weave pages say why; retries back off; a panic in the build is caught (section 3) |
 | PR #79 round 1, `80050786bf97`: row caps cut ids and cursors | Ids, hashes and paged check names are never cut; arrays are bounded by count; cut rows are marked; the line pages its current policy's lists (section 4) |
+| PR #79 round 2, `c50605c13cd4`: the Weave pages stayed 503 after a failed change was undone | The old snapshot's Weave state is built again (section 3) |
+| PR #79 round 2, `886fba8945e1`: a protected path near 4 KiB was cut, breaking its cursor | A row that is itself a key is never cut (section 4) |
 
 Round 2's notes are taken too:
 - the scripts count rises to 13;

@@ -541,6 +541,8 @@ impl Viewer {
     fn watch(&self) {
         // The signature that last failed to read, when it may be tried again, and the backoff after that.
         let mut failed: Option<(Signature, Instant, Duration)> = None;
+        // Whether the current snapshot's Weave state was set Failed by a failed re-read (not a panic).
+        let mut read_failed = false;
         loop {
             // The current snapshot's Weave state, read here and never on a request's thread, so neither
             // listening nor the other pages wait for it: at start, and after each re-read. A panic in
@@ -566,6 +568,13 @@ impl Viewer {
             // changes the count again, so the next poll reads again rather than missing it.
             let Ok(now) = signature(&self.dir) else { continue };
             if now == last.signature {
+                // The change that failed to read went away (finding c50605c13cd4): the replica is what
+                // `last` read, so its Weave state is built again at the loop's top.
+                if read_failed {
+                    read_failed = false;
+                    failed = None;
+                    last.weave.clear();
+                }
                 continue;
             }
             if let Some((sig, retry, _)) = failed
@@ -584,6 +593,7 @@ impl Viewer {
             match next {
                 Ok(next) => {
                     failed = None;
+                    read_failed = false;
                     let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
                     *current = (current.0 + 1, Arc::new(next));
                     self.changed.notify_all();
@@ -601,6 +611,7 @@ impl Viewer {
                         _ => REREAD_BACKOFF,
                     };
                     failed = Some((now, Instant::now() + backoff, backoff));
+                    read_failed = true;
                 }
             }
         }

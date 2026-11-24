@@ -16,7 +16,7 @@ const SOURCES = ["common.js", "weave.js"].map((f) => [f, fs.readFileSync(path.jo
 
 // A distinct 64-hex id whose short form (its first 12 digits) is distinct too.
 const id = (n) => n.toString(16).padStart(4, "0").repeat(16);
-const HOSTILE = "</script><img src=x onerror=alert(1)> & \u001b[2K‮txt.exe \"quoted\"";
+const HOSTILE = "</script><img src=x onerror=alert(1)> & \u001b[2K\u202etxt.exe \"quoted\"";
 
 // ---- A minimal DOM ----
 
@@ -183,7 +183,7 @@ check("a line's decision list marks a bidi control in a note (finding 2a8558fd62
   assert.ok(m.includes("U+202E"), `marks: ${m}`);
   assert.ok(m.includes("\\u{1b}"), `marks: ${m}`);
   assert.ok(page.textContent.includes("</script><img src=x onerror=alert(1)>"), "the note is text");
-  assert.ok(!page.textContent.includes("‮"), "no raw bidi control reaches the page");
+  assert.ok(!page.textContent.includes("\u202e"), "no raw bidi control reaches the page");
   safe(page, "line");
 });
 
@@ -225,6 +225,29 @@ check("a line's one current policy pages its checks with More, by check name", a
   await more.on.click[0]();
   assert.ok(fetched.some((p) => p.includes("list=checks") && p.includes("after=c49")), fetched.join("\n"));
   assert.ok(page.textContent.includes("c50"));
+});
+
+check("a goal whose binding is unknown says so, not that it doesn't bind (round 2, note 2)", async () => {
+  const goal = { goal: id(80), link: id(81), statement: "keep it fast", author: id(9), author_name: "alice", linker: id(9), linker_name: "alice", binds: null };
+  const { page } = await load(`#line/${LINE}`, answers([
+    [`/api/weave/line/${LINE}`, lineAnswer({ goals: list([goal]) })],
+    [`/api/weave/log/${LINE}`, { list: "decisions", ...list([]) }],
+  ]));
+  assert.ok(page.textContent.includes("binding unknown"), page.textContent);
+  assert.ok(!page.textContent.includes("doesn't bind"));
+});
+
+check("a diverged policy's current versions page past the first 50 (round 2, note 4)", async () => {
+  const versions = Array.from({ length: 50 }, (_, i) => policy(id(100 + i), "main"));
+  const { page, fetched } = await load(`#line/${LINE}`, answers([
+    [`/api/weave/line/${LINE}?list=current`, { list: "current", ...list([policy(id(150), "main")]) }],
+    [`/api/weave/line/${LINE}`, lineAnswer({ diverged: true, current: list(versions, 51), policy: { checks: null, integrators: null, validators: null, goal_setters: null, protected: null } })],
+    [`/api/weave/log/${LINE}`, { list: "decisions", ...list([]) }],
+  ]));
+  const more = buttons(page).find((b) => b.textContent === "More (51 in all)");
+  assert.ok(more, "a More button for the current versions");
+  await more.on.click[0]();
+  assert.ok(fetched.some((p) => p.includes("list=current") && p.includes(`after=${id(149)}`)), fetched.join("\n"));
 });
 
 check("a decision with no current policy says nothing is counted (finding 08c43e704dff)", async () => {

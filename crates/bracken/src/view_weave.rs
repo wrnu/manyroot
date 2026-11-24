@@ -365,8 +365,14 @@ fn page<'a, T>(
 /// [`LIST_TEXT`] and `row_bytes`, and its total.
 fn embedded<T>(items: &[T], row_bytes: usize, item: impl Fn(&T) -> Value) -> Value {
     let shown = &items[..items.len().min(IN_ANSWER)];
-    json!({"items": shown.iter().map(|i| fit(capped(item(i), LIST_TEXT), row_bytes)).collect::<Vec<_>>(),
+    json!({"items": shown.iter().map(|i| row(item(i), row_bytes)).collect::<Vec<_>>(),
            "total": items.len(), "more": items.len() > shown.len()})
+}
+
+/// A list's row within its caps. A row that is a bare string (a protected path, an id) is its own key for
+/// `after`, so it is never cut (finding 886fba8945e1); its policy bounds it (a path is at most 4 KiB).
+fn row(v: Value, row_bytes: usize) -> Value {
+    if v.is_string() { v } else { fit(capped(v, LIST_TEXT), row_bytes) }
 }
 
 /// One page of a list, alone: what `list=<name>` answers.
@@ -379,7 +385,7 @@ fn listed<T>(
     p: &Paging,
 ) -> Result<Value, Fail> {
     let (shown, more) = page(items, key, p.after, p.limit)?;
-    let rows: Vec<Value> = shown.iter().map(|i| fit(capped(item(i), LIST_TEXT), row_bytes)).collect();
+    let rows: Vec<Value> = shown.iter().map(|i| row(item(i), row_bytes)).collect();
     Ok(json!({"list": name, "items": rows, "total": items.len(), "more": more}))
 }
 

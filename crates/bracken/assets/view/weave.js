@@ -302,13 +302,13 @@
     // Every current version: several when the policy has diverged (independent note 2).
     if (l.diverged) {
       out.push(...section("Current policy (diverged: its author settles it)", h("p", { class: "muted" }, `${l.current.total} current versions`)));
-      for (const v of l.current.items) out.push(policyFacts(v, null, id));
+      out.push(pagedList(l.current, (v) => v.version, (v) => h("li", {}, policyFacts(v, null, id)), (after) => api(`/api/weave/line/${id}?${query({ list: "current", after, limit: PAGE })}`)));
     } else {
       out.push(...section("Current policy", policyFacts(l.current.items[0], l.policy, id)));
     }
     const log = await api(`/api/weave/log/${id}?${query({ limit: PAGE })}`);
     out.push(...section("Decisions, newest first", pagedList(log, (d) => d.decision, decisionRow, (after) => api(`/api/weave/log/${id}?${query({ after, limit: PAGE })}`))));
-    const goalRow = (g) => h("li", { class: g.binds ? "green" : "" }, h("span", { class: "statement" }, shown(g.statement)), h("span", { class: "muted" }, shown(`by ${who(g.author, g.author_name)}${g.binds ? ", binds" : ", doesn't bind"}`)), cutMark(g));
+    const goalRow = (g) => h("li", { class: g.binds ? "green" : "" }, h("span", { class: "statement" }, shown(g.statement)), h("span", { class: "muted" }, shown(`by ${who(g.author, g.author_name)}${g.binds === null ? ", binding unknown: no single current policy" : g.binds ? ", binds" : ", doesn't bind"}`)), cutMark(g));
     out.push(...section("Goals", pagedList(l.goals, (g) => g.link, goalRow, (after) => api(`/api/weave/line/${id}?${query({ list: "goals", after, limit: PAGE })}`))));
     const versionRow = (v) => h("li", {}, h("span", { class: "id" }, short(v.version)), h("span", { class: "muted" }, shown(`${v.name}, by ${who(v.author, v.author_name)}`)), cutMark(v));
     out.push(...section("Policy versions", pagedList(l.versions, (v) => v.version, versionRow, (after) => api(`/api/weave/line/${id}?${query({ list: "versions", after, limit: PAGE })}`))));
