@@ -18,27 +18,7 @@
 
   // ---- Text ----
 
-  const INVISIBLE = new RegExp(
-    "[\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]|[\\u{e0000}-\\u{e007f}]|[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]",
-    "gu",
-  );
-
-  /** Text as children for h(): its invisible and control characters shown, never hidden or obeyed. */
-  function shown(value) {
-    const text = String(value === null || value === undefined ? "" : value);
-    const out = [];
-    let last = 0;
-    for (const m of text.matchAll(INVISIBLE)) {
-      if (m.index > last) out.push(text.slice(last, m.index));
-      const cp = m[0].codePointAt(0);
-      const hex = cp.toString(16).toUpperCase().padStart(4, "0");
-      const control = cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
-      out.push(h("span", { class: "invisible", title: control ? "a control character" : "an invisible character" }, control ? `\\u{${cp.toString(16)}}` : `U+${hex}`));
-      last = m.index + m[0].length;
-    }
-    if (last < text.length) out.push(text.slice(last));
-    return out;
-  }
+  const shown = B.shown;
 
   /**
    * A text's first line, at most `max` characters: common.js's firstLine() without its plain(), which would

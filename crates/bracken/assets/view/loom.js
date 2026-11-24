@@ -1178,12 +1178,13 @@
     );
     previewToggleBtn = toggle;
     if (!previewOpen) return B.h("div", { class: "artifact-preview-wrap" }, toggle);
-    // Content goes in strictly through B.h (document.createTextNode + bidi stripping), never as HTML.
+    // Content goes in strictly through B.shown + B.h (text nodes + .invisible marker spans), never as HTML,
+    // so markup is inert and invisible/control/bidi characters are visibly marked rather than hidden or dropped.
     return B.h(
       "div",
       { class: "artifact-preview-wrap" },
       toggle,
-      B.h("div", { class: "artifact-preview" }, text),
+      B.h("div", { class: "artifact-preview" }, B.shown(text)),
       c.body.text_truncated ? B.h("p", { class: "preview-note" }, "Truncated at 64 KiB (use bracken cat for full content).") : null
     );
   }
