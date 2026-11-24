@@ -464,7 +464,9 @@ fn test_table_box_refuses_a_nextest_tarball_that_doesnt_match_its_pin() {
 /// script runs here with stubs for the box's tools. `add-apt-repository` fails the first `$PPA_FAILS`
 /// times; `git --version` says `$IMAGE_GIT` until the PPA's git is installed, then 2.56. Adding the PPA is
 /// tried four times and setup goes on once it works; if it never does, the image's git is used only when
-/// it's 2.46 or later, and otherwise setup fails, saying why. A git still too old after install fails too.
+/// it's 2.45 or later, and otherwise setup fails, saying why. A git still too old after install fails too,
+/// and says whether apt-cache policy shows the PPA's index (note 0e3164150e9a: Launchpad's content server
+/// answered 503, so the PPA was added but apt installed Ubuntu's git).
 #[test]
 fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() {
     for scripts in SCRIPTS {
@@ -495,6 +497,12 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
             ),
             ("apt-get", "echo \"apt-get $*\" >>\"$T/ran\"\ncase \"$*\" in *' git '*) touch \"$T/ppa-git\" ;; esac"),
             (
+                "apt-cache",
+                "[ \"$*\" = 'policy git' ] || exit 9\necho 'git:'\necho '  Version table:'\n\
+                 [ -n \"$NO_PPA_INDEX\" ] || echo '     500 https://ppa.launchpadcontent.net/git-core/ppa/ubuntu noble/main amd64 Packages'\n\
+                 echo '     500 http://archive.ubuntu.com/ubuntu noble/main amd64 Packages'",
+            ),
+            (
                 "git",
                 "[ \"$1\" = --version ] || exit 0\nif [ -e \"$T/ppa-git\" ]; then echo \"git version ${PPA_GIT:-2.56.0}\"; else echo \"git version $IMAGE_GIT\"; fi",
             ),
@@ -507,7 +515,7 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
         }
         let boxed = tmp.path().join("box");
         std::fs::create_dir_all(&boxed).unwrap();
-        let boxed_run = |fails: &str, image: &str, ppa_git: &str| {
+        let boxed_run = |fails: &str, image: &str, ppa_git: &str, no_index: &str| {
             for f in ["ran", "tries", "ppa-git"] {
                 let _ = std::fs::remove_file(tmp.path().join(f));
             }
@@ -519,6 +527,7 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
                 .env("PPA_FAILS", fails)
                 .env("IMAGE_GIT", image)
                 .env("PPA_GIT", ppa_git)
+                .env("NO_PPA_INDEX", no_index)
                 .output()
                 .unwrap();
             let ran = std::fs::read_to_string(tmp.path().join("ran")).unwrap_or_default();
@@ -527,7 +536,7 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
         };
 
         // Two failures, then the PPA: it waits 10 s and 30 s, installs the PPA's git, and goes on.
-        let (out, ran, tries) = boxed_run("2", "2.43.0", "");
+        let (out, ran, tries) = boxed_run("2", "2.43.0", "", "");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(tries, "3", "{scripts}: {stderr}");
         assert!(ran.starts_with("sleep 10\nsleep 30\napt-get install"), "{scripts}: {ran}");
@@ -537,19 +546,19 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
 
         // Launchpad down for all four tries, with today's image git (2.43): setup fails, saying why, and
         // installs nothing.
-        let (out, ran, tries) = boxed_run("9", "2.43.0", "");
+        let (out, ran, tries) = boxed_run("9", "2.43.0", "", "");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!((out.status.code(), tries.as_str()), (Some(1), "4"), "{scripts}: {stderr}");
         assert!(
             stderr.contains("box setup failed: couldn't add ppa:git-core/ppa after 4 tries")
-                && stderr.contains("git version 2.43.0 is older than the 2.46"),
+                && stderr.contains("git version 2.43.0 is older than the 2.45 the clean check needs"),
             "{scripts}: {stderr}"
         );
         assert_eq!(ran, "sleep 10\nsleep 30\nsleep 90\n", "{scripts}: went on: {ran}");
 
-        // Down for all four, with an image git of 2.46 or later: it says so, uses it, and goes on.
-        for image in ["2.46.0", "2.50.1", "3.0"] {
-            let (out, ran, _) = boxed_run("9", image, "");
+        // Down for all four, with an image git of 2.45 or later: it says so, uses it, and goes on.
+        for image in ["2.45.0", "2.46.0", "2.50.1", "3.0"] {
+            let (out, ran, _) = boxed_run("9", image, "", "");
             let stderr = String::from_utf8_lossy(&out.stderr);
             assert!(!stderr.contains("box setup failed"), "{scripts}: {image}: {stderr}");
             assert!(stderr.contains(&format!("using the image's git version {image}")), "{scripts}: {stderr}");
@@ -557,28 +566,53 @@ fn test_table_box_retries_the_git_ppa_and_falls_back_only_to_a_new_enough_git() 
             assert!(ran.contains("\ntar\n"), "{scripts}: {image}: went on: {ran}");
         }
 
-        // The PPA works but installs a git too old: setup fails, saying so.
-        let (out, ran, _) = boxed_run("0", "2.43.0", "2.45.2");
+        // The PPA works, its index is there, but it installs a git too old: setup fails, saying so.
+        let (out, ran, _) = boxed_run("0", "2.43.0", "2.44.1", "");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
-        assert!(stderr.contains("box setup failed: git version 2.45.2 is older than the 2.46"), "{scripts}: {stderr}");
+        assert!(
+            stderr.contains("box setup failed: git version 2.44.1 is older than the 2.45 the clean check needs"),
+            "{scripts}: {stderr}"
+        );
+        assert!(!stderr.contains("no index from it"), "{scripts}: {stderr}");
+        assert!(!ran.contains("tar"), "{scripts}: went on: {ran}");
+
+        // The PPA was added but apt couldn't fetch its index, so apt installed Ubuntu's 2.43: setup says so,
+        // shows apt-cache policy git, and goes no further.
+        let (out, ran, _) = boxed_run("0", "2.43.0", "2.43.0", "yes");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{scripts}: {stderr}");
+        assert!(
+            stderr.contains("box setup failed: ppa:git-core/ppa was added, but apt has no index from it")
+                && stderr.contains("so apt installed git version 2.43.0, older than the 2.45 the clean check needs")
+                && stderr.contains("archive.ubuntu.com"),
+            "{scripts}: {stderr}"
+        );
         assert!(!ran.contains("tar"), "{scripts}: went on: {ran}");
     }
 }
 
-/// Finding b8b6193329db: the git version test-table's box needs is the experiment's MIN_GIT, the one
-/// number in research/experiment/src/git_mode.rs, and the box script's comparison reads only `need_git`.
+/// Finding b8b6193329db, as the root table now stands (answer c733ce9e013f): the git the box needs is the
+/// clean check's floor, --weave-mac's refusal of a git older than 2.45, whose tests run in the box. The
+/// experiment's MIN_GIT (2.46) is research/'s, a workspace the table doesn't build. The box script's
+/// comparison reads only `need_git`.
 #[test]
-fn test_table_box_needs_the_experiments_min_git() {
-    let source = std::fs::read_to_string(repo_root().join("research/experiment/src/git_mode.rs")).unwrap();
-    let line = source.lines().find(|l| l.starts_with("pub const MIN_GIT: (u32, u32) = (")).expect("MIN_GIT");
-    let pair = line.trim_start_matches("pub const MIN_GIT: (u32, u32) = (").trim_end_matches(");");
-    let (major, minor) = pair.split_once(", ").expect("two numbers");
-    let (major, minor): (u32, u32) = (major.parse().unwrap(), minor.parse().unwrap());
+fn test_table_box_needs_the_clean_checks_git() {
     for scripts in SCRIPTS {
         let table = std::fs::read_to_string(repo_root().join(scripts).join("test-table")).unwrap();
+        let floor = table
+            .lines()
+            .find_map(|l| {
+                l.trim().strip_prefix(
+                    "if ((10#${BASH_REMATCH[1]} < 2 || (10#${BASH_REMATCH[1]} == 2 && 10#${BASH_REMATCH[2]} < ",
+                )
+            })
+            .and_then(|rest| rest.strip_suffix("))); then"))
+            .expect("the clean check's comparison");
+        let minor: u32 = floor.parse().unwrap();
+        assert!(table.contains(&format!("is older than 2.{minor}, which ignores GIT_NO_LAZY_FETCH")), "{scripts}");
         let set: Vec<&str> = table.lines().filter(|l| l.starts_with("need_git=")).collect();
-        assert_eq!(set, [format!("need_git={major}.{minor}")], "{scripts}: test-table's need_git is MIN_GIT");
+        assert_eq!(set, [format!("need_git=2.{minor}")], "{scripts}: test-table's need_git is the clean check's");
         assert!(
             table.contains(r#"[ "$minor" -ge "${need_git#*.}" ]"#) && !table.contains(&format!("-ge {minor} ]")),
             "{scripts}: the comparison reads need_git, not a number of its own"

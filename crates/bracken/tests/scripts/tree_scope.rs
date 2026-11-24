@@ -365,6 +365,391 @@ fn tree_scope_folds_case_and_fails_closed_on_a_collision_or_a_criss_cross() {
     }
 }
 
+/// Finding e41d9b6f87db (task 72e821f475dd): the case check counts only the merged tree's spellings, so a
+/// head that renames a file or a whole directory by letter case alone passes it (a frozen path is still
+/// named, both spellings), while a rename that leaves the old spelling beside the new, a new case variant of
+/// a path or of a directory that stays, is still refused.
+#[test]
+fn tree_scope_lets_a_case_only_rename_through_and_still_refuses_two_spellings() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("tree-scope");
+        let files = [("scripts/tree-scope", scope.as_path())];
+        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/format.rs", "format\n");
+            put(dir, "notes.txt", "notes\n");
+            put(dir, "tools/a.txt", "a\n");
+            put(dir, "tools/b.txt", "b\n");
+        });
+        let scope = |args: &[&str]| {
+            let out = command(&dir, "scripts/tree-scope", args).output().unwrap();
+            let said =
+                (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());
+            (out.status.code(), said.0, said.1)
+        };
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let head = |files: &[(&str, &str)]| plumb(&dir, &main, &[&main], files);
+
+        // A file renamed by case alone: one spelling in the merged tree, so nothing to refuse.
+        let (code, out, err) = scope(&["frozen", &main, &head(&[("notes.txt", ""), ("NOTES.txt", "notes\n")])]);
+        assert_eq!(code, Some(3), "{scripts}: {out}{err}");
+        // A whole directory renamed by case alone.
+        let renamed = head(&[("tools/a.txt", ""), ("tools/b.txt", ""), ("Tools/a.txt", "a\n"), ("Tools/b.txt", "b\n")]);
+        let (code, out, err) = scope(&["frozen", &main, &renamed]);
+        assert_eq!(code, Some(3), "{scripts}: {out}{err}");
+        // A frozen file renamed by case: both spellings named as frozen, not refused.
+        let frozen = head(&[("crates/tree/src/format.rs", ""), ("crates/tree/src/Format.rs", "format\n")]);
+        let (code, out, err) = scope(&["frozen", &main, &frozen]);
+        assert_eq!(code, Some(0), "{scripts}: {out}{err}");
+        for path in ["crates/tree/src/Format.rs", "crates/tree/src/format.rs"] {
+            assert!(out.contains(&format!("tree-scope: frozen: {path} (")), "{scripts}: {path}: {out}");
+        }
+
+        // Still refused: a case variant beside the path it varies, and part of a directory moved to a new
+        // spelling while the rest stays.
+        for (files, both) in [
+            (&[("NOTES.txt", "notes\n")][..], "NOTES.txt and notes.txt"),
+            (&[("tools/a.txt", ""), ("Tools/a.txt", "a\n")][..], "Tools and tools"),
+        ] {
+            let (code, out, err) = scope(&["frozen", &main, &head(files)]);
+            assert_eq!(code, Some(2), "{scripts}: {both}: {out}{err}");
+            assert!(out.is_empty(), "{scripts}: {both}: {out}");
+            assert!(err.contains("differing only in case") && err.contains(both), "{scripts}: {both}: {err}");
+        }
+    }
+}
+
+/// Finding c2ee30084fa6 (task 920a8585d468) and answer c733ce9e013f: a cargo configuration crates/tree
+/// builds with is frozen: the root's .cargo/, crates/.cargo/ and a .cargo/ at any depth under crates/tree,
+/// in any letter case. Another crate's .cargo/ isn't.
+#[test]
+fn tree_scope_frozen_names_every_cargo_configuration_crates_tree_builds_with() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("tree-scope");
+        let files = [("scripts/tree-scope", scope.as_path())];
+        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/format.rs", "format\n");
+            put(dir, ".cargo/config.toml", "[build]\n");
+        });
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let frozen = |files: &[(&str, &str)]| {
+            let head = plumb(&dir, &main, &[&main], files);
+            let out = command(&dir, "scripts/tree-scope", &["frozen", &main, &head]).output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let root = "cargo's configuration for the workspace, which crates/tree builds with";
+        let inside = "a cargo configuration that cargo run inside crates/tree reads";
+        for (path, why) in [
+            (".cargo/config.toml", root),
+            (".cargo/config", root),
+            (".CARGO/config.toml", root),
+            ("crates/.cargo/config.toml", inside),
+            ("crates/tree/.cargo/config.toml", inside),
+            ("crates/tree/tests/.cargo/config.toml", inside),
+            ("crates/tree/benches/deep/.Cargo/config.toml", inside),
+        ] {
+            // .CARGO beside the root's .cargo would be refused as a case collision: change it alone.
+            let files: Vec<(&str, &str)> = if path.starts_with(".CARGO") {
+                vec![(".cargo/config.toml", ""), (path, "[build]\nrustflags = [\"--cfg\", \"x\"]\n")]
+            } else {
+                vec![(path, "[build]\nrustflags = [\"--cfg\", \"x\"]\n")]
+            };
+            let (code, out) = frozen(&files);
+            assert_eq!(code, Some(0), "{scripts}: {path}: {out}");
+            assert!(out.contains(&format!("tree-scope: frozen: {path} ({why})\n")), "{scripts}: {path}: {out}");
+        }
+        for path in ["crates/bracken/.cargo/config.toml", "crates/tree/cargo/config.toml", "docs/.cargo/config.toml"] {
+            let (code, out) = frozen(&[(path, "[build]\n")]);
+            assert_eq!(code, Some(3), "{scripts}: {path}: {out}");
+        }
+    }
+}
+
+/// Finding 2f66d8148a00 (task 42e17ebb190f) and decision 4fcfa49dfc1c: tree-scope frozen compares the root
+/// Cargo.toml's frozen view, parsed with tomllib, at the base and the head: [workspace] without members,
+/// exclude, default-members and metadata; the [workspace.dependencies] entries crates/tree takes; [profile],
+/// [patch] and [replace]. Every counterexample of round 1's findings is reported, in whatever form TOML
+/// allows and through whatever letter case the tree tracks; a new member, another crate's dependency,
+/// metadata and comments aren't; a manifest that doesn't parse, or a python3 that fails, is.
+#[test]
+fn tree_scope_frozen_compares_the_root_manifests_parsed_frozen_view() {
+    let root = "[workspace]\nresolver = \"3\"\nmembers = [\"crates/tree\", \"crates/other\"]\nexclude = [\"research\"]\n\n\
+                [workspace.package]\nedition = \"2024\"\n\n\
+                [workspace.dependencies]\n# Pinned exactly.\nblake3 = \"=1.8.7\"\n\
+                imara-diff = { version = \"=0.2.0\", default-features = false }\nserde_json = \"1\"\n\
+                clap = { version = \"4\", features = [\"derive\"] }\n\n\
+                [profile.dev]\ndebug = \"line-tables-only\"\n\n[profile.dev.package.\"*\"]\nopt-level = 2\n";
+    let tree = "[package]\nname = \"bracken-tree\"\nedition.workspace = true\n\n[dependencies]\nblake3.workspace = true\n\
+                imara-diff = { workspace = true }\n\n[dev-dependencies]\nserde_json.workspace = true\n";
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("tree-scope");
+        let files = [("scripts/tree-scope", scope.as_path())];
+        let (tmp, dir) = repo(&files, ".bracken/\n", |dir| put(dir, "crates/tree/src/format.rs", "format\n"));
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        // A base holding `base` as the root manifest at `path` and `tree` as crates/tree's, and a head on it
+        // changing the root manifest to `head`: tree-scope frozen's exit code and output.
+        let path_env = std::env::var("PATH").unwrap();
+        let frozen_in = |path: &str, base: &str, tree: &str, head: &str, env_path: &str| {
+            let b = plumb(&dir, &main, &[&main], &[(path, base), ("crates/tree/Cargo.toml", tree)]);
+            let h = plumb(&dir, &b, &[&b], &[(path, head)]);
+            let out = command(&dir, "scripts/tree-scope", &["frozen", &b, &h]).env("PATH", env_path).output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let frozen = |base: &str, tree: &str, head: &str| frozen_in("Cargo.toml", base, tree, head, &path_env);
+        let says = |(code, out): (Option<i32>, String), what: &str, why: &str| {
+            assert_eq!(code, Some(0), "{scripts}: {what}: {out}");
+            assert!(out.contains(&format!("tree-scope: frozen: Cargo.toml ({why})\n")), "{scripts}: {what}: {out}");
+        };
+        let takes = "which crates/tree takes from the workspace";
+        let profile = "[profile]: how crates/tree compiles";
+
+        // The plain changes.
+        for (what, head, why) in [
+            (
+                "a feature on a crate it takes",
+                root.replace("default-features = false", "default-features = true"),
+                format!("[workspace.dependencies] imara-diff, {takes}"),
+            ),
+            (
+                "a version it takes",
+                root.replace("=1.8.7", "=1.8.8"),
+                format!("[workspace.dependencies] blake3, {takes}"),
+            ),
+            (
+                "a dev-dependency it takes",
+                root.replace("serde_json = \"1\"", "serde_json = { version = \"1\", features = [\"preserve_order\"] }"),
+                format!("[workspace.dependencies] serde_json, {takes}"),
+            ),
+            (
+                "an entry as its own table",
+                root.replace("blake3 = \"=1.8.7\"\n", "")
+                    + "\n[workspace.dependencies.blake3]\nversion = \"=1.8.7\"\nfeatures = [\"neon\"]\n",
+                format!("[workspace.dependencies] blake3, {takes}"),
+            ),
+            ("a profile", root.replace("line-tables-only", "full"), profile.to_owned()),
+            ("a package's profile", root.replace("opt-level = 2", "opt-level = 0"), profile.to_owned()),
+            ("a new profile", format!("{root}\n[profile.release]\noverflow-checks = false\n"), profile.to_owned()),
+            (
+                "the inherited edition",
+                root.replace("edition = \"2024\"", "edition = \"2021\""),
+                "[workspace] package: how the workspace builds crates/tree".to_owned(),
+            ),
+            (
+                "the resolver",
+                root.replace("resolver = \"3\"", "resolver = \"2\""),
+                "[workspace] resolver: how the workspace builds crates/tree".to_owned(),
+            ),
+            (
+                "a patch",
+                format!("{root}\n[patch.crates-io]\nblake3 = {{ path = \"../blake3\" }}\n"),
+                "[patch]: how crates/tree compiles".to_owned(),
+            ),
+            (
+                "a replace",
+                format!("{root}\n[replace]\n\"blake3:1.8.7\" = {{ path = \"../blake3\" }}\n"),
+                "[replace]: how crates/tree compiles".to_owned(),
+            ),
+        ] {
+            says(frozen(root, tree, &head), what, &why);
+        }
+
+        // Finding 21c742cb5437: quotes inside a literal string and a comment.
+        let quoted = format!(
+            "{root}\n[workspace.metadata.notes]\ntags = [ '\"' ] # \"\n[profile.dev.package.bracken-tree]\noverflow-checks = false\nopt-level = 3\n"
+        );
+        says(frozen(root, tree, &quoted), "21c742cb5437 (1)", profile);
+        let excluded = root.replace("exclude = [\"research\"]", "exclude = [\"research\", '\"'] # \"");
+        let (code, out) = frozen(root, tree, &excluded);
+        assert_eq!(code, Some(3), "{scripts}: an exclude alone isn't frozen: {out}");
+        let both = excluded
+            .replace("opt-level = 2", "opt-level = 0")
+            .replace("debug = \"line-tables-only\"", "debug = false")
+            .replace("default-features = false", "default-features = true");
+        let (code, out) = frozen(&excluded, tree, &both);
+        assert_eq!(code, Some(0), "{scripts}: 21c742cb5437 (2): {out}");
+        assert!(out.contains(profile) && out.contains("imara-diff"), "{scripts}: 21c742cb5437 (2): {out}");
+
+        // Finding 23dc00447dd5: a header inserted or deleted moves unchanged lines between tables.
+        let moved =
+            root.replace("[profile.dev.package.\"*\"]\n", "[profile.dev.package.\"*\"]\n[workspace.metadata]\n");
+        says(frozen(root, tree, &moved), "23dc00447dd5 (a): opt-level", profile);
+        let moved = root.replace("[profile.dev]\n", "[profile.dev]\n[workspace.metadata]\n");
+        says(frozen(root, tree, &moved), "23dc00447dd5 (a): debug", profile);
+        let base_b = root.replace(
+            "debug = \"line-tables-only\"\n",
+            "debug = \"line-tables-only\"\n[workspace.metadata]\noverflow-checks = false\n",
+        );
+        let deleted = base_b.replace("[workspace.metadata]\n", "");
+        let (code, out) = frozen(&base_b, tree, &deleted);
+        assert_eq!(code, Some(0), "{scripts}: 23dc00447dd5 (b): {out}");
+        assert!(out.contains(profile), "{scripts}: 23dc00447dd5 (b): {out}");
+        let table = root.replace("imara-diff = { version = \"=0.2.0\", default-features = false }\n", "")
+            + "\n[workspace.dependencies.imara-diff]\nversion = \"=0.2.0\"\ndefault-features = false\n";
+        let split = table.replace(
+            "version = \"=0.2.0\"\ndefault-features = false\n",
+            "version = \"=0.2.0\"\n[workspace.dependencies.clap2]\nversion = \"4\"\ndefault-features = false\n",
+        );
+        says(
+            frozen(&table, tree, &split),
+            "23dc00447dd5 (c)",
+            &format!("[workspace.dependencies] imara-diff, {takes}"),
+        );
+
+        // Finding 445cc0fe0da7: a literal string holding a quote, then brackets in strings and comments.
+        let bridged = root.replace("exclude = [\"research\"]", "exclude = [\"research\", 'a\"', \"[\"]").replace(
+            "debug = \"line-tables-only\"",
+            "debug = \"line-tables-only\"\noverflow-checks = false\nopt-level = 3",
+        ) + "\n[profile.release]\nlto = true\n[profile.dev.package.bracken-tree]\nopt-level = 0\n\
+              [patch.crates-io]\nblake3 = { path = \"../evil\" }\n";
+        let (code, out) = frozen(root, tree, &bridged);
+        assert_eq!(code, Some(0), "{scripts}: 445cc0fe0da7 (a): {out}");
+        assert!(out.contains(profile) && out.contains("[patch]"), "{scripts}: 445cc0fe0da7 (a): {out}");
+        let noted = root.replace(
+            "[profile.dev]\ndebug = \"line-tables-only\"\n",
+            "[workspace.metadata]\nnote = 'a\"b' # \" [\n[profile.dev]\ndebug = \"line-tables-only\"\noverflow-checks = false\n",
+        ) + "\n[profile.dev.package.bracken-tree]\nopt-level = 0\n";
+        says(frozen(root, tree, &noted), "445cc0fe0da7 (b)", profile);
+
+        // Finding 2c56e188f7ab: crates/tree taking blake3 in other valid forms.
+        let blake3 = root.replace("blake3 = \"=1.8.7\"", "blake3 = { version = \"=1.8.7\", default-features = false }");
+        let blake3_on = blake3.replace("default-features = false }\nimara", "default-features = true }\nimara");
+        let plain = tree.replace("blake3.workspace = true\n", "");
+        for (what, tree) in [
+            (
+                "a target table's dotted key",
+                format!("{plain}\n[target.'cfg(unix)']\ndependencies.blake3.workspace = true\n"),
+            ),
+            (
+                "a top-level dotted key",
+                "dependencies.blake3.workspace = true\ndependencies.imara-diff.workspace = true\n\
+                 [package]\nname = \"bracken-tree\"\n"
+                    .to_owned(),
+            ),
+            ("a quoted workspace key", format!("{plain}\n[dependencies.blake3]\n\"workspace\" = true\n")),
+            ("CRLF lines", format!("{plain}\n[dependencies.blake3]\nworkspace = true\n").replace('\n', "\r\n")),
+            (
+                "a # in a string",
+                plain.replace(
+                    "[dependencies]\n",
+                    "[dependencies]\nblake3 = { features = [\"a#b\"], workspace = true }\n",
+                ),
+            ),
+            (
+                "a target's dependencies",
+                format!("{plain}\n[target.'cfg(unix)'.dependencies]\nblake3 = {{ workspace = true }}\n"),
+            ),
+        ] {
+            says(
+                frozen(&blake3, &tree, &blake3_on),
+                &format!("2c56e188f7ab: {what}"),
+                &format!("[workspace.dependencies] blake3, {takes}"),
+            );
+        }
+
+        // Finding 9077ff0d3be9: a tree that tracks the root manifest as CARGO.toml.
+        let (code, out) =
+            frozen_in("CARGO.toml", root, tree, &root.replace("opt-level = 2", "opt-level = 0"), &path_env);
+        assert_eq!(code, Some(0), "{scripts}: 9077ff0d3be9: {out}");
+        assert!(
+            out.contains(&format!("tree-scope: frozen: CARGO.toml ({profile})\n")),
+            "{scripts}: 9077ff0d3be9: {out}"
+        );
+
+        // Not frozen.
+        for (what, head) in [
+            ("a new member", root.replace("\"crates/other\"]", "\"crates/other\", \"crates/index\"]")),
+            ("an exclude", root.replace("[\"research\"]", "[\"research\", \"scratch\"]")),
+            ("another crate's dependency", root.replace("features = [\"derive\"]", "features = [\"derive\", \"env\"]")),
+            ("a new dependency", root.replace("serde_json = \"1\"\n", "serde_json = \"1\"\nrusqlite = \"0.32\"\n")),
+            ("metadata", format!("{root}\n[workspace.metadata.docs]\nall = true\n")),
+            ("a comment", root.replace("# Pinned exactly.", "# Pinned exactly, as the freeze asks.")),
+            (
+                "a reordering",
+                root.replace("serde_json = \"1\"\nclap", "clap")
+                    .replace("[\"derive\"] }\n", "[\"derive\"] }\nserde_json = \"1\"\n"),
+            ),
+        ] {
+            let (code, out) = frozen(root, tree, &head);
+            assert_eq!(code, Some(3), "{scripts}: {what}: {out}");
+        }
+
+        // Failures are frozen: a manifest that doesn't parse, and a python3 that fails saying nothing.
+        let (code, out) = frozen(root, tree, &format!("{root}\n[profile.dev\n"));
+        assert_eq!(code, Some(0), "{scripts}: a parse error: {out}");
+        assert!(
+            out.contains("tree-scope: frozen: Cargo.toml (the root Cargo.toml after doesn't parse as TOML ("),
+            "{scripts}: {out}"
+        );
+        let stubs = tmp.path().join("stubs");
+        std::fs::create_dir_all(&stubs).unwrap();
+        write_executable(&stubs.join("python3"), "#!/bin/sh\nexit 3\n");
+        let (code, out) = frozen_in(
+            "Cargo.toml",
+            root,
+            tree,
+            &root.replace("# Pinned exactly.", "# A comment."),
+            &format!("{}:{path_env}", stubs.display()),
+        );
+        assert_eq!(code, Some(0), "{scripts}: a failing python3: {out}");
+        assert!(
+            out.contains("tree-scope: frozen: Cargo.toml (python3 failed reading the root Cargo.toml (exit 3))"),
+            "{out}"
+        );
+    }
+}
+
+/// Finding 61094746cfa7 (task 1fb015806aa5): what changes how crates/tree compiles with no change to its
+/// source, manifest or the lock is frozen too: the rustc wrapper every compile runs through, crates/tree's
+/// build script, and a toolchain pin rustup reads for a build there, in any letter case. Another crate's
+/// build script or toolchain file, or a file beside the wrapper, isn't.
+#[test]
+fn tree_scope_frozen_names_the_wrapper_build_script_and_toolchain_pins() {
+    for scripts in SCRIPTS {
+        let scope = repo_root().join(scripts).join("tree-scope");
+        let files = [("scripts/tree-scope", scope.as_path())];
+        let (_tmp, dir) = repo(&files, ".bracken/\n", |dir| {
+            put(dir, "crates/tree/src/format.rs", "format\n");
+            put(dir, "scripts/rustc-wrapper", "#!/bin/sh\nexec \"$@\"\n");
+        });
+        let main = String::from_utf8(run(&dir, "git", &["rev-parse", "main"]).stdout).unwrap().trim().to_owned();
+        let frozen = |files: &[(&str, &str)]| {
+            let head = plumb(&dir, &main, &[&main], files);
+            let out = command(&dir, "scripts/tree-scope", &["frozen", &main, &head]).output().unwrap();
+            (out.status.code(), String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let wrapper = "the rustc wrapper .cargo/config.toml runs for every compile, crates/tree's included";
+        let build = "crates/tree's build script, which cargo builds and runs with no manifest change";
+        let toolchain = "a toolchain pin rustup reads for a build of crates/tree";
+        for (path, text, why) in [
+            ("scripts/rustc-wrapper", "#!/bin/sh\nexec \"$@\" --cfg x\n", wrapper),
+            ("crates/tree/build.rs", "fn main() { println!(\"cargo:rustc-cfg=x\"); }\n", build),
+            ("crates/tree/Build.rs", "fn main() {}\n", build),
+            ("rust-toolchain.toml", "[toolchain]\nchannel = \"nightly\"\n", toolchain),
+            ("rust-toolchain", "nightly\n", toolchain),
+            ("crates/rust-toolchain.toml", "[toolchain]\nchannel = \"nightly\"\n", toolchain),
+            ("crates/rust-toolchain", "nightly\n", toolchain),
+            ("crates/tree/rust-toolchain.toml", "[toolchain]\nchannel = \"nightly\"\n", toolchain),
+            ("crates/tree/Rust-Toolchain", "nightly\n", toolchain),
+        ] {
+            let (code, out) = frozen(&[(path, text)]);
+            assert_eq!(code, Some(0), "{scripts}: {path}: {out}");
+            assert!(out.contains(&format!("tree-scope: frozen: {path} ({why})\n")), "{scripts}: {path}: {out}");
+        }
+        // Removing the wrapper is a change to it too.
+        let (code, out) = frozen(&[("scripts/rustc-wrapper", "")]);
+        assert!(code == Some(0) && out.contains(&format!("scripts/rustc-wrapper ({wrapper})")), "{scripts}: {out}");
+        for path in [
+            "crates/bracken/build.rs",
+            "crates/tree/tests/build.rs",
+            "crates/bracken/rust-toolchain.toml",
+            "scripts/rustc-wrapper.md",
+            "docs/rust-toolchain.toml",
+        ] {
+            let (code, out) = frozen(&[(path, "x\n")]);
+            assert_eq!(code, Some(3), "{scripts}: {path}: {out}");
+        }
+    }
+}
+
 /// Findings 5b38ef3c9557 and e1a2fe970409. APFS folds some non-ASCII letters onto ASCII ones (the long s
 /// onto s, the Kelvin sign onto k), so a path holding any byte outside printable ASCII is refused by frozen,
 /// exit 2 naming it escaped, frozen or not. And it reads every path

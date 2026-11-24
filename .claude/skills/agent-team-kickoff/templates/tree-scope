@@ -39,7 +39,8 @@
 # error with nothing on standard output, since one couldn't be printed a line each (findings
 # db2dc1c6120e, e3f9ae2b1820). So is a changed path that differs only in ASCII case from another path in the
 # merged tree (<base> merged with <head>, as GitHub's squash merge makes it), naming both: a
-# case-insensitive checkout writes one over the other; a head that doesn't merge cleanly; and several
+# case-insensitive checkout writes one over the other (a path the head deleted isn't in it, so a rename by
+# letter case alone passes: finding e41d9b6f87db); a head that doesn't merge cleanly; and several
 # merge bases, a criss-cross history a diff from one can miss (findings 89119f47ba5c, bb7107f27076). Every
 # path is matched with its ASCII letters lowercased. A path holding any byte outside
 # printable ASCII is refused too, named escaped: APFS folds some non-ASCII letters onto ASCII ones (finding
@@ -51,7 +52,13 @@
 # counts too.
 #   'tree-scope: frozen: <path> (<why>)': crates/tree/src/, crates/tree/Cargo.toml, the format guard,
 #     paths.rs, lines.rs, weave_fixture.rs and tests/fixtures/ in crates/tree, the committed pin
-#     .config/weave-root (docs/design/weave-marker.md, option A), and, as
+#     .config/weave-root (docs/design/weave-marker.md, option A), a cargo configuration crates/tree
+#     builds with (the root's .cargo/, crates/.cargo/, and a .cargo/ at any depth under crates/tree:
+#     finding c2ee30084fa6, answer c733ce9e013f), what else changes how crates/tree compiles with no
+#     change to those (finding 61094746cfa7): scripts/rustc-wrapper, crates/tree/build.rs, and a
+#     rust-toolchain or rust-toolchain.toml at the root, in crates/ or in crates/tree; as
+#     'tree-scope: frozen: Cargo.toml (<what>)', a change to the root Cargo.toml's frozen view (see
+#     cargo_toml_changes), or a failure to read it; and, as
 #     'tree-scope: frozen: Cargo.lock (<crate> <old> -> <new>)', a change to the Cargo.lock entry of a
 #     crate the frozen formats rest on: unicode-normalization, icu_casemap, ciborium, blake3, imara-diff.
 #     merge asks for a current owner-review claim by manager naming the pr claim and the head.
@@ -139,6 +146,14 @@ frozen_mode() {
     crates/tree/tests/weave_fixture.rs) echo "the weave-v1 fixture's test and its pinned values" ;;
     crates/tree/tests/fixtures/*) echo "a Weave fixture" ;;
     .config/weave-root) echo "the Weave Ground's committed pin: its id, and the root whose marker counts" ;;
+    .cargo/*) echo "cargo's configuration for the workspace, which crates/tree builds with" ;;
+    crates/.cargo/* | crates/tree/.cargo/* | crates/tree/*/.cargo/*)
+      echo "a cargo configuration that cargo run inside crates/tree reads" ;;
+    scripts/rustc-wrapper) echo "the rustc wrapper .cargo/config.toml runs for every compile, crates/tree's included" ;;
+    crates/tree/build.rs) echo "crates/tree's build script, which cargo builds and runs with no manifest change" ;;
+    rust-toolchain | rust-toolchain.toml | crates/rust-toolchain | crates/rust-toolchain.toml | \
+      crates/tree/rust-toolchain | crates/tree/rust-toolchain.toml)
+      echo "a toolchain pin rustup reads for a build of crates/tree" ;;
     *) return 1 ;;
   esac
 }
@@ -169,6 +184,131 @@ lock_versions() {
   local v
   v=$(sed -n 's/^version = "\(.*\)"$/\1/p' <<<"$1" | tr '\n' ' ' | sed 's/ $//')
   echo "${v:-none}"
+}
+
+# The root Cargo.toml (task 42e17ebb190f, finding 2f66d8148a00; decision 4fcfa49dfc1c): what in it can change
+# how crates/tree compiles, which neither crates/tree's manifest nor Cargo.lock shows. Both manifests are
+# parsed with the standard library's tomllib (python3 -I, Python 3.11 or later; no third-party package),
+# never read line by line: strings, comments and moved headers defeated that (findings 21c742cb5437,
+# 23dc00447dd5, 445cc0fe0da7, 2c56e188f7ab). The frozen view is [workspace] without members, exclude,
+# default-members and metadata ([workspace.package], the resolver and the rest stay in), the
+# [workspace.dependencies] entries of every crate crates/tree takes with `workspace = true` in any dependency
+# table (target.* included) at either end, [profile], [patch] and [replace]. It's frozen where the two views
+# differ as canonical JSON; a missing python3 or tomllib, a manifest that doesn't parse, or anything
+# unexpected is frozen too, with the reason. Each manifest is read through the path the tree tracks for it,
+# in whatever letter case (finding 9077ff0d3be9), and handed to python as a file, never as code.
+TOML_VIEW=$(cat <<'PY'
+import json, sys
+try:
+    import tomllib
+except ImportError:
+    print("python3 has no tomllib (it needs 3.11 or later), so the root Cargo.toml can't be read")
+    sys.exit(1)
+
+def load(path, what):
+    with open(path, "rb") as f:
+        data = f.read()
+    if not data:
+        return {}
+    try:
+        return tomllib.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        print(f"{what} doesn't parse as TOML ({e})")
+        sys.exit(1)
+
+def taken(manifest):
+    names = set()
+    def scan(table):
+        for key in ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies"):
+            deps = table.get(key)
+            if isinstance(deps, dict):
+                for name, dep in deps.items():
+                    if isinstance(dep, dict) and dep.get("workspace") is True:
+                        names.add(name)
+    scan(manifest)
+    targets = manifest.get("target")
+    if isinstance(targets, dict):
+        for table in targets.values():
+            if isinstance(table, dict):
+                scan(table)
+    return names
+
+def view(root, names):
+    ws = root.get("workspace")
+    ws = ws if isinstance(ws, dict) else {"": ws}
+    rest = {k: v for k, v in ws.items() if k not in ("members", "exclude", "default-members", "metadata", "dependencies")}
+    deps = ws.get("dependencies")
+    deps = deps if isinstance(deps, dict) else {}
+    return {
+        "workspace": rest,
+        "dependencies": {name: deps.get(name) for name in sorted(names)},
+        "profile": root.get("profile"),
+        "patch": root.get("patch"),
+        "replace": root.get("replace"),
+    }
+
+def canon(value):
+    return json.dumps(value, sort_keys=True, default=str)
+
+def main():
+    old_root, new_root, old_tree, new_tree = sys.argv[1:5]
+    a = load(old_root, "the root Cargo.toml before")
+    b = load(new_root, "the root Cargo.toml after")
+    names = taken(load(old_tree, "crates/tree/Cargo.toml before")) | taken(load(new_tree, "crates/tree/Cargo.toml after"))
+    va, vb = view(a, names), view(b, names)
+    for key in sorted(set(va["workspace"]) | set(vb["workspace"])):
+        if canon(va["workspace"].get(key)) != canon(vb["workspace"].get(key)):
+            print(f"[workspace] {key}: how the workspace builds crates/tree")
+    for name in sorted(names):
+        if canon(va["dependencies"][name]) != canon(vb["dependencies"][name]):
+            print(f"[workspace.dependencies] {name}, which crates/tree takes from the workspace")
+    for part in ("profile", "patch", "replace"):
+        if canon(va[part]) != canon(vb[part]):
+            print(f"[{part}]: how crates/tree compiles")
+
+try:
+    main()
+except SystemExit:
+    raise
+except Exception as e:
+    print(f"reading the root Cargo.toml failed ({type(e).__name__}: {e})")
+    sys.exit(1)
+PY
+)
+# tracked <tree-ish> <path>: the one path <tree-ish> tracks that is <path> in some letter case, or nothing;
+# fails if it tracks more than one.
+tracked() {
+  local found
+  found=$(git ls-tree -r --name-only "$1" | LC_ALL=C awk -v want="$(lower "$2")" 'tolower($0) == want')
+  [ "$(grep -c . <<<"$found")" -le 1 ] || return 1
+  echo "$found"
+}
+# cargo_toml_changes <old> <new>: why the root Cargo.toml's frozen view differs between two tree-ishes, one
+# reason a line, each once; nothing if it doesn't. Any failure is a reason too.
+cargo_toml_changes() {
+  local dir f side path
+  command -v python3 >/dev/null || { echo "no python3 here to read the root Cargo.toml"; return 0; }
+  dir=$(mktemp -d) || { echo "no temporary directory to read the root Cargo.toml in"; return 0; }
+  for side in old new; do
+    local commit=$1
+    [ $side = old ] || commit=$2
+    for f in Cargo.toml crates/tree/Cargo.toml; do
+      path=$(tracked "$commit" "$f") || { echo "$commit tracks $f in more than one letter case"; rm -rf "$dir"; return 0; }
+      if [ -n "$path" ]; then
+        git show "$commit:$path" >"$dir/$side-${f//\//-}" 2>/dev/null ||
+          { echo "can't read $path at $commit"; rm -rf "$dir"; return 0; }
+      else
+        : >"$dir/$side-${f//\//-}"
+      fi
+    done
+  done
+  local out rc=0
+  out=$(python3 -I -c "$TOML_VIEW" "$dir/old-Cargo.toml" "$dir/new-Cargo.toml" "$dir/old-crates-tree-Cargo.toml" \
+    "$dir/new-crates-tree-Cargo.toml" 2>&1) || rc=$?
+  rm -rf "$dir"
+  # A failure is a reason, its own words or, with none, its exit status; one line each, as python wrote them.
+  [ $rc -eq 0 ] || [ -n "$out" ] || out="python3 failed reading the root Cargo.toml (exit $rc)"
+  [ -z "$out" ] || awk '!seen[$0]++' <<<"$out"
 }
 
 case "${1:-}" in
@@ -206,7 +346,9 @@ case "${1:-}" in
     # checkout (macOS's default) writes one over the other (finding 89119f47ba5c), so refuse, naming both.
     git ls-tree -r -z --name-only "$merged" | tr '\0' '\n' >"$tree_paths" || exit 2
     # Each path and each of its leading directories (finding 304dd65b233c: a case variant of a directory
-    # replaces it): any two spellings with one lowercase form, one of them from a changed path, collide.
+    # replaces it): any two spellings in the merged tree with one lowercase form, where a changed path has
+    # that form, collide. Only the merged tree's spellings count: a path the head deleted is in no checkout,
+    # so renaming a file by letter case alone is one spelling (finding e41d9b6f87db).
     collisions=$(LC_ALL=C awk '
       function add(p, touched,   n, i, part, pre, k) {
         n = split(p, part, "/")
@@ -214,7 +356,7 @@ case "${1:-}" in
         for (i = 1; i <= n; i++) {
           pre = (i == 1) ? part[1] : pre "/" part[i]
           k = tolower(pre)
-          if (touched) hit[k] = 1
+          if (touched) { hit[k] = 1; continue }
           if ((k, pre) in seen) continue
           seen[k, pre] = 1
           all[k] = (k in all) ? all[k] " and " pre : pre
@@ -233,6 +375,15 @@ case "${1:-}" in
       if why=$(frozen_mode "$path"); then found=true; echo "tree-scope: frozen: $path ($why)"; fi
       if why=$(owner_mode "$path"); then found=true; echo "tree-scope: owner: $path ($why)"; fi
       if why=$(security_mode "$path"); then found=true; echo "tree-scope: security: $path ($why)"; fi
+      if [ "$(lower "$path")" = cargo.toml ]; then
+        why=$(cargo_toml_changes "$base" "$head")
+        [ -n "$why" ] || why=$(cargo_toml_changes "$2" "$merged")
+        while IFS= read -r reason; do
+          [ -n "$reason" ] || continue
+          found=true
+          echo "tree-scope: frozen: $path ($reason)"
+        done <<<"$why"
+      fi
       if [ "$path" = Cargo.lock ]; then
         for crate in $FROZEN_CRATES; do
           before=$(lock_entry "$base" "$crate")

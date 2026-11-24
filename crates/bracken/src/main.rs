@@ -28,6 +28,7 @@ mod terminal;
 mod typed;
 mod verify;
 mod view;
+mod view_weave;
 mod wire;
 
 /// `println!`, through [`write_stdout`]. Shadows the standard macro in this file.
@@ -514,11 +515,24 @@ enum IdCommand {
     /// What a team server would sign for `name` under a scopes file, parsed and matched exactly as the
     /// server does (`team-server ready`). Fails, naming why, when the file doesn't parse: the server then
     /// signs nothing. Reads only the file.
+    ///
+    /// With `--kind`, `--relation` or `--tag`, it also judges each through the server's own check: a
+    /// contribution of that kind, a relation of that kind, a claim carrying that tag. It prints a line for
+    /// each one refused, and exits 1 if any is (all are, with no scope).
     Scope {
         name: String,
         /// The team server's scopes.toml.
         #[arg(long, value_name = "FILE")]
         scopes: PathBuf,
+        /// A kind of contribution to judge (claim, relation, evidence, ...). Repeatable.
+        #[arg(long = "kind", value_name = "KIND")]
+        kinds: Vec<BodyKind>,
+        /// A kind of relation to judge (implements, supersedes, ...). Repeatable.
+        #[arg(long = "relation", value_name = "KIND")]
+        relations: Vec<RelationKind>,
+        /// A tag to judge, as a claim would carry it (note, type:pr, pr:3, ...). Repeatable.
+        #[arg(long = "tag", value_name = "TAG")]
+        tags: Vec<String>,
         #[command(flatten)]
         out: Output,
     },
@@ -556,16 +570,51 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Weave(weave::WeaveCommand::Init { purpose, out }) => {
             return weave::init(cli.dir.as_deref(), cli.agent.as_deref(), purpose, out);
         }
-        Command::Id(IdCommand::Scope { name, scopes, out }) => {
+        Command::Id(IdCommand::Scope { name, scopes, kinds, relations, tags, out }) => {
             let text = std::fs::read_to_string(&scopes).with_context(|| format!("reading {}", scopes.display()))?;
             let scope = signing::scope_of(&text, &name).with_context(|| format!("{}", scopes.display()))?;
+            // Each thing asked about that the server would refuse: (what, which, why).
+            let none = || "it has no scope".to_owned();
+            let mut refused: Vec<(&str, String, String)> = Vec::new();
+            for kind in kinds {
+                if let Some(why) = scope.as_ref().map_or_else(|| Some(none()), |s| s.refuses_kind(kind)) {
+                    refused.push(("kind", kind.to_string(), why));
+                }
+            }
+            for kind in relations {
+                let why = scope.as_ref().map_or_else(
+                    || Some(none()),
+                    |s| s.refuses_kind(BodyKind::Relation).or_else(|| s.refuses_relation(kind)),
+                );
+                if let Some(why) = why {
+                    refused.push(("relation", kind.to_string(), why));
+                }
+            }
+            for tag in tags {
+                let why = scope
+                    .as_ref()
+                    .map_or_else(|| Some(none()), |s| s.refuses_kind(BodyKind::Claim).or_else(|| s.refuses_tag(&tag)));
+                if let Some(why) = why {
+                    refused.push(("tag", tag, why));
+                }
+            }
             if out.json {
-                print_json(&json!({"name": name, "scope": scope}));
+                let refused: Vec<Value> = refused
+                    .iter()
+                    .map(|(what, which, why)| json!({"what": what, "which": which, "why": why}))
+                    .collect();
+                print_json(&json!({"name": name, "scope": scope, "refused": refused}));
             } else {
-                match scope {
+                match &scope {
                     Some(scope) => println!("{}: {}", terminal::printable(&name), scope.describe()),
                     None => println!("{}: no scope, so a server signs nothing for it", terminal::printable(&name)),
                 }
+                for (what, which, why) in &refused {
+                    println!("refused {what} {}: {}", terminal::printable(which), terminal::printable(why));
+                }
+            }
+            if !refused.is_empty() {
+                return Ok(ExitCode::FAILURE);
             }
         }
         Command::Verify { out } => {
@@ -581,11 +630,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{n} contributions verified{note}");
             }
         }
+        Command::View { port, bind, hosts, runs, policy } => {
+            let dir = ground_dir(cli.dir.as_deref())?;
+            // Taken before the replica is read, so a write during the read changes it again and the view's
+            // first poll reads again (finding 31f5a44fc779).
+            let first = view::signature(&dir)?;
+            // The view never writes, not even the snapshot. It is handed this replica, so it holds one copy.
+            let s = snapshot::Refreshing::open(&dir, snapshot::Refresh::No)?.into_inner();
+            // Validators by name from the public agent directory: the view never reads identities.
+            let policy = policy.build(&view::public_names(&s)?)?;
+            view::serve(s, first, policy, &view::Bind { ips: bind, port, names: hosts }, runs.as_deref())?;
+        }
         command => {
-            // The view never writes, not even the snapshot.
-            let refresh =
-                if matches!(command, Command::View { .. }) { snapshot::Refresh::No } else { snapshot::Refresh::Yes };
-            let s = snapshot::Refreshing::open(&ground_dir(cli.dir.as_deref())?, refresh)?;
+            let s = snapshot::Refreshing::open(&ground_dir(cli.dir.as_deref())?, snapshot::Refresh::Yes)?;
             return run_in_store(s, cli.agent.as_deref(), command);
         }
     }
@@ -807,11 +864,7 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
         Command::Status { all, full, limit, policy, out } => {
             print_status(&s, &policy, &StatusArgs { all, full, limit, json: out.json, agent })?
         }
-        Command::View { port, bind, hosts, runs, policy } => {
-            // Validators by name from the public agent directory: the view never reads identities.
-            let policy = policy.build(&view::public_names(&s)?)?;
-            view::serve(s.dir(), policy, &view::Bind { ips: bind, port, names: hosts }, runs.as_deref())?;
-        }
+        Command::View { .. } => unreachable!("handled before opening a store"),
         Command::Intend { id, duration, out } => {
             let who = any_signer(&s, agent)?;
             let target = resolve(&s, &id)?;
@@ -1317,10 +1370,17 @@ fn contribute_with_parents(
         Body::Evidence { method, details, .. } => vec![method.as_bytes(), details.as_bytes()],
         Body::Retract { reason, .. } => vec![reason.as_bytes()],
     };
-    for (name, hex, raw) in local_secret_keys(s)? {
-        let found = fields.iter().any(|f| contains(&f.to_ascii_lowercase(), hex.as_bytes()) || contains(f, &raw));
-        if found {
-            bail!("this contribution contains the private key of identity {name:?}; it can't go into the Ground");
+    // Each local identity, read through the store like every other read of identities/: a symlinked
+    // directory, or an entry that isn't a regular file (a FIFO would block a plain read), is refused rather
+    // than followed (security note 5 on PR #44, report acaa5cd6f738).
+    let identities = s.identities()?;
+    refuse_unreadable_identity_names(s.dir())?;
+    for id in identities {
+        if fields.iter().any(|f| id.key_is_in(f)) {
+            bail!(
+                "this contribution contains the private key of identity {:?}; it can't go into the Ground",
+                id.name()
+            );
         }
     }
     if parents.is_empty() {
@@ -1390,34 +1450,62 @@ fn claim_tags(
     Ok((tags, parents))
 }
 
-/// Each local identity's name and secret key, as lowercase hex and as bytes. Read from the
-/// identity files themselves, like scripts/ground-checkpoint does.
-fn local_secret_keys(s: &Store) -> Result<Vec<(String, String, Vec<u8>)>> {
-    let dir = s.identities_dir();
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+/// Refuses a write while `<ground>/identities` holds a `*.json` entry whose name isn't UTF-8 (finding
+/// e2000e28c6f6). [`Store::identities`] skips such a name, as no identity Bracken makes has one, but Linux
+/// allows it, so a key file could sit there that the private-key scan can't read: fail closed rather than
+/// miss it. It lists names only, opening no file. On Unix, identities/ is opened from the Ground's root with
+/// `O_DIRECTORY | O_NOFOLLOW`, as the store opens it, and listed through that descriptor, so a symlink
+/// swapped in after `Store::identities` is refused, not followed (finding aba16386e811).
+#[cfg(unix)]
+fn refuse_unreadable_identity_names(ground: &Path) -> Result<()> {
+    use rustix::fs::{self as fs, CWD, Mode, OFlags};
+    use rustix::io::Errno;
+    let identities = ground.join("identities");
+    let listing = || format!("listing {}", identities.display());
+    let root = fs::openat(CWD, ground, OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC, Mode::empty())
+        .map_err(io::Error::from)
+        .with_context(|| format!("opening {}", ground.display()))?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let dir = match fs::openat(&root, "identities", flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(()),
+        Err(Errno::LOOP | Errno::NOTDIR) => bail!("{} isn't a directory (or is a symlink)", identities.display()),
+        Err(e) => return Err(io::Error::from(e)).with_context(listing),
     };
-    let mut keys = Vec::new();
-    for entry in entries {
-        let path = entry.with_context(|| format!("reading {}", dir.display()))?.path();
-        if path.extension().is_none_or(|e| e != "json") {
-            continue;
+    for entry in fs::Dir::read_from(&dir).map_err(io::Error::from).with_context(listing)? {
+        let entry = entry.map_err(io::Error::from).with_context(listing)?;
+        let name = entry.file_name().to_bytes();
+        if std::str::from_utf8(name).is_err() && name.ends_with(b".json") {
+            bail!(
+                "{} holds {:?}, whose name isn't UTF-8, so the private-key scan can't read it as an identity; \
+                 rename or remove it before writing",
+                identities.display(),
+                String::from_utf8_lossy(name)
+            );
         }
-        let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let file: Value = serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        let Some(hex) = file["secret_key"].as_str() else { continue };
-        let hex = hex.to_ascii_lowercase();
-        let raw = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok()).collect();
-        let name = path.file_stem().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
-        keys.push((name, hex, raw));
     }
-    Ok(keys)
+    Ok(())
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty() && haystack.windows(needle.len()).any(|w| w == needle)
+/// As the Unix one, by path: no `openat` here.
+#[cfg(not(unix))]
+fn refuse_unreadable_identity_names(ground: &Path) -> Result<()> {
+    let identities = ground.join("identities");
+    let entries = match std::fs::read_dir(&identities) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("listing {}", identities.display())),
+    };
+    for entry in entries {
+        let name = entry.with_context(|| format!("listing {}", identities.display()))?.file_name();
+        if name.to_str().is_none() && name.as_encoded_bytes().ends_with(b".json") {
+            bail!(
+                "{} holds {name:?}, whose name isn't UTF-8, so the private-key scan can't read it",
+                identities.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn resolve(s: &Store, prefix: &str) -> Result<ContributionId> {
@@ -2666,6 +2754,52 @@ fn print_json(v: &impl serde::Serialize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding aba16386e811: the non-UTF-8 name check opens identities/ from the Ground's root with
+    /// O_NOFOLLOW, never by path. Absent: nothing to refuse. A symlink, even to a plain directory: refused,
+    /// not followed. A directory: listed.
+    #[cfg(unix)]
+    #[test]
+    fn the_identity_name_check_never_follows_a_symlinked_identities() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ground = tmp.path().join("g");
+        std::fs::create_dir(&ground).unwrap();
+        refuse_unreadable_identity_names(&ground).expect("no identities/ is nothing to refuse");
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("val.json"), "{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, ground.join("identities")).unwrap();
+        let err = refuse_unreadable_identity_names(&ground).unwrap_err().to_string();
+        assert!(err.contains("isn't a directory (or is a symlink)"), "{err}");
+        std::fs::remove_file(ground.join("identities")).unwrap();
+        std::fs::create_dir(ground.join("identities")).unwrap();
+        std::fs::write(ground.join("identities/val.json"), "{}").unwrap();
+        refuse_unreadable_identity_names(&ground).expect("a UTF-8 name is the store's to read");
+    }
+
+    /// As above, on Linux, where a name needn't be UTF-8: a symlinked identities/ whose target holds a
+    /// non-UTF-8 key file name is refused as a symlink, without listing the target; the same name in the
+    /// real directory is refused as unreadable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_identity_name_check_refuses_a_non_utf8_name_but_not_through_a_symlink() {
+        use std::os::unix::ffi::OsStrExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let ground = tmp.path().join("g");
+        std::fs::create_dir(&ground).unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let odd = std::ffi::OsStr::from_bytes(b"\xffzed.json");
+        std::fs::write(elsewhere.join(odd), "{}").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, ground.join("identities")).unwrap();
+        let err = refuse_unreadable_identity_names(&ground).unwrap_err().to_string();
+        assert!(err.contains("isn't a directory (or is a symlink)") && !err.contains("UTF-8"), "{err}");
+        std::fs::remove_file(ground.join("identities")).unwrap();
+        std::fs::create_dir(ground.join("identities")).unwrap();
+        std::fs::write(ground.join("identities").join(odd), "{}").unwrap();
+        let err = refuse_unreadable_identity_names(&ground).unwrap_err().to_string();
+        assert!(err.contains("isn't UTF-8"), "{err}");
+    }
 
     /// `show`'s one-contribution answer against the whole view, the oracle (task `7a3d17f979c3`): on
     /// random graphs with retractions, supersessions by the author and by others, and relations and

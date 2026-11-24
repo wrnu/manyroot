@@ -14,6 +14,11 @@
 #   - --dir in any form: it always uses the Weave Ground;
 #   - evidence: check results come only from the check runner (weave.md section 3);
 #   - sync and serve: the Weave Ground never syncs in v0, and this never reads .bracken-team;
+#   - view with anything but --port, the policy options (--min-passes, --validator, --follow-changes), --as
+#     and help: the Weave Ground's view is read-only and on loopback only, so --bind, --host and --runs, and
+#     any option or word not on that list, are refused (docs/design/weave-view.md section 6; answer
+#     e490eaaaebb3). A list of what passes, not of what doesn't, so an option a later bracken adds is refused
+#     until it is named here. NetBird, a service or any other exposure is the owner's own approval;
 #   - --as weave-runner, for anything but weave validate;
 #   - weave integrate and weave line merge, which move a line, for anyone but --as weave-integrator: builders
 #     propose (scripts/weave-propose), and only the integrator merges (stage 2a, task 87a1bcba025d);
@@ -92,6 +97,31 @@ case "$cmd" in
   evidence) fail "evidence is refused: a check result on a Weave record comes only from the check runner (weave validate)" ;;
   sync | serve) fail "$cmd is refused: the Weave Ground never syncs in v0" ;;
 esac
+# The view: only what keeps it read-only on loopback passes. Every argument is read, past '--' too, and an
+# option's value may not look like an option, so nothing hides another option from this list.
+if [ "$cmd" = view ]; then
+  seen_view=false
+  for ((i = 1; i <= $#; i++)); do
+    arg=${!i}
+    case "$arg" in
+      view)
+        $seen_view && fail "view takes no word $arg"
+        seen_view=true
+        ;;
+      --port | --min-passes | --validator | --as)
+        j=$((i + 1))
+        [ $j -le $# ] || fail "view: $arg needs a value"
+        [[ ${!j} != -* ]] || fail "view: $arg's value can't start with '-': ${!j}"
+        i=$j
+        ;;
+      --port=* | --min-passes=* | --validator=* | --as=* | --follow-changes | -h | --help) ;;
+      --bind | --bind=* | --host | --host=* | --runs | --runs=*)
+        fail "view: ${arg%%=*} is refused: the Weave Ground's view is read-only on loopback only (127.0.0.1), with no runs; any other exposure is the owner's own approval"
+        ;;
+      *) fail "view: $arg is refused: the Weave Ground's view takes only --port, --min-passes, --validator, --follow-changes, --as and --help" ;;
+    esac
+  done
+fi
 if [ "$cmd" = artifact ]; then
   for m in ${media[@]+"${media[@]}"}; do
     [[ $(printf '%s' "$m" | tr '[:upper:]' '[:lower:]') != application/vnd.bracken.weave* ]] ||

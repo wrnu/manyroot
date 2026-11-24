@@ -130,7 +130,7 @@ pub(crate) struct ReviewArgs {
     out: Output,
 }
 
-fn counted_json(c: &Counted, checks: &Checks, names: &Names) -> Value {
+pub(crate) fn counted_json(c: &Counted, checks: &Checks, names: &Names) -> Value {
     let result = |id: &ContributionId| {
         let r = checks.result(id).expect("counted from the results");
         json!({"result": id, "author": r.author.to_string(), "author_name": names.display(&r.author),
@@ -182,32 +182,11 @@ pub(crate) fn green(s: &Store, args: GreenArgs) -> Result<ExitCode> {
         return green_on_manifest(s, &ix, &lines, &line, &checks, &names, manifest, &args.out);
     }
     let green = checks.green(g, &lines, &line);
-    let (state, decisions): (&str, Vec<ContributionId>) = match &green {
-        Green::Undefined(versions) => ("undefined", versions.clone()),
-        Green::None => ("none", vec![]),
-        Green::One(d) => ("one", vec![*d]),
-        Green::Ambiguous(ds) => ("ambiguous", ds.clone()),
-    };
     let heads = lines.heads(&line);
     let per_head: Vec<(ContributionId, Option<Vec<Counted>>)> =
         heads.iter().map(|h| (*h, checks.counted(g, &lines, h))).collect();
     if args.out.json {
-        let heads: Vec<Value> = per_head
-            .iter()
-            .map(|(h, counted)| {
-                let manifest = lines.decision(h).expect("a head").decision.manifest.to_string();
-                let checks: Option<Vec<Value>> =
-                    counted.as_ref().map(|cs| cs.iter().map(|c| counted_json(c, &checks, &names)).collect());
-                json!({"decision": h, "manifest": manifest, "checks": checks})
-            })
-            .collect();
-        let (green, versions) = match green {
-            Green::Undefined(_) => (vec![], decisions),
-            _ => (decisions, vec![]),
-        };
-        print_json(
-            &json!({"line": line, "state": state, "green": green, "diverged_versions": versions, "heads": heads}),
-        );
+        print_json(&green_json(&line, &green, &per_head, &lines, &checks, &names));
         return Ok(ExitCode::SUCCESS);
     }
     let ids = |ds: &[ContributionId]| ds.iter().map(ContributionId::short).collect::<Vec<_>>().join(" ");
@@ -227,6 +206,38 @@ pub(crate) fn green(s: &Store, args: GreenArgs) -> Result<ExitCode> {
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `weave green --json`'s answer, from the line's green and each head's counted results; `bracken view`'s
+/// line page serves the same.
+pub(crate) fn green_json(
+    line: &ContributionId,
+    green: &Green,
+    per_head: &[(ContributionId, Option<Vec<Counted>>)],
+    lines: &Lines,
+    checks: &Checks,
+    names: &Names,
+) -> Value {
+    let (state, decisions): (&str, Vec<ContributionId>) = match green {
+        Green::Undefined(versions) => ("undefined", versions.clone()),
+        Green::None => ("none", vec![]),
+        Green::One(d) => ("one", vec![*d]),
+        Green::Ambiguous(ds) => ("ambiguous", ds.clone()),
+    };
+    let heads: Vec<Value> = per_head
+        .iter()
+        .map(|(h, counted)| {
+            let manifest = lines.decision(h).expect("a head").decision.manifest.to_string();
+            let checks: Option<Vec<Value>> =
+                counted.as_ref().map(|cs| cs.iter().map(|c| counted_json(c, checks, names)).collect());
+            json!({"decision": h, "manifest": manifest, "checks": checks})
+        })
+        .collect();
+    let (green, versions) = match green {
+        Green::Undefined(_) => (vec![], decisions),
+        _ => (decisions, vec![]),
+    };
+    json!({"line": line, "state": state, "green": green, "diverged_versions": versions, "heads": heads})
 }
 
 /// `weave green --manifest`: each check of the line's current policy, counted on the manifest.
@@ -274,7 +285,7 @@ fn green_on_manifest(
     Ok(ExitCode::SUCCESS)
 }
 
-fn target_json(t: &Target) -> Value {
+pub(crate) fn target_json(t: &Target) -> Value {
     match t {
         Target::Decision(d) => json!({"decision": d}),
         Target::Manifest(id, hash) => json!({"manifest_artifact": id, "manifest": hash.to_string()}),
@@ -290,7 +301,7 @@ fn target_text(t: &Target) -> String {
     }
 }
 
-fn review_json(r: &Review, t: &Target, names: &Names) -> Value {
+pub(crate) fn review_json(r: &Review, t: &Target, names: &Names) -> Value {
     json!({"review": r.id, "kind": if r.objection { "objection" } else { "agreement" },
            "author": r.author.to_string(), "author_name": names.display(&r.author), "from": r.from,
            "target": target_json(t), "note": r.note})
@@ -307,7 +318,7 @@ fn review_text(r: &Review, t: &Target, names: &Names) -> String {
     )
 }
 
-fn basis_json(b: &Basis) -> Value {
+pub(crate) fn basis_json(b: &Basis) -> Value {
     match b {
         Basis::Evidence { result, check, replaced } => {
             json!({"kind": b.kind(), "result": result, "check": check, "replaced": replaced})
@@ -317,7 +328,7 @@ fn basis_json(b: &Basis) -> Value {
     }
 }
 
-fn open_json(o: &Open, names: &Names) -> Value {
+pub(crate) fn open_json(o: &Open, names: &Names) -> Value {
     json!({"objection": o.objection.id, "author": o.objection.author.to_string(),
            "author_name": names.display(&o.objection.author), "from": o.objection.from,
            "target": target_json(&o.objection.target), "basis": basis_json(&o.basis),

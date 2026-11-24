@@ -24,7 +24,20 @@
   // before it, so appending keeps parents ahead of their children.
   let ground = null; // /api/ground
   let statuses = {}; // /api/status's statuses
+  // Compact status code per contribution index (0 pending, 1 accepted, 2 rejected, 3 superseded),
+  // kept in sync with `statuses` so dense redraws avoid per-knot string hash lookups.
+  let statusCode = new Uint8Array(0);
+  const STATUS_WORD = ["pending", "accepted", "rejected", "superseded"];
+  const STATUS_NUM = { accepted: 1, rejected: 2, superseded: 3 };
+  function syncStatuses() {
+    if (statusCode.length < N) statusCode = new Uint8Array(Math.max(N, statusCode.length * 2, 1024));
+    for (let i = 0; i < N; i++) {
+      const s = statuses[ids[i]];
+      statusCode[i] = s ? STATUS_NUM[s.status] || 0 : 0;
+    }
+  }
   const ids = [], index = new Map(), kind = [], author = [], parents = [], children = [], time = [], depth = [], tags = [];
+  const artifactsAll = [];
   const failed = new Set();
   // Each retraction and its target, in index order: what's retracted is worked out from these (as
   // Graph::all_retracted does), so a retraction that is itself retracted later stops counting.
@@ -39,7 +52,7 @@
   }
 
   function reset() {
-    for (const col of [ids, kind, author, parents, children, time, depth, tags]) col.length = 0;
+    for (const col of [ids, kind, author, parents, children, time, depth, tags, artifactsAll]) col.length = 0;
     index.clear();
     retracts.length = 0;
     clearCuts();
@@ -80,6 +93,7 @@
       const ps = g.parents[k].map((p) => pos[p]);
       if (ps.some((p) => p === undefined)) return false;
       kind[i] = g.kind[k];
+      if (kind[i] === "artifact") artifactsAll.push(i);
       author[i] = g.author[k];
       parents[i] = ps;
       children[i] = [];
@@ -101,6 +115,7 @@
     clearCuts();
     for (const p of g.failed || []) if (pos[p] !== undefined) failed.add(pos[p]);
     cursor = g.cursor;
+    syncStatuses();
     return true;
   }
 
@@ -129,7 +144,10 @@
     if (statusAsked) return (statusAsked.again = true);
     statusAsked = { again: false };
     api("/api/status")
-      .then((s) => (statuses = s.statuses))
+      .then((s) => {
+        statuses = s.statuses;
+        syncStatuses();
+      })
       .catch(() => {})
       .finally(() => {
         const again = statusAsked.again;
@@ -155,6 +173,7 @@
       if (d.status_changed === null || Object.keys(d.status_changed).length) loadStatus();
       if (N <= BULK_TEXT) bulkTexts(before);
       buildAgents();
+      updateKey();
       layout();
       note();
     });
@@ -173,8 +192,20 @@
     });
   }
 
+  const FILTER_LABEL = {
+    claim: "claims",
+    artifact: "artifacts",
+    relation: "relations",
+    pass: "passing evidence",
+    fail: "failing evidence",
+    retract: "retractions",
+    accepted: "accepted subjects",
+    rejected: "rejected subjects",
+  };
+
   function note(extra) {
     const parts = [`${N.toLocaleString("en")} contributions`, `${agentsCount} agents`, extra || "live"];
+    if (state.filter) parts.push(`showing ${FILTER_LABEL[state.filter] || state.filter}`);
     if (Number.isFinite(state.surface)) parts.push("scrubbed back: retractions as they stood, status only now");
     B.text($("data-note"), parts.join(" · "));
   }
@@ -290,7 +321,7 @@
   document.addEventListener("visibilitychange", () => document.visibilityState === "hidden" && saveFlag());
 
   // ---- State and geometry ----
-  const state = { axis: "time", surface: Infinity, hover: -1, selected: -1, view: null, playing: false, speed: 1, morph: 1 };
+  const state = { axis: "time", surface: Infinity, hover: -1, selected: -1, view: null, playing: false, speed: 1, morph: 1, filter: null };
   const canvas = $("loom-canvas");
   const ctx = canvas.getContext("2d");
   const gauge = $("gauge-canvas");
@@ -355,18 +386,47 @@
     geom.grid = grid;
   }
 
+  function matchesFilter(i, filter = state.filter) {
+    if (!filter) return true;
+    switch (filter) {
+      case "claim":
+        return kind[i] === "claim";
+      case "artifact":
+        return kind[i] === "artifact";
+      case "relation":
+        return kind[i] === "relation";
+      case "pass":
+        return kind[i] === "evidence" && !failed.has(i);
+      case "fail":
+        return kind[i] === "evidence" && failed.has(i);
+      case "retract":
+        return kind[i] === "retract";
+      case "accepted":
+        return (kind[i] === "claim" || kind[i] === "artifact") && statusOf(i) === "accepted";
+      case "rejected":
+        return (kind[i] === "claim" || kind[i] === "artifact") && statusOf(i) === "rejected";
+      default:
+        return true;
+    }
+  }
+
   function hit(x, y) {
     let best = -1, bd = 14 * 14;
+    let bestArt = -1, bdArt = 10 * 10;
     const dense = visibleCount > DENSE;
+    const filt = state.filter;
     for (let gx = Math.floor(x / CELL) - 1; gx <= Math.floor(x / CELL) + 1; gx++)
       for (let gy = Math.floor(y / CELL) - 1; gy <= Math.floor(y / CELL) + 1; gy++)
         for (const i of geom.grid.get(gx * 65536 + gy) || []) {
           if (valueOf(i) > state.surface) continue;
-          if (dense && kind[i] !== "claim" && kind[i] !== "artifact") continue;
+          if (filt) {
+            if (!matchesFilter(i, filt)) continue;
+          } else if (dense && kind[i] !== "claim" && kind[i] !== "artifact") continue;
           const d = (X(i) - x) ** 2 + (Y(i) - y) ** 2;
           if (d < bd) (bd = d), (best = i);
+          if (kind[i] === "artifact" && d < bdArt) (bdArt = d), (bestArt = i);
         }
-    return best;
+    return bestArt >= 0 ? bestArt : best;
   }
 
   function layout() {
@@ -493,6 +553,18 @@
     drawHyphae(vis, dense, false);
     if (!dense) drawKnots(vis, r);
     else drawBlooms(vis);
+    let labelVis = vis, labelDense = dense;
+    if (state.filter) {
+      ctx.fillStyle = B.token("--ground");
+      ctx.globalAlpha = 0.76;
+      ctx.fillRect(0, TOP, W, H - TOP);
+      ctx.globalAlpha = 1;
+      const matched = vis.filter((i) => matchesFilter(i));
+      labelVis = matched;
+      labelDense = matched.length > DENSE;
+      if (labelDense) drawFilteredDense(matched);
+      else drawKnots(matched, Math.max(r, 3.6));
+    }
     if (ancestry) {
       ctx.fillStyle = B.token("--ground");
       ctx.globalAlpha = 0.72;
@@ -511,7 +583,7 @@
       }
     }
     drawSurface();
-    drawLabels(vis, r, dense);
+    drawLabels(labelVis, r, labelDense);
     drawGauge();
     lastDrawMs = performance.now() - t0;
     canvas.dataset.drawMs = lastDrawMs.toFixed(1);
@@ -659,42 +731,175 @@
     ctx.globalAlpha = 1;
   }
 
+  function drawOneKnot(i, r, now) {
+    const k = kind[i];
+    const small = k === "relation" || k === "evidence" || k === "retract";
+    let rr = small ? r * 0.72 : r;
+    const b = born.get(i);
+    if (b !== undefined && !B.reducedMotion()) {
+      const t = Math.min(1, (now - b) / 420);
+      rr *= 0.25 + 0.75 * ease(t);
+      if (t >= 1) born.delete(i);
+    }
+    B.drawKnot(ctx, k, X(i), Y(i), rr, lookOf(i), 1);
+    return rr;
+  }
+
   function drawKnots(vis, r) {
     const now = performance.now();
+    const artifacts = [];
+    const focusR = new Map();
     for (const i of vis) {
-      const k = kind[i];
-      const small = k === "relation" || k === "evidence" || k === "retract";
-      let rr = small ? r * 0.72 : r;
-      const b = born.get(i);
-      if (b !== undefined && !B.reducedMotion()) {
-        const t = Math.min(1, (now - b) / 420);
-        rr *= 0.25 + 0.75 * ease(t);
-        if (t >= 1) born.delete(i);
+      if (kind[i] === "artifact") {
+        artifacts.push(i);
+        continue;
       }
-      B.drawKnot(ctx, k, X(i), Y(i), rr, lookOf(i), 1);
-      if (i === state.hover || i === state.selected) {
-        ctx.beginPath();
-        ctx.arc(X(i), Y(i), rr * 2.6, 0, Math.PI * 2);
-        ctx.strokeStyle = B.token("--focus");
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
-      }
+      const rr = drawOneKnot(i, r, now);
+      if (i === state.hover || i === state.selected) focusR.set(i, rr);
+    }
+    // Artifacts draw last so later knots on a busy root can't cover them.
+    const ar = Math.max(r, 3.2);
+    for (const i of artifacts) {
+      const rr = drawOneKnot(i, ar, now);
+      if (i === state.hover || i === state.selected) focusR.set(i, rr);
+    }
+    for (const [i, rr] of focusR) {
+      ctx.beginPath();
+      ctx.arc(X(i), Y(i), rr * 2.6, 0, Math.PI * 2);
+      ctx.strokeStyle = B.token("--focus");
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
     }
     if (born.size) requestDraw();
   }
 
+  // Cached nodule stamps for dense Grounds with hundreds of artifacts (at most 16 looks: 4 statuses + 12 inks).
+  const stamps = { key: "", map: new Map() };
+  function artifactStamp(ar, st, inkIndex) {
+    const key = `${B.theme()}:${ar.toFixed(2)}:${dpr}`;
+    if (stamps.key !== key) {
+      stamps.key = key;
+      stamps.map.clear();
+    }
+    const id = st === "pending" ? `p:${inkIndex}` : st;
+    let entry = stamps.map.get(id);
+    if (entry) return entry;
+    const half = Math.ceil(ar * 2.2) + 2;
+    const css = half * 2;
+    const oc = new OffscreenCanvas(Math.round(css * dpr), Math.round(css * dpr));
+    const sctx = oc.getContext("2d");
+    sctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const lk = B.look("artifact", { status: st, retracted: st === "retracted", agent: inkIndex });
+    B.drawKnot(sctx, "artifact", half, half, ar, lk, 1);
+    entry = { oc, half, css };
+    stamps.map.set(id, entry);
+    return entry;
+  }
+
   function drawBlooms(vis) {
-    // At density, only what the policy settled shows as a point: accepted green, rejected rust.
+    // At density, settled claims show as points (accepted green, rejected rust), and artifacts
+    // always draw last with their own nodule shape, whatever their status, so nothing covers them.
     const accepted = B.token("--accepted"), rejected = B.token("--rejected");
-    for (const i of vis) {
-      if (kind[i] !== "claim" && kind[i] !== "artifact") continue;
-      const st = statusOf(i);
-      if (st !== "accepted" && st !== "rejected") continue;
-      ctx.fillStyle = st === "accepted" ? accepted : rejected;
-      ctx.fillRect(X(i) - 1, Y(i) - 1, 2, 2);
+    const ret = retractedAt(state.surface);
+    const isBehind = behind();
+    const rej = [], artifacts = [];
+    if (!isBehind) {
+      ctx.fillStyle = accepted;
+      for (let m = 0; m < vis.length; m++) {
+        const i = vis[m];
+        const k = kind[i];
+        if (k === "artifact") {
+          artifacts.push(i);
+          continue;
+        }
+        if (k !== "claim" || ret[i] === 1) continue;
+        const sc = statusCode[i];
+        if (sc === 1) ctx.fillRect(X(i) - 1, Y(i) - 1, 2, 2);
+        else if (sc === 2) rej.push(i);
+      }
+      if (rej.length) {
+        ctx.fillStyle = rejected;
+        for (let m = 0; m < rej.length; m++) {
+          const i = rej[m];
+          ctx.fillRect(X(i) - 1, Y(i) - 1, 2, 2);
+        }
+      }
+    } else {
+      for (let m = 0; m < vis.length; m++) if (kind[vis[m]] === "artifact") artifacts.push(vis[m]);
+    }
+    const ar = Math.max(2.8, Math.min(4.8, Math.sqrt((W * (H - TOP)) / Math.max(1, artifacts.length) / 40)));
+    if (artifacts.length > 400) {
+      // When hundreds of artifacts pack a root, keep the latest per nodule-sized vertical cell and
+      // blit cached stamps on integer device pixels so 50k stays crisp and no slower than main.
+      const step = Math.max(2, Math.ceil(ar * 2));
+      const bins = Math.max(1, Math.ceil((H - TOP + PAD * 2) / step));
+      const last = new Int32Array(agentsCount * bins).fill(-1);
+      for (let m = 0; m < artifacts.length; m++) {
+        const i = artifacts[m];
+        const b = Math.max(0, Math.min(bins - 1, Math.floor((Y(i) - TOP + PAD) / step)));
+        last[author[i] * bins + b] = i;
+      }
+      if (typeof OffscreenCanvas !== "undefined") {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        for (let k = 0; k < last.length; k++) {
+          const i = last[k];
+          if (i < 0) continue;
+          const st = ret[i] === 1 ? "retracted" : isBehind ? "pending" : STATUS_WORD[statusCode[i]];
+          const s = artifactStamp(ar, st, author[i] % 12);
+          ctx.drawImage(s.oc, Math.round((X(i) - s.half) * dpr), Math.round((Y(i) - s.half) * dpr));
+        }
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      } else {
+        for (let k = 0; k < last.length; k++) {
+          const i = last[k];
+          if (i >= 0) B.drawKnot(ctx, "artifact", X(i), Y(i), ar, lookOf(i), 1);
+        }
+      }
+    } else {
+      for (let m = 0; m < artifacts.length; m++) {
+        const i = artifacts[m];
+        B.drawKnot(ctx, "artifact", X(i), Y(i), ar, lookOf(i), 1);
+      }
     }
     for (const i of [state.hover, state.selected]) {
       if (i < 0 || i >= N || valueOf(i) > state.surface) continue;
+      if (kind[i] === "artifact" && artifacts.length > 400) B.drawKnot(ctx, "artifact", X(i), Y(i), ar, lookOf(i), 1);
+      const ringR = kind[i] === "artifact" ? Math.max(6, ar * 2.1) : 6;
+      ctx.beginPath();
+      ctx.arc(X(i), Y(i), ringR, 0, Math.PI * 2);
+      ctx.strokeStyle = B.token("--focus");
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+    }
+  }
+
+  function drawFilteredDense(matched) {
+    if (state.filter === "artifact") return drawBlooms(matched);
+    const fixed =
+      state.filter === "pass"
+        ? B.token("--pass")
+        : state.filter === "fail"
+          ? B.token("--fail")
+          : state.filter === "accepted"
+            ? B.token("--accepted")
+            : state.filter === "rejected"
+              ? B.token("--rejected")
+              : null;
+    if (fixed) {
+      ctx.fillStyle = fixed;
+      for (let m = 0; m < matched.length; m++) {
+        const i = matched[m];
+        ctx.fillRect(X(i) - 1, Y(i) - 1, 2, 2);
+      }
+    } else {
+      for (let m = 0; m < matched.length; m++) {
+        const i = matched[m];
+        ctx.fillStyle = B.ink(author[i]);
+        ctx.fillRect(X(i) - 1, Y(i) - 1, 2, 2);
+      }
+    }
+    for (const i of [state.hover, state.selected]) {
+      if (i < 0 || i >= N || valueOf(i) > state.surface || !matchesFilter(i)) continue;
       ctx.beginPath();
       ctx.arc(X(i), Y(i), 6, 0, Math.PI * 2);
       ctx.strokeStyle = B.token("--focus");
@@ -741,7 +946,8 @@
       const el = B.h("div", { class: ancestry && !inAncestry(i) ? "knot-label dim" : "knot-label" }, B.firstLine(t, 70));
       el.style.left = `${X(i) + r + 6}px`;
       el.style.top = `${y - 8}px`;
-      el.style.maxWidth = `${Math.max(80, Math.min(260, colW * 1.45, W - X(i) - r - 14))}px`;
+      const maxW = state.filter ? Math.min(260, W - X(i) - r - 14) : Math.min(260, colW * 1.45, W - X(i) - r - 14);
+      el.style.maxWidth = `${Math.max(80, maxW)}px`;
       els.push(el);
     }
     box.replaceChildren(...els);
@@ -931,6 +1137,14 @@
     }
   }
 
+  function formatSize(bytes) {
+    if (bytes < 1024) return `${bytes.toLocaleString("en")} ${bytes === 1 ? "byte" : "bytes"}`;
+    const units = ["KiB", "MiB", "GiB"];
+    let n = bytes, u = -1;
+    while (n >= 1024 && u < units.length - 1) (n /= 1024), u++;
+    return `${n.toFixed(1)} ${units[u]} (${bytes.toLocaleString("en")} bytes)`;
+  }
+
   function refreshSide() {
     const side = $("side");
     const i = state.selected;
@@ -967,6 +1181,7 @@
         B.h("dt", {}, "causal step"), B.h("dd", { class: "num" }, String(depth[i])),
         B.h("dt", {}, "id"), B.h("dd", { class: "id" }, id),
         c && c.kind === "artifact" && c.body.media_type ? [B.h("dt", {}, "type"), B.h("dd", {}, c.body.media_type)] : null,
+        c && c.kind === "artifact" && typeof c.body.size === "number" ? [B.h("dt", {}, "size"), B.h("dd", { class: "num" }, formatSize(c.body.size))] : null,
         a ? [B.h("dt", {}, evidence), B.h("dd", {}, `${a.passes.length} passing, ${a.fails.length} failing`)]
           : s ? [B.h("dt", {}, evidence), B.h("dd", {}, `${s.passes} passing, ${s.fails} failing`)] : null,
         a && a.superseded_by && a.superseded_by.length ? [B.h("dt", {}, "replaced by"), B.h("dd", { class: "id" }, a.superseded_by.map((x) => x.slice(0, 12)).join(", "))] : null,
@@ -995,11 +1210,10 @@
         : [];
     // Behind now, only what was there at the surface: a knot's parents always were, its children may not be.
     const there = (list) => list.filter((j) => valueOf(j) <= state.surface);
-    // A claim's whole life, in the Root view. Ids are hex, so the address holds nothing else.
-    const toRoot =
-      kind[i] === "claim"
-        ? B.h("button", { type: "button", class: "open-root", on: { click: () => location.assign(`/root.html#${id}`) } }, "Follow this claim's life")
-        : null;
+    // A claim's or artifact's whole life, in the Root view. Ids are hex, so the address holds nothing else.
+    const toRoot = subject
+      ? B.h("button", { type: "button", class: "open-root", on: { click: () => location.assign(`/root.html#${id}`) } }, `Follow this ${kind[i]}'s life`)
+      : null;
     side.replaceChildren(...[card, toRoot].filter(Boolean), ...lineage("Woven onto", there(parents[i])), ...lineage("Built on by", there(children[i])));
   }
 
@@ -1081,6 +1295,7 @@
       showHover(-1);
     }
     note();
+    updateKey();
     refreshSide();
     requestDraw();
   }
@@ -1136,6 +1351,7 @@
     state.view = null;
     state.surface = Infinity;
     note();
+    updateKey();
     refreshSide();
     state.hover = -1;
     ancestry = null;
@@ -1158,20 +1374,100 @@
   $("axis-time").addEventListener("click", () => setAxis("time"));
   $("axis-causal").addEventListener("click", () => setAxis("causal"));
 
-  // ---- The key ----
+  // ---- The key: interactive kind/status filter and artifact jump ----
+  const keyButtons = new Map();
+  let artCountEl = null, artPrevBtn = null, artNextBtn = null;
+
+  function visibleArtifacts() {
+    const out = [];
+    for (let m = 0; m < artifactsAll.length; m++) {
+      const i = artifactsAll[m];
+      if (valueOf(i) <= state.surface) out.push(i);
+    }
+    out.sort((a, b) => valueOf(a) - valueOf(b) || a - b);
+    return out;
+  }
+
+  function toggleFilter(id) {
+    state.filter = state.filter === id ? null : id;
+    if (state.hover >= 0 && !matchesFilter(state.hover)) {
+      state.hover = -1;
+      ancestry = null;
+      showHover(-1);
+    }
+    updateKey();
+    note();
+    requestDraw();
+  }
+
+  function jumpArtifact(dir) {
+    const list = visibleArtifacts();
+    if (!list.length) return;
+    const cur = list.indexOf(state.selected);
+    const nextIdx = cur < 0 ? (dir > 0 ? 0 : list.length - 1) : (cur + dir + list.length) % list.length;
+    const target = list[nextIdx];
+    if (state.view) {
+      const [va, vb] = state.view;
+      const v = valueOf(target);
+      if (v < va || v > vb) {
+        const [ra, rb] = range();
+        const span = vb - va;
+        const na = Math.max(ra, Math.min(rb - span, v - span / 2));
+        state.view = [na, na + span];
+      }
+    }
+    select(target);
+  }
+
+  function updateKey() {
+    for (const [id, btn] of keyButtons) B.attr(btn, "aria-pressed", String(state.filter === id));
+    const count = visibleArtifacts().length;
+    if (artCountEl) B.text(artCountEl, String(count));
+    if (artPrevBtn) artPrevBtn.disabled = count === 0;
+    if (artNextBtn) artNextBtn.disabled = count === 0;
+  }
+
   function buildKey() {
     const key = $("key");
-    const item = (kindName, lk, label) => B.h("span", {}, B.knotIcon(kindName, lk, 16), label);
-    key.replaceChildren(
-      item("claim", B.look("claim", { status: "pending", agent: 0 }), "claim"),
-      item("artifact", B.look("artifact", { status: "pending", agent: 2 }), "artifact"),
-      item("relation", B.look("relation", { agent: 4 }), "relation"),
-      item("evidence", B.look("evidence", { verdict: "pass" }), "pass"),
-      item("evidence", B.look("evidence", { verdict: "fail" }), "fail"),
-      item("retract", B.look("retract", { agent: 1 }), "retraction"),
-      item("claim", B.look("claim", { status: "accepted" }), "accepted"),
-      item("claim", B.look("claim", { status: "rejected" }), "rejected")
+    keyButtons.clear();
+    const item = (id, kindName, lk, label, extra) => {
+      const btn = B.h(
+        "button",
+        {
+          type: "button",
+          class: "key-btn",
+          "aria-pressed": String(state.filter === id),
+          title: `Filter to ${FILTER_LABEL[id] || label}`,
+          on: { click: () => toggleFilter(id) },
+        },
+        B.knotIcon(kindName, lk, 16),
+        label,
+        extra || null
+      );
+      keyButtons.set(id, btn);
+      return btn;
+    };
+    artCountEl = B.h("span", { class: "num key-count" }, "0");
+    artPrevBtn = B.h("button", { type: "button", class: "key-jump", "aria-label": "Previous artifact", title: "Previous artifact", on: { click: () => jumpArtifact(-1) } }, "‹");
+    artNextBtn = B.h("button", { type: "button", class: "key-jump", "aria-label": "Next artifact", title: "Next artifact", on: { click: () => jumpArtifact(1) } }, "›");
+    const artifactGroup = B.h(
+      "span",
+      { class: "key-group" },
+      item("artifact", "artifact", B.look("artifact", { status: "pending", agent: 2 }), "artifact", artCountEl),
+      artPrevBtn,
+      artNextBtn
     );
+    key.replaceChildren(
+      item("claim", "claim", B.look("claim", { status: "pending", agent: 0 }), "claim"),
+      artifactGroup,
+      item("relation", "relation", B.look("relation", { agent: 4 }), "relation"),
+      item("pass", "evidence", B.look("evidence", { verdict: "pass" }), "pass"),
+      item("fail", "evidence", B.look("evidence", { verdict: "fail" }), "fail"),
+      item("retract", "retract", B.look("retract", { agent: 1 }), "retraction"),
+      item("accepted", "claim", B.look("claim", { status: "accepted" }), "accepted"),
+      item("rejected", "claim", B.look("claim", { status: "rejected" }), "rejected")
+    );
+    updateKey();
   }
 
   document.addEventListener("bracken-theme", () => {
@@ -1192,11 +1488,13 @@
       await loadGround();
       await loadAll();
       statuses = (await api("/api/status")).statuses;
+      syncStatuses();
     } catch (e) {
       note("couldn't read the Ground");
       throw e;
     }
     buildAgents();
+    updateKey();
     note();
     layout();
     if (N <= BULK_TEXT) bulkTexts(null);

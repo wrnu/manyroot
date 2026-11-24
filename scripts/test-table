@@ -219,14 +219,19 @@ scope_args() {
 }
 
 # The box's setup, before anything of the tree: the tools it lacks.
-# It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which neither traces the
-# programs it starts nor fsck-checks a fetched bundle; the experiment's git-mode tests check both and
-# need 2.46 (MIN_GIT in research/experiment/src/git_mode.rs). The git-core PPA has the current git.
+# It lacks b3sum (team-server) and a git newer than the 2.43 Ubuntu ships, which ignores
+# GIT_NO_LAZY_FETCH: --weave-mac's clean check needs 2.45 or later (weave_mac), and its tests run that
+# check in the box with the box's git. The 2.46 that the
+# experiment's git-mode tests need (MIN_GIT in research/experiment/src/git_mode.rs) is research/'s own,
+# a workspace this table doesn't build. The git-core PPA has the current git.
 # Launchpad times out or drops the connection now and then (task 95302a01f49a), so adding the PPA is
 # tried four times, each for at most 2 minutes, 10, 30 and 90 s apart. If it still fails, the image's
-# own git does only if it's 2.46 or later; otherwise setup fails, saying so. Whichever git it ends
-# with is checked against 2.46. need_git holds that number, which a test keeps equal to MIN_GIT.
-# Their output shows only if they fail. Then cargo-nextest, as pinned. After its checkout, --remote
+# own git does only if it's 2.45 or later; otherwise setup fails, saying so. Whichever git it ends
+# with is checked against 2.45. need_git holds that number, which a test keeps equal to the clean
+# check's. add-apt-repository can succeed while apt can't fetch the PPA's index (Launchpad's content
+# server answering 503, note 0e3164150e9a), and then apt installs Ubuntu's git; so when the git is too
+# old after the PPA was added, setup reads apt-cache policy git and says whether the PPA's index is there.
+# The setup steps' output shows only if they fail. Then cargo-nextest, as pinned. After its checkout, --remote
 # also fetches every crate the host's whole package graph needs, dev-dependencies of packages a -p
 # list leaves out included, since a build fetches only what it builds (task 53efd11c6e4a:
 # unicode-properties, manyroot's dev-dependency, without -p manyroot).
@@ -237,7 +242,7 @@ setup() {
   log=$(mktemp)
   "$@" >"$log" 2>&1 || { rc=$?; echo "test-table: box setup failed (exit $rc): $*" >&2; cat "$log" >&2; exit "$rc"; }
 }
-need_git=2.46
+need_git=2.45
 git_ok() {
   read -r major minor < <(git --version 2>/dev/null | sed -n "s/^git version \([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p") ||
     return 1
@@ -265,11 +270,16 @@ elif git_ok; then
   setup $sudo apt-get update -qq
   setup $sudo apt-get install -y -qq -o Acquire::Retries=3 b3sum curl jq lsof
 else
-  echo "test-table: box setup failed: couldn'"'"'t add ppa:git-core/ppa after $tries tries (Launchpad unreachable?), and the image'"'"'s $(git_said) is older than the $need_git the experiment'"'"'s git-mode tests need" >&2
+  echo "test-table: box setup failed: couldn'"'"'t add ppa:git-core/ppa after $tries tries (Launchpad unreachable?), and the image'"'"'s $(git_said) is older than the $need_git the clean check needs" >&2
   exit 1
 fi
 git_ok || {
-  echo "test-table: box setup failed: $(git_said) is older than the $need_git the experiment'"'"'s git-mode tests need" >&2
+  if [ $ppa = yes ] && ! apt-cache policy git 2>/dev/null | grep -q "ppa\.launchpadcontent\.net/git-core/ppa"; then
+    echo "test-table: box setup failed: ppa:git-core/ppa was added, but apt has no index from it (apt-cache policy git lists no ppa.launchpadcontent.net/git-core/ppa source: Launchpad'"'"'s content server down?), so apt installed $(git_said), older than the $need_git the clean check needs; retry when Launchpad answers" >&2
+    apt-cache policy git 2>&1 | head -n 12 >&2 || true
+  else
+    echo "test-table: box setup failed: $(git_said) is older than the $need_git the clean check needs" >&2
+  fi
   exit 1
 }
 nextest_tar=cargo-nextest-$nextest_version-x86_64-unknown-linux-gnu.tar.gz
@@ -633,7 +643,7 @@ git init -q tree
 cd tree
 git fetch -q ../tree.bundle +weave:refs/heads/tested
 # The commit as committed: attributes come from the empty tree, so the .gitattributes of the commit
-# itself can not filter the checkout (finding 42ac5a6e8aee; git 2.40 or later, box_setup gives 2.46).
+# itself can not filter the checkout (finding 42ac5a6e8aee; git 2.40 or later, box_setup gives 2.45 or later).
 git --attr-source=4b825dc642cb6eb9a060e54bf8d69288fbee4904 checkout -q tested
 git update-ref refs/remotes/origin/main HEAD
 echo "WEAVE bundle $(sha256sum ../tree.bundle | cut -d" " -f1)"

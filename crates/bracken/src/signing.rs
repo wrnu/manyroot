@@ -169,23 +169,30 @@ impl Scope {
 
     /// Why `body` is outside this scope, if it is.
     fn refuses(&self, body: &Body) -> Option<String> {
-        let kind = body.kind();
-        if !self.kinds.contains(&kind) {
-            return Some(format!("its scope doesn't include {kind}s"));
-        }
-        match body {
-            Body::Relation { kind, .. } if !self.relations.contains(kind) => {
-                Some(format!("its scope doesn't include {kind} relations"))
-            }
-            // A tag is judged by each of its names: `type:decision` is `decision` too (crate::typed).
-            Body::Claim { tags, .. } => tags.iter().find_map(|t| {
-                let names = crate::typed::scope_names(t);
-                let allowed = self.tags.as_ref().is_none_or(|a| names.iter().any(|n| a.iter().any(|x| x == n)))
-                    && !names.iter().any(|n| self.forbidden_tags.iter().any(|x| x == n));
-                (!allowed).then(|| format!("its scope doesn't allow the tag {t:?}"))
-            }),
+        self.refuses_kind(body.kind()).or_else(|| match body {
+            Body::Relation { kind, .. } => self.refuses_relation(*kind),
+            Body::Claim { tags, .. } => tags.iter().find_map(|t| self.refuses_tag(t)),
             _ => None,
-        }
+        })
+    }
+
+    /// Why this scope refuses every contribution of `kind`, if it does.
+    pub fn refuses_kind(&self, kind: BodyKind) -> Option<String> {
+        (!self.kinds.contains(&kind)).then(|| format!("its scope doesn't include {kind}s"))
+    }
+
+    /// Why this scope refuses a relation of `kind`, beyond [`Scope::refuses_kind`], if it does.
+    pub fn refuses_relation(&self, kind: RelationKind) -> Option<String> {
+        (!self.relations.contains(&kind)).then(|| format!("its scope doesn't include {kind} relations"))
+    }
+
+    /// Why this scope refuses a claim carrying `tag`, beyond [`Scope::refuses_kind`], if it does. A tag is
+    /// judged by each of its names: `type:decision` is `decision` too (crate::typed).
+    pub fn refuses_tag(&self, tag: &str) -> Option<String> {
+        let names = crate::typed::scope_names(tag);
+        let allowed = self.tags.as_ref().is_none_or(|a| names.iter().any(|n| a.iter().any(|x| x == n)))
+            && !names.iter().any(|n| self.forbidden_tags.iter().any(|x| x == n));
+        (!allowed).then(|| format!("its scope doesn't allow the tag {tag:?}"))
     }
 }
 
