@@ -435,6 +435,30 @@ store, once per object for every `Store` write: it tripled the test table's
 time in the box with fsync contention, for no gain, since nothing but the index
 needs the entry to be durable.
 
+**What it costs, and PR 3's first change** (question `a9016692b85e`, decision
+`3cacdd00ad77`). Keeping the index on every command costs, in release builds on
+a small Ground, about 9 ms more CPU per write (8.7 against 18.0 ms) and about
+4 ms per read (8.3 against 12.7 ms). Of a read's share, the WAL's first access
+is about 1.1 ms, the 256 shard stats and the clock about 1.2 ms, and the
+reconcile about 1 ms; a write's refresh opens a second connection and syncs.
+In the test table the larger cost is the directory fsyncs above, which main
+never makes: on ext4 each is a journal commit that parallel tests queue
+behind. Paired runs on one box put PR 2's nextest time at 1.3 to 1.6 times
+main's. PR 3, which moves reads onto the index, measures two changes first,
+each against main in paired runs, with the target that the table's nextest
+time is within 20% of main's:
+
+- **(A) A write's refresh doesn't index.** The write leaves its shard dirty,
+  and the next open's refresh indexes it and syncs each dirty shard once,
+  however many writes came before. Writes come back near main's cost, and
+  reads pay the syncs, batched. This changes the write order above.
+- **(B) Only commands that read from the index refresh it**, with writes,
+  `verify` and the full check: in PR 3 that is the reads moved onto it,
+  which then skip the full open (about 3 ms of a read today).
+
+A single `syncfs` per commit on Linux in place of per-path fsyncs was measured
+no faster, and isn't pursued.
+
 **Checkpoints.** Connections set `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, so a
 command doesn't checkpoint, which would fsync the WAL and the file, as it
 closes. SQLite's autocheckpoint, every 1,000 pages, does it instead. The `-wal`
