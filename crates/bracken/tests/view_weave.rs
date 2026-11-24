@@ -413,6 +413,13 @@ fn a_session_of_requests_changes_no_file_under_the_ground() {
             format!("/api/weave/tree/{second}?dir=src&list=missing"),
             format!("/api/weave/file/{second}?path=README.md"),
             format!("/api/weave/file/{first}?path=src/lib.rs"),
+            // History and diffs, with each of their parameters.
+            format!("/api/weave/history/{line}?path=README.md"),
+            format!("/api/weave/history/{line}?path=README.md&after={first}&limit=5"),
+            format!("/api/weave/diff?a={first}&b={second}"),
+            format!("/api/weave/diff?a={first}&b={second}&list=files&after={}&limit=5", encode("odd/x\u{202e}y.txt")),
+            format!("/api/weave/diff?a={first}&b={second}&path=README.md"),
+            format!("/api/weave/diff?a={first}&b={second}&path={}", encode("odd/x\u{202e}y.txt")),
             "/api/ground".to_owned(),
             "/api/graph".to_owned(),
             "/weave.html".to_owned(),
@@ -997,4 +1004,178 @@ fn a_symlink_over_the_cap_is_oversized_and_a_target_is_never_followed() {
     for path in ["escape%00", "%00", "escape/", "escape/passwd"] {
         v.refused(&format!("/api/weave/file/{id}?path={path}"), 404);
     }
+}
+
+// ---- History and diffs (PR (d)) ----
+
+/// A Weave Ground where `f.txt` on main is added, modified, has its mode changed and is left alone. Then
+/// a line `dev` starts by merging main into it, and changes the file once. Then main deletes it.
+/// Returns the Ground, main's decisions in order, and dev's two.
+fn with_a_history() -> (Weave, Vec<String>, Vec<String>) {
+    let w = Weave::new();
+    let mut main = vec![w.decide(&[("f.txt", "one\n")], "add"), w.decide(&[("f.txt", "one\ntwo\n")], "modify")];
+    let f = w.repo.join("f.txt");
+    std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+    main.push(w.decide(&[], "mode"));
+    main.push(w.decide(&[("other.txt", "x\n")], "unrelated"));
+    w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
+    let merged = w.json(&["weave", "line", "merge", "main", "--into", "dev", "--as", AS, "--json"]);
+    let mut dev = vec![merged["decision"].as_str().expect("a decision").to_owned()];
+    std::fs::write(&f, "one\ntwo\nthree\n").expect("write");
+    w.git(&["add", "-A"]);
+    w.git(&["commit", "-q", "-m", "dev"]);
+    let out = w.json(&["weave", "integrate", "--line", "dev", "--as", AS, "--note", "on dev", "--json"]);
+    dev.push(out["decision"].as_str().expect("a decision").to_owned());
+    std::fs::remove_file(&f).expect("delete");
+    main.push(w.decide(&[], "delete"));
+    (w, main, dev)
+}
+
+fn line_named(w: &Weave, name: &str) -> String {
+    let lines = w.json(&["weave", "line", "list", "--json"]);
+    let row = lines["lines"].as_array().expect("lines").iter().find(|l| l["name"] == name).expect("the line");
+    row["line"].as_str().expect("an id").to_owned()
+}
+
+#[test]
+fn a_files_history_lists_each_change_on_the_line_newest_first() {
+    let (w, main, dev) = with_a_history();
+    let (main_line, dev_line) = (line_named(&w, "main"), line_named(&w, "dev"));
+    let v = view(&w.ground);
+    let h = v.api(&format!("/api/weave/history/{main_line}?path=f.txt"));
+    let rows: Vec<(String, String)> = h["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|r| (r["decision"].as_str().expect("id").to_owned(), r["kind"].as_str().expect("kind").to_owned()))
+        .collect();
+    let want = [(&main[4], "deleted"), (&main[2], "mode changed"), (&main[1], "modified"), (&main[0], "added")];
+    assert_eq!(rows, want.map(|(d, k)| (d.clone(), k.to_owned())), "the unrelated decision isn't listed");
+    // The line's root compares with an absent file, and has no parent.
+    assert!(h["items"][3]["parent"].is_null() && h["items"][3]["before"].is_null());
+    assert_eq!(h["items"][1]["before"]["mode"], "100644");
+    assert_eq!(h["items"][1]["after"]["mode"], "100755");
+    // Paging after a decision.
+    let next = v.api(&format!("/api/weave/history/{main_line}?path=f.txt&after={}&limit=1", main[2]));
+    assert_eq!(next["items"][0]["decision"], main[1].as_str());
+    assert_eq!(next["more"], true);
+    // dev's first decision, made by a line merge, has no parent on dev: it compares with main's head,
+    // where the file is the same, so it isn't listed; dev's own change is.
+    let d = v.api(&format!("/api/weave/history/{dev_line}?path=f.txt"));
+    assert_eq!(d["total"], 1, "{d}");
+    assert_eq!(d["items"][0]["decision"], dev[1].as_str());
+    assert_eq!(
+        (d["items"][0]["kind"].as_str(), d["items"][0]["parent_on_line"].as_bool()),
+        (Some("modified"), Some(true))
+    );
+    let merge = v.api(&format!("/api/weave/file/{}?path=f.txt", dev[0]));
+    assert_eq!(merge["decision"]["parent"], main[3].as_str(), "the merge's parent is main's head, on another line");
+    v.refused(&format!("/api/weave/history/{main_line}"), 400);
+}
+
+#[test]
+fn a_diff_lists_the_files_that_changed_and_diffs_one() {
+    let (w, main, _) = with_a_history();
+    let v = view(&w.ground);
+    let (a, b) = (&main[0], &main[3]);
+    let list = v.api(&format!("/api/weave/diff?a={a}&b={b}"));
+    let files: Vec<(String, String)> = list["files"]["items"]
+        .as_array()
+        .expect("files")
+        .iter()
+        .map(|f| (f["path"].as_str().expect("a path").to_owned(), f["kind"].as_str().expect("a kind").to_owned()))
+        .collect();
+    assert_eq!(files, [("f.txt".to_owned(), "modified".to_owned()), ("other.txt".to_owned(), "added".to_owned())]);
+    let cli = w.json(&["weave", "diff", a, b, "--json"]);
+    assert_eq!(cli["files"].as_array().map(Vec::len), Some(2), "the CLI lists the same two");
+    // The same two trees named by their manifests' content hashes.
+    let (ha, hb) = (list["a"].as_str().expect("a hash"), list["b"].as_str().expect("a hash"));
+    assert!(ha.starts_with("blake3:"));
+    assert_eq!(v.api(&format!("/api/weave/diff?a={ha}&b={hb}"))["files"], list["files"]);
+    let page = v.api(&format!("/api/weave/diff?a={a}&b={b}&list=files&after=f.txt"));
+    assert_eq!(page["items"][0]["path"], "other.txt");
+    let one = v.api(&format!("/api/weave/diff?a={a}&b={b}&path=f.txt"));
+    assert_eq!(one["shown"], "text");
+    let unified = one["unified"].as_str().expect("unified text");
+    assert!(unified.contains("+two\n") && unified.contains(" one\n"), "{unified}");
+    assert_eq!(one["lines"].as_u64(), Some(unified.lines().count() as u64));
+    let added = v.api(&format!("/api/weave/diff?a={a}&b={b}&path=other.txt"));
+    assert_eq!(added["shown"], "text");
+    assert!(added["unified"].as_str().expect("text").contains("+x\n"));
+    // Mode only, the same file, a path in neither, and a missing parameter.
+    assert_eq!(v.api(&format!("/api/weave/diff?a={}&b={}&path=f.txt", main[1], main[2]))["shown"], "mode_only");
+    assert_eq!(v.api(&format!("/api/weave/diff?a={a}&b={a}&path=f.txt"))["shown"], "same");
+    v.refused(&format!("/api/weave/diff?a={a}&b={b}&path=nowhere"), 404);
+    v.refused(&format!("/api/weave/diff?a={a}"), 400);
+    v.refused(&format!("/api/weave/diff?a={a}&b={b}&path=f.txt&limit=5"), 400);
+}
+
+/// The caps: a side over 1 MiB, a side not text, a side not held, and two sides too long to diff line by
+/// line are each named, with no text.
+#[test]
+fn a_diff_at_the_caps_names_why_it_has_no_text() {
+    let w = Weave::new();
+    let long_a: String = (0..5_000).map(|i| format!("a{i}\n")).collect();
+    let long_b: String = (0..4_000).map(|i| format!("b{i}\n")).collect();
+    let a = w.decide(&[("big.txt", "small\n"), ("bin.dat", "text\n"), ("long.txt", &long_a)], "a");
+    let big = "x\n".repeat((1 << 19) + 1);
+    std::fs::write(w.repo.join("bin.dat"), b"\x00binary").expect("write");
+    std::os::unix::fs::symlink("big.txt", w.repo.join("link")).expect("a symlink");
+    let b = w.decide(&[("big.txt", &big), ("long.txt", &long_b)], "b");
+    // A side not held: a hand-made manifest naming a file this replica never saw.
+    let m = Manifest::new(vec![Entry {
+        path: "big.txt".into(),
+        mode: Mode::File,
+        hash: ContentHash::of(b"never seen"),
+        size: 10,
+    }]);
+    let file = w.tmp.path().join("m.cbor");
+    std::fs::write(&file, m.encode()).expect("writes the manifest");
+    let out = w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", MANIFEST_MEDIA_TYPE, "--as", AS]);
+    let hand = out.trim().strip_prefix("artifact ").expect("labelled").to_owned();
+    let v = view(&w.ground);
+    let shown = |path: &str| v.api(&format!("/api/weave/diff?a={a}&b={b}&path={path}"))["shown"].clone();
+    assert_eq!(shown("big.txt"), "oversized");
+    assert_eq!(shown("bin.dat"), "binary");
+    assert_eq!(shown("link"), "binary", "a symlink's target isn't diffed as a file's text");
+    assert_eq!(shown("long.txt"), "too_large_to_diff", "5,000 x 4,000 lines pass diff::MAX_DIFF_CELLS");
+    let missing = v.api(&format!("/api/weave/diff?a={a}&b={hand}&path=big.txt"));
+    assert_eq!(missing["shown"], "missing");
+    assert!(missing.get("unified").is_none());
+    let list = v.api(&format!("/api/weave/diff?a={a}&b={hand}"));
+    let row =
+        list["files"]["items"].as_array().expect("files").iter().find(|f| f["path"] == "big.txt").expect("big.txt");
+    assert_eq!(row["not_held"], true);
+}
+
+/// The unified diffs build at most 2 at a time: a third, while 2 are building, is refused at once with a
+/// 503, never left waiting.
+#[test]
+fn the_diff_slots_refuse_a_third_at_once() {
+    let w = Weave::new();
+    let a = w.decide(&[("1.txt", "a\n"), ("2.txt", "a\n"), ("3.txt", "a\n")], "a");
+    let b = w.decide(&[("1.txt", "b\n"), ("2.txt", "b\n"), ("3.txt", "b\n")], "b");
+    let v = view_with(&w.ground, &[("BRACKEN_VIEW_DIFF_DELAY_MS", "1500")]);
+    assert_eq!(v.api("/api/weave")["weave"], true);
+    let started = Instant::now();
+    let replies: Vec<(u16, String)> = std::thread::scope(|s| {
+        let handles: Vec<_> = ["1.txt", "2.txt", "3.txt"]
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let (a, b, v) = (a.clone(), b.clone(), &v);
+                s.spawn(move || {
+                    std::thread::sleep(Duration::from_millis(200 * i as u64));
+                    let r = v.request_once(&format!("/api/weave/diff?a={a}&b={b}&path={path}"));
+                    (r.status, String::from_utf8_lossy(&r.body).into_owned())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a request")).collect()
+    });
+    let refused: Vec<&(u16, String)> = replies.iter().filter(|(s, _)| *s == 503).collect();
+    assert_eq!(refused.len(), 1, "{replies:?}");
+    assert!(refused[0].1.contains("busy"), "{}", refused[0].1);
+    assert_eq!(replies.iter().filter(|(s, _)| *s == 200).count(), 2);
+    assert!(started.elapsed() < Duration::from_millis(1_500 * 3), "the third wasn't left waiting");
 }

@@ -1107,7 +1107,7 @@ fn tree_at(s: &Store, ix: &Index, lines: &Lines, given: &str, what: &str) -> Res
     manifest_hash(s, ix, given, what)
 }
 
-fn file_value_json(v: bracken_tree::FileValue) -> Value {
+pub(crate) fn file_value_json(v: bracken_tree::FileValue) -> Value {
     json!({"hash": v.hash.to_string(), "mode": format!("{:o}", v.mode.bits())})
 }
 

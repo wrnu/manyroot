@@ -223,7 +223,7 @@ struct Viewer {
     /// Slots for building `?as_of=` graphs, [`PAST_BUILDS`] of them.
     building: Slots,
     /// Slots for the Weave reads that sort the graph or walk a line, taken without waiting.
-    weave_slots: Slots,
+    weave_slots: crate::view_weave::WeaveSlots,
     /// For tests only (`BRACKEN_VIEW_REREAD_DELAY_MS`): how long a re-read waits after reading the
     /// replica before it's used, so a test can write while one is under way. At most
     /// [`MAX_REREAD_DELAY`].
@@ -633,7 +633,7 @@ impl Viewer {
             changed: Condvar::new(),
             past: Mutex::new(Vec::new()),
             building: Slots::new(PAST_BUILDS),
-            weave_slots: Slots::new(crate::view_weave::DERIVED_AT_ONCE),
+            weave_slots: crate::view_weave::WeaveSlots::new(),
             reread_delay,
             runs,
         })
@@ -1236,7 +1236,7 @@ pub(crate) struct Slots {
 }
 
 impl Slots {
-    fn new(max: usize) -> Slots {
+    pub(crate) fn new(max: usize) -> Slots {
         Slots { max, taken: Mutex::new(0), freed: Condvar::new() }
     }
 
