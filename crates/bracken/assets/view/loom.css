@@ -82,22 +82,24 @@
 /* ---- The window: agents' roots in the soil ---- */
 .window {
   position: relative;
-  overflow: hidden;
+  overflow-x: auto;
+  overflow-y: hidden;
   background:
     radial-gradient(120% 60% at 50% -10%, var(--ground-raised), transparent 60%),
     var(--ground);
 }
 .window canvas {
   position: absolute;
-  inset: 0;
-  width: 100%;
+  left: 0;
+  top: 0;
+  width: var(--loom-w, 100%);
   height: 100%;
 }
 .agents {
   position: absolute;
   left: 0;
-  right: 0;
   top: 0;
+  width: var(--loom-w, 100%);
   height: 64px;
   border-bottom: 1px solid var(--stratum-line);
   background: linear-gradient(to bottom, var(--ground-raised), var(--ground));
@@ -133,10 +135,18 @@
   border-radius: 50%;
   background: var(--agent-ink);
 }
+.agent.repeat::after {
+  /* past the first twelve inks, agents repeat with a ringed seed and a dashed root */
+  background: transparent;
+  border: 2px solid var(--agent-ink);
+}
 
 .labels {
   position: absolute;
-  inset: 64px 0 0 0;
+  left: 0;
+  top: 64px;
+  bottom: 0;
+  width: var(--loom-w, 100%);
   pointer-events: none;
   z-index: 1;
 }
@@ -168,8 +178,9 @@
 }
 .tether {
   position: absolute;
-  inset: 0;
-  width: 100%;
+  left: 0;
+  top: 0;
+  width: var(--loom-w, 100%);
   height: 100%;
   pointer-events: none;
   z-index: 3;
@@ -306,7 +317,7 @@
   border-color: var(--stratum-line);
 }
 #loom-canvas {
-  touch-action: none;
+  touch-action: pan-x;
 }
 .speed {
   display: inline-flex;
