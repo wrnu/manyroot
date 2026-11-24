@@ -352,6 +352,34 @@ check("a megabyte of newlines renders 5,000 lines at a time, from the text alrea
   assert.ok(elements < 30100, `the page holds only what it shows: ${elements} elements`);
 });
 
+check("a 1 MiB line of control characters is a few elements, every one still marked (finding 3c69d509671e)", async () => {
+  const text = "\u0001".repeat(1 << 20);
+  const { page } = await load(`#file/${D2}/ctl`, answers([[`/api/weave/file/${D2}?path=ctl`, fileAnswer("ctl", { size: 1 << 20, shown: "text", text, lines: 1 })]]));
+  const elements = [...page.walk()].length;
+  assert.ok(elements < 400, `${elements} elements`);
+  assert.strictEqual(marks(page).filter((m) => m === "\\u{1}").length, 256, "256 marks as elements");
+  assert.ok(page.textContent.includes(`+${(1 << 20) - 256} more below marked as [U+XXXX]`));
+  assert.ok(page.textContent.includes("[\\u{1}][\\u{1}]"), "the rest marked in the text");
+  assert.ok(!page.textContent.includes("\u0001"), "no raw control reaches the page");
+});
+
+check("a 1 MiB symlink target of control characters is a few elements (finding 3c69d509671e)", async () => {
+  const text = "\u0001".repeat(1 << 20);
+  const { page } = await load(`#file/${D2}/link`, answers([[`/api/weave/file/${D2}?path=link`, fileAnswer("link", { symlink: true, mode: 0o120000, size: 1 << 20, shown: "symlink", text })]]));
+  const elements = [...page.walk()].length;
+  assert.ok(elements < 400, `${elements} elements`);
+  assert.ok(!page.textContent.includes("\u0001"));
+});
+
+check("5,000 short lines of control characters are bounded per batch, not per line", async () => {
+  const text = ("\u0001".repeat(200) + "\n").repeat(5000);
+  const { page } = await load(`#file/${D2}/ctl`, answers([[`/api/weave/file/${D2}?path=ctl`, fileAnswer("ctl", { size: text.length, shown: "text", text, lines: 5000 })]]));
+  const spans = [...page.walk()].filter((e) => e.className.includes("invisible")).length;
+  assert.ok(spans <= 2000 + 5000, `${spans} mark spans for 1,000,000 controls`);
+  assert.strictEqual(rows(page).length, 5000);
+  assert.ok(!page.textContent.includes("\u0001"));
+});
+
 check("files that can't be shown are named with why, never shown", async () => {
   for (const [shownAs, extra, says] of [
     ["binary", {}, "isn't text"],

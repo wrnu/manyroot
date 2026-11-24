@@ -315,7 +315,9 @@ conflicts, problems, missing paths and change entries.
   hash, a check's name where it is the key a list pages after
   (`list=counted`, `list=checks`), and a row that is itself a key, such as
   a protected path in `list=protected` (at most 4 KiB, as a path is), or a
-  tree child's name. They are links and cursors. Only free text is cut, and
+  tree child's name and path (finding `9c8b398bffe2`: a tree row is never
+  cut, since its name is at most 255 bytes and its path at most 4 KiB).
+  They are links and cursors. Only free text is cut, and
   arrays are bounded by count, never by cutting their strings.
 - **A key is listed once.** A hand-made policy may name an agent or a path
   twice (`Line::check` allows it; the CLI never writes one). The view lists
@@ -439,7 +441,8 @@ computes only this:
 
 | What | Cap | Why |
 |---|---|---|
-| A file's text shown | 1 MiB, and rendered 5,000 lines at a time | About 20,000 lines of code fit in 1 MiB, but a megabyte of newlines is a million lines. So the page builds the rows for 5,000 lines and adds the next 5,000 when asked, from the text it already holds. The answer gives `lines`, the count |
+| A file's text shown | 1 MiB, and rendered 5,000 lines at a time | About 20,000 lines of code fit in 1 MiB, but a megabyte of newlines is a million lines. So the page builds the rows for 5,000 lines and adds the next 5,000 when asked, from the text it already holds. The answer gives `lines`, the count. A symlink's target is capped the same way, and over it is `oversized`, before its bytes are scanned |
+| Invisible characters marked as elements | 256 a string, and 2,000 a batch of 5,000 lines | Past that, each is written `[U+XXXX]` in the text after one span saying how many, so a megabyte of control characters is a few hundred elements, not a million (finding `3c69d509671e`). The same cap as `common.js`'s `B.shown` in PR #80 |
 | Each side of a unified diff | 1 MiB, and `diff::MAX_DIFF_CELLS` | `diff::unified` builds a table of up to 16 million `u32`s (64 MB). The page renders its output 5,000 lines at a time, as for files |
 | Work building at once | 2 unified diffs, 2 conflict previews, 2 graph-sorting reads (section 3) | Taken with a new non-blocking `Slots::try_take`. Today's `Slots::take` waits, which would hold a connection. A request past the slots gets a 503 at once, to retry |
 | A conflict preview | 20 conflicts a page, 10 resolutions each, sides at most 1 MiB each and 16 MiB in all | *Conflict preview* above |

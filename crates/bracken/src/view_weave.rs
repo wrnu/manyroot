@@ -379,8 +379,13 @@ fn embedded<T>(items: &[T], row_bytes: usize, item: impl Fn(&T) -> Value) -> Val
 /// A list's row within its caps. A row that is a bare string (a protected path, an id) is its own key for
 /// `after`, so it is never cut (finding 886fba8945e1); its policy bounds it (a path is at most 4 KiB).
 fn row(v: Value, row_bytes: usize) -> Value {
-    if v.is_string() { v } else { fit(capped(v, LIST_TEXT), row_bytes) }
+    if v.is_string() || row_bytes == WHOLE { v } else { fit(capped(v, LIST_TEXT), row_bytes) }
 }
+
+/// The `row_bytes` of a list whose rows are never cut: a tree child, whose name and path are a link and a
+/// cursor (finding 9c8b398bffe2). Its strings are a name of at most 255 bytes, a path of at most
+/// `MAX_PATH_BYTES` (4 KiB), a hash and a mode, so a row is bounded without cutting.
+const WHOLE: usize = usize::MAX;
 
 /// One page of a list, alone: what `list=<name>` answers.
 fn listed<T>(
@@ -815,13 +820,8 @@ impl Ctx<'_> {
             let list = if name == "protected" { &v["guardrails"]["protected"] } else { &v[name] };
             // Each entry once, in order: a policy may name an agent or a path twice (Line::check allows
             // it), and a repeat would be a key `after` matches twice (round-3 note 1 on PR #79).
-            let mut seen = Vec::new();
-            for x in list.as_array().into_iter().flatten() {
-                if !seen.contains(x) {
-                    seen.push(x.clone());
-                }
-            }
-            seen
+            let mut once = std::collections::HashSet::new();
+            list.as_array().into_iter().flatten().filter(|x| once.insert(x.to_string())).cloned().collect()
         };
         let policy_key = |name: &'static str| {
             move |x: &Value| match name {
@@ -1036,15 +1036,18 @@ impl Ctx<'_> {
                                      "path": e.path, "mode": e.mode.bits(), "symlink": e.mode == Mode::Symlink,
                                      "size": e.size, "hash": e.hash.to_string(), "held": self.held(e)}),
         };
-        let missing = self.s.index.missing(manifest);
         match p.list {
-            Some("children") => return listed("children", &children, Child::key, child_row, ROW_BYTES, p),
-            Some("missing") => return listed("missing", &missing, String::clone, |m| json!(m), ROW_BYTES, p),
+            Some("children") => return listed("children", &children, Child::key, child_row, WHOLE, p),
             _ => {}
+        }
+        // Computed only for the answers that show it (round-1 notes on PR #81).
+        let missing = self.s.index.missing(manifest);
+        if p.list == Some("missing") {
+            return listed("missing", &missing, String::clone, |m| json!(m), ROW_BYTES, p);
         }
         Ok(json!({"manifest": hash.to_string(), "dir": dir, "files": manifest.entries.len(),
                   "complete": missing.is_empty(),
-                  "children": embedded(&children, ROW_BYTES, child_row),
+                  "children": embedded(&children, WHOLE, child_row),
                   "missing": embedded(&missing, ROW_BYTES, |m| json!(m))}))
     }
 
@@ -1061,11 +1064,13 @@ impl Ctx<'_> {
         let bytes = if self.held(e) { self.s.index.file(self.g, &e.hash) } else { None };
         let (shown, text) = match bytes {
             None => ("missing", None),
-            Some(b) if e.mode == Mode::Symlink => match text(b) {
-                Some(t) if b.len() <= FILE_TEXT => ("symlink", Some(t)),
-                _ => ("binary", None),
-            },
+            // Over the cap is oversized, before the bytes are scanned, a symlink's as any file's (finding
+            // 88362a2d04a6).
             Some(b) if b.len() > FILE_TEXT => ("oversized", None),
+            Some(b) if e.mode == Mode::Symlink => match text(b) {
+                Some(t) => ("symlink", Some(t)),
+                None => ("binary", None),
+            },
             Some(b) => match text(b) {
                 Some(t) => ("text", Some(t)),
                 None => ("binary", None),
@@ -1118,9 +1123,10 @@ fn children<'m>(m: &'m Manifest, dir: &str) -> Vec<Child<'m>> {
     dirs
 }
 
-/// `b` as text: UTF-8 without NUL.
+/// `b` as text: UTF-8 without NUL, by `diff::is_text`'s rule, so the file page and diffs agree on it (a
+/// symlink's mode is checked by the caller, which shows a text target as a target).
 fn text(b: &[u8]) -> Option<&str> {
-    if b.contains(&0) { None } else { std::str::from_utf8(b).ok() }
+    if bracken_tree::diff::is_text(Mode::File, b) { std::str::from_utf8(b).ok() } else { None }
 }
 
 /// How many lines `text` has: its newlines, and one more if it doesn't end with one.

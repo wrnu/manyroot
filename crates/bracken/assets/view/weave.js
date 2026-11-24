@@ -18,25 +18,49 @@
 
   // ---- Text ----
 
+  // The same as PR #80's B.shown in common.js, signature and all, so this one gives way to it when #80
+  // merges: every Default_Ignorable_Code_Point (bidi, zero-width, BOM, variation selectors, tags) and C0/C1
+  // control but \t and \n is marked. At most `maxSpans` marks are elements; past that, each is written
+  // `[U+XXXX]` in the text, after one span saying so, so a text of a million controls is a few elements,
+  // not a million (finding 3c69d509671e).
   const INVISIBLE = new RegExp(
-    "[\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]|[\\u{e0000}-\\u{e007f}]|[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]",
+    "\\p{Default_Ignorable_Code_Point}|[\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]|[\\u{e0000}-\\u{e007f}]|[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]",
     "gu",
   );
+  const SHOWN_SPAN_LIMIT = 256;
 
   /** Text as children for h(): its invisible and control characters shown, never hidden or obeyed. */
-  function shown(value) {
-    const text = String(value === null || value === undefined ? "" : value);
+  function shown(value, maxSpans = SHOWN_SPAN_LIMIT) {
+    const src = String(value === null || value === undefined ? "" : value);
     const out = [];
     let last = 0;
-    for (const m of text.matchAll(INVISIBLE)) {
-      if (m.index > last) out.push(text.slice(last, m.index));
+    let spans = 0;
+    let tail = null;
+    let extra = 0;
+    for (const m of src.matchAll(INVISIBLE)) {
       const cp = m[0].codePointAt(0);
       const hex = cp.toString(16).toUpperCase().padStart(4, "0");
       const control = cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
-      out.push(h("span", { class: "invisible", title: control ? "a control character" : "an invisible character" }, control ? `\\u{${cp.toString(16)}}` : `U+${hex}`));
+      const label = control ? `\\u{${cp.toString(16)}}` : `U+${hex}`;
+      if (spans < maxSpans) {
+        if (m.index > last) out.push(src.slice(last, m.index));
+        out.push(h("span", { class: "invisible", title: control ? "a control character" : "an invisible character" }, label));
+        spans++;
+      } else {
+        if (tail === null) tail = [];
+        if (m.index > last) tail.push(src.slice(last, m.index));
+        tail.push(`[${label}]`);
+        extra++;
+      }
       last = m.index + m[0].length;
     }
-    if (last < text.length) out.push(text.slice(last));
+    if (tail !== null) {
+      if (last < src.length) tail.push(src.slice(last));
+      out.push(h("span", { class: "invisible", title: "invisible or control characters past the highlight limit" }, `+${extra} more below marked as [U+XXXX]`));
+      out.push(tail.join(""));
+    } else if (last < src.length) {
+      out.push(src.slice(last));
+    }
     return out;
   }
 
@@ -410,13 +434,15 @@
     const childKey = (c) => (c.dir ? `${c.name}/` : c.name);
     out.push(...section(dir ? "In this directory" : "At the root", pagedList(t.children, childKey, childRow, (after) => api(`/api/weave/tree/${record}?${q({ list: "children", after, limit: PAGE })}`))));
     if (t.missing.total) {
-      out.push(...section("Not held by this replica", pagedList(t.missing, (p) => p, (p) => h("li", { class: "failing" }, goPath("file", record, p, p)), (after) => api(`/api/weave/tree/${record}?${q({ list: "missing", after, limit: PAGE })}`))));
+      out.push(...section("Not held by this replica", pagedList(t.missing, (p) => p, (p) => h("li", { class: "failing" }, goPath("file", record, p, p)), (after) => api(`/api/weave/tree/${record}?${query({ list: "missing", after, limit: PAGE })}`))));
     }
     return out;
   }
 
   /** Lines shown at once; more are added from the text already held, when asked (section 4, Caps). */
   const LINES_AT_ONCE = 5000;
+  /** Invisible characters marked as elements per batch of lines; the rest are marked in the text. */
+  const MARKS_AT_ONCE = 2000;
 
   /** A file's text as numbered rows, built `LINES_AT_ONCE` at a time. */
   function numbered(text, count) {
@@ -428,7 +454,15 @@
     const more = h("button", { type: "button", class: "more" }, "");
     const add = () => {
       const end = Math.min(next + LINES_AT_ONCE, lines.length);
-      for (; next < end; next++) table.append(h("li", {}, h("span", { class: "ln", "aria-hidden": "true" }, String(next + 1)), h("span", { class: "code" }, shown(lines[next]))));
+      // Marks for the whole batch, not per line: 5,000 lines of controls are at most this many mark spans,
+      // and one more a line past it (finding 3c69d509671e).
+      let budget = MARKS_AT_ONCE;
+      for (; next < end; next++) {
+        const parts = shown(lines[next], Math.min(SHOWN_SPAN_LIMIT, budget));
+        budget -= parts.filter((x) => typeof x !== "string").length;
+        if (budget < 0) budget = 0;
+        table.append(h("li", {}, h("span", { class: "ln", "aria-hidden": "true" }, String(next + 1)), h("span", { class: "code" }, parts)));
+      }
       if (next >= lines.length) more.remove();
       else more.textContent = `Show ${Math.min(LINES_AT_ONCE, lines.length - next)} more lines (${lines.length - next} left)`;
     };
@@ -454,7 +488,7 @@
       missing: "This replica doesn't hold this file at the size its tree names, so it can't be shown.",
     };
     if (f.shown === "symlink") out.push(...section("Symlink to", h("p", { class: "text" }, shown(f.text))));
-    else if (f.shown === "text") out.push(...section(`${f.lines} lines`, numbered(f.text, f.lines)));
+    else if (f.shown === "text") out.push(...section(f.lines === 1 ? "1 line" : `${f.lines} lines`, numbered(f.text, f.lines)));
     else out.push(h("p", { class: "muted" }, why[f.shown] || "It can't be shown."));
     return out;
   }

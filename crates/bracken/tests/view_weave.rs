@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use bracken_tree::ContentHash;
 use bracken_tree::format::{
-    Entry, Guardrails, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE, Manifest, Mode, Record, VERSION,
+    Entry, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE, Manifest, Mode, Record, VERSION,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -406,6 +406,13 @@ fn a_session_of_requests_changes_no_file_under_the_ground() {
             format!("/api/weave/decision/{first}"),
             format!("/api/weave/decision/{second}?list=reviews"),
             format!("/api/weave/record/{line}"),
+            // The tree and file endpoints, with each of their parameters (finding df1009d45d54).
+            format!("/api/weave/tree/{second}"),
+            format!("/api/weave/tree/{second}?dir=src"),
+            format!("/api/weave/tree/{second}?list=children&after=src/&limit=5"),
+            format!("/api/weave/tree/{second}?dir=src&list=missing"),
+            format!("/api/weave/file/{second}?path=README.md"),
+            format!("/api/weave/file/{first}?path=src/lib.rs"),
             "/api/ground".to_owned(),
             "/api/graph".to_owned(),
             "/weave.html".to_owned(),
@@ -924,7 +931,70 @@ fn a_policy_list_with_repeats_pages_each_entry_once() {
         after = seen.last().cloned();
     }
     let mut want = protected;
-    want.dedup_by(|a, b| a == b);
-    want.remove(99);
+    want.remove(99); // the repeat of the 50th
     assert_eq!(seen, want, "each path once, in order, and paging ends");
+}
+
+/// Finding 9c8b398bffe2: a tree child's name and path are a link and a cursor, so neither is cut, even for
+/// a path of nearly the longest a path may be whose characters JSON must escape.
+#[test]
+fn a_tree_childs_path_and_name_are_never_cut() {
+    let (w, ..) = Weave::with_two_decisions();
+    let readme = ContentHash::of(b"hello\n");
+    // 16 components of 255 bytes: each a quote, which JSON writes as two bytes, and the last a file.
+    let part = "\"".repeat(255);
+    let dir = vec![part.as_str(); 15].join("/");
+    let long = format!("{dir}/{part}");
+    assert_eq!(long.len(), 4095);
+    let m = Manifest::new(vec![
+        Entry { path: long.clone(), mode: Mode::File, hash: readme, size: 6 },
+        Entry { path: format!("{dir}/z"), mode: Mode::File, hash: readme, size: 6 },
+    ]);
+    let file = w.tmp.path().join("m.cbor");
+    std::fs::write(&file, m.encode()).expect("writes the manifest");
+    let out = w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", MANIFEST_MEDIA_TYPE, "--as", AS]);
+    let id = out.trim().strip_prefix("artifact ").expect("labelled").to_owned();
+    let v = view(&w.ground);
+    let t = v.api(&format!("/api/weave/tree/{id}?dir={}", encode(&dir)));
+    let first = &t["children"]["items"][0];
+    assert_eq!(first["path"], long.as_str(), "the path is whole");
+    assert_eq!(first["name"], part.as_str(), "the name is whole");
+    assert!(first.get("cut").is_none());
+    // Paging after it, by its whole name, reaches the next child.
+    let next = v.api(&format!("/api/weave/tree/{id}?dir={}&list=children&after={}", encode(&dir), encode(&part)));
+    assert_eq!(next["items"][0]["name"], "z");
+    assert_eq!(v.api(&format!("/api/weave/file/{id}?path={}", encode(&long)))["text"], "hello\n");
+}
+
+/// Finding 88362a2d04a6: a symlink whose target is over the 1 MiB cap is oversized, as any file is, not
+/// binary. Round-1 note 4: a symlink's target is shown as text and never followed, and a NUL in a path is
+/// a key like any other, so it names no file.
+#[test]
+fn a_symlink_over_the_cap_is_oversized_and_a_target_is_never_followed() {
+    let (w, _) = with_a_tree();
+    let big = "x\n".repeat((1 << 19) + 1);
+    let escape: &[u8] = b"../../../etc/passwd";
+    let file = w.tmp.path().join("escape.txt");
+    std::fs::write(&file, escape).expect("writes the target");
+    w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", FILE_MEDIA_TYPE, "--as", AS]);
+    let held = |b: &[u8]| (ContentHash::of(b), b.len() as u64);
+    let (big_hash, big_size) = held(big.as_bytes());
+    let (escape_hash, escape_size) = held(escape);
+    let m = Manifest::new(vec![
+        Entry { path: "big-link".into(), mode: Mode::Symlink, hash: big_hash, size: big_size },
+        Entry { path: "escape".into(), mode: Mode::Symlink, hash: escape_hash, size: escape_size },
+    ]);
+    let file = w.tmp.path().join("m.cbor");
+    std::fs::write(&file, m.encode()).expect("writes the manifest");
+    let out = w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", MANIFEST_MEDIA_TYPE, "--as", AS]);
+    let id = out.trim().strip_prefix("artifact ").expect("labelled").to_owned();
+    let v = view(&w.ground);
+    let big = v.api(&format!("/api/weave/file/{id}?path=big-link"));
+    assert_eq!((big["shown"].as_str(), big["symlink"].as_bool()), (Some("oversized"), Some(true)));
+    assert!(big.get("text").is_none());
+    let escape = v.api(&format!("/api/weave/file/{id}?path=escape"));
+    assert_eq!((escape["shown"].as_str(), escape["text"].as_str()), (Some("symlink"), Some("../../../etc/passwd")));
+    for path in ["escape%00", "%00", "escape/", "escape/passwd"] {
+        v.refused(&format!("/api/weave/file/{id}?path={path}"), 404);
+    }
 }
