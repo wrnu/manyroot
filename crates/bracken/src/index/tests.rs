@@ -161,6 +161,20 @@ fn rows(dir: &Path, sql: &str) -> i64 {
     conn(dir).query_row(sql, [], |r| r.get(0)).expect("a count")
 }
 
+/// A copy of the directory tree `from` at `to` (files and directories only, as a Ground holds).
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("a directory");
+    for e in std::fs::read_dir(from).expect("listed") {
+        let e = e.expect("an entry");
+        let kind = e.file_type().expect("its type");
+        if kind.is_dir() {
+            copy_tree(&e.path(), &to.join(e.file_name()));
+        } else {
+            std::fs::copy(e.path(), to.join(e.file_name())).expect("copied");
+        }
+    }
+}
+
 fn shard_of(id: &ContributionId) -> u8 {
     id.as_bytes()[0]
 }
@@ -633,10 +647,14 @@ fn a_changed_value_in_any_table_fails_its_checksum() {
         ("meta ids", "UPDATE meta SET v = zeroblob(32) WHERE k = 'ids'"),
         ("meta key", "UPDATE meta SET v = zeroblob(32) WHERE k = 'key'"),
     ];
+    // One Ground, copied for each case: its 80 writes, each synced by the store, once.
+    let template = tempfile::tempdir().expect("tmp");
+    let made = ground(template.path());
+    grow(&made, 29, 80);
     for (what, sql) in cases {
         let tmp = tempfile::tempdir().expect("tmp");
-        let dir = ground(tmp.path());
-        grow(&dir, 29, 80);
+        let dir = tmp.path().join("g");
+        copy_tree(&made, &dir);
         read(&dir, 0);
         let c = conn(&dir);
         c.execute_batch(sql).expect("changed");
