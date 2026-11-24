@@ -22,7 +22,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bracken_tree::ContentHash;
-use bracken_tree::format::{Entry, Manifest, Mode};
+use bracken_tree::FileValue;
+use bracken_tree::diff::Kind;
+use bracken_tree::format::{Decision, Entry, Manifest, Mode};
 use bracken_tree::ground::{Index, kind_of};
 use bracken_tree::lines::{Lines, newest_first};
 use bracken_tree::results::Checks;
@@ -33,7 +35,8 @@ use serde_json::{Map, Value, json};
 use crate::Names;
 use crate::view::Slots;
 use crate::weave::{
-    ListedLine, counted_json, decision_json, green_json, line_row_json, listed_lines, problem_json, review_json,
+    ListedLine, counted_json, decision_json, file_value_json, green_json, line_row_json, listed_lines, problem_json,
+    review_json,
 };
 
 /// The most bytes of `weave-root` read: an AgentId in hex is 64, and a newline.
@@ -61,6 +64,8 @@ const ROW_BYTES: usize = 4 * 1024;
 const MAX_NESTED_LIMIT: usize = 200;
 /// The most per-line reads (heads, green, objections) that run at once; more get a 503 at once.
 pub(crate) const DERIVED_AT_ONCE: usize = 2;
+/// The most unified diffs built at once; more get a 503 at once.
+const DIFFS_AT_ONCE: usize = 2;
 /// The fewest hex digits an id in a path may have, as for `/api/contribution`.
 const ID_DIGITS: usize = 8;
 /// The most bytes of a file's text the file page shows; a larger file is named, not shown (section 4).
@@ -294,6 +299,10 @@ pub(crate) fn takes(path: &str) -> &'static [&'static str] {
         &["dir", "list", "after", "limit"]
     } else if rest.starts_with("/file/") {
         &["path"]
+    } else if rest.starts_with("/history/") {
+        &["path", "after", "limit"]
+    } else if rest == "/diff" {
+        &["a", "b", "path", "list", "after", "limit"]
     } else if rest.starts_with("/log/") {
         &["after", "limit"]
     } else {
@@ -575,7 +584,7 @@ pub(crate) fn route(
     names: &Names,
     path: &str,
     query: &HashMap<String, String>,
-    slots: &Slots,
+    slots: &WeaveSlots,
 ) -> Result<Value, Fail> {
     let rest = path.strip_prefix("/api/weave").unwrap_or_default();
     let state = match weave {
@@ -597,6 +606,11 @@ pub(crate) fn route(
         at.record(id)?
     } else if let Some(id) = rest.strip_prefix("/tree/") {
         at.tree(id, &p, query)?
+    } else if let Some(line) = rest.strip_prefix("/history/") {
+        at.history(line, &p, query)?
+    } else if rest == "/diff" {
+        // One file's unified diff is capped at FILE_TEXT a side, not PAGE_TEXT, as a file's text is.
+        return at.diff(&p, query);
     } else if let Some(id) = rest.strip_prefix("/file/") {
         // A file's text is capped at FILE_TEXT, not PAGE_TEXT: its other strings are its path (at most
         // 4 KiB, as any path), mode and hash.
@@ -612,17 +626,35 @@ struct Ctx<'a> {
     s: &'a State,
     g: &'a Graph,
     names: &'a Names,
-    slots: &'a Slots,
+    slots: &'a WeaveSlots,
+}
+
+/// The Weave endpoints' slots, each taken without waiting (section 4, Caps): the per-line reads that sort
+/// the graph or walk a line, and unified diffs.
+pub(crate) struct WeaveSlots {
+    reads: Slots,
+    diffs: Slots,
+}
+
+impl WeaveSlots {
+    pub(crate) fn new() -> WeaveSlots {
+        WeaveSlots { reads: Slots::new(DERIVED_AT_ONCE), diffs: Slots::new(DIFFS_AT_ONCE) }
+    }
 }
 
 impl Ctx<'_> {
     /// A derived answer: kept, or computed now within the slots and kept.
     fn derived(&self, key: String, compute: impl FnOnce() -> Value) -> Result<Value, Fail> {
+        self.derived_in(&self.slots.reads, key, compute)
+    }
+
+    /// A derived answer, computed within one of `slots` if it isn't kept.
+    fn derived_in(&self, slots: &Slots, key: String, compute: impl FnOnce() -> Value) -> Result<Value, Fail> {
         let lock = || self.s.derived.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(v) = lock().get(&key) {
             return Ok(v);
         }
-        let Some(_slot) = self.slots.try_take() else {
+        let Some(_slot) = slots.try_take() else {
             return fail(503, "the view is busy with other Weave reads: try again in a moment");
         };
         let v = compute();
@@ -944,6 +976,7 @@ impl Ctx<'_> {
         let mut more = Map::new();
         more.insert("verdict".into(), verdict);
         more.insert("line".into(), json!(line));
+        more.insert("compared_with".into(), json!(self.compared_parent(&record.decision)));
         more.insert("line_name".into(), json!(lines.line(&line).map(|l| l.policy.name.clone())));
         more.insert("policy".into(), json!(lines.policy_in_force_for(&id).map(|v| v.id)));
         more.insert(
@@ -1050,6 +1083,150 @@ impl Ctx<'_> {
                   "missing": embedded(&missing, ROW_BYTES, |m| json!(m))}))
     }
 
+    /// For a tree a decision names, its line and the decision its history compares it with (as
+    /// [`Self::history`] does): what the file page links its history and its diff by. Null for any other.
+    fn decision_context(&self, given: &str) -> Value {
+        if given.starts_with("blake3:") {
+            return Value::Null;
+        }
+        let lines = &self.s.lines;
+        let Some(r) = resolve(self.g, given).ok().and_then(|id| lines.decision(&id)) else { return Value::Null };
+        json!({"decision": r.id, "line": r.decision.line, "parent": self.compared_parent(&r.decision)})
+    }
+
+    /// The decision a decision's file and tree are compared with: its first parent on its own line; with
+    /// none there (the line's root, or a first decision a line merge started from another line's head), its
+    /// first parent; with no parent, none.
+    fn compared_parent(&self, d: &Decision) -> Option<ContributionId> {
+        let lines = &self.s.lines;
+        let on_line = d.parents.iter().find(|p| lines.decision(p).is_some_and(|x| x.decision.line == d.line));
+        on_line.or(d.parents.first()).copied()
+    }
+
+    /// `/api/weave/history/<line>?path`: the line's decisions, newest first, where the file at `path` differs
+    /// from the decision it is compared with: its first parent on the line; with none there (the line's root,
+    /// or a first decision a line merge started from another line's head), its first parent on any line; with
+    /// no parent, an absent file (section 4).
+    fn history(&self, given: &str, p: &Paging, query: &HashMap<String, String>) -> Result<Value, Fail> {
+        let line = self.line_of(given)?;
+        let Some(path) = query.get("path") else { return fail(400, "name the file with path") };
+        let lines = &self.s.lines;
+        let empty = Vec::new();
+        let mut rows: Vec<(ContributionId, Value)> = Vec::new();
+        for id in self.s.logs.get(&line).unwrap_or(&empty) {
+            let d = &lines.decision(id).expect("logged decisions exist").decision;
+            let parent = self.compared_parent(d);
+            let before = parent
+                .and_then(|p| lines.decision(&p))
+                .and_then(|r| value_at(&self.s.index, &r.decision.manifest, path));
+            let after = value_at(&self.s.index, &d.manifest, path);
+            let Some(kind) = change(before, after) else { continue };
+            let author = lines.decision(id).expect("logged").author;
+            rows.push((
+                *id,
+                json!({"decision": id, "author": author.to_string(), "author_name": self.names.display(&author),
+                                   "parent": parent, "parent_on_line": parent.and_then(|p| lines.decision(&p)).is_some_and(|r| r.decision.line == line), "kind": kind.as_str(),
+                                   "before": before.map(file_value_json), "after": after.map(file_value_json)}),
+            ));
+        }
+        let mut v = listed("history", &rows, |(id, _)| id.to_hex(), |(_, row)| row.clone(), WHOLE, p)?;
+        v["line"] = json!(line);
+        v["path"] = json!(path);
+        Ok(v)
+    }
+
+    /// `/api/weave/diff?a&b`: the files that differ from `a`'s tree to `b`'s, paged by path; with `path`, that
+    /// one file's unified diff, built within a diff slot and kept (section 4).
+    fn diff(&self, p: &Paging, query: &HashMap<String, String>) -> Result<Value, Fail> {
+        let (Some(a), Some(b)) = (query.get("a"), query.get("b")) else {
+            return fail(400, "name the two trees with a and b");
+        };
+        let ((ha, ma), (hb, mb)) = (self.tree_of(a)?, self.tree_of(b)?);
+        if let Some(path) = query.get("path") {
+            if p.list.is_some() || query.contains_key("after") || query.contains_key("limit") {
+                return fail(400, "path names one file: it takes no list, after or limit");
+            }
+            return self.file_diff(&ha, ma, &hb, mb, path);
+        }
+        p.check(&["files"], query)?;
+        let diffs = bracken_tree::diff::manifests(ma, mb);
+        // Held at the entry's size, as the tree and one file's diff judge it (finding 81ffe9a422c4).
+        let unheld = |m: &Manifest, path: &str| m.get(path).is_some_and(|e| !self.held(e));
+        let row = |d: &bracken_tree::diff::FileDiff| {
+            json!({"path": d.path, "kind": d.kind.as_str(), "before": d.before.map(file_value_json),
+                   "after": d.after.map(file_value_json), "not_held": unheld(ma, &d.path) || unheld(mb, &d.path)})
+        };
+        if p.list.is_some() {
+            return listed("files", &diffs, |d| d.path.clone(), row, WHOLE, p);
+        }
+        Ok(json!({"a": ha.to_string(), "b": hb.to_string(), "files": embedded(&diffs, WHOLE, row)}))
+    }
+
+    /// One file's diff from `ma` to `mb`: its unified text, or why not. A side that isn't held at its entry's
+    /// size is `missing`; over [`FILE_TEXT`], `oversized`; not text (or a symlink), `binary`; a diff past
+    /// `diff::MAX_DIFF_CELLS`, `too_large_to_diff`; only the mode changed, `mode_only`.
+    fn file_diff(
+        &self,
+        ha: &ContentHash,
+        ma: &Manifest,
+        hb: &ContentHash,
+        mb: &Manifest,
+        path: &str,
+    ) -> Result<Value, Fail> {
+        let (ea, eb) = (ma.get(path), mb.get(path));
+        if ea.is_none() && eb.is_none() {
+            return fail(404, "neither tree has a file at that path");
+        }
+        let (before, after) = (ea.map(Entry::value), eb.map(Entry::value));
+        let mut v = json!({"a": ha.to_string(), "b": hb.to_string(), "path": path,
+                           "kind": change(before, after).map(Kind::as_str),
+                           "before": before.map(file_value_json), "after": after.map(file_value_json)});
+        // A side's text: Ok(text), or Err(why it has none). An absent side is empty text.
+        let side = |e: Option<&Entry>| -> Result<&str, &'static str> {
+            let Some(e) = e else { return Ok("") };
+            if !self.held(e) {
+                return Err("missing");
+            }
+            let bytes = self.s.index.file(self.g, &e.hash).ok_or("missing")?;
+            if bytes.len() > FILE_TEXT {
+                return Err("oversized");
+            }
+            if e.mode == Mode::Symlink {
+                return Err("binary");
+            }
+            text(bytes).ok_or("binary")
+        };
+        // Neither side is read when the contents are the same.
+        let sides = || side(ea).and_then(|old| side(eb).map(|new| (old, new)));
+        let shown = match change(before, after) {
+            None => "same",
+            Some(Kind::ModeChanged) => "mode_only",
+            Some(_) => match sides() {
+                Err(why) => why,
+                Ok((old, new)) => {
+                    let key = format!("diff {ha} {hb} {path}");
+                    let unified = self.derived_in(&self.slots.diffs, key, || {
+                        let delay = diff_delay();
+                        if !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
+                        json!(bracken_tree::diff::unified(path, old, new))
+                    })?;
+                    match unified.as_str() {
+                        Some(t) => {
+                            v["lines"] = json!(line_count(t));
+                            v["unified"] = json!(t);
+                            "text"
+                        }
+                        None => "too_large_to_diff",
+                    }
+                }
+            },
+        };
+        v["shown"] = json!(shown);
+        Ok(v)
+    }
+
     /// `/api/weave/file/<record>?path`: one file of a tree, named by its mode, size and hash, with its text
     /// only if it is a held regular file of UTF-8 text without NUL, at most [`FILE_TEXT`]; a symlink with
     /// its target if that is such text. The path is looked up in the manifest held in memory, never
@@ -1059,7 +1236,8 @@ impl Ctx<'_> {
         let Some(path) = query.get("path") else { return fail(400, "name the file with path") };
         let Some(e) = manifest.get(path) else { return fail(404, "no file at that path in this tree") };
         let mut v = json!({"manifest": hash.to_string(), "path": e.path, "mode": e.mode.bits(),
-                           "symlink": e.mode == Mode::Symlink, "size": e.size, "hash": e.hash.to_string()});
+                           "symlink": e.mode == Mode::Symlink, "size": e.size, "hash": e.hash.to_string(),
+                           "decision": self.decision_context(given)});
         let bytes = if self.held(e) { self.s.index.file(self.g, &e.hash) } else { None };
         let (shown, text) = match bytes {
             None => ("missing", None),
@@ -1082,6 +1260,32 @@ impl Ctx<'_> {
         }
         Ok(v)
     }
+}
+
+/// What a manifest holds at `path`, if anything.
+fn value_at(ix: &Index, manifest: &ContentHash, path: &str) -> Option<FileValue> {
+    ix.manifest(manifest).and_then(|(_, m)| m.get(path)).map(Entry::value)
+}
+
+/// How a file's value changed, in `diff::Kind`'s words; none if it didn't.
+fn change(before: Option<FileValue>, after: Option<FileValue>) -> Option<Kind> {
+    match (before, after) {
+        (None, None) => None,
+        (None, Some(_)) => Some(Kind::Added),
+        (Some(_), None) => Some(Kind::Deleted),
+        (Some(x), Some(y)) if x == y => None,
+        (Some(x), Some(y)) if x.hash == y.hash => Some(Kind::ModeChanged),
+        _ => Some(Kind::Modified),
+    }
+}
+
+/// A test hook: how long a unified diff waits inside its slot, so a test can hold the slots (at most 2 s).
+fn diff_delay() -> std::time::Duration {
+    static DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *DELAY.get_or_init(|| {
+        let ms = std::env::var("BRACKEN_VIEW_DIFF_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+        std::time::Duration::from_millis(ms.min(2_000))
+    })
 }
 
 /// A child of a tree's directory: a directory, with the number of files below it, or a file.

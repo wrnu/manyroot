@@ -413,6 +413,118 @@ check("a tree route with a bad record or a path that doesn't decode is the home 
   }
 });
 
+// ---- History and diffs (PR (d)) ----
+
+const ODD = "odd/<b>‮x.txt";
+const ENC = encodeURIComponent(ODD);
+const value = (n, mode = "100644") => ({ hash: `blake3:${id(n)}`, mode });
+const histRow = (d, kind, parent, extra = {}) => ({ decision: d, author: id(9), author_name: "alice", parent, parent_on_line: true, kind, before: value(40), after: value(41), ...extra });
+const diffRows = (page) => [...page.walk()].filter((e) => e.tagName === "UL" && e.className.includes("diff")).flatMap((ul) => ul.children);
+
+check("a file's history lists each change, links each to its diff, and says which has no parent", async () => {
+  const D3 = id(5);
+  const answer = list([
+    histRow(D3, "modified", D2, { parent_on_line: false }),
+    histRow(D2, "mode changed", D1, { before: value(40), after: value(40, "100755") }),
+    histRow(D1, "added", null, { before: null }),
+  ]);
+  const { page, fetched, location } = await load(`#history/${LINE}/${ENC}`, answers([[`/api/weave/history/${LINE}?path=${ENC}`, answer]]));
+  assert.deepStrictEqual(fetched, [`/api/weave/history/${LINE}?path=${ENC}&limit=50`]);
+  safe(page, "history");
+  assert.ok(marks(page).includes("U+202E"), "the path's bidi control is marked");
+  assert.ok(page.textContent.includes("odd/<b>"), "markup in a path is text");
+  assert.ok(page.textContent.includes("3 changes"));
+  assert.ok(page.textContent.includes(`100644 ${id(40).slice(0, 12)}`), "a value's mode and hash");
+  assert.ok(page.textContent.includes("absent → 100644"), "the root compares with an absent file");
+  assert.ok(page.textContent.includes("the line's first version"));
+  assert.ok(page.textContent.includes("against a parent on another line"));
+  const toDiff = buttons(page).find((b) => b.textContent === "the diff");
+  toDiff.on.click[0]();
+  assert.strictEqual(location.hash, `#diff/${D1}/${D2}/${ENC}`, "the path goes out as one encoded part");
+});
+
+check("a diff lists its files, each a button to that file's diff, and says which aren't held", async () => {
+  const files = list([
+    { path: ODD, kind: "modified", before: value(40), after: value(41), not_held: false },
+    { path: "gone", kind: "deleted", before: value(42), after: null, not_held: true },
+  ], 3);
+  const { page, fetched, location } = await load(`#diff/${D1}/${D2}`, answers([[`/api/weave/diff?`, { a: MANIFEST, b: MANIFEST, files }]]));
+  assert.deepStrictEqual(fetched, [`/api/weave/diff?a=${D1}&b=${D2}`], "the first 50 come in the answer, unpaged (finding fb21c13db9b1)");
+  safe(page, "diff list");
+  assert.ok(marks(page).includes("U+202E"));
+  assert.ok(page.textContent.includes("3 files") && page.textContent.includes("not held here"));
+  const more = buttons(page).find((b) => b.textContent.startsWith("More"));
+  assert.ok(more, "the rest by paging");
+  more.on.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(fetched[1], `/api/weave/diff?a=${D1}&b=${D2}&list=files&after=gone&limit=50`, "a next page names its list");
+  buttons(page).find((b) => b.textContent === "gone").on.click[0]();
+  assert.strictEqual(location.hash, `#diff/${D1}/${D2}/gone`);
+});
+
+check("a file's diff is rows of text: markup is text, invisibles marked, each line classed by what it is", async () => {
+  const unified = `--- a/${ODD}\n+++ b/${ODD}\n@@ -1,2 +1,2 @@\n <script>alert(1)</script>\n--- removed, though it starts like a head\n+‮added\n`;
+  const { page } = await load(`#diff/${D1}/${D2}/${ENC}`, answers([[`/api/weave/diff?`, { a: MANIFEST, b: MANIFEST, path: ODD, kind: "modified", before: value(40), after: value(41), shown: "text", lines: 6, unified }]]));
+  safe(page, "diff file");
+  const r = diffRows(page);
+  assert.deepStrictEqual(r.map((li) => li.className), ["head", "head", "hunk", "", "del", "add"]);
+  assert.strictEqual(r[3].textContent, " <script>alert(1)</script>");
+  assert.ok(marks(page).includes("U+202E"));
+  assert.ok(!page.textContent.includes("‮"), "no raw bidi control reaches the page");
+});
+
+check("an empty file added has no hunk: its two lines are head, not a removal and an addition (independent note 2)", async () => {
+  const unified = "--- a/empty\n+++ b/empty\n";
+  const { page } = await load(`#diff/${D1}/${D2}/empty`, answers([[`/api/weave/diff?`, { a: MANIFEST, b: MANIFEST, path: "empty", kind: "added", before: null, after: value(41), shown: "text", lines: 2, unified }]]));
+  assert.deepStrictEqual(diffRows(page).map((li) => li.className), ["head", "head"]);
+});
+
+check("a merge's what changed diffs against its parent on its own line, not the first by id (security N1)", async () => {
+  const onLine = id(6);
+  const { page, location } = await load(`#decision/${D2}`, answers([[`/api/weave/decision/${D2}`, decisionAnswer({ parents: [D1, onLine], compared_with: onLine })]]));
+  buttons(page).find((b) => b.textContent === "what changed").on.click[0]();
+  assert.strictEqual(location.hash, `#diff/${onLine}/${D2}`);
+});
+
+check("a long diff renders 5,000 lines at a time, from the text already held", async () => {
+  const unified = "@@ -1 +1 @@\n" + "+x\n".repeat(12000);
+  const { page, fetched } = await load(`#diff/${D1}/${D2}/f`, answers([[`/api/weave/diff?`, { a: MANIFEST, b: MANIFEST, path: "f", kind: "modified", before: value(40), after: value(41), shown: "text", lines: 12001, unified }]]));
+  assert.strictEqual(diffRows(page).length, 5000);
+  buttons(page).find((b) => b.textContent.startsWith("Show 5000 more lines")).on.click[0]();
+  assert.strictEqual(diffRows(page).length, 10000);
+  assert.strictEqual(fetched.length, 1, "more lines need no new request");
+});
+
+check("a diff with no text says why, never shows a side", async () => {
+  for (const [why, says] of [
+    ["same", "same in both trees"],
+    ["mode_only", "Only its mode changed"],
+    ["binary", "isn't text"],
+    ["oversized", "1 MiB cap"],
+    ["missing", "doesn't hold a side"],
+    ["too_large_to_diff", "too long to diff"],
+  ]) {
+    const { page } = await load(`#diff/${D1}/${D2}/f`, answers([[`/api/weave/diff?`, { a: MANIFEST, b: MANIFEST, path: "f", kind: null, before: value(40), after: value(40), shown: why }]]));
+    assert.ok(page.textContent.includes(says), `${why}: ${page.textContent}`);
+    assert.strictEqual(diffRows(page).length, 0);
+  }
+});
+
+check("a file links to its history on the decision's line and to its diff against the decision before", async () => {
+  const { page, location } = await load(`#file/${D2}/${ENC}`, answers([[`/api/weave/file/${D2}?`, fileAnswer(ODD, { shown: "text", text: "x\n", lines: 1, decision: { decision: D2, line: LINE, parent: D1 } })]]));
+  buttons(page).find((b) => b.textContent === "every change to it on this line").on.click[0]();
+  assert.strictEqual(location.hash, `#history/${LINE}/${ENC}`);
+  buttons(page).find((b) => b.textContent === "its diff against the decision before").on.click[0]();
+  assert.strictEqual(location.hash, `#diff/${D1}/${D2}/${ENC}`);
+});
+
+check("a history or diff route with a bad id, no path, or a path that doesn't decode is the home page, unfetched", async () => {
+  for (const hash of [`#history/${LINE}`, `#history/${LINE}/%E0%A4%A`, `#history/not-a-line/f`, `#diff/${D1}`, `#diff/${D1}/zz/f`, `#diff/${D1}/${D2}/%E0%A4%A`]) {
+    const { fetched } = await load(hash, answers([["/api/weave", home()]]));
+    assert.deepStrictEqual(fetched, ["/api/weave"], `${hash}: ${fetched}`);
+  }
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of checks) {

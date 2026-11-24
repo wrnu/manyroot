@@ -80,7 +80,37 @@
       if (name === "file" && !path) return { name: "tree", id, path };
       return { name, id, path };
     }
+    // `#history/<line>/<path>` and `#diff/<a>/<b>[/<path>]`: ids checked, the path one encoded part.
+    const pathFrom = (at) => {
+      try {
+        return decodeURIComponent(parts.slice(at).join("/"));
+      } catch (_) {
+        return null;
+      }
+    };
+    if (name === "history" && ID.test(id)) {
+      const path = pathFrom(2);
+      if (path) return { name, id, path };
+    }
+    const other = (parts[2] || "").toLowerCase();
+    if (name === "diff" && RECORD.test(id) && RECORD.test(other)) {
+      const path = pathFrom(3);
+      if (path !== null) return { name, id, other, path };
+    }
     return { name: "home" };
+  }
+
+  /** A button to the diff from record `a`'s tree to `b`'s: the list, or with `path`, one file. */
+  function goDiff(a, b, path, label) {
+    if (!RECORD.test(String(a)) || !RECORD.test(String(b))) return h("span", { class: "muted" }, shown(label));
+    const tail = path ? `/${encodeURIComponent(path)}` : "";
+    return h("button", { type: "button", class: "go", on: { click: () => { location.hash = `diff/${a}/${b}${tail}`; } } }, shown(label));
+  }
+
+  /** A button to a path's history on a line. */
+  function goHistory(lineId, path, label) {
+    if (!ID.test(String(lineId))) return h("span", { class: "muted" }, shown(label));
+    return h("button", { type: "button", class: "go", on: { click: () => { location.hash = `history/${lineId}/${encodeURIComponent(path)}`; } } }, shown(label));
   }
 
   // ---- Reading ----
@@ -329,7 +359,7 @@
     out.push(facts([
       ["verdict", verdict],
       ["manifest", h("span", {}, h("span", { class: "id" }, shown(d.manifest)), " ", goPath("tree", d.decision, "", "browse its files"))],
-      ["parents", d.parents.length ? h("span", {}, d.parents.map((p) => go("decision", p))) : null],
+      ["parents", d.parents.length ? h("span", {}, d.parents.map((p) => go("decision", p)), " ", d.compared_with ? goDiff(d.compared_with, d.decision, "", "what changed") : null) : null],
       ["policy in force", d.policy ? h("span", { class: "id" }, short(d.policy)) : null],
       ["git", d.source ? h("span", { class: "id" }, shown(d.source.git)) : null],
       ["proposals", d.proposals.length ? h("span", { class: "id" }, shown(d.proposals.map(short).join(" "))) : null],
@@ -407,7 +437,15 @@
   function numbered(text, count) {
     const lines = text.split("\n");
     if (lines.length > count) lines.length = count; // a final newline ends the last line, not a new one
-    const table = h("ul", { class: "source" });
+    return batched(lines, "source", (i, parts) => h("li", {}, h("span", { class: "ln", "aria-hidden": "true" }, String(i + 1)), h("span", { class: "code" }, parts)));
+  }
+
+  /**
+   * `lines` as rows of a list of `kind`, built `LINES_AT_ONCE` at a time with one mark budget a batch, each by
+   * `row(index, the line's marked parts)`; more are added from the lines already held, when asked.
+   */
+  function batched(lines, kind, row) {
+    const table = h("ul", { class: kind });
     const wrap = h("div", {}, table);
     let next = 0;
     const more = h("button", { type: "button", class: "more" }, "");
@@ -420,7 +458,7 @@
         const parts = shown(lines[next], Math.min(SHOWN_SPAN_LIMIT, budget));
         budget -= parts.filter((x) => typeof x !== "string").length;
         if (budget < 0) budget = 0;
-        table.append(h("li", {}, h("span", { class: "ln", "aria-hidden": "true" }, String(next + 1)), h("span", { class: "code" }, parts)));
+        table.append(row(next, parts));
       }
       if (next >= lines.length) more.remove();
       else more.textContent = `Show ${Math.min(LINES_AT_ONCE, lines.length - next)} more lines (${lines.length - next} left)`;
@@ -440,6 +478,8 @@
       ["size", `${sizeText(f.size)} (${f.size} bytes)`],
       ["hash", h("span", { class: "id" }, shown(f.hash))],
       ["in", goPath("tree", record, dir, dir ? `${dir}/` : "the tree's root")],
+      ["history", f.decision ? goHistory(f.decision.line, path, "every change to it on this line") : null],
+      ["changed here", f.decision && f.decision.parent ? goDiff(f.decision.parent, f.decision.decision, path, "its diff against the decision before") : null],
     ]));
     const why = {
       binary: f.symlink ? "Its target isn't text, so it isn't shown." : "It isn't text (it has a NUL byte or isn't UTF-8), so it isn't shown.",
@@ -452,6 +492,66 @@
     return out;
   }
 
+  // ---- History and diffs ----
+
+  const valueText = (v) => (v ? `${v.mode === "120000" ? "symlink" : v.mode} ${String(v.hash).slice(7, 19)}` : "absent");
+
+  async function history(lineId, path) {
+    const q = (extra) => query({ path, ...extra });
+    const hist = await api(`/api/weave/history/${lineId}?${q({ limit: PAGE })}`);
+    const out = [h("h2", {}, shown(path)), h("p", { class: "lede" }, "Every decision on ", go("line", lineId, "the line"), " that changed this file, newest first.")];
+    const row = (r) => h("li", { class: r.kind === "deleted" ? "failing" : "" },
+      go("decision", r.decision),
+      h("span", { class: "sc" }, r.kind),
+      h("span", { class: "muted" }, shown(`by ${who(r.author, r.author_name)}: ${valueText(r.before)} → ${valueText(r.after)}`)),
+      r.after ? goPath("file", r.decision, path, "the file") : null,
+      r.parent ? goDiff(r.parent, r.decision, path, r.parent_on_line ? "the diff" : "the diff, against a parent on another line") : h("span", { class: "muted" }, "the line's first version"));
+    out.push(...section(hist.total === 1 ? "1 change" : `${hist.total} changes`, pagedList(hist, (r) => r.decision, row, (after) => api(`/api/weave/history/${lineId}?${q({ after, limit: PAGE })}`))));
+    return out;
+  }
+
+  async function diffList(a, b) {
+    // The first 50 come in the answer; the rest page by list=files (finding fb21c13db9b1).
+    const d = await api(`/api/weave/diff?${query({ a, b })}`);
+    const out = [h("h2", {}, "What changed"), h("p", { class: "lede" }, "From ", goPath("tree", a, "", recordLabel(a)), " to ", goPath("tree", b, "", recordLabel(b)), ".")];
+    const row = (f) => h("li", { class: f.kind === "deleted" ? "failing" : "" },
+      goDiff(a, b, f.path, f.path), h("span", { class: "sc" }, f.kind), f.not_held ? h("span", { class: "muted" }, "not held here") : null);
+    out.push(...section(d.files.total === 1 ? "1 file" : `${d.files.total} files`, pagedList(d.files, (f) => f.path, row, (after) => api(`/api/weave/diff?${query({ a, b, list: "files", after, limit: PAGE })}`))));
+    return out;
+  }
+
+  async function diffFile(a, b, path) {
+    const d = await api(`/api/weave/diff?${query({ a, b, path })}`);
+    const out = [h("h2", {}, shown(path)), h("p", { class: "lede" }, goDiff(a, b, "", "Every file that changed"), " · ",
+      d.after ? goPath("file", b, path, "the file after") : h("span", { class: "muted" }, "deleted"))];
+    out.push(facts([["change", d.kind || "none"], ["before", valueText(d.before)], ["after", valueText(d.after)]]));
+    const why = {
+      same: "It's the same in both trees.",
+      mode_only: "Only its mode changed.",
+      binary: "A side isn't text (or is a symlink), so there's no text diff.",
+      oversized: "A side is over the view's 1 MiB cap, so there's no text diff. The CLI shows it.",
+      missing: "This replica doesn't hold a side at the size its tree names, so there's no text diff.",
+      too_large_to_diff: "The two sides are too long to diff line by line here (diff::MAX_DIFF_CELLS).",
+    };
+    if (d.shown === "text") {
+      const lines = d.unified.split("\n");
+      if (lines.length > d.lines) lines.length = d.lines;
+      // The `---`/`+++` head is only what comes before the first hunk: a removed line `-- x` is `--- x`. An
+      // empty file added or deleted has no hunk, so all of it is head.
+      const hunk = lines.findIndex((l) => l.startsWith("@@"));
+      const firstHunk = hunk < 0 ? lines.length : hunk;
+      const cls = (i) => {
+        const line = lines[i];
+        if (i < firstHunk) return "head";
+        return line.startsWith("@@") ? "hunk" : line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : "";
+      };
+      out.push(...section(d.lines === 1 ? "1 line of diff" : `${d.lines} lines of diff`, batched(lines, "source diff", (i, parts) => h("li", { class: cls(i) }, h("span", { class: "code" }, parts)))));
+    } else {
+      out.push(h("p", { class: "muted" }, why[d.shown] || "There's no text diff."));
+    }
+    return out;
+  }
+
   // ---- Showing ----
 
   async function render() {
@@ -461,7 +561,14 @@
     $("data-note").textContent = "Reading the Weave records…";
     let body;
     try {
-      const pages = { line: () => line(r.id), decision: () => decision(r.id), tree: () => tree(r.id, r.path), file: () => file(r.id, r.path) };
+      const pages = {
+        line: () => line(r.id),
+        decision: () => decision(r.id),
+        tree: () => tree(r.id, r.path),
+        file: () => file(r.id, r.path),
+        history: () => history(r.id, r.path),
+        diff: () => (r.path ? diffFile(r.id, r.other, r.path) : diffList(r.id, r.other)),
+      };
       body = await (pages[r.name] || home)();
     } catch (e) {
       body = [h("h2", {}, "This page can't be shown"), h("p", { class: "problem" }, shown(e.message))];
