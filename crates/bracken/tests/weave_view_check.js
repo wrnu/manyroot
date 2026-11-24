@@ -309,6 +309,110 @@ check("a replica without Weave says so and clears the status note", async () => 
   assert.strictEqual(note.textContent, "");
 });
 
+// ---- Trees and files (PR (c)) ----
+
+const MANIFEST = `blake3:${id(200)}`;
+const fileRow = (name, extra = {}) => ({ name, dir: false, path: name, mode: 0o100644, symlink: false, size: 12, hash: `blake3:${id(201)}`, held: true, ...extra });
+const treeAnswer = (children, extra = {}) => ({ manifest: MANIFEST, dir: "", files: children.length, complete: true, children: list(children), missing: list([]), ...extra });
+const fileAnswer = (path, extra) => ({ manifest: MANIFEST, path, mode: 0o100644, symlink: false, size: 12, hash: `blake3:${id(201)}`, ...extra });
+const rows = (page) => [...page.walk()].filter((e) => e.tagName === "UL" && e.className.includes("source")).flatMap((ul) => ul.children);
+
+check("a decision's tree lists directories then files; a path goes out encoded and comes back as text", async () => {
+  const odd = "odd dir/x‮y & ?#.txt";
+  const { page, fetched, location } = await load(`#tree/${D2}/`, answers([
+    [`/api/weave/tree/${D2}?dir=odd%20dir`, treeAnswer([fileRow("x‮y & ?#.txt", { path: odd })], { dir: "odd dir" })],
+    [`/api/weave/file/${D2}?path=${encodeURIComponent(odd)}`, fileAnswer(odd, { shown: "text", text: "one\n", lines: 1 })],
+    [`/api/weave/tree/${D2}`, treeAnswer([{ name: "odd dir", dir: true, files: 1 }, fileRow("README.md")])],
+  ]));
+  assert.ok(page.textContent.includes("odd dir/") && page.textContent.includes("README.md"), page.textContent);
+  const dir = buttons(page).find((b) => b.textContent === "odd dir/");
+  dir.on.click[0]();
+  assert.strictEqual(location.hash, `#tree/${D2}/odd%20dir`);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(fetched.includes(`/api/weave/tree/${D2}?dir=odd%20dir`), fetched.join("\n"));
+  assert.ok(marks(page).includes("U+202E"), `the file's name is marked: ${marks(page)}`);
+  const f = buttons(page).find((b) => b.textContent.includes(".txt"));
+  f.on.click[0]();
+  assert.strictEqual(location.hash, `#file/${D2}/${encodeURIComponent(odd)}`);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(fetched.includes(`/api/weave/file/${D2}?path=${encodeURIComponent(odd)}`), fetched.join("\n"));
+  safe(page, "tree");
+});
+
+check("a file's text is numbered rows of text: markup is text, and invisibles are marked", async () => {
+  const text = "<script>alert(1)</script>\n‮reversed\n\tindented\n";
+  const { page } = await load(`#file/${D2}/page.html`, answers([[`/api/weave/file/${D2}?path=page.html`, fileAnswer("page.html", { shown: "text", text, lines: 3 })]]));
+  const r = rows(page);
+  assert.strictEqual(r.length, 3, "3 lines, the final newline ends the last");
+  assert.strictEqual(r[0].children[1].textContent, "<script>alert(1)</script>");
+  assert.strictEqual(r[2].children[0].textContent, "3");
+  assert.ok(marks(page).includes("U+202E"));
+  safe(page, "file");
+});
+
+check("a megabyte of newlines renders 5,000 lines at a time, from the text already held (finding f3ec9bbabd28)", async () => {
+  const text = "\n".repeat(1 << 20);
+  const { page, fetched } = await load(`#file/${D2}/nl.txt`, answers([[`/api/weave/file/${D2}?path=nl.txt`, fileAnswer("nl.txt", { size: 1 << 20, shown: "text", text, lines: 1 << 20 })]]));
+  assert.strictEqual(rows(page).length, 5000);
+  const more = buttons(page).find((b) => b.textContent.startsWith("Show 5000 more lines"));
+  assert.ok(more, "a button for the next 5,000");
+  more.on.click[0]();
+  assert.strictEqual(rows(page).length, 10000);
+  assert.strictEqual(fetched.length, 1, "more lines need no new request");
+  const elements = [...page.walk()].length;
+  assert.ok(elements < 30100, `the page holds only what it shows: ${elements} elements`);
+});
+
+check("a 1 MiB line of control characters is a few elements, every one still marked (finding 3c69d509671e)", async () => {
+  const text = "\u0001".repeat(1 << 20);
+  const { page } = await load(`#file/${D2}/ctl`, answers([[`/api/weave/file/${D2}?path=ctl`, fileAnswer("ctl", { size: 1 << 20, shown: "text", text, lines: 1 })]]));
+  const elements = [...page.walk()].length;
+  assert.ok(elements < 400, `${elements} elements`);
+  assert.strictEqual(marks(page).filter((m) => m === "\\u{1}").length, 256, "256 marks as elements");
+  assert.ok(page.textContent.includes(`+${(1 << 20) - 256} more below marked as [U+XXXX]`));
+  assert.ok(page.textContent.includes("[\\u{1}][\\u{1}]"), "the rest marked in the text");
+  assert.ok(!page.textContent.includes("\u0001"), "no raw control reaches the page");
+});
+
+check("a 1 MiB symlink target of control characters is a few elements (finding 3c69d509671e)", async () => {
+  const text = "\u0001".repeat(1 << 20);
+  const { page } = await load(`#file/${D2}/link`, answers([[`/api/weave/file/${D2}?path=link`, fileAnswer("link", { symlink: true, mode: 0o120000, size: 1 << 20, shown: "symlink", text })]]));
+  const elements = [...page.walk()].length;
+  assert.ok(elements < 400, `${elements} elements`);
+  assert.ok(!page.textContent.includes("\u0001"));
+});
+
+check("5,000 short lines of control characters are bounded per batch, not per line", async () => {
+  const text = ("\u0001".repeat(200) + "\n").repeat(5000);
+  const { page } = await load(`#file/${D2}/ctl`, answers([[`/api/weave/file/${D2}?path=ctl`, fileAnswer("ctl", { size: text.length, shown: "text", text, lines: 5000 })]]));
+  const spans = [...page.walk()].filter((e) => e.className.includes("invisible")).length;
+  assert.ok(spans <= 2000 + 5000, `${spans} mark spans for 1,000,000 controls`);
+  assert.strictEqual(rows(page).length, 5000);
+  assert.ok(!page.textContent.includes("\u0001"));
+});
+
+check("files that can't be shown are named with why, never shown", async () => {
+  for (const [shownAs, extra, says] of [
+    ["binary", {}, "isn't text"],
+    ["binary", { symlink: true, mode: 0o120000 }, "Its target isn't text"],
+    ["oversized", { size: 2 << 20 }, "1 MiB cap"],
+    ["missing", {}, "doesn't hold this file"],
+  ]) {
+    const { page } = await load(`#file/${D2}/f`, answers([[`/api/weave/file/${D2}?path=f`, fileAnswer("f", { shown: shownAs, ...extra })]]));
+    assert.ok(page.textContent.includes(says), `${shownAs}: ${page.textContent}`);
+    assert.strictEqual(rows(page).length, 0);
+  }
+  const { page } = await load(`#file/${D2}/link`, answers([[`/api/weave/file/${D2}?path=link`, fileAnswer("link", { symlink: true, mode: 0o120000, shown: "symlink", text: "src/lib.rs" })]]));
+  assert.ok(page.textContent.includes("Symlink to") && page.textContent.includes("src/lib.rs"));
+});
+
+check("a tree route with a bad record or a path that doesn't decode is the home page, unfetched", async () => {
+  for (const hash of [`#tree/../../etc/x`, `#file/${D2}/%E0%A4%A`, `#tree/blake3:zz/`]) {
+    const { fetched } = await load(hash, answers([["/api/weave", home()]]));
+    assert.deepStrictEqual(fetched, ["/api/weave"], `${hash}: ${fetched}`);
+  }
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of checks) {
