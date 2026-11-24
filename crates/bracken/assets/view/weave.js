@@ -400,7 +400,7 @@
   async function proposals(lineId, status) {
     const q = (extra) => query({ status: status === "all" ? undefined : status, ...extra });
     const list = await api(`/api/weave/proposals/${lineId}?${q({ limit: PAGE })}`);
-    const out = [h("h2", {}, "Proposals"), h("p", { class: "lede" }, "To ", go("line", lineId, "the line"), ", the oldest first.")];
+    const out = [h("h2", {}, "Proposals"), h("p", { class: "lede" }, "To ", go("line", lineId, "the line"), ", by id.")];
     const filter = (s) => (s === status ? h("span", { class: "sc" }, s) : h("button", { type: "button", class: "go", on: { click: () => { location.hash = `proposals/${lineId}/${s}`; } } }, s));
     out.push(h("p", { class: "crumbs" }, STATUSES.flatMap((st, i) => (i ? [h("span", { class: "muted" }, " · "), filter(st)] : [filter(st)]))));
     const row = (p) => h("li", { class: p.status === "open" ? "green" : p.status === "invalid" ? "failing" : "" },
@@ -464,7 +464,8 @@
       return h("li", { class: c.lines === "clean" ? "green" : c.lines === "conflicts" ? "failing" : "" },
         goDiff(p.base, p.proposal, c.path, c.path), h("span", { class: "sc" }, c.lines.replace(/_/g, " ")),
         h("p", { class: "muted" }, shown(`${linesText(c)}. Base ${valueText(c.base)}, the line's ${valueText(c.into)}, the proposal's ${valueText(c.from)}.`)),
-        c.settled_by ? h("p", {}, "Integrate would apply ", h("span", { class: "id" }, short(c.settled_by)), ", an integrator's resolution.") : null,
+        c.settled_by ? h("p", {}, "Integrate would try ", h("span", { class: "id" }, short(c.settled_by)), ", an integrator's resolution. ",
+          c.settled_by_held === false ? h("span", { class: "fail" }, "Its result isn't held here, so integrate would refuse.") : "It can still refuse if the merged paths collide.") : null,
         c.resolutions_total ? pagedList(offered, (r) => r.resolution, resolutionRow, more("resolutions", { path: c.path })) : h("p", { class: "muted" }, "No resolution offered."),
         cutMark(c));
     };

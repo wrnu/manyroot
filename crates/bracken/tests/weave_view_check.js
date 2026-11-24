@@ -556,15 +556,16 @@ check("a proposal's preview names each conflict and why, pages conflicts by path
   const offered = [{ resolution: R1, author: id(9), author_name: "integrator", integrator: true, result: value(41) }];
   const items = [
     conflict(ODD, "conflicts", { ranges: [[1, 1], [4, 6]], ranges_total: 3, resolutions: offered, resolutions_total: 11, settled_by: R1 }),
-    conflict("b", "clean"), conflict("c", "not_text"), conflict("d", "over_view_cap"), conflict("e", "mode"),
+    conflict("b", "clean", { resolutions: offered, resolutions_total: 1, settled_by: R1, settled_by_held: false }), conflict("c", "not_text"), conflict("d", "over_view_cap"), conflict("e", "mode"),
   ];
   const answer = proposalAnswer({ preview: { head: D2, items, total: 30, more: true, settled: 3 } });
   const { page, fetched, location } = await load(`#proposal/${P1}`, answers([[`/api/weave/proposal/${P1}?list=resolutions`, list([], 11)], [`/api/weave/proposal/${P1}?list=conflicts`, list([])], [`/api/weave/proposal/${P1}`, answer]]));
   safe(page, "proposal");
   const text = page.textContent;
-  for (const says of ["conflict at base lines 1, 4–6 and 1 more", "merge cleanly", "no line merge", "1 MiB cap", "its modes don't", "30 conflicts", "Integrate would apply", "an integrator of the line"]) {
+  for (const says of ["conflict at base lines 1, 4–6 and 1 more", "merge cleanly", "no line merge", "1 MiB cap", "its modes don't", "30 conflicts", "Integrate would try", "merged paths collide", "an integrator of the line"]) {
     assert.ok(text.includes(says), `${says}: ${text.slice(0, 2000)}`);
   }
+  assert.ok(text.includes("Its result isn't held here, so integrate would refuse"), "a resolution integrate would refuse (security note 2)");
   assert.ok(marks(page).includes("U+202E"), "a path's bidi control is marked");
   assert.ok(text.includes("</script><img"), "the summary is text");
   const mores = buttons(page).filter((b) => b.textContent.startsWith("More"));

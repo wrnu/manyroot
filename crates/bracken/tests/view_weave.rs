@@ -1489,7 +1489,8 @@ fn a_conflicts_resolutions_are_marked_and_paged() {
     assert_eq!(shown, all[..10], "the first 10, by id");
     let mut integrators = by_integrator.clone();
     integrators.sort_unstable();
-    assert_eq!(f["settled_by"], integrators[0].as_str(), "integrate applies an integrator's, the smallest id first");
+    assert_eq!(f["settled_by"], integrators[0].as_str(), "integrate tries an integrator's, the smallest id first");
+    assert_eq!(f["settled_by_held"], true, "its result is held here");
     let rest = v.api(&format!("/api/weave/proposal/{}?list=resolutions&path=f.txt&after={}", p.open, all[9]));
     assert_eq!(rest["items"].as_array().map(Vec::len), Some(1));
     assert_eq!(rest["items"][0]["resolution"], all[10]);
@@ -1568,6 +1569,8 @@ fn a_forked_line_and_a_diverged_policy_get_no_preview() {
     let o = v.api(&format!("/api/weave/proposal/{}", p.open));
     assert!(o["preview"].is_null());
     assert!(o["preview_why"].as_str().expect("why").contains("diverged"), "{}", o["preview_why"]);
+    assert!(o["objections"].is_null());
+    v.refused(&format!("/api/weave/proposal/{}?list=objections", p.open), 404);
 }
 
 /// An open proposal whose preview has 1,000 conflicts naming one small blob (`d/<n>.txt`), then 17 whose
@@ -1630,6 +1633,7 @@ fn a_preview_pages_20_conflicts_at_most_and_16_mib_of_sides() {
         after = seen.last().cloned();
     }
     assert_eq!(seen.len(), 1_017, "each conflict once");
+    assert_eq!(seen.iter().collect::<std::collections::BTreeSet<_>>().len(), 1_017, "no conflict twice");
     assert!(pages[..50].iter().all(|n| *n == 20), "{pages:?}");
     assert_eq!(
         pages[50..],
@@ -1675,4 +1679,106 @@ fn the_preview_slots_refuse_a_third_and_a_kept_page_still_answers() {
     assert!(replies[2].1 < Duration::from_millis(1_000), "the kept page waited: {:?}", replies[2].1);
     assert_eq!(replies[3].0, 503, "{replies:?}");
     assert!(replies[3].2.contains("busy") && replies[3].1 < Duration::from_millis(1_000), "{:?}", replies[3]);
+    // The merge runs only inside a slot (finding dda45ad01045): with both taken, even a cursor that names
+    // no conflict is refused at once, unmerged, rather than merged to find it isn't there.
+    let held: Vec<(u16, String)> = std::thread::scope(|s| {
+        let take = |after: &'static str| {
+            let v = &v;
+            let url = format!("/api/weave/proposal/{proposal}?list=conflicts&after={}", encode(after));
+            s.spawn(move || {
+                let r = v.request_once(&url);
+                (r.status, String::from_utf8_lossy(&r.body).into_owned())
+            })
+        };
+        let (a, b) = (take("d/4.txt"), take("d/5.txt"));
+        std::thread::sleep(Duration::from_millis(300));
+        let r = v.request_once(&format!("/api/weave/proposal/{proposal}?list=conflicts&after=nowhere"));
+        let mine = (r.status, String::from_utf8_lossy(&r.body).into_owned());
+        a.join().expect("a request");
+        b.join().expect("a request");
+        vec![mine]
+    });
+    assert_eq!(held[0].0, 503, "{held:?}");
+    // An empty cursor names no conflict, and isn't the first page kept (independent note 1).
+    v.refused(&format!("/api/weave/proposal/{proposal}?list=conflicts&after="), 400);
+}
+
+/// A preview needs the line's heads, a per-line read: while the reads are busy, it is a 503 to retry, never
+/// "no preview" (finding 7deca14f22ed).
+#[test]
+fn a_busy_read_of_the_line_is_a_503_not_no_preview() {
+    let p = with_proposals();
+    let dev = p.w.id_of(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS, "--json"], "line");
+    let v = view_with(&p.w.ground, &[("BRACKEN_VIEW_READ_DELAY_MS", "1500")]);
+    // Waits out the first read of the records, without reading any line's heads (which the summary would).
+    assert_eq!(v.api(&format!("/api/weave/record/{}", p.open))["page"], "proposal");
+    let replies: Vec<(u16, String)> = std::thread::scope(|s| {
+        let take = |url: String| {
+            let v = &v;
+            s.spawn(move || v.request_once(&url).status)
+        };
+        let (a, b) = (take(format!("/api/weave/line/{}", p.line)), take(format!("/api/weave/line/{dev}")));
+        std::thread::sleep(Duration::from_millis(300));
+        let mut out = Vec::new();
+        for url in [
+            format!("/api/weave/proposal/{}?list=conflicts", p.open),
+            format!("/api/weave/proposal/{}?list=resolutions&path=f.txt", p.open),
+        ] {
+            let r = v.request_once(&url);
+            out.push((r.status, String::from_utf8_lossy(&r.body).into_owned()));
+        }
+        assert_eq!((a.join().expect("a read"), b.join().expect("a read")), (200, 200));
+        out
+    });
+    for (status, body) in &replies {
+        assert_eq!(*status, 503, "{replies:?}");
+        assert!(body.contains("busy"), "{body}");
+    }
+    // Once the line's heads are kept, the preview is there.
+    assert_eq!(v.api(&format!("/api/weave/proposal/{}?list=conflicts", p.open))["total"], 5);
+}
+
+/// Where integrate wouldn't merge a conflict's lines at all, the preview says so (`not_text`), from the
+/// sides' modes and sizes, before the view's own 1 MiB cap: a side absent or a symlink, or over
+/// `text_merge::MAX_TEXT_BYTES` (finding 9e061e918bcd).
+#[test]
+fn a_side_integrate_wouldnt_merge_is_not_text_before_the_view_cap() {
+    let w = Weave::new();
+    let two = |c: u8| {
+        let mut v = vec![c; (2 << 20) - 1];
+        v.push(b'\n');
+        v
+    };
+    let nine = |c: u8| {
+        let mut v = vec![c; (9 << 20) - 1];
+        v.push(b'\n');
+        v
+    };
+    w.write(&[("gone.txt", &two(b'a')), ("link", &two(b'a')), ("nine.txt", &nine(b'a'))]);
+    w.commit("base");
+    let base = w.id_of(&["weave", "integrate", "--as", AS, "--note", "base", "--json"], "decision");
+    w.git(&["checkout", "-q", "-b", "p"]);
+    w.write(&[("gone.txt", &two(b'p')), ("nine.txt", &nine(b'p'))]);
+    std::fs::remove_file(w.repo.join("link")).expect("delete");
+    std::os::unix::fs::symlink("gone.txt", w.repo.join("link")).expect("a symlink");
+    w.commit("p");
+    let proposal = w.propose("p", &base, "sides");
+    w.git(&["checkout", "-q", "main"]);
+    std::fs::remove_file(w.repo.join("gone.txt")).expect("delete");
+    w.write(&[("link", &two(b'h')), ("nine.txt", &nine(b'h'))]);
+    w.commit("head");
+    w.ok(&["weave", "integrate", "--as", AS, "--note", "head", "--json"]);
+    let v = view(&w.ground);
+    let o = v.api(&format!("/api/weave/proposal/{proposal}"));
+    let lines: Vec<(&str, &str)> = o["preview"]["items"]
+        .as_array()
+        .expect("conflicts")
+        .iter()
+        .map(|c| (c["path"].as_str().expect("path"), c["lines"].as_str().expect("lines")))
+        .collect();
+    assert_eq!(
+        lines,
+        [("gone.txt", "not_text"), ("link", "not_text"), ("nine.txt", "not_text")],
+        "deleted on the line, a symlink, over 8 MiB"
+    );
 }

@@ -684,7 +684,10 @@ impl WeaveSlots {
 impl Ctx<'_> {
     /// A derived answer: kept, or computed now within the slots and kept.
     fn derived(&self, key: String, compute: impl FnOnce() -> Value) -> Result<Value, Fail> {
-        self.derived_in(&self.slots.reads, key, compute)
+        self.derived_in(&self.slots.reads, key, || {
+            pause(&READ_DELAY, "BRACKEN_VIEW_READ_DELAY_MS");
+            compute()
+        })
     }
 
     /// A derived answer, computed within one of `slots` if it isn't kept.
@@ -1413,38 +1416,43 @@ impl Ctx<'_> {
             let kind = self.g.get(&id).map(kind_of).unwrap_or_default();
             return fail(404, format!("{} is a {kind}, not a proposal", id.short()));
         };
-        let line = named.line;
-        let st = self.status(&id, &self.integrations(&line));
-        // The change from its base's tree to its own, when both are held.
-        let base_tree = lines.decision(&named.base).and_then(|d| self.s.index.manifest(&d.decision.manifest));
-        let own_tree = self.s.index.manifest(&named.manifest);
-        let change = match (base_tree, own_tree) {
-            (Some((_, b)), Some((_, m))) => Some(Change::between(b, m)),
-            _ => None,
+        let st = self.status(&id, &self.integrations(&named.line));
+        // Each list is worked out only for an answer that shows it (independent note 2 on PR #86).
+        let change = || {
+            let base_tree = lines.decision(&named.base).and_then(|d| self.s.index.manifest(&d.decision.manifest));
+            match (base_tree, self.s.index.manifest(&named.manifest)) {
+                (Some((_, b)), Some((_, m))) => Some(Change::between(b, m)),
+                _ => None,
+            }
         };
-        let entries = change.as_ref().map_or(&[][..], Change::entries);
         let change_row = |e: &bracken_tree::format::ChangeEntry| json!({"path": e.path, "before": e.before.map(file_value_json), "after": e.after.map(file_value_json)});
-        let reviews = self.s.reviews.of_proposal(lines, &id);
+        let reviews = || self.s.reviews.of_proposal(lines, &id);
         let review_row = |(r, t): &(&bracken_tree::ground::Review, Target)| review_json(r, t, self.names);
-        // Only a page that shows the preview works out what it merges (the line's heads are a derived read).
-        let preview = || if st.status == "open" { self.preview_target(&id) } else { Err("it isn't open".into()) };
+        // What the preview merges, or why there is none; a busy read is a 503, never "no preview"
+        // (finding 7deca14f22ed).
+        let preview = || -> Result<Result<PreviewTarget<'_>, String>, Fail> {
+            if st.status == "open" { self.preview_target(&id) } else { Ok(Err("it isn't open".into())) }
+        };
+        let no_preview = |why: String| (404, format!("no conflict preview: {why}"));
         match p.list {
-            Some("change") => return listed("change", entries, |e| e.path.clone(), change_row, WHOLE, p),
-            Some("reviews") => return listed("reviews", &reviews, |(r, _)| r.id.to_hex(), review_row, ROW_BYTES, p),
+            Some("change") => {
+                let change = change();
+                let entries = change.as_ref().map_or(&[][..], Change::entries);
+                return listed("change", entries, |e| e.path.clone(), change_row, WHOLE, p);
+            }
+            Some("reviews") => {
+                return listed("reviews", &reviews(), |(r, _)| r.id.to_hex(), review_row, ROW_BYTES, p);
+            }
             Some("objections") => {
                 let objections = self.proposal_objections(&id)?;
-                let items = objections.as_array().cloned().unwrap_or_default();
-                return listed(
-                    "objections",
-                    &items,
-                    |o| o["objection"].as_str().unwrap_or_default().to_owned(),
-                    Value::clone,
-                    ROW_BYTES,
-                    p,
-                );
+                let Some(items) = objections.as_array() else {
+                    return fail(404, "its line has no single current policy, so no objections are listed");
+                };
+                let key = |o: &Value| o["objection"].as_str().unwrap_or_default().to_owned();
+                return listed("objections", items, key, Value::clone, ROW_BYTES, p);
             }
             Some("conflicts") => {
-                let target = preview().map_err(|why| (404, format!("no conflict preview: {why}")))?;
+                let target = preview()?.map_err(no_preview)?;
                 // A page is at most 20 conflicts, and 20 when no limit is given.
                 let limit = if query.contains_key("limit") { p.limit } else { PREVIEW_CONFLICTS };
                 if limit > PREVIEW_CONFLICTS {
@@ -1455,7 +1463,7 @@ impl Ctx<'_> {
                 return Ok(v);
             }
             Some("resolutions") => {
-                let target = preview().map_err(|why| (404, format!("no conflict preview: {why}")))?;
+                let target = preview()?.map_err(no_preview)?;
                 let Some(path) = query.get("path") else {
                     return fail(400, "name the conflict with path");
                 };
@@ -1472,10 +1480,12 @@ impl Ctx<'_> {
         }
         let objections = self.proposal_objections(&id)?;
         let objection_items = objections.as_array().cloned().unwrap_or_default();
-        let (preview, preview_why) = match preview() {
+        let (preview, preview_why) = match preview()? {
             Ok(target) => (self.preview(&id, &target, None, PREVIEW_CONFLICTS)?, Value::Null),
             Err(why) => (Value::Null, json!(why)),
         };
+        let change = change();
+        let entries = change.as_ref().map_or(&[][..], Change::entries);
         let integrating =
             st.decision.and_then(|d| lines.decision(&d)).map(|d| json!({"decision": d.id, "note": d.decision.note}));
         let mut v = self.proposal_row(&id, &st);
@@ -1483,7 +1493,7 @@ impl Ctx<'_> {
             "integrated_by": integrating,
             "change_held": change.is_some(),
             "change": embedded(entries, WHOLE, change_row),
-            "reviews": embedded(&reviews, ROW_BYTES, review_row),
+            "reviews": embedded(&reviews(), ROW_BYTES, review_row),
             "objections": if objections.is_null() { Value::Null } else { embedded(&objection_items, ROW_BYTES, Value::clone) },
             "preview": preview,
             "preview_why": preview_why,
@@ -1506,30 +1516,34 @@ impl Ctx<'_> {
     }
 
     /// What a preview merges, or why there is none: an open proposal on a line with one head and one current
-    /// policy, its base held (section 4, *Conflict preview*, 1).
-    fn preview_target(&self, id: &ContributionId) -> Result<PreviewTarget<'_>, String> {
+    /// policy, its base held (section 4, *Conflict preview*, 1). Reading the line's heads can be refused while
+    /// the reads are busy: that is the outer error, a 503, never a reason for no preview.
+    fn preview_target(&self, id: &ContributionId) -> Result<Result<PreviewTarget<'_>, String>, Fail> {
         let lines = &self.s.lines;
-        let record = lines.proposal(id).ok_or("it isn't a valid proposal")?;
+        let Some(record) = lines.proposal(id) else { return Ok(Err("it isn't a valid proposal".into())) };
         let line = record.proposal.line;
         let current = lines.current_versions(&line);
         let [policy] = current.as_slice() else {
-            return Err("the line's policy has diverged, so integrate would refuse".into());
+            return Ok(Err("the line's policy has diverged, so integrate would refuse".into()));
         };
         let integrators = lines.version(policy).map(|v| v.policy.integrators.clone()).unwrap_or_default();
-        let state = self.line_state(&line).map_err(|(_, why)| why)?;
+        let state = self.line_state(&line)?;
         let heads = state["heads"].as_array().cloned().unwrap_or_default();
         let [head] = heads.as_slice() else {
-            return Err(format!("the line has {} heads, so integrate would refuse", heads.len()));
+            return Ok(Err(format!("the line has {} heads, so integrate would refuse", heads.len())));
         };
-        let head: ContributionId =
-            head["decision"].as_str().and_then(|h| h.parse().ok()).ok_or("the line's head isn't readable")?;
+        let Some(head) = head["decision"].as_str().and_then(|h| h.parse::<ContributionId>().ok()) else {
+            return Ok(Err("the line's head isn't readable".into()));
+        };
         let tree = |d: &ContributionId| {
             lines.decision(d).and_then(|r| self.s.index.manifest(&r.decision.manifest)).map(|(_, m)| m)
         };
-        let base = tree(&record.proposal.base).ok_or("its base's tree isn't held")?;
-        let into = tree(&head).ok_or("the line head's tree isn't held")?;
-        let (_, from) = self.s.index.manifest(&record.proposal.manifest).ok_or("its tree isn't held")?;
-        Ok(PreviewTarget { head, integrators, base, into, from })
+        let Some(base) = tree(&record.proposal.base) else { return Ok(Err("its base's tree isn't held".into())) };
+        let Some(into) = tree(&head) else { return Ok(Err("the line head's tree isn't held".into())) };
+        let Some((_, from)) = self.s.index.manifest(&record.proposal.manifest) else {
+            return Ok(Err("its tree isn't held".into()));
+        };
+        Ok(Ok(PreviewTarget { head, integrators, base, into, from }))
     }
 
     fn resolution_json(
@@ -1547,7 +1561,8 @@ impl Ctx<'_> {
 
     /// One page of the conflict preview: the three-way merge's conflicts after `after`, at most `limit`, and
     /// fewer if their sides would pass [`PREVIEW_BYTES`]: the page stops before the conflict that would, and
-    /// the next page starts from it. Kept per proposal, head and page; built in one of the preview slots.
+    /// the next page starts from it. Kept per proposal, head and page. The merge runs only in one of the
+    /// preview slots, so with both taken a page that isn't kept is refused at once (finding dda45ad01045).
     fn preview(
         &self,
         id: &ContributionId,
@@ -1555,11 +1570,18 @@ impl Ctx<'_> {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Value, Fail> {
-        let key = format!("preview {id} {} {} {limit}", t.head, after.map(encode_key).unwrap_or_default());
-        // A kept page costs no merge.
-        if let Some(v) = self.s.derived.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+        // The first page and a page after a cursor never share a key, even after an empty cursor
+        // (independent note 1 on PR #86).
+        let from = after.map_or_else(|| "start".to_owned(), |a| format!("after {}", encode_key(a)));
+        let key = format!("preview {id} {} {from} {limit}", t.head);
+        let lock = || self.s.derived.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(v) = lock().get(&key) {
             return Ok(v);
         }
+        let Some(_slot) = self.slots.previews.try_take() else {
+            return fail(503, "the view is busy with other Weave reads: try again in a moment");
+        };
+        pause(&PREVIEW_DELAY, "BRACKEN_VIEW_PREVIEW_DELAY_MS");
         let merged = three_way(t.base, t.into, t.from);
         let start = match after {
             None => 0,
@@ -1568,50 +1590,60 @@ impl Ctx<'_> {
                 None => return fail(400, format!("after names no conflict of this preview: {a:?}")),
             },
         };
-        self.derived_in(&self.slots.previews, key, || {
-            pause(&PREVIEW_DELAY, "BRACKEN_VIEW_PREVIEW_DELAY_MS");
-            let mut rows = Vec::new();
-            let mut spent: u64 = 0;
-            let mut next = start;
-            while next < merged.conflicts.len() && rows.len() < limit {
-                let c = &merged.conflicts[next];
-                // What its sides cost is known from their sizes, before any is read.
-                let cost = self.read_cost(c);
-                if !rows.is_empty() && spent + cost > PREVIEW_BYTES {
-                    break;
-                }
-                spent += cost;
-                rows.push(self.conflict_json(c, &t.integrators));
-                next += 1;
+        let mut rows = Vec::new();
+        let mut spent: u64 = 0;
+        let mut next = start;
+        while next < merged.conflicts.len() && rows.len() < limit {
+            let c = &merged.conflicts[next];
+            // What its sides cost is known from their sizes, before any is read.
+            let cost = self.read_cost(c);
+            if !rows.is_empty() && spent + cost > PREVIEW_BYTES {
+                break;
             }
-            json!({"head": t.head, "items": rows, "total": merged.conflicts.len(),
-                   "more": next < merged.conflicts.len(), "settled": merged.settled.len()})
-        })
+            spent += cost;
+            rows.push(self.conflict_json(c, &t.integrators));
+            next += 1;
+        }
+        let v = json!({"head": t.head, "items": rows, "total": merged.conflicts.len(),
+                       "more": next < merged.conflicts.len(), "settled": merged.settled.len()});
+        lock().keep(key, &v);
+        Ok(v)
     }
 
-    /// The held sizes of a conflict's sides, and whether one is over the view's cap.
-    fn side_sizes(&self, c: &Conflict) -> (Vec<u64>, bool) {
-        let sizes: Vec<u64> =
-            [c.key.base, c.ours, c.theirs].iter().flatten().filter_map(|v| self.s.index.file_size(&v.hash)).collect();
-        let over = sizes.iter().any(|s| *s > FILE_TEXT as u64);
-        (sizes, over)
+    /// How a conflict's lines would merge, from its sides' modes and held sizes alone, when that settles it:
+    /// `not_text` where `text_conflicts` (as integrate) would give none without reading a byte (a side absent,
+    /// a symlink, not held, or over `text_merge::MAX_TEXT_BYTES`); then `over_view_cap` where a side is over
+    /// the view's cap. `None` when the sides are to be read (finding 9e061e918bcd).
+    fn lines_unread(&self, c: &Conflict) -> Option<&'static str> {
+        let sizes: Option<Vec<u64>> = [c.key.base, c.ours, c.theirs]
+            .iter()
+            .map(|v| v.filter(|v| v.mode != Mode::Symlink).and_then(|v| self.s.index.file_size(&v.hash)))
+            .collect();
+        let Some(sizes) = sizes else { return Some("not_text") };
+        if sizes.iter().any(|s| *s > bracken_tree::text_merge::MAX_TEXT_BYTES as u64) {
+            Some("not_text")
+        } else if sizes.iter().any(|s| *s > FILE_TEXT as u64) {
+            Some("over_view_cap")
+        } else {
+            None
+        }
     }
 
-    /// The bytes [`Ctx::conflict_json`] reads of a conflict's sides: none over the view's cap, and none unless
-    /// all three are there and none is a symlink, as `text_conflicts` reads them.
+    /// The bytes [`Ctx::conflict_json`] reads of a conflict's sides: all three, held and within the view's
+    /// cap, or none.
     fn read_cost(&self, c: &Conflict) -> u64 {
-        let (sizes, over) = self.side_sizes(c);
-        let read = [c.key.base, c.ours, c.theirs].iter().all(|v| v.is_some_and(|v| v.mode != Mode::Symlink));
-        if over || !read { 0 } else { sizes.iter().sum() }
+        if self.lines_unread(c).is_some() {
+            return 0;
+        }
+        [c.key.base, c.ours, c.theirs].iter().flatten().filter_map(|v| self.s.index.file_size(&v.hash)).sum()
     }
 
-    /// A conflict's row. Over the view's cap, a side is named, not read.
+    /// A conflict's row. A side over the view's cap is named, not read.
     fn conflict_json(&self, c: &Conflict, integrators: &[AgentId]) -> Value {
         let ix = &self.s.index;
-        let (lines, ranges) = if self.side_sizes(c).1 {
-            ("over_view_cap", Vec::new())
-        } else {
-            match text_conflicts(c, |h| ix.file(self.g, h)) {
+        let (lines, ranges) = match self.lines_unread(c) {
+            Some(lines) => (lines, Vec::new()),
+            None => match text_conflicts(c, |h| ix.file(self.g, h)) {
                 None => ("not_text", Vec::new()),
                 Some(r) if r.is_empty() => {
                     let modes = match (c.key.base, c.ours, c.theirs) {
@@ -1621,7 +1653,7 @@ impl Ctx<'_> {
                     (if modes { "clean" } else { "mode" }, Vec::new())
                 }
                 Some(r) => ("conflicts", r),
-            }
+            },
         };
         let offered = ix.resolutions().for_key(&c.key);
         let rows: Vec<Value> = offered
@@ -1629,17 +1661,18 @@ impl Ctx<'_> {
             .take(PREVIEW_RESOLUTIONS)
             .map(|(rid, r)| self.resolution_json(rid, r, integrators))
             .collect();
-        // What integrate would apply on its own: an integrator's resolution, the smallest id first.
-        let settled_by = offered
-            .iter()
-            .find(|(rid, _)| self.g.get(rid).is_some_and(|x| integrators.contains(&x.author())))
-            .map(|(rid, _)| *rid);
+        // What integrate would try on its own: an integrator's resolution, the smallest id first. Integrate
+        // still refuses if its result isn't held here (`settled_by_held`), or if the merged paths collide,
+        // which only the whole merged tree shows (security note 2 on PR #86).
+        let settled =
+            offered.iter().find(|(rid, _)| self.g.get(rid).is_some_and(|x| integrators.contains(&x.author())));
+        let settled_by_held = settled.map(|(_, r)| r.result.is_none_or(|v| ix.file_size(&v.hash).is_some()));
         let shown: Vec<Value> = ranges.iter().take(PREVIEW_RANGES).map(|(a, b)| json!([a, b])).collect();
-        let row = json!({"path": c.key.path, "base": c.key.base.map(file_value_json),
-                         "into": c.ours.map(file_value_json), "from": c.theirs.map(file_value_json),
-                         "lines": lines, "ranges": shown, "ranges_total": ranges.len(),
-                         "resolutions": rows, "resolutions_total": offered.len(), "settled_by": settled_by});
-        row
+        json!({"path": c.key.path, "base": c.key.base.map(file_value_json),
+               "into": c.ours.map(file_value_json), "from": c.theirs.map(file_value_json),
+               "lines": lines, "ranges": shown, "ranges_total": ranges.len(),
+               "resolutions": rows, "resolutions_total": offered.len(),
+               "settled_by": settled.map(|(rid, _)| *rid), "settled_by_held": settled_by_held})
     }
 }
 
@@ -1653,9 +1686,13 @@ struct PreviewTarget<'a> {
 }
 
 impl PreviewTarget<'_> {
-    /// The key of the conflict at `path`, if the merge has one there.
+    /// The key of the conflict at `path`, if the merge has one there: three lookups, by `three_way`'s rule
+    /// (a path is settled where the sides agree, or one side is the base's), never the whole merge
+    /// (finding dda45ad01045).
     fn key(&self, path: &str) -> Option<Key> {
-        three_way(self.base, self.into, self.from).conflicts.into_iter().find(|c| c.key.path == path).map(|c| c.key)
+        let value = |m: &Manifest| m.get(path).map(Entry::value);
+        let (b, x, y) = (value(self.base), value(self.into), value(self.from));
+        (x != y && x != b && y != b).then(|| Key::new(path.to_owned(), b, [x, y]))
     }
 }
 
@@ -1664,9 +1701,10 @@ fn encode_key(s: &str) -> String {
     s.bytes().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Test hooks: how long a unified diff, and a conflict preview's page, waits inside its slot, so a test can
-/// hold the slots: `BRACKEN_VIEW_DIFF_DELAY_MS` and `BRACKEN_VIEW_PREVIEW_DELAY_MS`, each at most 2 s. Unset,
-/// nothing sleeps.
+/// Test hooks: how long a per-line read, a unified diff, and a conflict preview's page wait inside their
+/// slots, so a test can hold the slots: `BRACKEN_VIEW_READ_DELAY_MS`, `BRACKEN_VIEW_DIFF_DELAY_MS` and
+/// `BRACKEN_VIEW_PREVIEW_DELAY_MS`, each at most 2 s. Unset, nothing sleeps.
+static READ_DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
 static DIFF_DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
 static PREVIEW_DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
 
