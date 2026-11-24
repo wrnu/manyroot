@@ -146,22 +146,10 @@ mod imp {
 
         /// [`Dir::sub`], creating it first if it doesn't exist.
         pub(crate) fn sub_or_create(&self, name: &str, mode: u32) -> io::Result<Dir> {
-            self.sub_or_create_new(name, mode).map(|(dir, _)| dir)
-        }
-
-        /// [`Dir::sub_or_create`], and whether this call made it.
-        pub(crate) fn sub_or_create_new(&self, name: &str, mode: u32) -> io::Result<(Dir, bool)> {
             match fs::mkdirat(&self.fd, name, Mode::from_raw_mode(mode as _)) {
-                Ok(()) => Ok((self.sub(name)?, true)),
-                Err(rustix::io::Errno::EXIST) => Ok((self.sub(name)?, false)),
+                Ok(()) | Err(rustix::io::Errno::EXIST) => self.sub(name),
                 Err(e) => Err(e.into()),
             }
-        }
-
-        /// Makes this directory's entries durable: `sync_all` on its descriptor, which is `F_FULLFSYNC`
-        /// on macOS and `fsync` elsewhere, so a rename into it survives a power loss.
-        pub(crate) fn sync(&self) -> io::Result<()> {
-            File::from(self.fd.try_clone()?).sync_all()
         }
 
         /// Every entry but `.` and `..`, with its type as the listing says, never following a link.
@@ -247,16 +235,6 @@ mod imp {
                 return Err(refused(NOT_A_DIR));
             }
             Ok(Dir { path })
-        }
-
-        pub(crate) fn sub_or_create_new(&self, name: &str, mode: u32) -> io::Result<(Dir, bool)> {
-            let existed = self.path.join(name).exists();
-            self.sub_or_create(name, mode).map(|dir| (dir, !existed))
-        }
-
-        /// Directories can't be synced here; a no-op.
-        pub(crate) fn sync(&self) -> io::Result<()> {
-            Ok(())
         }
 
         pub(crate) fn sub_or_create(&self, name: &str, _mode: u32) -> io::Result<Dir> {

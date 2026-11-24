@@ -364,6 +364,11 @@ fn open_db(path: &Path, busy: Duration) -> Result<Connection> {
     let conn = Connection::open_with_flags(path, flags)?;
     conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     conn.pragma_update(None, "trusted_schema", "OFF")?;
+    // No checkpoint when a command's connection closes, which would fsync the WAL and the file on every
+    // command (note b33068a95bbf): SQLite's autocheckpoint, every 1,000 pages, does it. With
+    // synchronous=NORMAL a power loss can only roll back recent commits whole, stamps with their rows,
+    // so the index falls behind and freshness finds again what it lacks.
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
     conn.busy_timeout(busy)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
@@ -445,13 +450,19 @@ pub struct Outcome {
 pub(crate) struct Options {
     pub racy_ns: i128,
     pub busy: Duration,
+    /// Whether to make what a transaction names durable before it commits: false only for the full
+    /// check's passes, which are rolled back or in memory.
+    pub sync: bool,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { racy_ns: RACY_NS, busy: BUSY }
+        Options { racy_ns: RACY_NS, busy: BUSY, sync: true }
     }
 }
+
+/// The full check's options: nothing it builds is committed, so nothing is synced.
+const CHECK: Options = Options { racy_ns: RACY_NS, busy: BUSY, sync: false };
 
 /// Keeps the index current with `store`, which was opened after `before` was taken: built on first use,
 /// rebuilt in place on a mismatch, moved to a new generation on damage, otherwise only dirty shards
@@ -880,7 +891,8 @@ fn reconcile(
     // directories are synced. A write's refresh records nothing and leaves its shards without a row.
     match record {
         Record::Yes => {
-            for n in &dirty {
+            // Only rows that are there: a refresh that records and adds nothing writes nothing.
+            for n in dirty.iter().filter(|n| rows.contains_key(n)) {
                 tx.execute("DELETE FROM shard WHERE n = ?1", [i64::from(*n)])?;
             }
             if let Some(t) = before.clock {
@@ -898,8 +910,13 @@ fn reconcile(
                         Seen::Present(_) => {}
                     }
                 }
-                let keep = recorded_clock.filter(|f| !stepped_back && *f > t).unwrap_or(t);
-                put_meta(tx, "fs_clock", &clock_bytes(keep))?;
+                // fs_clock is recorded with the stamps it judged (section 5 step 6), and after a step
+                // back. A refresh that records none leaves the last one, which every stamp recorded is
+                // more than the margin older than, so a later step back below it is still caught.
+                if outcome.recorded > 0 || stepped_back {
+                    let keep = recorded_clock.filter(|f| !stepped_back && *f > t).unwrap_or(t);
+                    put_meta(tx, "fs_clock", &clock_bytes(keep))?;
+                }
             }
         }
         Record::No => {
@@ -908,7 +925,9 @@ fn reconcile(
             }
         }
     }
-    outcome.synced = durable(&to_sync).map_err(|e| Needs::Error(e.context("syncing objects/")))?;
+    if opts.sync {
+        outcome.synced = durable(&to_sync).map_err(|e| Needs::Error(e.context("syncing objects/")))?;
+    }
     Ok(outcome)
 }
 
@@ -919,6 +938,10 @@ fn durable(paths: &[PathBuf]) -> Result<usize> {
     let unique: BTreeSet<&PathBuf> = paths.iter().collect();
     #[cfg(test)]
     tests::SYNCED.with(|s| s.borrow_mut().extend(unique.iter().map(|p| (*p).clone())));
+    #[cfg(test)]
+    if tests::FAIL_SYNC.with(std::cell::Cell::get) {
+        bail!("a sync that fails, for a test");
+    }
     #[cfg(unix)]
     {
         use rustix::fs::{Mode, OFlags};
@@ -1013,7 +1036,12 @@ fn rebuild_in(
     put_meta(tx, "file", &file_identity(path))?;
     put_meta(tx, "derived_stale", &[0])?;
     let mut outcome = Outcome { rebuilt: true, dirty_shards: 256, added: g.len(), ..Outcome::default() };
-    let mut to_sync = Vec::new();
+    // Every object the rebuild names, its shard directory and objects/, before the commit (answer
+    // ddaf02041077): the store doesn't sync directories, so this commit is where they become durable.
+    let mut to_sync: Vec<PathBuf> = g.iter().map(|c| object_path(dir, &c.id())).collect();
+    let shards: BTreeSet<u8> = g.iter().map(|c| c.id().as_bytes()[0]).collect();
+    to_sync.extend(shards.iter().map(|n| dir.join("objects").join(format!("{n:02x}"))));
+    to_sync.push(dir.join("objects"));
     if record == Record::Yes
         && let Some(t) = before.clock
     {
@@ -1033,7 +1061,9 @@ fn rebuild_in(
         }
         put_meta(tx, "fs_clock", &clock_bytes(t))?;
     }
-    outcome.synced = durable(&to_sync)?;
+    if opts.sync && dir.join("objects").exists() {
+        outcome.synced = durable(&to_sync)?;
+    }
     Ok(outcome)
 }
 
@@ -1553,7 +1583,7 @@ pub fn compare(dir: &Path, store: &Store, before: &Before) -> Result<()> {
     let mut fresh = Connection::open_in_memory()?;
     {
         let tx = fresh.transaction()?;
-        rebuild_in(&tx, dir, Path::new(""), store, &Before::stats(dir), Record::No, Options::default())?;
+        rebuild_in(&tx, dir, Path::new(""), store, &Before::stats(dir), Record::No, CHECK)?;
         tx.commit()?;
     }
     differs("a freshly built index", &want, &actual(&fresh)?)?;
@@ -1606,7 +1636,7 @@ enum Replica {
 /// compared with `want`, the full recompute from `store`. Anything the store holds that the index lacks
 /// is a disagreement, and so is an indexed contribution with no object.
 fn replica(tx: &Connection, dir: &Path, path: &Path, store: &Store, want: &Answers, stats: &Before) -> Result<Replica> {
-    match reconcile(tx, dir, path, store, stats, Record::No, Options::default()) {
+    match reconcile(tx, dir, path, store, stats, Record::No, CHECK) {
         Ok(_) => {}
         Err(Needs::Rebuild) => return Ok(Replica::Unused),
         Err(Needs::Damaged(e)) => return Err(e.context("BRACKEN_FULL_CHECK: this replica's index is damaged")),

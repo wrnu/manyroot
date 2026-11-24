@@ -13,6 +13,8 @@ use super::*;
 thread_local! {
     /// What [`durable`] synced on this thread.
     pub(super) static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
+    /// Makes [`durable`] fail on this thread, after recording what it was asked to sync.
+    pub(super) static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 const PEOPLE: [&str; 3] = ["manager", "builder", "reviewer"];
@@ -98,7 +100,7 @@ fn take(dir: &Path) -> Before {
 }
 
 fn opts(racy: i128) -> Options {
-    Options { racy_ns: racy, busy: BUSY }
+    Options { racy_ns: racy, busy: BUSY, sync: true }
 }
 
 /// Opens as a read does (clock and stamps first), refreshes with racy window `racy`, and checks the
@@ -340,6 +342,7 @@ fn a_write_through_refreshing_is_indexed_and_leaves_its_shard_without_a_row() {
     let dir = ground(tmp.path());
     grow(&dir, 18, 30);
     read(&dir, 0);
+    SYNCED.with(|s| s.borrow_mut().clear());
     let written = {
         let mut s = crate::snapshot::Refreshing::open(&dir, crate::snapshot::Refresh::Yes).expect("opens");
         let who = s.identity("builder").expect("an identity");
@@ -347,6 +350,10 @@ fn a_write_through_refreshing_is_indexed_and_leaves_its_shard_without_a_row() {
     };
     let hex = written.to_hex().to_uppercase();
     assert_eq!(rows(&dir, &format!("SELECT count(*) FROM obj WHERE hex(id) = '{hex}'")), 1, "indexed by the write");
+    let synced = SYNCED.with(|s| s.borrow().clone());
+    assert!(synced.contains(&object_path(&dir, &written)), "the write's own object, before the commit: {synced:?}");
+    let shard = dir.join("objects").join(format!("{:02x}", shard_of(&written)));
+    assert!(synced.contains(&shard), "and its shard directory (the store doesn't sync it): {synced:?}");
     assert_eq!(rows(&dir, &format!("SELECT count(*) FROM shard WHERE n = {}", shard_of(&written))), 0);
     assert_eq!(read(&dir, 0).added, 0);
 }
@@ -408,7 +415,12 @@ fn concurrent_refreshes_agree_and_add_each_object_once() {
             _ => total,
         };
         if what == "damaged" {
+            // Not a database: its -wal and -shm go too, or SQLite would read every page from the WAL,
+            // which stays between commands.
             let file = path(&dir).expect("path");
+            for suffix in ["-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", file.display()));
+            }
             std::fs::write(&file, vec![7u8; 8192]).expect("not a database");
         }
         let handles: Vec<_> = (0..4)
@@ -485,7 +497,7 @@ fn a_lock_not_granted_in_time_is_not_damage() {
     let _lock = holder.transaction_with_behavior(TransactionBehavior::Immediate).expect("locked");
     let before = take(&dir);
     let store = Store::open(&dir).expect("valid");
-    let quick = Options { racy_ns: 0, busy: Duration::from_millis(50) };
+    let quick = Options { racy_ns: 0, busy: Duration::from_millis(50), sync: true };
     assert!(refresh_with(&dir, &store, &before, Record::Yes, quick).is_err());
     assert_eq!(current_generation(&std::fs::canonicalize(dir.join("cache")).expect("cache")), Some(1));
 }
@@ -1003,14 +1015,15 @@ fn an_existing_index_is_left_unchanged_by_the_view_and_a_read_only_cache() {
     grow(&dir, 58, 30);
     read(&dir, 0);
     grow(&dir, 59, 5); // something for an open that wrote to find
-    let file = path(&dir).expect("path");
-    let state = || -> (Vec<u8>, std::time::SystemTime, bool, bool) {
-        let m = std::fs::metadata(&file).expect("m");
-        let side = |s: &str| std::path::PathBuf::from(format!("{}{s}", file.display())).exists();
-        (std::fs::read(&file).expect("r"), m.modified().expect("mtime"), side("-wal"), side("-shm"))
-    };
+    // Every file in cache/, with its bytes and mtime: the index, its -wal and -shm (which stay between
+    // commands, note b33068a95bbf), the clock and the snapshot.
+    let state = || cache_files(&dir);
     let was = state();
-    assert!(!was.2 && !was.3, "no -wal or -shm once the last connection closed");
+    let file = path(&dir).expect("path");
+    let name = |s: &str| format!("{}{s}", file.file_name().expect("a name").to_string_lossy());
+    for n in [name(""), name("-wal"), name("-shm")] {
+        assert!(was.contains_key(&n), "{n} is there: {:?}", was.keys());
+    }
     crate::snapshot::open(&dir, crate::snapshot::Refresh::No).expect("the view opens");
     assert!(state() == was, "the view left the index unchanged");
     if rustix::process::geteuid().is_root() {
@@ -1141,4 +1154,115 @@ fn an_index_ahead_with_damaged_derived_rows_still_fails_the_full_check() {
     run(false).expect("without the damage the index agrees");
     let err = run(true).expect_err("a damaged hidden set fails the check, the index being ahead or not");
     assert!(format!("{err:#}").contains("hidden"), "{err:#}");
+}
+
+/// Every file in `dir`'s cache/, by name, with its bytes and mtime.
+fn cache_files(dir: &Path) -> std::collections::BTreeMap<String, (Vec<u8>, std::time::SystemTime)> {
+    std::fs::read_dir(dir.join("cache"))
+        .expect("cache/")
+        .flatten()
+        .map(|e| {
+            let m = e.metadata().expect("m");
+            (
+                e.file_name().to_string_lossy().into_owned(),
+                (std::fs::read(e.path()).expect("r"), m.modified().expect("t")),
+            )
+        })
+        .collect()
+}
+
+/// Answer ddaf02041077: the index's commit is where what it names becomes durable, so no path commits a
+/// row before syncing every object it names, its shard directory and objects/. With every sync failing, a
+/// first build, a rebuild, a freshness refresh and a write's own refresh each commit nothing; with syncs
+/// working, each syncs those paths.
+#[test]
+fn no_path_commits_before_it_syncs_what_it_names() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 70, 30);
+    let failing = |dir: &Path, record: Record| {
+        let store = Store::open(dir).expect("valid");
+        FAIL_SYNC.with(|f| f.set(true));
+        let got = refresh_with(dir, &store, &take(dir), record, opts(0));
+        FAIL_SYNC.with(|f| f.set(false));
+        assert!(got.is_err(), "{record:?}: a failed sync fails the refresh: {got:?}");
+    };
+    let ids = |dir: &Path| -> Vec<ContributionId> {
+        Store::open(dir).expect("valid").graph().iter().map(|c| c.id()).collect()
+    };
+    let all_named = |dir: &Path, synced: &[PathBuf], ids: &[ContributionId]| {
+        for id in ids {
+            assert!(synced.contains(&object_path(dir, id)), "{id:?}'s object");
+            let shard = dir.join("objects").join(format!("{:02x}", shard_of(id)));
+            assert!(synced.contains(&shard), "{id:?}'s shard");
+        }
+    };
+
+    // The first build: nothing committed, so no schema; then built, everything synced.
+    failing(&dir, Record::Yes);
+    let schema: i64 = conn(&dir).query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0)).expect("count");
+    assert_eq!(schema, 0, "the failed build committed nothing");
+    SYNCED.with(|s| s.borrow_mut().clear());
+    assert!(read(&dir, 0).rebuilt);
+    let synced = SYNCED.with(|s| s.borrow().clone());
+    all_named(&dir, &synced, &ids(&dir));
+    assert!(synced.contains(&dir.join("objects")), "and objects/");
+
+    // Freshness and a write's own refresh: nothing of the new objects committed, then committed after.
+    for record in [Record::Yes, Record::No] {
+        let before: Vec<ContributionId> = ids(&dir);
+        grow(&dir, 71 + record as u64, 5);
+        let new: Vec<ContributionId> = ids(&dir).into_iter().filter(|id| !before.contains(id)).collect();
+        let indexed = rows(&dir, "SELECT count(*) FROM obj");
+        failing(&dir, record);
+        assert_eq!(rows(&dir, "SELECT count(*) FROM obj"), indexed, "{record:?}: nothing committed");
+        SYNCED.with(|s| s.borrow_mut().clear());
+        let store = Store::open(&dir).expect("valid");
+        refresh_with(&dir, &store, &take(&dir), record, opts(0)).expect("refreshed");
+        all_named(&dir, &SYNCED.with(|s| s.borrow().clone()), &new);
+        agrees(&dir, &store);
+    }
+
+    // A rebuild in place (a ground mismatch): the old index stays whole, then everything is synced.
+    put_meta(&conn(&dir), "ground", &[9u8; 32]).expect("a ground mismatch");
+    let indexed = rows(&dir, "SELECT count(*) FROM obj");
+    failing(&dir, Record::Yes);
+    assert_eq!(rows(&dir, "SELECT count(*) FROM obj"), indexed, "the failed rebuild committed nothing");
+    SYNCED.with(|s| s.borrow_mut().clear());
+    assert!(read(&dir, 0).rebuilt);
+    all_named(&dir, &SYNCED.with(|s| s.borrow().clone()), &ids(&dir));
+}
+
+/// Note b33068a95bbf: a refresh that records nothing and adds nothing writes nothing, so a read of a Ground
+/// whose index is current makes no SQLite commit, and no checkpoint has anything to sync.
+#[test]
+fn a_refresh_with_nothing_to_record_writes_nothing() {
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 75, 30);
+    read(&dir, 0);
+    assert_eq!(read(&dir, 0), Outcome::default(), "current");
+    // The database file and its WAL, which a commit writes. Not -shm: SQLite's shared memory, where every
+    // reader marks its place, which is never synced and holds no commit.
+    let index = |dir: &Path| {
+        let mut files = cache_files(dir);
+        files.retain(|n, _| n.starts_with("index-") && !n.ends_with("-shm"));
+        files
+    };
+    let was = index(&dir);
+    assert!(was.keys().any(|n| n.ends_with("-wal")), "{:?}", was.keys());
+    for _ in 0..3 {
+        assert_eq!(read(&dir, 0), Outcome::default());
+    }
+    let now = index(&dir);
+    let changed: Vec<&String> = now.keys().filter(|k| now.get(*k) != was.get(*k)).collect();
+    assert!(changed.is_empty(), "changed: {changed:?}");
+
+    // A shard written within the margin stays dirty and is listed again, and still nothing is written.
+    grow(&dir, 76, 1);
+    read(&dir, i128::MAX / 4); // adds it; the margin records no stamp
+    let was = index(&dir);
+    let again = read(&dir, i128::MAX / 4);
+    assert!(again.dirty_shards > 0 && again.added == 0 && again.recorded == 0, "{again:?}");
+    assert!(index(&dir) == was, "a dirty shard with nothing new writes nothing");
 }

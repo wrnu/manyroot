@@ -370,9 +370,9 @@ with.
      1M).
    - An absent shard is recorded as absent.
    - A rebuild follows the same steps. Its stamps come from step 2, taken before
-     its own listing. What it fsyncs is the shard directories whose stamps it
-     records, not every object file: a rebuild indexes what the store listed, and
-     a shard recorded clean must not be one a power loss could change back.
+     its own listing. Before it commits, it fsyncs every object it names, every
+     shard directory those are in or whose stamp it records, and `objects/`
+     (section 6, Order).
    - Stamps come only from step 2's stats. A refresh that waits for the lock
      rechecks `meta` and the shard rows it reads there, but never takes new stats
      after the listing and records them.
@@ -414,10 +414,28 @@ caught the same way.
 **Order.** A write follows three steps:
 
 1. Write the object to a temporary file, fsync it and rename it into its shard,
-   as today.
-2. Fsync the shard directory, and `objects/` when the shard was new. Today's
-   `write_object` doesn't; PR 2 adds it (`crates/manyroot/src/fsx.rs`).
+   as today. The store's durability is exactly main's: `write_object` syncs the
+   file, not its directory.
+2. The index transaction fsyncs the object, its shard directory, and `objects/`
+   when the shard is new.
 3. Commit the index transaction (`synchronous=NORMAL`).
+
+**The index's commit is the one place its durability is enforced** (answer
+`ddaf02041077`). Every path that commits, whether a write's refresh, a
+freshness refresh or a rebuild, first fsyncs every object the transaction
+names, those objects' shard directories, and `objects/` for a new shard. Only
+the full check's passes skip it: they are rolled back or in memory. Note
+`b33068a95bbf` measured an earlier head that also synced directories in the
+store, once per object for every `Store` write: it tripled the test table's
+time in the box with fsync contention, for no gain, since nothing but the index
+needs the entry to be durable.
+
+**Checkpoints.** Connections set `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, so a
+command doesn't checkpoint, which would fsync the WAL and the file, as it
+closes. SQLite's autocheckpoint, every 1,000 pages, does it instead. The `-wal`
+and `-shm` files therefore stay in `cache/` between commands. A refresh that
+records and adds nothing writes nothing, so a read of a current index makes no
+commit.
 
 That transaction also deletes the shard's `shard` row, so the next open lists
 that shard again. The write path never records a stamp taken after its own
@@ -428,7 +446,10 @@ listed.
 index lacks, in a shard whose stat has changed. The next open finds it, checks it
 and indexes it.
 
-**Power loss.** After step 2, the object is durable before its row can be. The row
+**Power loss.** After step 2, the object is durable before its row can be.
+With `synchronous=NORMAL` and no checkpoint on close, a power loss rolls back
+whole recent commits, rows with the stamps recorded beside them, so the index
+falls behind and freshness finds again what it lacks. The row
 deletion holds even if step 2 were lost: if the index transaction survived and
 the rename didn't, the shard has no row, so it is listed, the id is found
 missing, and the index is rebuilt.
@@ -620,7 +641,9 @@ Each property maps to a test, in PR 2 unless marked PR 3:
 | Clock | stamps are judged against `cache/clock`'s mtime: a local clock offset changes nothing; with `fs_clock` ahead of *T*, every shard is dirty on that same open, before any stamp is compared; a `cache/clock` that can't be written records no stamps |
 | Filesystems | an unlisted filesystem type records no stamps |
 | mtime reset | a shard whose mtime is put back is still dirty (ctime) |
-| Write order | a write's transaction leaves its shard without a row; the shard directory is fsynced |
+| Write order | a write's transaction leaves its shard without a row; the write's own object and shard directory are fsynced by the index transaction (the store syncs only the file) |
+| Sync before commit | with every sync failing, a first build, a rebuild, a freshness refresh and a write's refresh each commit nothing; with syncs working, each syncs every object it names, its shard and `objects/` |
+| Reads write nothing | a refresh that records and adds nothing leaves the index file and its WAL byte for byte unchanged |
 | Process crash | a store dropped after the object write and before the index commit (and a real abort, through a debug-only hook) is repaired on the next open |
 | Crash mid-rebuild | a rebuild rolled back leaves the old index or none, never half of one |
 | Concurrency | several processes refreshing a stale, missing or damaged index at once agree, and each object is added once |
@@ -651,7 +674,7 @@ Each PR reports those numbers.
 | `baeb35cd5483`, `de4b1cb363b6` racy margin, clock skew, non-POSIX filesystems | section 5 steps 1 and 6: *T* from the filesystem, taken before the stats; a clock step back clears the rows; stamps only on allow-listed local filesystems |
 | `41f111d3222e` stray entries, non-regular or misnamed files, absent shards | section 5 steps 2–4: `objects/` and dirty shards listed with the store's own checks on every open; all 256 shards decided, absent ones included |
 | `155f7566cac1`, `2538f1286416` rebuild protocol, newer schema | section 6, Rebuilds and Schema versions: in place in one transaction, never unlinking an open file; per-version files; BUSY isn't damage |
-| `1128ae98db65`, `23579eecd2a7` power loss | section 6, Order: shard directory fsync before the index commit, and the shard's row deleted in that transaction |
+| `1128ae98db65`, `23579eecd2a7` power loss | section 6, Order: the index transaction fsyncs the object, its shard directory and a new shard's `objects/` before it commits, and deletes the shard's row |
 | `21fedaad26ab` integer widths | section 4, Integer widths: `ts_key` order-preserving, stat fields whole |
 | `3f3b3d278d99` quick_check, value corruption | section 6, Integrity checks: when quick_check runs; SQLITE_CORRUPT means a new generation; per-row checksums checked on every row used (decision `c489f7f9dea9`); dropped rows caught by the full check, the gate and verify |
 | `5947f43b4b64` read-only opens, serve | section 6, Read-only opens and `bracken serve` |

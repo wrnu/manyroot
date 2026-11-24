@@ -92,7 +92,16 @@ fn the_binary_reads_the_coordination_fixture_unchanged() {
     // index with the clock its freshness reads (task 7d140f132b1a, docs/design/index-store.md).
     let mut after = files(&ground);
     let cache: Vec<PathBuf> = after.keys().filter(|p| p.starts_with("cache")).cloned().collect();
-    let want = ["cache/.gitignore", "cache/clock", "cache/index-v1-1.sqlite", "cache/snapshot"].map(PathBuf::from);
+    // The index's -wal and -shm stay between commands (no checkpoint on close, note b33068a95bbf).
+    let want = [
+        "cache/.gitignore",
+        "cache/clock",
+        "cache/index-v1-1.sqlite",
+        "cache/index-v1-1.sqlite-shm",
+        "cache/index-v1-1.sqlite-wal",
+        "cache/snapshot",
+    ]
+    .map(PathBuf::from);
     assert_eq!(cache, want, "only the snapshot, the index and its clock");
     assert!(String::from_utf8_lossy(&after[&PathBuf::from("cache/.gitignore")]).lines().any(|l| l == "*"));
     after.retain(|p, _| !p.starts_with("cache"));

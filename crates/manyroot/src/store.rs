@@ -699,19 +699,10 @@ fn object_path(dir: &Path, id: &ContributionId) -> PathBuf {
 /// fails the write. The file is synced before the rename, which replaces whatever is at the
 /// object's path, a symlink included, rather than writing through it. A failed write leaves no
 /// temporary file behind.
-///
-/// Then the shard directory is synced, and `objects/` too if this write made the shard, so the
-/// rename is durable before anything that names the object (bracken's index, task `7d140f132b1a`,
-/// docs/design/index-store.md section 6) can be.
 fn write_object(dir: &Path, c: &Contribution) -> Result<(), StoreError> {
     let path = object_path(dir, &c.id());
     let hex = c.id().to_hex();
     let objects = open_root(dir)?.sub_or_create("objects", 0o777).map_err(|e| fail(dir.join("objects"), e))?;
-    let (shard, made) = objects.sub_or_create_new(&hex[..2], 0o777).map_err(|e| fail(objects.join(&hex[..2]), e))?;
-    shard.replace(&hex[2..], &c.id().short(), &c.encode(), 0o666).map_err(|e| fail(path.clone(), e))?;
-    shard.sync().map_err(|e| fail(objects.join(&hex[..2]), e))?;
-    if made {
-        objects.sync().map_err(|e| fail(objects.path().to_owned(), e))?;
-    }
-    Ok(())
+    let shard = objects.sub_or_create(&hex[..2], 0o777).map_err(|e| fail(objects.join(&hex[..2]), e))?;
+    shard.replace(&hex[2..], &c.id().short(), &c.encode(), 0o666).map_err(|e| fail(path, e))
 }
