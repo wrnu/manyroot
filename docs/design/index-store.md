@@ -437,10 +437,11 @@ needs the entry to be durable.
 
 **What it costs, and PR 3's first change** (question `a9016692b85e`, decision
 `3cacdd00ad77`). Keeping the index on every command costs, in release builds on
-a small Ground, about 9 ms more CPU per write (8.7 against 18.0 ms) and about
-4 ms per read (8.3 against 12.7 ms). Of a read's share, the WAL's first access
-is about 1.1 ms, the 256 shard stats and the clock about 1.2 ms, and the
-reconcile about 1 ms; a write's refresh opens a second connection and syncs.
+a small Ground, about 6 ms more CPU per write (8.9 against 15.2 ms) and about
+3.5 ms per read (8.4 against 11.9 ms). Of a read's share, opening the index
+and its WAL is about 1 ms, the 256 shard stats and the clock about 1.2 ms, and
+the reconcile about 1 ms; a write's refresh opens a second connection and
+syncs.
 In the test table the larger cost is the directory fsyncs above, which main
 never makes: on ext4 each is a journal commit that parallel tests queue
 behind. Paired runs on one box put PR 2's nextest time at 1.3 to 1.6 times
@@ -461,10 +462,16 @@ no faster, and isn't pursued.
 
 **Checkpoints.** Connections set `SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`, so a
 command doesn't checkpoint, which would fsync the WAL and the file, as it
-closes. SQLite's autocheckpoint, every 1,000 pages, does it instead. The `-wal`
-and `-shm` files therefore stay in `cache/` between commands. A refresh that
-records and adds nothing writes nothing, so a read of a current index makes no
-commit.
+closes. Instead, a commit that wrote checkpoints the WAL into the file and
+truncates it to nothing (`wal_checkpoint(TRUNCATE)`) once it is past 256 KiB,
+a few commands' worth. SQLite's autocheckpoint alone isn't enough here: with
+no checkpoint on close the WAL is never restarted, and each process's first
+connection rebuilds the WAL's index from the whole file and counts none of it
+checkpointed. The WAL then grew without bound (17 MB after 300 claims), every
+command read all of it, and every commit past 1,000 pages copied it all into
+the file again, with three fsyncs. The `-wal` and `-shm` files stay in
+`cache/` between commands. A refresh that records and adds nothing writes
+nothing, so a read of a current index makes no commit and no checkpoint.
 
 That transaction also deletes the shard's `shard` row, so the next open lists
 that shard again. The write path never records a stamp taken after its own
@@ -673,6 +680,7 @@ Each property maps to a test, in PR 2 unless marked PR 3:
 | Write order | a write's transaction leaves its shard without a row; the write's own object and shard directory are fsynced by the index transaction (the store syncs only the file) |
 | Sync before commit | with every sync failing, a first build, a rebuild, a freshness refresh and a write's refresh each commit nothing; with syncs working, each syncs every object it names, its shard and `objects/` |
 | Reads write nothing | a refresh that records and adds nothing leaves the index file and its WAL byte for byte unchanged |
+| The WAL stays bounded | across 80 commands that each commit, the WAL never passes twice the truncation limit; a refresh that writes nothing leaves even a WAL past the limit as it was |
 | Process crash | a store dropped after the object write and before the index commit (and a real abort, through a debug-only hook) is repaired on the next open |
 | Crash mid-rebuild | a rebuild rolled back leaves the old index or none, never half of one |
 | Concurrency | several processes refreshing a stale, missing or damaged index at once agree, and each object is added once |

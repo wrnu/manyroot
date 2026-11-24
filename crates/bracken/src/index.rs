@@ -536,7 +536,26 @@ fn refresh_file(
         Err(Needs::Error(e)) => return Err(e),
     };
     tx.commit()?;
+    truncate_wal(&conn, path);
     Ok(outcome)
+}
+
+/// The size past which a commit checkpoints the WAL into the file and truncates it (section 6,
+/// Checkpoints).
+const WAL_LIMIT: u64 = 256 * 1024;
+
+/// After a commit that wrote, a WAL past [`WAL_LIMIT`] is checkpointed and truncated to nothing. Without a
+/// checkpoint on close the WAL is never restarted, and every process's first connection rebuilds its index
+/// from the whole file and counts none of it checkpointed, so it would grow without bound and each commit
+/// past SQLite's autocheckpoint would copy all of it again, with an fsync of the WAL and of the file. Best
+/// effort: the commit is already durable as `synchronous=NORMAL` makes it, and a checkpoint left undone
+/// is done by a later commit.
+fn truncate_wal(conn: &Connection, path: &Path) {
+    let mut wal = path.as_os_str().to_owned();
+    wal.push("-wal");
+    if conn.total_changes() > 0 && std::fs::metadata(&wal).is_ok_and(|m| m.len() > WAL_LIMIT) {
+        let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    }
 }
 
 /// `bracken verify`: the index rebuilt whole from `store`, a full open made after `before` was taken,
@@ -549,6 +568,7 @@ pub fn rebuild(dir: &Path, store: &Store, before: &Before) -> Result<()> {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         rebuild_in(&tx, dir, path, store, before, Record::Yes, Options::default())?;
         tx.commit()?;
+        truncate_wal(&conn, path);
         let integrity: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         if integrity != "ok" {
             bail!("the index failed SQLite's quick_check after a rebuild: {integrity}");

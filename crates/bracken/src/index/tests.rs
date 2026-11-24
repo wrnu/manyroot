@@ -1023,6 +1023,40 @@ fn the_last_generation_damaged_doesnt_overflow() {
 /// Security review note 4: syncing never waits on a FIFO put where an object or a shard was.
 #[cfg(unix)]
 #[test]
+fn the_wal_stays_bounded_across_commands() {
+    // No checkpoint on close: without the truncation, each process's first connection rebuilt the WAL's
+    // index from the whole file, counted none of it checkpointed, and every commit copied it all again.
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    let mut wal = path(&dir).expect("a path").into_os_string();
+    wal.push("-wal");
+    let mut largest = 0;
+    for k in 0..80u64 {
+        grow(&dir, 300 + k, 2);
+        read(&dir, 0);
+        largest = largest.max(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0));
+    }
+    assert!(largest <= 2 * WAL_LIMIT, "the WAL reached {largest} bytes");
+    // A refresh that writes nothing leaves even a WAL past the limit alone (reads write nothing).
+    let c = conn(&dir);
+    // Pages written and dropped again: the WAL grows, and the schema is the index's own.
+    c.execute_batch(
+        "PRAGMA wal_autocheckpoint = 0;
+         CREATE TABLE pad(x);
+         WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 200)
+         INSERT INTO pad SELECT zeroblob(4096) FROM n;
+         DROP TABLE pad;",
+    )
+    .expect("padded");
+    drop(c);
+    let len = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(len > WAL_LIMIT, "padded past the limit: {len}");
+    read(&dir, 0);
+    let after = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert_eq!(after, len, "a read that commits nothing doesn't checkpoint");
+}
+
+#[test]
 fn durable_syncs_files_and_directories() {
     REAL_SYNC.with(|r| r.set(true));
     let tmp = tempfile::tempdir().expect("tmp");
