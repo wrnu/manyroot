@@ -33,6 +33,10 @@ mod checks;
 mod merge;
 mod review;
 
+// What `bracken view`'s Weave pages reuse, so they answer in the CLI's --json shapes.
+pub(crate) use merge::{ListedLine, line_row_json, listed_lines};
+pub(crate) use review::{counted_json, green_json, review_json};
+
 #[derive(Subcommand)]
 pub(crate) enum WeaveCommand {
     /// Create a Weave Ground at --dir: the Weave marker and a `main` line, signed with --as (created
@@ -875,7 +879,7 @@ fn print_tree_written(manifest: Option<ContentHash>, files: &[(ContentHash, Stri
     }
 }
 
-fn decision_json(d: &DecisionRecord, names: &super::Names) -> Value {
+pub(crate) fn decision_json(d: &DecisionRecord, names: &super::Names) -> Value {
     let r = &d.decision;
     let breakage: Vec<Value> =
         r.breakage.iter().map(|b| json!({"check": b.check, "detail": b.detail, "paths": b.paths})).collect();
@@ -972,7 +976,7 @@ fn refuse_listed<'a>(listed: impl Iterator<Item = &'a Unreadable>, what: &str) -
 /// The counted marker's author: the Ground's root, when it has signed a marker that counts. A line name
 /// resolves only among the lines this author opened (gap G9, docs/design/weave-freeze.md section 2.4),
 /// the same author the default-line rule uses.
-fn marker_author(s: &Store, ix: &Index) -> Option<AgentId> {
+pub(crate) fn marker_author(s: &Store, ix: &Index) -> Option<AgentId> {
     ix.counted_marker().map(|m| s.graph().get(&m).expect("indexed from the graph").author())
 }
 
@@ -998,7 +1002,11 @@ pub(crate) fn refuse_id_like_name(name: &str) -> Result<()> {
 
 /// The current lines named `name` whose first artifact is by `author`, the counted marker's author:
 /// the lines a name reaches. None without a counted marker.
-fn by_name<'a>(lines: &'a Lines, author: Option<&'a AgentId>, name: &'a str) -> impl Iterator<Item = &'a Version> {
+pub(crate) fn by_name<'a>(
+    lines: &'a Lines,
+    author: Option<&'a AgentId>,
+    name: &'a str,
+) -> impl Iterator<Item = &'a Version> {
     lines.lines().filter(move |v| v.policy.name == name && Some(&v.author) == author)
 }
 
@@ -1169,7 +1177,7 @@ fn compare(manifest: &Manifest, plan: &Plan) -> Vec<Value> {
     rows
 }
 
-fn problem_json(p: &Problem) -> Value {
+pub(crate) fn problem_json(p: &Problem) -> Value {
     match p {
         Problem::InvalidPayload { id, media_type, error } => json!({
             "problem": "invalid_payload", "id": id, "media_type": media_type, "error": error.to_string(),

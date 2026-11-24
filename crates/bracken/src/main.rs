@@ -27,6 +27,7 @@ mod terminal;
 mod typed;
 mod verify;
 mod view;
+mod view_weave;
 mod wire;
 
 /// `println!`, through [`write_stdout`]. Shadows the standard macro in this file.
@@ -628,11 +629,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 println!("{n} contributions verified{note}");
             }
         }
+        Command::View { port, bind, hosts, runs, policy } => {
+            let dir = ground_dir(cli.dir.as_deref())?;
+            // Taken before the replica is read, so a write during the read changes it again and the view's
+            // first poll reads again (finding 31f5a44fc779).
+            let first = view::signature(&dir)?;
+            // The view never writes, not even the snapshot. It is handed this replica, so it holds one copy.
+            let s = snapshot::Refreshing::open(&dir, snapshot::Refresh::No)?.into_inner();
+            // Validators by name from the public agent directory: the view never reads identities.
+            let policy = policy.build(&view::public_names(&s)?)?;
+            view::serve(s, first, policy, &view::Bind { ips: bind, port, names: hosts }, runs.as_deref())?;
+        }
         command => {
-            // The view never writes, not even the snapshot.
-            let refresh =
-                if matches!(command, Command::View { .. }) { snapshot::Refresh::No } else { snapshot::Refresh::Yes };
-            let s = snapshot::Refreshing::open(&ground_dir(cli.dir.as_deref())?, refresh)?;
+            let s = snapshot::Refreshing::open(&ground_dir(cli.dir.as_deref())?, snapshot::Refresh::Yes)?;
             return run_in_store(s, cli.agent.as_deref(), command);
         }
     }
@@ -854,11 +863,7 @@ fn run_in_store(mut s: snapshot::Refreshing, agent: Option<&str>, command: Comma
         Command::Status { all, full, limit, policy, out } => {
             print_status(&s, &policy, &StatusArgs { all, full, limit, json: out.json, agent })?
         }
-        Command::View { port, bind, hosts, runs, policy } => {
-            // Validators by name from the public agent directory: the view never reads identities.
-            let policy = policy.build(&view::public_names(&s)?)?;
-            view::serve(s.dir(), policy, &view::Bind { ips: bind, port, names: hosts }, runs.as_deref())?;
-        }
+        Command::View { .. } => unreachable!("handled before opening a store"),
         Command::Intend { id, duration, out } => {
             let who = any_signer(&s, agent)?;
             let target = resolve(&s, &id)?;

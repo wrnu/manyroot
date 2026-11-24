@@ -269,30 +269,9 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             let lines = super::lines_for(s, &ix, &[]);
             let author = super::marker_author(s, &ix);
             let names = Names::load(s)?;
-            // How a line is reached: by its name, or by its id only, because the marker's author didn't
-            // open it or opened another line of its name (gap G9).
-            let listed: Vec<(&Version, &str, bool)> = lines
-                .lines()
-                .map(|v| {
-                    let reach = if Some(v.author) != author {
-                        "id_only"
-                    } else if super::by_name(&lines, author.as_ref(), &v.policy.name).nth(1).is_some() {
-                        "name_shared"
-                    } else {
-                        "name"
-                    };
-                    (v, reach, lines.default_line() == Some(v.id))
-                })
-                .collect();
+            let listed = listed_lines(&lines, author.as_ref());
             if out.json {
-                let rows: Vec<Value> = listed
-                    .iter()
-                    .map(|(v, reach, default)| {
-                        json!({"line": v.id, "name": v.policy.name, "author": v.author.to_string(),
-                               "author_name": names.display(&v.author), "default": default,
-                               "by_name": *reach == "name", "reach": reach})
-                    })
-                    .collect();
+                let rows: Vec<Value> = listed.iter().map(|l| line_row_json(l, &names)).collect();
                 print_json(&json!({"marker_author": author.map(|a| a.to_string()), "lines": rows}));
                 return Ok(ExitCode::SUCCESS);
             }
@@ -458,6 +437,35 @@ pub(crate) fn line(s: &mut Store, agent: Option<&str>, command: LineCommand) -> 
             write_merge(s, agent, &ix, &lines, target, note, dry_run, None, None, &Default::default(), out)
         }
     }
+}
+
+/// A current line as `weave line list` shows it: its version, how a name reaches it, and whether it is
+/// the default line.
+pub(crate) type ListedLine<'a> = (&'a Version, &'static str, bool);
+
+/// Every current line, with how it is reached: by its name, or by its id only, because the marker's
+/// author didn't open it or opened another line of its name (gap G9).
+pub(crate) fn listed_lines<'a>(lines: &'a Lines, author: Option<&AgentId>) -> Vec<ListedLine<'a>> {
+    lines
+        .lines()
+        .map(|v| {
+            let reach = if Some(&v.author) != author {
+                "id_only"
+            } else if super::by_name(lines, author, &v.policy.name).nth(1).is_some() {
+                "name_shared"
+            } else {
+                "name"
+            };
+            (v, reach, lines.default_line() == Some(v.id))
+        })
+        .collect()
+}
+
+/// One row of `weave line list --json`.
+pub(crate) fn line_row_json((v, reach, default): &ListedLine, names: &Names) -> Value {
+    json!({"line": v.id, "name": v.policy.name, "author": v.author.to_string(),
+           "author_name": names.display(&v.author), "default": default,
+           "by_name": *reach == "name", "reach": reach})
 }
 
 fn print_policy(
