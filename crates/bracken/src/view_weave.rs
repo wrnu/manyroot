@@ -1036,9 +1036,8 @@ impl Ctx<'_> {
                                      "path": e.path, "mode": e.mode.bits(), "symlink": e.mode == Mode::Symlink,
                                      "size": e.size, "hash": e.hash.to_string(), "held": self.held(e)}),
         };
-        match p.list {
-            Some("children") => return listed("children", &children, Child::key, child_row, WHOLE, p),
-            _ => {}
+        if p.list == Some("children") {
+            return listed("children", &children, Child::key, child_row, WHOLE, p);
         }
         // Computed only for the answers that show it (round-1 notes on PR #81).
         let missing = self.s.index.missing(manifest);
