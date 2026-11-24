@@ -50,7 +50,18 @@
   // for a step after the one shown, whose standing then the page doesn't have.
   function buildLife(r) {
     const c = r.claim;
-    const ev = [{ t: c.timestamp_ms, ids: [c.id], who: nameOf(c.author, c.author_name), kind: "claim", what: "wrote it" }];
+    const isArt = c.kind === "artifact";
+    const ev = [
+      {
+        t: c.timestamp_ms,
+        ids: [c.id],
+        who: nameOf(c.author, c.author_name),
+        kind: isArt ? "artifact" : "claim",
+        what: isArt ? "added the artifact" : "wrote it",
+        status: isArt ? statusOf(c.assessment) : undefined,
+        agent: agentIndex.get(c.author) || 0,
+      },
+    ];
     for (const i of r.intents) {
       ev.push({ t: i.from_ms, ids: [i.id, i.relation], who: nameOf(i.author, i.author_name), kind: "intent", what: "intends to work on it" });
       if (i.ended_ms !== null) ev.push({ t: i.ended_ms, ids: [], who: nameOf(i.author, i.author_name), kind: "intent-end", what: `intent ended: ${i.ended_by}`, plain: "intent ended" });
@@ -60,9 +71,9 @@
       ev.push({ t: a.timestamp_ms, ids: [a.id, im.relation], who: nameOf(a.author, a.author_name), kind: "artifact", what: im.relation_retracted ? "implemented it, relation since retracted, with" : "implements it with", plain: "implements it with", text: a.body.name, status: statusOf(im.assessment) });
       for (const e of im.evidence) ev.push(evidenceEntry(e, `on ${a.body.name}`));
     }
-    for (const e of r.evidence) ev.push(evidenceEntry(e, "on the claim"));
+    for (const e of r.evidence) ev.push(evidenceEntry(e, isArt ? "on the artifact" : "on the claim"));
     for (const rf of r.refinements) ev.push({ t: rf.timestamp_ms, ids: [rf.id, rf.relation], who: nameOf("", rf.author_name), kind: "claim", what: "refines it:", text: rf.statement });
-    for (const rv of r.rivals) ev.push({ t: rv.timestamp_ms, ids: [rv.id, rv.relation].filter(Boolean), who: nameOf("", rv.author_name), kind: "claim", what: rv.how === "contradicts" ? "contradicts it:" : "replaces the same claim:", text: rv.statement });
+    for (const rv of r.rivals) ev.push({ t: rv.timestamp_ms, ids: [rv.id, rv.relation].filter(Boolean), who: nameOf("", rv.author_name), kind: "claim", what: rv.how === "contradicts" ? "contradicts it:" : isArt ? "replaces the same artifact:" : "replaces the same claim:", text: rv.statement });
     for (const rp of r.lineage.replaces) ev.push({ t: rp.timestamp_ms, ids: [rp.id], who: nameOf("", rp.author_name), kind: "claim", what: "wrote what it replaces:", text: rp.statement });
     for (const rb of r.lineage.replaced_by)
       ev.push({ t: rb.timestamp_ms, ids: [rb.id], who: nameOf("", rb.author_name), kind: "claim", what: rb.counts ? "would replace it:" : "would replace it, which doesn't count:", plain: "would replace it:", text: rb.statement });
@@ -177,8 +188,9 @@
     drawRivals(g, r);
     drawRoots(g, r, entering);
     drawStem(g, r, status, entering);
-    // The seed itself, at the soil line.
-    g.push(B.svgKnot("claim", CX, SOIL, 11, B.look("claim", { status, retracted: r.claim.retracted, agent: agentIndex.get(r.claim.author) || 0 })));
+    // The subject itself, at the soil line: a seed for a claim, a nodule for an artifact.
+    const rootKind = r.claim.kind === "artifact" ? "artifact" : "claim";
+    g.push(B.svgKnot(rootKind, CX, SOIL, 11, B.look(rootKind, { status, retracted: r.claim.retracted, agent: agentIndex.get(r.claim.author) || 0 })));
     stage.replaceChildren(...g);
     renderTitle(r, status);
     renderStory();
@@ -222,7 +234,9 @@
   function drawRoots(g, r, entering) {
     const impls = r.implementations;
     if (!impls.length) {
-      g.push(label(CX, SOIL + 80, [{ text: "nothing implements it yet", cls: "faint italic" }], { anchor: "middle" }));
+      if (r.claim.kind !== "artifact") {
+        g.push(label(CX, SOIL + 80, [{ text: "nothing implements it yet", cls: "faint italic" }], { anchor: "middle" }));
+      }
       return;
     }
     const n = impls.length;
@@ -399,7 +413,7 @@
       g.push(label(x, SOIL - 170, [
         { text: `${nameOf("", rb.author_name)} would replace it`, cls: "sc dim" },
         ...wrap(rb.statement, 28, 2).map((text) => ({ text, cls: "italic" })),
-        { text: rb.counts ? "" : "doesn't count: it isn't by this claim's author", cls: "faint" },
+        { text: rb.counts ? "" : `doesn't count: it isn't by this ${r.claim.kind === "artifact" ? "artifact" : "claim"}'s author`, cls: "faint" },
       ], { anchor: "middle", air: true }));
     });
   }
@@ -407,7 +421,10 @@
   // ---- The title and the story ----
   function renderTitle(r, status) {
     const c = r.claim;
-    B.text($("statement"), B.firstLine(c.body.statement || c.body.name, 240));
+    const rawLine = String(c.body.statement || c.body.name || "").split(/\r\n|[\n\r\u0085\u2028\u2029]/)[0];
+    const chars = Array.from(rawLine);
+    const titleLine = chars.length > 240 ? chars.slice(0, 239).join("") + "…" : rawLine;
+    $("statement").replaceChildren(...B.shown(titleLine));
     const tags = c.body.tags && c.body.tags.length ? c.body.tags : [];
     $("byline").replaceChildren(
       ...[
@@ -434,7 +451,7 @@
   /** How a life entry looks; `later` (a step after the one shown) draws it without a status. */
   function lookOf(e, later) {
     if (e.kind === "evidence") return B.look("evidence", { verdict: e.verdict });
-    if (e.kind === "artifact") return B.look("artifact", { status: later ? "pending" : e.status, agent: 2 });
+    if (e.kind === "artifact") return B.look("artifact", { status: later ? "pending" : e.status, agent: e.agent !== undefined ? e.agent : 2 });
     if (e.kind === "intent-end") return { fill: null, stroke: "var(--superseded)", dash: [2, 2] };
     return B.look("claim", { status: "pending", agent: 1 });
   }
