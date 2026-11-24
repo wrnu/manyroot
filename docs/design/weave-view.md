@@ -355,12 +355,12 @@ conflicts, problems, missing paths and change entries.
 | `/api/weave/history/<line>?path&after&limit` | the line's decisions, newest first, where the path's file value differs from the decision's first parent on the line, each with `kind`, `before` and `after` (`hash` and octal `mode`, or null for absent), its author, the `parent` compared with and `parent_on_line`. A `path` is required. A decision with no parent on the line (the line's root, or a first decision a line merge started from another line's head) compares with its first parent on any line, or, with no parent, with an absent file | `logs`; `Lines::decision`; `Index::manifest`; `Manifest::get` |
 | `/api/weave/diff?a&b&list&after&limit` | `a` and `b` as manifest hashes, and `files`: the per-file list from `a`'s tree to `b`'s, paged by path (`list=files`: `after` and `limit` without it are a 400, never ignored), each with `path`, `kind`, `before`, `after` and `not_held` (a side not held at its entry's size). `a` and `b` are any record with a tree, or `blake3:<hash>` of a manifest | `diff::manifests` |
 | `/api/weave/diff?a&b&path` | that one file's `kind`, `before` and `after`, and `shown`: `text` with the `unified` text and its `lines`, or why not: `same`, `mode_only`, `missing`, `oversized`, `binary` (a side not text, or a symlink) or `too_large_to_diff`, checked in that order on `a`'s side then `b`'s. A path in neither tree is a 404; with `path`, `list`, `after` or `limit` is a 400. The unified text is kept in `derived` under the two hashes and the path, built in one of the 2 diff slots (section 4, Caps) | `diff::unified`, `diff::is_text` |
-| `/api/weave/proposals/<line>?status&after&limit` | proposals on the line, ascending by id, each with `status`, author, base, summary. `status` filters (`open`, `integrated`, `invalid`, `retracted`, `all`). No change is computed for a list: the change's size is on the proposal's page | `records`; `Lines::proposal`, `proposal_named`; `logs` and `Lines::decision` for what each decision lists, compared by the payloads' `change` hashes |
-| `/api/weave/proposal/<id>?list&after&limit` | the proposal, its status and integrating decision with its note, its change entries (`Change::between`, one per request), reviews, objections to answer, and for an open proposal the conflict preview | `Lines::proposal`; `derived` for `proposal_objections` and the preview; `Reviews::of_proposal`; `format::Change::between`; *Conflict preview* below |
+| `/api/weave/proposals/<line>?status&after&limit` | proposals on the line, ascending by id, each with `status`, author, base, summary. `status` filters (`open`, `integrated`, `invalid`, `retracted`, `all`). No change is computed for a list: the change's size is on the proposal's page. A status is `retracted` or `invalid` first, as views ignore those, then `integrated` or `open`; `decision` names the decision that integrated the proposal's change whatever its status, the oldest on the line | `records`; `Lines::proposal`, `proposal_named`; `logs` and `Lines::decision` for what each decision lists, compared by the payloads' `change` hashes |
+| `/api/weave/proposal/<id>?list&after&limit` | the proposal, its status and integrating decision with its note (`integrated_by`), its change entries (`Change::between`, one per request; `change_held` false when its base's tree or its own isn't held), reviews, objections to answer (null with no single current policy), and for an open proposal the conflict preview, or null with `preview_why`. The preview's conflicts page by path with `list=conflicts` (20 at most, the default), each with `base`, `into` (the line head's side), `from` (the proposal's), `lines`, `ranges` (50 and `ranges_total`), the first 10 `resolutions` with `resolutions_total`, and `settled_by`, the integrator's resolution integrate would apply. A conflict's resolutions page with `list=resolutions&path=<path>`; `path` goes with nothing else | `Lines::proposal`; `derived` for `proposal_objections` and the preview; `Reviews::of_proposal`; `format::Change::between`; *Conflict preview* below |
 | `/api/weave/manifest/<hash>?line&list&after&limit` | its check results by anyone (`Index::check_results` for that manifest, ascending by id), each with its first 4 KiB of details, a box log link and validator mark; the counted results under `line`'s current policy (default the default line; none when the policy has diverged); its reviews and the objections to it; the decisions and proposals with this manifest | `Index::check_results`; `Checks::counted_on_manifest`, and `Checks::latest` for `replaced` on a validator's result; `Reviews::of_manifest`; `derived` for `manifest_objections`; each evidence's `details` from `g` |
 | `/api/weave/result/<id>` | one check result, with its details up to 64 KiB | `Index::check_results`; `g` |
 | `/api/weave/log-artifact/<id>` | a `text/plain` box log's text, cut to 64 KiB, shown only if it is UTF-8 without NUL; otherwise named with its size | `records`; `g`; `diff::is_text` |
-| `/api/weave/record/<id or hash>` | `kind` and the page that shows it | `ground::kind_of`, `Index::hash_kind` |
+| `/api/weave/record/<id or hash>` | `kind` and the page that shows it (`decision`, `line`, `proposal` or `tree`) | `ground::kind_of`, `Index::hash_kind` |
 
 - **What a tree shows.** A tree's record can be a decision (its manifest), a
   proposal (its manifest), a manifest artifact, or a content hash. A tree is
@@ -426,9 +426,12 @@ computes only this:
      - `over_view_cap` when a side is over the view's 1 MiB cap. Integrate
        itself line-merges sides up to 8 MiB, so this one says only that
        the view didn't compute it, never that it can't merge.
-4. **The budget, per page.** The three sides of the page's conflicts add up
-   to at most 16 MiB. A conflict past that is listed as `not_computed`, and
-   the next page starts from it. Nothing merged is kept: `text_conflicts`
+4. **The budget, per page.** The sides the page's conflicts read add up
+   to at most 16 MiB. A page stops before the conflict that would pass that,
+   with `more`, and the next page starts from it. A conflict alone reads at
+   most 3 MiB, so the first on a page is always computed, and none is left
+   `not_computed`. A side over the view's cap, and a conflict whose sides
+   aren't all there, read nothing. Nothing merged is kept: `text_conflicts`
    returns ranges, not bytes. So duplicate content hashes across many paths
    (one 8 MiB blob named at 1,000 paths) cost at most 20 diffs of 1 MiB
    sides a request, never 1,000 merges.
@@ -819,6 +822,16 @@ Notes taken:
 | PR #79 round 2, `c50605c13cd4`: the Weave pages stayed 503 after a failed change was undone | The old snapshot's Weave state is built again (section 3) |
 | PR #79 round 2, `886fba8945e1`: a protected path near 4 KiB was cut, breaking its cursor | A row that is itself a key is never cut (section 4) |
 | PR #79 round 3, notes on the builder's rationales (`2be6896ef4ff`), taken in PR (c) | Note 1: repeated policy entries are listed once, so paging can't loop. Note 2: section 4 states the row bound with never-cut check names. Note 3: the recovery after a failed re-read relies on `signature()`'s append-only counts, as every re-read does; a same-count replacement in `objects/` or `agents/` isn't seen until the next change. That's the Ground's append-only rule, and unchanged here |
+
+### PR (e)
+
+| What | Handling |
+|---|---|
+| The design's row | `tests/view_weave.rs`: each status, filtered; a fork (a second decision from the base, written by hand) and a diverged policy getting no preview; an integrator's resolution and another's, 11 on one key paging; a mode-only change against a change of text; 1,000 conflicts naming one blob, 20 a page; a side over the view's cap; the cache, answering while both slots are taken |
+| A page past 16 MiB of sides | The page stops before the conflict, which starts the next page, rather than listing it as `not_computed` (section 4, *Conflict preview*, 4). 17 conflicts with a 1 MiB side give pages of 15 and 2 |
+| `mode` | Kept as the design names it, though with only regular and executable files among text sides, two changed modes always merge, so it doesn't arise from import's trees |
+| The preview slots' test | A hook, `BRACKEN_VIEW_PREVIEW_DELAY_MS` (at most 2 s), holds a preview page in its slot, as the diff hook does |
+| `records` | The state keeps every proposal artifact that decodes by its line, ascending, retracted and invalid ones included; resolutions come from `Index::resolutions` |
 
 ### PR (d)
 

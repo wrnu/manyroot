@@ -525,6 +525,85 @@ check("a history or diff route with a bad id, no path, or a path that doesn't de
   }
 });
 
+// ---- Proposals and the conflict preview (PR (e)) ----
+
+const P1 = id(7);
+const P2 = id(8);
+const R1 = id(9);
+const propRow = (p, status, extra = {}) => ({ proposal: p, status, why: null, decision: null, author: id(9), author_name: "alice", line: LINE, base: D1, manifest: MANIFEST, change: `blake3:${id(60)}`, summary: "fix it", ...extra });
+const conflict = (path, lines, extra = {}) => ({ path, base: value(40), into: value(41), from: value(42), lines, ranges: [], ranges_total: 0, resolutions: [], resolutions_total: 0, settled_by: null, ...extra });
+const proposalAnswer = (extra = {}) => ({
+  ...propRow(P1, "open", { summary: HOSTILE }), integrated_by: null, change_held: true,
+  change: list([{ path: ODD, before: value(40), after: value(41) }]), reviews: list([]), objections: list([]),
+  preview: { head: D2, items: [], total: 0, more: false, settled: 3 }, preview_why: null, ...extra,
+});
+
+check("a line's proposals list each with its status, filter by status, and mark hostile text", async () => {
+  const rows = list([propRow(P1, "open", { summary: HOSTILE }), propRow(P2, "invalid", { why: "its change isn't ‮the change" })]);
+  const { page, fetched, location } = await load(`#proposals/${LINE}`, answers([[`/api/weave/proposals/${LINE}`, rows]]));
+  assert.deepStrictEqual(fetched, [`/api/weave/proposals/${LINE}?limit=50`]);
+  safe(page, "proposals");
+  assert.ok(page.textContent.includes("2 proposals") && page.textContent.includes("</script><img"), "markup is text");
+  assert.ok(marks(page).includes("U+202E"));
+  buttons(page).find((b) => b.textContent === "open").on.click[0]();
+  assert.strictEqual(location.hash, `#proposals/${LINE}/open`);
+  const filtered = await load(`#proposals/${LINE}/open`, answers([[`/api/weave/proposals/${LINE}`, list([propRow(P1, "open")])]]));
+  assert.deepStrictEqual(filtered.fetched, [`/api/weave/proposals/${LINE}?status=open&limit=50`]);
+  assert.ok(filtered.page.textContent.includes("1 proposal, open"));
+});
+
+check("a proposal's preview names each conflict and why, pages conflicts by path and resolutions by conflict", async () => {
+  const offered = [{ resolution: R1, author: id(9), author_name: "integrator", integrator: true, result: value(41) }];
+  const items = [
+    conflict(ODD, "conflicts", { ranges: [[1, 1], [4, 6]], ranges_total: 3, resolutions: offered, resolutions_total: 11, settled_by: R1 }),
+    conflict("b", "clean"), conflict("c", "not_text"), conflict("d", "over_view_cap"), conflict("e", "mode"),
+  ];
+  const answer = proposalAnswer({ preview: { head: D2, items, total: 30, more: true, settled: 3 } });
+  const { page, fetched, location } = await load(`#proposal/${P1}`, answers([[`/api/weave/proposal/${P1}?list=resolutions`, list([], 11)], [`/api/weave/proposal/${P1}?list=conflicts`, list([])], [`/api/weave/proposal/${P1}`, answer]]));
+  safe(page, "proposal");
+  const text = page.textContent;
+  for (const says of ["conflict at base lines 1, 4–6 and 1 more", "merge cleanly", "no line merge", "1 MiB cap", "its modes don't", "30 conflicts", "Integrate would apply", "an integrator of the line"]) {
+    assert.ok(text.includes(says), `${says}: ${text.slice(0, 2000)}`);
+  }
+  assert.ok(marks(page).includes("U+202E"), "a path's bidi control is marked");
+  assert.ok(text.includes("</script><img"), "the summary is text");
+  const mores = buttons(page).filter((b) => b.textContent.startsWith("More"));
+  assert.strictEqual(mores.length, 2, "more resolutions, and more conflicts");
+  mores[0].on.click[0]();
+  mores[1].on.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(fetched.includes(`/api/weave/proposal/${P1}?list=resolutions&after=${R1}&limit=50&path=${ENC}`), fetched.join("\n"));
+  assert.ok(fetched.includes(`/api/weave/proposal/${P1}?list=conflicts&after=e`), "a conflicts page asks for no limit: 20 at most");
+  buttons(page).find((b) => b.textContent.startsWith("odd/<b>")).on.click[0]();
+  assert.strictEqual(location.hash, `#diff/${D1}/${P1}/${ENC}`, "each path diffs the base against the proposal");
+});
+
+check("a proposal with no preview says why; one whose line has no single policy lists no objections", async () => {
+  const answer = proposalAnswer({ status: "open", preview: null, preview_why: "the line has 2 heads, so integrate would refuse", objections: null });
+  const { page } = await load(`#proposal/${P1}`, answers([[`/api/weave/proposal/${P1}`, answer]]));
+  assert.ok(page.textContent.includes("No preview: the line has 2 heads"));
+  assert.ok(page.textContent.includes("no single current policy"));
+  const integrated = proposalAnswer({ status: "integrated", decision: D2, integrated_by: { decision: D2, note: "took ‮it" }, preview: null, preview_why: "it isn't open" });
+  const done = await load(`#proposal/${P1}`, answers([[`/api/weave/proposal/${P1}`, integrated]]));
+  assert.ok(done.page.textContent.includes("The integrator's note") && marks(done.page).includes("U+202E"));
+});
+
+check("a decision links to the proposals it integrated, and a line to its proposals", async () => {
+  const { page, location } = await load(`#decision/${D2}`, answers([[`/api/weave/decision/${D2}`, decisionAnswer({ proposals: [P1] })]]));
+  buttons(page).find((b) => b.textContent === P1.slice(0, 12)).on.click[0]();
+  assert.strictEqual(location.hash, `#proposal/${P1}`);
+  const l = await load(`#line/${LINE}`, answers([[`/api/weave/line/${LINE}`, lineAnswer()], [`/api/weave/log/${LINE}`, list([])]]));
+  buttons(l.page).find((b) => b.textContent === "every proposal to this line").on.click[0]();
+  assert.strictEqual(l.location.hash, `#proposals/${LINE}`);
+});
+
+check("a proposals route with a bad line or status, or a proposal route with a bad id, is the home page, unfetched", async () => {
+  for (const hash of [`#proposals/${LINE}/closed`, `#proposals/xyz`, `#proposal/${P1.slice(1)}`, `#proposal/../${P1}`]) {
+    const { fetched } = await load(hash, answers([["/api/weave", home()]]));
+    assert.deepStrictEqual(fetched, ["/api/weave"], `${hash}: ${fetched}`);
+  }
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of checks) {

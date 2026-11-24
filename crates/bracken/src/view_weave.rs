@@ -24,9 +24,10 @@ use std::sync::{Arc, Mutex};
 use bracken_tree::ContentHash;
 use bracken_tree::FileValue;
 use bracken_tree::diff::Kind;
-use bracken_tree::format::{Decision, Entry, Manifest, Mode};
+use bracken_tree::format::{Change, Decision, Entry, Manifest, Mode, PROPOSAL_MEDIA_TYPE};
 use bracken_tree::ground::{Index, kind_of};
 use bracken_tree::lines::{Lines, newest_first};
+use bracken_tree::merge::{Conflict, Key, merge_mode, text_conflicts, three_way};
 use bracken_tree::results::Checks;
 use bracken_tree::reviews::{Reviews, Target, goals};
 use manyroot::{AgentId, Body, ContributionId, Graph, RelationKind};
@@ -66,6 +67,15 @@ const MAX_NESTED_LIMIT: usize = 200;
 pub(crate) const DERIVED_AT_ONCE: usize = 2;
 /// The most unified diffs built at once; more get a 503 at once.
 const DIFFS_AT_ONCE: usize = 2;
+/// The most conflict previews built at once; more get a 503 at once.
+const PREVIEWS_AT_ONCE: usize = 2;
+/// A conflict preview's page: at most so many conflicts, so many resolutions each in the answer, and so
+/// many bytes of the sides it reads in all (section 4, *Conflict preview*).
+const PREVIEW_CONFLICTS: usize = 20;
+const PREVIEW_RESOLUTIONS: usize = 10;
+const PREVIEW_BYTES: u64 = 16 << 20;
+/// The most base line ranges a conflict's row lists, with their total.
+const PREVIEW_RANGES: usize = 50;
 /// The fewest hex digits an id in a path may have, as for `/api/contribution`.
 const ID_DIGITS: usize = 8;
 /// The most bytes of a file's text the file page shows; a larger file is named, not shown (section 4).
@@ -101,6 +111,9 @@ pub(crate) struct State {
     reviews: Reviews,
     /// Each policy version, by the versions that supersede it in a relation its own author signed.
     successors: HashMap<ContributionId, Vec<ContributionId>>,
+    /// Every proposal artifact whose payload decodes, retracted or invalid too, by its payload's line,
+    /// ascending: `Lines` lists only valid ones per line (section 3, `records`).
+    proposals: HashMap<ContributionId, Vec<ContributionId>>,
     /// Answers of the reads that sort the graph or walk a line, by key, oldest first, each with its
     /// serialized size; at most [`DERIVED_BYTES`] in all.
     derived: Mutex<Derived>,
@@ -231,6 +244,18 @@ impl Weave {
             list.sort();
             list.dedup();
         }
+        let mut proposals: HashMap<ContributionId, Vec<ContributionId>> = HashMap::new();
+        for c in g.iter() {
+            if let Body::Artifact { media_type, .. } = c.body()
+                && media_type == PROPOSAL_MEDIA_TYPE
+                && let Some(p) = lines.proposal_named(&c.id())
+            {
+                proposals.entry(p.line).or_default().push(c.id());
+            }
+        }
+        for list in proposals.values_mut() {
+            list.sort();
+        }
         let checks = Mutex::new(Checks::build(g, &index, &lines));
         let reviews = Reviews::build(&index, &lines);
         Weave::Built(Box::new(State {
@@ -243,6 +268,7 @@ impl Weave {
             checks,
             reviews,
             successors,
+            proposals,
             derived: Mutex::new(Derived::default()),
         }))
     }
@@ -305,6 +331,10 @@ pub(crate) fn takes(path: &str) -> &'static [&'static str] {
         &["a", "b", "path", "list", "after", "limit"]
     } else if rest.starts_with("/log/") {
         &["after", "limit"]
+    } else if rest.starts_with("/proposals/") {
+        &["status", "after", "limit"]
+    } else if rest.starts_with("/proposal/") {
+        &["path", "list", "after", "limit"]
     } else {
         &[]
     }
@@ -606,6 +636,10 @@ pub(crate) fn route(
         at.record(id)?
     } else if let Some(id) = rest.strip_prefix("/tree/") {
         at.tree(id, &p, query)?
+    } else if let Some(line) = rest.strip_prefix("/proposals/") {
+        at.proposals(line, &p, query)?
+    } else if let Some(id) = rest.strip_prefix("/proposal/") {
+        at.proposal(id, &p, query)?
     } else if let Some(line) = rest.strip_prefix("/history/") {
         at.history(line, &p, query)?
     } else if rest == "/diff" {
@@ -634,11 +668,16 @@ struct Ctx<'a> {
 pub(crate) struct WeaveSlots {
     reads: Slots,
     diffs: Slots,
+    previews: Slots,
 }
 
 impl WeaveSlots {
     pub(crate) fn new() -> WeaveSlots {
-        WeaveSlots { reads: Slots::new(DERIVED_AT_ONCE), diffs: Slots::new(DIFFS_AT_ONCE) }
+        WeaveSlots {
+            reads: Slots::new(DERIVED_AT_ONCE),
+            diffs: Slots::new(DIFFS_AT_ONCE),
+            previews: Slots::new(PREVIEWS_AT_ONCE),
+        }
     }
 }
 
@@ -1006,6 +1045,8 @@ impl Ctx<'_> {
             Some("decision")
         } else if lines.line(&id).is_some() {
             Some("line")
+        } else if lines.proposal_named(&id).is_some() {
+            Some("proposal")
         } else {
             None
         };
@@ -1206,10 +1247,7 @@ impl Ctx<'_> {
                 Ok((old, new)) => {
                     let key = format!("diff {ha} {hb} {path}");
                     let unified = self.derived_in(&self.slots.diffs, key, || {
-                        let delay = diff_delay();
-                        if !delay.is_zero() {
-                            std::thread::sleep(delay);
-                        }
+                        pause(&DIFF_DELAY, "BRACKEN_VIEW_DIFF_DELAY_MS");
                         json!(bracken_tree::diff::unified(path, old, new))
                     })?;
                     match unified.as_str() {
@@ -1279,13 +1317,367 @@ fn change(before: Option<FileValue>, after: Option<FileValue>) -> Option<Kind> {
     }
 }
 
-/// A test hook: how long a unified diff waits inside its slot, so a test can hold the slots (at most 2 s).
-fn diff_delay() -> std::time::Duration {
-    static DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *DELAY.get_or_init(|| {
-        let ms = std::env::var("BRACKEN_VIEW_DIFF_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+/// A proposal's status (section 1, *Follow proposals*), and the decision that integrated it, if one did.
+struct Status {
+    status: &'static str,
+    why: Option<String>,
+    decision: Option<ContributionId>,
+}
+
+impl Ctx<'_> {
+    /// For each change a decision on `line` integrated, the oldest such decision: what a proposal with that
+    /// change is integrated by, whichever proposal the decision named (section 1).
+    fn integrations(&self, line: &ContributionId) -> HashMap<ContentHash, ContributionId> {
+        let lines = &self.s.lines;
+        let mut by_change = HashMap::new();
+        let empty = Vec::new();
+        for id in self.s.logs.get(line).unwrap_or(&empty).iter().rev() {
+            for p in &lines.decision(id).expect("logged decisions exist").decision.proposals {
+                if let Some(named) = lines.proposal_named(p) {
+                    by_change.entry(named.change).or_insert(*id);
+                }
+            }
+        }
+        by_change
+    }
+
+    /// A proposal's status: `retracted` and `invalid` first (views ignore those), then `integrated` if a
+    /// decision on its line lists it or one with the same change, else `open`. `decision` names the decision
+    /// that integrated its change whatever its status.
+    fn status(&self, id: &ContributionId, integrations: &HashMap<ContentHash, ContributionId>) -> Status {
+        let lines = &self.s.lines;
+        let Some(named) = lines.proposal_named(id) else {
+            return Status { status: "invalid", why: Some("its payload doesn't decode".into()), decision: None };
+        };
+        let decision = integrations.get(&named.change).copied();
+        let (status, why) = if self.g.is_retracted(id) {
+            ("retracted", None)
+        } else {
+            match lines.proposal(id).map(|r| &r.verdict) {
+                Some(Err(e)) => ("invalid", Some(e.to_string())),
+                None => ("invalid", Some("this replica doesn't judge it".into())),
+                Some(Ok(())) if decision.is_some() => ("integrated", None),
+                Some(Ok(())) => ("open", None),
+            }
+        };
+        Status { status, why, decision }
+    }
+
+    fn proposal_row(&self, id: &ContributionId, st: &Status) -> Value {
+        let named = self.s.lines.proposal_named(id);
+        let author = self.g.get(id).map(|c| c.author());
+        json!({"proposal": id, "status": st.status, "why": st.why, "decision": st.decision,
+               "author": author.map(|a| a.to_string()), "author_name": author.map(|a| self.names.display(&a)),
+               "line": named.map(|p| p.line), "base": named.map(|p| p.base),
+               "manifest": named.map(|p| p.manifest.to_string()), "change": named.map(|p| p.change.to_string()),
+               "summary": named.map(|p| p.summary.clone())})
+    }
+
+    /// `/api/weave/proposals/<line>?status&after&limit`: the line's proposals, ascending by id, each with its
+    /// status; `status` filters (default `all`). No change is computed for a list (section 4).
+    fn proposals(&self, given: &str, p: &Paging, query: &HashMap<String, String>) -> Result<Value, Fail> {
+        let line = self.line_of(given)?;
+        let want = query.get("status").map_or("all", String::as_str);
+        if !["open", "integrated", "invalid", "retracted", "all"].contains(&want) {
+            return fail(400, "status is one of open, integrated, invalid, retracted, all");
+        }
+        let integrations = self.integrations(&line);
+        let empty = Vec::new();
+        let rows: Vec<(ContributionId, Status)> = self
+            .s
+            .proposals
+            .get(&line)
+            .unwrap_or(&empty)
+            .iter()
+            .map(|id| (*id, self.status(id, &integrations)))
+            .filter(|(_, st)| want == "all" || st.status == want)
+            .collect();
+        let mut v =
+            listed("proposals", &rows, |(id, _)| id.to_hex(), |(id, st)| self.proposal_row(id, st), ROW_BYTES, p)?;
+        v["line"] = json!(line);
+        v["status"] = json!(want);
+        Ok(v)
+    }
+
+    /// `/api/weave/proposal/<id>?list&after&limit&path`: the proposal, its status and integrating decision,
+    /// its change, reviews, the objections a decision using it unchanged would answer, and for an open one
+    /// on a line with one head and one current policy the conflict preview (section 4).
+    fn proposal(&self, given: &str, p: &Paging, query: &HashMap<String, String>) -> Result<Value, Fail> {
+        p.check(&["change", "reviews", "objections", "conflicts", "resolutions"], query)?;
+        if query.contains_key("path") && p.list != Some("resolutions") {
+            return fail(400, "path names a conflict's resolutions: it goes with list=resolutions");
+        }
+        let id = resolve(self.g, given)?;
+        let lines = &self.s.lines;
+        let Some(named) = lines.proposal_named(&id) else {
+            let kind = self.g.get(&id).map(kind_of).unwrap_or_default();
+            return fail(404, format!("{} is a {kind}, not a proposal", id.short()));
+        };
+        let line = named.line;
+        let st = self.status(&id, &self.integrations(&line));
+        // The change from its base's tree to its own, when both are held.
+        let base_tree = lines.decision(&named.base).and_then(|d| self.s.index.manifest(&d.decision.manifest));
+        let own_tree = self.s.index.manifest(&named.manifest);
+        let change = match (base_tree, own_tree) {
+            (Some((_, b)), Some((_, m))) => Some(Change::between(b, m)),
+            _ => None,
+        };
+        let entries = change.as_ref().map_or(&[][..], Change::entries);
+        let change_row = |e: &bracken_tree::format::ChangeEntry| json!({"path": e.path, "before": e.before.map(file_value_json), "after": e.after.map(file_value_json)});
+        let reviews = self.s.reviews.of_proposal(lines, &id);
+        let review_row = |(r, t): &(&bracken_tree::ground::Review, Target)| review_json(r, t, self.names);
+        // Only a page that shows the preview works out what it merges (the line's heads are a derived read).
+        let preview = || if st.status == "open" { self.preview_target(&id) } else { Err("it isn't open".into()) };
+        match p.list {
+            Some("change") => return listed("change", entries, |e| e.path.clone(), change_row, WHOLE, p),
+            Some("reviews") => return listed("reviews", &reviews, |(r, _)| r.id.to_hex(), review_row, ROW_BYTES, p),
+            Some("objections") => {
+                let objections = self.proposal_objections(&id)?;
+                let items = objections.as_array().cloned().unwrap_or_default();
+                return listed(
+                    "objections",
+                    &items,
+                    |o| o["objection"].as_str().unwrap_or_default().to_owned(),
+                    Value::clone,
+                    ROW_BYTES,
+                    p,
+                );
+            }
+            Some("conflicts") => {
+                let target = preview().map_err(|why| (404, format!("no conflict preview: {why}")))?;
+                // A page is at most 20 conflicts, and 20 when no limit is given.
+                let limit = if query.contains_key("limit") { p.limit } else { PREVIEW_CONFLICTS };
+                if limit > PREVIEW_CONFLICTS {
+                    return fail(400, format!("a conflict preview's page is at most {PREVIEW_CONFLICTS} conflicts"));
+                }
+                let mut v = self.preview(&id, &target, p.after, limit)?;
+                v["list"] = json!("conflicts");
+                return Ok(v);
+            }
+            Some("resolutions") => {
+                let target = preview().map_err(|why| (404, format!("no conflict preview: {why}")))?;
+                let Some(path) = query.get("path") else {
+                    return fail(400, "name the conflict with path");
+                };
+                let key = target.key(path).ok_or_else(|| (404, "no conflict at that path".to_owned()))?;
+                let offered = self.s.index.resolutions().for_key(&key);
+                let row = |(rid, r): &(ContributionId, bracken_tree::format::Resolution)| {
+                    self.resolution_json(rid, r, &target.integrators)
+                };
+                let mut v = listed("resolutions", offered, |(rid, _)| rid.to_hex(), row, ROW_BYTES, p)?;
+                v["path"] = json!(path);
+                return Ok(v);
+            }
+            _ => {}
+        }
+        let objections = self.proposal_objections(&id)?;
+        let objection_items = objections.as_array().cloned().unwrap_or_default();
+        let (preview, preview_why) = match preview() {
+            Ok(target) => (self.preview(&id, &target, None, PREVIEW_CONFLICTS)?, Value::Null),
+            Err(why) => (Value::Null, json!(why)),
+        };
+        let integrating =
+            st.decision.and_then(|d| lines.decision(&d)).map(|d| json!({"decision": d.id, "note": d.decision.note}));
+        let mut v = self.proposal_row(&id, &st);
+        let fields = json!({
+            "integrated_by": integrating,
+            "change_held": change.is_some(),
+            "change": embedded(entries, WHOLE, change_row),
+            "reviews": embedded(&reviews, ROW_BYTES, review_row),
+            "objections": if objections.is_null() { Value::Null } else { embedded(&objection_items, ROW_BYTES, Value::clone) },
+            "preview": preview,
+            "preview_why": preview_why,
+        });
+        if let (Value::Object(into), Value::Object(from)) = (&mut v, fields) {
+            into.extend(from);
+        }
+        Ok(v)
+    }
+
+    /// The objections a decision using the proposal unchanged would have to answer, as `open_json` rows;
+    /// null when its line has no current policy. Kept per proposal: it walks the line's ancestry.
+    fn proposal_objections(&self, id: &ContributionId) -> Result<Value, Fail> {
+        self.derived(format!("proposal objections {id}"), || {
+            match self.s.lines.proposal_objections(self.g, &self.s.index, id) {
+                Some(list) => Value::Array(list.iter().map(|o| crate::weave::open_json(o, self.names)).collect()),
+                None => Value::Null,
+            }
+        })
+    }
+
+    /// What a preview merges, or why there is none: an open proposal on a line with one head and one current
+    /// policy, its base held (section 4, *Conflict preview*, 1).
+    fn preview_target(&self, id: &ContributionId) -> Result<PreviewTarget<'_>, String> {
+        let lines = &self.s.lines;
+        let record = lines.proposal(id).ok_or("it isn't a valid proposal")?;
+        let line = record.proposal.line;
+        let current = lines.current_versions(&line);
+        let [policy] = current.as_slice() else {
+            return Err("the line's policy has diverged, so integrate would refuse".into());
+        };
+        let integrators = lines.version(policy).map(|v| v.policy.integrators.clone()).unwrap_or_default();
+        let state = self.line_state(&line).map_err(|(_, why)| why)?;
+        let heads = state["heads"].as_array().cloned().unwrap_or_default();
+        let [head] = heads.as_slice() else {
+            return Err(format!("the line has {} heads, so integrate would refuse", heads.len()));
+        };
+        let head: ContributionId =
+            head["decision"].as_str().and_then(|h| h.parse().ok()).ok_or("the line's head isn't readable")?;
+        let tree = |d: &ContributionId| {
+            lines.decision(d).and_then(|r| self.s.index.manifest(&r.decision.manifest)).map(|(_, m)| m)
+        };
+        let base = tree(&record.proposal.base).ok_or("its base's tree isn't held")?;
+        let into = tree(&head).ok_or("the line head's tree isn't held")?;
+        let (_, from) = self.s.index.manifest(&record.proposal.manifest).ok_or("its tree isn't held")?;
+        Ok(PreviewTarget { head, integrators, base, into, from })
+    }
+
+    fn resolution_json(
+        &self,
+        id: &ContributionId,
+        r: &bracken_tree::format::Resolution,
+        integrators: &[AgentId],
+    ) -> Value {
+        let author = self.g.get(id).map(|c| c.author());
+        json!({"resolution": id, "author": author.map(|a| a.to_string()),
+               "author_name": author.map(|a| self.names.display(&a)),
+               "integrator": author.is_some_and(|a| integrators.contains(&a)),
+               "result": r.result.map(file_value_json)})
+    }
+
+    /// One page of the conflict preview: the three-way merge's conflicts after `after`, at most `limit`, and
+    /// fewer if their sides would pass [`PREVIEW_BYTES`]: the page stops before the conflict that would, and
+    /// the next page starts from it. Kept per proposal, head and page; built in one of the preview slots.
+    fn preview(
+        &self,
+        id: &ContributionId,
+        t: &PreviewTarget,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Value, Fail> {
+        let key = format!("preview {id} {} {} {limit}", t.head, after.map(encode_key).unwrap_or_default());
+        // A kept page costs no merge.
+        if let Some(v) = self.s.derived.lock().unwrap_or_else(|p| p.into_inner()).get(&key) {
+            return Ok(v);
+        }
+        let merged = three_way(t.base, t.into, t.from);
+        let start = match after {
+            None => 0,
+            Some(a) => match merged.conflicts.iter().position(|c| c.key.path == a) {
+                Some(at) => at + 1,
+                None => return fail(400, format!("after names no conflict of this preview: {a:?}")),
+            },
+        };
+        self.derived_in(&self.slots.previews, key, || {
+            pause(&PREVIEW_DELAY, "BRACKEN_VIEW_PREVIEW_DELAY_MS");
+            let mut rows = Vec::new();
+            let mut spent: u64 = 0;
+            let mut next = start;
+            while next < merged.conflicts.len() && rows.len() < limit {
+                let c = &merged.conflicts[next];
+                // What its sides cost is known from their sizes, before any is read.
+                let cost = self.read_cost(c);
+                if !rows.is_empty() && spent + cost > PREVIEW_BYTES {
+                    break;
+                }
+                spent += cost;
+                rows.push(self.conflict_json(c, &t.integrators));
+                next += 1;
+            }
+            json!({"head": t.head, "items": rows, "total": merged.conflicts.len(),
+                   "more": next < merged.conflicts.len(), "settled": merged.settled.len()})
+        })
+    }
+
+    /// The held sizes of a conflict's sides, and whether one is over the view's cap.
+    fn side_sizes(&self, c: &Conflict) -> (Vec<u64>, bool) {
+        let sizes: Vec<u64> =
+            [c.key.base, c.ours, c.theirs].iter().flatten().filter_map(|v| self.s.index.file_size(&v.hash)).collect();
+        let over = sizes.iter().any(|s| *s > FILE_TEXT as u64);
+        (sizes, over)
+    }
+
+    /// The bytes [`Ctx::conflict_json`] reads of a conflict's sides: none over the view's cap, and none unless
+    /// all three are there and none is a symlink, as `text_conflicts` reads them.
+    fn read_cost(&self, c: &Conflict) -> u64 {
+        let (sizes, over) = self.side_sizes(c);
+        let read = [c.key.base, c.ours, c.theirs].iter().all(|v| v.is_some_and(|v| v.mode != Mode::Symlink));
+        if over || !read { 0 } else { sizes.iter().sum() }
+    }
+
+    /// A conflict's row. Over the view's cap, a side is named, not read.
+    fn conflict_json(&self, c: &Conflict, integrators: &[AgentId]) -> Value {
+        let ix = &self.s.index;
+        let (lines, ranges) = if self.side_sizes(c).1 {
+            ("over_view_cap", Vec::new())
+        } else {
+            match text_conflicts(c, |h| ix.file(self.g, h)) {
+                None => ("not_text", Vec::new()),
+                Some(r) if r.is_empty() => {
+                    let modes = match (c.key.base, c.ours, c.theirs) {
+                        (Some(b), Some(x), Some(y)) => merge_mode(b.mode, x.mode, y.mode).is_some(),
+                        _ => true,
+                    };
+                    (if modes { "clean" } else { "mode" }, Vec::new())
+                }
+                Some(r) => ("conflicts", r),
+            }
+        };
+        let offered = ix.resolutions().for_key(&c.key);
+        let rows: Vec<Value> = offered
+            .iter()
+            .take(PREVIEW_RESOLUTIONS)
+            .map(|(rid, r)| self.resolution_json(rid, r, integrators))
+            .collect();
+        // What integrate would apply on its own: an integrator's resolution, the smallest id first.
+        let settled_by = offered
+            .iter()
+            .find(|(rid, _)| self.g.get(rid).is_some_and(|x| integrators.contains(&x.author())))
+            .map(|(rid, _)| *rid);
+        let shown: Vec<Value> = ranges.iter().take(PREVIEW_RANGES).map(|(a, b)| json!([a, b])).collect();
+        let row = json!({"path": c.key.path, "base": c.key.base.map(file_value_json),
+                         "into": c.ours.map(file_value_json), "from": c.theirs.map(file_value_json),
+                         "lines": lines, "ranges": shown, "ranges_total": ranges.len(),
+                         "resolutions": rows, "resolutions_total": offered.len(), "settled_by": settled_by});
+        row
+    }
+}
+
+/// The three trees a preview merges, the line head it was computed against, and the line's integrators.
+struct PreviewTarget<'a> {
+    head: ContributionId,
+    integrators: Vec<AgentId>,
+    base: &'a Manifest,
+    into: &'a Manifest,
+    from: &'a Manifest,
+}
+
+impl PreviewTarget<'_> {
+    /// The key of the conflict at `path`, if the merge has one there.
+    fn key(&self, path: &str) -> Option<Key> {
+        three_way(self.base, self.into, self.from).conflicts.into_iter().find(|c| c.key.path == path).map(|c| c.key)
+    }
+}
+
+/// A cursor as part of a cache key: its bytes in hex, so no path can make two keys collide.
+fn encode_key(s: &str) -> String {
+    s.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Test hooks: how long a unified diff, and a conflict preview's page, waits inside its slot, so a test can
+/// hold the slots: `BRACKEN_VIEW_DIFF_DELAY_MS` and `BRACKEN_VIEW_PREVIEW_DELAY_MS`, each at most 2 s. Unset,
+/// nothing sleeps.
+static DIFF_DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+static PREVIEW_DELAY: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+
+fn pause(cell: &'static std::sync::OnceLock<std::time::Duration>, var: &str) {
+    let delay = *cell.get_or_init(|| {
+        let ms = std::env::var(var).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
         std::time::Duration::from_millis(ms.min(2_000))
-    })
+    });
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
 }
 
 /// A child of a tree's directory: a directory, with the number of files below it, or a file.
