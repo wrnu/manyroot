@@ -15,6 +15,8 @@
   const $ = (id) => document.getElementById(id);
   const ID = /^[0-9a-f]{64}$/;
   const PAGE = 50;
+  /** The statuses a proposals list filters by. */
+  const STATUSES = ["all", "open", "integrated", "invalid", "retracted"];
 
   // ---- Text ----
 
@@ -69,7 +71,12 @@
   function route() {
     const parts = location.hash.slice(1).split("/");
     const [name, id] = [parts[0], (parts[1] || "").toLowerCase()];
-    if ((name === "line" || name === "decision") && ID.test(id)) return { name, id };
+    if ((name === "line" || name === "decision" || name === "proposal") && ID.test(id)) return { name, id };
+    // `#proposals/<line>[/<status>]`: the status one of a fixed few, or all.
+    if (name === "proposals" && ID.test(id)) {
+      const status = parts[2] || "all";
+      if (STATUSES.includes(status)) return { name, id, status };
+    }
     if ((name === "tree" || name === "file") && RECORD.test(id)) {
       let path = "";
       try {
@@ -328,6 +335,7 @@
       ["forked", l.forked ? "yes: a decision listing every head settles it" : "no"],
       ["green", stateWord(l.green)],
       ["open objections", l.open_objections === null ? null : String(l.open_objections)],
+      ["proposals", go("proposals", l.line, "every proposal to this line")],
     ]));
     // Each head's counted checks: a forked line has several (independent note 1).
     for (const head of l.green ? l.green.heads : []) {
@@ -350,6 +358,8 @@
     return out;
   }
 
+  const reviewRow = (r) => h("li", { class: r.kind === "objection" ? "failing" : "green" }, h("span", { class: "sc" }, r.kind), h("span", { class: "muted" }, shown(`by ${who(r.author, r.author_name)}`)), cutMark(r), h("span", { class: "note" }, shown(r.note)));
+
   async function decision(id) {
     const d = await api(`/api/weave/decision/${id}`);
     $("data-note").textContent = "";
@@ -362,7 +372,7 @@
       ["parents", d.parents.length ? h("span", {}, d.parents.map((p) => go("decision", p)), " ", d.compared_with ? goDiff(d.compared_with, d.decision, "", "what changed") : null) : null],
       ["policy in force", d.policy ? h("span", { class: "id" }, short(d.policy)) : null],
       ["git", d.source ? h("span", { class: "id" }, shown(d.source.git)) : null],
-      ["proposals", d.proposals.length ? h("span", { class: "id" }, shown(d.proposals.map(short).join(" "))) : null],
+      ["proposals", d.proposals.length ? h("span", {}, d.proposals.map((p) => go("proposal", p))) : null],
       ["resolutions", d.resolutions.length ? h("span", { class: "id" }, shown(d.resolutions.map(short).join(" "))) : null],
     ]));
     if (d.cut) out.push(h("p", { class: "muted" }, "Some text on this page is shortened to 64 KiB; the CLI has it in full."));
@@ -381,8 +391,87 @@
       for (const a of d.answers) ul.append(h("li", {}, h("span", { class: "id" }, short(a.objection)), h("span", { class: "sc" }, shown(a.disposition)), h("span", { class: "note" }, shown(a.reason))));
       out.push(...section("Objections it answers", ul));
     }
-    const reviewRow = (r) => h("li", { class: r.kind === "objection" ? "failing" : "green" }, h("span", { class: "sc" }, r.kind), h("span", { class: "muted" }, shown(`by ${who(r.author, r.author_name)}`)), cutMark(r), h("span", { class: "note" }, shown(r.note)));
     out.push(...section("Reviews", pagedList(d.reviews, (r) => r.review, reviewRow, (after) => api(`/api/weave/decision/${id}?${query({ list: "reviews", after, limit: PAGE })}`))));
+    return out;
+  }
+
+  // ---- Proposals ----
+
+  async function proposals(lineId, status) {
+    const q = (extra) => query({ status: status === "all" ? undefined : status, ...extra });
+    const list = await api(`/api/weave/proposals/${lineId}?${q({ limit: PAGE })}`);
+    const out = [h("h2", {}, "Proposals"), h("p", { class: "lede" }, "To ", go("line", lineId, "the line"), ", by id.")];
+    const filter = (s) => (s === status ? h("span", { class: "sc" }, s) : h("button", { type: "button", class: "go", on: { click: () => { location.hash = `proposals/${lineId}/${s}`; } } }, s));
+    out.push(h("p", { class: "crumbs" }, STATUSES.flatMap((st, i) => (i ? [h("span", { class: "muted" }, " · "), filter(st)] : [filter(st)]))));
+    const row = (p) => h("li", { class: p.status === "open" ? "green" : p.status === "invalid" ? "failing" : "" },
+      go("proposal", p.proposal), h("span", { class: "sc" }, p.status),
+      h("span", { class: "muted" }, shown(`by ${who(p.author, p.author_name)}`)),
+      p.summary ? h("span", { class: "note" }, shown(firstLine(p.summary, 200))) : null,
+      p.why ? h("span", { class: "muted" }, shown(p.why)) : null, cutMark(p));
+    const title = list.total === 1 ? "1 proposal" : `${list.total} proposals`;
+    out.push(...section(status === "all" ? title : `${title}, ${status}`, pagedList(list, (p) => p.proposal, row, (after) => api(`/api/weave/proposals/${lineId}?${q({ after, limit: PAGE })}`))));
+    return out;
+  }
+
+  /** What the preview says of a conflict's lines (section 4, *Conflict preview*). */
+  function linesText(c) {
+    const ranges = c.ranges.map(([a, b]) => (a === b ? `${a}` : `${a}–${b}`)).join(", ");
+    const more = c.ranges_total > c.ranges.length ? ` and ${c.ranges_total - c.ranges.length} more` : "";
+    return {
+      clean: "its lines merge cleanly",
+      conflicts: `its lines conflict at base lines ${ranges}${more}`,
+      mode: "its lines merge, but its modes don't",
+      not_text: "no line merge: a side isn't text, is absent, is a symlink, isn't held, or differs in too many lines",
+      over_view_cap: "a side is over the view's 1 MiB cap, so the view didn't compute it (integrate merges sides up to 8 MiB)",
+    }[c.lines] || c.lines;
+  }
+
+  async function proposal(id) {
+    const p = await api(`/api/weave/proposal/${id}`);
+    const more = (list, extra) => (after) => api(`/api/weave/proposal/${id}?${query({ list, after, limit: PAGE, ...extra })}`);
+    const out = [h("h2", {}, "Proposal ", h("span", { class: "id" }, short(p.proposal))),
+      h("p", { class: "lede" }, "to ", go("line", p.line, "its line"), shown(` by ${who(p.author, p.author_name)}`))];
+    out.push(facts([
+      ["status", h("span", { class: p.status === "invalid" ? "fail" : "" }, shown(p.why ? `${p.status}: ${p.why}` : p.status))],
+      ["base", go("decision", p.base)],
+      ["tree", goPath("tree", p.proposal, "", "browse its files")],
+      ["integrated by", p.integrated_by ? go("decision", p.integrated_by.decision) : null],
+      ["on the line", go("proposals", p.line, "every proposal to it")],
+    ]));
+    if (p.cut) out.push(h("p", { class: "muted" }, "Some text on this page is shortened to 64 KiB; the CLI has it in full."));
+    if (p.summary) out.push(...section("Its summary", h("p", { class: "text" }, shown(p.summary))));
+    if (p.integrated_by && p.integrated_by.note) out.push(...section("The integrator's note", h("p", { class: "text" }, shown(p.integrated_by.note))));
+    const changeRow = (e) => h("li", {}, goDiff(p.base, p.proposal, e.path, e.path), h("span", { class: "muted" }, shown(`${valueText(e.before)} → ${valueText(e.after)}`)));
+    out.push(...section("What it changes", p.change_held
+      ? h("div", {}, goDiff(p.base, p.proposal, "", "its diff against its base"), pagedList(p.change, (e) => e.path, changeRow, more("change")))
+      : h("p", { class: "muted" }, "Its base's tree or its own isn't held here, so its change can't be listed.")));
+    out.push(...section("Reviews", pagedList(p.reviews, (r) => r.review, reviewRow, more("reviews"))));
+    const objectionRow = (o) => h("li", { class: "failing" }, h("span", { class: "id" }, short(o.objection)), h("span", { class: "sc" }, shown(o.basis.kind)),
+      h("span", { class: "muted" }, shown(`by ${who(o.author, o.author_name)}; answered by ${o.allowed.join(", ") || "nothing"}`)), cutMark(o));
+    out.push(...section("Objections a decision using it would answer", p.objections
+      ? pagedList(p.objections, (o) => o.objection, objectionRow, more("objections"))
+      : h("p", { class: "muted" }, "Its line has no single current policy, so none is listed.")));
+    if (!p.preview) {
+      out.push(...section("Conflict preview", h("p", { class: "muted" }, shown(`No preview: ${p.preview_why}.`))));
+      return out;
+    }
+    const v = p.preview;
+    const resolutionRow = (r) => h("li", { class: r.integrator ? "green" : "" }, h("span", { class: "id" }, short(r.resolution)),
+      h("span", { class: "muted" }, shown(`by ${who(r.author, r.author_name)}${r.integrator ? ", an integrator of the line" : ""}`)),
+      h("span", {}, shown(r.result ? `takes ${valueText(r.result)}` : "deletes it")), cutMark(r));
+    const conflictRow = (c) => {
+      const offered = { items: c.resolutions, total: c.resolutions_total, more: c.resolutions_total > c.resolutions.length };
+      return h("li", { class: c.lines === "clean" ? "green" : c.lines === "conflicts" ? "failing" : "" },
+        goDiff(p.base, p.proposal, c.path, c.path), h("span", { class: "sc" }, c.lines.replace(/_/g, " ")),
+        h("p", { class: "muted" }, shown(`${linesText(c)}. Base ${valueText(c.base)}, the line's ${valueText(c.into)}, the proposal's ${valueText(c.from)}.`)),
+        c.settled_by ? h("p", {}, "Integrate would try ", h("span", { class: "id" }, short(c.settled_by)), ", an integrator's resolution. ",
+          c.settled_by_held === false ? h("span", { class: "fail" }, "Its result isn't held here, so integrate would refuse.") : "It can still refuse if the merged paths collide.") : null,
+        c.resolutions_total ? pagedList(offered, (r) => r.resolution, resolutionRow, more("resolutions", { path: c.path })) : h("p", { class: "muted" }, "No resolution offered."),
+        cutMark(c));
+    };
+    out.push(...section("Conflict preview",
+      h("p", { class: "lede" }, "What integrating it onto the line's head ", go("decision", v.head), shown(` would meet: ${v.total === 1 ? "1 conflict" : `${v.total} conflicts`}, and ${v.settled} files merged on their own. Nothing is written.`)),
+      pagedList(v, (c) => c.path, conflictRow, (after) => api(`/api/weave/proposal/${id}?${query({ list: "conflicts", after })}`))));
     return out;
   }
 
@@ -567,6 +656,8 @@
         tree: () => tree(r.id, r.path),
         file: () => file(r.id, r.path),
         history: () => history(r.id, r.path),
+        proposals: () => proposals(r.id, r.status),
+        proposal: () => proposal(r.id),
         diff: () => (r.path ? diffFile(r.id, r.other, r.path) : diffList(r.id, r.other)),
       };
       body = await (pages[r.name] || home)();

@@ -13,7 +13,8 @@ use std::time::{Duration, Instant};
 
 use bracken_tree::ContentHash;
 use bracken_tree::format::{
-    Entry, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE, Manifest, Mode, Record, VERSION,
+    DECISION_MEDIA_TYPE, Decision, Entry, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE,
+    Manifest, Mode, PROPOSAL_MEDIA_TYPE, Proposal, Record, VERSION,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1230,4 +1231,554 @@ fn the_diff_delay_is_capped() {
     let took = started.elapsed();
     assert!(took >= Duration::from_millis(1_900), "the delay applies: {took:?}");
     assert!(took < Duration::from_secs(10), "the delay isn't capped: {took:?}");
+}
+
+// ---- Proposals and the conflict preview (PR (e)) ----
+
+impl Weave {
+    /// Commits the work tree as it is, on the current branch.
+    fn commit(&self, message: &str) {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-q", "-m", message]);
+    }
+
+    /// Writes `files` into the work tree.
+    fn write(&self, files: &[(&str, &[u8])]) {
+        for (path, bytes) in files {
+            std::fs::write(self.repo.join(path), bytes).expect("write");
+        }
+    }
+
+    /// A proposal of git branch `branch`'s tree against `base`, signed `AS`.
+    fn propose(&self, branch: &str, base: &str, summary: &str) -> String {
+        self.id_of(
+            &["weave", "propose", "--from-git", branch, "--base", base, "--summary", summary, "--as", AS, "--json"],
+            "proposal",
+        )
+    }
+
+    /// An artifact of `bytes` with `media_type`, signed `AS`: its id.
+    fn artifact(&self, name: &str, bytes: &[u8], media_type: &str) -> String {
+        let file = self.tmp.path().join(name);
+        std::fs::write(&file, bytes).expect("writes the artifact");
+        let out = self.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", media_type, "--as", AS]);
+        out.trim().strip_prefix("artifact ").expect("labelled").to_owned()
+    }
+}
+
+fn exec(w: &Weave, path: &str) {
+    std::fs::set_permissions(w.repo.join(path), std::os::unix::fs::PermissionsExt::from_mode(0o755)).expect("chmod");
+}
+
+/// A Weave Ground with, on main: an open proposal `open` from the first decision, `base`, whose preview
+/// against the head has one conflict of each kind; an integrated one; a retracted one; and an invalid one.
+struct Proposals {
+    w: Weave,
+    line: String,
+    base: String,
+    head: String,
+    open: String,
+    integrated: String,
+    retracted: String,
+    invalid: String,
+}
+
+fn with_proposals() -> Proposals {
+    let w = Weave::new();
+    let base = w.decide(
+        &[("f.txt", "1\n2\n3\n"), ("h.txt", "1\n2\n3\n"), ("m.sh", "echo\n"), ("bin.dat", "a\n"), ("big.txt", "b\n")],
+        "base",
+    );
+    let line = w.main_line();
+    // The proposal: f.txt and h.txt each change one line, m.sh only its mode, bin.dat becomes binary and
+    // big.txt over the view's 1 MiB cap.
+    w.git(&["checkout", "-q", "-b", "p"]);
+    let big = vec![b'p'; (1 << 20) + 1];
+    w.write(&[("f.txt", b"x\n2\n3\n"), ("h.txt", b"1\n2\nz\n"), ("bin.dat", b"\x00p"), ("big.txt", &big)]);
+    exec(&w, "m.sh");
+    w.commit("p");
+    let open = w.propose("p", &base, "the open one");
+    // The head: each of those files changes another way.
+    w.git(&["checkout", "-q", "main"]);
+    w.write(&[
+        ("f.txt", b"y\n2\n3\n"),
+        ("h.txt", b"q\n2\n3\n"),
+        ("m.sh", b"echo hi\n"),
+        ("bin.dat", b"\x00h"),
+        ("big.txt", b"h\n"),
+    ]);
+    let after_base = w.decide(&[], "head");
+    // Integrated: a proposal from the head, integrated by name.
+    w.git(&["checkout", "-q", "-b", "q"]);
+    w.write(&[("q.txt", b"q\n")]);
+    w.commit("q");
+    let integrated = w.propose("q", &after_base, "integrated");
+    w.git(&["checkout", "-q", "main"]);
+    let head = w.id_of(
+        &["weave", "integrate", "--proposals", &integrated, "--as", AS, "--note", "takes q", "--json"],
+        "decision",
+    );
+    // Retracted.
+    w.git(&["checkout", "-q", "-b", "r"]);
+    w.write(&[("r.txt", b"r\n")]);
+    w.commit("r");
+    let retracted = w.propose("r", &head, "retracted");
+    w.ok(&["retract", &retracted, "--as", AS]);
+    w.git(&["checkout", "-q", "main"]);
+    // Invalid: a change that isn't its base's to its tree.
+    let named = w.json(&["weave", "head", "--json"]);
+    let manifest: ContentHash = named["heads"][0]["manifest"].as_str().expect("a manifest").parse().expect("a hash");
+    let bad = Proposal {
+        v: VERSION,
+        line: line.parse().expect("an id"),
+        base: head.parse().expect("an id"),
+        manifest,
+        change: ContentHash::of(b"not this change"),
+        summary: "invalid".into(),
+    };
+    let invalid = w.artifact("bad.cbor", &bad.encode(), PROPOSAL_MEDIA_TYPE);
+    Proposals { w, line, base, head, open, integrated, retracted, invalid }
+}
+
+#[test]
+fn proposals_list_each_status_and_filter_by_it() {
+    let p = with_proposals();
+    let v = view(&p.w.ground);
+    let all = v.api(&format!("/api/weave/proposals/{}", p.line));
+    let status: BTreeMap<String, String> = all["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|r| (r["proposal"].as_str().expect("id").to_owned(), r["status"].as_str().expect("status").to_owned()))
+        .collect();
+    let want: BTreeMap<String, String> =
+        [(&p.open, "open"), (&p.integrated, "integrated"), (&p.retracted, "retracted"), (&p.invalid, "invalid")]
+            .into_iter()
+            .map(|(id, s)| (id.clone(), s.to_owned()))
+            .collect();
+    assert_eq!(status, want);
+    let ids: Vec<&str> =
+        all["items"].as_array().expect("items").iter().filter_map(|r| r["proposal"].as_str()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_unstable();
+    assert_eq!(ids, sorted, "ascending by id");
+    let row = |id: &str| {
+        all["items"].as_array().expect("items").iter().find(|r| r["proposal"] == id).expect("listed").clone()
+    };
+    assert_eq!(row(&p.integrated)["decision"], p.head.as_str());
+    assert!(row(&p.invalid)["why"].as_str().expect("why").contains("isn't the change"));
+    assert_eq!(row(&p.open)["summary"], "the open one");
+    for (status, id) in
+        [("open", &p.open), ("integrated", &p.integrated), ("retracted", &p.retracted), ("invalid", &p.invalid)]
+    {
+        let one = v.api(&format!("/api/weave/proposals/{}?status={status}", p.line));
+        assert_eq!(one["total"], 1, "{status}: {one}");
+        assert_eq!(one["items"][0]["proposal"], id.as_str());
+    }
+    let page = v.api(&format!("/api/weave/proposals/{}?after={}&limit=1", p.line, ids[0]));
+    assert_eq!((page["items"][0]["proposal"].as_str(), page["more"].as_bool()), (Some(ids[1]), Some(true)));
+    v.refused(&format!("/api/weave/proposals/{}?status=closed", p.line), 400);
+    v.refused(&format!("/api/weave/proposals/{}", p.open), 404);
+    // An integrated one's page names the decision and its note; only an open one has a preview.
+    let i = v.api(&format!("/api/weave/proposal/{}", p.integrated));
+    assert_eq!(i["integrated_by"]["note"], "takes q");
+    assert!(i["preview"].is_null() && i["preview_why"].as_str().expect("why").contains("isn't open"));
+    assert_eq!(i["change"]["items"][0]["path"], "q.txt");
+    assert!(i["change"]["items"][0]["before"].is_null());
+    v.refused(&format!("/api/weave/proposal/{}", p.base), 404);
+    for id in [&p.open, &p.retracted, &p.invalid] {
+        assert_eq!(v.api(&format!("/api/weave/record/{id}"))["page"], "proposal", "{id}");
+    }
+}
+
+#[test]
+fn an_open_proposals_preview_names_each_conflict_as_integrate_would_meet_it() {
+    let p = with_proposals();
+    // A review of each kind: an objection, which a decision using it would answer, and an agreement.
+    let claim = p.w.id_of(&["claim", "f.txt is wrong", "--as", AS, "--json"], "id");
+    let objection = p.w.id_of(&["relate", &claim, "contradicts", &p.open, "--note", "no", "--as", AS, "--json"], "id");
+    let agreement = p.w.id_of(&["relate", &claim, "supports", &p.open, "--note", "yes", "--as", AS, "--json"], "id");
+    p.w.ok(&["log", "--limit", "1"]); // so the snapshot is up to date before the view starts
+    let before = files(&p.w.ground);
+    let v = view(&p.w.ground);
+    let o = v.api(&format!("/api/weave/proposal/{}", p.open));
+    let reviews: Vec<(&str, &str)> = o["reviews"]["items"]
+        .as_array()
+        .expect("reviews")
+        .iter()
+        .map(|r| (r["review"].as_str().expect("id"), r["kind"].as_str().expect("kind")))
+        .collect();
+    let mut want = vec![(objection.as_str(), "objection"), (agreement.as_str(), "agreement")];
+    want.sort_unstable();
+    assert_eq!(reviews, want);
+    assert_eq!(o["objections"]["items"][0]["objection"], objection.as_str(), "{}", o["objections"]);
+    assert_eq!(o["objections"]["items"][0]["basis"]["kind"], "discussion");
+    for list in ["change", "reviews", "objections", "conflicts"] {
+        let page = v.api(&format!("/api/weave/proposal/{}?list={list}&limit=2", p.open));
+        assert_eq!(page["list"], list);
+        assert_eq!(
+            page["items"].as_array().map(Vec::len),
+            Some(if list == "objections" { 1 } else { 2 }),
+            "{list}: {page}"
+        );
+    }
+    assert_eq!(o["status"], "open");
+    assert_eq!(o["change"]["total"], 5, "{}", o["change"]);
+    let preview = &o["preview"];
+    assert_eq!(preview["head"], p.head.as_str());
+    let lines: Vec<(&str, &str)> = preview["items"]
+        .as_array()
+        .expect("conflicts")
+        .iter()
+        .map(|c| (c["path"].as_str().expect("path"), c["lines"].as_str().expect("lines")))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("big.txt", "over_view_cap"),
+            ("bin.dat", "not_text"),
+            ("f.txt", "conflicts"),
+            ("h.txt", "clean"),
+            ("m.sh", "clean")
+        ],
+        "a mode-only change against a change of text merges line by line"
+    );
+    let f = &preview["items"][2];
+    assert_eq!(f["ranges"], serde_json::json!([[1, 1]]));
+    assert_eq!(f["into"]["mode"], "100644");
+    let m = &preview["items"][4];
+    assert_eq!((m["base"]["mode"].as_str(), m["from"]["mode"].as_str()), (Some("100644"), Some("100755")));
+    assert_eq!(preview["total"], 5);
+    assert_eq!(preview["more"], false);
+    v.request(&format!("/api/weave/proposals/{}", p.line));
+    v.request(&format!("/api/weave/proposal/{}?list=resolutions&path=f.txt", p.open));
+    std::thread::sleep(Duration::from_millis(1_500)); // a watcher poll or so
+    drop(v);
+    assert_eq!(files(&p.w.ground), before, "the view changed a file under the Ground");
+}
+
+/// The resolutions offered for a conflict's key: the first 10 in the preview, the rest paged by path, each
+/// marked if an integrator of the line wrote it; the first an integrator wrote is what integrate applies.
+#[test]
+fn a_conflicts_resolutions_are_marked_and_paged() {
+    let p = with_proposals();
+    p.w.ok(&["id", "new", "alice"]);
+    // `weave resolve` settles a merge's conflicts in path order: big.txt and bin.dat come first.
+    for path in ["big.txt", "bin.dat"] {
+        p.w.ok(&["weave", "resolve", "--proposals", &p.open, "--take", "into", path, "--as", AS]);
+    }
+    let mut by_integrator = Vec::new();
+    for _ in 0..10 {
+        by_integrator.push(p.w.id_of(
+            &["weave", "resolve", "--proposals", &p.open, "--take", "into", "f.txt", "--as", AS, "--json"],
+            "resolution",
+        ));
+    }
+    let by_alice = p.w.id_of(
+        &["weave", "resolve", "--proposals", &p.open, "--take", "from", "f.txt", "--as", "alice", "--json"],
+        "resolution",
+    );
+    let mut all: Vec<&str> = by_integrator.iter().map(String::as_str).chain([by_alice.as_str()]).collect();
+    all.sort_unstable();
+    let v = view(&p.w.ground);
+    let o = v.api(&format!("/api/weave/proposal/{}", p.open));
+    let f = o["preview"]["items"].as_array().expect("conflicts").iter().find(|c| c["path"] == "f.txt").expect("f.txt");
+    assert_eq!(f["resolutions_total"], 11);
+    let shown: Vec<&str> =
+        f["resolutions"].as_array().expect("resolutions").iter().filter_map(|r| r["resolution"].as_str()).collect();
+    assert_eq!(shown, all[..10], "the first 10, by id");
+    let mut integrators = by_integrator.clone();
+    integrators.sort_unstable();
+    assert_eq!(f["settled_by"], integrators[0].as_str(), "integrate tries an integrator's, the smallest id first");
+    assert_eq!(f["settled_by_held"], true, "its result is held here");
+    let rest = v.api(&format!("/api/weave/proposal/{}?list=resolutions&path=f.txt&after={}", p.open, all[9]));
+    assert_eq!(rest["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(rest["items"][0]["resolution"], all[10]);
+    let page = v.api(&format!("/api/weave/proposal/{}?list=resolutions&path=f.txt&limit=20", p.open));
+    let marks: Vec<(String, bool)> = page["items"]
+        .as_array()
+        .expect("resolutions")
+        .iter()
+        .map(|r| (r["resolution"].as_str().expect("id").to_owned(), r["integrator"].as_bool().expect("a mark")))
+        .collect();
+    assert!(marks.iter().all(|(id, integrator)| *integrator == (*id != by_alice)), "{marks:?}");
+    assert_eq!(
+        page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|r| r["resolution"] == by_alice.as_str())
+            .expect("alice's")["author_name"],
+        "alice"
+    );
+    v.refused(&format!("/api/weave/proposal/{}?list=resolutions", p.open), 400);
+    v.refused(&format!("/api/weave/proposal/{}?list=resolutions&path=nowhere", p.open), 404);
+    v.refused(&format!("/api/weave/proposal/{}?path=f.txt", p.open), 400);
+}
+
+/// Integrate refuses on a forked line and under a diverged policy, so the preview does too, saying why.
+#[test]
+fn a_forked_line_and_a_diverged_policy_get_no_preview() {
+    let p = with_proposals();
+    // A second decision from the base, written by hand, forks main.
+    let base_manifest = {
+        let log = p.w.json(&["weave", "log", "--json"]);
+        let rows = log["decisions"].as_array().or_else(|| log.as_array()).expect("decisions").clone();
+        let row = rows.iter().find(|d| d["decision"] == p.base.as_str()).expect("the base").clone();
+        row["manifest"].as_str().expect("a manifest").parse::<ContentHash>().expect("a hash")
+    };
+    let fork = Decision {
+        v: VERSION,
+        line: p.line.parse().expect("an id"),
+        manifest: base_manifest,
+        parents: vec![p.base.parse().expect("an id")],
+        proposals: vec![],
+        breakage: vec![],
+        answers: vec![],
+        resolutions: vec![],
+        goals: vec![],
+        source: None,
+        note: "a fork".into(),
+    };
+    p.w.artifact("fork.cbor", &fork.encode(), DECISION_MEDIA_TYPE);
+    {
+        let v = view(&p.w.ground);
+        let o = v.api(&format!("/api/weave/proposal/{}", p.open));
+        assert!(o["preview"].is_null(), "{o}");
+        assert!(o["preview_why"].as_str().expect("why").contains("2 heads"), "{}", o["preview_why"]);
+        v.refused(&format!("/api/weave/proposal/{}?list=conflicts", p.open), 404);
+    }
+    // A second successor of main's first policy version diverges its chain.
+    let me = p.w.json(&["id", "list", "--json"])[0]["agent"].as_str().expect("an agent").to_owned();
+    for max_known in [1, 2] {
+        let next = Line {
+            v: VERSION,
+            name: "main".into(),
+            integrators: vec![me.parse().expect("a key")],
+            validators: vec![me.parse().expect("a key")],
+            goal_setters: vec![],
+            checks: BTreeMap::new(),
+            executors: BTreeMap::new(),
+            guardrails: Guardrails { max_known, max_age: 0, protected: vec![] },
+            owner_decision: Some(OD.into()),
+        };
+        let id = p.w.artifact(&format!("v{max_known}.cbor"), &next.encode(), LINE_MEDIA_TYPE);
+        p.w.ok(&["relate", &id, "supersedes", &p.line, "--as", AS]);
+    }
+    let v = view(&p.w.ground);
+    let o = v.api(&format!("/api/weave/proposal/{}", p.open));
+    assert!(o["preview"].is_null());
+    assert!(o["preview_why"].as_str().expect("why").contains("diverged"), "{}", o["preview_why"]);
+    assert!(o["objections"].is_null());
+    v.refused(&format!("/api/weave/proposal/{}?list=objections", p.open), 404);
+}
+
+/// An open proposal whose preview has 1,000 conflicts naming one small blob (`d/<n>.txt`), then 17 whose
+/// proposal side is a 1 MiB line (`w/<n>.txt`): the line's main, the proposal.
+fn with_a_large_preview() -> (Weave, String) {
+    let w = Weave::new();
+    let write_all = |d: &str, w_side: &[u8]| {
+        std::fs::create_dir_all(w.repo.join("d")).expect("mkdir");
+        std::fs::create_dir_all(w.repo.join("w")).expect("mkdir");
+        for i in 0..1_000 {
+            std::fs::write(w.repo.join(format!("d/{i}.txt")), d).expect("write");
+        }
+        for i in 0..17 {
+            std::fs::write(w.repo.join(format!("w/{i}.txt")), w_side).expect("write");
+        }
+    };
+    write_all("a\n", b"a\n");
+    w.commit("base");
+    let base = w.id_of(&["weave", "integrate", "--as", AS, "--note", "base", "--json"], "decision");
+    w.git(&["checkout", "-q", "-b", "p"]);
+    let mut line = vec![b'p'; (1 << 20) - 1];
+    line.push(b'\n');
+    write_all("p\n", &line);
+    w.commit("p");
+    let proposal = w.propose("p", &base, "many");
+    w.git(&["checkout", "-q", "main"]);
+    write_all("h\n", b"h\n");
+    w.commit("head");
+    w.ok(&["weave", "integrate", "--as", AS, "--note", "head", "--json"]);
+    (w, proposal)
+}
+
+/// The preview's budget (section 4, *Conflict preview*): at most 20 conflicts a page, whatever one blob
+/// many paths name; and a page stops before the conflict whose sides would pass 16 MiB read, which the
+/// next page starts from, so every conflict is computed on some page.
+#[test]
+fn a_preview_pages_20_conflicts_at_most_and_16_mib_of_sides() {
+    let (w, proposal) = with_a_large_preview();
+    let v = view(&w.ground);
+    let first = v.api(&format!("/api/weave/proposal/{proposal}"));
+    let preview = &first["preview"];
+    assert_eq!(preview["total"], 1_017);
+    assert_eq!(preview["items"].as_array().map(Vec::len), Some(20));
+    assert_eq!(preview["more"], true);
+    let mut seen: Vec<String> = Vec::new();
+    let mut pages: Vec<usize> = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let url = match &after {
+            None => format!("/api/weave/proposal/{proposal}?list=conflicts"),
+            Some(a) => format!("/api/weave/proposal/{proposal}?list=conflicts&after={}", encode(a)),
+        };
+        let page = v.api(&url);
+        let items = page["items"].as_array().expect("conflicts");
+        pages.push(items.len());
+        seen.extend(items.iter().map(|c| c["path"].as_str().expect("path").to_owned()));
+        if page["more"] == false {
+            break;
+        }
+        after = seen.last().cloned();
+    }
+    assert_eq!(seen.len(), 1_017, "each conflict once");
+    assert_eq!(seen.iter().collect::<std::collections::BTreeSet<_>>().len(), 1_017, "no conflict twice");
+    assert!(pages[..50].iter().all(|n| *n == 20), "{pages:?}");
+    assert_eq!(
+        pages[50..],
+        [15, 2],
+        "15 sides of 1 MiB and their 4-byte others fit 16 MiB; the 16th starts the next page"
+    );
+    v.refused(&format!("/api/weave/proposal/{proposal}?list=conflicts&limit=21"), 400);
+    v.refused(&format!("/api/weave/proposal/{proposal}?list=conflicts&after=nowhere"), 400);
+}
+
+/// Previews build at most 2 at once, and a third is refused at once; a page already built is kept, and
+/// answers while both slots are taken.
+#[test]
+fn the_preview_slots_refuse_a_third_and_a_kept_page_still_answers() {
+    let (w, proposal) = with_a_large_preview();
+    let v = view_with(&w.ground, &[("BRACKEN_VIEW_PREVIEW_DELAY_MS", "1500")]);
+    let warm = Instant::now();
+    v.api(&format!("/api/weave/proposal/{proposal}"));
+    assert!(warm.elapsed() >= Duration::from_millis(1_400), "the first page is built, in a slot");
+    let replies: Vec<(u16, Duration, String)> = std::thread::scope(|s| {
+        let urls = [
+            (0, format!("/api/weave/proposal/{proposal}?list=conflicts&after={}", encode("d/1.txt"))),
+            (0, format!("/api/weave/proposal/{proposal}?list=conflicts&after={}", encode("d/2.txt"))),
+            (300, format!("/api/weave/proposal/{proposal}")),
+            (400, format!("/api/weave/proposal/{proposal}?list=conflicts&after={}", encode("d/3.txt"))),
+        ];
+        let handles: Vec<_> = urls
+            .into_iter()
+            .map(|(wait, url)| {
+                let v = &v;
+                s.spawn(move || {
+                    std::thread::sleep(Duration::from_millis(wait));
+                    let started = Instant::now();
+                    let r = v.request_once(&url);
+                    (r.status, started.elapsed(), String::from_utf8_lossy(&r.body).into_owned())
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("a request")).collect()
+    });
+    assert_eq!((replies[0].0, replies[1].0), (200, 200), "{replies:?}");
+    assert_eq!(replies[2].0, 200, "the kept page: {replies:?}");
+    assert!(replies[2].1 < Duration::from_millis(1_000), "the kept page waited: {:?}", replies[2].1);
+    assert_eq!(replies[3].0, 503, "{replies:?}");
+    assert!(replies[3].2.contains("busy") && replies[3].1 < Duration::from_millis(1_000), "{:?}", replies[3]);
+    // The merge runs only inside a slot (finding dda45ad01045): with both taken, even a cursor that names
+    // no conflict is refused at once, unmerged, rather than merged to find it isn't there.
+    let held: Vec<(u16, String)> = std::thread::scope(|s| {
+        let take = |after: &'static str| {
+            let v = &v;
+            let url = format!("/api/weave/proposal/{proposal}?list=conflicts&after={}", encode(after));
+            s.spawn(move || {
+                let r = v.request_once(&url);
+                (r.status, String::from_utf8_lossy(&r.body).into_owned())
+            })
+        };
+        let (a, b) = (take("d/4.txt"), take("d/5.txt"));
+        std::thread::sleep(Duration::from_millis(300));
+        let r = v.request_once(&format!("/api/weave/proposal/{proposal}?list=conflicts&after=nowhere"));
+        let mine = (r.status, String::from_utf8_lossy(&r.body).into_owned());
+        a.join().expect("a request");
+        b.join().expect("a request");
+        vec![mine]
+    });
+    assert_eq!(held[0].0, 503, "{held:?}");
+    // An empty cursor names no conflict, and isn't the first page kept (independent note 1).
+    v.refused(&format!("/api/weave/proposal/{proposal}?list=conflicts&after="), 400);
+}
+
+/// A preview needs the line's heads, a per-line read: while the reads are busy, it is a 503 to retry, never
+/// "no preview" (finding 7deca14f22ed).
+#[test]
+fn a_busy_read_of_the_line_is_a_503_not_no_preview() {
+    let p = with_proposals();
+    let dev = p.w.id_of(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS, "--json"], "line");
+    let v = view_with(&p.w.ground, &[("BRACKEN_VIEW_READ_DELAY_MS", "1500")]);
+    // Waits out the first read of the records, without reading any line's heads (which the summary would).
+    assert_eq!(v.api(&format!("/api/weave/record/{}", p.open))["page"], "proposal");
+    let replies: Vec<(u16, String)> = std::thread::scope(|s| {
+        let take = |url: String| {
+            let v = &v;
+            s.spawn(move || v.request_once(&url).status)
+        };
+        let (a, b) = (take(format!("/api/weave/line/{}", p.line)), take(format!("/api/weave/line/{dev}")));
+        std::thread::sleep(Duration::from_millis(300));
+        let mut out = Vec::new();
+        for url in [
+            format!("/api/weave/proposal/{}?list=conflicts", p.open),
+            format!("/api/weave/proposal/{}?list=resolutions&path=f.txt", p.open),
+        ] {
+            let r = v.request_once(&url);
+            out.push((r.status, String::from_utf8_lossy(&r.body).into_owned()));
+        }
+        assert_eq!((a.join().expect("a read"), b.join().expect("a read")), (200, 200));
+        out
+    });
+    for (status, body) in &replies {
+        assert_eq!(*status, 503, "{replies:?}");
+        assert!(body.contains("busy"), "{body}");
+    }
+    // Once the line's heads are kept, the preview is there.
+    assert_eq!(v.api(&format!("/api/weave/proposal/{}?list=conflicts", p.open))["total"], 5);
+}
+
+/// Where integrate wouldn't merge a conflict's lines at all, the preview says so (`not_text`), from the
+/// sides' modes and sizes, before the view's own 1 MiB cap: a side absent or a symlink, or over
+/// `text_merge::MAX_TEXT_BYTES` (finding 9e061e918bcd).
+#[test]
+fn a_side_integrate_wouldnt_merge_is_not_text_before_the_view_cap() {
+    let w = Weave::new();
+    let two = |c: u8| {
+        let mut v = vec![c; (2 << 20) - 1];
+        v.push(b'\n');
+        v
+    };
+    let nine = |c: u8| {
+        let mut v = vec![c; (9 << 20) - 1];
+        v.push(b'\n');
+        v
+    };
+    w.write(&[("gone.txt", &two(b'a')), ("link", &two(b'a')), ("nine.txt", &nine(b'a'))]);
+    w.commit("base");
+    let base = w.id_of(&["weave", "integrate", "--as", AS, "--note", "base", "--json"], "decision");
+    w.git(&["checkout", "-q", "-b", "p"]);
+    w.write(&[("gone.txt", &two(b'p')), ("nine.txt", &nine(b'p'))]);
+    std::fs::remove_file(w.repo.join("link")).expect("delete");
+    std::os::unix::fs::symlink("gone.txt", w.repo.join("link")).expect("a symlink");
+    w.commit("p");
+    let proposal = w.propose("p", &base, "sides");
+    w.git(&["checkout", "-q", "main"]);
+    std::fs::remove_file(w.repo.join("gone.txt")).expect("delete");
+    w.write(&[("link", &two(b'h')), ("nine.txt", &nine(b'h'))]);
+    w.commit("head");
+    w.ok(&["weave", "integrate", "--as", AS, "--note", "head", "--json"]);
+    let v = view(&w.ground);
+    let o = v.api(&format!("/api/weave/proposal/{proposal}"));
+    let lines: Vec<(&str, &str)> = o["preview"]["items"]
+        .as_array()
+        .expect("conflicts")
+        .iter()
+        .map(|c| (c["path"].as_str().expect("path"), c["lines"].as_str().expect("lines")))
+        .collect();
+    assert_eq!(
+        lines,
+        [("gone.txt", "not_text"), ("link", "not_text"), ("nine.txt", "not_text")],
+        "deleted on the line, a symlink, over 8 MiB"
+    );
 }

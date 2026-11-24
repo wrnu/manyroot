@@ -35,7 +35,7 @@ mod review;
 
 // What `bracken view`'s Weave pages reuse, so they answer in the CLI's --json shapes.
 pub(crate) use merge::{ListedLine, line_row_json, listed_lines};
-pub(crate) use review::{counted_json, green_json, review_json};
+pub(crate) use review::{counted_json, green_json, open_json, review_json};
 
 #[derive(Subcommand)]
 pub(crate) enum WeaveCommand {
