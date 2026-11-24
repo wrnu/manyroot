@@ -276,6 +276,17 @@ check("the decision page shows hostile text as text, with invisibles marked", as
   safe(page, "decision");
 });
 
+check("Default_Ignorable_Code_Point characters are marked, not hidden (finding f9e80dd8ad15)", async () => {
+  const smuggled = "Run the tests.\u206f\u{e0100}\u3164";
+  const { page } = await load(`#decision/${D2}`, answers([[`/api/weave/decision/${D2}`, decisionAnswer({ note: smuggled })]]));
+  const m = marks(page);
+  assert.ok(m.includes("U+206F"), `marks: ${m}`);
+  assert.ok(m.includes("U+E0100"), `marks: ${m}`);
+  assert.ok(m.includes("U+3164"), `marks: ${m}`);
+  assert.ok(!page.textContent.includes("\u206f") && !page.textContent.includes("\u{e0100}") && !page.textContent.includes("\u3164"));
+  safe(page, "decision");
+});
+
 check("while the view reads its Weave records the page waits, then shows them", async () => {
   let n = 0;
   const { page, fetched } = await load("", (p) =>

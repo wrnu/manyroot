@@ -1103,9 +1103,14 @@
 
   // ---- The side: the specimen label, from /api/contribution/<id> ----
   let shown = null; // the selected contribution's /api/contribution, once it arrives
+  let previewOpen = false;
+  let focusPreview = false;
+  let previewToggleBtn = null;
   function select(i) {
     state.selected = i;
     shown = null;
+    previewOpen = false;
+    focusPreview = false;
     refreshSide();
     requestDraw();
     if (i < 0) return;
@@ -1143,6 +1148,45 @@
     let n = bytes, u = -1;
     while (n >= 1024 && u < units.length - 1) (n /= 1024), u++;
     return `${n.toFixed(1)} ${units[u]} (${bytes.toLocaleString("en")} bytes)`;
+  }
+
+  function artifactPreview(c) {
+    previewToggleBtn = null;
+    if (!c || c.kind !== "artifact" || !c.body) return null;
+    const text = c.body.text;
+    if (text === null || text === undefined) {
+      return B.h("p", { class: "preview-note" }, "Binary content — preview unavailable (use bracken cat).");
+    }
+    if (text.length === 0) {
+      return B.h("p", { class: "preview-note" }, "Empty artifact (0 bytes).");
+    }
+    const toggle = B.h(
+      "button",
+      {
+        type: "button",
+        class: "preview-toggle",
+        "aria-pressed": String(previewOpen),
+        on: {
+          click: () => {
+            previewOpen = !previewOpen;
+            focusPreview = true;
+            refreshSide();
+          },
+        },
+      },
+      previewOpen ? "Hide content" : "Show content"
+    );
+    previewToggleBtn = toggle;
+    if (!previewOpen) return B.h("div", { class: "artifact-preview-wrap" }, toggle);
+    // Content goes in strictly through B.shown + B.h (text nodes + .invisible marker spans), never as HTML,
+    // so markup is inert and invisible/control/bidi characters are visibly marked rather than hidden or dropped.
+    return B.h(
+      "div",
+      { class: "artifact-preview-wrap" },
+      toggle,
+      B.h("div", { class: "artifact-preview" }, B.shown(text)),
+      c.body.text_truncated ? B.h("p", { class: "preview-note" }, "Truncated at 64 KiB (use bracken cat for full content).") : null
+    );
   }
 
   function refreshSide() {
@@ -1187,7 +1231,8 @@
         a && a.superseded_by && a.superseded_by.length ? [B.h("dt", {}, "replaced by"), B.h("dd", { class: "id" }, a.superseded_by.map((x) => x.slice(0, 12)).join(", "))] : null,
         tags[i].length ? [B.h("dt", {}, "tags"), B.h("dd", {}, tags[i].map((t, k) => [k ? ", " : "", B.bdi(t)]))] : null,
         c && c.intents && c.intents.length ? [B.h("dt", {}, "intents"), B.h("dd", {}, `${c.intents.length} live`)] : null
-      )
+      ),
+      artifactPreview(c)
     );
     const lineage = (title, list) =>
       list.length
@@ -1215,6 +1260,10 @@
       ? B.h("button", { type: "button", class: "open-root", on: { click: () => location.assign(`/root.html#${id}`) } }, `Follow this ${kind[i]}'s life`)
       : null;
     side.replaceChildren(...[card, toRoot].filter(Boolean), ...lineage("Woven onto", there(parents[i])), ...lineage("Built on by", there(children[i])));
+    if (focusPreview) {
+      focusPreview = false;
+      if (previewToggleBtn && previewToggleBtn.focus) previewToggleBtn.focus();
+    }
   }
 
   // ---- The scrubber: drag the surface handle, or use the keys, to replay. It settles on a contribution. ----

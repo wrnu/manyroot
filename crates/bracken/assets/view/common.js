@@ -35,6 +35,58 @@ const Bracken = (() => {
     return String(value).replace(BIDI_CONTROLS, "");
   }
 
+  // Invisible format characters (all Unicode Default_Ignorable_Code_Point — bidi, zero-width, BOM,
+  // variation selectors including U+E0100-E01EF, Hangul fillers, Unicode tags) and C0/C1 controls other
+  // than \t and \n: shown() replaces each with a visible marker before plain() would strip or hide them.
+  const INVISIBLE = new RegExp(
+    "\\p{Default_Ignorable_Code_Point}|[\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]|[\\u{e0000}-\\u{e007f}]|[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]",
+    "gu"
+  );
+  const SHOWN_SPAN_LIMIT = 256;
+
+  /** Text as children for h(): its invisible and control characters shown, never hidden or obeyed. */
+  function shown(value, maxSpans = SHOWN_SPAN_LIMIT) {
+    const src = String(value === null || value === undefined ? "" : value);
+    const out = [];
+    let last = 0;
+    let spans = 0;
+    let tail = null;
+    let extra = 0;
+    for (const m of src.matchAll(INVISIBLE)) {
+      const cp = m[0].codePointAt(0);
+      const hex = cp.toString(16).toUpperCase().padStart(4, "0");
+      const control = cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
+      const label = control ? `\\u{${cp.toString(16)}}` : `U+${hex}`;
+      if (spans < maxSpans) {
+        if (m.index > last) out.push(src.slice(last, m.index));
+        out.push(
+          h("span", { class: "invisible", title: control ? "a control character" : "an invisible character" }, label)
+        );
+        spans++;
+      } else {
+        if (tail === null) tail = [];
+        if (m.index > last) tail.push(src.slice(last, m.index));
+        tail.push(`[${label}]`);
+        extra++;
+      }
+      last = m.index + m[0].length;
+    }
+    if (tail !== null) {
+      if (last < src.length) tail.push(src.slice(last));
+      out.push(
+        h(
+          "span",
+          { class: "invisible", title: "invisible or control characters past the highlight limit" },
+          `+${extra} more below marked as [U+XXXX]`
+        )
+      );
+      out.push(tail.join(""));
+    } else if (last < src.length) {
+      out.push(src.slice(last));
+    }
+    return out;
+  }
+
   /** Builds an element. Strings among `children` become text nodes, never markup. */
   function h(tag, attrs, ...children) {
     const el = document.createElement(makeable(HTML_TAGS, tag));
@@ -309,6 +361,6 @@ const Bracken = (() => {
     return motionQuery.matches;
   }
 
-  return { h, s, attr, bdi, text, firstLine, theme, setTheme, themeButton, token, ink, SHAPES, STROKED, look, drawKnot, svgKnot, knotIcon,
+  return { h, s, attr, bdi, text, shown, firstLine, theme, setTheme, themeButton, token, ink, SHAPES, STROKED, look, drawKnot, svgKnot, knotIcon,
     agentName, headings, clock, day, ago, KIND_WORD, reducedMotion };
 })();
