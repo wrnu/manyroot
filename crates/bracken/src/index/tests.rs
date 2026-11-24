@@ -90,6 +90,7 @@ fn grow_store(store: &mut Store, seed: u64, n: usize) {
 /// [`Before::take`], trusting any local filesystem type: the test boxes' filesystems aren't all on the
 /// allow-list, and these tests are about the logic, not the list ([`allow_list`] covers that).
 fn take(dir: &Path) -> Before {
+    settle(dir);
     let mut before = Before::take(dir);
     if before.clock.is_none()
         && let Some(cache) = crate::snapshot::cache::Cache::open(dir, true).expect("cache/")
@@ -97,6 +98,34 @@ fn take(dir: &Path) -> Before {
         before.clock = cache.clock().ok().map(|(t, _)| t);
     }
     before
+}
+
+/// Waits until the filesystem's clock has passed every shard's mtime and ctime. The tests read with no
+/// racy margin, but a stamp is still recorded only if it is strictly older than T, and Linux stamps files
+/// from a coarse clock: a read in the same tick as the writes before it would leave their shards dirty
+/// once more. In use, the margin is 2 s; this only lets the time pass that any real read follows.
+fn settle(dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let ns = |s: i64, n: i64| i128::from(s) * 1_000_000_000 + i128::from(n);
+    let newest = std::fs::read_dir(dir.join("objects"))
+        .map(|d| {
+            d.flatten()
+                .filter_map(|e| e.metadata().ok())
+                .map(|m| ns(m.mtime(), m.mtime_nsec()).max(ns(m.ctime(), m.ctime_nsec())))
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let probe = dir.with_extension("tick");
+    for _ in 0..2_000 {
+        std::fs::write(&probe, b"t").expect("a probe beside the Ground");
+        let m = std::fs::metadata(&probe).expect("its stat");
+        if ns(m.mtime(), m.mtime_nsec()) > newest {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the filesystem's clock never passed the newest shard");
 }
 
 fn opts(racy: i128) -> Options {
