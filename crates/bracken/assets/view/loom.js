@@ -1064,8 +1064,103 @@
     }
   }
 
+  function updateZoomControls() {
+    const zIn = $("zoom-in"), zOut = $("zoom-out"), zReset = $("zoom-reset");
+    const [ra, rb] = range();
+    const canZoom = N > 0 && rb > ra;
+    if (zIn) zIn.disabled = !canZoom;
+    if (zOut) zOut.disabled = state.view === null;
+    if (zReset) zReset.disabled = state.view === null;
+  }
+
+  function zoomBy(factor, anchorY = (TOP + H) / 2) {
+    const [ra, rb] = range();
+    if (rb <= ra) return;
+    const [a, b] = view();
+    const at = a + ((anchorY - TOP - PAD) / Math.max(1, H - TOP - PAD * 2)) * (b - a);
+    const minSpan = Math.max(1, (rb - ra) * 1e-5);
+    const span = Math.max(minSpan, (b - a) * factor);
+    if (span >= rb - ra) {
+      state.view = null;
+    } else {
+      const frac = (at - a) / Math.max(1e-9, b - a);
+      const na = Math.max(ra, Math.min(rb - span, at - frac * span));
+      state.view = [na, na + span];
+    }
+    updateZoomControls();
+    requestDraw();
+  }
+
+  function resetZoom() {
+    if (state.view === null) return;
+    state.view = null;
+    updateZoomControls();
+    requestDraw();
+  }
+
   const win = $("window");
+  const touches = new Map();
+  let pinchDist = 0;
+  let lastTap = { t: 0, x: 0, y: 0 };
+  let touchDragY = null;
+  let suppressClick = false;
+
+  win.addEventListener("pointerdown", (e) => {
+    if (e.pointerType !== "touch") return;
+    touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (touches.size === 2) {
+      const pts = [...touches.values()];
+      pinchDist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+      touchDragY = null;
+      suppressClick = true;
+      return;
+    }
+    if (touches.size === 1) {
+      const now = performance.now();
+      const dt = now - lastTap.t;
+      const d = Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y);
+      if (dt > 0 && dt < 320 && d < 28) {
+        const r = canvas.getBoundingClientRect();
+        if (state.view === null) zoomBy(0.45, e.clientY - r.top);
+        else resetZoom();
+        lastTap = { t: 0, x: 0, y: 0 };
+        suppressClick = true;
+        return;
+      }
+      lastTap = { t: now, x: e.clientX, y: e.clientY };
+      touchDragY = state.view !== null ? e.clientY : null;
+    }
+  });
   win.addEventListener("pointermove", (e) => {
+    if (e.pointerType === "touch" && touches.has(e.pointerId)) {
+      touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (touches.size === 2) {
+        const pts = [...touches.values()];
+        const dist = Math.hypot(pts[1].x - pts[0].x, pts[1].y - pts[0].y);
+        if (pinchDist > 10 && dist > 10) {
+          const r = canvas.getBoundingClientRect();
+          const midY = (pts[0].y + pts[1].y) / 2 - r.top;
+          zoomBy(pinchDist / dist, midY);
+          pinchDist = dist;
+          suppressClick = true;
+        }
+        return;
+      }
+      if (touches.size === 1 && touchDragY !== null && state.view) {
+        const dy = touchDragY - e.clientY;
+        if (Math.abs(dy) > 3) {
+          touchDragY = e.clientY;
+          const [a, b] = view();
+          const [ra, rb] = range();
+          const d = (dy / Math.max(1, H - TOP)) * (b - a);
+          const na = Math.max(ra, Math.min(rb - (b - a), a + d));
+          state.view = [na, na + (b - a)];
+          suppressClick = true;
+          requestDraw();
+        }
+        return;
+      }
+    }
     if (!geom.key) return; // mid-morph
     const r = canvas.getBoundingClientRect();
     const i = hit(e.clientX - r.left, e.clientY - r.top);
@@ -1078,13 +1173,27 @@
     canvas.style.cursor = i >= 0 ? "pointer" : "default";
     requestDraw();
   });
+  const endTouch = (e) => {
+    if (e.pointerType !== "touch") return;
+    touches.delete(e.pointerId);
+    if (touches.size < 2) pinchDist = 0;
+    if (touches.size === 0) touchDragY = null;
+  };
+  win.addEventListener("pointerup", endTouch);
+  win.addEventListener("pointercancel", endTouch);
   win.addEventListener("pointerleave", () => {
     state.hover = -1;
     syncAncestry();
     showHover(-1);
     requestDraw();
   });
-  win.addEventListener("click", () => select(state.hover));
+  win.addEventListener("click", () => {
+    if (suppressClick) {
+      suppressClick = false;
+      return;
+    }
+    select(state.hover);
+  });
   win.addEventListener(
     "wheel",
     (e) => {
@@ -1093,20 +1202,19 @@
       const [ra, rb] = range();
       const r = canvas.getBoundingClientRect();
       if (e.ctrlKey || e.metaKey) {
-        const at = a + ((e.clientY - r.top - TOP - PAD) / (H - TOP - PAD * 2)) * (b - a);
-        const f = Math.exp(e.deltaY * 0.0025);
-        const na = at - (at - a) * f, nb = at + (b - at) * f;
-        if (nb - na >= rb - ra) state.view = null;
-        else state.view = [Math.max(ra, na), Math.min(rb, nb)];
+        zoomBy(Math.exp(e.deltaY * 0.0025), e.clientY - r.top);
       } else if (state.view) {
         const d = (e.deltaY / (H - TOP)) * (b - a);
         const na = Math.max(ra, Math.min(rb - (b - a), a + d));
         state.view = [na, na + (b - a)];
+        requestDraw();
       }
-      requestDraw();
     },
     { passive: false }
   );
+  if ($("zoom-in")) $("zoom-in").addEventListener("click", () => zoomBy(0.6));
+  if ($("zoom-out")) $("zoom-out").addEventListener("click", () => zoomBy(1 / 0.6));
+  if ($("zoom-reset")) $("zoom-reset").addEventListener("click", resetZoom);
 
   function showHover(i) {
     const el = $("hover-label");
@@ -1246,10 +1354,15 @@
     const a = c && c.assessment;
     const lines = c ? body(c).filter(Boolean) : [textOf(i) ?? "…"];
     const name = c && c.author_name ? c.author_name : B.agentName(ground, author[i]);
+    const closeBtn = B.h(
+      "button",
+      { type: "button", class: "side-close", "aria-label": "Close label", title: "Close", on: { click: () => select(-1) } },
+      "×"
+    );
     const card = B.h(
       "article",
       { class: "label-card" },
-      B.h("div", { class: "kind sc" }, B.knotIcon(kind[i], lookOf(i)), `${B.KIND_WORD[kind[i]]} · ${subject ? st : cut ? "retracted" : verdictOf(i) || "woven"}`),
+      B.h("div", { class: "kind sc" }, B.knotIcon(kind[i], lookOf(i)), `${B.KIND_WORD[kind[i]]} · ${subject ? st : cut ? "retracted" : verdictOf(i) || "woven"}`, closeBtn),
       B.h("p", { class: "statement" }, lines[0]),
       lines.slice(1).map((l) => B.h("p", { class: "detail" }, l)),
       B.h(
@@ -1468,6 +1581,7 @@
     state.axis = axis;
     state.view = null;
     state.surface = Infinity;
+    updateZoomControls();
     note();
     updateKey();
     refreshSide();
@@ -1618,6 +1732,7 @@
     }
     buildAgents();
     updateKey();
+    updateZoomControls();
     note();
     layout();
     if (N <= BULK_TEXT) bulkTexts(null);
