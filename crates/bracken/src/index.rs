@@ -974,6 +974,10 @@ fn durable(paths: &[PathBuf]) -> Result<usize> {
     if tests::FAIL_SYNC.with(std::cell::Cell::get) {
         bail!("a sync that fails, for a test");
     }
+    #[cfg(test)]
+    let real = tests::REAL_SYNC.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    let real = true;
     #[cfg(unix)]
     {
         use rustix::fs::{Mode, OFlags};
@@ -988,15 +992,19 @@ fn durable(paths: &[PathBuf]) -> Result<usize> {
             if !matches!(kind, rustix::fs::FileType::RegularFile | rustix::fs::FileType::Directory) {
                 bail!("{} is neither a file nor a directory, so it isn't synced or indexed", p.display());
             }
-            rustix::fs::fsync(&fd).with_context(|| format!("syncing {}", p.display()))?;
+            if real {
+                rustix::fs::fsync(&fd).with_context(|| format!("syncing {}", p.display()))?;
+            }
             last = Some(fd);
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        if let Some(fd) = &last {
+        if real && let Some(fd) = &last {
             rustix::fs::fcntl_fullfsync(fd).context("F_FULLFSYNC")?;
         }
         let _ = last;
     }
+    #[cfg(not(unix))]
+    let _ = real;
     Ok(unique.len())
 }
 

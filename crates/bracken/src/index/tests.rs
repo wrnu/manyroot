@@ -15,6 +15,12 @@ thread_local! {
     pub(super) static SYNCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
     /// Makes [`durable`] fail on this thread, after recording what it was asked to sync.
     pub(super) static FAIL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether [`durable`] makes its `fsync` calls on this thread. Off in these unit tests, which check
+    /// what is synced and when through `SYNCED` and `FAIL_SYNC`; everything else `durable` does (each
+    /// path opened without following a link, its type checked) still runs. The integration tests run the
+    /// binary, which always syncs, and `durable_syncs_files_and_directories` turns it on here (note
+    /// b33068a95bbf: on the box's ext4 these syscalls were half the unit tests' time).
+    pub(super) static REAL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 const PEOPLE: [&str; 3] = ["manager", "builder", "reviewer"];
@@ -998,6 +1004,20 @@ fn the_last_generation_damaged_doesnt_overflow() {
 
 /// Security review note 4: syncing never waits on a FIFO put where an object or a shard was.
 #[cfg(unix)]
+#[test]
+fn durable_syncs_files_and_directories() {
+    REAL_SYNC.with(|r| r.set(true));
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 54, 20);
+    let outcome = read(&dir, 0);
+    assert!(outcome.synced > 0, "the first build syncs what it names: {outcome:?}");
+    let file = Store::open(&dir).expect("valid").graph().iter().map(|c| object_path(&dir, &c.id())).next();
+    let paths = [file.expect("an object"), dir.join("objects")];
+    assert_eq!(durable(&paths).expect("synced"), 2);
+    REAL_SYNC.with(|r| r.set(false));
+}
+
 #[test]
 fn a_fifo_in_the_sync_list_is_refused_without_waiting() {
     let tmp = tempfile::tempdir().expect("tmp");
