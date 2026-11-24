@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Deterministic check for Loom artifact rendering, hit-testing, and detail panel.
+// Deterministic check for Loom artifact rendering, hit-testing, detail panel, legend filter, and jump.
 // Runs crates/bracken/assets/view/{common,loom}.js in Node's vm module with a minimal
 // mock DOM and recording 2D canvas context — no browser or external dependency.
+// Note: run by hand (not by scripts/test-table, since Node is not in the test table or boat box).
 //
 // Run: node crates/bracken/tests/loom_artifacts_check.js
 "use strict";
@@ -471,7 +472,42 @@ async function main() {
   const mArtsAfter = mOps.slice(mLastBloom + 1).filter((o) => o.op === "strokePath" && o.d === m.Bracken.SHAPES.artifact).length;
   assert(mArtsAfter > 0, "expected bucketed artifact nodules drawn after blooms when >400 artifacts exist");
 
-  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel (name/type/size/status/Root link), and non-dense z-order all pass.");
+  // 6. Interactive legend filter: artifact count badge, toggle filter on/off, stitched labels, hit filtering.
+  const keyEl = byId.get("key");
+  const keyBtns = keyEl.querySelectorAll(".key-btn");
+  assert.strictEqual(keyBtns.length, 8, `expected 8 interactive legend filter buttons, got ${keyBtns.length}`);
+  const artBtn = keyBtns.find((b) => b.textContent.includes("artifact"));
+  assert(artBtn, "missing artifact filter button in key");
+  assert(artBtn.textContent.includes("4"), `expected artifact count badge 4, got: ${artBtn.textContent}`);
+
+  // Toggle artifact filter ON -> aria-pressed=true, data-note announces filter, labels render for the 4 artifacts.
+  artBtn.dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert.strictEqual(artBtn.getAttribute("aria-pressed"), "true", "artifact filter button should be pressed");
+  assert(byId.get("data-note").textContent.includes("showing artifacts"), `expected filter in data-note: ${byId.get("data-note").textContent}`);
+  assert.strictEqual(byId.get("labels").querySelectorAll(".knot-label").length, 4, "filtering to 4 artifacts should show their stitched labels even on a dense Ground");
+
+  // Toggle artifact filter OFF -> aria-pressed=false, labels clear again on dense Ground.
+  artBtn.dispatch("click", {});
+  for (let k = 0; k < 10; k++) await new Promise((r) => setImmediate(r));
+  assert.strictEqual(artBtn.getAttribute("aria-pressed"), "false", "artifact filter button should unpress");
+  assert.strictEqual(byId.get("labels").querySelectorAll(".knot-label").length, 0, "unfiltered dense Ground should hide inline labels");
+
+  // 7. Artifact prev/next jump buttons cycle through artifacts and open each specimen card.
+  const jumpBtns = keyEl.querySelectorAll(".key-jump");
+  assert.strictEqual(jumpBtns.length, 2, `expected prev/next artifact jump buttons, got ${jumpBtns.length}`);
+  const [prevBtn, nextBtn] = jumpBtns;
+  assert.strictEqual(prevBtn.disabled, false, "prev artifact button should be enabled when artifacts exist");
+  assert.strictEqual(nextBtn.disabled, false, "next artifact button should be enabled when artifacts exist");
+  // Currently selected is idx 100 (docs/pending.md); clicking Next should jump to idx 1500 (docs/accepted.md).
+  nextBtn.dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert(byId.get("side").textContent.includes("docs/accepted.md"), `expected Next jump to open docs/accepted.md, got: ${byId.get("side").textContent}`);
+  prevBtn.dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert(byId.get("side").textContent.includes("docs/pending.md"), `expected Prev jump to return to docs/pending.md, got: ${byId.get("side").textContent}`);
+
+  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, and artifact jump all pass.");
 }
 
 main().catch((err) => {
