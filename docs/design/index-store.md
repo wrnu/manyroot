@@ -343,8 +343,10 @@ with.
    protocol rule.
    - **Make them durable first.** Before the transaction that adds them commits,
      fsync each added object file, each shard directory it was found in, and
-     `objects/` if that shard is new. A write's own refresh does the same for
-     what it adds beyond its own objects. Each is a plain `fsync`; on macOS one
+     `objects/` if that shard is new to the index (the index holds nothing in
+     it: the commit that indexed a shard's first object synced `objects/`). A
+     write's own refresh does the same, except for the objects its own store
+     wrote, which the store synced before their rename. Each is a plain `fsync`; on macOS one
      `F_FULLFSYNC` follows, on the last of them, which flushes the drive's cache
      for everything written before it, so it stands for a full sync of each
      (Rust's `File::sync_all` is the same `F_FULLFSYNC` per file). Another writer (git, an older binary,
@@ -416,14 +418,17 @@ caught the same way.
 1. Write the object to a temporary file, fsync it and rename it into its shard,
    as today. The store's durability is exactly main's: `write_object` syncs the
    file, not its directory.
-2. The index transaction fsyncs the object, its shard directory, and `objects/`
-   when the shard is new.
+2. The index transaction fsyncs the shard directory, and `objects/` when the
+   shard is new to the index. The object itself was synced by step 1, in this
+   process; any other object the refresh adds is fsynced too.
 3. Commit the index transaction (`synchronous=NORMAL`).
 
 **The index's commit is the one place its durability is enforced** (answer
 `ddaf02041077`). Every path that commits, whether a write's refresh, a
 freshness refresh or a rebuild, first fsyncs every object the transaction
-names, those objects' shard directories, and `objects/` for a new shard. Only
+names, those objects' shard directories, and `objects/` for a shard new to the
+index. The one exception is an object the command's own store wrote: the store
+synced it before its rename, in the same process, before the commit. Only
 the full check's passes skip it: they are rolled back or in memory. Note
 `b33068a95bbf` measured an earlier head that also synced directories in the
 store, once per object for every `Store` write: it tripled the test table's

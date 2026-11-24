@@ -371,6 +371,8 @@ fn a_write_through_refreshing_is_indexed_and_leaves_its_shard_without_a_row() {
     let dir = ground(tmp.path());
     grow(&dir, 18, 30);
     read(&dir, 0);
+    let indexed_shards: HashSet<u8> =
+        Store::open(&dir).expect("valid").graph().iter().map(|c| shard_of(&c.id())).collect();
     SYNCED.with(|s| s.borrow_mut().clear());
     let written = {
         let mut s = crate::snapshot::Refreshing::open(&dir, crate::snapshot::Refresh::Yes).expect("opens");
@@ -380,11 +382,69 @@ fn a_write_through_refreshing_is_indexed_and_leaves_its_shard_without_a_row() {
     let hex = written.to_hex().to_uppercase();
     assert_eq!(rows(&dir, &format!("SELECT count(*) FROM obj WHERE hex(id) = '{hex}'")), 1, "indexed by the write");
     let synced = SYNCED.with(|s| s.borrow().clone());
-    assert!(synced.contains(&object_path(&dir, &written)), "the write's own object, before the commit: {synced:?}");
+    // The store synced the write's own object before its rename; the index doesn't again.
+    assert!(!synced.contains(&object_path(&dir, &written)), "the store synced the write's own: {synced:?}");
     let shard = dir.join("objects").join(format!("{:02x}", shard_of(&written)));
-    assert!(synced.contains(&shard), "and its shard directory (the store doesn't sync it): {synced:?}");
+    assert!(synced.contains(&shard), "its shard directory, before the commit (the store doesn't sync it): {synced:?}");
+    let new = !indexed_shards.contains(&shard_of(&written));
+    assert_eq!(synced.contains(&dir.join("objects")), new, "objects/ for a shard new to the index only: {synced:?}");
     assert_eq!(rows(&dir, &format!("SELECT count(*) FROM shard WHERE n = {}", shard_of(&written))), 0);
     assert_eq!(read(&dir, 0).added, 0);
+}
+
+#[test]
+fn a_writes_refresh_syncs_every_object_it_adds_but_its_own() {
+    // Security review note 1: a write's refresh may add another process's object, renamed in without a
+    // sync; only what this command's store wrote is known to be synced.
+    let tmp = tempfile::tempdir().expect("tmp");
+    let dir = ground(tmp.path());
+    grow(&dir, 20, 30);
+    read(&dir, 0);
+    let mut store = Store::open(&dir).expect("valid");
+    let before_ids: HashSet<ContributionId> = store.graph().iter().map(|c| c.id()).collect();
+    let indexed_shards: HashSet<u8> = before_ids.iter().map(shard_of).collect();
+    grow_store(&mut store, 21, 6);
+    let added: Vec<ContributionId> =
+        store.graph().iter().map(|c| c.id()).filter(|id| !before_ids.contains(id)).collect();
+    let (own, others) = added.split_at(added.len() / 2);
+    let written: HashSet<ContributionId> = own.iter().copied().collect();
+    SYNCED.with(|s| s.borrow_mut().clear());
+    let outcome = refresh_after_write(&dir, &store, &Before::stats(&dir), &written).expect("refreshed");
+    assert_eq!(outcome.added, added.len());
+    let synced = SYNCED.with(|s| s.borrow().clone());
+    for id in own {
+        assert!(!synced.contains(&object_path(&dir, id)), "its own, synced by the store: {synced:?}");
+    }
+    for id in others {
+        assert!(synced.contains(&object_path(&dir, id)), "another's, before the commit: {synced:?}");
+    }
+    for id in &added {
+        let shard = dir.join("objects").join(format!("{:02x}", shard_of(id)));
+        assert!(synced.contains(&shard), "every shard directory: {synced:?}");
+    }
+    let new = added.iter().any(|id| !indexed_shards.contains(&shard_of(id)));
+    assert_eq!(synced.contains(&dir.join("objects")), new, "objects/ for a shard new to the index only");
+    agrees(&dir, &store);
+
+    // One write at a time, until one lands in a shard new to the index and one in a shard it holds.
+    let (mut seen_new, mut seen_held) = (false, false);
+    for k in 0..400u64 {
+        let indexed: HashSet<u8> = store.graph().iter().map(|c| shard_of(&c.id())).collect();
+        let had: HashSet<ContributionId> = store.graph().iter().map(|c| c.id()).collect();
+        grow_store(&mut store, 100 + k, 1);
+        let Some(id) = store.graph().iter().map(|c| c.id()).find(|id| !had.contains(id)) else { continue };
+        SYNCED.with(|s| s.borrow_mut().clear());
+        refresh_after_write(&dir, &store, &Before::stats(&dir), &HashSet::from([id])).expect("refreshed");
+        let synced = SYNCED.with(|s| s.borrow().clone());
+        let new = !indexed.contains(&shard_of(&id));
+        assert_eq!(synced.contains(&dir.join("objects")), new, "objects/ for a shard new to the index only");
+        seen_new |= new;
+        seen_held |= !new;
+        if seen_new && seen_held {
+            return;
+        }
+    }
+    panic!("no write landed in both a new shard and a held one");
 }
 
 #[test]

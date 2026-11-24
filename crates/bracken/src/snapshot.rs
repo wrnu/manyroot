@@ -150,13 +150,18 @@ pub struct Refreshing {
     refresh: Refresh,
     /// How many contributions the store held when opened: more when dropped means this command wrote.
     opened: usize,
+    /// Whether `held` named exactly the store's contributions when opened, so that what the store holds
+    /// beyond it when dropped is what this command's store wrote.
+    held_is_opened: bool,
 }
 
 impl Refreshing {
     pub fn open(dir: &Path, refresh: Refresh) -> Result<Refreshing> {
         let (store, held) = open_held(dir, refresh)?;
         let opened = store.graph().len();
-        Ok(Refreshing { store: Some(store), held, refresh, opened })
+        // The snapshot's ids are among the store's, so the same count is the same set.
+        let held_is_opened = held.as_ref().is_some_and(|h| h.ids.len() == opened);
+        Ok(Refreshing { store: Some(store), held, refresh, opened, held_is_opened })
     }
 
     /// The store, for a command that keeps it (`watch`, `serve`): it reads through the snapshot itself.
@@ -194,7 +199,15 @@ impl Drop for Refreshing {
             && crate::index::usable(store.dir())
         {
             let before = crate::index::Before::stats(store.dir());
-            let _ = crate::index::refresh(store.dir(), store, &before, crate::index::Record::No);
+            // What this command's store wrote, each object synced by the store before its rename; when
+            // that isn't known, none, and the index syncs every object it adds.
+            let written: HashSet<ContributionId> = match &self.held {
+                Some(held) if self.held_is_opened => {
+                    store.graph().iter().map(|c| c.id()).filter(|id| !held.ids.contains(id)).collect()
+                }
+                _ => HashSet::new(),
+            };
+            let _ = crate::index::refresh_after_write(store.dir(), store, &before, &written);
         }
         if let (Some(store), Some(held)) = (&self.store, &mut self.held)
             && self.refresh == Refresh::Yes

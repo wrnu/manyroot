@@ -472,6 +472,17 @@ pub fn refresh(dir: &Path, store: &Store, before: &Before, record: Record) -> Re
     refresh_with(dir, store, before, record, Options::default())
 }
 
+/// A write's own refresh (no stamps recorded): `written` are the contributions this process's store
+/// wrote, each synced by the store before its rename, so they aren't synced again (section 6, Order).
+pub fn refresh_after_write(
+    dir: &Path,
+    store: &Store,
+    before: &Before,
+    written: &HashSet<ContributionId>,
+) -> Result<Outcome> {
+    refresh_inner(dir, store, before, Record::No, Options::default(), written)
+}
+
 pub(crate) fn refresh_with(
     dir: &Path,
     store: &Store,
@@ -479,12 +490,23 @@ pub(crate) fn refresh_with(
     record: Record,
     opts: Options,
 ) -> Result<Outcome> {
+    refresh_inner(dir, store, before, record, opts, &HashSet::new())
+}
+
+fn refresh_inner(
+    dir: &Path,
+    store: &Store,
+    before: &Before,
+    record: Record,
+    opts: Options,
+    written: &HashSet<ContributionId>,
+) -> Result<Outcome> {
     let cache = cache_dir(dir)?;
     let generation = current_generation(&cache).unwrap_or(1);
-    match refresh_file(dir, &cache.join(file_name(generation)), store, before, record, opts) {
+    match refresh_file(dir, &cache.join(file_name(generation)), store, before, record, opts, written) {
         Err(e) if is_damage(&e) => {
             let next = cache.join(file_name(next_generation(generation)?));
-            let mut outcome = refresh_file(dir, &next, store, before, record, opts)?;
+            let mut outcome = refresh_file(dir, &next, store, before, record, opts, written)?;
             outcome.new_generation = true;
             Ok(outcome)
         }
@@ -504,10 +526,11 @@ fn refresh_file(
     before: &Before,
     record: Record,
     opts: Options,
+    written: &HashSet<ContributionId>,
 ) -> Result<Outcome> {
     let mut conn = open_db(path, opts.busy)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let outcome = match reconcile(&tx, dir, path, store, before, record, opts) {
+    let outcome = match reconcile(&tx, dir, path, store, before, record, opts, written) {
         Ok(outcome) => outcome,
         Err(Needs::Rebuild | Needs::Damaged(_)) => rebuild_in(&tx, dir, path, store, before, record, opts)?,
         Err(Needs::Error(e)) => return Err(e),
@@ -751,6 +774,7 @@ fn object_exists(dir: &Path, id: &ContributionId) -> bool {
 
 /// Brings an index of the right version, ground and file up to date (section 5 steps 3-6), or says it
 /// needs a rebuild.
+#[allow(clippy::too_many_arguments)]
 fn reconcile(
     tx: &Connection,
     dir: &Path,
@@ -759,6 +783,7 @@ fn reconcile(
     before: &Before,
     record: Record,
     opts: Options,
+    written: &HashSet<ContributionId>,
 ) -> Result<Outcome, Needs> {
     if !has_schema(tx)? {
         return Err(Needs::Rebuild);
@@ -815,6 +840,9 @@ fn reconcile(
     let g = store.graph();
     let mut added: Vec<ContributionId> = Vec::new();
     let mut added_shards: BTreeSet<u8> = BTreeSet::new();
+    // Shards the index holds nothing in: only their entries in objects/ may not be durable yet (every
+    // commit that indexed a shard's first object synced objects/).
+    let mut new_shards: BTreeSet<u8> = BTreeSet::new();
     if !dirty.is_empty() {
         let wanted: HashSet<u8> = dirty.iter().copied().collect();
         let mut in_graph: HashMap<u8, HashSet<ContributionId>> = HashMap::new();
@@ -838,6 +866,9 @@ fn reconcile(
             let new: Vec<ContributionId> = listed.iter().filter(|id| !indexed.contains(id)).copied().collect();
             if !new.is_empty() {
                 added_shards.insert(*n);
+                if indexed.is_empty() {
+                    new_shards.insert(*n);
+                }
             }
             added.extend(new);
         }
@@ -845,16 +876,17 @@ fn reconcile(
 
     let mut outcome = Outcome { dirty_shards: dirty.len(), added: added.len(), ..Outcome::default() };
 
-    // Step 5: what freshness found is made durable before it's committed (a write's own objects were
-    // synced by the store).
-    // On every path, a write's own refresh included: what it adds may be another writer's, renamed in
-    // without a sync (security review note 1).
-    let mut to_sync: Vec<PathBuf> = added.iter().map(|id| object_path(dir, id)).collect();
+    // Step 5: what freshness found is made durable before it's committed, on every path, a write's own
+    // refresh included: what it adds may be another writer's, renamed in without a sync (security review
+    // note 1). Only the objects this process's store wrote, and so synced before their rename, aren't
+    // synced again.
+    let mut to_sync: Vec<PathBuf> =
+        added.iter().filter(|id| !written.contains(id)).map(|id| object_path(dir, id)).collect();
     for n in &added_shards {
         to_sync.push(dir.join("objects").join(format!("{n:02x}")));
-        if !matches!(rows.get(n), Some(Row::Present(_))) {
-            to_sync.push(dir.join("objects"));
-        }
+    }
+    if !new_shards.is_empty() {
+        to_sync.push(dir.join("objects"));
     }
 
     if !added.is_empty() {
@@ -1636,7 +1668,7 @@ enum Replica {
 /// compared with `want`, the full recompute from `store`. Anything the store holds that the index lacks
 /// is a disagreement, and so is an indexed contribution with no object.
 fn replica(tx: &Connection, dir: &Path, path: &Path, store: &Store, want: &Answers, stats: &Before) -> Result<Replica> {
-    match reconcile(tx, dir, path, store, stats, Record::No, CHECK) {
+    match reconcile(tx, dir, path, store, stats, Record::No, CHECK, &HashSet::new()) {
         Ok(_) => {}
         Err(Needs::Rebuild) => return Ok(Replica::Unused),
         Err(Needs::Damaged(e)) => return Err(e.context("BRACKEN_FULL_CHECK: this replica's index is damaged")),
