@@ -323,6 +323,7 @@
 
   // ---- State and geometry ----
   const state = { axis: "time", surface: Infinity, hover: -1, selected: -1, view: null, playing: false, speed: 1, morph: 1, filter: null };
+  const win = $("window");
   const canvas = $("loom-canvas");
   const ctx = canvas.getContext("2d");
   const gauge = $("gauge-canvas");
@@ -430,11 +431,25 @@
     return bestArt >= 0 ? bestArt : best;
   }
 
+  const MIN_COL = 64; // minimum horizontal spacing between agent roots before scrolling
+  const MAX_CANVAS_W = 4096; // cap CSS canvas width so huge agent counts stay safe on mobile GPUs
+  let viewW = 0;
+
   function layout() {
     dpr = window.devicePixelRatio || 1;
-    const r = canvas.getBoundingClientRect();
-    W = r.width;
-    H = r.height;
+    const wr = win.getBoundingClientRect();
+    viewW = wr.width;
+    H = wr.height;
+    let subjectCount = 0;
+    for (let i = 0; i < N; i++) if (kind[i] === "claim" || kind[i] === "artifact") subjectCount++;
+    const hasLabels = N <= DENSE && subjectCount <= LABELS;
+    const left = Math.min(56, Math.max(36, viewW * 0.08));
+    // Only reserve the wide right margin when inline knot labels will actually be shown.
+    const right = hasLabels ? Math.min(200, viewW * 0.16) : left;
+    const minW = agentsCount > 1 ? left + right + (agentsCount - 1) * MIN_COL : viewW;
+    const maxW = Math.max(viewW, Math.floor((MAX_CANVAS_W * 2) / Math.max(1, dpr)));
+    W = Math.min(maxW, Math.max(viewW, Math.round(minW)));
+    win.style.setProperty("--loom-w", `${W}px`);
     canvas.width = Math.round(W * dpr);
     canvas.height = Math.round(H * dpr);
     const gr = gauge.getBoundingClientRect();
@@ -442,7 +457,6 @@
     GH = gr.height;
     gauge.width = Math.round(GW * dpr);
     gauge.height = Math.round(GH * dpr);
-    const left = 56, right = Math.min(200, W * 0.16);
     const span = (W - left - right) / Math.max(1, agentsCount - 1 || 1);
     colX = Array.from({ length: agentsCount }, (_, a) => (agentsCount === 1 ? W / 2 : left + a * span));
     // Each heading is as wide as its text, so long as it stays clear of its neighbours: two neighbours
@@ -451,6 +465,7 @@
       (el) => Math.max(el.querySelector(".heading").getBoundingClientRect().width, el.querySelector(".count").getBoundingClientRect().width) + 2
     );
     const gap = 8;
+    const colSpacing = agentsCount > 1 ? colX[1] - colX[0] : W;
     for (const [a, el] of agentEls.entries()) {
       const room = (b) => {
         if (b < 0) return colX[a];
@@ -459,8 +474,9 @@
         return between - Math.min(natural[b] / 2, between / 2);
       };
       const width = Math.min(natural[a], 2 * Math.min(room(a - 1), room(a + 1)));
+      const clamped = Math.max(16, Math.min(colSpacing - 2, Math.max(32, width)));
       el.style.left = `${colX[a]}px`;
-      el.style.setProperty("--col", `${Math.max(32, width)}px`);
+      el.style.setProperty("--col", `${clamped}px`);
       B.attr(el, "title", B.agentName(ground, a));
     }
     geom.key = "";
@@ -474,7 +490,8 @@
     band.replaceChildren();
     const heads = B.headings(ground.agents.map((_, i) => B.agentName(ground, i)));
     agentEls = ground.agents.map((a, i) => {
-      const el = B.h("div", { class: "agent" }, B.h("span", { class: "heading" }, heads[i]), B.h("span", { class: "count num" }, (counts[i] || 0).toLocaleString("en")));
+      const cls = i >= 12 ? "agent repeat" : "agent";
+      const el = B.h("div", { class: cls }, B.h("span", { class: "heading" }, heads[i]), B.h("span", { class: "count num" }, (counts[i] || 0).toLocaleString("en")));
       el.style.setProperty("--agent-ink", B.ink(i));
       band.append(el);
       return el;
@@ -621,24 +638,26 @@
     ctx.lineCap = "round";
     for (let a = 0; a < agentsCount; a++) {
       if (y0[a] === Infinity) continue;
+      const repeated = a >= 12;
       ctx.strokeStyle = B.ink(a);
       ctx.globalAlpha = 0.85;
       if (!dense) {
         ctx.lineWidth = 1.5;
+        ctx.setLineDash(repeated ? [6, 4] : []);
         ctx.beginPath();
         ctx.moveTo(rootX(a, y0[a]), y0[a]);
         for (let y = y0[a] + 3; y < y1[a]; y += 3) ctx.lineTo(rootX(a, y), y);
         ctx.lineTo(rootX(a, y1[a]), y1[a]);
         ctx.stroke();
       } else {
-        // The density reads as the root's girth.
+        // The density reads as the root's girth; past index 11, alternate 5 px bins draw a dashed stem.
         let max = 0;
         for (let b = 0; b < bins; b++) max = Math.max(max, hist[a * bins + b]);
         let prev = null;
         for (let b = 0; b < bins; b++) {
           const y = TOP + ((b + 0.5) / bins) * (H - TOP);
           if (y < y0[a] || y > y1[a]) continue;
-          if (prev !== null) {
+          if (prev !== null && (!repeated || (b & 1) === 0)) {
             ctx.lineWidth = 0.8 + 6 * Math.sqrt(hist[a * bins + b] / Math.max(1, max));
             ctx.beginPath();
             ctx.moveTo(rootX(a, prev), prev);
@@ -649,12 +668,14 @@
         }
       }
       // The root cap at the growing tip.
+      ctx.setLineDash([]);
       ctx.globalAlpha = 1;
       ctx.beginPath();
       ctx.arc(rootX(a, y1[a]), y1[a] + 2.5, 1.6, 0, Math.PI * 2);
       ctx.fillStyle = B.ink(a);
       ctx.fill();
     }
+    ctx.setLineDash([]);
     ctx.globalAlpha = 1;
   }
 
@@ -666,6 +687,7 @@
       for (const p of parents[i]) {
         if (author[p] !== author[i] || !inAncestry(p)) continue;
         ctx.strokeStyle = B.ink(author[i]);
+        ctx.setLineDash(author[i] >= 12 ? [6, 4] : []);
         ctx.beginPath();
         const ya = Y(p), yb = Y(i);
         ctx.moveTo(X(p), ya);
@@ -673,6 +695,7 @@
         ctx.lineTo(X(i), yb);
         ctx.stroke();
       }
+    ctx.setLineDash([]);
   }
 
   function hyphaPath(x0, y0, x1, y1) {
@@ -1051,16 +1074,24 @@
     ancestry = target;
   }
 
-  /** Pans a zoomed view so `target` sits inside the window. */
+  /** Pans a zoomed or horizontally scrolled view so `target` sits inside the window. */
   function frameKnot(target) {
-    if (!state.view || target < 0 || target >= N) return;
-    const [va, vb] = state.view;
-    const v = valueOf(target);
-    if (v < va || v > vb) {
-      const [ra, rb] = range();
-      const span = vb - va;
-      const na = Math.max(ra, Math.min(rb - span, v - span / 2));
-      state.view = [na, na + span];
+    if (target < 0 || target >= N) return;
+    if (state.view) {
+      const [va, vb] = state.view;
+      const v = valueOf(target);
+      if (v < va || v > vb) {
+        const [ra, rb] = range();
+        const span = vb - va;
+        const na = Math.max(ra, Math.min(rb - span, v - span / 2));
+        state.view = [na, na + span];
+      }
+    }
+    if (W > viewW && typeof win.scrollLeft === "number") {
+      const kx = colX[author[target]];
+      if (kx !== undefined && (kx < win.scrollLeft + 24 || kx > win.scrollLeft + viewW - 24)) {
+        win.scrollLeft = Math.max(0, Math.min(W - viewW, kx - viewW / 2));
+      }
     }
   }
 
@@ -1098,7 +1129,6 @@
     requestDraw();
   }
 
-  const win = $("window");
   const touches = new Map();
   let pinchDist = 0;
   let lastTap = { t: 0, x: 0, y: 0 };
@@ -1197,6 +1227,7 @@
   win.addEventListener(
     "wheel",
     (e) => {
+      if (!(e.ctrlKey || e.metaKey) && Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
       e.preventDefault();
       const [a, b] = view();
       const [ra, rb] = range();
@@ -1229,7 +1260,9 @@
     el.replaceChildren(B.h("div", { class: "who sc" }, who), B.h("div", { class: "what" }, t === undefined ? "…" : B.firstLine(t, 140)));
     el.hidden = false;
     const kx = X(i), ky = Y(i);
-    const left = kx > W - 380 ? kx - 360 : kx + 26;
+    const sx = typeof win.scrollLeft === "number" ? win.scrollLeft : 0;
+    const visRight = sx + (viewW || W);
+    const left = kx > visRight - 380 ? Math.max(sx + 8, kx - 360) : kx + 26;
     const top = Math.max(TOP + 6, Math.min(H - 90, ky - 46));
     el.style.left = `${left}px`;
     el.style.top = `${top}px`;

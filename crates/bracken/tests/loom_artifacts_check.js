@@ -33,6 +33,7 @@ class MockNode {
     this.hidden = false;
     this.disabled = false;
     this.className = "";
+    this.scrollLeft = 0;
     this.parentElement = null;
     this._text = "";
   }
@@ -93,7 +94,7 @@ class MockNode {
   }
   getBoundingClientRect() {
     if (this._rect) return this._rect;
-    if (this.attrs.id === "loom-canvas") return { left: 0, top: 0, width: 1000, height: 760 };
+    if (this.attrs.id === "loom-canvas" || this.attrs.id === "window") return { left: 0, top: 0, width: 1000, height: 760 };
     if (this.attrs.id === "gauge-canvas") return { left: 0, top: 0, width: 92, height: 760 };
     return { left: 0, top: 0, width: 48, height: 18 };
   }
@@ -132,7 +133,7 @@ function makeCanvas(id, rect = null) {
     closePath() { ops.push({ op: "close" }); },
     bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) { ops.push({ op: "bezier", x, y }); },
     arc(x, y, r) { ops.push({ op: "arc", x: tx + x * sx, y: ty + y * sy, r: r * sx }); },
-    setLineDash() {},
+    setLineDash(d) { ops.push({ op: "setLineDash", dash: d.slice() }); },
     fill(p) {
       if (p && p._d) ops.push({ op: "fillPath", d: p._d, x: tx, y: ty, r: sx, fillStyle: this.fillStyle });
       else ops.push({ op: "fill", fillStyle: this.fillStyle });
@@ -168,6 +169,7 @@ async function runLoom(fixture, hash = "", canvasHeight = 760) {
     "window", "surface", "surface-time", "flag", "to-flag", "play", "speed",
     "axis-time", "axis-causal", "zoom-in", "zoom-out", "zoom-reset", "key",
   ]) reg(id);
+  byId.get("window")._rect = { left: 0, top: 0, width: 1000, height: canvasHeight };
   const nav = new MockNode("nav");
   const docListeners = {};
   const winListeners = {};
@@ -738,7 +740,65 @@ async function main() {
   assert(side.textContent.includes("Hover a knot"), "clicking .side-close must deselect and show hint");
   assert(!hasAncestryVeil(), "clicking .side-close must clear pinned ancestry");
 
-  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, safe text preview, pinned ancestry, clickable lineage, hashchange, dense ancestry threshold, negative-Y band clamp, zoom controls, touch zoom, and side close all pass.");
+  // 12. Adaptive agent band: right margin reclaimed when labels suppressed, horizontal scroll for >12 agents,
+  // non-overlapping --col widths, ringed repeat headers, and dashed roots for agents >= 12.
+  // 12a. Dense fixture (2 agents, 1000px window, labels suppressed): rightmost agent reclaims the 160px margin (> 900px).
+  const denseAgents = byId.get("agents").children;
+  const denseRightX = parseFloat(denseAgents[1].style.left);
+  assert(denseRightX > 900, `expected dense right margin to be reclaimed (colX[1] > 900), got ${denseRightX}`);
+
+  // 12b. 25-agent fixture in a 1000px window: expands --loom-w for horizontal scroll (>= 1500px),
+  // keeps column spacing >= 60px with --col <= spacing, marks agents >= 12 with class 'repeat',
+  // and draws dashed roots (setLineDash [6, 4]) for agents >= 12.
+  const t25 = 1793000000000;
+  const ids25 = [], kind25 = [], author25 = [], parents25 = [], time25 = [], depth25 = [], tags25 = [];
+  for (let i = 0; i < 50; i++) {
+    ids25.push(hexId(20000 + i));
+    kind25.push("claim");
+    author25.push(i % 25);
+    parents25.push(i >= 25 ? [i - 25] : []);
+    time25.push(t25 + i * 10000);
+    depth25.push(i);
+    tags25.push([]);
+  }
+  const agents25 = Array.from({ length: 25 }, (_, a) => ({
+    agent: hexId(30000 + a),
+    name: `agent-${a}`,
+    contributions: 2,
+    first_ms: t25,
+    last_ms: t25 + 500000,
+  }));
+  const fix25 = {
+    route(url) {
+      if (url === "/api/ground") return { ground: hexId(88888), name: "25-agents", now_ms: t25 + 600000, contributions: 50, heads: [ids25[49]], cursor: ids25[49], policy: { min_passes: 1, validators: [] }, agents: agents25 };
+      if (url === "/api/graph") return { cursor: ids25[49], more: false, ids: ids25, kind: kind25, author: author25, parents: parents25, time: time25, depth: depth25, tags: tags25, refs: [], retracted: [], failed: [], retracts: [] };
+      if (url === "/api/status") return { policy: { min_passes: 1, validators: [] }, statuses: {}, conflicts: [] };
+      if (url.startsWith("/api/contributions")) {
+        return {
+          contributions: ids25.map((id, i) => ({ id, kind: "claim", author: agents25[i % 25].agent, author_name: agents25[i % 25].name, body: { statement: `c${i}`, tags: [] } })),
+          cursor: ids25[49],
+          more: false,
+        };
+      }
+      return undefined;
+    },
+  };
+  const run25 = await runLoom(fix25);
+  const loomW25 = parseFloat(run25.byId.get("window").style["--loom-w"]);
+  assert(loomW25 >= 1500, `expected 25 agents to widen --loom-w for horizontal scroll (>=1500), got ${loomW25}`);
+  const els25 = run25.byId.get("agents").children;
+  assert.strictEqual(els25.length, 25, "expected 25 agent headers");
+  const spacing25 = parseFloat(els25[1].style.left) - parseFloat(els25[0].style.left);
+  assert(spacing25 >= 60, `expected readable >=60px column spacing for 25 agents, got ${spacing25}`);
+  for (let a = 0; a < 25; a++) {
+    const colW = parseFloat(els25[a].style["--col"]);
+    assert(colW <= spacing25, `agent ${a} --col (${colW}) must not exceed column spacing (${spacing25})`);
+    assert.strictEqual(els25[a].className.includes("repeat"), a >= 12, `agent ${a} repeat class mismatch: ${els25[a].className}`);
+  }
+  const dashes25 = run25.loomCanvas._ops.filter((o) => o.op === "setLineDash" && o.dash.length > 0);
+  assert(dashes25.length >= 13, `expected dashed root strokes for agents 12..24 (>=13 calls), got ${dashes25.length}`);
+
+  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, safe text preview, pinned ancestry, clickable lineage, hashchange, dense ancestry threshold, negative-Y band clamp, zoom controls, touch zoom, side close, and adaptive agent band all pass.");
 }
 
 main().catch((err) => {
