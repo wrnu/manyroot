@@ -12,10 +12,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use bracken_tree::ContentHash;
+use bracken_tree::check::{Exit, RecordedTail};
 use bracken_tree::format::{
     DECISION_MEDIA_TYPE, Decision, Entry, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE,
     Manifest, Mode, PROPOSAL_MEDIA_TYPE, Proposal, Record, VERSION,
 };
+use bracken_tree::results::details;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -1781,4 +1783,388 @@ fn a_side_integrate_wouldnt_merge_is_not_text_before_the_view_cap() {
         [("gone.txt", "not_text"), ("link", "not_text"), ("nine.txt", "not_text")],
         "deleted on the line, a symlink, over 8 MiB"
     );
+}
+
+// ---- Objections, check results and box logs (PR (f)) ----
+
+const VAL: &str = "val";
+
+impl Weave {
+    /// The id a write prints with --json.
+    fn written(&self, args: &[&str]) -> String {
+        let mut args = args.to_vec();
+        args.push("--json");
+        self.id_of(&args, "id")
+    }
+
+    /// A check result on manifest artifact `artifact` for `method`, by `who`; `extra` adds lines to its
+    /// details, after the run's (a box log's `log <id> <hash>`).
+    fn result(&self, on: (&str, &str), method: &str, passed: bool, attempt: u64, who: &str, extra: &str) -> String {
+        let (manifest, artifact) = on;
+        let hash: ContentHash = manifest.parse().expect("a manifest's hash");
+        let exit = Exit::Code(if passed { 0 } else { 1 });
+        let mut d = details(&hash, attempt, &["true".to_owned()], &exit, &RecordedTail::Text("out".into()));
+        if !extra.is_empty() {
+            d = format!("{extra}\n{d}");
+        }
+        let verdict = if passed { "pass" } else { "fail" };
+        self.written(&["evidence", artifact, verdict, "--method", method, "--details", &d, "--as", who])
+    }
+}
+
+/// A Weave Ground whose main has a validator `val` and a check `test`, and a first decision `d1` with:
+/// results by the validator (a fail its pass replaced), by someone else, one retracted, and two naming
+/// box logs (one text, one not UTF-8); an evidence-backed, a goal-backed and a discussion objection to
+/// `d1`, and a retracted one; then `d2`, answering one objection by name, every one to `d1` by target,
+/// and the line's window; and a line `dev` started by merging main.
+struct Reviewed {
+    w: Weave,
+    line: String,
+    dev: String,
+    d1: String,
+    d2: String,
+    manifest: String,
+    artifact: String,
+    results: BTreeMap<&'static str, String>,
+    logs: (String, String),
+    objections: BTreeMap<&'static str, String>,
+    goal: String,
+    method: String,
+    d2_tree: (String, String),
+}
+
+fn with_reviews() -> Reviewed {
+    let w = Weave::new();
+    w.ok(&["id", "new", VAL]);
+    w.ok(&[
+        "weave",
+        "line",
+        "policy",
+        "main",
+        "--validator",
+        VAL,
+        "--check",
+        "test=true",
+        "--owner-decision",
+        OD,
+        "--as",
+        AS,
+    ]);
+    let line = w.main_line();
+    w.write(&[("a.txt", b"one\n")]);
+    w.commit("a");
+    let out = w.json(&["weave", "integrate", "--as", AS, "--note", "one", "--json"]);
+    let field = |k: &str| out[k].as_str().expect("a field").to_owned();
+    let (d1, manifest, artifact) = (field("decision"), field("manifest"), field("manifest_id"));
+    let method = w.json(&["weave", "green", "--json"])["heads"][0]["checks"][0]["method"]
+        .as_str()
+        .expect("the check's method")
+        .to_owned();
+    // dev starts from d1, before anything objects to it.
+    let dev = w.id_of(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS, "--json"], "line");
+    w.ok(&["weave", "line", "merge", "main", "--into", "dev", "--as", AS, "--json"]);
+    let mut results = BTreeMap::new();
+    results.insert("replaced", w.result((&manifest, &artifact), &method, false, 1, VAL, ""));
+    results.insert("counted", w.result((&manifest, &artifact), &method, true, 2, VAL, ""));
+    results.insert("other", w.result((&manifest, &artifact), &method, true, 1, AS, ""));
+    let retracted = w.result((&manifest, &artifact), &method, false, 2, AS, "");
+    w.ok(&["retract", &retracted, "--as", AS]);
+    results.insert("retracted", retracted);
+    let text = w.artifact("log.txt", format!("ran\n{HOSTILE}\nfailed at the end\n").as_bytes(), "text/plain");
+    let binary = w.artifact("log.bin", b"\xff\xfe not \x00 text", "text/plain");
+    let logged = |log: &str, attempt| {
+        w.result((&manifest, &artifact), &method, true, attempt, AS, &format!("log {log} {}", ContentHash::of(b"log")))
+    };
+    results.insert("text_log", logged(&text, 3));
+    results.insert("binary_log", logged(&binary, 4));
+    let mut objections = BTreeMap::new();
+    objections.insert("evidence", w.written(&["relate", &results["replaced"], "contradicts", &d1, "--as", VAL]));
+    let goal = w.written(&["claim", "keep it fast", "--tag", "weave-goal", "--as", AS]);
+    let goal_id = goal.clone();
+    w.ok(&["relate", &goal, "refines", &line, "--as", AS]);
+    objections.insert("goal", w.written(&["relate", &goal, "contradicts", &d1, "--note", "too slow", "--as", AS]));
+    let talk = w.written(&["claim", "I'd rather not", "--as", VAL]);
+    objections.insert("discussion", w.written(&["relate", &talk, "contradicts", &d1, "--note", HOSTILE, "--as", VAL]));
+    let gone = w.written(&["claim", "never mind", "--as", VAL]);
+    let gone = w.written(&["relate", &gone, "contradicts", &d1, "--as", VAL]);
+    w.ok(&["retract", &gone, "--as", VAL]);
+    objections.insert("retracted", gone);
+    w.write(&[("b.txt", b"two\n")]);
+    w.commit("b");
+    let by_name = format!("{}=fixed:by name", objections["discussion"]);
+    let by_target = format!("{d1}=fixed:by target");
+    let by_line = format!("{line}=fixed:the window");
+    let answers = ["--answer", &by_name, "--answer", &by_target, "--answer", &by_line];
+    let mut args = vec!["weave", "integrate", "--as", AS, "--note", "two", "--json"];
+    args.extend(answers);
+    let out = w.json(&args);
+    let field = |k: &str| out[k].as_str().expect("a field").to_owned();
+    let (d2, d2_tree) = (field("decision"), (field("manifest"), field("manifest_id")));
+    Reviewed {
+        w,
+        line,
+        dev,
+        d1,
+        d2,
+        manifest,
+        artifact,
+        results,
+        logs: (text, binary),
+        objections,
+        goal: goal_id,
+        method,
+        d2_tree,
+    }
+}
+
+/// A manifest's check results by anyone, each marked: a validator's counted pass, the fail it replaced,
+/// someone else's, a retracted one; the counted results under the line's policy; the decisions with it.
+#[test]
+fn a_manifests_results_are_marked_counted_replaced_retracted_or_not_a_validators() {
+    let r = with_reviews();
+    let v = view(&r.w.ground);
+    let m = v.api(&format!("/api/weave/manifest/{}", r.manifest));
+    assert_eq!(m["results"]["total"], 6);
+    let row = |id: &str| {
+        m["results"]["items"].as_array().expect("results").iter().find(|x| x["result"] == id).expect("listed").clone()
+    };
+    let marks = |name: &str| {
+        let x = row(&r.results[name]);
+        (x["validator"].as_bool(), x["replaced"].as_bool(), x["retracted"].as_bool(), x["passed"].as_bool())
+    };
+    assert_eq!(marks("counted"), (Some(true), Some(false), Some(false), Some(true)));
+    assert_eq!(marks("replaced"), (Some(true), Some(true), Some(false), Some(false)));
+    assert_eq!(marks("other"), (Some(false), None, Some(false), Some(true)));
+    assert_eq!(marks("retracted"), (Some(false), None, Some(true), Some(false)));
+    assert_eq!(row(&r.results["text_log"])["log"], r.logs.0.as_str());
+    assert_eq!(row(&r.results["counted"])["check"], "test");
+    let test = &m["counted"]["items"][0];
+    assert_eq!(test["check"], "test");
+    assert_eq!(test["passes"][0]["result"], r.results["counted"].as_str());
+    assert_eq!(test["replaced"][0]["result"], r.results["replaced"].as_str());
+    // d1, and dev's first decision, which a merge of main made with d1's tree.
+    assert_eq!(m["decisions"]["total"], 2);
+    assert!(m["decisions"]["items"].as_array().expect("decisions").iter().any(|d| d == r.d1.as_str()));
+    assert_eq!(v.api(&format!("/api/weave/manifest/{}?list=results&limit=2", r.manifest))["more"], true);
+    // One result's page has its details; the default line judges its marks.
+    let one = v.api(&format!("/api/weave/result/{}", r.results["text_log"]));
+    assert!(one["details"].as_str().expect("details").contains("attempt 3"));
+    assert_eq!((one["validator"].as_bool(), one["line"].as_str()), (Some(false), Some(r.line.as_str())));
+    v.refused(&format!("/api/weave/result/{}", r.d1), 404);
+    v.refused(&format!("/api/weave/manifest/{}", r.artifact), 404);
+    v.refused(&format!("/api/weave/manifest/blake3:{}", "0".repeat(64)), 404);
+}
+
+/// A box log is shown as text when it is UTF-8 without NUL, its last 64 KiB; otherwise named with its
+/// size. Only a `text/plain` artifact is a log.
+#[test]
+fn a_box_log_is_text_only_if_it_is_and_never_anything_else() {
+    let r = with_reviews();
+    let big = r.w.artifact("big.txt", &[b"x".repeat(70_000), b"\nthe end\n".to_vec()].concat(), "text/plain");
+    let v = view(&r.w.ground);
+    let text = v.api(&format!("/api/weave/log-artifact/{}", r.logs.0));
+    assert_eq!(text["shown"], "text");
+    assert!(text["text"].as_str().expect("text").contains(HOSTILE), "the page marks it, the API keeps it");
+    let binary = v.api(&format!("/api/weave/log-artifact/{}", r.logs.1));
+    assert_eq!((binary["shown"].as_str(), binary["size"].as_u64()), (Some("binary"), Some(13)));
+    assert!(binary.get("text").is_none());
+    let tail = v.api(&format!("/api/weave/log-artifact/{big}"));
+    let t = tail["text"].as_str().expect("text");
+    assert!(t.ends_with("the end\n") && t.len() == 64 * 1024 && tail["cut"] == true, "the last 64 KiB");
+    v.refused(&format!("/api/weave/log-artifact/{}", r.artifact), 404);
+    v.refused(&format!("/api/weave/log-artifact/{}", r.d1), 404);
+}
+
+/// A line's objections: each basis; a retracted one marked; the answers naming one, its target and the
+/// line; `state` splitting open from the rest as `weave review` does; and a line that branched from the
+/// objected decision lists them alike, with the same open count its own page gives.
+#[test]
+fn a_lines_objections_show_each_basis_and_every_kind_of_answer() {
+    let r = with_reviews();
+    // Three objections to d2, which nothing answers yet: open, one of each basis.
+    let on = (r.d2_tree.0.as_str(), r.d2_tree.1.as_str());
+    let failed = r.w.result(on, &r.method, false, 1, VAL, "");
+    let mut open = BTreeMap::new();
+    open.insert(r.w.written(&["relate", &failed, "contradicts", &r.d2, "--as", VAL]), "evidence-backed");
+    open.insert(r.w.written(&["relate", &r.goal, "contradicts", &r.d2, "--as", AS]), "goal-backed");
+    let late = r.w.written(&["claim", "and this", "--as", VAL]);
+    open.insert(r.w.written(&["relate", &late, "contradicts", &r.d2, "--as", VAL]), "discussion");
+    let review = r.w.json(&["weave", "review", "--json"]);
+    let mut cli_open: Vec<&str> =
+        review["open"].as_array().expect("open").iter().filter_map(|o| o["objection"].as_str()).collect();
+    cli_open.sort_unstable();
+    let v = view(&r.w.ground);
+    let all = v.api(&format!("/api/weave/objections/{}", r.line));
+    assert_eq!(all["total"], 7, "{all}");
+    let row = |id: &str| {
+        all["items"].as_array().expect("items").iter().find(|o| o["objection"] == id).expect("listed").clone()
+    };
+    assert_eq!(row(&r.objections["retracted"])["retracted"], true);
+    assert_eq!(row(&r.objections["discussion"])["note"], HOSTILE);
+    assert_eq!(row(&r.objections["discussion"])["answers"][0]["decision"], r.d2.as_str(), "answered by name");
+    assert_eq!(row(&r.objections["discussion"])["answers"][0]["disposition"], "fixed");
+    assert_eq!(row(&r.objections["evidence"])["answers_total"], 0, "only a target answer names it");
+    let to_d1 = all["target_answers"]
+        .as_array()
+        .expect("by target")
+        .iter()
+        .find(|t| t["target"]["decision"] == r.d1.as_str())
+        .expect("d1");
+    assert_eq!(to_d1["answers"][0]["decision"], r.d2.as_str(), "answered by target");
+    assert_eq!(all["line_answers"], 1, "answered line-wide");
+    let open_page = v.api(&format!("/api/weave/objections/{}?state=open", r.line));
+    let mut view_open: Vec<&str> =
+        open_page["items"].as_array().expect("items").iter().filter_map(|o| o["objection"].as_str()).collect();
+    view_open.sort_unstable();
+    assert_eq!(view_open, cli_open, "open is what weave review lists");
+    assert_eq!(view_open, open.keys().map(String::as_str).collect::<Vec<_>>());
+    for (id, basis) in &open {
+        let o = row(id);
+        assert_eq!((o["basis"]["kind"].as_str(), o["open"].as_bool()), (Some(*basis), Some(true)), "{o}");
+        assert!(!o["allowed"].as_array().expect("allowed").is_empty());
+    }
+    let discussion = open.iter().find(|(_, b)| **b == "discussion").expect("one").0;
+    assert!(row(discussion)["allowed"].as_array().expect("allowed").iter().any(|d| d == "overridden"));
+    let other = v.api(&format!("/api/weave/objections/{}?state=other", r.line));
+    assert_eq!(other["total"], 4);
+    assert_eq!(v.api(&format!("/api/weave/line/{}", r.line))["open_objections"], 3);
+    // d2's manifest page lists what a decision using it unchanged would answer.
+    let m = v.api(&format!("/api/weave/manifest/{}", r.d2_tree.0));
+    assert!(m["objections"]["items"].is_array(), "{m}");
+    // dev branched from main: d1 is in its heads' ancestry, so its objections are dev's too.
+    let dev = v.api(&format!("/api/weave/objections/{}", r.dev));
+    let ids = |page: &Value| -> Vec<String> {
+        page["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .map(|o| o["objection"].as_str().expect("id").to_owned())
+            .collect()
+    };
+    // d1 is in dev's heads' ancestry, d2 isn't: dev lists the objections to d1, as main does.
+    let to_d1: Vec<String> = all["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .filter(|o| o["target"]["decision"] == r.d1.as_str())
+        .map(|o| o["objection"].as_str().expect("id").to_owned())
+        .collect();
+    assert_eq!(to_d1.len(), 4);
+    assert_eq!(ids(&dev), to_d1);
+    let dev_open = v.api(&format!("/api/weave/objections/{}?state=open", r.dev))["total"].clone();
+    assert_eq!(v.api(&format!("/api/weave/line/{}", r.dev))["open_objections"], dev_open, "counted and listed alike");
+    let page = v.api(&format!("/api/weave/objections/{}?limit=2", r.line));
+    let next = v.api(&format!("/api/weave/objections/{}?after={}&limit=2", r.line, ids(&page)[1]));
+    assert_eq!(ids(&next), ids(&all)[2..4]);
+    v.refused(&format!("/api/weave/objections/{}?limit=201", r.line), 400);
+    v.refused(&format!("/api/weave/objections/{}?state=closed", r.line), 400);
+}
+
+/// Under a diverged policy nothing is open or counted: those lists say so, and the rest still answer.
+#[test]
+fn a_diverged_policy_has_no_open_objections_or_counted_results() {
+    let r = with_reviews();
+    let me = r.w.json(&["id", "list", "--json"])[0]["agent"].as_str().expect("an agent").to_owned();
+    for max_known in [1, 2] {
+        let next = Line {
+            v: VERSION,
+            name: "main".into(),
+            integrators: vec![me.parse().expect("a key")],
+            validators: vec![],
+            goal_setters: vec![],
+            checks: BTreeMap::new(),
+            executors: BTreeMap::new(),
+            guardrails: Guardrails { max_known, max_age: 0, protected: vec![] },
+            owner_decision: Some(OD.into()),
+        };
+        let id = r.w.artifact(&format!("v{max_known}.cbor"), &next.encode(), LINE_MEDIA_TYPE);
+        r.w.ok(&["relate", &id, "supersedes", &r.line, "--as", AS]);
+    }
+    let v = view(&r.w.ground);
+    let all = v.api(&format!("/api/weave/objections/{}", r.line));
+    assert_eq!(all["total"], 4);
+    assert!(all["items"][0]["open"].is_null());
+    v.refused(&format!("/api/weave/objections/{}?state=open", r.line), 404);
+    let m = v.api(&format!("/api/weave/manifest/{}", r.manifest));
+    assert!(m["counted"].is_null() && m["objections"].is_null(), "{m}");
+    assert!(m["results"]["items"][0]["validator"].is_null(), "no policy to judge it by");
+    v.refused(&format!("/api/weave/manifest/{}?list=counted", r.manifest), 404);
+}
+
+/// Writes `count` passing results on a manifest, 4 writers at once. A write that meets another half
+/// done ("an ancestor is missing") is tried again.
+fn many_results(w: &Weave, on: (&str, &str), count: usize) {
+    let method = format!("test blake3:{}", "0".repeat(64));
+    let hash: ContentHash = on.0.parse().expect("a manifest's hash");
+    std::thread::scope(|s| {
+        for k in 0..4 {
+            let method = &method;
+            s.spawn(move || {
+                for i in (k..count).step_by(4) {
+                    let tail = RecordedTail::Text("ok".into());
+                    let d = details(&hash, i as u64 + 1, &["true".to_owned()], &Exit::Code(0), &tail);
+                    let args = ["evidence", on.1, "pass", "--method", method, "--details", &d, "--as", AS];
+                    let wrote = (0..10).any(|_| w.run(&args).status.success());
+                    assert!(wrote, "result {i} wasn't written");
+                }
+            });
+        }
+    });
+}
+
+/// 2,001 results on one manifest page 2,000 at most, then the last.
+#[test]
+fn two_thousand_and_one_results_page() {
+    let w = Weave::new();
+    w.write(&[("a.txt", b"one\n")]);
+    w.commit("a");
+    let out = w.json(&["weave", "integrate", "--as", AS, "--note", "one", "--json"]);
+    let (manifest, artifact) = (out["manifest"].as_str().expect("a hash"), out["manifest_id"].as_str().expect("an id"));
+    many_results(&w, (manifest, artifact), 2_001);
+    let v = view(&w.ground);
+    let first = v.api(&format!("/api/weave/manifest/{manifest}?list=results&limit=2000"));
+    assert_eq!((first["total"].as_u64(), first["more"].as_bool()), (Some(2_001), Some(true)));
+    let items = first["items"].as_array().expect("results");
+    assert_eq!(items.len(), 2_000);
+    let last = items[1_999]["result"].as_str().expect("an id");
+    let rest = v.api(&format!("/api/weave/manifest/{manifest}?list=results&after={last}&limit=2000"));
+    assert_eq!((rest["items"].as_array().map(Vec::len), rest["more"].as_bool()), (Some(1), Some(false)));
+    v.refused(&format!("/api/weave/manifest/{manifest}?list=results&limit=2001"), 400);
+}
+
+/// Many lines sharing one manifest, with many objections to it: each line lists them all, and what the
+/// view keeps of each line's objections is their ids and bases, never their notes, within its budget.
+#[test]
+fn many_lines_sharing_a_manifest_keep_their_objections_within_the_budget() {
+    let w = Weave::new();
+    w.write(&[("a.txt", b"one\n")]);
+    w.commit("a");
+    let out = w.json(&["weave", "integrate", "--as", AS, "--note", "one", "--json"]);
+    let (manifest, artifact) =
+        (out["manifest"].as_str().expect("a hash").to_owned(), out["manifest_id"].as_str().expect("an id").to_owned());
+    let lines: Vec<String> = (0..8)
+        .map(|i| {
+            let name = format!("l{i}");
+            let id = w.id_of(&["weave", "line", "create", &name, "--owner-decision", OD, "--as", AS, "--json"], "line");
+            w.ok(&["weave", "line", "merge", "main", "--into", &name, "--as", AS, "--json"]);
+            id
+        })
+        .collect();
+    let why = w.written(&["claim", "no", "--as", AS]);
+    for i in 0..100 {
+        let note = format!("{i} {}", "n".repeat(3_000));
+        w.ok(&["relate", &why, "contradicts", &artifact, "--note", &note, "--as", AS]);
+    }
+    let v = view(&w.ground);
+    for line in &lines {
+        let page = v.api(&format!("/api/weave/objections/{line}?limit=200"));
+        assert_eq!(page["total"], 100, "{line}");
+        assert_eq!(page["items"][0]["target"]["manifest"], manifest.as_str());
+        assert!(page["items"][0]["note"].as_str().expect("a note").len() >= 3_000 - 8);
+    }
+    let derived = &v.api("/api/weave")["derived"];
+    let bytes = derived["bytes"].as_u64().expect("bytes");
+    assert!(bytes <= derived["budget"].as_u64().expect("a budget"));
+    // 8 lines' 100 objections each, kept without their 3,000-byte notes: well under 8 x 100 x 3,000.
+    assert!(bytes < 8 * 100 * 1_000, "{bytes} bytes kept");
 }

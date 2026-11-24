@@ -36,8 +36,8 @@ use serde_json::{Map, Value, json};
 use crate::Names;
 use crate::view::Slots;
 use crate::weave::{
-    ListedLine, counted_json, decision_json, file_value_json, green_json, line_row_json, listed_lines, problem_json,
-    review_json,
+    ListedLine, counted_json, decision_json, file_value_json, green_json, line_row_json, listed_lines, open_json,
+    problem_json, review_json, target_json,
 };
 
 /// The most bytes of `weave-root` read: an AgentId in hex is 64, and a newline.
@@ -80,6 +80,8 @@ const PREVIEW_RANGES: usize = 50;
 const ID_DIGITS: usize = 8;
 /// The most bytes of a file's text the file page shows; a larger file is named, not shown (section 4).
 const FILE_TEXT: usize = 1 << 20;
+/// The most bytes of a box log the log page shows: its last ones (section 4, Caps).
+const LOG_TEXT: usize = 64 * 1024;
 
 /// A refusal: the status and its reason.
 pub(crate) type Fail = (u16, String);
@@ -114,9 +116,35 @@ pub(crate) struct State {
     /// Every proposal artifact whose payload decodes, retracted or invalid too, by its payload's line,
     /// ascending: `Lines` lists only valid ones per line (section 3, `records`).
     proposals: HashMap<ContributionId, Vec<ContributionId>>,
+    /// Every answer a qualifying decision gives, by what it names, keyed as `crates/tree` resolves an answer
+    /// (section 3, `answers`): each with the decision and its disposition, in log order.
+    answers: HashMap<Answered, Vec<(ContributionId, &'static str)>>,
     /// Answers of the reads that sort the graph or walk a line, by key, oldest first, each with its
     /// serialized size; at most [`DERIVED_BYTES`] in all.
     derived: Mutex<Derived>,
+}
+
+/// What a decision's answer names, as `crates/tree` resolves it: an objection; every objection to a decision,
+/// a manifest (by its hash) or a proposal (by its line and change); or every objection in its own line's
+/// window.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Answered {
+    Objection(ContributionId),
+    Decision(ContributionId),
+    Manifest(ContentHash),
+    Proposal(ContributionId, ContentHash),
+    Line(ContributionId),
+}
+
+impl Answered {
+    /// The key answers to every objection to `target` are kept under.
+    fn of(target: &Target) -> Answered {
+        match target {
+            Target::Decision(d) => Answered::Decision(*d),
+            Target::Manifest(_, hash) => Answered::Manifest(*hash),
+            Target::Proposal { line, change, .. } => Answered::Proposal(*line, *change),
+        }
+    }
 }
 
 /// The derived answers kept, oldest first, bounded by their serialized bytes.
@@ -256,6 +284,29 @@ impl Weave {
         for list in proposals.values_mut() {
             list.sort();
         }
+        let objection_ids: std::collections::HashSet<ContributionId> =
+            lines.objections().list().iter().map(|o| o.id).collect();
+        let mut answers: HashMap<Answered, Vec<(ContributionId, &'static str)>> = HashMap::new();
+        for id in logs.values().flatten() {
+            let d = &lines.decision(id).expect("logged decisions exist").decision;
+            for a in &d.answers {
+                let named = a.objection;
+                let key = if objection_ids.contains(&named) {
+                    Answered::Objection(named)
+                } else if lines.decision(&named).is_some() {
+                    Answered::Decision(named)
+                } else if let Some(hash) = index.manifest_named(&named) {
+                    Answered::Manifest(hash)
+                } else if let Some(p) = lines.proposal_named(&named) {
+                    Answered::Proposal(p.line, p.change)
+                } else if lines.line(&named).is_some() {
+                    Answered::Line(named)
+                } else {
+                    continue;
+                };
+                answers.entry(key).or_default().push((*id, a.disposition.as_str()));
+            }
+        }
         let checks = Mutex::new(Checks::build(g, &index, &lines));
         let reviews = Reviews::build(&index, &lines);
         Weave::Built(Box::new(State {
@@ -269,6 +320,7 @@ impl Weave {
             reviews,
             successors,
             proposals,
+            answers,
             derived: Mutex::new(Derived::default()),
         }))
     }
@@ -335,6 +387,10 @@ pub(crate) fn takes(path: &str) -> &'static [&'static str] {
         &["status", "after", "limit"]
     } else if rest.starts_with("/proposal/") {
         &["path", "list", "after", "limit"]
+    } else if rest.starts_with("/objections/") {
+        &["state", "after", "limit"]
+    } else if rest.starts_with("/manifest/") {
+        &["line", "list", "after", "limit"]
     } else {
         &[]
     }
@@ -640,6 +696,15 @@ pub(crate) fn route(
         at.proposals(line, &p, query)?
     } else if let Some(id) = rest.strip_prefix("/proposal/") {
         at.proposal(id, &p, query)?
+    } else if let Some(line) = rest.strip_prefix("/objections/") {
+        at.objections(line, &p, query)?
+    } else if let Some(hash) = rest.strip_prefix("/manifest/") {
+        at.manifest(hash, &p, query)?
+    } else if let Some(id) = rest.strip_prefix("/result/") {
+        at.result(id)?
+    } else if let Some(id) = rest.strip_prefix("/log-artifact/") {
+        // A box log's text is capped at LOG_TEXT, as its own text.
+        return at.log_artifact(id);
     } else if let Some(line) = rest.strip_prefix("/history/") {
         at.history(line, &p, query)?
     } else if rest == "/diff" {
@@ -792,6 +857,10 @@ impl Ctx<'_> {
             None => Value::Null,
         };
         let (root, root_name) = self.agent(&self.s.root);
+        let derived = {
+            let d = self.s.derived.lock().unwrap_or_else(|p| p.into_inner());
+            (d.bytes, d.kept.len())
+        };
         Ok(json!({
             "weave": true,
             "marker": self.s.marker,
@@ -804,6 +873,8 @@ impl Ctx<'_> {
             "problems": embedded(&at, NESTED_ROW_BYTES, problem),
             "unreadable": embedded(unreadable, ROW_BYTES, unreadable_row),
             "ignored_versions": embedded(ignored, ROW_BYTES, |i| json!(i)),
+            // What the derived answers hold now, against their budget (section 3).
+            "derived": {"bytes": derived.0, "entries": derived.1, "budget": DERIVED_BYTES},
         }))
     }
 
@@ -1509,7 +1580,7 @@ impl Ctx<'_> {
     fn proposal_objections(&self, id: &ContributionId) -> Result<Value, Fail> {
         self.derived(format!("proposal objections {id}"), || {
             match self.s.lines.proposal_objections(self.g, &self.s.index, id) {
-                Some(list) => Value::Array(list.iter().map(|o| crate::weave::open_json(o, self.names)).collect()),
+                Some(list) => Value::Array(list.iter().map(|o| open_json(o, self.names)).collect()),
                 None => Value::Null,
             }
         })
@@ -1673,6 +1744,302 @@ impl Ctx<'_> {
                "lines": lines, "ranges": shown, "ranges_total": ranges.len(),
                "resolutions": rows, "resolutions_total": offered.len(),
                "settled_by": settled.map(|(rid, _)| *rid), "settled_by_held": settled_by_held})
+    }
+}
+
+// ---- Objections, check results and box logs (PR (f)) ----
+
+impl Ctx<'_> {
+    /// The line's objections (section 4, *Which objections a line has*), each with what only the objection
+    /// reads give: whether it is open, and an open one's basis and allowed dispositions. Kept per line;
+    /// `open` is null for every one when the line has no single current policy.
+    fn line_objections(&self, line: &ContributionId) -> Result<Value, Fail> {
+        self.derived(format!("objections {line}"), || {
+            let lines = &self.s.lines;
+            let mut ancestry = std::collections::HashSet::new();
+            for head in lines.heads(line) {
+                ancestry.extend(lines.decision_ancestry(&head));
+            }
+            let mut manifests: std::collections::HashSet<ContentHash> =
+                ancestry.iter().filter_map(|d| lines.decision(d)).map(|d| d.decision.manifest).collect();
+            let empty = Vec::new();
+            let on_line = self.s.proposals.get(line).unwrap_or(&empty);
+            manifests.extend(on_line.iter().filter_map(|p| lines.proposal_named(p)).map(|p| p.manifest));
+            let open: Option<HashMap<ContributionId, Value>> = lines
+                .open_objections(self.g, &self.s.index, line)
+                .map(|list| list.iter().map(|o| (o.objection.id, open_json(o, self.names))).collect());
+            let rows: Vec<Value> = lines
+                .objections()
+                .list()
+                .iter()
+                .filter(|o| match &o.target {
+                    Target::Decision(d) => ancestry.contains(d),
+                    Target::Proposal { line: l, .. } => l == line,
+                    Target::Manifest(_, hash) => manifests.contains(hash),
+                })
+                .map(|o| {
+                    let mine = open.as_ref().map(|open| open.get(&o.id));
+                    json!({"objection": o.id, "open": mine.map(|m| m.is_some()),
+                           "basis": mine.flatten().map(|m| m["basis"].clone()),
+                           "allowed": mine.flatten().map(|m| m["allowed"].clone())})
+                })
+                .collect();
+            json!(rows)
+        })
+    }
+
+    /// `/api/weave/objections/<line>?state&after&limit`: the line's objections, ascending by id, `state`
+    /// filtering (`open`, `other`, `all`), each with its author, note, target, whether it's retracted, an
+    /// open one's basis and allowed dispositions, and the answers naming it (5 and their total); then, once
+    /// a page, the answers naming each target on it, and the count of line-wide answers.
+    fn objections(&self, given: &str, p: &Paging, query: &HashMap<String, String>) -> Result<Value, Fail> {
+        let line = self.line_of(given)?;
+        p.nested()?;
+        let state = query.get("state").map_or("all", String::as_str);
+        if !["open", "other", "all"].contains(&state) {
+            return fail(400, "state is one of open, other, all");
+        }
+        let scope = self.line_objections(&line)?;
+        let all = scope.as_array().cloned().unwrap_or_default();
+        let policy = all.first().is_none_or(|o| !o["open"].is_null());
+        if state != "all" && !policy {
+            return fail(404, "this line has no single current policy, so no objection is open or not");
+        }
+        let rows: Vec<Value> = all
+            .into_iter()
+            .filter(|o| match state {
+                "open" => o["open"] == true,
+                "other" => o["open"] == false,
+                _ => true,
+            })
+            .collect();
+        let key = |o: &Value| o["objection"].as_str().unwrap_or_default().to_owned();
+        let (shown, more) = page(&rows, key, p.after, p.limit)?;
+        let list = self.s.lines.objections().list();
+        let reviews: HashMap<ContributionId, &bracken_tree::ground::Review> = {
+            let ids: std::collections::HashSet<String> = shown.iter().map(key).collect();
+            self.s.index.reviews().iter().filter(|r| ids.contains(&r.id.to_hex())).map(|r| (r.id, r)).collect()
+        };
+        let answered = |key: &Answered| {
+            let all = self.s.answers.get(key).map_or(&[][..], Vec::as_slice);
+            let five: Vec<Value> =
+                all.iter().take(NESTED).map(|(d, how)| json!({"decision": d, "disposition": how})).collect();
+            (five, all.len())
+        };
+        let mut targets: Vec<Target> = Vec::new();
+        let items: Vec<Value> = shown
+            .iter()
+            .filter_map(|o| {
+                let id: ContributionId = o["objection"].as_str()?.parse().ok()?;
+                let at = list.binary_search_by_key(&id, |x| x.id).ok()?;
+                let ob = &list[at];
+                if !targets.contains(&ob.target) {
+                    targets.push(ob.target);
+                }
+                let review = reviews.get(&id);
+                let (answers, answers_total) = answered(&Answered::Objection(id));
+                let (author, author_name) = self.agent(&ob.author);
+                let mut row = json!({"objection": id, "author": author, "author_name": author_name, "from": ob.from,
+                                     "target": target_json(&ob.target), "note": review.map(|r| r.note.clone()),
+                                     "retracted": review.is_some_and(|r| r.retracted), "open": o["open"],
+                                     "basis": o["basis"], "allowed": o["allowed"], "answers": answers,
+                                     "answers_total": answers_total});
+                if let Some(b) = row.get_mut("basis") {
+                    cut_strings(b, Cap::Bytes(NESTED_BYTES), &[]);
+                }
+                Some(fit(capped(row, LIST_TEXT), NESTED_ROW_BYTES))
+            })
+            .collect();
+        let target_answers: Vec<Value> = targets
+            .iter()
+            .map(|t| {
+                let (answers, total) = answered(&Answered::of(t));
+                json!({"target": target_json(t), "answers": answers, "answers_total": total})
+            })
+            .collect();
+        Ok(json!({"list": "objections", "line": line, "state": state, "items": items, "total": rows.len(),
+                  "more": more, "target_answers": target_answers,
+                  "line_answers": self.s.answers.get(&Answered::Line(line)).map_or(0, Vec::len)}))
+    }
+
+    /// A line's one current policy, if it has one.
+    fn policy_of(&self, line: &ContributionId) -> Option<(ContributionId, &bracken_tree::format::Line)> {
+        let lines = &self.s.lines;
+        match lines.current_versions(line).as_slice() {
+            [one] => lines.version(one).map(|v| (*one, &v.policy)),
+            _ => None,
+        }
+    }
+
+    /// A check result as a row: its author, check, verdict and attempt, whether it's retracted, whether a
+    /// validator of `policy` wrote it and, if so, whether a later attempt replaced it; its details cut to
+    /// `details_bytes`, and the box log its details name.
+    fn result_json(
+        &self,
+        r: &bracken_tree::results::CheckResult,
+        policy: Option<&bracken_tree::format::Line>,
+        details_bytes: usize,
+    ) -> Value {
+        let details = match self.g.get(&r.id).map(|c| c.body()) {
+            Some(Body::Evidence { details, .. }) => details.clone(),
+            _ => String::new(),
+        };
+        let log = details.lines().find_map(|l| {
+            let id = l.strip_prefix("log ")?.split(' ').next()?;
+            let id: ContributionId = id.parse().ok()?;
+            matches!(self.g.get(&id).map(|c| c.body()), Some(Body::Artifact { media_type, .. }) if media_type == "text/plain")
+                .then_some(id)
+        });
+        let validator = policy.map(|p| p.validators.contains(&r.author));
+        let replaced = (validator == Some(true)).then(|| {
+            let checks = self.s.checks.lock().unwrap_or_else(|p| p.into_inner());
+            !checks.latest(&r.author, &r.manifest, &r.method).contains(&r.id)
+        });
+        let mut v = json!({"result": r.id, "author": r.author.to_string(), "author_name": self.names.display(&r.author),
+                           "manifest": r.manifest.to_string(), "method": r.method,
+                           "check": r.method.split(' ').next().unwrap_or_default(), "passed": r.passed,
+                           "attempt": r.attempt, "retracted": r.retracted, "validator": validator,
+                           "replaced": replaced, "details": details, "log": log});
+        if cut_strings(&mut v["details"], Cap::Bytes(details_bytes), &[]) {
+            v["details_cut"] = json!(true);
+        }
+        v
+    }
+
+    /// `/api/weave/manifest/<hash>?line&list&after&limit`: a manifest's check results by anyone, ascending by
+    /// id; the results counted under `line`'s current policy (default the default line); its reviews; the
+    /// objections to integrating it unchanged; and the decisions and proposals with it (section 4).
+    fn manifest(&self, given: &str, p: &Paging, query: &HashMap<String, String>) -> Result<Value, Fail> {
+        p.check(&["results", "counted", "reviews", "objections", "decisions", "proposals"], query)?;
+        let hash: ContentHash = given.parse().map_err(|_| (404, format!("{given} isn't a content hash")))?;
+        if self.s.index.manifest(&hash).is_none() {
+            return fail(404, format!("this replica holds no valid manifest with content hash {hash}"));
+        }
+        let lines = &self.s.lines;
+        let line = match query.get("line") {
+            Some(l) => self.line_of(l)?,
+            None => lines.default_line().ok_or_else(|| (404, "this replica has no default line".to_owned()))?,
+        };
+        let policy = self.policy_of(&line);
+        let results: Vec<&bracken_tree::results::CheckResult> =
+            self.s.index.check_results().iter().filter(|r| r.manifest == hash).collect();
+        let result_row =
+            |r: &&bracken_tree::results::CheckResult| self.result_json(r, policy.map(|(_, p)| p), LIST_TEXT);
+        let counted: Option<Vec<Value>> = policy.map(|(version, pol)| {
+            let checks = self.s.checks.lock().unwrap_or_else(|p| p.into_inner());
+            checks
+                .counted_on_manifest(self.g, &version, pol, &hash)
+                .iter()
+                .map(|c| nest(counted_json(c, &checks, self.names), &["passes", "fails", "replaced"]))
+                .collect()
+        });
+        let reviews = self.s.reviews.of_manifest(&hash);
+        let review_row = |(r, t): &(&bracken_tree::ground::Review, Target)| review_json(r, t, self.names);
+        let decisions: Vec<ContributionId> = {
+            let mut all: Vec<ContributionId> = self
+                .s
+                .logs
+                .values()
+                .flatten()
+                .filter(|d| lines.decision(d).is_some_and(|r| r.decision.manifest == hash))
+                .copied()
+                .collect();
+            all.sort();
+            all
+        };
+        let proposals: Vec<ContributionId> = {
+            let mut all: Vec<ContributionId> = self
+                .s
+                .proposals
+                .values()
+                .flatten()
+                .filter(|id| lines.proposal_named(id).is_some_and(|x| x.manifest == hash))
+                .copied()
+                .collect();
+            all.sort();
+            all
+        };
+        let id_row = |id: &ContributionId| json!(id);
+        let objections = || -> Result<Option<Vec<Value>>, Fail> {
+            let v = self.derived(format!("manifest objections {line} {hash}"), || {
+                match lines.manifest_objections(self.g, &self.s.index, &line, &hash) {
+                    Some(list) => Value::Array(list.iter().map(|o| open_json(o, self.names)).collect()),
+                    None => Value::Null,
+                }
+            })?;
+            Ok(v.as_array().cloned())
+        };
+        let counted_row = |c: &Value| c.clone();
+        let no_policy = || (404, "this line has no single current policy, so nothing is counted or open".to_owned());
+        match p.list {
+            Some("results") => return listed("results", &results, |r| r.id.to_hex(), result_row, ROW_BYTES, p),
+            Some("counted") => {
+                p.nested()?;
+                let counted = counted.ok_or_else(no_policy)?;
+                let key = |c: &Value| c["check"].as_str().unwrap_or_default().to_owned();
+                return listed("counted", &counted, key, counted_row, NESTED_ROW_BYTES, p);
+            }
+            Some("reviews") => return listed("reviews", &reviews, |(r, _)| r.id.to_hex(), review_row, ROW_BYTES, p),
+            Some("objections") => {
+                let list = objections()?.ok_or_else(no_policy)?;
+                let key = |o: &Value| o["objection"].as_str().unwrap_or_default().to_owned();
+                return listed("objections", &list, key, Value::clone, ROW_BYTES, p);
+            }
+            Some("decisions") => return listed("decisions", &decisions, |d| d.to_hex(), id_row, ROW_BYTES, p),
+            Some("proposals") => return listed("proposals", &proposals, |d| d.to_hex(), id_row, ROW_BYTES, p),
+            _ => {}
+        }
+        let objections = objections()?;
+        Ok(json!({
+            "manifest": hash.to_string(),
+            "line": line,
+            "line_name": lines.line(&line).map(|l| l.policy.name.clone()),
+            "results": embedded(&results, ROW_BYTES, result_row),
+            "counted": counted.as_ref().map(|c| embedded(c, NESTED_ROW_BYTES, counted_row)),
+            "reviews": embedded(&reviews, ROW_BYTES, review_row),
+            "objections": objections.as_ref().map(|o| embedded(o, ROW_BYTES, Value::clone)),
+            "decisions": embedded(&decisions, ROW_BYTES, id_row),
+            "proposals": embedded(&proposals, ROW_BYTES, id_row),
+        }))
+    }
+
+    /// `/api/weave/result/<id>`: one check result, with its details up to 64 KiB (the answer's own cap).
+    fn result(&self, given: &str) -> Result<Value, Fail> {
+        let id = resolve(self.g, given)?;
+        let results = self.s.index.check_results();
+        let Some(r) = results.iter().find(|r| r.id == id) else {
+            let kind = self.g.get(&id).map(kind_of).unwrap_or_default();
+            return fail(404, format!("{} is a {kind}, not a check result on a manifest", id.short()));
+        };
+        let policy = self.s.lines.default_line().and_then(|l| self.policy_of(&l));
+        let mut v = self.result_json(r, policy.map(|(_, p)| p), PAGE_TEXT);
+        // Its validator mark is judged under the default line's current policy.
+        v["line"] = json!(self.s.lines.default_line());
+        Ok(v)
+    }
+
+    /// `/api/weave/log-artifact/<id>`: a `text/plain` artifact's text, its last [`LOG_TEXT`] (a box log's
+    /// failure is at its end), shown only if it is UTF-8 without NUL; otherwise named with its size. Its
+    /// bytes are another agent's output: the page shows them as text, never runs them.
+    fn log_artifact(&self, given: &str) -> Result<Value, Fail> {
+        let id = resolve(self.g, given)?;
+        let Some(Body::Artifact { media_type, content, .. }) = self.g.get(&id).map(|c| c.body()) else {
+            let kind = self.g.get(&id).map(kind_of).unwrap_or_default();
+            return fail(404, format!("{} is a {kind}, not a log", id.short()));
+        };
+        if media_type != "text/plain" {
+            return fail(404, format!("{} is an artifact of {media_type}, not a log", id.short()));
+        }
+        let size = content.len();
+        let Some(text) = text(content) else {
+            return Ok(json!({"log": id, "size": size, "shown": "binary"}));
+        };
+        let mut start = size.saturating_sub(LOG_TEXT);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        let tail = &text[start..];
+        Ok(json!({"log": id, "size": size, "shown": "text", "text": tail, "lines": line_count(tail), "cut": start > 0}))
     }
 }
 

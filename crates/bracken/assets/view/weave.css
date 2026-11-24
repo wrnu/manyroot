@@ -32,6 +32,7 @@ body.weave-page {
 .weave .lede {
   color: var(--root-dim);
   margin: 0 0 0.8rem;
+  overflow-wrap: anywhere;
 }
 
 .weave .facts {
