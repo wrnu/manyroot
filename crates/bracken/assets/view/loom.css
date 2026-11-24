@@ -220,11 +220,36 @@
   font-size: 0.85rem;
 }
 .side .lineage li {
+  padding: 0.1rem 0;
+}
+.side .lineage-btn {
   display: grid;
   grid-template-columns: 18px 1fr;
   gap: 0.4rem;
   align-items: start;
-  padding: 0.2rem 0;
+  width: 100%;
+  padding: 0.25rem 0.35rem;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: inherit;
+  font: inherit;
+}
+.side .lineage-btn:hover {
+  background: var(--ground-raised);
+  border-color: var(--stratum-line);
+}
+.side .lineage-btn:hover .statement {
+  color: var(--root);
+}
+.side .lineage-text {
+  min-width: 0;
+}
+.side .lineage-more {
+  margin-top: 0.35rem;
+  font-size: 0.8rem;
+  padding: 0.18rem 0.6rem;
 }
 .side .lineage .statement {
   color: var(--root-dim);
@@ -339,6 +364,36 @@
   white-space: pre-line;
   overflow-wrap: anywhere;
 }
+.artifact-preview-wrap {
+  margin-top: 0.75rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--stratum-line);
+}
+.preview-toggle {
+  font-size: 0.82rem;
+  padding: 0.2rem 0.7rem;
+}
+.artifact-preview {
+  margin-top: 0.55rem;
+  padding: 0.6rem 0.7rem;
+  max-height: 18rem;
+  overflow: auto;
+  background: var(--ground-deep);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: var(--root-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.preview-note {
+  margin: 0.55rem 0 0;
+  color: var(--root-faint);
+  font-size: 0.8rem;
+  font-style: italic;
+}
 
 /* Ground text is isolated from the words around it, so direction marks in it (U+202E and the like)
    can't reorder anything outside its own element. Inside composed lines, names and methods are <bdi>. */
@@ -349,6 +404,7 @@
 .label-card .statement,
 .label-card .detail,
 .label-card dd,
+.artifact-preview,
 .side .lineage .statement {
   unicode-bidi: isolate;
 }
