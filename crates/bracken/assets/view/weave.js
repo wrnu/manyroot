@@ -71,10 +71,32 @@
     );
   }
 
+  /** A tree's record: a 64-hex id, or a manifest's content hash. */
+  const RECORD = /^(blake3:)?[0-9a-f]{64}$/;
+
+  /**
+   * A button that opens a tree's directory or file: the route is `tree` or `file`, the record checked, and the
+   * path one percent-encoded part, decoded only by route() and only ever sent back as a query value.
+   */
+  function goPath(route, record, path, label) {
+    if (!RECORD.test(String(record))) return h("span", { class: "id" }, shown(label));
+    return h("button", { type: "button", class: "go", on: { click: () => { location.hash = `${route}/${record}/${encodeURIComponent(path)}`; } } }, shown(label));
+  }
+
   function route() {
     const parts = location.hash.slice(1).split("/");
     const [name, id] = [parts[0], (parts[1] || "").toLowerCase()];
     if ((name === "line" || name === "decision") && ID.test(id)) return { name, id };
+    if ((name === "tree" || name === "file") && RECORD.test(id)) {
+      let path = "";
+      try {
+        path = decodeURIComponent(parts.slice(2).join("/"));
+      } catch (_) {
+        return { name: "home" };
+      }
+      if (name === "file" && !path) return { name: "tree", id, path };
+      return { name, id, path };
+    }
     return { name: "home" };
   }
 
@@ -323,7 +345,7 @@
       h("p", { class: "lede" }, "on ", go("line", d.line, d.line_name || short(d.line)), shown(` by ${who(d.author, d.author_name)}`))];
     out.push(facts([
       ["verdict", verdict],
-      ["manifest", h("span", { class: "id" }, shown(d.manifest))],
+      ["manifest", h("span", {}, h("span", { class: "id" }, shown(d.manifest)), " ", goPath("tree", d.decision, "", "browse its files"))],
       ["parents", d.parents.length ? h("span", {}, d.parents.map((p) => go("decision", p))) : null],
       ["policy in force", d.policy ? h("span", { class: "id" }, short(d.policy)) : null],
       ["git", d.source ? h("span", { class: "id" }, shown(d.source.git)) : null],
@@ -351,6 +373,92 @@
     return out;
   }
 
+  // ---- Trees and files ----
+
+  /** The record a tree page names, as the API takes it, and as the page shows it. */
+  const recordLabel = (record) => (record.startsWith("blake3:") ? `manifest ${record.slice(7, 19)}` : `record ${short(record)}`);
+
+  /** A path's parents as buttons: the tree's root, then each directory down to `path`'s own. */
+  function crumbs(record, path, last) {
+    const out = [goPath("tree", record, "", recordLabel(record))];
+    const parts = path ? path.split("/") : [];
+    parts.forEach((part, i) => {
+      out.push(h("span", { class: "muted" }, " / "));
+      const at = parts.slice(0, i + 1).join("/");
+      out.push(i === parts.length - 1 && last ? h("span", {}, shown(part)) : goPath("tree", record, at, part));
+    });
+    return h("p", { class: "crumbs" }, out);
+  }
+
+  const sizeText = (n) => (n < 1024 ? `${n} B` : n < 1 << 20 ? `${(n / 1024).toFixed(1)} KiB` : `${(n / (1 << 20)).toFixed(1)} MiB`);
+
+  async function tree(record, dir) {
+    const q = (extra) => query({ dir, ...extra });
+    const t = await api(`/api/weave/tree/${record}?${q({})}`);
+    const out = [h("h2", {}, "Files"), crumbs(record, dir, true)];
+    out.push(facts([
+      ["manifest", h("span", { class: "id" }, shown(t.manifest))],
+      ["files", String(t.files)],
+      ["complete", t.complete ? "yes: this replica holds every file" : `no: ${t.missing.total} files aren't held here`],
+    ]));
+    const childRow = (c) => {
+      const path = dir ? `${dir}/${c.name}` : c.name;
+      if (c.dir) return h("li", {}, goPath("tree", record, path, `${c.name}/`), h("span", { class: "muted" }, c.files === 1 ? "1 file" : `${c.files} files`));
+      return h("li", { class: c.held ? "" : "failing" }, goPath("file", record, path, c.name),
+        h("span", { class: "muted" }, `${c.symlink ? "symlink" : c.mode.toString(8)} · ${sizeText(c.size)}${c.held ? "" : " · not held here"}`));
+    };
+    const childKey = (c) => (c.dir ? `${c.name}/` : c.name);
+    out.push(...section(dir ? "In this directory" : "At the root", pagedList(t.children, childKey, childRow, (after) => api(`/api/weave/tree/${record}?${q({ list: "children", after, limit: PAGE })}`))));
+    if (t.missing.total) {
+      out.push(...section("Not held by this replica", pagedList(t.missing, (p) => p, (p) => h("li", { class: "failing" }, goPath("file", record, p, p)), (after) => api(`/api/weave/tree/${record}?${q({ list: "missing", after, limit: PAGE })}`))));
+    }
+    return out;
+  }
+
+  /** Lines shown at once; more are added from the text already held, when asked (section 4, Caps). */
+  const LINES_AT_ONCE = 5000;
+
+  /** A file's text as numbered rows, built `LINES_AT_ONCE` at a time. */
+  function numbered(text, count) {
+    const lines = text.split("\n");
+    if (lines.length > count) lines.length = count; // a final newline ends the last line, not a new one
+    const table = h("ul", { class: "source" });
+    const wrap = h("div", {}, table);
+    let next = 0;
+    const more = h("button", { type: "button", class: "more" }, "");
+    const add = () => {
+      const end = Math.min(next + LINES_AT_ONCE, lines.length);
+      for (; next < end; next++) table.append(h("li", {}, h("span", { class: "ln", "aria-hidden": "true" }, String(next + 1)), h("span", { class: "code" }, shown(lines[next]))));
+      if (next >= lines.length) more.remove();
+      else more.textContent = `Show ${Math.min(LINES_AT_ONCE, lines.length - next)} more lines (${lines.length - next} left)`;
+    };
+    more.addEventListener("click", add);
+    add();
+    if (next < lines.length) wrap.append(more);
+    return wrap;
+  }
+
+  async function file(record, path) {
+    const f = await api(`/api/weave/file/${record}?${query({ path })}`);
+    const dir = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+    const out = [h("h2", {}, shown(path.slice(dir ? dir.length + 1 : 0))), crumbs(record, path, true)];
+    out.push(facts([
+      ["mode", f.symlink ? "symlink" : f.mode.toString(8)],
+      ["size", `${sizeText(f.size)} (${f.size} bytes)`],
+      ["hash", h("span", { class: "id" }, shown(f.hash))],
+      ["in", goPath("tree", record, dir, dir ? `${dir}/` : "the tree's root")],
+    ]));
+    const why = {
+      binary: f.symlink ? "Its target isn't text, so it isn't shown." : "It isn't text (it has a NUL byte or isn't UTF-8), so it isn't shown.",
+      oversized: "It's over the view's 1 MiB cap, so it isn't shown. The CLI shows it.",
+      missing: "This replica doesn't hold this file at the size its tree names, so it can't be shown.",
+    };
+    if (f.shown === "symlink") out.push(...section("Symlink to", h("p", { class: "text" }, shown(f.text))));
+    else if (f.shown === "text") out.push(...section(`${f.lines} lines`, numbered(f.text, f.lines)));
+    else out.push(h("p", { class: "muted" }, why[f.shown] || "It can't be shown."));
+    return out;
+  }
+
   // ---- Showing ----
 
   async function render() {
@@ -360,7 +468,8 @@
     $("data-note").textContent = "Reading the Weave records…";
     let body;
     try {
-      body = r.name === "line" ? await line(r.id) : r.name === "decision" ? await decision(r.id) : await home();
+      const pages = { line: () => line(r.id), decision: () => decision(r.id), tree: () => tree(r.id, r.path), file: () => file(r.id, r.path) };
+      body = await (pages[r.name] || home)();
     } catch (e) {
       body = [h("h2", {}, "This page can't be shown"), h("p", { class: "problem" }, shown(e.message))];
     }

@@ -139,6 +139,38 @@ body.weave-page {
   overflow-wrap: anywhere;
 }
 
+/* A file's text: numbered lines, each wrapping within the page, never scrolling it sideways. */
+.weave ul.source {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  line-height: 1.45;
+}
+.weave ul.source li {
+  display: grid;
+  grid-template-columns: 4.2em minmax(0, 1fr);
+  min-height: 1.45em;
+}
+.weave ul.source .ln {
+  color: var(--root-faint);
+  font-size: 0.75rem;
+  text-align: right;
+  padding-right: 0.6em;
+  border-right: 1px solid var(--stratum-line);
+  user-select: none;
+}
+.weave ul.source .code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  padding-left: 0.6em;
+}
+.weave .crumbs {
+  overflow-wrap: anywhere;
+  margin: 0 0 0.8rem;
+}
+
 .weave .problem {
   color: var(--rejected);
 }

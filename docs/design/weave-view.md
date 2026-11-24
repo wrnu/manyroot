@@ -314,8 +314,13 @@ conflicts, problems, missing paths and change entries.
 - **What is never cut** (finding `80050786bf97`): a record id, a content
   hash, a check's name where it is the key a list pages after
   (`list=counted`, `list=checks`), and a row that is itself a key, such as
-  a protected path in `list=protected` (at most 4 KiB, as a path is). They are links and cursors. Only free text
-  is cut, and arrays are bounded by count, never by cutting their strings.
+  a protected path in `list=protected` (at most 4 KiB, as a path is), or a
+  tree child's name. They are links and cursors. Only free text is cut, and
+  arrays are bounded by count, never by cutting their strings.
+- **A key is listed once.** A hand-made policy may name an agent or a path
+  twice (`Line::check` allows it; the CLI never writes one). The view lists
+  each entry of a policy's lists once, in order, so `after` names one item
+  and paging can't loop (round-3 note 1 on PR #79).
   A row or answer with any string cut carries `"cut": true`, and the page
   says "(shortened)". The row's own page, or the CLI, has the rest.
 - **So every answer is bounded by its limit times one row's cap, in
@@ -326,7 +331,11 @@ conflicts, problems, missing paths and change entries.
   - Any other row is at most 4 KiB, so a page of 2,000 is at most about
     8 MiB.
   - What is never cut isn't counted against these: an id is 64 bytes, and a
-    check's name is as long as its policy makes it.
+    check's name is as long as its policy makes it, since `Line::check`
+    bounds neither. So a row is at most its cap plus its never-cut strings.
+    A row whose never-cut strings alone pass its cap has its other strings
+    cut to nothing, marked `cut`, and its own page has them (round-3 note
+    2 on PR #79).
 
   These are bytes before `json_bytes`, which can write each one as up to 6
   bytes. So a page is at most about 28 MiB (200 nested rows) or 48 MiB
@@ -339,8 +348,8 @@ conflicts, problems, missing paths and change entries.
 | `/api/weave/objections/<line>?state&after&limit` | the line's objections (*Which objections a line has*, below), ascending by id, `limit` at most 200; `state` filters (`open`, `other`, `all`). Each has its author, its note (4 KiB) and whether it's retracted now (joined from `Index::reviews` by id). An open one also has its basis and allowed dispositions. Each has `answers`, a nested list of the decisions whose answers name the objection itself: 5 entries of decision and disposition, and the total. Answers that name its target or the line are the same for every objection to that target. So they come once per page, in `target_answers`, keyed by target (5 each, and the total), and `line_answers` is the line's count of line-wide answers. A decision's own page has each answer's full reason | `Lines::objections().list()` with each `Objection`'s target; `Lines::decision_ancestry`; `Index::reviews`; `answers`; `derived` for the line's objection ids and `open_objections` |
 | `/api/weave/log/<line>?after&limit` | decisions newest first, as `weave log --json` rows | `logs`; `Lines::decision` |
 | `/api/weave/decision/<id>?list&after&limit` | the `weave log` row, plus `verdict` (`qualifies`, or the rule's message), `policy` in force, `counted` per check, reviews | `Lines::decision`, `verdict`, `policy_in_force_for`; `Checks::counted`; `Reviews::of_decision` |
-| `/api/weave/tree/<record>?dir&after&limit` | the record's manifest hash, and the direct children of `dir` (default the root): directories with the number of files below them, then files with mode, size, hash and `held` | `Index::manifest`, `file_size` (held means held at the entry's size); the manifest's sorted entries, by a range search on the prefix |
-| `/api/weave/file/<record>?path` | `path`, `mode`, `size`, `hash`, `shown`: `text`, `symlink`, `binary`, `oversized` or `missing`; `text` only when shown, with `lines` | `Manifest::get`, `Index::file`, `file_size`, `diff::is_text` |
+| `/api/weave/tree/<record>?dir&list&after&limit` | the record's manifest hash, its number of files, whether it's complete, and the direct children of `dir` (default the root; taken exactly as given, never normalised, so `src/` or `/src` is a 404): directories with the number of files below them, then files with mode, size, hash and `held`, paged by name (a directory's with a trailing `/`); and `missing`, the paths not held at their entry's size, paged | `Index::manifest`, `file_size` (held means held at the entry's size); the manifest's sorted entries, by a range search on the prefix |
+| `/api/weave/file/<record>?path` | `path`, `mode`, `size`, `hash`, `shown`: `text`, `symlink`, `binary`, `oversized` or `missing`; `text` only when shown, with `lines`. A symlink's target is shown only if it is text; import refuses one that isn't, so only a hand-made manifest has one. The text is capped at 1 MiB, not the 64 KiB of a record's other text | `Manifest::get`, `Index::file`, `file_size`, `diff::is_text` |
 | `/api/weave/history/<line>?path&after&limit` | the line's decisions, newest first, where the path's file value differs from the decision's first parent on the line, each with `kind`, `before` and `after`. A decision with no parent on the line (the line's root, or a first decision a line merge started from another line's head) compares with its first parent on any line, or, with no parent, with an absent file | `logs`; `Lines::decision`; `Index::manifest`; `Manifest::get` |
 | `/api/weave/diff?a&b&after&limit` | the per-file list from `a`'s tree to `b`'s: `path`, `kind`, `before`, `after` | `diff::manifests` |
 | `/api/weave/diff?a&b&path` | that one file: `unified` text, or `shown` saying why not (`binary`, `oversized`, `too_large_to_diff`, `missing`) | `diff::unified`, `diff::is_text` |
@@ -805,6 +814,7 @@ Notes taken:
 | PR #79 round 1, `80050786bf97`: row caps cut ids and cursors | Ids, hashes and paged check names are never cut; arrays are bounded by count; cut rows are marked; the line pages its current policy's lists (section 4) |
 | PR #79 round 2, `c50605c13cd4`: the Weave pages stayed 503 after a failed change was undone | The old snapshot's Weave state is built again (section 3) |
 | PR #79 round 2, `886fba8945e1`: a protected path near 4 KiB was cut, breaking its cursor | A row that is itself a key is never cut (section 4) |
+| PR #79 round 3, notes on the builder's rationales (`2be6896ef4ff`), taken in PR (c) | Note 1: repeated policy entries are listed once, so paging can't loop. Note 2: section 4 states the row bound with never-cut check names. Note 3: the recovery after a failed re-read relies on `signature()`'s append-only counts, as every re-read does; a same-count replacement in `objects/` or `agents/` isn't seen until the next change. That's the Ground's append-only rule, and unchanged here |
 
 Round 2's notes are taken too:
 - the scripts count rises to 13;

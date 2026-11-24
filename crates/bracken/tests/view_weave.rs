@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use bracken_tree::format::{Guardrails, LINE_MEDIA_TYPE, Line, Record, VERSION};
+use bracken_tree::ContentHash;
+use bracken_tree::format::{
+    Entry, Guardrails, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE, Manifest, Mode, Record, VERSION,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -61,6 +64,11 @@ impl Weave {
     }
 
     fn git(&self, args: &[&str]) {
+        self.git_out(args);
+    }
+
+    /// `git` in the repository, with its output.
+    fn git_out(&self, args: &[&str]) -> String {
         let out = Command::new("git")
             .arg("-C")
             .arg(&self.repo)
@@ -71,6 +79,7 @@ impl Weave {
             .output()
             .expect("git runs");
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8(out.stdout).expect("UTF-8")
     }
 
     /// Commits `files` and records the commit as the default line's next decision, with `note`.
@@ -700,4 +709,222 @@ fn encode(s: &str) -> String {
             }
         })
         .collect()
+}
+
+// ---- Trees and files (PR (c)) ----
+
+/// A Weave Ground whose head decision's tree holds a text file, an HTML file, a binary file, an oversized
+/// file and a symlink to text, nested two directories deep. Import refuses a symlink whose target isn't
+/// UTF-8, so that case is a hand-made manifest's (`hand_made_manifests_name_what_they_cant_show`).
+fn with_a_tree() -> (Weave, String) {
+    let w = Weave::new();
+    let files: &[(&str, &[u8])] = &[
+        ("README.md", b"hello\nworld"),
+        ("page.html", b"<script>alert(1)</script>\n<img src=x onerror=alert(2)>\n"),
+        ("src/lib.rs", b"pub fn a() {}\n"),
+        ("src/deep/mod.rs", b"\xe2\x80\xaecode\n"),
+        ("blob.bin", b"\x00\x01\x02 not text"),
+    ];
+    for (path, bytes) in files {
+        let file = w.repo.join(path);
+        std::fs::create_dir_all(file.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(file, bytes).expect("write");
+    }
+    std::fs::write(w.repo.join("big.txt"), "x\n".repeat((1 << 19) + 1)).expect("write");
+    w.git(&["add", "-A"]);
+    // A symlink staged straight into the index, so the test needn't make one on disk.
+    let blob = w.tmp.path().join("link.target");
+    std::fs::write(&blob, "src/lib.rs").expect("write");
+    let sha = w.git_out(&["hash-object", "-w", blob.to_str().expect("UTF-8")]);
+    w.git(&["update-index", "--add", "--cacheinfo", &format!("120000,{},link", sha.trim())]);
+    w.git(&["commit", "-q", "-m", "tree"]);
+    let out = w.json(&["weave", "integrate", "--as", AS, "--note", "a tree", "--json"]);
+    (w, out["decision"].as_str().expect("a decision").to_owned())
+}
+
+#[test]
+fn a_tree_lists_directories_then_files_and_pages_by_name() {
+    let (w, d) = with_a_tree();
+    let v = view(&w.ground);
+    let root = v.api(&format!("/api/weave/tree/{d}"));
+    assert_eq!(root["files"], 7);
+    assert_eq!(root["complete"], true);
+    let names: Vec<(String, bool)> = root["children"]["items"]
+        .as_array()
+        .expect("children")
+        .iter()
+        .map(|c| (c["name"].as_str().expect("a name").to_owned(), c["dir"] == true))
+        .collect();
+    let want = [
+        ("src", true),
+        ("README.md", false),
+        ("big.txt", false),
+        ("blob.bin", false),
+        ("link", false),
+        ("page.html", false),
+    ];
+    assert_eq!(names, want.map(|(n, d)| (n.to_owned(), d)));
+    assert_eq!(root["children"]["items"][0]["files"], 2, "src holds 2 files below it");
+    let link = &root["children"]["items"][4];
+    assert_eq!(
+        (link["symlink"].clone(), link["mode"].clone(), link["held"].clone()),
+        (true.into(), 0o120000.into(), true.into())
+    );
+    // A directory, and a page of it after a child's key; a directory's key ends with '/'.
+    let src = v.api(&format!("/api/weave/tree/{d}?dir=src"));
+    assert_eq!(src["children"]["items"][0]["name"], "deep");
+    assert_eq!(src["children"]["items"][1]["path"], "src/lib.rs");
+    let after = v.api(&format!("/api/weave/tree/{d}?dir=src&list=children&after=deep/"));
+    assert_eq!(after["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(after["items"][0]["name"], "lib.rs");
+    v.refused(&format!("/api/weave/tree/{d}?dir=nowhere"), 404);
+    // The same tree by the manifest's content hash.
+    let hash = root["manifest"].as_str().expect("a hash");
+    assert_eq!(v.api(&format!("/api/weave/tree/{hash}"))["files"], 7);
+    assert_eq!(v.api(&format!("/api/weave/record/{hash}"))["page"], "tree");
+}
+
+#[test]
+fn a_file_shows_only_held_text_within_the_cap_and_names_the_rest() {
+    let (w, d) = with_a_tree();
+    let v = view(&w.ground);
+    let file = |path: &str| v.api(&format!("/api/weave/file/{d}?path={path}"));
+    let readme = file("README.md");
+    assert_eq!(
+        (readme["shown"].as_str(), readme["text"].as_str(), readme["lines"].as_u64()),
+        (Some("text"), Some("hello\nworld"), Some(2))
+    );
+    let deep = file("src/deep/mod.rs");
+    assert_eq!(deep["text"], "\u{202e}code\n", "the bidi control comes back as it is, for the page to mark");
+    let blob = file("blob.bin");
+    assert_eq!(blob["shown"], "binary");
+    assert!(blob.get("text").is_none());
+    let big = file("big.txt");
+    assert_eq!((big["shown"].as_str(), big["size"].as_u64()), (Some("oversized"), Some(((1u64 << 19) + 1) * 2)));
+    assert!(big.get("text").is_none());
+    let link = file("link");
+    assert_eq!((link["shown"].as_str(), link["text"].as_str()), (Some("symlink"), Some("src/lib.rs")));
+    v.refused(&format!("/api/weave/file/{d}"), 400);
+}
+
+/// Security note 5 on PR #79: a file's bytes leave the view only as a JSON string, under the view's
+/// headers; a path is a key in the manifest, never a file-system path.
+#[test]
+fn a_files_bytes_are_json_text_and_a_path_never_reaches_the_file_system() {
+    let (w, d) = with_a_tree();
+    let v = view(&w.ground);
+    let r = v.request(&format!("/api/weave/file/{d}?path=page.html"));
+    assert_eq!(r.status, 200);
+    assert_eq!(r.headers["content-type"], "application/json");
+    assert_eq!(r.headers["x-content-type-options"], "nosniff");
+    assert!(r.headers["content-security-policy"].contains("default-src 'none'"));
+    let raw = String::from_utf8(r.body.clone()).expect("UTF-8");
+    assert!(!raw.contains('<') && !raw.contains('>'), "markup is escaped in the bytes: {raw}");
+    assert_eq!(r.json()["text"], "<script>alert(1)</script>\n<img src=x onerror=alert(2)>\n");
+    // Paths that would climb out of a directory, or name the replica's own files, aren't in the manifest.
+    let ground = w.ground.to_str().expect("UTF-8").to_owned();
+    for path in [
+        "../README.md",
+        "/README.md",
+        "src/../README.md",
+        "%2e%2e%2fREADME.md",
+        "./README.md",
+        "src//lib.rs",
+        "README.md/",
+        "ground.json",
+        "weave-root",
+        &format!("{ground}/ground.json"),
+        "/etc/passwd",
+    ] {
+        v.refused(&format!("/api/weave/file/{d}?path={path}"), 404);
+    }
+    for dir in ["..", "../src", "/", "/src", "src/", "src/..", "./src", "%2e%2e"] {
+        v.refused(&format!("/api/weave/tree/{d}?dir={dir}"), 404);
+    }
+}
+
+/// A hand-made manifest is browsable. A file this replica doesn't hold, or holds at another size, is named
+/// as missing; a symlink whose target isn't text is named as binary; neither is shown.
+#[test]
+fn hand_made_manifests_name_what_they_cant_show() {
+    let (w, d) = with_a_tree();
+    let readme = ContentHash::of(b"hello\nworld");
+    let blob: &[u8] = b"\x00\x01\x02 not text";
+    let never = ContentHash::of(b"bytes this replica never saw");
+    let m = Manifest::new(vec![
+        Entry { path: "held.md".into(), mode: Mode::File, hash: readme, size: 11 },
+        Entry { path: "short.md".into(), mode: Mode::File, hash: readme, size: 99 },
+        Entry { path: "gone.md".into(), mode: Mode::File, hash: never, size: 5 },
+        Entry { path: "badlink".into(), mode: Mode::Symlink, hash: ContentHash::of(blob), size: blob.len() as u64 },
+    ]);
+    let file = w.tmp.path().join("m.cbor");
+    std::fs::write(&file, m.encode()).expect("writes the manifest");
+    let out = w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", MANIFEST_MEDIA_TYPE, "--as", AS]);
+    let id = out.trim().strip_prefix("artifact ").expect("labelled").to_owned();
+    let v = view(&w.ground);
+    assert_eq!(v.api(&format!("/api/weave/record/{id}"))["page"], "tree");
+    let t = v.api(&format!("/api/weave/tree/{id}"));
+    assert_eq!(t["complete"], false);
+    let missing: Vec<&str> =
+        t["missing"]["items"].as_array().expect("missing").iter().filter_map(Value::as_str).collect();
+    assert_eq!(missing, ["gone.md", "short.md"]);
+    let held: Vec<bool> =
+        t["children"]["items"].as_array().expect("children").iter().map(|c| c["held"] == true).collect();
+    assert_eq!(held, [true, false, true, false], "badlink, gone, held, short");
+    let bad = v.api(&format!("/api/weave/file/{id}?path=badlink"));
+    assert_eq!((bad["shown"].as_str(), bad["symlink"].as_bool()), (Some("binary"), Some(true)));
+    assert!(bad.get("text").is_none());
+    assert_eq!(v.api(&format!("/api/weave/file/{id}?path=held.md"))["text"], "hello\nworld");
+    for path in ["short.md", "gone.md"] {
+        let f = v.api(&format!("/api/weave/file/{id}?path={path}"));
+        assert_eq!(f["shown"], "missing", "{path}");
+        assert!(f.get("text").is_none(), "{path}");
+    }
+    // A decision's own tree is still whole.
+    assert_eq!(v.api(&format!("/api/weave/tree/{d}"))["complete"], true);
+}
+
+/// Round-3 note 1 on PR #79: a hand-made policy may name a path twice (the CLI never writes one). Each
+/// entry is listed once, so paging after a repeated key can't loop and every path is reached.
+#[test]
+fn a_policy_list_with_repeats_pages_each_entry_once() {
+    let (w, ..) = Weave::with_two_decisions();
+    let me = w.json(&["id", "list", "--json"])[0]["agent"].as_str().expect("an agent").to_owned();
+    // 101 entries, the 50th and the 100th the same path, as the reviewer's case.
+    let mut protected: Vec<String> = (0..101).map(|i| format!("p{i:03}")).collect();
+    protected[99] = protected[49].clone();
+    let line = Line {
+        v: VERSION,
+        name: "repeats".into(),
+        integrators: vec![me.parse().expect("a key"), me.parse().expect("a key")],
+        validators: vec![],
+        goal_setters: vec![me.parse().expect("a key")],
+        checks: BTreeMap::new(),
+        executors: BTreeMap::new(),
+        guardrails: Guardrails { max_known: 0, max_age: 0, protected: protected.clone() },
+        owner_decision: Some(OD.into()),
+    };
+    let file = w.tmp.path().join("repeats.cbor");
+    std::fs::write(&file, line.encode()).expect("writes the policy");
+    let out = w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", LINE_MEDIA_TYPE, "--as", AS]);
+    let id = out.trim().strip_prefix("artifact ").expect("labelled").to_owned();
+    let v = view(&w.ground);
+    let page = v.api(&format!("/api/weave/line/{id}"));
+    assert_eq!(page["policy"]["integrators"]["total"], 1, "the same integrator twice is listed once");
+    assert_eq!(page["policy"]["protected"]["total"], 100);
+    let mut seen: Vec<String> = Vec::new();
+    let mut after: Option<String> = None;
+    for _ in 0..10 {
+        let q = after.as_ref().map_or(String::new(), |a| format!("&after={a}"));
+        let got = v.api(&format!("/api/weave/line/{id}?list=protected&limit=50{q}"));
+        seen.extend(got["items"].as_array().expect("items").iter().map(|p| p.as_str().expect("a path").to_owned()));
+        if got["more"] != true {
+            break;
+        }
+        after = seen.last().cloned();
+    }
+    let mut want = protected;
+    want.dedup_by(|a, b| a == b);
+    want.remove(99);
+    assert_eq!(seen, want, "each path once, in order, and paging ends");
 }

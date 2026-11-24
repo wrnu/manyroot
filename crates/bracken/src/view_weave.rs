@@ -22,6 +22,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use bracken_tree::ContentHash;
+use bracken_tree::format::{Entry, Manifest, Mode};
 use bracken_tree::ground::{Index, kind_of};
 use bracken_tree::lines::{Lines, newest_first};
 use bracken_tree::results::Checks;
@@ -62,6 +63,8 @@ const MAX_NESTED_LIMIT: usize = 200;
 pub(crate) const DERIVED_AT_ONCE: usize = 2;
 /// The fewest hex digits an id in a path may have, as for `/api/contribution`.
 const ID_DIGITS: usize = 8;
+/// The most bytes of a file's text the file page shows; a larger file is named, not shown (section 4).
+const FILE_TEXT: usize = 1 << 20;
 
 /// A refusal: the status and its reason.
 pub(crate) type Fail = (u16, String);
@@ -287,6 +290,10 @@ pub(crate) fn takes(path: &str) -> &'static [&'static str] {
     let rest = path.strip_prefix("/api/weave").unwrap_or_default();
     if rest.is_empty() || rest.starts_with("/line/") || rest.starts_with("/decision/") {
         &["list", "after", "limit"]
+    } else if rest.starts_with("/tree/") {
+        &["dir", "list", "after", "limit"]
+    } else if rest.starts_with("/file/") {
+        &["path"]
     } else if rest.starts_with("/log/") {
         &["after", "limit"]
     } else {
@@ -583,6 +590,12 @@ pub(crate) fn route(
         at.decision(id, &p, query)?
     } else if let Some(id) = rest.strip_prefix("/record/") {
         at.record(id)?
+    } else if let Some(id) = rest.strip_prefix("/tree/") {
+        at.tree(id, &p, query)?
+    } else if let Some(id) = rest.strip_prefix("/file/") {
+        // A file's text is capped at FILE_TEXT, not PAGE_TEXT: its other strings are its path (at most
+        // 4 KiB, as any path), mode and hash.
+        return at.file(id, query);
     } else {
         return fail(404, "no such Weave page");
     };
@@ -800,7 +813,15 @@ impl Ctx<'_> {
         let policy_list = |name: &str| -> Vec<Value> {
             let Some(v) = &one else { return Vec::new() };
             let list = if name == "protected" { &v["guardrails"]["protected"] } else { &v[name] };
-            list.as_array().cloned().unwrap_or_default()
+            // Each entry once, in order: a policy may name an agent or a path twice (Line::check allows
+            // it), and a repeat would be a key `after` matches twice (round-3 note 1 on PR #79).
+            let mut seen = Vec::new();
+            for x in list.as_array().into_iter().flatten() {
+                if !seen.contains(x) {
+                    seen.push(x.clone());
+                }
+            }
+            seen
         };
         let policy_key = |name: &'static str| {
             move |x: &Value| match name {
@@ -955,8 +976,157 @@ impl Ctx<'_> {
         } else {
             None
         };
+        let page = page.or_else(|| self.manifest_of(&id).map(|_| "tree"));
         Ok(json!({"id": id, "kind": kind, "page": page}))
     }
+
+    /// The manifest a record names, and its hash: a decision's or a proposal's, a manifest artifact's, or
+    /// the one with a content hash. Only a valid manifest has a tree.
+    fn manifest_of(&self, id: &ContributionId) -> Option<(ContentHash, &Manifest)> {
+        let lines = &self.s.lines;
+        let hash = if let Some(d) = lines.decision(id) {
+            d.decision.manifest
+        } else if let Some(p) = lines.proposal(id) {
+            p.proposal.manifest
+        } else {
+            self.s.index.manifest_named(id)?
+        };
+        self.s.index.manifest(&hash).map(|(_, m)| (hash, m))
+    }
+
+    /// The tree a path names: `<id prefix>` of a decision, proposal or manifest artifact, or
+    /// `blake3:<hash>` of a manifest.
+    fn tree_of(&self, given: &str) -> Result<(ContentHash, &Manifest), Fail> {
+        if given.starts_with("blake3:") {
+            let hash: ContentHash = given.parse().map_err(|_| (404, format!("{given} isn't a content hash")))?;
+            return match self.s.index.manifest(&hash) {
+                Some((_, m)) => Ok((hash, m)),
+                None => fail(404, format!("this replica holds no valid manifest with content hash {hash}")),
+            };
+        }
+        let id = resolve(self.g, given)?;
+        match self.manifest_of(&id) {
+            Some(found) => Ok(found),
+            None => {
+                let kind = self.g.get(&id).map(kind_of).unwrap_or_default();
+                fail(404, format!("{} is a {kind} with no valid manifest, so it has no tree", id.short()))
+            }
+        }
+    }
+
+    /// Whether this replica holds an entry's file at the size the entry names.
+    fn held(&self, e: &Entry) -> bool {
+        self.s.index.file_size(&e.hash) == Some(e.size)
+    }
+
+    /// `/api/weave/tree/<record>?dir`: the direct children of `dir` (the root if none), directories first
+    /// with the number of files below them, then files; and the paths this replica doesn't hold.
+    fn tree(&self, given: &str, p: &Paging, query: &HashMap<String, String>) -> Result<Value, Fail> {
+        p.check(&["children", "missing"], query)?;
+        let (hash, manifest) = self.tree_of(given)?;
+        // Exactly as given, never normalised (section 7): the root is no `dir` or an empty one.
+        let dir = query.get("dir").map(String::as_str).unwrap_or_default();
+        let children = children(manifest, dir);
+        if !dir.is_empty() && children.is_empty() {
+            return fail(404, "no directory at that path in this tree");
+        }
+        let child_row = |c: &Child| match c {
+            Child::Dir { name, files } => json!({"name": name, "dir": true, "files": files}),
+            Child::File(e) => json!({"name": e.path.rsplit('/').next().unwrap_or(&e.path), "dir": false,
+                                     "path": e.path, "mode": e.mode.bits(), "symlink": e.mode == Mode::Symlink,
+                                     "size": e.size, "hash": e.hash.to_string(), "held": self.held(e)}),
+        };
+        let missing = self.s.index.missing(manifest);
+        match p.list {
+            Some("children") => return listed("children", &children, Child::key, child_row, ROW_BYTES, p),
+            Some("missing") => return listed("missing", &missing, String::clone, |m| json!(m), ROW_BYTES, p),
+            _ => {}
+        }
+        Ok(json!({"manifest": hash.to_string(), "dir": dir, "files": manifest.entries.len(),
+                  "complete": missing.is_empty(),
+                  "children": embedded(&children, ROW_BYTES, child_row),
+                  "missing": embedded(&missing, ROW_BYTES, |m| json!(m))}))
+    }
+
+    /// `/api/weave/file/<record>?path`: one file of a tree, named by its mode, size and hash, with its text
+    /// only if it is a held regular file of UTF-8 text without NUL, at most [`FILE_TEXT`]; a symlink with
+    /// its target if that is such text. The path is looked up in the manifest held in memory, never
+    /// joined to a directory (section 7).
+    fn file(&self, given: &str, query: &HashMap<String, String>) -> Result<Value, Fail> {
+        let (hash, manifest) = self.tree_of(given)?;
+        let Some(path) = query.get("path") else { return fail(400, "name the file with path") };
+        let Some(e) = manifest.get(path) else { return fail(404, "no file at that path in this tree") };
+        let mut v = json!({"manifest": hash.to_string(), "path": e.path, "mode": e.mode.bits(),
+                           "symlink": e.mode == Mode::Symlink, "size": e.size, "hash": e.hash.to_string()});
+        let bytes = if self.held(e) { self.s.index.file(self.g, &e.hash) } else { None };
+        let (shown, text) = match bytes {
+            None => ("missing", None),
+            Some(b) if e.mode == Mode::Symlink => match text(b) {
+                Some(t) if b.len() <= FILE_TEXT => ("symlink", Some(t)),
+                _ => ("binary", None),
+            },
+            Some(b) if b.len() > FILE_TEXT => ("oversized", None),
+            Some(b) => match text(b) {
+                Some(t) => ("text", Some(t)),
+                None => ("binary", None),
+            },
+        };
+        v["shown"] = json!(shown);
+        if let Some(t) = text {
+            v["text"] = json!(t);
+            v["lines"] = json!(line_count(t));
+        }
+        Ok(v)
+    }
+}
+
+/// A child of a tree's directory: a directory, with the number of files below it, or a file.
+enum Child<'m> {
+    Dir { name: &'m str, files: usize },
+    File(&'m Entry),
+}
+
+impl Child<'_> {
+    /// Its key for `after`: its name, a directory's with a trailing `/`, so a file and a directory of the same
+    /// name are told apart.
+    fn key(&self) -> String {
+        match self {
+            Child::Dir { name, .. } => format!("{name}/"),
+            Child::File(e) => e.path.rsplit('/').next().unwrap_or(&e.path).to_owned(),
+        }
+    }
+}
+
+/// The direct children of `dir` in `m`: directories, then files, each in path-byte order. The entries under
+/// `dir` are a contiguous range of the sorted manifest, found by binary search.
+fn children<'m>(m: &'m Manifest, dir: &str) -> Vec<Child<'m>> {
+    let prefix = if dir.is_empty() { String::new() } else { format!("{dir}/") };
+    let start = m.entries.partition_point(|e| e.path.as_bytes() < prefix.as_bytes());
+    let end = start + m.entries[start..].partition_point(|e| e.path.as_bytes().starts_with(prefix.as_bytes()));
+    let (mut dirs, mut files): (Vec<Child>, Vec<Child>) = (Vec::new(), Vec::new());
+    for e in &m.entries[start..end] {
+        let rest = &e.path[prefix.len()..];
+        match rest.split_once('/') {
+            Some((name, _)) => match dirs.last_mut() {
+                Some(Child::Dir { name: last, files }) if *last == name => *files += 1,
+                _ => dirs.push(Child::Dir { name, files: 1 }),
+            },
+            None => files.push(Child::File(e)),
+        }
+    }
+    dirs.extend(files);
+    dirs
+}
+
+/// `b` as text: UTF-8 without NUL.
+fn text(b: &[u8]) -> Option<&str> {
+    if b.contains(&0) { None } else { std::str::from_utf8(b).ok() }
+}
+
+/// How many lines `text` has: its newlines, and one more if it doesn't end with one.
+fn line_count(text: &str) -> usize {
+    let newlines = text.bytes().filter(|b| *b == b'\n').count();
+    newlines + usize::from(!text.is_empty() && !text.ends_with('\n'))
 }
 
 #[cfg(test)]
