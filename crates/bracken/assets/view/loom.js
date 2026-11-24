@@ -13,6 +13,7 @@
   const TOP = 64; // the agents' band
   const PAD = 28;
   const DENSE = 5000; // above this many visible, knots give way to girth and bundles
+  const DENSE_ANCESTRY = 1000; // above this many visible ancestors, bundle ancestry too so 50k hover stays responsive
   const BULK_TEXT = 3000; // a Ground this small has all its text fetched at once
   const LABELS = 90; // labels show while at most this many subjects are visible
   const FETCHES = 4; // text requests in flight at once
@@ -570,9 +571,9 @@
       ctx.globalAlpha = 0.72;
       ctx.fillRect(0, TOP, W, H - TOP);
       ctx.globalAlpha = 1;
-      // A late knot's ancestry can be most of the Ground: past the same limit, it's drawn dense too.
+      // A late knot's ancestry can be thousands of knots: past DENSE_ANCESTRY, draw it dense too so hover stays fast.
       const anc = vis.filter(inAncestry);
-      if (anc.length > DENSE) {
+      if (anc.length > DENSE_ANCESTRY) {
         drawRoots(anc, true);
         drawHyphae(anc, true, false);
         drawBlooms(anc);
@@ -705,11 +706,13 @@
     // At density, links bundle: one strand per pair of agents per band of the window, weighted by its count,
     // so the paths the work actually takes stand out and a uniform mesh doesn't.
     const band = Math.max(14, (H - TOP) / 70);
+    const stride = Math.max(256, agentsCount);
     const bundles = new Map();
     for (const i of vis)
       for (const p of parents[i]) {
         if (author[p] === author[i] || valueOf(p) > state.surface) continue;
-        const key = (author[p] * 256 + author[i]) * 4096 + Math.floor(Y(i) / band);
+        const bi = Math.max(0, Math.min(4095, Math.floor(Y(i) / band)));
+        const key = (author[p] * stride + author[i]) * 4096 + bi;
         let e = bundles.get(key);
         if (!e) bundles.set(key, (e = { a: author[p], b: author[i], y0: 0, y1: 0, n: 0 }));
         e.y0 += Y(p);
