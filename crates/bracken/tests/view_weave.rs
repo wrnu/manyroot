@@ -1108,6 +1108,11 @@ fn a_diff_lists_the_files_that_changed_and_diffs_one() {
     v.refused(&format!("/api/weave/diff?a={a}&b={b}&path=nowhere"), 404);
     v.refused(&format!("/api/weave/diff?a={a}"), 400);
     v.refused(&format!("/api/weave/diff?a={a}&b={b}&path=f.txt&limit=5"), 400);
+    // after and limit page the list only when it is named, never ignored (finding fb21c13db9b1).
+    v.refused(&format!("/api/weave/diff?a={a}&b={b}&after=f.txt&limit=1"), 400);
+    v.refused(&format!("/api/weave/diff?a={a}&b={b}&limit=1"), 400);
+    v.refused(&format!("/api/weave/diff?a={a}&b={b}&list=files&after=nowhere"), 400);
+    v.refused(&format!("/api/weave/diff?a={a}&b={b}&list=tree"), 400);
 }
 
 /// The caps: a side over 1 MiB, a side not text, a side not held, and two sides too long to diff line by
@@ -1123,12 +1128,11 @@ fn a_diff_at_the_caps_names_why_it_has_no_text() {
     std::os::unix::fs::symlink("big.txt", w.repo.join("link")).expect("a symlink");
     let b = w.decide(&[("big.txt", &big), ("long.txt", &long_b)], "b");
     // A side not held: a hand-made manifest naming a file this replica never saw.
-    let m = Manifest::new(vec![Entry {
-        path: "big.txt".into(),
-        mode: Mode::File,
-        hash: ContentHash::of(b"never seen"),
-        size: 10,
-    }]);
+    // And one held, but at another size than its entry names (finding 81ffe9a422c4).
+    let m = Manifest::new(vec![
+        Entry { path: "big.txt".into(), mode: Mode::File, hash: ContentHash::of(b"never seen"), size: 10 },
+        Entry { path: "short.txt".into(), mode: Mode::File, hash: ContentHash::of(b"small\n"), size: 99 },
+    ]);
     let file = w.tmp.path().join("m.cbor");
     std::fs::write(&file, m.encode()).expect("writes the manifest");
     let out = w.ok(&["artifact", file.to_str().expect("UTF-8"), "--media-type", MANIFEST_MEDIA_TYPE, "--as", AS]);
@@ -1146,6 +1150,10 @@ fn a_diff_at_the_caps_names_why_it_has_no_text() {
     let row =
         list["files"]["items"].as_array().expect("files").iter().find(|f| f["path"] == "big.txt").expect("big.txt");
     assert_eq!(row["not_held"], true);
+    let short =
+        list["files"]["items"].as_array().expect("files").iter().find(|f| f["path"] == "short.txt").expect("short.txt");
+    assert_eq!(short["not_held"], true, "held, but not at the entry's size");
+    assert_eq!(v.api(&format!("/api/weave/diff?a={a}&b={hand}&path=short.txt"))["shown"], "missing");
 }
 
 /// The unified diffs build at most 2 at a time: a third, while 2 are building, is refused at once with a
@@ -1178,4 +1186,48 @@ fn the_diff_slots_refuse_a_third_at_once() {
     assert!(refused[0].1.contains("busy"), "{}", refused[0].1);
     assert_eq!(replies.iter().filter(|(s, _)| *s == 200).count(), 2);
     assert!(started.elapsed() < Duration::from_millis(1_500 * 3), "the third wasn't left waiting");
+}
+
+/// A merge's "what changed" compares with its parent on its own line, as its history and file pages do,
+/// whichever parent sorts first (security note N1, independent note 3).
+#[test]
+fn a_merge_is_compared_with_its_parent_on_its_own_line() {
+    let w = Weave::new();
+    let first = w.decide(&[("a.txt", "a\n")], "a");
+    w.ok(&["weave", "line", "create", "dev", "--owner-decision", OD, "--as", AS]);
+    w.ok(&["weave", "line", "merge", "main", "--into", "dev", "--as", AS, "--json"]);
+    std::fs::write(w.repo.join("b.txt"), "b\n").expect("write");
+    w.git(&["add", "-A"]);
+    w.git(&["commit", "-q", "-m", "dev"]);
+    let dev_head =
+        w.id_of(&["weave", "integrate", "--line", "dev", "--as", AS, "--note", "on dev", "--json"], "decision");
+    let main_head = w.decide(&[("c.txt", "c\n")], "c");
+    let merge = w.id_of(&["weave", "line", "merge", "main", "--into", "dev", "--as", AS, "--json"], "decision");
+    let v = view(&w.ground);
+    let d = v.api(&format!("/api/weave/decision/{merge}"));
+    let mut parents: Vec<&str> = d["parents"].as_array().expect("parents").iter().filter_map(Value::as_str).collect();
+    parents.sort_unstable();
+    let mut both = [dev_head.as_str(), main_head.as_str()];
+    both.sort_unstable();
+    assert_eq!(parents, both);
+    assert_eq!(d["compared_with"], dev_head.as_str());
+    assert_eq!(v.api(&format!("/api/weave/file/{merge}?path=a.txt"))["decision"]["parent"], dev_head.as_str());
+    // The line's root has nothing to compare with.
+    let root = v.api(&format!("/api/weave/decision/{}", first));
+    assert!(root["compared_with"].is_null(), "{root}");
+}
+
+/// `BRACKEN_VIEW_DIFF_DELAY_MS` is capped at 2 s: a huge value still answers a diff within a few seconds.
+#[test]
+fn the_diff_delay_is_capped() {
+    let w = Weave::new();
+    let a = w.decide(&[("f.txt", "a\n")], "a");
+    let b = w.decide(&[("f.txt", "b\n")], "b");
+    let v = view_with(&w.ground, &[("BRACKEN_VIEW_DIFF_DELAY_MS", "600000")]);
+    assert_eq!(v.api("/api/weave")["weave"], true);
+    let started = Instant::now();
+    assert_eq!(v.api(&format!("/api/weave/diff?a={a}&b={b}&path=f.txt"))["shown"], "text");
+    let took = started.elapsed();
+    assert!(took >= Duration::from_millis(1_900), "the delay applies: {took:?}");
+    assert!(took < Duration::from_secs(10), "the delay isn't capped: {took:?}");
 }

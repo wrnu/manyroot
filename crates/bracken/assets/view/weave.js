@@ -359,7 +359,7 @@
     out.push(facts([
       ["verdict", verdict],
       ["manifest", h("span", {}, h("span", { class: "id" }, shown(d.manifest)), " ", goPath("tree", d.decision, "", "browse its files"))],
-      ["parents", d.parents.length ? h("span", {}, d.parents.map((p) => go("decision", p)), " ", goDiff(d.parents[0], d.decision, "", "what changed")) : null],
+      ["parents", d.parents.length ? h("span", {}, d.parents.map((p) => go("decision", p)), " ", d.compared_with ? goDiff(d.compared_with, d.decision, "", "what changed") : null) : null],
       ["policy in force", d.policy ? h("span", { class: "id" }, short(d.policy)) : null],
       ["git", d.source ? h("span", { class: "id" }, shown(d.source.git)) : null],
       ["proposals", d.proposals.length ? h("span", { class: "id" }, shown(d.proposals.map(short).join(" "))) : null],
@@ -511,7 +511,8 @@
   }
 
   async function diffList(a, b) {
-    const d = await api(`/api/weave/diff?${query({ a, b, limit: PAGE })}`);
+    // The first 50 come in the answer; the rest page by list=files (finding fb21c13db9b1).
+    const d = await api(`/api/weave/diff?${query({ a, b })}`);
     const out = [h("h2", {}, "What changed"), h("p", { class: "lede" }, "From ", goPath("tree", a, "", recordLabel(a)), " to ", goPath("tree", b, "", recordLabel(b)), ".")];
     const row = (f) => h("li", { class: f.kind === "deleted" ? "failing" : "" },
       goDiff(a, b, f.path, f.path), h("span", { class: "sc" }, f.kind), f.not_held ? h("span", { class: "muted" }, "not held here") : null);
@@ -535,8 +536,10 @@
     if (d.shown === "text") {
       const lines = d.unified.split("\n");
       if (lines.length > d.lines) lines.length = d.lines;
-      // The `---`/`+++` head is only what comes before the first hunk: a removed line `-- x` is `--- x`.
-      const firstHunk = lines.findIndex((l) => l.startsWith("@@"));
+      // The `---`/`+++` head is only what comes before the first hunk: a removed line `-- x` is `--- x`. An
+      // empty file added or deleted has no hunk, so all of it is head.
+      const hunk = lines.findIndex((l) => l.startsWith("@@"));
+      const firstHunk = hunk < 0 ? lines.length : hunk;
       const cls = (i) => {
         const line = lines[i];
         if (i < firstHunk) return "head";

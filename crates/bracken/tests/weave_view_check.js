@@ -449,12 +449,15 @@ check("a diff lists its files, each a button to that file's diff, and says which
     { path: "gone", kind: "deleted", before: value(42), after: null, not_held: true },
   ], 3);
   const { page, fetched, location } = await load(`#diff/${D1}/${D2}`, answers([[`/api/weave/diff?`, { a: MANIFEST, b: MANIFEST, files }]]));
-  assert.deepStrictEqual(fetched, [`/api/weave/diff?a=${D1}&b=${D2}&limit=50`]);
+  assert.deepStrictEqual(fetched, [`/api/weave/diff?a=${D1}&b=${D2}`], "the first 50 come in the answer, unpaged (finding fb21c13db9b1)");
   safe(page, "diff list");
   assert.ok(marks(page).includes("U+202E"));
   assert.ok(page.textContent.includes("3 files") && page.textContent.includes("not held here"));
   const more = buttons(page).find((b) => b.textContent.startsWith("More"));
   assert.ok(more, "the rest by paging");
+  more.on.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.strictEqual(fetched[1], `/api/weave/diff?a=${D1}&b=${D2}&list=files&after=gone&limit=50`, "a next page names its list");
   buttons(page).find((b) => b.textContent === "gone").on.click[0]();
   assert.strictEqual(location.hash, `#diff/${D1}/${D2}/gone`);
 });
@@ -468,6 +471,19 @@ check("a file's diff is rows of text: markup is text, invisibles marked, each li
   assert.strictEqual(r[3].textContent, " <script>alert(1)</script>");
   assert.ok(marks(page).includes("U+202E"));
   assert.ok(!page.textContent.includes("‮"), "no raw bidi control reaches the page");
+});
+
+check("an empty file added has no hunk: its two lines are head, not a removal and an addition (independent note 2)", async () => {
+  const unified = "--- a/empty\n+++ b/empty\n";
+  const { page } = await load(`#diff/${D1}/${D2}/empty`, answers([[`/api/weave/diff?`, { a: MANIFEST, b: MANIFEST, path: "empty", kind: "added", before: null, after: value(41), shown: "text", lines: 2, unified }]]));
+  assert.deepStrictEqual(diffRows(page).map((li) => li.className), ["head", "head"]);
+});
+
+check("a merge's what changed diffs against its parent on its own line, not the first by id (security N1)", async () => {
+  const onLine = id(6);
+  const { page, location } = await load(`#decision/${D2}`, answers([[`/api/weave/decision/${D2}`, decisionAnswer({ parents: [D1, onLine], compared_with: onLine })]]));
+  buttons(page).find((b) => b.textContent === "what changed").on.click[0]();
+  assert.strictEqual(location.hash, `#diff/${onLine}/${D2}`);
 });
 
 check("a long diff renders 5,000 lines at a time, from the text already held", async () => {

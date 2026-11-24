@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use bracken_tree::ContentHash;
 use bracken_tree::FileValue;
 use bracken_tree::diff::Kind;
-use bracken_tree::format::{Entry, Manifest, Mode};
+use bracken_tree::format::{Decision, Entry, Manifest, Mode};
 use bracken_tree::ground::{Index, kind_of};
 use bracken_tree::lines::{Lines, newest_first};
 use bracken_tree::results::Checks;
@@ -976,6 +976,7 @@ impl Ctx<'_> {
         let mut more = Map::new();
         more.insert("verdict".into(), verdict);
         more.insert("line".into(), json!(line));
+        more.insert("compared_with".into(), json!(self.compared_parent(&record.decision)));
         more.insert("line_name".into(), json!(lines.line(&line).map(|l| l.policy.name.clone())));
         more.insert("policy".into(), json!(lines.policy_in_force_for(&id).map(|v| v.id)));
         more.insert(
@@ -1090,9 +1091,16 @@ impl Ctx<'_> {
         }
         let lines = &self.s.lines;
         let Some(r) = resolve(self.g, given).ok().and_then(|id| lines.decision(&id)) else { return Value::Null };
-        let d = &r.decision;
+        json!({"decision": r.id, "line": r.decision.line, "parent": self.compared_parent(&r.decision)})
+    }
+
+    /// The decision a decision's file and tree are compared with: its first parent on its own line; with
+    /// none there (the line's root, or a first decision a line merge started from another line's head), its
+    /// first parent; with no parent, none.
+    fn compared_parent(&self, d: &Decision) -> Option<ContributionId> {
+        let lines = &self.s.lines;
         let on_line = d.parents.iter().find(|p| lines.decision(p).is_some_and(|x| x.decision.line == d.line));
-        json!({"decision": r.id, "line": d.line, "parent": on_line.or(d.parents.first())})
+        on_line.or(d.parents.first()).copied()
     }
 
     /// `/api/weave/history/<line>?path`: the line's decisions, newest first, where the file at `path` differs
@@ -1107,8 +1115,7 @@ impl Ctx<'_> {
         let mut rows: Vec<(ContributionId, Value)> = Vec::new();
         for id in self.s.logs.get(&line).unwrap_or(&empty) {
             let d = &lines.decision(id).expect("logged decisions exist").decision;
-            let on_line = d.parents.iter().find(|p| lines.decision(p).is_some_and(|r| r.decision.line == line));
-            let parent = on_line.or(d.parents.first()).copied();
+            let parent = self.compared_parent(d);
             let before = parent
                 .and_then(|p| lines.decision(&p))
                 .and_then(|r| value_at(&self.s.index, &r.decision.manifest, path));
@@ -1118,7 +1125,7 @@ impl Ctx<'_> {
             rows.push((
                 *id,
                 json!({"decision": id, "author": author.to_string(), "author_name": self.names.display(&author),
-                                   "parent": parent, "parent_on_line": on_line.is_some(), "kind": kind.as_str(),
+                                   "parent": parent, "parent_on_line": parent.and_then(|p| lines.decision(&p)).is_some_and(|r| r.decision.line == line), "kind": kind.as_str(),
                                    "before": before.map(file_value_json), "after": after.map(file_value_json)}),
             ));
         }
@@ -1141,14 +1148,13 @@ impl Ctx<'_> {
             }
             return self.file_diff(&ha, ma, &hb, mb, path);
         }
-        if p.list.is_some_and(|l| l != "files") {
-            return fail(400, "list is files");
-        }
+        p.check(&["files"], query)?;
         let diffs = bracken_tree::diff::manifests(ma, mb);
-        let unheld = |v: Option<FileValue>| v.is_some_and(|v| !self.s.index.holds_file(&v.hash));
+        // Held at the entry's size, as the tree and one file's diff judge it (finding 81ffe9a422c4).
+        let unheld = |m: &Manifest, path: &str| m.get(path).is_some_and(|e| !self.held(e));
         let row = |d: &bracken_tree::diff::FileDiff| {
             json!({"path": d.path, "kind": d.kind.as_str(), "before": d.before.map(file_value_json),
-                   "after": d.after.map(file_value_json), "not_held": unheld(d.before) || unheld(d.after)})
+                   "after": d.after.map(file_value_json), "not_held": unheld(ma, &d.path) || unheld(mb, &d.path)})
         };
         if p.list.is_some() {
             return listed("files", &diffs, |d| d.path.clone(), row, WHOLE, p);
@@ -1200,7 +1206,10 @@ impl Ctx<'_> {
                 Ok((old, new)) => {
                     let key = format!("diff {ha} {hb} {path}");
                     let unified = self.derived_in(&self.slots.diffs, key, || {
-                        std::thread::sleep(diff_delay());
+                        let delay = diff_delay();
+                        if !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
                         json!(bracken_tree::diff::unified(path, old, new))
                     })?;
                     match unified.as_str() {
