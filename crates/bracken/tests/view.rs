@@ -678,7 +678,7 @@ fn every_asset_is_served_with_the_csp() {
     }
     // What the pages and their styles load, so nothing they ask for is missing.
     let mut named: Vec<String> = Vec::new();
-    for page in ["/", "/root.html", "/trust.html", "/tension.html", "/runs.html"] {
+    for page in ["/", "/root.html", "/trust.html", "/tension.html", "/runs.html", "/weave.html"] {
         let page = String::from_utf8(v.get(page).body).unwrap();
         for attr in ["src=\"", "href=\""] {
             for part in page.split(attr).skip(1) {
@@ -686,7 +686,7 @@ fn every_asset_is_served_with_the_csp() {
             }
         }
     }
-    for css in ["/visualizer.css", "/loom.css", "/root.css", "/trust.css", "/tension.css", "/runs.css"] {
+    for css in ["/visualizer.css", "/loom.css", "/root.css", "/trust.css", "/tension.css", "/runs.css", "/weave.css"] {
         let text = String::from_utf8(v.get(css).body).unwrap();
         for part in text.split("url(\"").skip(1) {
             named.push(part.split('"').next().unwrap().to_owned());
@@ -710,6 +710,36 @@ fn every_asset_is_served_with_the_csp() {
         assert_security_headers(p, &r);
         assert_eq!(r.headers["content-type"], media(p), "{p}");
         assert!(!r.body.is_empty(), "{p}");
+    }
+}
+
+/// A page on another site can send blind requests that make the view work, though it can't read the
+/// answer: every `/api/` path, the Loom's and the event stream included, refuses one a browser says is
+/// cross-site or same-site, and serves the view's own pages, a typed URL and a tool that says nothing
+/// (docs/design/weave-view.md section 7). The pages themselves are served to anyone.
+#[test]
+fn cross_site_requests_are_refused_on_every_api_path() {
+    let dir = ground();
+    let v = view(&dir);
+    let ask = |path: &str, site: Option<&str>| {
+        let mut s = TcpStream::connect(v.at.as_str()).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+        let site = site.map_or(String::new(), |x| format!("Sec-Fetch-Site: {x}\r\n"));
+        write!(s, "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n{site}Connection: close\r\n\r\n", v.port).unwrap();
+        let mut raw = Vec::new();
+        let _ = s.read_to_end(&mut raw);
+        parse(&raw).status
+    };
+    for path in ["/api/ground", "/api/graph", "/api/tension", "/api/events", "/api/weave", "/api/weave/line/00000000"] {
+        for site in ["cross-site", "same-site", "Cross-Site"] {
+            assert_eq!(ask(path, Some(site)), 403, "{path} from {site}");
+        }
+    }
+    for site in [None, Some("same-origin"), Some("none")] {
+        assert_eq!(ask("/api/ground", site), 200, "{site:?}");
+    }
+    for page in ["/", "/weave.html", "/common.js"] {
+        assert_eq!(ask(page, Some("cross-site")), 200, "{page}");
     }
 }
 

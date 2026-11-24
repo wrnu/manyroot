@@ -1,0 +1,157 @@
+/* The Weave pages (docs/design/weave-view.md): lines as stems, decisions as knots, on the visualizer's soil. */
+
+html,
+body.weave-page {
+  height: auto;
+  min-height: 100%;
+}
+
+.weave {
+  max-width: 64rem;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem 3rem;
+}
+
+.weave h2 {
+  margin: 0.2rem 0 0.4rem;
+  font-weight: 600;
+  font-size: 1.35rem;
+  overflow-wrap: anywhere;
+}
+.weave h3 {
+  margin: 1.6rem 0 0.5rem;
+  font-family: "Alegreya Sans SC", "Alegreya", sans-serif;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  font-size: 0.95rem;
+  color: var(--root-dim);
+  border-bottom: 1px solid var(--stratum-line);
+  padding-bottom: 0.25rem;
+}
+
+.weave .lede {
+  color: var(--root-dim);
+  margin: 0 0 0.8rem;
+}
+
+.weave .facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.2rem 1rem;
+  margin: 0;
+  font-size: 0.92rem;
+}
+.weave .facts dt {
+  color: var(--root-faint);
+}
+.weave .facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+/* A list of records: each a row, a stem's knot at its left. */
+.weave .rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.weave .rows li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.75rem;
+  padding: 0.45rem 0 0.45rem 1.1rem;
+  border-left: 2px solid var(--stratum-line);
+  position: relative;
+  overflow-wrap: anywhere;
+}
+.weave .rows li::before {
+  content: "";
+  position: absolute;
+  left: -5px;
+  top: 0.95rem;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ground);
+  border: 1.5px solid var(--root-dim);
+}
+.weave .rows li.green::before {
+  background: var(--accepted);
+  border-color: var(--accepted);
+}
+.weave .rows li.failing::before {
+  border-color: var(--rejected);
+}
+.weave .rows .note {
+  flex-basis: 100%;
+  color: var(--root-dim);
+  font-size: 0.9rem;
+  white-space: pre-wrap;
+}
+
+/* A record id or a line's name is a button: it moves the page, it never navigates away. */
+.weave button.go {
+  border: none;
+  border-radius: 2px;
+  background: none;
+  padding: 0;
+  color: var(--root);
+  text-decoration: underline;
+  text-decoration-color: var(--root-faint);
+  text-underline-offset: 0.2em;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.weave button.go:hover {
+  text-decoration-color: var(--root);
+}
+.weave button.more {
+  margin-top: 0.6rem;
+}
+
+.weave .pass {
+  color: var(--pass);
+}
+.weave .fail {
+  color: var(--fail);
+}
+.weave .muted {
+  color: var(--root-faint);
+}
+
+/* An invisible character, shown: so text can't read differently from its bytes. */
+.weave .invisible {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.75em;
+  color: var(--focus);
+  border: 1px solid var(--focus);
+  border-radius: 2px;
+  padding: 0 0.15em;
+}
+
+.weave .argv,
+.weave .text {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.weave .problem {
+  color: var(--rejected);
+}
+
+@media (max-width: 760px) {
+  .weave {
+    padding: 0.9rem 1rem 2rem;
+  }
+  .weave .facts {
+    grid-template-columns: 1fr;
+    gap: 0 0;
+  }
+  .weave .facts dd {
+    margin-bottom: 0.45rem;
+  }
+}
