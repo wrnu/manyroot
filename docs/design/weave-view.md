@@ -442,13 +442,14 @@ computes only this:
 | What | Cap | Why |
 |---|---|---|
 | A file's text shown | 1 MiB, and rendered 5,000 lines at a time | About 20,000 lines of code fit in 1 MiB, but a megabyte of newlines is a million lines. So the page builds the rows for 5,000 lines and adds the next 5,000 when asked, from the text it already holds. The answer gives `lines`, the count. A symlink's target is capped the same way, and over it is `oversized`, before its bytes are scanned |
+| A tree child's row | Not bounded by the row caps, since its name and path are never cut, but by `MAX_PATH_BYTES` (4 KiB) and the 255-byte name: a path of control characters, each written `\u00XX`, makes a row of about 26 KiB | A page of 2,000 such rows by hand is about 52 MB; the page asks for 50 at a time, about 1.3 MB (security note 1 on PR #81 round 2) |
 | Invisible characters marked as elements | 256 a string, and 2,000 a batch of 5,000 lines | Past that, each is written `[U+XXXX]` in the text after one span saying how many, so a megabyte of control characters is a few hundred elements, not a million (finding `3c69d509671e`). The same cap as `common.js`'s `B.shown` in PR #80 |
 | Each side of a unified diff | 1 MiB, and `diff::MAX_DIFF_CELLS` | `diff::unified` builds a table of up to 16 million `u32`s (64 MB). The page renders its output 5,000 lines at a time, as for files |
 | Work building at once | 2 unified diffs, 2 conflict previews, 2 graph-sorting reads (section 3) | Taken with a new non-blocking `Slots::try_take`. Today's `Slots::take` waits, which would hold a connection. A request past the slots gets a 503 at once, to retry |
 | A conflict preview | 20 conflicts a page, 10 resolutions each, sides at most 1 MiB each and 16 MiB in all | *Conflict preview* above |
 | Lists | 50 inside an answer; pages of 200 by default, 2,000 at most, or 200 at most for an endpoint whose rows hold nested lists | *Every list is paged* above |
 | A list inside a list item | 5 entries and its total, each entry's text 200 characters and 800 bytes | The row's own page has the rest |
-| A list row | 24 KiB with nested lists, 4 KiB otherwise, as serialized JSON | *Every list is paged* above. A flat row's own text can be up to 4 KiB a string, so a row with a long note or a check result's full 4 KiB of details is trimmed a little further, its longest strings first, to fit. Its own page has the text in full, up to 64 KiB |
+| A list row | 24 KiB with nested lists, 4 KiB otherwise, as serialized JSON; a tree child's row is the exception, below | *Every list is paged* above. A flat row's own text can be up to 4 KiB a string, so a row with a long note or a check result's full 4 KiB of details is trimmed a little further, its longest strings first, to fit. Its own page has the text in full, up to 64 KiB |
 | A check result's details | 4 KiB in a list, 64 KiB on `/api/weave/result/<id>` | 64 KiB is the view's existing `TEXT_BYTES`. A list of 2,000 results is at most 8 MiB of details |
 | A box log | 64 KiB | |
 | Notes, summaries, reasons, goals and other short text in a list | 4 KiB each | A record's own page has its text up to 64 KiB |

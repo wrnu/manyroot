@@ -158,6 +158,16 @@ a:hover {
   overflow-wrap: anywhere;
 }
 
+/* An invisible or control character, shown: so text can't read differently from its bytes. */
+.invisible {
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.75em;
+  color: var(--focus);
+  border: 1px solid var(--focus);
+  border-radius: 2px;
+  padding: 0 0.15em;
+}
+
 /* Scrollbars, in the soil. */
 * {
   scrollbar-color: var(--stratum-line) transparent;

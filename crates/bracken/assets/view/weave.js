@@ -18,51 +18,10 @@
 
   // ---- Text ----
 
-  // The same as PR #80's B.shown in common.js, signature and all, so this one gives way to it when #80
-  // merges: every Default_Ignorable_Code_Point (bidi, zero-width, BOM, variation selectors, tags) and C0/C1
-  // control but \t and \n is marked. At most `maxSpans` marks are elements; past that, each is written
-  // `[U+XXXX]` in the text, after one span saying so, so a text of a million controls is a few elements,
-  // not a million (finding 3c69d509671e).
-  const INVISIBLE = new RegExp(
-    "\\p{Default_Ignorable_Code_Point}|[\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]|[\\u{e0000}-\\u{e007f}]|[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]",
-    "gu",
-  );
+  // common.js's B.shown: each invisible or control character marked, at most this many as elements a
+  // string; past that, written [U+XXXX] in the text after one span saying so (finding 3c69d509671e).
+  const shown = B.shown;
   const SHOWN_SPAN_LIMIT = 256;
-
-  /** Text as children for h(): its invisible and control characters shown, never hidden or obeyed. */
-  function shown(value, maxSpans = SHOWN_SPAN_LIMIT) {
-    const src = String(value === null || value === undefined ? "" : value);
-    const out = [];
-    let last = 0;
-    let spans = 0;
-    let tail = null;
-    let extra = 0;
-    for (const m of src.matchAll(INVISIBLE)) {
-      const cp = m[0].codePointAt(0);
-      const hex = cp.toString(16).toUpperCase().padStart(4, "0");
-      const control = cp < 0x20 || (cp >= 0x7f && cp <= 0x9f);
-      const label = control ? `\\u{${cp.toString(16)}}` : `U+${hex}`;
-      if (spans < maxSpans) {
-        if (m.index > last) out.push(src.slice(last, m.index));
-        out.push(h("span", { class: "invisible", title: control ? "a control character" : "an invisible character" }, label));
-        spans++;
-      } else {
-        if (tail === null) tail = [];
-        if (m.index > last) tail.push(src.slice(last, m.index));
-        tail.push(`[${label}]`);
-        extra++;
-      }
-      last = m.index + m[0].length;
-    }
-    if (tail !== null) {
-      if (last < src.length) tail.push(src.slice(last));
-      out.push(h("span", { class: "invisible", title: "invisible or control characters past the highlight limit" }, `+${extra} more below marked as [U+XXXX]`));
-      out.push(tail.join(""));
-    } else if (last < src.length) {
-      out.push(src.slice(last));
-    }
-    return out;
-  }
 
   /**
    * A text's first line, at most `max` characters: common.js's firstLine() without its plain(), which would
@@ -423,7 +382,7 @@
     out.push(facts([
       ["manifest", h("span", { class: "id" }, shown(t.manifest))],
       ["files", String(t.files)],
-      ["complete", t.complete ? "yes: this replica holds every file" : `no: ${t.missing.total} files aren't held here`],
+      ["complete", t.complete ? "yes: this replica holds every file" : `no: ${t.missing.total === 1 ? "1 file isn't" : `${t.missing.total} files aren't`} held here`],
     ]));
     const childRow = (c) => {
       const path = dir ? `${dir}/${c.name}` : c.name;

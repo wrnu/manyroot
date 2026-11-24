@@ -339,6 +339,36 @@
   white-space: pre-line;
   overflow-wrap: anywhere;
 }
+.artifact-preview-wrap {
+  margin-top: 0.75rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--stratum-line);
+}
+.preview-toggle {
+  font-size: 0.82rem;
+  padding: 0.2rem 0.7rem;
+}
+.artifact-preview {
+  margin-top: 0.55rem;
+  padding: 0.6rem 0.7rem;
+  max-height: 18rem;
+  overflow: auto;
+  background: var(--ground-deep);
+  border: 1px solid var(--stratum-line);
+  border-radius: 3px;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.76rem;
+  line-height: 1.45;
+  color: var(--root-dim);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.preview-note {
+  margin: 0.55rem 0 0;
+  color: var(--root-faint);
+  font-size: 0.8rem;
+  font-style: italic;
+}
 
 /* Ground text is isolated from the words around it, so direction marks in it (U+202E and the like)
    can't reorder anything outside its own element. Inside composed lines, names and methods are <bdi>. */
@@ -349,6 +379,7 @@
 .label-card .statement,
 .label-card .detail,
 .label-card dd,
+.artifact-preview,
 .side .lineage .statement {
   unicode-bidi: isolate;
 }

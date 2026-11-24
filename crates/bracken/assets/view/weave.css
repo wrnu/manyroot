@@ -121,16 +121,6 @@ body.weave-page {
   color: var(--root-faint);
 }
 
-/* An invisible character, shown: so text can't read differently from its bytes. */
-.weave .invisible {
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  font-size: 0.75em;
-  color: var(--focus);
-  border: 1px solid var(--focus);
-  border-radius: 2px;
-  padding: 0 0.15em;
-}
-
 .weave .argv,
 .weave .text {
   font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
