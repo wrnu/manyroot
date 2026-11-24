@@ -92,6 +92,7 @@ class MockNode {
     return out;
   }
   getBoundingClientRect() {
+    if (this._rect) return this._rect;
     if (this.attrs.id === "loom-canvas") return { left: 0, top: 0, width: 1000, height: 760 };
     if (this.attrs.id === "gauge-canvas") return { left: 0, top: 0, width: 92, height: 760 };
     return { left: 0, top: 0, width: 48, height: 18 };
@@ -103,9 +104,10 @@ class MockNode {
   }
 }
 
-function makeCanvas(id) {
+function makeCanvas(id, rect = null) {
   const el = new MockNode("canvas");
   el.attrs.id = id;
+  if (rect) el._rect = rect;
   const ops = [];
   const stack = [];
   let tx = 0, ty = 0, sx = 1, sy = 1;
@@ -128,7 +130,7 @@ function makeCanvas(id) {
     lineTo() {},
     quadraticCurveTo() { ops.push({ op: "quad" }); },
     closePath() { ops.push({ op: "close" }); },
-    bezierCurveTo() {},
+    bezierCurveTo(cp1x, cp1y, cp2x, cp2y, x, y) { ops.push({ op: "bezier", x, y }); },
     arc(x, y, r) { ops.push({ op: "arc", x: tx + x * sx, y: ty + y * sy, r: r * sx }); },
     setLineDash() {},
     fill(p) {
@@ -148,19 +150,19 @@ function makeCanvas(id) {
   return el;
 }
 
-async function runLoom(fixture, hash = "") {
+async function runLoom(fixture, hash = "", canvasHeight = 760) {
   const byId = new Map();
-  const reg = (id, tag = "div") => {
-    const n = tag === "canvas" ? makeCanvas(id) : new MockNode(tag);
+  const reg = (id, tag = "div", rect = null) => {
+    const n = tag === "canvas" ? makeCanvas(id, rect) : new MockNode(tag);
     n.attrs.id = id;
     byId.set(id, n);
     return n;
   };
   const gaugeParent = new MockNode("section");
-  const gaugeCanvas = reg("gauge-canvas", "canvas");
+  const gaugeCanvas = reg("gauge-canvas", "canvas", { left: 0, top: 0, width: 92, height: canvasHeight });
   gaugeParent.append(gaugeCanvas);
 
-  const loomCanvas = reg("loom-canvas", "canvas");
+  const loomCanvas = reg("loom-canvas", "canvas", { left: 0, top: 0, width: 1000, height: canvasHeight });
   for (const id of [
     "ground-name", "data-note", "agents", "labels", "tether", "hover-label", "side",
     "window", "surface", "surface-time", "flag", "to-flag", "play", "speed",
@@ -626,7 +628,70 @@ async function main() {
   assert(side.textContent.includes("Hover a knot"), "clearing hash should deselect");
   assert(!hasAncestryVeil(), "deselecting should clear pinned ancestry veil");
 
-  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, safe text preview, pinned ancestry, clickable lineage, and hashchange all pass.");
+  // 10. Dense ancestry draw threshold (DENSE_ANCESTRY = 1000) and negative-Y band clamping in drawHyphae.
+  // 10a. Knot 1500 has 1,501 ancestors (> 1000, < 5000): ancestry must bundle hyphae + use dense blooms instead of drawing 1,501 individual knots.
+  location.hash = `#${dense.ids[1500]}`;
+  dispatchWin("hashchange");
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  const veilIdx1500 = loomCanvas._ops.findLastIndex((o) => o.op === "fillRect" && o.alpha === 0.72);
+  assert(veilIdx1500 >= 0, "expected ancestry veil when knot 1500 is selected");
+  const afterVeil1500 = loomCanvas._ops.slice(veilIdx1500 + 1);
+  const ancKnots1500 = afterVeil1500.filter((o) => o.op === "strokePath").length;
+  const ancBeziers1500 = afterVeil1500.filter((o) => o.op === "bezier").length;
+  assert(
+    ancKnots1500 < 50 && ancBeziers1500 < 200,
+    `expected dense bundled ancestry for 1,501 ancestors, got ${ancKnots1500} individual knots and ${ancBeziers1500} beziers`
+  );
+  // Meanwhile knot 100 (101 ancestors <= 1000) still draws its ancestry in detailed mode.
+  location.hash = `#${dense.ids[100]}`;
+  dispatchWin("hashchange");
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  const veilIdx100 = loomCanvas._ops.findLastIndex((o) => o.op === "fillRect" && o.alpha === 0.72);
+  const ancKnots100 = loomCanvas._ops.slice(veilIdx100 + 1).filter((o) => o.op === "strokePath").length;
+  assert(ancKnots100 >= 100, `expected detailed ancestry (>=100 knots) for 101 ancestors, got ${ancKnots100}`);
+
+  // 10b. Negative-Y band clamping in drawHyphae: on a tall zoomed canvas where knots in the top 5% visible margin
+  // have Y(i) < 0, clamping Math.floor(Y(i) / band) to [0, 4095] merges negative-Y knots into band 0 rather than
+  // creating a negative-band bundle (which would sit off-screen at y < 0 and risk colliding with pair-1 band 4095).
+  const tall = makeDenseFixture();
+  const tallGraph = tall.route("/api/graph");
+  // Place all cross-agent edges in two clusters: one at the very top of the zoomed window (Y < 0) and one just inside (Y ~ 10),
+  // while keeping >5000 knots visible inside the zoomed window so dense drawHyphae runs.
+  const tBase = tallGraph.time[0];
+  const tSpan = tallGraph.time[tallGraph.time.length - 1] - tBase;
+  // After one ctrl+wheel zoom centered at canvas midpoint (f ≈ 0.78), view ≈ [0.11, 0.89] and visible lo ≈ 0.071 of tSpan.
+  // Put knot 1000 (author 1, parent 999 author 0) at 0.08 * tSpan (which lands at Y < 0 on a 2400px tall canvas!)
+  // and knot 1002 (author 1, parent 1001 author 0) at 0.112 * tSpan (Y ≈ 100px? Let's put it at 0.085 * tSpan -> Y ≈ +5px).
+  for (let i = 0; i < tallGraph.time.length; i++) {
+    // Keep >5000 knots inside [0.15, 0.85] on author 0 so only our two test edges cross agents (0 -> 1).
+    tallGraph.author[i] = 0;
+    tallGraph.time[i] = tBase + Math.round((0.15 + (i / tallGraph.time.length) * 0.7) * tSpan);
+    tallGraph.parents[i] = i === 0 ? [] : [i - 1];
+  }
+  // Pin range() endpoints to [tBase, tBase + tSpan] so ctrl+wheel zoom (f ≈ 0.7788) gives view ≈ [0.1106, 0.8894].
+  tallGraph.time[0] = tBase;
+  tallGraph.time[tallGraph.time.length - 1] = tBase + tSpan;
+  tallGraph.time[10] = tBase + Math.round(0.075 * tSpan); // Y ≈ -12 (< 0) after zoom on 2400px canvas
+  tallGraph.author[10] = 1;
+  tallGraph.parents[10] = [9];
+  tallGraph.parents[11] = [9]; // avoid reverse 1 -> 0 edge
+  tallGraph.time[12] = tBase + Math.round(0.085 * tSpan); // Y ≈ +17 (in [0, band)) after zoom on 2400px canvas
+  tallGraph.author[12] = 1;
+  tallGraph.parents[12] = [11];
+  tallGraph.parents[13] = [11]; // avoid reverse 1 -> 0 edge
+  const tallRun = await runLoom(tall, "", 2400);
+  const tallWin = tallRun.byId.get("window");
+  tallWin.dispatch("wheel", { ctrlKey: true, clientY: 1200, deltaY: -100, preventDefault() {} });
+  for (let k = 0; k < 10; k++) await new Promise((r) => setImmediate(r));
+  const tallBeziers = tallRun.loomCanvas._ops.filter((o) => o.op === "bezier");
+  // Both cross-agent edges (knot 10 at Y < 0 and knot 12 at 0 <= Y < band) must clamp into band 0 (1 bundle, not 2, and no bundle with y < 0).
+  assert.strictEqual(
+    tallBeziers.length,
+    1,
+    `expected negative-Y edge to clamp into band 0 (1 bundle total), got ${tallBeziers.length}: ${JSON.stringify(tallBeziers)}`
+  );
+
+  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, safe text preview, pinned ancestry, clickable lineage, hashchange, dense ancestry threshold, and negative-Y band clamp all pass.");
 }
 
 main().catch((err) => {

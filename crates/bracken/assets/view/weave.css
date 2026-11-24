@@ -156,6 +156,19 @@ body.weave-page {
   overflow-wrap: anywhere;
   padding-left: 0.6em;
 }
+.weave ul.diff li {
+  display: block;
+}
+.weave ul.diff li.add {
+  color: var(--pass);
+}
+.weave ul.diff li.del {
+  color: var(--fail);
+}
+.weave ul.diff li.hunk,
+.weave ul.diff li.head {
+  color: var(--root-faint);
+}
 .weave .crumbs {
   overflow-wrap: anywhere;
   margin: 0 0 0.8rem;
