@@ -17,6 +17,10 @@
   const PAGE = 50;
   /** The statuses a proposals list filters by. */
   const STATUSES = ["all", "open", "integrated", "invalid", "retracted"];
+  /** The states a line's objections filter by. */
+  const STATES = ["all", "open", "other"];
+  /** A manifest's content hash, as its page takes it. */
+  const MANIFEST = /^blake3:[0-9a-f]{64}$/;
 
   // ---- Text ----
 
@@ -71,7 +75,13 @@
   function route() {
     const parts = location.hash.slice(1).split("/");
     const [name, id] = [parts[0], (parts[1] || "").toLowerCase()];
-    if ((name === "line" || name === "decision" || name === "proposal") && ID.test(id)) return { name, id };
+    if (["line", "decision", "proposal", "result", "log"].includes(name) && ID.test(id)) return { name, id };
+    if (name === "manifest" && MANIFEST.test(id)) return { name, id };
+    // `#objections/<line>[/<state>]`: the state one of a fixed few.
+    if (name === "objections" && ID.test(id)) {
+      const state = parts[2] || "all";
+      if (STATES.includes(state)) return { name, id, state };
+    }
     // `#proposals/<line>[/<status>]`: the status one of a fixed few, or all.
     if (name === "proposals" && ID.test(id)) {
       const status = parts[2] || "all";
@@ -112,6 +122,18 @@
     if (!RECORD.test(String(a)) || !RECORD.test(String(b))) return h("span", { class: "muted" }, shown(label));
     const tail = path ? `/${encodeURIComponent(path)}` : "";
     return h("button", { type: "button", class: "go", on: { click: () => { location.hash = `diff/${a}/${b}${tail}`; } } }, shown(label));
+  }
+
+  /** A button to a manifest's page: its check results, reviews and objections. */
+  function goManifest(hash, label) {
+    if (!MANIFEST.test(String(hash))) return h("span", { class: "muted" }, shown(label));
+    return h("button", { type: "button", class: "go", on: { click: () => { location.hash = `manifest/${hash}`; } } }, shown(label));
+  }
+
+  /** A row of filter buttons, the chosen one shown as a label. */
+  function filters(all, chosen, routeOf) {
+    const one = (x) => (x === chosen ? h("span", { class: "sc" }, x) : h("button", { type: "button", class: "go", on: { click: () => { location.hash = routeOf(x); } } }, x));
+    return h("p", { class: "crumbs" }, all.flatMap((x, i) => (i ? [h("span", { class: "muted" }, " · "), one(x)] : [one(x)])));
   }
 
   /** A button to a path's history on a line. */
@@ -336,6 +358,7 @@
       ["green", stateWord(l.green)],
       ["open objections", l.open_objections === null ? null : String(l.open_objections)],
       ["proposals", go("proposals", l.line, "every proposal to this line")],
+      ["objections", go("objections", l.line, "every objection to its work")],
     ]));
     // Each head's counted checks: a forked line has several (independent note 1).
     for (const head of l.green ? l.green.heads : []) {
@@ -358,6 +381,8 @@
     return out;
   }
 
+  const objectionRow = (o) => h("li", { class: "failing" }, h("span", { class: "id" }, short(o.objection)), h("span", { class: "sc" }, shown(o.basis.kind)),
+    h("span", { class: "muted" }, shown(`by ${who(o.author, o.author_name)}; answered by ${o.allowed.join(", ") || "nothing"}`)), cutMark(o));
   const reviewRow = (r) => h("li", { class: r.kind === "objection" ? "failing" : "green" }, h("span", { class: "sc" }, r.kind), h("span", { class: "muted" }, shown(`by ${who(r.author, r.author_name)}`)), cutMark(r), h("span", { class: "note" }, shown(r.note)));
 
   async function decision(id) {
@@ -368,7 +393,7 @@
       h("p", { class: "lede" }, "on ", go("line", d.line, d.line_name || short(d.line)), shown(` by ${who(d.author, d.author_name)}`))];
     out.push(facts([
       ["verdict", verdict],
-      ["manifest", h("span", {}, h("span", { class: "id" }, shown(d.manifest)), " ", goPath("tree", d.decision, "", "browse its files"))],
+      ["manifest", h("span", {}, h("span", { class: "id" }, shown(d.manifest)), " ", goPath("tree", d.decision, "", "browse its files"), " ", goManifest(d.manifest, "its checks"))],
       ["parents", d.parents.length ? h("span", {}, d.parents.map((p) => go("decision", p)), " ", d.compared_with ? goDiff(d.compared_with, d.decision, "", "what changed") : null) : null],
       ["policy in force", d.policy ? h("span", { class: "id" }, short(d.policy)) : null],
       ["git", d.source ? h("span", { class: "id" }, shown(d.source.git)) : null],
@@ -401,8 +426,7 @@
     const q = (extra) => query({ status: status === "all" ? undefined : status, ...extra });
     const list = await api(`/api/weave/proposals/${lineId}?${q({ limit: PAGE })}`);
     const out = [h("h2", {}, "Proposals"), h("p", { class: "lede" }, "To ", go("line", lineId, "the line"), ", by id.")];
-    const filter = (s) => (s === status ? h("span", { class: "sc" }, s) : h("button", { type: "button", class: "go", on: { click: () => { location.hash = `proposals/${lineId}/${s}`; } } }, s));
-    out.push(h("p", { class: "crumbs" }, STATUSES.flatMap((st, i) => (i ? [h("span", { class: "muted" }, " · "), filter(st)] : [filter(st)]))));
+    out.push(filters(STATUSES, status, (s) => `proposals/${lineId}/${s}`));
     const row = (p) => h("li", { class: p.status === "open" ? "green" : p.status === "invalid" ? "failing" : "" },
       go("proposal", p.proposal), h("span", { class: "sc" }, p.status),
       h("span", { class: "muted" }, shown(`by ${who(p.author, p.author_name)}`)),
@@ -434,7 +458,7 @@
     out.push(facts([
       ["status", h("span", { class: p.status === "invalid" ? "fail" : "" }, shown(p.why ? `${p.status}: ${p.why}` : p.status))],
       ["base", go("decision", p.base)],
-      ["tree", goPath("tree", p.proposal, "", "browse its files")],
+      ["tree", h("span", {}, goPath("tree", p.proposal, "", "browse its files"), " ", goManifest(p.manifest, "its checks"))],
       ["integrated by", p.integrated_by ? go("decision", p.integrated_by.decision) : null],
       ["on the line", go("proposals", p.line, "every proposal to it")],
     ]));
@@ -446,8 +470,6 @@
       ? h("div", {}, goDiff(p.base, p.proposal, "", "its diff against its base"), pagedList(p.change, (e) => e.path, changeRow, more("change")))
       : h("p", { class: "muted" }, "Its base's tree or its own isn't held here, so its change can't be listed.")));
     out.push(...section("Reviews", pagedList(p.reviews, (r) => r.review, reviewRow, more("reviews"))));
-    const objectionRow = (o) => h("li", { class: "failing" }, h("span", { class: "id" }, short(o.objection)), h("span", { class: "sc" }, shown(o.basis.kind)),
-      h("span", { class: "muted" }, shown(`by ${who(o.author, o.author_name)}; answered by ${o.allowed.join(", ") || "nothing"}`)), cutMark(o));
     out.push(...section("Objections a decision using it would answer", p.objections
       ? pagedList(p.objections, (o) => o.objection, objectionRow, more("objections"))
       : h("p", { class: "muted" }, "Its line has no single current policy, so none is listed.")));
@@ -475,6 +497,114 @@
     return out;
   }
 
+  // ---- Objections, check results and box logs ----
+
+  /** An objection on a line's page: its basis if open, its note, target, answers, and whether retracted. */
+  function lineObjectionRow(o) {
+    const target = o.target.decision ? go("decision", o.target.decision, `decision ${short(o.target.decision)}`)
+      : o.target.proposal ? go("proposal", o.target.proposal, `proposal ${short(o.target.proposal)}`)
+      : goManifest(o.target.manifest, `manifest ${String(o.target.manifest).slice(7, 19)}`);
+    const state = o.retracted ? "retracted" : o.open === true ? `open, ${o.basis.kind}` : o.open === false ? "not open" : "";
+    const answered = o.answers.map((a) => h("span", {}, go("decision", a.decision), h("span", { class: "muted" }, shown(` ${a.disposition}`))));
+    return h("li", { class: o.open ? "failing" : "" }, h("span", { class: "id" }, short(o.objection)), h("span", { class: "sc" }, shown(state)),
+      h("span", { class: "muted" }, shown(`by ${who(o.author, o.author_name)} to `)), target,
+      o.open ? h("span", { class: "muted" }, shown(`answered by ${o.allowed.join(", ") || "nothing"}`)) : null,
+      o.open && o.basis.result ? h("span", {}, go("result", o.basis.result, "the failing result"), h("span", { class: "muted" }, shown(` of ${o.basis.check}${o.basis.replaced ? ", since replaced by a pass" : ""}`))) : null,
+      o.open && o.basis.goal ? h("span", {}, h("span", { class: "muted" }, "for goal "), h("span", { class: "id" }, short(o.basis.goal))) : null,
+      o.note ? h("span", { class: "note" }, shown(firstLine(o.note, 200))) : null,
+      o.answers_total ? h("p", { class: "muted" }, `Answered by name in `, ...answered, o.answers_total > o.answers.length ? ` and ${o.answers_total - o.answers.length} more` : "") : null,
+      cutMark(o));
+  }
+
+  async function objections(lineId, state) {
+    const q = (extra) => query({ state: state === "all" ? undefined : state, ...extra });
+    const first = await api(`/api/weave/objections/${lineId}?${q({ limit: PAGE })}`);
+    const out = [h("h2", {}, "Objections"), h("p", { class: "lede" }, "To the work of ", go("line", lineId, "the line"), ": its heads' decisions and their ancestors on any line, its proposals, and their trees.")];
+    out.push(filters(STATES, state, (s) => `objections/${lineId}/${s}`));
+    const title = first.total === 1 ? "1 objection" : `${first.total} objections`;
+    // Each page names the targets on it with their answers: a later page's are added to the list below.
+    const ul = h("ul", { class: "rows" });
+    const seen = new Set();
+    const addTargets = (list) => {
+      for (const t of list) {
+        const key = JSON.stringify(t.target);
+        if (!seen.has(key)) {
+          seen.add(key);
+          ul.append(targetRow(t));
+        }
+      }
+    };
+    const more = async (after) => {
+      const next = await api(`/api/weave/objections/${lineId}?${q({ after, limit: PAGE })}`);
+      addTargets(next.target_answers);
+      return next;
+    };
+    out.push(...section(state === "all" ? title : `${title}, ${state}`, pagedList(first, (o) => o.objection, lineObjectionRow, more)));
+    // Answers that name a target or the line answer every objection to it alike: listed once.
+    const targetRow = (t) => h("li", {}, shown(t.target.decision ? `decision ${short(t.target.decision)}` : t.target.proposal ? `proposal ${short(t.target.proposal)}` : `manifest ${String(t.target.manifest).slice(7, 19)}`),
+      t.answers_total ? h("span", {}, " answered by ", ...t.answers.map((a) => h("span", {}, go("decision", a.decision), h("span", { class: "muted" }, shown(` ${a.disposition} `)))), t.answers_total > t.answers.length ? `and ${t.answers_total - t.answers.length} more` : "") : h("span", { class: "muted" }, " answered by target nowhere"));
+    addTargets(first.target_answers);
+    out.push(...section("Answers naming their targets", ul, h("p", { class: "muted" }, first.line_answers === 1 ? "1 decision answers the line's whole window." : `${first.line_answers} decisions answer the line's whole window.`)));
+    return out;
+  }
+
+  /** A check result as a row: its check, verdict, author and marks. */
+  function resultRow(r) {
+    const marks = [r.validator === true ? "a validator's" : r.validator === false ? "not a validator's" : null, r.replaced ? "replaced by a later attempt" : null, r.retracted ? "retracted" : null].filter(Boolean).join(", ");
+    return h("li", { class: r.retracted || r.replaced ? "" : r.passed ? "green" : "failing" }, go("result", r.result), h("span", { class: "sc" }, shown(r.check)),
+      h("span", { class: r.passed ? "pass" : "fail" }, r.passed ? "pass" : "fail"),
+      h("span", { class: "muted" }, shown(`attempt ${r.attempt === null ? "?" : r.attempt}, by ${who(r.author, r.author_name)}${marks ? `; ${marks}` : ""}`)),
+      r.log ? go("log", r.log, "its log") : null, cutMark(r));
+  }
+
+  async function manifest(hash) {
+    const m = await api(`/api/weave/manifest/${hash}`);
+    const more = (list) => (after) => api(`/api/weave/manifest/${hash}?${query({ list, after, limit: PAGE })}`);
+    const out = [h("h2", {}, "Checks on a tree"), h("p", { class: "lede" }, h("span", { class: "id" }, shown(m.manifest)), " ", goPath("tree", m.manifest, "", "browse its files"))];
+    out.push(facts([["counted under", go("line", m.line, m.line_name || short(m.line))]]));
+    out.push(...section("Counted under the line's current policy", m.counted === null ? checkRows(null)
+      : m.counted.total === 0 ? checkRows([]) : pagedList(m.counted, (c) => c.check, checkRow, more("counted"))));
+    out.push(...section(m.results.total === 1 ? "1 check result, by anyone" : `${m.results.total} check results, by anyone`, pagedList(m.results, (r) => r.result, resultRow, more("results"))));
+    out.push(...section("Reviews", pagedList(m.reviews, (r) => r.review, reviewRow, more("reviews"))));
+    out.push(...section("Objections a decision using it unchanged would answer", m.objections
+      ? pagedList(m.objections, (o) => o.objection, objectionRow, more("objections"))
+      : h("p", { class: "muted" }, "The line has no single current policy, so none is listed.")));
+    out.push(...section("Decisions with this tree", pagedList(m.decisions, (d) => d, (d) => h("li", {}, go("decision", d)), more("decisions"))));
+    out.push(...section("Proposals with this tree", pagedList(m.proposals, (p) => p, (p) => h("li", {}, go("proposal", p)), more("proposals"))));
+    return out;
+  }
+
+  async function result(id) {
+    const r = await api(`/api/weave/result/${id}`);
+    const out = [h("h2", {}, "Check result ", h("span", { class: "id" }, short(r.result))),
+      h("p", { class: "lede" }, shown(`${r.check}: ${r.passed ? "pass" : "fail"}, by ${who(r.author, r.author_name)}`))];
+    out.push(facts([
+      ["on", goManifest(r.manifest, `manifest ${String(r.manifest).slice(7, 19)}`)],
+      ["method", h("span", { class: "argv" }, shown(r.method))],
+      ["attempt", r.attempt === null ? null : String(r.attempt)],
+      ["validator", r.validator === null ? null : r.validator ? "yes, under the default line's policy" : "no, under the default line's policy"],
+      ["replaced", r.replaced === null ? null : r.replaced ? "yes: a later attempt by its validator" : "no"],
+      ["retracted", r.retracted ? "yes" : "no"],
+      ["box log", r.log ? go("log", r.log, "read it") : null],
+    ]));
+    if (r.details_cut) out.push(h("p", { class: "muted" }, "Its details are shortened to 64 KiB here."));
+    out.push(...section("Its details", h("p", { class: "text" }, shown(r.details))));
+    return out;
+  }
+
+  async function log(id) {
+    const l = await api(`/api/weave/log-artifact/${id}`);
+    const out = [h("h2", {}, "Box log ", h("span", { class: "id" }, short(l.log))),
+      h("p", { class: "lede" }, `${sizeText(l.size)} (${l.size} bytes) of a check's output, shown as text, never run.`)];
+    if (l.shown !== "text") {
+      out.push(h("p", { class: "muted" }, "It isn't text (it has a NUL byte or isn't UTF-8), so it isn't shown."));
+      return out;
+    }
+    if (l.cut) out.push(h("p", { class: "muted" }, "Only its last 64 KiB are shown here, where a failure usually is; lines are numbered from there."));
+    out.push(...section(l.lines === 1 ? "1 line" : `${l.lines} lines`, numbered(l.text, l.lines)));
+    return out;
+  }
+
   // ---- Trees and files ----
 
   /** The record a tree page names, as the API takes it, and as the page shows it. */
@@ -499,7 +629,7 @@
     const t = await api(`/api/weave/tree/${record}?${q({})}`);
     const out = [h("h2", {}, "Files"), crumbs(record, dir, true)];
     out.push(facts([
-      ["manifest", h("span", { class: "id" }, shown(t.manifest))],
+      ["manifest", h("span", {}, h("span", { class: "id" }, shown(t.manifest)), " ", goManifest(t.manifest, "its checks"))],
       ["files", String(t.files)],
       ["complete", t.complete ? "yes: this replica holds every file" : `no: ${t.missing.total === 1 ? "1 file isn't" : `${t.missing.total} files aren't`} held here`],
     ]));
@@ -658,6 +788,10 @@
         history: () => history(r.id, r.path),
         proposals: () => proposals(r.id, r.status),
         proposal: () => proposal(r.id),
+        objections: () => objections(r.id, r.state),
+        manifest: () => manifest(r.id),
+        result: () => result(r.id),
+        log: () => log(r.id),
         diff: () => (r.path ? diffFile(r.id, r.other, r.path) : diffList(r.id, r.other)),
       };
       body = await (pages[r.name] || home)();

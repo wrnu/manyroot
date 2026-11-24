@@ -605,6 +605,108 @@ check("a proposals route with a bad line or status, or a proposal route with a b
   }
 });
 
+// ---- Objections, check results and box logs (PR (f)) ----
+
+const O1 = id(70);
+const O2 = id(71);
+const RES = id(72);
+const LOG = id(73);
+const objRow = (o, extra = {}) => ({ objection: o, author: id(9), author_name: "bob", from: null, target: { decision: D1 }, note: HOSTILE, retracted: false, open: true,
+  basis: { kind: "evidence", result: RES, check: "test", replaced: false }, allowed: ["fixed", "overridden"], answers: [], answers_total: 0, ...extra });
+const objectionsAnswer = (items, extra = {}) => ({ list: "objections", line: LINE, state: "all", ...list(items), target_answers: [], line_answers: 0, ...extra });
+const resultRow = (r, extra = {}) => ({ result: r, author: id(9), author_name: "val", manifest: MANIFEST, method: "test true", check: "test", passed: false, attempt: 1,
+  retracted: false, validator: true, replaced: false, details: HOSTILE, log: null, ...extra });
+const manifestAnswer = (extra = {}) => ({
+  manifest: MANIFEST, line: LINE, line_name: "main", results: list([resultRow(RES, { log: LOG })], 2001), counted: list([counted("test")]),
+  reviews: list([]), objections: list([]), decisions: list([D1]), proposals: list([]), ...extra,
+});
+
+check("a line's objections show each basis, its answers by name, by target and line-wide, and filter by state", async () => {
+  const items = [
+    objRow(O1, { answers: [{ decision: D2, disposition: "fixed" }], answers_total: 6 }),
+    objRow(O2, { open: false, basis: null, allowed: null, retracted: true, target: { proposal: P1, line: LINE, change: `blake3:${id(60)}` } }),
+  ];
+  const answer = objectionsAnswer(items, { total: 7, more: true, target_answers: [{ target: { decision: D1 }, answers: [{ decision: D2, disposition: "fixed" }], answers_total: 1 }], line_answers: 2 });
+  // A later page names a target the first didn't: its answers join the list (independent note 2, round 1).
+  const later = objectionsAnswer([objRow(id(77), { target: { manifest_artifact: id(5), manifest: MANIFEST }, basis: { kind: "goal", goal: id(78) } })], { total: 7, target_answers: [{ target: { manifest_artifact: id(5), manifest: MANIFEST }, answers: [{ decision: D2, disposition: "overridden" }], answers_total: 1 }] });
+  const { page, fetched, location } = await load(`#objections/${LINE}`, answers([[`/api/weave/objections/${LINE}`, (p) => [200, p.includes("after=") ? later : answer]]]));
+  assert.deepStrictEqual(fetched, [`/api/weave/objections/${LINE}?limit=50`]);
+  safe(page, "objections");
+  const text = page.textContent;
+  for (const says of ["7 objections", "open, evidence", "retracted", "answered by fixed, overridden", "and 5 more", "2 decisions answer the line's whole window", "decision " + D1.slice(0, 12)]) {
+    assert.ok(text.includes(says), `${says}: ${text.slice(0, 1500)}`);
+  }
+  assert.ok(text.includes("</script><img") && marks(page).includes("U+202E"), "a hostile note is text, its invisibles marked");
+  buttons(page).find((b) => b.textContent.startsWith("More")).on.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(fetched.includes(`/api/weave/objections/${LINE}?after=${O2}&limit=50`), fetched.join("\n"));
+  const after = page.textContent;
+  assert.ok(after.includes(`manifest ${MANIFEST.slice(7, 19)} answered by `) && after.includes("overridden"), "a later page's target answers are listed");
+  assert.ok(after.includes(`for goal ${id(78).slice(0, 12)}`) && after.includes("of test"), "each basis's own detail");
+  buttons(page).find((b) => b.textContent === "the failing result").on.click[0]();
+  assert.strictEqual(location.hash, `#result/${RES}`);
+  location.hash = `objections/${LINE}`;
+  const open = await load(`#objections/${LINE}/open`, answers([[`/api/weave/objections/${LINE}`, objectionsAnswer([objRow(O1)], { state: "open" })]]));
+  assert.deepStrictEqual(open.fetched, [`/api/weave/objections/${LINE}?state=open&limit=50`]);
+  assert.ok(open.page.textContent.includes("1 objection, open"));
+});
+
+check("a manifest lists its results with their marks, counted checks, objections and decisions, and pages its results", async () => {
+  const replaced = resultRow(id(74), { replaced: true, passed: false });
+  const other = resultRow(id(75), { validator: false, passed: true, author_name: "‮eve" });
+  const gone = resultRow(id(76), { retracted: true });
+  const answer = manifestAnswer({ results: list([resultRow(RES, { log: LOG }), replaced, other, gone], 2001), objections: null, counted: null });
+  const { page, fetched, location } = await load(`#manifest/${MANIFEST}`, answers([[`/api/weave/manifest/${MANIFEST}`, answer]]));
+  assert.deepStrictEqual(fetched, [`/api/weave/manifest/${MANIFEST}`]);
+  safe(page, "manifest");
+  const text = page.textContent;
+  for (const says of ["2001 check results", "a validator's", "replaced by a later attempt", "not a validator's", "retracted", "no single current policy", "No current policy"]) {
+    assert.ok(text.includes(says), `${says}: ${text.slice(0, 1500)}`);
+  }
+  assert.ok(marks(page).includes("U+202E"), "an author's bidi control is marked");
+  buttons(page).find((b) => b.textContent.startsWith("More (2001")).on.click[0]();
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(fetched.includes(`/api/weave/manifest/${MANIFEST}?list=results&after=${id(76)}&limit=50`), fetched.join("\n"));
+  buttons(page).find((b) => b.textContent === "its log").on.click[0]();
+  assert.strictEqual(location.hash, `#log/${LOG}`);
+});
+
+check("a check result's details are text, and a box log is numbered text with invisibles marked, never run", async () => {
+  const r = await load(`#result/${RES}`, answers([[`/api/weave/result/${RES}`, { ...resultRow(RES, { log: LOG }), details_cut: true, line: LINE }]]));
+  safe(r.page, "result");
+  assert.ok(r.page.textContent.includes("</script><img") && marks(r.page).includes("U+202E") && r.page.textContent.includes("shortened to 64 KiB"));
+  const text = `ok\n${HOSTILE}\n\u0000tail\n`;
+  const l = await load(`#log/${LOG}`, answers([[`/api/weave/log-artifact/${LOG}`, { log: LOG, size: 70000, shown: "text", text, lines: 3, cut: true }]]));
+  safe(l.page, "log");
+  assert.strictEqual(rows(l.page).length, 3);
+  assert.ok(l.page.textContent.includes("</script><img") && l.page.textContent.includes("last 64 KiB"));
+  assert.ok(marks(l.page).includes("U+202E") && marks(l.page).includes("\\u{1b}") && marks(l.page).includes("\\u{0}"), marks(l.page).join(","));
+  const b = await load(`#log/${LOG}`, answers([[`/api/weave/log-artifact/${LOG}`, { log: LOG, size: 13, shown: "binary" }]]));
+  assert.ok(b.page.textContent.includes("isn't text") && rows(b.page).length === 0);
+});
+
+check("a line links to its objections; a decision, proposal and tree to their manifest's checks", async () => {
+  const l = await load(`#line/${LINE}`, answers([[`/api/weave/line/${LINE}`, lineAnswer()], [`/api/weave/log/${LINE}`, list([])]]));
+  buttons(l.page).find((b) => b.textContent === "every objection to its work").on.click[0]();
+  assert.strictEqual(l.location.hash, `#objections/${LINE}`);
+  const d = await load(`#decision/${D2}`, answers([[`/api/weave/decision/${D2}`, decisionAnswer({ manifest: MANIFEST })]]));
+  buttons(d.page).find((b) => b.textContent === "its checks").on.click[0]();
+  assert.strictEqual(d.location.hash, `#manifest/${MANIFEST}`);
+  const p = await load(`#proposal/${P1}`, answers([[`/api/weave/proposal/${P1}`, proposalAnswer()]]));
+  buttons(p.page).find((b) => b.textContent === "its checks").on.click[0]();
+  assert.strictEqual(p.location.hash, `#manifest/${MANIFEST}`);
+  const t = await load(`#tree/${D2}`, answers([[`/api/weave/tree/${D2}`, treeAnswer([])]]));
+  buttons(t.page).find((b) => b.textContent === "its checks").on.click[0]();
+  assert.strictEqual(t.location.hash, `#manifest/${MANIFEST}`);
+});
+
+check("an objections, manifest, result or log route with a bad id or state is the home page, unfetched", async () => {
+  for (const hash of [`#objections/${LINE}/closed`, `#objections/xyz`, `#manifest/${id(200)}`, `#manifest/sha256:${id(200)}`, `#manifest/blake3:${id(200)}x`, `#result/${RES.slice(1)}`, `#log/../${LOG}`]) {
+    const { fetched } = await load(hash, answers([["/api/weave", home()]]));
+    assert.deepStrictEqual(fetched, ["/api/weave"], `${hash}: ${fetched}`);
+  }
+});
+
 (async () => {
   let failed = 0;
   for (const [name, fn] of checks) {

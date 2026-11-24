@@ -345,7 +345,7 @@ conflicts, problems, missing paths and change entries.
 
 | Endpoint | Gives | Read with |
 |---|---|---|
-| `/api/weave?list&after&limit` | `weave`, marker, root; `lines` (as `weave line list --json`, each with its number of decisions from `logs`); the default line's `heads`, `forked` and green `state`; `problems` (each `Incomplete`'s `missing` as a nested list: 5 paths and its total); `unreadable`; `ignored_versions`. No other line's heads, green or objections: those sort or walk per line (section 3) | `Index::counted_marker`, `root`, `problems`; `Lines::lines`, `default_line`, `unreadable`, `ignored_versions`; `logs`; for the default line, `derived` |
+| `/api/weave?list&after&limit` | `weave`, marker, root; `lines` (as `weave line list --json`, each with its number of decisions from `logs`); the default line's `heads`, `forked` and green `state`; `problems` (each `Incomplete`'s `missing` as a nested list: 5 paths and its total); `unreadable`; `ignored_versions`; `derived`, its bytes and entries now and its budget. No other line's heads, green or objections: those sort or walk per line (section 3) | `Index::counted_marker`, `root`, `problems`; `Lines::lines`, `default_line`, `unreadable`, `ignored_versions`; `logs`; for the default line, `derived` |
 | `/api/weave/line/<line>?list&after&limit` | the one current policy's `checks`, `integrators`, `validators`, `goal_setters` and `protected` in `policy`, each in full by `list=` (null when the policy has diverged: then each current version's lists are nested in `current`); current policy versions (several if diverged) with every policy field, every version of the chain (`records`' supersedes relations between `Lines::version`s, by the line's author), `heads`, `green` (as `weave green --json`), `goals` with `binds`, and the number of open objections: exactly the objections `/api/weave/objections/<line>?state=open` lists, which `Lines::open_objections` gives (*Which objections a line has*, below) | `Lines::line`, `current_versions`, `version`; `derived` for `heads`, `Checks::green` and `counted`, and `open_objections`; `reviews::goals`, `Goal::binds` |
 | `/api/weave/objections/<line>?state&after&limit` | the line's objections (*Which objections a line has*, below), ascending by id, `limit` at most 200; `state` filters (`open`, `other`, `all`). Each has its author, its note (4 KiB) and whether it's retracted now (joined from `Index::reviews` by id). An open one also has its basis and allowed dispositions. Each has `answers`, a nested list of the decisions whose answers name the objection itself: 5 entries of decision and disposition, and the total. Answers that name its target or the line are the same for every objection to that target. So they come once per page, in `target_answers`, keyed by target (5 each, and the total), and `line_answers` is the line's count of line-wide answers. A decision's own page has each answer's full reason | `Lines::objections().list()` with each `Objection`'s target; `Lines::decision_ancestry`; `Index::reviews`; `answers`; `derived` for the line's objection ids and `open_objections` |
 | `/api/weave/log/<line>?after&limit` | decisions newest first, as `weave log --json` rows | `logs`; `Lines::decision` |
@@ -358,8 +358,8 @@ conflicts, problems, missing paths and change entries.
 | `/api/weave/proposals/<line>?status&after&limit` | proposals on the line, ascending by id, each with `status`, author, base, summary. `status` filters (`open`, `integrated`, `invalid`, `retracted`, `all`). No change is computed for a list: the change's size is on the proposal's page. A status is `retracted` or `invalid` first, as views ignore those, then `integrated` or `open`; `decision` names the decision that integrated the proposal's change whatever its status, the oldest on the line | `records`; `Lines::proposal`, `proposal_named`; `logs` and `Lines::decision` for what each decision lists, compared by the payloads' `change` hashes |
 | `/api/weave/proposal/<id>?list&after&limit&path` | the proposal, its status and integrating decision with its note (`integrated_by`), its change entries (`Change::between`, one per request; `change_held` false when its base's tree or its own isn't held), reviews, objections to answer (null with no single current policy), and for an open proposal the conflict preview, or null with `preview_why`. The preview's conflicts page by path with `list=conflicts` (20 at most, the default), each with `base`, `into` (the line head's side), `from` (the proposal's), `lines`, `ranges` (50 and `ranges_total`), the first 10 `resolutions` with `resolutions_total`, and `settled_by`, the integrator's resolution integrate would try, with `settled_by_held`: false when its result isn't held here, where integrate would refuse (it can also refuse on a path collision, which only the whole merged tree shows). A conflict's resolutions page with `list=resolutions&path=<path>`; `path` goes with nothing else | `Lines::proposal`; `derived` for `proposal_objections` and the preview; `Reviews::of_proposal`; `format::Change::between`; *Conflict preview* below |
 | `/api/weave/manifest/<hash>?line&list&after&limit` | its check results by anyone (`Index::check_results` for that manifest, ascending by id), each with its first 4 KiB of details, a box log link and validator mark; the counted results under `line`'s current policy (default the default line; none when the policy has diverged); its reviews and the objections to it; the decisions and proposals with this manifest | `Index::check_results`; `Checks::counted_on_manifest`, and `Checks::latest` for `replaced` on a validator's result; `Reviews::of_manifest`; `derived` for `manifest_objections`; each evidence's `details` from `g` |
-| `/api/weave/result/<id>` | one check result, with its details up to 64 KiB | `Index::check_results`; `g` |
-| `/api/weave/log-artifact/<id>` | a `text/plain` box log's text, cut to 64 KiB, shown only if it is UTF-8 without NUL; otherwise named with its size | `records`; `g`; `diff::is_text` |
+| `/api/weave/result/<id>` | one check result, with its details up to 64 KiB, its box log (the `log <id>` line its details carry, if that names a `text/plain` artifact), and its validator and `replaced` marks under the default line's current policy (null with none) | `Index::check_results`; `Checks::latest`; `g` |
+| `/api/weave/log-artifact/<id>` | a `text/plain` box log's last 64 KiB, cut on a character boundary, with `lines` and `cut`, shown only if the whole log is UTF-8 without NUL; otherwise named with its size. Any other record is a 404 | `g`; the view's text test |
 | `/api/weave/record/<id or hash>` | `kind` and the page that shows it (`decision`, `line`, `proposal` or `tree`) | `ground::kind_of`, `Index::hash_kind` |
 
 - **What a tree shows.** A tree's record can be a decision (its manifest), a
@@ -460,7 +460,7 @@ computes only this:
 | A list inside a list item | 5 entries and its total, each entry's text 200 characters and 800 bytes | The row's own page has the rest |
 | A list row | 24 KiB with nested lists, 4 KiB otherwise, as serialized JSON; a tree child's row is the exception, below | *Every list is paged* above. A flat row's own text can be up to 4 KiB a string, so a row with a long note or a check result's full 4 KiB of details is trimmed a little further, its longest strings first, to fit. Its own page has the text in full, up to 64 KiB |
 | A check result's details | 4 KiB in a list, 64 KiB on `/api/weave/result/<id>` | 64 KiB is the view's existing `TEXT_BYTES`. A list of 2,000 results is at most 8 MiB of details |
-| A box log | 64 KiB | |
+| A box log | Its last 64 KiB | A failing check's cause is usually at the end of its output. The page numbers lines from the start of what it shows, and says the log was cut |
 | Notes, summaries, reasons, goals and other short text in a list | 4 KiB each | A record's own page has its text up to 64 KiB |
 | Answers per objection | 5 that name it, with the total; target-level answers once per page, 5 per target | Deduplicated, so one target's answers aren't repeated on every objection to it |
 | `derived` | 32 MiB in all, 4 MiB an entry, by serialized size | Section 3 |
@@ -794,6 +794,19 @@ section:
 | `7b26f824e133`: non-open objections promised but not served; `Obligations::list` includes retracted ones | A paged `/api/weave/objections/<line>` serves them. Section 4 says which objections a line has, joins each to `Index::reviews` for its note and whether it's retracted, and caps the answering decisions it lists from the `answers` index. Section 1 promises only that, and still nothing that needs `crates/tree` |
 | `5151a25507b9`: `Lines::log` and the objection reads sort the whole graph per call | Logs come from one `newest_first` per rebuild, bucketed by verdict line. Heads, green and objections are computed only for the line or record a request names, slotted and cached, and never for every line; the home page shows them for the default line only (sections 3, 4 and 5) |
 
+Round 2's notes are taken too:
+- the scripts count rises to 13;
+- `encodeURIComponent` in queries as well as fragments;
+- a side over the view's cap is `over_view_cap`, never "can't merge";
+- browsers without `Sec-Fetch-Site` are served;
+- `/weave.css` joins `tests/view.rs`' stylesheet list;
+- the signature is taken before the `Store` opens;
+- `derived` is behind a mutex, and preview pages are at most 20 conflicts,
+  so none is skipped;
+- `signature()` uses `symlink_metadata`, with the inode and change time;
+- `replaced` applies to validators' results, and results are paged;
+- `merge_mode` is checked beside `text_conflicts`.
+
 ### Round 3
 
 Decision `057c4e8dace6`: these three only, then a delta check.
@@ -829,19 +842,6 @@ Notes taken:
 | PR #79 round 2, `886fba8945e1`: a protected path near 4 KiB was cut, breaking its cursor | A row that is itself a key is never cut (section 4) |
 | PR #79 round 3, notes on the builder's rationales (`2be6896ef4ff`), taken in PR (c) | Note 1: repeated policy entries are listed once, so paging can't loop. Note 2: section 4 states the row bound with never-cut check names. Note 3: the recovery after a failed re-read relies on `signature()`'s append-only counts, as every re-read does; a same-count replacement in `objects/` or `agents/` isn't seen until the next change. That's the Ground's append-only rule, and unchanged here |
 
-Round 2's notes are taken too:
-- the scripts count rises to 13;
-- `encodeURIComponent` in queries as well as fragments;
-- a side over the view's cap is `over_view_cap`, never "can't merge";
-- browsers without `Sec-Fetch-Site` are served;
-- `/weave.css` joins `tests/view.rs`' stylesheet list;
-- the signature is taken before the `Store` opens;
-- `derived` is behind a mutex, and preview pages are at most 20 conflicts,
-  so none is skipped;
-- `signature()` uses `symlink_metadata`, with the inode and change time;
-- `replaced` applies to validators' results, and results are paged;
-- `merge_mode` is checked beside `text_conflicts`.
-
 ### PR (d)
 
 | What | Handling |
@@ -869,3 +869,19 @@ Round 2's notes are taken too:
 | PR #86 round 1, `9e061e918bcd`: `over_view_cap` where integrate wouldn't merge the lines at all | `not_text` is decided first, from modes and sizes, as integrate meets it |
 | PR #86 round 1, security note 2 | `settled_by` is what integrate would try; `settled_by_held` says when its result isn't held, and the page says integrate can still refuse on a path collision |
 | PR #86 round 1, independent notes | 1: the first page and an empty cursor no longer share a cache key. 2: each list is worked out only for an answer that shows it. 4: `list=objections` is a 404 with no single current policy. 5: wording and this order. 6: the paging test checks no conflict comes twice; it isn't cross-checked against `weave integrate`, which writes a decision when nothing conflicts. 3: collisions and unreadable records aren't modelled, by design |
+
+### PR (f)
+
+| What | Handling |
+|---|---|
+| The design's row | `tests/view_weave.rs`: a validator's counted, replaced and retracted results and another agent's; an objection of each basis, one retracted; answers by name, by target and line-wide, matching `weave review --json`; a branch listing the objections to the decision it branched from; a diverged policy; 2,001 results paging; 8 lines sharing a manifest with 100 objections to it; a binary log |
+| Box logs are untrusted output | The log page shows text through `B.shown`, its last 64 KiB, numbered and rendered 5,000 lines at a time; a log that isn't UTF-8, or has a NUL, is named with its size and never shown. Nothing in it is a link, an attribute or markup |
+| Which of a result's details is its log | Read as `weave check`'s `box_logs` reads it: the `log <id> <hash>` line among the run's own lines, before the first blank line, linked only if `<id>` is a `text/plain` artifact whose content hashes to `<hash>` |
+| Holding `derived` in its budget | The line's objections are kept once per line, without their notes, which are joined from `Index::reviews` per page. The home page reports `derived`'s bytes and entries beside its budget, which the test reads |
+| A manifest's page under a line | `line` defaults to the default line; with no single current policy there, its counted results and objections are null and their lists are 404s |
+| PR #89 round 1, `5a1de3c50555`: a result's log was read from its output tail too, and its hash ignored | It's read as `box_logs` reads it, above: a `log` line printed in the tail, or one naming the wrong hash, links nothing |
+| PR #89 round 1, `99494ecf590b`: a validator's retracted result was marked replaced | `Checks` leaves retracted results out of `latest`, so a retracted result is marked retracted, never replaced |
+| PR #89 round 1, `7dbac34361ad`: the `answers` index took any line's id as line-wide, counted entries, and was built in `HashMap` order | It keys an answer as `Obligations::resolve` does: an objection; the decision's own line; or `reviews::Target::of`. One decision naming a key twice is one entry, its dispositions joined. Lines are visited in id order, each newest first |
+| PR #89 round 1, `502be46c7d98`: a diverged line with nothing in scope answered `state=open` | Whether a line has one current policy comes from the line, not from a row |
+| PR #89 round 1, `d26f7287d8b1`: a check's name was cut at its first space | `format::parse_method` splits the method at its last |
+| PR #89 round 1, independent notes | An open basis's check name is cut before it's kept in `derived`, and the row says it was cut. The objections page adds each later page's target answers to its list, and shows an evidence basis's check and whether it was replaced, and a goal basis's goal |
