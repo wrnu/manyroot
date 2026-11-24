@@ -135,7 +135,7 @@ async function runRoot(subjectKind) {
       timestamp_ms: t0,
       retracted: false,
       body: subjectKind === "artifact"
-        ? { name: "docs/vision.md", media_type: "text/markdown", size: 1200, text: "# Vision" }
+        ? { name: "docs/vi\u200bsion\u202e.md", media_type: "text/markdown", size: 1200, text: "# Vision" }
         : { statement: "A test claim", tags: [] },
       assessment: { id: subId, status: "accepted", passes: [{ id: evId }], fails: [], superseded_by: [] },
     },
@@ -205,6 +205,12 @@ async function main() {
   const firstArtPaths = [...firstArtLi.walk()].filter((n) => n.tag === "path" && n.attrs.d).map((n) => n.attrs.d);
   assert(firstArtPaths.includes(art.Bracken.SHAPES.artifact), "initial story icon for artifact must use artifact nodule shape");
   assert(artStory.textContent.includes("on the artifact"), `expected evidence story entry 'on the artifact', got: ${artStory.textContent}`);
+  // Hidden characters (U+200B, U+202E) in the artifact name must be visibly marked via B.shown, never dropped or left invisible.
+  const stmt = art.byId.get("statement");
+  const titleMarks = [...stmt.walk()].filter((n) => n.className === "invisible").map((n) => n.textContent);
+  assert(titleMarks.includes("U+200B"), `artifact title must mark U+200B via B.shown, got marks: ${JSON.stringify(titleMarks)}`);
+  assert(titleMarks.includes("U+202E"), `artifact title must mark U+202E via B.shown, got marks: ${JSON.stringify(titleMarks)}`);
+  assert(!stmt.textContent.includes("\u200b") && !stmt.textContent.includes("\u202e"), "raw hidden characters must not reach title DOM");
 
   // 2. Claim in Root view (regression guard): central knot is claim seed, story says "wrote it" + "on the claim",
   // and "nothing implements it yet" still appears when implementations is empty.

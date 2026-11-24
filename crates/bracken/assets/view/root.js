@@ -421,7 +421,10 @@
   // ---- The title and the story ----
   function renderTitle(r, status) {
     const c = r.claim;
-    B.text($("statement"), B.firstLine(c.body.statement || c.body.name, 240));
+    const rawLine = String(c.body.statement || c.body.name || "").split(/\r\n|[\n\r\u0085\u2028\u2029]/)[0];
+    const chars = Array.from(rawLine);
+    const titleLine = chars.length > 240 ? chars.slice(0, 239).join("") + "…" : rawLine;
+    $("statement").replaceChildren(...B.shown(titleLine));
     const tags = c.body.tags && c.body.tags.length ? c.body.tags : [];
     $("byline").replaceChildren(
       ...[
