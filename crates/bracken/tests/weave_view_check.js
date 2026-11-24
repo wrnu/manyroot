@@ -627,7 +627,9 @@ check("a line's objections show each basis, its answers by name, by target and l
     objRow(O2, { open: false, basis: null, allowed: null, retracted: true, target: { proposal: P1, line: LINE, change: `blake3:${id(60)}` } }),
   ];
   const answer = objectionsAnswer(items, { total: 7, more: true, target_answers: [{ target: { decision: D1 }, answers: [{ decision: D2, disposition: "fixed" }], answers_total: 1 }], line_answers: 2 });
-  const { page, fetched, location } = await load(`#objections/${LINE}`, answers([[`/api/weave/objections/${LINE}`, (p) => [200, p.includes("after=") ? objectionsAnswer([], { total: 7 }) : answer]]]));
+  // A later page names a target the first didn't: its answers join the list (independent note 2, round 1).
+  const later = objectionsAnswer([objRow(id(77), { target: { manifest_artifact: id(5), manifest: MANIFEST }, basis: { kind: "goal", goal: id(78) } })], { total: 7, target_answers: [{ target: { manifest_artifact: id(5), manifest: MANIFEST }, answers: [{ decision: D2, disposition: "overridden" }], answers_total: 1 }] });
+  const { page, fetched, location } = await load(`#objections/${LINE}`, answers([[`/api/weave/objections/${LINE}`, (p) => [200, p.includes("after=") ? later : answer]]]));
   assert.deepStrictEqual(fetched, [`/api/weave/objections/${LINE}?limit=50`]);
   safe(page, "objections");
   const text = page.textContent;
@@ -635,11 +637,14 @@ check("a line's objections show each basis, its answers by name, by target and l
     assert.ok(text.includes(says), `${says}: ${text.slice(0, 1500)}`);
   }
   assert.ok(text.includes("</script><img") && marks(page).includes("U+202E"), "a hostile note is text, its invisibles marked");
-  buttons(page).find((b) => b.textContent === "the failing result").on.click[0]();
-  assert.strictEqual(location.hash, `#result/${RES}`);
   buttons(page).find((b) => b.textContent.startsWith("More")).on.click[0]();
   await new Promise((r) => setTimeout(r, 20));
   assert.ok(fetched.includes(`/api/weave/objections/${LINE}?after=${O2}&limit=50`), fetched.join("\n"));
+  const after = page.textContent;
+  assert.ok(after.includes(`manifest ${MANIFEST.slice(7, 19)} answered by `) && after.includes("overridden"), "a later page's target answers are listed");
+  assert.ok(after.includes(`for goal ${id(78).slice(0, 12)}`) && after.includes("of test"), "each basis's own detail");
+  buttons(page).find((b) => b.textContent === "the failing result").on.click[0]();
+  assert.strictEqual(location.hash, `#result/${RES}`);
   location.hash = `objections/${LINE}`;
   const open = await load(`#objections/${LINE}/open`, answers([[`/api/weave/objections/${LINE}`, objectionsAnswer([objRow(O1)], { state: "open" })]]));
   assert.deepStrictEqual(open.fetched, [`/api/weave/objections/${LINE}?state=open&limit=50`]);

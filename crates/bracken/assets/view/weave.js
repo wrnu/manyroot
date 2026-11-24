@@ -509,7 +509,8 @@
     return h("li", { class: o.open ? "failing" : "" }, h("span", { class: "id" }, short(o.objection)), h("span", { class: "sc" }, shown(state)),
       h("span", { class: "muted" }, shown(`by ${who(o.author, o.author_name)} to `)), target,
       o.open ? h("span", { class: "muted" }, shown(`answered by ${o.allowed.join(", ") || "nothing"}`)) : null,
-      o.open && o.basis.result ? go("result", o.basis.result, "the failing result") : null,
+      o.open && o.basis.result ? h("span", {}, go("result", o.basis.result, "the failing result"), h("span", { class: "muted" }, shown(` of ${o.basis.check}${o.basis.replaced ? ", since replaced by a pass" : ""}`))) : null,
+      o.open && o.basis.goal ? h("span", {}, h("span", { class: "muted" }, "for goal "), h("span", { class: "id" }, short(o.basis.goal))) : null,
       o.note ? h("span", { class: "note" }, shown(firstLine(o.note, 200))) : null,
       o.answers_total ? h("p", { class: "muted" }, `Answered by name in `, ...answered, o.answers_total > o.answers.length ? ` and ${o.answers_total - o.answers.length} more` : "") : null,
       cutMark(o));
@@ -521,12 +522,28 @@
     const out = [h("h2", {}, "Objections"), h("p", { class: "lede" }, "To the work of ", go("line", lineId, "the line"), ": its heads' decisions and their ancestors on any line, its proposals, and their trees.")];
     out.push(filters(STATES, state, (s) => `objections/${lineId}/${s}`));
     const title = first.total === 1 ? "1 objection" : `${first.total} objections`;
-    out.push(...section(state === "all" ? title : `${title}, ${state}`, pagedList(first, (o) => o.objection, lineObjectionRow, (after) => api(`/api/weave/objections/${lineId}?${q({ after, limit: PAGE })}`))));
+    // Each page names the targets on it with their answers: a later page's are added to the list below.
+    const ul = h("ul", { class: "rows" });
+    const seen = new Set();
+    const addTargets = (list) => {
+      for (const t of list) {
+        const key = JSON.stringify(t.target);
+        if (!seen.has(key)) {
+          seen.add(key);
+          ul.append(targetRow(t));
+        }
+      }
+    };
+    const more = async (after) => {
+      const next = await api(`/api/weave/objections/${lineId}?${q({ after, limit: PAGE })}`);
+      addTargets(next.target_answers);
+      return next;
+    };
+    out.push(...section(state === "all" ? title : `${title}, ${state}`, pagedList(first, (o) => o.objection, lineObjectionRow, more)));
     // Answers that name a target or the line answer every objection to it alike: listed once.
     const targetRow = (t) => h("li", {}, shown(t.target.decision ? `decision ${short(t.target.decision)}` : t.target.proposal ? `proposal ${short(t.target.proposal)}` : `manifest ${String(t.target.manifest).slice(7, 19)}`),
       t.answers_total ? h("span", {}, " answered by ", ...t.answers.map((a) => h("span", {}, go("decision", a.decision), h("span", { class: "muted" }, shown(` ${a.disposition} `)))), t.answers_total > t.answers.length ? `and ${t.answers_total - t.answers.length} more` : "") : h("span", { class: "muted" }, " answered by target nowhere"));
-    const ul = h("ul", { class: "rows" });
-    for (const t of first.target_answers) ul.append(targetRow(t));
+    addTargets(first.target_answers);
     out.push(...section("Answers naming their targets", ul, h("p", { class: "muted" }, first.line_answers === 1 ? "1 decision answers the line's whole window." : `${first.line_answers} decisions answer the line's whole window.`)));
     return out;
   }

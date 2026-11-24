@@ -118,7 +118,7 @@ pub(crate) struct State {
     proposals: HashMap<ContributionId, Vec<ContributionId>>,
     /// Every answer a qualifying decision gives, by what it names, keyed as `crates/tree` resolves an answer
     /// (section 3, `answers`): each with the decision and its disposition, in log order.
-    answers: HashMap<Answered, Vec<(ContributionId, &'static str)>>,
+    answers: HashMap<Answered, Vec<(ContributionId, String)>>,
     /// Answers of the reads that sort the graph or walk a line, by key, oldest first, each with its
     /// serialized size; at most [`DERIVED_BYTES`] in all.
     derived: Mutex<Derived>,
@@ -286,25 +286,36 @@ impl Weave {
         }
         let objection_ids: std::collections::HashSet<ContributionId> =
             lines.objections().list().iter().map(|o| o.id).collect();
-        let mut answers: HashMap<Answered, Vec<(ContributionId, &'static str)>> = HashMap::new();
-        for id in logs.values().flatten() {
+        // Keyed as `Obligations::resolve` keys an answer: an objection; the decision's own line; or what
+        // `Target::of` names. Lines in id order, each newest first, so the 5 listed are the same each build;
+        // one decision naming a key twice is one entry, its dispositions joined (finding 7dbac34361ad).
+        let mut answers: HashMap<Answered, Vec<(ContributionId, String)>> = HashMap::new();
+        let mut by_line: Vec<(&ContributionId, &Vec<ContributionId>)> = logs.iter().collect();
+        by_line.sort_by_key(|(line, _)| **line);
+        for id in by_line.into_iter().flat_map(|(_, log)| log) {
             let d = &lines.decision(id).expect("logged decisions exist").decision;
             for a in &d.answers {
                 let named = a.objection;
                 let key = if objection_ids.contains(&named) {
                     Answered::Objection(named)
-                } else if lines.decision(&named).is_some() {
-                    Answered::Decision(named)
-                } else if let Some(hash) = index.manifest_named(&named) {
-                    Answered::Manifest(hash)
-                } else if let Some(p) = lines.proposal_named(&named) {
-                    Answered::Proposal(p.line, p.change)
-                } else if lines.line(&named).is_some() {
+                } else if named == d.line {
                     Answered::Line(named)
                 } else {
-                    continue;
+                    match Target::of(&index, &lines, &named) {
+                        Some(t) => Answered::of(&t),
+                        None => continue,
+                    }
                 };
-                answers.entry(key).or_default().push((*id, a.disposition.as_str()));
+                let list = answers.entry(key).or_default();
+                match list.last_mut() {
+                    Some((last, how)) if last == id => {
+                        if !how.split(", ").any(|x| x == a.disposition.as_str()) {
+                            how.push_str(", ");
+                            how.push_str(a.disposition.as_str());
+                        }
+                    }
+                    _ => list.push((*id, a.disposition.as_str().to_owned())),
+                }
             }
         }
         let checks = Mutex::new(Checks::build(g, &index, &lines));
@@ -1779,9 +1790,11 @@ impl Ctx<'_> {
                 })
                 .map(|o| {
                     let mine = open.as_ref().map(|open| open.get(&o.id));
-                    json!({"objection": o.id, "open": mine.map(|m| m.is_some()),
-                           "basis": mine.flatten().map(|m| m["basis"].clone()),
-                           "allowed": mine.flatten().map(|m| m["allowed"].clone())})
+                    // The basis's check name is cut here, before it's kept, as a nested entry is.
+                    let mut basis = mine.flatten().map(|m| m["basis"].clone());
+                    let cut = basis.as_mut().is_some_and(|b| cut_strings(b, Cap::Bytes(NESTED_BYTES), &[]));
+                    json!({"objection": o.id, "open": mine.map(|m| m.is_some()), "basis": basis,
+                           "basis_cut": cut, "allowed": mine.flatten().map(|m| m["allowed"].clone())})
                 })
                 .collect();
             json!(rows)
@@ -1801,7 +1814,8 @@ impl Ctx<'_> {
         }
         let scope = self.line_objections(&line)?;
         let all = scope.as_array().cloned().unwrap_or_default();
-        let policy = all.first().is_none_or(|o| !o["open"].is_null());
+        // With no objection in scope there is no row to say so: the line's policy does (finding 502be46c7d98).
+        let policy = self.policy_of(&line).is_some();
         if state != "all" && !policy {
             return fail(404, "this line has no single current policy, so no objection is open or not");
         }
@@ -1839,15 +1853,14 @@ impl Ctx<'_> {
                 let review = reviews.get(&id);
                 let (answers, answers_total) = answered(&Answered::Objection(id));
                 let (author, author_name) = self.agent(&ob.author);
-                let mut row = json!({"objection": id, "author": author, "author_name": author_name, "from": ob.from,
+                let row = json!({"objection": id, "author": author, "author_name": author_name, "from": ob.from,
                                      "target": target_json(&ob.target), "note": review.map(|r| r.note.clone()),
                                      "retracted": review.is_some_and(|r| r.retracted), "open": o["open"],
                                      "basis": o["basis"], "allowed": o["allowed"], "answers": answers,
                                      "answers_total": answers_total});
-                if let Some(b) = row.get_mut("basis") {
-                    cut_strings(b, Cap::Bytes(NESTED_BYTES), &[]);
-                }
-                Some(fit(capped(row, LIST_TEXT), NESTED_ROW_BYTES))
+                let mut row = fit(capped(row, LIST_TEXT), NESTED_ROW_BYTES);
+                mark_cut(&mut row, o["basis_cut"] == true);
+                Some(row)
             })
             .collect();
         let target_answers: Vec<Value> = targets
@@ -1884,20 +1897,19 @@ impl Ctx<'_> {
             Some(Body::Evidence { details, .. }) => details.clone(),
             _ => String::new(),
         };
-        let log = details.lines().find_map(|l| {
-            let id = l.strip_prefix("log ")?.split(' ').next()?;
-            let id: ContributionId = id.parse().ok()?;
-            matches!(self.g.get(&id).map(|c| c.body()), Some(Body::Artifact { media_type, .. }) if media_type == "text/plain")
-                .then_some(id)
-        });
+        let log = box_log(self.g, &details);
         let validator = policy.map(|p| p.validators.contains(&r.author));
+        // `Checks` leaves retracted results out of `latest`, so a retracted one isn't "replaced": it says it's
+        // retracted (finding 99494ecf590b).
         let replaced = (validator == Some(true)).then(|| {
             let checks = self.s.checks.lock().unwrap_or_else(|p| p.into_inner());
-            !checks.latest(&r.author, &r.manifest, &r.method).contains(&r.id)
+            !r.retracted && !checks.latest(&r.author, &r.manifest, &r.method).contains(&r.id)
         });
+        // A check's name may hold spaces: the method splits at its last (finding d26f7287d8b1).
+        let check = bracken_tree::format::parse_method(&r.method).map_or(r.method.as_str(), |(name, _)| name);
         let mut v = json!({"result": r.id, "author": r.author.to_string(), "author_name": self.names.display(&r.author),
                            "manifest": r.manifest.to_string(), "method": r.method,
-                           "check": r.method.split(' ').next().unwrap_or_default(), "passed": r.passed,
+                           "check": check, "passed": r.passed,
                            "attempt": r.attempt, "retracted": r.retracted, "validator": validator,
                            "replaced": replaced, "details": details, "log": log});
         if cut_strings(&mut v["details"], Cap::Bytes(details_bytes), &[]) {
@@ -2133,6 +2145,26 @@ fn text(b: &[u8]) -> Option<&str> {
 fn line_count(text: &str) -> usize {
     let newlines = text.bytes().filter(|b| *b == b'\n').count();
     newlines + usize::from(!text.is_empty() && !text.ends_with('\n'))
+}
+
+/// The box log a check result's details name, read as `weave check`'s `box_logs` reads it (finding
+/// 5a1de3c50555): only from the run's own lines, before the first blank line (the tail after it is the
+/// tree's output, which anyone's code fills), as `log <id> <hash>`, and only if `<id>` is a `text/plain`
+/// artifact whose content hashes to `<hash>`.
+fn box_log(g: &Graph, details: &str) -> Option<ContributionId> {
+    let run_lines = details.split("\n\n").next().unwrap_or_default();
+    let log = run_lines.lines().find_map(|l| l.strip_prefix("log "))?;
+    let mut words = log.split(' ');
+    let id: ContributionId = words.next()?.parse().ok()?;
+    let want: ContentHash = words.next()?.parse().ok()?;
+    match g.get(&id).map(|c| c.body()) {
+        Some(Body::Artifact { media_type, content, .. })
+            if media_type == "text/plain" && ContentHash::of(content) == want =>
+        {
+            Some(id)
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]

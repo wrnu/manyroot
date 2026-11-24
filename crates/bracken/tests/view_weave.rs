@@ -14,8 +14,8 @@ use std::time::{Duration, Instant};
 use bracken_tree::ContentHash;
 use bracken_tree::check::{Exit, RecordedTail};
 use bracken_tree::format::{
-    DECISION_MEDIA_TYPE, Decision, Entry, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line, MANIFEST_MEDIA_TYPE,
-    Manifest, Mode, PROPOSAL_MEDIA_TYPE, Proposal, Record, VERSION,
+    Answer, DECISION_MEDIA_TYPE, Decision, Disposition, Entry, FILE_MEDIA_TYPE, Guardrails, LINE_MEDIA_TYPE, Line,
+    MANIFEST_MEDIA_TYPE, Manifest, Mode, PROPOSAL_MEDIA_TYPE, Proposal, Record, VERSION,
 };
 use bracken_tree::results::details;
 use serde_json::Value;
@@ -1872,11 +1872,13 @@ fn with_reviews() -> Reviewed {
     results.insert("retracted", retracted);
     let text = w.artifact("log.txt", format!("ran\n{HOSTILE}\nfailed at the end\n").as_bytes(), "text/plain");
     let binary = w.artifact("log.bin", b"\xff\xfe not \x00 text", "text/plain");
-    let logged = |log: &str, attempt| {
-        w.result((&manifest, &artifact), &method, true, attempt, AS, &format!("log {log} {}", ContentHash::of(b"log")))
+    let text_bytes = format!("ran\n{HOSTILE}\nfailed at the end\n");
+    let logged = |log: &str, content: &[u8], attempt| {
+        let line = format!("log {log} {}", ContentHash::of(content));
+        w.result((&manifest, &artifact), &method, true, attempt, AS, &line)
     };
-    results.insert("text_log", logged(&text, 3));
-    results.insert("binary_log", logged(&binary, 4));
+    results.insert("text_log", logged(&text, text_bytes.as_bytes(), 3));
+    results.insert("binary_log", logged(&binary, b"\xff\xfe not \x00 text", 4));
     let mut objections = BTreeMap::new();
     objections.insert("evidence", w.written(&["relate", &results["replaced"], "contradicts", &d1, "--as", VAL]));
     let goal = w.written(&["claim", "keep it fast", "--tag", "weave-goal", "--as", AS]);
@@ -2080,7 +2082,29 @@ fn a_diverged_policy_has_no_open_objections_or_counted_results() {
         let id = r.w.artifact(&format!("v{max_known}.cbor"), &next.encode(), LINE_MEDIA_TYPE);
         r.w.ok(&["relate", &id, "supersedes", &r.line, "--as", AS]);
     }
+    // A line with nothing in its scope, its policy diverged too (finding 502be46c7d98).
+    let quiet = r.w.id_of(&["weave", "line", "create", "quiet", "--owner-decision", OD, "--as", AS, "--json"], "line");
+    for max_known in [1, 2] {
+        let next = Line {
+            v: VERSION,
+            name: "quiet".into(),
+            integrators: vec![me.parse().expect("a key")],
+            validators: vec![],
+            goal_setters: vec![],
+            checks: BTreeMap::new(),
+            executors: BTreeMap::new(),
+            guardrails: Guardrails { max_known, max_age: 0, protected: vec![] },
+            owner_decision: Some(OD.into()),
+        };
+        let id = r.w.artifact(&format!("q{max_known}.cbor"), &next.encode(), LINE_MEDIA_TYPE);
+        r.w.ok(&["relate", &id, "supersedes", &quiet, "--as", AS]);
+    }
     let v = view(&r.w.ground);
+    assert_eq!(v.api(&format!("/api/weave/objections/{quiet}"))["total"], 0);
+    assert!(v.api(&format!("/api/weave/line/{quiet}"))["open_objections"].is_null());
+    for state in ["open", "other"] {
+        v.refused(&format!("/api/weave/objections/{quiet}?state={state}"), 404);
+    }
     let all = v.api(&format!("/api/weave/objections/{}", r.line));
     assert_eq!(all["total"], 4);
     assert!(all["items"][0]["open"].is_null());
@@ -2089,6 +2113,90 @@ fn a_diverged_policy_has_no_open_objections_or_counted_results() {
     assert!(m["counted"].is_null() && m["objections"].is_null(), "{m}");
     assert!(m["results"]["items"][0]["validator"].is_null(), "no policy to judge it by");
     v.refused(&format!("/api/weave/manifest/{}?list=counted", r.manifest), 404);
+}
+
+/// A result's box log is read as `weave check` reads it: from the run's lines only, with the hash it names
+/// (finding 5a1de3c50555). A validator's retracted result is retracted, not replaced (99494ecf590b). A
+/// check's name keeps its spaces (d26f7287d8b1).
+#[test]
+fn a_results_log_retraction_and_check_name_are_read_as_the_weave_reads_them() {
+    let r = with_reviews();
+    let on = (r.manifest.as_str(), r.artifact.as_str());
+    let text = &r.logs.0;
+    let wrong = r.w.result(on, &r.method, true, 5, AS, &format!("log {text} {}", ContentHash::of(b"another log")));
+    // A log line in the tail, the tree's output, after the run's lines and their blank line.
+    let hash: ContentHash = r.manifest.parse().expect("a manifest's hash");
+    let printed = format!("log {text} {}", ContentHash::of(format!("ran\n{HOSTILE}\nfailed at the end\n").as_bytes()));
+    let d = details(&hash, 6, &["true".to_owned()], &Exit::Code(0), &RecordedTail::Text(printed));
+    assert!(d.split("\n\n").next().is_some_and(|run| !run.contains("log ")), "{d}");
+    let tail = r.w.written(&["evidence", &r.artifact, "pass", "--method", &r.method, "--details", &d, "--as", AS]);
+    let alone = r.w.result(on, &r.method, false, 3, VAL, "");
+    r.w.ok(&["retract", &alone, "--as", VAL]);
+    let spaced = r.w.result(on, &format!("unit tests blake3:{}", "0".repeat(64)), true, 1, AS, "");
+    let v = view(&r.w.ground);
+    let result = |id: &str| v.api(&format!("/api/weave/result/{id}"));
+    assert_eq!(result(&r.results["text_log"])["log"], text.as_str(), "the right hash is linked");
+    assert!(result(&wrong)["log"].is_null(), "a log whose hash isn't its content's");
+    assert!(result(&tail)["log"].is_null(), "a log line printed in the output");
+    let gone = result(&alone);
+    let marks = (gone["validator"].as_bool(), gone["retracted"].as_bool(), gone["replaced"].as_bool());
+    assert_eq!(marks, (Some(true), Some(true), Some(false)), "{gone}");
+    assert_eq!(result(&spaced)["check"], "unit tests");
+    let listed = v.api(&format!("/api/weave/manifest/{}?list=results&limit=200", r.manifest));
+    let row = listed["items"].as_array().expect("results").iter().find(|x| x["result"] == alone.as_str()).cloned();
+    assert_eq!(row.expect("listed")["replaced"], false);
+}
+
+/// The answers index keys an answer as `crates/tree` does: a line's id answers only on its own line, and
+/// one decision answering the line twice is one decision (finding 7dbac34361ad).
+#[test]
+fn line_wide_answers_count_decisions_on_the_line_alone() {
+    let r = with_reviews();
+    let w = &r.w;
+    w.write(&[("c.txt", b"three\n")]);
+    w.commit("c");
+    // Each disposition is allowed for some objection in main's window: overridden for the evidence one.
+    let (fixed, overridden) = (format!("{}=fixed:again", r.line), format!("{}=overridden:and again", r.line));
+    w.ok(&["weave", "integrate", "--as", AS, "--note", "three", "--answer", &fixed, "--answer", &overridden, "--json"]);
+    // On dev, an answer naming main's id names another line: crates/tree resolves it to nothing. The CLI
+    // refuses to write one, so it's written by hand, on dev's head.
+    let dev_head = {
+        let v = view(&w.ground);
+        v.api(&format!("/api/weave/line/{}", r.dev))["heads"][0]["decision"].as_str().expect("dev's head").to_owned()
+    };
+    let other = Decision {
+        v: VERSION,
+        line: r.dev.parse().expect("an id"),
+        manifest: r.d2_tree.0.parse().expect("a hash"),
+        parents: vec![dev_head.parse().expect("an id")],
+        proposals: vec![],
+        breakage: vec![],
+        // The objections to d1 are in dev's window too: answered by target, as d2 answers them on main.
+        answers: vec![
+            Answer { objection: r.d1.parse().expect("an id"), disposition: Disposition::Fixed, reason: "d1".into() },
+            Answer {
+                objection: r.line.parse().expect("an id"),
+                disposition: Disposition::Fixed,
+                reason: "not mine".into(),
+            },
+        ],
+        resolutions: vec![],
+        goals: vec![],
+        source: None,
+        note: "four".into(),
+    };
+    let other = w.artifact("four.cbor", &other.encode(), DECISION_MEDIA_TYPE);
+    let v = view(&w.ground);
+    let log = v.api(&format!("/api/weave/log/{}", r.dev));
+    assert!(
+        log["items"].as_array().expect("a log").iter().any(|d| d["decision"] == other.as_str()),
+        "it qualifies: {}",
+        v.api(&format!("/api/weave/decision/{other}"))
+    );
+    let main = v.api(&format!("/api/weave/objections/{}", r.line));
+    assert_eq!(main["line_answers"], 2, "d2 and the third decision: {main}");
+    let dev = v.api(&format!("/api/weave/objections/{}", r.dev));
+    assert_eq!(dev["line_answers"], 0, "{dev}");
 }
 
 /// Writes `count` passing results on a manifest, 4 writers at once. A write that meets another half
