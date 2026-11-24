@@ -139,7 +139,7 @@ function makeCanvas(id) {
       if (p && p._d) ops.push({ op: "strokePath", d: p._d, x: tx, y: ty, r: sx, strokeStyle: this.strokeStyle });
       else ops.push({ op: "stroke", strokeStyle: this.strokeStyle });
     },
-    fillRect(x, y, w, h) { ops.push({ op: "fillRect", x: tx + x, y: ty + y, w, h, fillStyle: this.fillStyle }); },
+    fillRect(x, y, w, h) { ops.push({ op: "fillRect", x: tx + x, y: ty + y, w, h, fillStyle: this.fillStyle, alpha: this.globalAlpha }); },
     strokeRect() {},
     fillText() {},
   };
@@ -234,7 +234,14 @@ async function runLoom(fixture, hash = "") {
 
   // Flush the async startup microtasks.
   for (let k = 0; k < 20; k++) await new Promise((r) => setImmediate(r));
-  return { byId, loomCanvas, navigated, Bracken: vm.runInContext("Bracken", ctx) };
+  return {
+    byId,
+    loomCanvas,
+    navigated,
+    location: sandbox.location,
+    dispatchWin: (ev) => { for (const fn of winListeners[ev] || []) fn(); },
+    Bracken: vm.runInContext("Bracken", ctx),
+  };
 }
 
 function makeDenseFixture() {
@@ -281,7 +288,8 @@ function makeDenseFixture() {
       if (i % 10 === 0) statuses[id] = { status: "accepted", passes: 1, fails: 0, superseded_by: [] };
     }
     author.push(a);
-    parents.push(i === 0 ? [] : [i - 1]);
+    // Give artifact 100 nine children (101..109) so clickable lineage expansion past 6 is exercised.
+    parents.push(i === 0 ? [] : i >= 102 && i <= 109 ? [i - 1, 100] : [i - 1]);
     time.push(ts);
     depth.push(i);
     tags.push([]);
@@ -421,7 +429,7 @@ function makeSmallOverlapFixture() {
 async function main() {
   // 1. Dense mode: all 4 artifact statuses drawn with artifact nodule shape, readable size, AFTER blooms.
   const dense = makeDenseFixture();
-  const { byId, loomCanvas, navigated, Bracken } = await runLoom(dense);
+  const { byId, loomCanvas, navigated, location, dispatchWin, Bracken } = await runLoom(dense);
   const ops = loomCanvas._ops;
   const artShape = Bracken.SHAPES.artifact;
   const bloomIndices = ops.map((o, idx) => (o.op === "fillRect" && o.w === 2 && o.h === 2 ? idx : -1)).filter((i) => i >= 0);
@@ -581,7 +589,44 @@ async function main() {
   assert.strictEqual(side.querySelector(".preview-toggle"), null, "binary artifact should not show text preview toggle");
   assert(side.querySelector(".preview-note").textContent.includes("Binary content"), "expected binary content note");
 
-  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, and safe text preview all pass.");
+  // 9. Persistent selected ancestry, clickable lineage (+ expand past 6), and live hashchange.
+  // 9a. Selected knot keeps its ancestry veil (alpha 0.72) lit after pointerleave, and clears on empty click.
+  location.hash = `#${dense.ids[100]}`;
+  dispatchWin("hashchange");
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert(side.textContent.includes("docs/pending.md"), `hashchange should select docs/pending.md, got: ${side.textContent}`);
+  win.dispatch("pointerleave", {});
+  for (let k = 0; k < 10; k++) await new Promise((r) => setImmediate(r));
+  const hasAncestryVeil = () => loomCanvas._ops.some((o) => o.op === "fillRect" && o.alpha === 0.72);
+  assert(hasAncestryVeil(), "selected knot ancestry must stay lit after pointerleave");
+
+  // 9b. Clickable lineage buttons and expand past 6 (idx 100 has 1 parent and 9 children).
+  const linBtnsBefore = side.querySelectorAll(".lineage-btn");
+  assert.strictEqual(linBtnsBefore.length, 7, `expected 1 parent + 6 capped child lineage buttons, got ${linBtnsBefore.length}`);
+  const moreBtn = side.querySelector(".lineage-more");
+  assert(moreBtn, "expected .lineage-more button when a knot has >6 children");
+  assert(moreBtn.textContent.includes("3 more"), `expected '3 more' on expand button, got: ${moreBtn.textContent}`);
+  moreBtn.dispatch("click", {});
+  const linBtnsAfter = side.querySelectorAll(".lineage-btn");
+  assert.strictEqual(linBtnsAfter.length, 10, `expected 1 parent + 9 expanded child lineage buttons, got ${linBtnsAfter.length}`);
+  assert.strictEqual(side.querySelector(".lineage-more"), null, "expand button should disappear once all children are shown");
+  // Clicking the parent lineage button (idx 99) selects claim 99.
+  linBtnsAfter[0].dispatch("click", {});
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert(side.textContent.includes("claim 99"), `clicking parent lineage button should select claim 99, got: ${side.textContent}`);
+
+  // 9c. Live hashchange selects another knot and empty hash deselects & clears ancestry veil.
+  location.hash = `#${dense.ids[3000]}`;
+  dispatchWin("hashchange");
+  for (let k = 0; k < 15; k++) await new Promise((r) => setImmediate(r));
+  assert(side.textContent.includes("docs/rejected.md"), `hashchange should select docs/rejected.md, got: ${side.textContent}`);
+  location.hash = "";
+  dispatchWin("hashchange");
+  for (let k = 0; k < 10; k++) await new Promise((r) => setImmediate(r));
+  assert(side.textContent.includes("Hover a knot"), "clearing hash should deselect");
+  assert(!hasAncestryVeil(), "deselecting should clear pinned ancestry veil");
+
+  console.log("OK: dense artifact draw, bucketed >400 draw, z-order, hit preference, detail panel, legend filter, artifact jump, safe text preview, pinned ancestry, clickable lineage, and hashchange all pass.");
 }
 
 main().catch((err) => {

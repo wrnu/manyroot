@@ -565,7 +565,7 @@
       if (labelDense) drawFilteredDense(matched);
       else drawKnots(matched, Math.max(r, 3.6));
     }
-    if (ancestry) {
+    if (ancestry !== null) {
       ctx.fillStyle = B.token("--ground");
       ctx.globalAlpha = 0.72;
       ctx.fillRect(0, TOP, W, H - TOP);
@@ -943,7 +943,7 @@
       const t = isIntent ? "intends to work on it" : textOf(i);
       if (t === undefined) continue;
       lastY.set(a, y);
-      const el = B.h("div", { class: ancestry && !inAncestry(i) ? "knot-label dim" : "knot-label" }, B.firstLine(t, 70));
+      const el = B.h("div", { class: ancestry !== null && !inAncestry(i) ? "knot-label dim" : "knot-label" }, B.firstLine(t, 70));
       el.style.left = `${X(i) + r + 6}px`;
       el.style.top = `${y - 8}px`;
       const maxW = state.filter ? Math.min(260, W - X(i) - r - 14) : Math.min(260, colW * 1.45, W - X(i) - r - 14);
@@ -1035,6 +1035,32 @@
         }
   }
 
+  /** Keeps ancestry lit for the hovered knot (preview) or, when unfiltered, the selected knot (pinned). */
+  function syncAncestry() {
+    let target = null;
+    if (state.hover >= 0 && state.hover < N && valueOf(state.hover) <= state.surface) {
+      target = state.hover;
+    } else if (!state.filter && state.selected >= 0 && state.selected < N && valueOf(state.selected) <= state.surface) {
+      target = state.selected;
+    }
+    if (target === ancestry) return;
+    if (target !== null) markAncestors(target);
+    ancestry = target;
+  }
+
+  /** Pans a zoomed view so `target` sits inside the window. */
+  function frameKnot(target) {
+    if (!state.view || target < 0 || target >= N) return;
+    const [va, vb] = state.view;
+    const v = valueOf(target);
+    if (v < va || v > vb) {
+      const [ra, rb] = range();
+      const span = vb - va;
+      const na = Math.max(ra, Math.min(rb - span, v - span / 2));
+      state.view = [na, na + span];
+    }
+  }
+
   const win = $("window");
   win.addEventListener("pointermove", (e) => {
     if (!geom.key) return; // mid-morph
@@ -1043,16 +1069,15 @@
     if (i === state.hover) return;
     const t0 = performance.now();
     state.hover = i;
-    if (i >= 0) markAncestors(i);
+    syncAncestry();
     canvas.dataset.hoverMs = (performance.now() - t0).toFixed(1);
-    ancestry = i >= 0 ? i : null;
     showHover(i);
     canvas.style.cursor = i >= 0 ? "pointer" : "default";
     requestDraw();
   });
   win.addEventListener("pointerleave", () => {
     state.hover = -1;
-    ancestry = null;
+    syncAncestry();
     showHover(-1);
     requestDraw();
   });
@@ -1102,15 +1127,22 @@
   }
 
   // ---- The side: the specimen label, from /api/contribution/<id> ----
+  const LINEAGE_PREVIEW = 6;
+  const LINEAGE_STEP = 50;
   let shown = null; // the selected contribution's /api/contribution, once it arrives
   let previewOpen = false;
   let focusPreview = false;
   let previewToggleBtn = null;
+  let parentsLimit = LINEAGE_PREVIEW;
+  let childrenLimit = LINEAGE_PREVIEW;
   function select(i) {
     state.selected = i;
     shown = null;
     previewOpen = false;
     focusPreview = false;
+    parentsLimit = LINEAGE_PREVIEW;
+    childrenLimit = LINEAGE_PREVIEW;
+    syncAncestry();
     refreshSide();
     requestDraw();
     if (i < 0) return;
@@ -1234,32 +1266,66 @@
       ),
       artifactPreview(c)
     );
-    const lineage = (title, list) =>
-      list.length
-        ? [
-            B.h("h2", { class: "sc" }, title),
+    const lineage = (title, list, limit, onMore) => {
+      if (!list.length) return [];
+      const shownList = list.slice(0, limit);
+      const rest = list.length - shownList.length;
+      const step = Math.min(rest, LINEAGE_STEP);
+      const moreLabel = rest <= LINEAGE_STEP ? `Show all (${rest} more)` : `Show ${step} more (${rest} remaining)`;
+      return [
+        B.h("h2", { class: "sc" }, title),
+        B.h(
+          "ul",
+          { class: "lineage" },
+          shownList.map((j) =>
             B.h(
-              "ul",
-              { class: "lineage" },
-              list.slice(0, 6).map((j) =>
+              "li",
+              {},
+              B.h(
+                "button",
+                {
+                  type: "button",
+                  class: "lineage-btn",
+                  on: {
+                    click: () => {
+                      frameKnot(j);
+                      select(j);
+                    },
+                  },
+                },
+                B.knotIcon(kind[j], lookOf(j), 16),
                 B.h(
-                  "li",
-                  {},
-                  B.knotIcon(kind[j], lookOf(j), 16),
-                  B.h("span", {}, B.h("span", { class: "sc" }, B.bdi(B.agentName(ground, author[j])), " "), B.h("span", { class: "statement" }, B.firstLine(textOf(j) ?? "…", 90)))
+                  "span",
+                  { class: "lineage-text" },
+                  B.h("span", { class: "sc" }, B.bdi(B.agentName(ground, author[j])), " "),
+                  B.h("span", { class: "statement" }, B.firstLine(textOf(j) ?? "…", 90))
                 )
-              ),
-              list.length > 6 ? B.h("li", {}, "", B.h("span", { class: "synthetic" }, `and ${list.length - 6} more`)) : null
-            ),
-          ]
-        : [];
+              )
+            )
+          )
+        ),
+        rest > 0
+          ? B.h("button", { type: "button", class: "lineage-more", on: { click: onMore } }, moreLabel)
+          : null,
+      ].filter(Boolean);
+    };
     // Behind now, only what was there at the surface: a knot's parents always were, its children may not be.
     const there = (list) => list.filter((j) => valueOf(j) <= state.surface);
     // A claim's or artifact's whole life, in the Root view. Ids are hex, so the address holds nothing else.
     const toRoot = subject
       ? B.h("button", { type: "button", class: "open-root", on: { click: () => location.assign(`/root.html#${id}`) } }, `Follow this ${kind[i]}'s life`)
       : null;
-    side.replaceChildren(...[card, toRoot].filter(Boolean), ...lineage("Woven onto", there(parents[i])), ...lineage("Built on by", there(children[i])));
+    side.replaceChildren(
+      ...[card, toRoot].filter(Boolean),
+      ...lineage("Woven onto", there(parents[i]), parentsLimit, () => {
+        parentsLimit += LINEAGE_STEP;
+        refreshSide();
+      }),
+      ...lineage("Built on by", there(children[i]), childrenLimit, () => {
+        childrenLimit += LINEAGE_STEP;
+        refreshSide();
+      })
+    );
     if (focusPreview) {
       focusPreview = false;
       if (previewToggleBtn && previewToggleBtn.focus) previewToggleBtn.focus();
@@ -1340,9 +1406,9 @@
     }
     if (state.hover >= 0 && valueOf(state.hover) > state.surface) {
       state.hover = -1;
-      ancestry = null;
       showHover(-1);
     }
+    syncAncestry();
     note();
     updateKey();
     refreshSide();
@@ -1403,7 +1469,7 @@
     updateKey();
     refreshSide();
     state.hover = -1;
-    ancestry = null;
+    syncAncestry();
     showHover(-1);
     B.attr($("axis-time"), "aria-pressed", String(axis === "time"));
     B.attr($("axis-causal"), "aria-pressed", String(axis === "causal"));
@@ -1441,9 +1507,9 @@
     state.filter = state.filter === id ? null : id;
     if (state.hover >= 0 && !matchesFilter(state.hover)) {
       state.hover = -1;
-      ancestry = null;
       showHover(-1);
     }
+    syncAncestry();
     updateKey();
     note();
     requestDraw();
@@ -1455,16 +1521,7 @@
     const cur = list.indexOf(state.selected);
     const nextIdx = cur < 0 ? (dir > 0 ? 0 : list.length - 1) : (cur + dir + list.length) % list.length;
     const target = list[nextIdx];
-    if (state.view) {
-      const [va, vb] = state.view;
-      const v = valueOf(target);
-      if (v < va || v > vb) {
-        const [ra, rb] = range();
-        const span = vb - va;
-        const na = Math.max(ra, Math.min(rb - span, v - span / 2));
-        state.view = [na, na + span];
-      }
-    }
+    frameKnot(target);
     select(target);
   }
 
@@ -1519,6 +1576,19 @@
     updateKey();
   }
 
+  function selectFromHash() {
+    const want = location.hash.slice(1).toLowerCase();
+    if (!want) {
+      if (state.selected >= 0) select(-1);
+      return;
+    }
+    if (!HEX.test(want) || !index.has(want)) return;
+    const target = index.get(want);
+    if (target === state.selected) return;
+    frameKnot(target);
+    select(target);
+  }
+
   document.addEventListener("bracken-theme", () => {
     buildKey();
     if (!ground) return;
@@ -1527,6 +1597,7 @@
     refreshSide();
   });
   window.addEventListener("resize", () => ground && layout());
+  window.addEventListener("hashchange", selectFromHash);
   // Headings are sized to their text, so lay out again once the fonts have arrived.
   document.fonts.ready.then(() => ground && layout());
   document.querySelector(".masthead nav").append(B.themeButton());
@@ -1548,8 +1619,7 @@
     layout();
     if (N <= BULK_TEXT) bulkTexts(null);
     // A link to /#<id> selects that knot.
-    const want = location.hash.slice(1).toLowerCase();
-    if (HEX.test(want) && index.has(want)) select(index.get(want));
+    selectFromHash();
     listen();
   });
 })();

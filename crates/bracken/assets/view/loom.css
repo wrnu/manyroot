@@ -220,11 +220,36 @@
   font-size: 0.85rem;
 }
 .side .lineage li {
+  padding: 0.1rem 0;
+}
+.side .lineage-btn {
   display: grid;
   grid-template-columns: 18px 1fr;
   gap: 0.4rem;
   align-items: start;
-  padding: 0.2rem 0;
+  width: 100%;
+  padding: 0.25rem 0.35rem;
+  text-align: left;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  color: inherit;
+  font: inherit;
+}
+.side .lineage-btn:hover {
+  background: var(--ground-raised);
+  border-color: var(--stratum-line);
+}
+.side .lineage-btn:hover .statement {
+  color: var(--root);
+}
+.side .lineage-text {
+  min-width: 0;
+}
+.side .lineage-more {
+  margin-top: 0.35rem;
+  font-size: 0.8rem;
+  padding: 0.18rem 0.6rem;
 }
 .side .lineage .statement {
   color: var(--root-dim);
